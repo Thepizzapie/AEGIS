@@ -1,0 +1,22 @@
+name: Aegis policy check
+
+# Runs the SAME Aegis policy against a PR's changed files — the universal,
+# agent-agnostic change-boundary surface. No runtime hooks required.
+on:
+  pull_request:
+
+jobs:
+  aegis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: Aegis policy check
+        env:
+          AEGIS_POLICIES: ./policies
+        run: aegis ci --base "origin/${{ github.base_ref }}"

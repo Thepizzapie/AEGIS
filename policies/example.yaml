@@ -1,0 +1,43 @@
+# Aegis USER policy.
+#
+# Built-in security rules run automatically BEFORE this file (credential/exfil/
+# persistence containment, destructive-git, recursive-delete, and Aegis
+# self-protection) — you don't write those. This file is for YOUR rules.
+#
+# First matching rule by priority wins; if nothing matches, default_action
+# applies. Rules can match with glob `argument_patterns:` or `regex:`.
+# Check with: aegis validate
+
+# Identity & confinement (optional, repo-level defaults):
+#   agent_label: ci-bot     # label records when no AEGIS_AGENT_NAME is set
+#   project: .              # hard-block Edit/Write outside this repo
+#   workspace: { allow: ["../shared"] }   # widen the confined root
+
+default_action: allow
+on_error: allow
+
+rules:
+  # Admins may do anything (highest priority).
+  - name: admin-allow-all
+    priority: 300
+    action: allow
+    tools: ["*"]
+    roles: [admin]
+
+  # Never read or write secret files.
+  - name: block-secret-files
+    priority: 150
+    action: deny
+    actions: [read, edit, write]
+    argument_patterns:
+      file_path: "*.env*"
+    message: "Reading/writing .env files is blocked by Aegis"
+
+  # Confirm before anything that touches prod (regex example).
+  - name: confirm-prod
+    priority: 120
+    action: ask
+    actions: [shell]
+    regex:
+      command: "\\b(kubectl|helm)\\b.*\\bprod\\b|terraform\\s+apply"
+    message: "Confirm before touching prod infrastructure"
