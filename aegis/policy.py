@@ -102,3 +102,7 @@ class Policy:
     # Default agent label when no AEGIS_AGENT_NAME is set -> zero-config
     # attribution for a repo's agents.
     agent_label: Optional[str] = None
+    # Forced install review: {mode: off|monitor|ask, deep: bool,
+    # require_pinned: bool, allow: [regex on command]}. Empty -> defaults
+    # (mode=ask) apply. See rules.rule_install_review.
+    install_review: dict = field(default_factory=dict)

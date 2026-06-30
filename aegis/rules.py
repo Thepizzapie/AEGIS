@@ -16,7 +16,7 @@ import re
 import subprocess
 from typing import Optional
 
-from . import normalize, patterns
+from . import normalize, patterns, review
 from .events import ActionClass, Event, HookEvent
 from .policy import Action, Decision
 
@@ -303,27 +303,101 @@ def rule_evasion(ev: Event, policy=None) -> Optional[Decision]:
                     "char-code construction are how guards get bypassed).")
 
 
-# ---- bulk dependency install: supply-chain defense, escapable ----------------
-def rule_bulk_install(ev: Event, policy=None) -> Optional[Decision]:
-    """Block blind / bulk dependency installs — ``npm install``, ``pip install -r``,
-    ``poetry install``, ``cargo build``, ``go mod download``, etc. A hijacked agent
-    adding a poisoned ``requirements.txt`` or running ``npm install`` in a
-    compromised repo is a supply-chain attack vector. Targeted single-package
-    installs (``npm install lodash``) are fine. Escapable with ``# aegis-allow``
-    or ``AEGIS_ALLOW_INSTALL=1``."""
+# ---- forced install review: read-before-install, then human ask --------------
+def rule_install_review(ev: Event, policy=None) -> Optional[Decision]:
+    """Force a full read of what an install pulls in, then a human ask.
+
+    The 0DIN "clean repo" reverse-shell attack rides an *unread* install: the agent
+    runs ``pip install -r requirements.txt`` from setup notes and never looks at the
+    package that, three indirection steps later, spawns a reverse shell. This gate
+    makes that impossible:
+
+    1. **Deny until read** — any install whose manifest (``requirements.txt``,
+       ``package.json`` + lock, ``pyproject.toml``/``poetry.lock``, …; plus
+       install-time scripts in ``deep`` mode) hasn't been **fully read** this session
+       is refused. A skim — a ``Read`` with a ``limit`` that stops short, or a
+       ``grep``/``head`` peek — never satisfies coverage (see ``aegis.review``).
+    2. **Then ask** — once coverage is satisfied, the install is surfaced to the human
+       with a factual digest (dep count, unpinned specs, URL/VCS deps, install
+       scripts) instead of running silently.
+
+    Config (``policy.install_review``): ``mode`` (off|monitor|ask, default ask),
+    ``deep`` (also require reading setup.py/postinstall scripts), ``require_pinned``
+    (deny unpinned specs), ``allow`` (regex exemptions on the command). The read-gate
+    is non-escapable by a spawned agent (it cannot ``# aegis-allow`` itself); a human
+    may override. No-execute fetches (``pip download``, ``npm --ignore-scripts``) and
+    ``AEGIS_ALLOW_INSTALL=1`` bypass the gate."""
     if not _is_shell(ev):
         return None
+    text = _shell_scan(ev)
+    if not patterns.INSTALL_ANY_RE.search(text):
+        return None
+    if patterns.NOEXEC_FETCH_RE.search(text):
+        return None  # sanctioned no-execute fetch — the first phase of a deep review
     if os.environ.get("AEGIS_ALLOW_INSTALL"):
         return None
+    cfg = getattr(policy, "install_review", None) or {}
+    mode = str(cfg.get("mode", "ask")).lower()
+    if mode == "off":
+        return None
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), _cmd(ev), re.IGNORECASE):
+                return None
+        except re.error:
+            continue
+
+    cwd = ev.cwd or os.getcwd()
+    deep = bool(cfg.get("deep"))
+    manifests = review.resolve_manifests(text, cwd, deep=deep)
+    session = ev.session_id or os.environ.get("AEGIS_SESSION_ID")
+    unread = [m for m in manifests if not review.is_fully_read(session, m, cwd)]
+    human_override = _override_allowed(ev)
+
+    if unread and not human_override:
+        if mode == "monitor":
+            return None
+        names = ", ".join(os.path.basename(m) for m in unread)
+        what = "install-time script(s)/manifest(s)" if deep else "manifest(s)"
+        return Decision(Action.DENY, "install-review",
+                        f"Install blocked — forced dependency review: {names} not fully "
+                        f"read this session. Read the entire {what} in full (no "
+                        f"limit/offset, no grep/head/tail) so what you install is "
+                        f"actually inspected, then retry. A human may append "
+                        f"'# aegis-allow'; a spawned agent cannot.")
+    if human_override or mode == "monitor":
+        return None
+
+    d = review.digest(manifests, text, cwd)
+    if cfg.get("require_pinned") and d.get("unpinned"):
+        return Decision(Action.DENY, "install-review",
+                        f"Install blocked — {d['unpinned']} unpinned dependency spec(s); "
+                        f"the installed set must be pinned (exact '==' / a lockfile) to be "
+                        f"reviewable. Pin the versions, or append '# aegis-allow' (human "
+                        f"only). [{review.format_digest(d)}]")
+    return Decision(Action.ASK, "install-review",
+                    f"Dependency install — review before approving: "
+                    f"{review.format_digest(d)}. Confirm you've read what's being installed.")
+
+
+# ---- fetch-and-execute / DNS-C2: remote code an agent never read -------------
+def rule_remote_exec(ev: Event, policy=None) -> Optional[Decision]:
+    """Deny piping a network fetch straight into a shell (``curl … | sh``) and DNS-TXT
+    command/payload retrieval — the shape of the 0DIN second stage when it surfaces as
+    a shell command (remote code that was never read). Human-escapable like evasion;
+    a spawned agent cannot wave itself past it."""
+    if not _is_shell(ev):
+        return None
     text = _shell_scan(ev)
-    if not patterns.BULK_INSTALL_RE.search(text):
+    if not (patterns.PIPE_TO_SHELL_RE.search(text) or patterns.DNS_C2_RE.search(text)):
         return None
     if _override_allowed(ev):
         return None
-    return Decision(Action.DENY, "bulk-install",
-                    "Bulk/blind dependency install is blocked — supply-chain risk. "
-                    "If this is intentional, append '# aegis-allow' to the command or "
-                    "set AEGIS_ALLOW_INSTALL=1.")
+    return Decision(Action.DENY, "remote-exec",
+                    "Fetch-piped-to-shell / DNS-TXT command retrieval is blocked — this "
+                    "runs remote code (or a DNS-delivered payload) that was never read. "
+                    "Download it, read it in full, then run the local copy. A human may "
+                    "append '# aegis-allow'.")
 
 
 # ---- branch strands: work-loss prevention, escapable ------------------------
@@ -393,8 +467,9 @@ BUILTIN_RULES = (
     rule_subagent_spawn,
     rule_network_egress,
     rule_evasion,
+    rule_remote_exec,
     rule_destructive_git,
     rule_destructive_delete,
-    rule_bulk_install,
+    rule_install_review,
     rule_branch_strands,
 )
