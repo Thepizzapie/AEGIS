@@ -24,6 +24,7 @@ without forking.
 - [How it works: the hook boundary](#how-it-works-the-hook-boundary)
 - [Architecture](#architecture)
 - [Built-in guard catalog](#the-built-in-guard-catalog)
+- [Forced install review](#forced-install-review)
 - [Evasion resistance](#evasion-resistance)
 - [Identity and rogue-agent defense](#identity-and-rogue-agent-defense)
 - [Policy](#policy)
@@ -181,7 +182,8 @@ hijacked agent from appending the escape token to its own commands.
 | **Destructive git** | force-push, `reset --hard`, rebase, `commit --amend`, `branch -D`, `clean -f` | Yes |
 | **Recursive force delete** | `rm -rf` and equivalents across bash, PowerShell (`Remove-Item -Recurse -Force`), and cmd (`rmdir /s`, `del /s`); also `find -delete`/`-exec rm`, `shred`, `truncate -s 0`, `dd of=/dev/...` | Yes |
 | **Sub-agent governance** | `Agent`/`Task` fan-out from a spawned agent (uncontrolled cost/blast radius) | Configurable (`AEGIS_ALLOW_SUBAGENTS`) |
-| **Bulk dependency install** | Blind `npm install` / `pip install -r` / `poetry install` / `bundle install` / `cargo build` / `go mod download` — a hijacked agent running a bulk install from a poisoned repo is a supply-chain attack. Targeted single-package installs (`npm install lodash`) are allowed. | Yes (`AEGIS_ALLOW_INSTALL=1`) |
+| **Forced install review** | A dependency install (`pip install` incl. `-r`, `npm/pnpm/yarn/bun install`, `poetry`/`pipenv`/`uv`/`pipx`, `cargo`, `go`, `conda`/`mamba`, path-qualified `./venv/bin/pip`) is **denied until its manifest is fully read this session** — then surfaced as a human `ask` with a digest (dep count, unpinned specs, URL/VCS deps, install scripts). A skim (a `Read` that stops short, or a `grep`/`head` peek) never satisfies coverage; editing a file after reading re-arms the gate. See [Forced install review](#forced-install-review) for exactly what this does and does **not** stop. | Human `# aegis-allow` / `AEGIS_ALLOW_INSTALL=1`; agent cannot self-escape |
+| **Fetch-to-shell / DNS-C2** | A network fetch piped straight into an interpreter (`curl … \| sh`, `wget … \| bash`, `iex(iwr …)`) and DNS-TXT command/payload retrieval (`dig/kdig/nslookup/host … TXT`) — remote code, or a DNS-delivered payload, that was never read. Catches the common single-command shape; see the section below for what it misses. | Human `# aegis-allow`; agent cannot self-escape |
 | **Branch strands** | Creating a new branch (`git checkout -b` / `git switch -c`) while the current branch has commits not in main — prevents stranding unmerged work. Checks actual git state. | Yes (`AEGIS_ALLOW_STRAND=1`) |
 | **Network egress** | Outbound destinations (tool URLs, `curl`/`Invoke-WebRequest`) against an allow/deny host list | Policy-driven |
 | **Workspace confinement** | File mutations (Edit/Write) outside the agent's project root. The root **binds to the identity** — a token's `project` claim or `AEGIS_PROJECT` — or to policy (`workspace.root` / `project`). Reads are unaffected. | No, once a project is bound (hard block) |
@@ -194,6 +196,82 @@ vector most guardrails miss entirely.
 Containment is a *known-paths* denylist (the locations above) — deliberately
 high-signal, not exhaustive: a secret at an unlisted path, or copied first and then
 read, can slip it. Pair it with least privilege so the agent can't reach what isn't listed.
+
+## Forced install review
+
+A recurring way an agent gets compromised is an **unread install**: it clones a repo,
+follows the setup notes, and runs `pip install -r requirements.txt` (or `npm install`)
+without ever looking at what it pulls in. Public proofs-of-concept — e.g. Mozilla
+0DIN's June 2026 "clean repo" reverse-shell — ride exactly this: a repository with no
+malicious *files*, whose dependency (or a later error message) carries the payload.
+
+Forced install review makes the install go **through** a real read instead of around it:
+
+1. **Deny until fully read.** An install is refused until the manifest that determines
+   what it pulls in — `requirements.txt` (and nested `-r`/`-c` includes), `package.json`
+   + lockfile, `pyproject.toml`/`poetry.lock`, `Gemfile`, `Cargo.toml`, `go.mod`, … — has
+   been **fully read in this session**. "Fully read" is enforced by a coverage ledger
+   (`aegis/review.py`): each `Read` records the line interval it actually returned, keyed
+   to the file's content hash; the union must span the whole file. A `Read` with a `limit`
+   that stops short, a `grep`/`head`/`tail` peek, or a read of a *different* file with the
+   same name does **not** satisfy it, and editing the file after reading re-arms the gate.
+2. **Then ask.** Once coverage is satisfied the install is surfaced to the human as an
+   `ask` with a factual digest — dependency count, **unpinned** specs, **URL/VCS/local**
+   deps, and whether install-time scripts are present — so the approval is informed.
+
+A *targeted* install of named packages (`pip install requests`, `npm install lodash`,
+`pip install --upgrade pip`) has no manifest to read and goes straight to the `ask` (the
+package names are summarized in the digest). A *local-path* install (`pip install ./pkg`)
+gates the build files of **that** directory.
+
+**Config** (`policy.install_review`) — built in, on by default at `mode: ask`:
+
+```yaml
+install_review:
+  mode: ask            # off | monitor (log the would-be decision to the audit, allow) | ask
+  deep: false          # also require reading the LOCAL setup.py / postinstall scripts
+  require_pinned: false # deny unpinned specs (force exact == / a lockfile)
+  allow: []            # regexes on the command that skip the gate
+```
+
+The read-gate is **non-escapable by a spawned agent** — it cannot `# aegis-allow` its own
+install (the override is honored only for a human). Bypasses for legitimate use: a human
+`# aegis-allow`, `AEGIS_ALLOW_INSTALL=1`, an `allow:` regex, or `mode: monitor` while you
+pilot. No-execute fetches (`pip download`, `npm pack`) are not installs and don't gate.
+
+### What this does and does **not** stop — honest kill-chain
+
+Against the 0DIN clean-repo chain, mapped to the tool calls Aegis actually sees:
+
+| Step | Action | Blocked? |
+|---|---|---|
+| Blind `pip install -r requirements.txt` (unread) | **Denied until the manifest is fully read**, then a human `ask` | **Yes — this is the value** |
+| The installed package's **install-time code** (`setup.py`/postinstall) runs inside pip's subprocess | Below the hook boundary — Aegis is not a sandbox and does not see inside a subprocess | **No** |
+| A second-stage command the package's error tells the agent to run (e.g. `python3 -m axiom init`) | A plain module run; no guard matches | **No** (unless it surfaces a guarded shell shape) |
+| That command resolves a DNS TXT record, base64-decodes, and execs a reverse shell — in-process | Never a separate tool call; `dig … TXT` only trips the guard if the payload *shells out* | **No** |
+
+So this gate blocks the **blind/poisoned-manifest** step and forces a human decision; it
+does **not** by itself stop a payload that lives in a dependency's install-time code or in
+a later step. `deep` mode force-reads the **local** `setup.py`/`pyproject.toml` (catching a
+malicious `pip install .`), **not** a downloaded third-party package's code. The real
+containment for the in-subprocess payload is OS isolation + deny-by-default egress — pair
+them with this gate; it is a policy layer, not a sandbox.
+
+### Known limits (so you're not surprised)
+
+- **Coverage proves bytes entered context, not comprehension.** A full read puts the whole
+  manifest in front of the model/human; it can't prove they understood it, and a benign
+  *name* (`requests`) tells you nothing about a typosquat.
+- **Coverage trusts the runtime's tool output.** The ledger believes the `Read` content the
+  runtime delivers at PostToolUse (same trust the hook itself rests on). It does not defend
+  a caller that forges its own hook payloads — that's the "the hook can be skipped" case the
+  server-side gate addresses. On a runtime that doesn't deliver Read content, coverage fails
+  **closed** (install blocked) — use a human override or `mode: monitor`.
+- **Denylist detection can be laundered.** Manifest contents fed through `xargs`/`$(…)`, or a
+  brand-new installer name, can dodge detection; a download-to-temp-then-execute split across
+  two statements dodges the fetch-to-shell guard. Deny-by-default egress is the backstop.
+- **The ledger has no TTL.** A full read earlier in the session satisfies the gate until the
+  file's content changes.
 
 ## Evasion resistance
 
@@ -347,7 +425,7 @@ while a user or org sets global defaults:
 
 Switches: `AEGIS_NO_BUILTINS` (turn off the default guard set),
 `AEGIS_IDENTITY_ENFORCE` (deny + reap rogue sessions), `AEGIS_ALLOW_SUBAGENTS`,
-`AEGIS_ALLOW_INSTALL` (permit bulk dep installs), `AEGIS_ALLOW_STRAND` (permit
+`AEGIS_ALLOW_INSTALL` (bypass the forced install-review gate), `AEGIS_ALLOW_STRAND` (permit
 branching with unmerged work), `AEGIS_WORKSPACE` / `AEGIS_PROJECT` (confinement root; `AEGIS_PROJECT` also binds the
 identity), `AEGIS_FAIL_CLOSED` (deny on an unparseable payload instead of fail-open).
 

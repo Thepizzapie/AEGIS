@@ -72,6 +72,28 @@ EVASION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Fetch-and-execute: pull a remote script and pipe it straight into an interpreter
+# (curl … | sh, wget … | bash, iex(iwr …)). The classic one-liner that runs code an
+# agent never read — and the shape of the 0DIN "clean repo" reverse-shell second
+# stage when it surfaces as a shell command. Non-escapable evasion tell.
+PIPE_TO_SHELL_RE = re.compile(
+    r"\b(?:curl|wget)\b[^|&;\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|python3?|node|perl|ruby|pwsh|powershell)\b"
+    r"|\b(?:iex|invoke-expression)\b[^|;\n]*\(?\s*(?:iwr|invoke-webrequest|curl|wget|new-object\s+net\.webclient)"
+    r"|\(\s*(?:iwr|invoke-webrequest)\b[^)]*\)\s*(?:\||\.content\s*\|)\s*iex",
+    re.IGNORECASE,
+)
+
+# DNS-as-C2 / DNS exfil: pulling a payload or command out of a TXT record (the 0DIN
+# stage that hides a base64 reverse-shell in an attacker-controlled DNS TXT record).
+# High-signal when the lookup feeds a decoder or interpreter.
+DNS_C2_RE = re.compile(
+    r"\b(?:dig|drill|kdig)\b[^|;&\n]*(?:\btxt\b|-t\s+txt|\+short)"
+    r"|\bnslookup\b[^|;&\n]*-(?:type|q|querytype)=txt\b"
+    r"|\bhost\b[^|;&\n]*\s-t\s+txt\b"
+    r"|\bResolve-DnsName\b[^|;&\n]*-Type\s+txt\b",
+    re.IGNORECASE,
+)
+
 # Aegis's own enforcement surface — deleting/editing this disables Aegis.
 ENFORCEMENT_PATH_RE = re.compile(r"\.aegis\b|\.claude[/\\]settings\.json\b", re.IGNORECASE)
 # broader: shell delete/move of the whole config dirs (.aegis / .claude)
@@ -156,5 +178,41 @@ BULK_INSTALL_RE = re.compile(
     r"|cargo\s+(?:fetch|build|run|test)"                            # cargo (pulls deps)
     r"|go\s+mod\s+(?:download|tidy)"                                # go mod download/tidy
     r")",
+    re.IGNORECASE,
+)
+
+# ANY dependency install — bulk OR targeted. The install-review gate fires on all of
+# these (forced full read of the manifest, then human ask), where the bulk guard only
+# caught the install-everything forms. Excludes the no-execute *fetch* forms
+# (pip download, npm --ignore-scripts) which don't run package code and are the
+# sanctioned first phase of a deep review.
+# Leading-context class includes '/' so a path-qualified interpreter
+# (./venv/bin/pip install ...) is still recognized.
+INSTALL_ANY_RE = re.compile(
+    r"(?:^|[\s;&|(/])(?:"
+    r"(?:npm|pnpm|bun)\s+(?:install|i|ci|add)\b"                    # npm install/add (+pkg or not)
+    r"|yarn\s+(?:install|add)\b|yarn(?=\s*(?:$|[;&|#]))"            # yarn install/add, or bare yarn
+    r"|(?:pip|pip3)\s+install\b"                                    # pip install (any)
+    r"|python3?\s+-m\s+pip\s+install\b"                             # python -m pip install (any)
+    r"|uv\s+(?:pip\s+install|add|sync|install)\b"                  # uv (modern installer)
+    r"|pipx\s+(?:install|run)\b"                                    # pipx
+    r"|poetry\s+(?:install|add)\b"                                  # poetry install/add
+    r"|pipenv\s+install\b"                                          # pipenv install (any)
+    r"|(?:bundle|gem)\s+install\b"                                  # bundle/gem install
+    r"|cargo\s+(?:install|fetch|build|run|test|add)\b"             # cargo (pulls/runs deps)
+    r"|go\s+(?:mod\s+(?:download|tidy)|get|install)\b"             # go get/install/mod
+    r"|(?:conda|mamba|micromamba)\s+(?:install|create)\b"          # conda/mamba family
+    r")",
+    re.IGNORECASE,
+)
+
+# No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
+# package code. These don't trip the gate (a download is not an install). NOTE: this
+# deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the
+# package on disk, whose top-level import code runs the moment it's required, so it is
+# an install and stays gated.
+NOEXEC_FETCH_RE = re.compile(
+    r"\bpip3?\s+download\b"
+    r"|\bnpm\s+pack\b",
     re.IGNORECASE,
 )

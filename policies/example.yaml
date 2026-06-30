@@ -13,6 +13,16 @@
 #   project: .              # hard-block Edit/Write outside this repo
 #   workspace: { allow: ["../shared"] }   # widen the confined root
 
+# Forced install review (optional). Built in and ON by default (mode: ask):
+# a dependency install is denied until its manifest (requirements.txt,
+# package.json + lock, pyproject.toml, ...) has been FULLY READ this session,
+# then surfaced as a human ask with a digest. Tune it here:
+#   install_review:
+#     mode: ask            # off | monitor (log-only) | ask (default)
+#     deep: false          # also require reading setup.py / postinstall scripts
+#     require_pinned: false # deny unpinned specs (force exact == / a lockfile)
+#     allow: []            # regexes on the command that skip the gate
+
 default_action: allow
 on_error: allow
 
