@@ -1,12 +1,20 @@
 """Forced install review — the read-coverage ledger (AEGI-review).
 
-The 0DIN "clean repo" attack rides an *unread* install: the agent runs
-``pip install -r requirements.txt`` straight from setup notes, never looking at
-what it pulls in, and a malicious package three indirection steps later spawns a
-reverse shell. This module is the spine of the defense — it records which files
-have been **fully read** in a session (full reads, not skims) so the install
-guard (``rules.rule_install_review``) can refuse to install a manifest the agent
-hasn't actually looked at, then force a human ask with a real digest.
+A common careless path to compromise is an *unread* install: the agent runs
+``pip install -r requirements.txt`` straight from a repo's setup notes, never
+looking at what it pulls in. This module records which files have been **fully
+read** in a session (full reads, not skims) so the install guard
+(``rules.rule_install_review``) can refuse to install a manifest the agent hasn't
+actually looked at, then force a human ask with a factual digest.
+
+Scope, stated honestly: this proves the manifest's bytes *entered context* and
+puts a human in the loop — it does not prove the reader comprehended them, and it
+does not inspect a dependency's install-time code (that runs inside the package
+manager's subprocess, below the hook boundary — Aegis is not a sandbox). It raises
+the cost of the *poisoned-manifest / blind-install* variant; it is not, by itself,
+a complete defense against an attack whose payload lives in package code or a
+later step. Pair it with deny-by-default egress and OS isolation. See the README
+"Forced install review" section for the precise kill-chain coverage.
 
 Two pieces:
 
@@ -40,7 +48,7 @@ from typing import List, Optional
 from . import config
 from .events import ActionClass, Event, HookEvent
 
-_MAX_BYTES = 5_000_000  # don't hash/scan absurdly large files
+_MAX_BYTES = 50_000_000  # don't hash/scan absurdly large files (big lockfiles fit)
 
 
 # ---------------------------------------------------------------- ledger storage
@@ -70,11 +78,17 @@ def _sha256(path: str) -> Optional[str]:
 
 
 def _line_count(path: str) -> int:
+    """Significant line count — trailing blank lines don't count toward coverage, so a
+    full read whose content the runtime returns without the file's trailing newline(s)
+    still satisfies the gate (a common, maddening false-deny otherwise)."""
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-            return sum(1 for _ in fh)
+            lines = fh.read().splitlines()
     except Exception:
         return 0
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return len(lines)
 
 
 def _append(session: Optional[str], record: dict) -> None:
@@ -133,12 +147,25 @@ def _extract_text(resp) -> Optional[str]:
 
 def record_read(session: Optional[str], file_path: str, args: dict,
                 content: Optional[str], cwd: Optional[str]) -> None:
-    """Record the line interval a Read covered, keyed by the file's current hash.
+    """Record the line interval a Read *actually* covered, keyed by the file's hash.
 
-    Coverage is derived, in order of reliability: from the returned content's line
-    count (most reliable — it's exactly what entered the model's context); else
-    from an explicit ``limit``; else assumed-to-EOF for a bare full read.
-    """
+    Coverage is derived ONLY from positive evidence — the returned content's line
+    count, i.e. exactly the bytes the runtime delivered into context. A read with no
+    content (an unrecognized/empty ``tool_response``, or a runtime that doesn't carry
+    Read output) records **nothing**: the gate fails closed, because an unread
+    manifest must never become installable. We deliberately do NOT infer coverage
+    from a ``limit`` (a request ceiling, not proof) or assume-to-EOF for a bare read
+    (that was the fail-open). This trusts the runtime to deliver a faithful
+    ``tool_response`` — the same trust the hook boundary itself rests on; it does not
+    defend against a caller that forges its own hook payloads (see README: the hook
+    can be skipped, the import-level gate cannot)."""
+    if content is None:
+        return  # no proof of any line read -> record nothing (fail closed)
+    n = len(str(content).splitlines())
+    if n == 0:
+        if not str(content):
+            return  # empty response -> zero lines proven
+        n = 1
     ap = _abspath(file_path, cwd)
     sha = _sha256(ap)
     if not sha:
@@ -151,21 +178,7 @@ def record_read(session: Optional[str], file_path: str, args: dict,
         offset = 1
     if offset < 1:
         offset = 1
-
-    n = None
-    if content is not None:
-        n = len(str(content).splitlines())
-        if n == 0 and str(content):
-            n = 1
-    if n is not None:
-        end = offset + n - 1
-    elif args.get("limit"):
-        try:
-            end = offset + int(args["limit"]) - 1
-        except (TypeError, ValueError):
-            end = total
-    else:
-        end = total  # bare full read -> assume to EOF
+    end = offset + n - 1
     if total:
         end = min(end, total)
     if end < offset:
@@ -257,45 +270,84 @@ _TOOL_RE = re.compile(
 _PIP_REQ_RE = re.compile(r"(?:-r|--requirement)\s+(\S+)", re.IGNORECASE)
 
 
+def _is_local_path(p: str) -> bool:
+    return p in (".", "..") or p.startswith((".", "/", "~"))
+
+
 def resolve_manifests(cmd_text: str, cwd: Optional[str], deep: bool = False) -> List[str]:
     """The manifest files (that exist on disk) which determine what this install
     pulls in — and, in deep mode, the install-time scripts that run package code.
 
     A *targeted* install of named third-party packages (``pip install requests``,
-    ``npm install lodash``) has no manifest to read — the named packages are reviewed
-    via the digest instead — so only ``-r``/explicit files apply. A *manifest-driven*
-    install (bare ``npm install``, ``poetry install``, ``pip install .``) pulls the
-    whole manifest, so the manifest + lockfile must be fully read."""
+    ``npm install lodash``, ``pip install --upgrade pip``) has no manifest to read —
+    the named packages are reviewed via the digest instead. An *explicit manifest*
+    install (``pip install -r requirements.txt``) gates exactly the named file(s)
+    (and any nested ``-r``/``-c`` includes) — not unrelated project files. A
+    *manifest-driven* install (bare ``npm install``, ``poetry install``) gates the
+    tool's manifest + lockfile. A *local-path* install (``pip install ./pkg``) gates
+    the build files of THAT directory, where its install hooks live."""
     cwd = cwd or os.getcwd()
     found: List[str] = []
 
-    def add(rel: str):
-        ap = _abspath(rel, cwd)
+    def add(rel: str, base: Optional[str] = None):
+        ap = _abspath(rel, base or cwd)
         if os.path.isfile(ap) and ap not in found:
             found.append(ap)
 
-    # pip -r <file> (possibly several) — the explicit manifest always applies
-    for m in _PIP_REQ_RE.finditer(cmd_text):
-        add(m.group(1))
+    # pip -r/-c <file> (possibly several), plus their nested includes — always apply
+    req_files = [m.group(1) for m in _PIP_REQ_RE.finditer(cmd_text)]
+    for rel in req_files:
+        add(rel)
+        _expand_requirement_includes(_abspath(rel, cwd), found)
 
     pkgs = package_args(cmd_text)
-    third_party = [p for p in pkgs
-                   if p not in (".", "..") and not p.startswith((".", "/", "~"))
-                   and "://" not in p]
+    third_party = [p for p in pkgs if not _is_local_path(p) and "://" not in p]
+    local_paths = [p for p in pkgs if _is_local_path(p)]
 
     m = _TOOL_RE.search(cmd_text)
     tool = (m.group(1).lower() if m else "")
-    if not third_party:  # manifest-driven: the whole manifest is installed
-        if tool.startswith("pip"):
-            add("pyproject.toml")
-            add("setup.py")
-        for rel in _MANIFESTS.get(tool, []):
-            add(rel)
 
-    if deep:  # also force-read the install-time scripts that run package code
-        for rel in _DEEP_SCRIPTS:
-            add(rel)
+    if not third_party:
+        if tool.startswith("pip"):
+            # only a local-path target drags in build files — and from THAT dir,
+            # not the cwd. A bare `-r` install gates just the requirement file(s).
+            for b in local_paths:
+                bp = _abspath(b, cwd)
+                root = bp if os.path.isdir(bp) else os.path.dirname(bp)
+                add("pyproject.toml", root)
+                add("setup.py", root)
+        else:
+            for rel in _MANIFESTS.get(tool, []):
+                add(rel)
+
+    if deep:  # also force-read the local install-time scripts that run package code
+        roots = [cwd] + [(_abspath(b, cwd) if os.path.isdir(_abspath(b, cwd))
+                          else os.path.dirname(_abspath(b, cwd))) for b in local_paths]
+        for root in roots:
+            for rel in _DEEP_SCRIPTS:
+                add(rel, root)
     return found
+
+
+def _expand_requirement_includes(path: str, acc: List[str], depth: int = 0) -> None:
+    """Resolve nested ``-r``/``-c`` includes inside a requirements file (pip resolves
+    them relative to the including file), so a manifest can't launder its real
+    contents through an include the gate never force-reads."""
+    if depth > 5:
+        return
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                s = line.split("#", 1)[0].strip()
+                m = re.match(r"(?:-r|--requirement|-c|--constraint)[\s=]+(\S+)", s)
+                if not m:
+                    continue
+                inc = _abspath(m.group(1), os.path.dirname(path))
+                if os.path.isfile(inc) and inc not in acc:
+                    acc.append(inc)
+                    _expand_requirement_includes(inc, acc, depth + 1)
+    except Exception:
+        pass
 
 
 def package_args(cmd_text: str) -> List[str]:
@@ -306,9 +358,18 @@ def package_args(cmd_text: str) -> List[str]:
         toks = shlex.split(cmd_text, comments=True)
     except Exception:
         toks = cmd_text.split()
-    verbs = {"install", "add", "i", "ci", "get"}
-    skip_tools = {"npm", "pnpm", "yarn", "bun", "pip", "pip3", "poetry", "pipenv",
-                  "bundle", "gem", "cargo", "go", "python", "python3", "-m", "pip"}
+    verbs = {"install", "add", "i", "ci", "get", "sync"}
+    # tool words to ignore when they appear BEFORE the verb. Note: pip/setuptools/
+    # wheel are intentionally NOT here, so `pip install --upgrade pip` registers
+    # `pip` as a named (targeted) package rather than a manifest-driven install.
+    skip_tools = {"npm", "pnpm", "yarn", "bun", "poetry", "pipenv", "uv", "pipx",
+                  "bundle", "gem", "cargo", "go", "conda", "mamba", "micromamba",
+                  "python", "python3", "-m"}
+    # options that consume the FOLLOWING token as their value (not a package)
+    val_opts = {"-r", "--requirement", "-c", "--constraint", "-e", "--editable",
+                "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
+                "--trusted-host", "-t", "--target", "--platform", "--python-version",
+                "--no-binary", "--only-binary", "--prefix", "--root"}
     pkgs = []
     seen_verb = False
     skip_next = False
@@ -323,7 +384,7 @@ def package_args(cmd_text: str) -> List[str]:
         if low in skip_tools:
             continue
         if t.startswith("-"):
-            if low in ("-r", "--requirement", "-c", "--constraint", "-e", "--editable"):
+            if low in val_opts:
                 skip_next = True
             continue
         if seen_verb:

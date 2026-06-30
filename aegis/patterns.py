@@ -87,7 +87,7 @@ PIPE_TO_SHELL_RE = re.compile(
 # stage that hides a base64 reverse-shell in an attacker-controlled DNS TXT record).
 # High-signal when the lookup feeds a decoder or interpreter.
 DNS_C2_RE = re.compile(
-    r"\b(?:dig|drill)\b[^|;&\n]*(?:\btxt\b|-t\s+txt|\+short)"
+    r"\b(?:dig|drill|kdig)\b[^|;&\n]*(?:\btxt\b|-t\s+txt|\+short)"
     r"|\bnslookup\b[^|;&\n]*-(?:type|q|querytype)=txt\b"
     r"|\bhost\b[^|;&\n]*\s-t\s+txt\b"
     r"|\bResolve-DnsName\b[^|;&\n]*-Type\s+txt\b",
@@ -186,28 +186,33 @@ BULK_INSTALL_RE = re.compile(
 # caught the install-everything forms. Excludes the no-execute *fetch* forms
 # (pip download, npm --ignore-scripts) which don't run package code and are the
 # sanctioned first phase of a deep review.
+# Leading-context class includes '/' so a path-qualified interpreter
+# (./venv/bin/pip install ...) is still recognized.
 INSTALL_ANY_RE = re.compile(
-    r"(?:^|[\s;&|(])(?:"
+    r"(?:^|[\s;&|(/])(?:"
     r"(?:npm|pnpm|bun)\s+(?:install|i|ci|add)\b"                    # npm install/add (+pkg or not)
-    r"|yarn(?:\s+(?:install|add))?(?![\w-])"                        # yarn / yarn install / yarn add
+    r"|yarn\s+(?:install|add)\b|yarn(?=\s*(?:$|[;&|#]))"            # yarn install/add, or bare yarn
     r"|(?:pip|pip3)\s+install\b"                                    # pip install (any)
     r"|python3?\s+-m\s+pip\s+install\b"                             # python -m pip install (any)
+    r"|uv\s+(?:pip\s+install|add|sync|install)\b"                  # uv (modern installer)
+    r"|pipx\s+(?:install|run)\b"                                    # pipx
     r"|poetry\s+(?:install|add)\b"                                  # poetry install/add
     r"|pipenv\s+install\b"                                          # pipenv install (any)
     r"|(?:bundle|gem)\s+install\b"                                  # bundle/gem install
     r"|cargo\s+(?:install|fetch|build|run|test|add)\b"             # cargo (pulls/runs deps)
     r"|go\s+(?:mod\s+(?:download|tidy)|get|install)\b"             # go get/install/mod
+    r"|(?:conda|mamba|micromamba)\s+(?:install|create)\b"          # conda/mamba family
     r")",
     re.IGNORECASE,
 )
 
-# No-execute *fetch* forms — pull artifacts WITHOUT running package install hooks.
-# The sanctioned first phase of a deep (script-review) install: these don't trip the
-# gate, so an agent can download, the human/agent reads setup.py/postinstall in full,
-# then the real (script-running) install is gated.
+# No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
+# package code. These don't trip the gate (a download is not an install). NOTE: this
+# deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the
+# package on disk, whose top-level import code runs the moment it's required, so it is
+# an install and stays gated.
 NOEXEC_FETCH_RE = re.compile(
     r"\bpip3?\s+download\b"
-    r"|\b(?:npm|pnpm|yarn|bun)\b[^|;&\n]*--ignore-scripts\b"
     r"|\bnpm\s+pack\b",
     re.IGNORECASE,
 )

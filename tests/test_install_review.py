@@ -60,6 +60,44 @@ def test_install_asks_after_full_read(tmp_path):
     assert d.action == Action.ASK and d.rule == "install-review"
 
 
+def test_no_content_response_does_not_satisfy(tmp_path):
+    """CRITICAL: a Read whose tool_response carries no content proves nothing read ->
+    the gate must stay closed (no assume-to-EOF fail-open)."""
+    _reqs(tmp_path, *[f"pkg{i}==1.0" for i in range(20)])
+    ev = Event.make(HookEvent.POST_TOOL_USE, tool="Read",
+                    args={"file_path": "requirements.txt"}, session_id="s",
+                    cwd=str(tmp_path), raw={"tool_response": None})
+    review.observe(ev)
+    assert evaluate(_shell("pip install -r requirements.txt", tmp_path), EMPTY).action == Action.DENY
+
+
+def test_empty_content_does_not_satisfy(tmp_path):
+    _reqs(tmp_path, *[f"pkg{i}==1.0" for i in range(20)])
+    _full_read("requirements.txt", tmp_path, content="")
+    assert evaluate(_shell("pip install -r requirements.txt", tmp_path), EMPTY).action == Action.DENY
+
+
+def test_trailing_blank_lines_still_fully_read(tmp_path):
+    """File ends with blank lines but the runtime returns content without them ->
+    must still count as fully read."""
+    (tmp_path / "requirements.txt").write_text("requests==2.0\nflask==3.0\n\n\n", encoding="utf-8")
+    _full_read("requirements.txt", tmp_path, content="requests==2.0\nflask==3.0")
+    assert evaluate(_shell("pip install -r requirements.txt", tmp_path), EMPTY).action == Action.ASK
+
+
+def test_monitor_mode_records_would_be_denial(tmp_path, monkeypatch):
+    """Monitor mode allows but writes the projected decision to the audit log."""
+    import json
+    audit = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("AEGIS_AUDIT", str(audit))
+    _reqs(tmp_path, "requests==2.0")
+    pol = Policy(install_review={"mode": "monitor"})
+    assert evaluate(_shell("pip install -r requirements.txt", tmp_path), pol).action == Action.ALLOW
+    rows = [json.loads(l) for l in audit.read_text().splitlines() if l.strip()]
+    monitor = [r for r in rows if r.get("rule") == "install-review-monitor"]
+    assert monitor and monitor[0]["decision"] == "deny"
+
+
 def test_skim_does_not_satisfy(tmp_path):
     """A partial read (limit/offset that stops short) must NOT count as review."""
     _reqs(tmp_path, *[f"pkg{i}==1.0" for i in range(10)])
@@ -135,15 +173,62 @@ def test_bare_npm_install_requires_package_json(tmp_path):
 
 def test_noexec_fetch_not_gated(tmp_path):
     _reqs(tmp_path, "requests==2.0")
-    # pip download / --ignore-scripts don't run package code -> the sanctioned
-    # first phase of a deep review, not gated
+    # a download/pack is not an install (no package code runs / nothing placed)
     assert evaluate(_shell("pip download -r requirements.txt", tmp_path), EMPTY).action == Action.ALLOW
-    assert evaluate(_shell("npm install --ignore-scripts", tmp_path), EMPTY).action == Action.ALLOW
+    assert evaluate(_shell("npm pack", tmp_path), EMPTY).action == Action.ALLOW
+
+
+def test_ignore_scripts_still_gated(tmp_path):
+    """`npm install --ignore-scripts` still PLACES the package -> stays gated."""
+    (tmp_path / "package.json").write_text('{"dependencies":{}}', encoding="utf-8")
+    assert evaluate(_shell("npm install --ignore-scripts", tmp_path), EMPTY).action == Action.DENY
 
 
 def test_non_install_shell_untouched(tmp_path):
     assert evaluate(_shell("echo hello", tmp_path), EMPTY).action == Action.ALLOW
     assert evaluate(_shell("python script.py", tmp_path), EMPTY).action == Action.ALLOW
+    # yarn build/test are scripts, not installs — must NOT gate
+    assert evaluate(_shell("yarn build", tmp_path), EMPTY).action == Action.ALLOW
+    assert evaluate(_shell("yarn test", tmp_path), EMPTY).action == Action.ALLOW
+
+
+def test_toolchain_upgrade_is_targeted_not_manifest(tmp_path):
+    """`pip install --upgrade pip` must NOT be blocked against the project manifest."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (tmp_path / "setup.py").write_text("setup()\n", encoding="utf-8")
+    d = evaluate(_shell("pip install --upgrade pip", tmp_path), EMPTY)
+    assert d.action == Action.ASK  # targeted -> ask, never deny-until-read
+
+
+def test_explicit_requirements_does_not_drag_pyproject(tmp_path):
+    """`pip install -r requirements.txt` gates ONLY the requirements file."""
+    _reqs(tmp_path, "requests==2.0")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (tmp_path / "setup.py").write_text("setup()\n", encoding="utf-8")
+    _full_read("requirements.txt", tmp_path)  # only the requirements file
+    assert evaluate(_shell("pip install -r requirements.txt", tmp_path), EMPTY).action == Action.ASK
+
+
+def test_modern_installers_gated(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    assert evaluate(_shell("uv add requests", tmp_path), EMPTY).action == Action.ASK   # targeted
+    assert evaluate(_shell("pipx install black", tmp_path), EMPTY).action == Action.ASK
+    # path-qualified pip is still recognized
+    _reqs(tmp_path, "requests==2.0")
+    assert evaluate(_shell("./venv/bin/pip install -r requirements.txt", tmp_path), EMPTY).action == Action.DENY
+
+
+def test_local_path_install_resolves_target_dir(tmp_path):
+    """`pip install ./evil` must gate ./evil/setup.py, not the benign cwd setup.py."""
+    (tmp_path / "setup.py").write_text("# benign cwd\nsetup()\n", encoding="utf-8")
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "setup.py").write_text("# malicious\nimport os\n", encoding="utf-8")
+    # reading the cwd setup.py must NOT satisfy the gate for ./evil
+    _full_read("setup.py", tmp_path)
+    assert evaluate(_shell("pip install ./evil", tmp_path), EMPTY).action == Action.DENY
+    _full_read("evil/setup.py", tmp_path)
+    assert evaluate(_shell("pip install ./evil", tmp_path), EMPTY).action == Action.ASK
 
 
 # --------------------------------------------------------------- config knobs
