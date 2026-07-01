@@ -25,6 +25,7 @@ without forking.
 - [Architecture](#architecture)
 - [Built-in guard catalog](#the-built-in-guard-catalog)
 - [Forced install review](#forced-install-review)
+- [MCP server-config protection](#mcp-server-config-protection)
 - [Evasion resistance](#evasion-resistance)
 - [Identity and rogue-agent defense](#identity-and-rogue-agent-defense)
 - [Policy](#policy)
@@ -187,6 +188,7 @@ hijacked agent from appending the escape token to its own commands.
 | **Branch strands** | Creating a new branch (`git checkout -b` / `git switch -c`) while the current branch has commits not in main — prevents stranding unmerged work. Checks actual git state. | Yes (`AEGIS_ALLOW_STRAND=1`) |
 | **Network egress** | Outbound destinations (tool URLs, `curl`/`Invoke-WebRequest`) against an allow/deny host list | Policy-driven |
 | **Workspace confinement** | File mutations (Edit/Write) outside the agent's project root. The root **binds to the identity** — a token's `project` claim or `AEGIS_PROJECT` — or to policy (`workspace.root` / `project`). Reads are unaffected. | No, once a project is bound (hard block) |
+| **MCP server-config protection** | Writes to MCP server-definition config files (`.mcp.json`, `~/.claude.json`'s `mcpServers`, `.cursor/mcp.json`, `.vscode/mcp.json`, `claude_desktop_config.json`, Windsurf's `mcp_config.json`) via Edit/Write **or an MCP filesystem tool**; shell redirects, deletes/moves, and in-place edits (`sed -i`, `cp`, `dd`, …) onto those paths; and CLI `mcp add`-style registration. A planted/altered server entry's `command`/`args`/`url`/`env` auto-executes on **every future session** — a durable, cross-session backdoor no other guard covers. See [MCP server-config protection](#mcp-server-config-protection). | Human `AEGIS_ALLOW_MCP_CONFIG=1` (Edit/Write/MCP-tool) or `# aegis-allow` (shell); agent cannot self-escape |
 
 The migration guard is worth calling out: an agent doesn't need a shell to wipe a
 database — it can call a DB MCP tool's `execute_sql` directly. Aegis reads the SQL
@@ -272,6 +274,70 @@ them with this gate; it is a policy layer, not a sandbox.
   two statements dodges the fetch-to-shell guard. Deny-by-default egress is the backstop.
 - **The ledger has no TTL.** A full read earlier in the session satisfies the gate until the
   file's content changes.
+
+## MCP server-config protection
+
+MCP server-definition config files (`.mcp.json`, `~/.claude.json`'s `mcpServers`,
+`.cursor/mcp.json`, `.vscode/mcp.json`, `claude_desktop_config.json`, Windsurf's
+`mcp_config.json`) declare a `command` / `args` / `url` / `env` per server. That
+definition is **auto-executed on every future session start** — the runtime launches
+it as part of bringing up the agent's tool surface, with no further approval. A
+hijacked or prompt-injected agent that plants or edits an entry here plants a
+durable, cross-session backdoor that outlives the current session entirely: the
+next launch (yours, a teammate's, or CI's) runs whatever `command`/`args` the
+attacker wrote, with the same privileges any other tool already has.
+
+This is a distinctly *agentic* attack surface — unique to tool-calling runtimes —
+that none of the other built-ins cover: self-protection guards Aegis's **own**
+config (`.aegis`, `.claude/settings.json`); containment/persistence guard **OS**-level
+persistence (cron, registry, scheduled tasks). Neither looks at MCP server
+definitions.
+
+**What's covered:**
+
+1. **Edit/Write/MCP-tool writes** to a known MCP config path (checked via the
+   generic path argument, so this catches an MCP filesystem-server tool's write —
+   not just Claude Code's own `Edit`/`Write` — regardless of whether that server
+   calls its path argument `file_path`, `path`, `target_file`, `filename`, `file`,
+   or `uri`).
+2. **Shell mutation** of a config path: redirects/`tee`/`Set-Content`, delete/move,
+   recursive force-delete, and in-place edits or copy-over-target (`sed -i`,
+   `perl -i`, batch-mode `vim`/`ex`, `cp`, `dd`, or a `python`/`node`/`ruby`/`perl`
+   one-liner that writes the file).
+3. **CLI registration** — `claude mcp add …`, `codex mcp add …`, and the bare
+   reference-CLI form `mcp add …` (anchored to command-start position so it doesn't
+   false-positive on a commit message or `grep` hit that merely contains the phrase).
+
+Reads (`Read`, `Grep`, `Glob`) are unaffected — only mutation is gated, so scaffolding
+a project from a template or auditing an existing `.mcp.json` works normally.
+
+**Config** (`policy.mcp_config`) — built in, on by default at `mode: deny`:
+
+```yaml
+mcp_config:
+  mode: deny            # deny | ask | monitor | off
+  allow: []              # regexes on the path/command that skip the gate
+```
+
+`ask` surfaces the change to a human for interactive approval instead of a hard
+deny — the same shape as `install_review`'s digest-then-ask. `monitor` logs the
+would-be decision to the audit and allows, for piloting before enforcing.
+
+**Escapable only by a human:** a trailing `# aegis-allow` on the shell form (the
+natural place for it — there's no syntax-safe way to embed a comment inside a JSON
+Edit/Write payload), or the env toggle `AEGIS_ALLOW_MCP_CONFIG=1` for the
+Edit/Write/MCP-tool form. A spawned agent cannot set its own environment for a hook
+invocation it doesn't control, and (per *Evasion resistance*, below) cannot use the
+`# aegis-allow` token on its own commands either — so neither escape hatch is
+agent-self-usable.
+
+**Known limits:** this is a known-paths denylist — an unlisted or newly-invented
+runtime's config file, or a symlink pointing outside the recognized set, isn't
+covered. A third-party MCP CLI that isn't Claude Code / Codex / Cursor / Windsurf /
+Gemini and doesn't use the bare `mcp add` phrasing can register a server without
+tripping the CLI check (the config-file write itself is still the backstop in that
+case). Like the other denylist guards here, pair with least privilege and
+deny-by-default egress for defense in depth.
 
 ## Evasion resistance
 
@@ -408,8 +474,11 @@ Validate with `aegis validate`.
 **Top-level fields** (besides `rules`): `default_action`, `on_error` (`allow`/`deny`),
 `egress` (network governance), `plugins` (custom guard modules), `workspace`
 (`{root, allow}` confinement), `project` (bind file mutations to a repo — hard-block
-out-of-project edits), and `agent_label` (default record label when no `AEGIS_AGENT_NAME`
-is set). The last two give a repo zero-config attribution + confinement.
+out-of-project edits), `agent_label` (default record label when no `AEGIS_AGENT_NAME`
+is set), `install_review` (forced dependency-manifest review — see
+[Forced install review](#forced-install-review)), and `mcp_config` (MCP server-config
+protection mode/allowlist — see [MCP server-config protection](#mcp-server-config-protection)).
+`workspace`/`project` give a repo zero-config attribution + confinement.
 
 ## Configuration & state
 
@@ -426,7 +495,10 @@ while a user or org sets global defaults:
 Switches: `AEGIS_NO_BUILTINS` (turn off the default guard set),
 `AEGIS_IDENTITY_ENFORCE` (deny + reap rogue sessions), `AEGIS_ALLOW_SUBAGENTS`,
 `AEGIS_ALLOW_INSTALL` (bypass the forced install-review gate), `AEGIS_ALLOW_STRAND` (permit
-branching with unmerged work), `AEGIS_WORKSPACE` / `AEGIS_PROJECT` (confinement root; `AEGIS_PROJECT` also binds the
+branching with unmerged work), `AEGIS_ALLOW_MCP_CONFIG` (human confirmation to write an
+MCP server config via Edit/Write/MCP-tool — see
+[MCP server-config protection](#mcp-server-config-protection)), `AEGIS_WORKSPACE` / `AEGIS_PROJECT`
+(confinement root; `AEGIS_PROJECT` also binds the
 identity), `AEGIS_FAIL_CLOSED` (deny on an unparseable payload instead of fail-open).
 
 Agent environment (set by your spawner at agent launch):
