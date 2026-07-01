@@ -206,6 +206,30 @@ INSTALL_ANY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# MCP server-definition config files — across the common agentic runtimes. These
+# declare a `command`/`args`/`url`/`env` per server that is auto-executed on every
+# FUTURE session start, with no shell involved when written via Edit/Write. Planting
+# or altering an entry here is a durable, cross-session backdoor — a distinct attack
+# surface from Aegis's own config (ENFORCEMENT_PATH_RE) or OS persistence (PERSIST_RE).
+MCP_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\])\.mcp\.json\b"                          # Claude Code (project-scoped)
+    r"|(?:^|[\s'\"/\\])\.claude\.json\b"                      # Claude Code (user-scoped, mcpServers)
+    r"|(?:^|[\s'\"/\\])claude_desktop_config\.json\b"         # Claude Desktop
+    r"|(?:^|[\s'\"/\\])\.cursor[/\\]mcp\.json\b"              # Cursor
+    r"|(?:^|[\s'\"/\\])\.vscode[/\\]mcp\.json\b"              # VS Code / Copilot
+    r"|(?:^|[\s'\"/\\])\.windsurf[/\\]mcp\.json\b"            # Windsurf (project)
+    r"|mcp_config\.json\b",                                   # Windsurf (global) / generic
+    re.IGNORECASE,
+)
+
+# CLI-based MCP server registration — mutates the same config WITHOUT a file write the
+# Edit/Write hook would ever see (`claude mcp add ...`, `codex mcp add ...`, etc.).
+MCP_CLI_ADD_RE = re.compile(
+    r"\b(?:claude|codex|cursor|windsurf|gemini)\b[^|;&\n]*\bmcp\b[^|;&\n]*\b(?:add|add-json|install)\b"
+    r"|\bmcp\s+add\b",
+    re.IGNORECASE,
+)
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the

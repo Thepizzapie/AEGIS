@@ -157,6 +157,58 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- MCP server-config protection: escapable with human confirmation ---------
+def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block writes to MCP server-definition config files (``.mcp.json``,
+    ``~/.claude.json``'s ``mcpServers``, and the Cursor/VS Code/Windsurf/Claude
+    Desktop equivalents) and CLI ``mcp add`` registration.
+
+    A server entry's ``command``/``args``/``url``/``env`` is auto-executed on every
+    FUTURE session start. A hijacked or prompt-injected agent that plants or edits
+    one plants a durable, cross-session backdoor — via a plain Edit/Write (no shell
+    involved, so shell-pattern guards never see it) or an MCP filesystem tool, or via
+    a CLI's own ``mcp add`` subcommand (which mutates the config without any file
+    write the Edit/Write hook would see). Distinct from self-protect (Aegis's own
+    config) and containment/persistence (OS-level only) — neither covers this surface.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the *shell* form (the
+    natural place for it — there's no syntax-safe way to embed a comment inside a
+    JSON Edit/Write payload), or the env toggle ``AEGIS_ALLOW_MCP_CONFIG=1`` set by
+    the orchestrator/human before launch for the Edit/Write/MCP-tool form. A spawned
+    agent cannot set its own env for a hook invocation it doesn't control, so neither
+    path is agent-self-escapable."""
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.MCP_CONFIG_PATH_RE.search(p):
+            return None
+        if os.environ.get("AEGIS_ALLOW_MCP_CONFIG"):
+            return None
+        return Decision(Action.DENY, "mcp-config-protect",
+                        f"Write to MCP server config '{p}' is blocked — a new or "
+                        "modified server entry (command/args/url/env) runs "
+                        "automatically on every future session, a durable backdoor. "
+                        "A human confirms with AEGIS_ALLOW_MCP_CONFIG=1 after "
+                        "reviewing the change; a spawned agent cannot set this.")
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        touches_config = bool(patterns.MCP_CONFIG_PATH_RE.search(cmd)) and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd))
+        cli_add = patterns.MCP_CLI_ADD_RE.search(cmd)
+        if not (touches_config or cli_add):
+            return None
+        if _override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MCP_CONFIG"):
+            return None
+        return Decision(Action.DENY, "mcp-config-protect",
+                        "Modifying MCP server configuration from a shell is blocked "
+                        "— this can register a new tool server that runs "
+                        "automatically on every future session. A human may append "
+                        "'# aegis-allow', or set AEGIS_ALLOW_MCP_CONFIG=1; a spawned "
+                        "agent cannot.")
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -494,6 +546,7 @@ BUILTIN_RULES = (
     rule_attest_session,
     rule_containment,
     rule_self_protect,
+    rule_mcp_config_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
