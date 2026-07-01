@@ -29,7 +29,13 @@ def _cmd(ev: Event) -> str:
 
 def _path(ev: Event) -> str:
     a = ev.args or {}
-    return str(a.get("file_path") or a.get("path") or a.get("notebook_path") or "")
+    # Beyond Claude Code's own arg names, cover the common key names third-party
+    # MCP filesystem-server tools use for their target path (varies by server —
+    # e.g. target_file/filename/file/uri) so path-based guards see MCP-tool writes,
+    # not just Edit/Write. Purely additive: widens detection, never narrows it.
+    return str(a.get("file_path") or a.get("path") or a.get("notebook_path")
+               or a.get("target_file") or a.get("targetFile") or a.get("filename")
+               or a.get("file") or a.get("uri") or "")
 
 
 def _is_shell(ev: Event) -> bool:
@@ -158,6 +164,16 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
 
 
 # ---- MCP server-config protection: escapable with human confirmation ---------
+def _mcp_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
 def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block writes to MCP server-definition config files (``.mcp.json``,
     ``~/.claude.json``'s ``mcpServers``, and the Cursor/VS Code/Windsurf/Claude
@@ -165,11 +181,17 @@ def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     A server entry's ``command``/``args``/``url``/``env`` is auto-executed on every
     FUTURE session start. A hijacked or prompt-injected agent that plants or edits
-    one plants a durable, cross-session backdoor — via a plain Edit/Write (no shell
-    involved, so shell-pattern guards never see it) or an MCP filesystem tool, or via
-    a CLI's own ``mcp add`` subcommand (which mutates the config without any file
-    write the Edit/Write hook would see). Distinct from self-protect (Aegis's own
-    config) and containment/persistence (OS-level only) — neither covers this surface.
+    one plants a durable, cross-session backdoor — via a plain Edit/Write, an MCP
+    filesystem tool, a shell redirect/delete/in-place-edit/copy onto the path, or a
+    CLI's own ``mcp add`` subcommand (which mutates the config without any file write
+    the Edit/Write hook would see). Distinct from self-protect (Aegis's own config)
+    and containment/persistence (OS-level only) — neither covers this surface.
+
+    Config (``policy.mcp_config``): ``mode`` (deny|ask|monitor|off, default deny),
+    ``allow`` (regexes on the path/command that skip the gate — a repo's own trusted
+    setup script, say). ``ask`` surfaces the change to a human for interactive
+    approval (like ``install_review``) instead of a hard deny; ``monitor`` logs the
+    would-be decision to the audit and allows.
 
     Escapable only by a human: a trailing '# aegis-allow' on the *shell* form (the
     natural place for it — there's no syntax-safe way to embed a comment inside a
@@ -177,35 +199,52 @@ def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
     the orchestrator/human before launch for the Edit/Write/MCP-tool form. A spawned
     agent cannot set its own env for a hook invocation it doesn't control, so neither
     path is agent-self-escapable."""
+    cfg = getattr(policy, "mcp_config", None) or {}
+    mode = str(cfg.get("mode", "deny")).lower()
+    if mode == "off":
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         if not p or not patterns.MCP_CONFIG_PATH_RE.search(p):
             return None
-        if os.environ.get("AEGIS_ALLOW_MCP_CONFIG"):
+        if os.environ.get("AEGIS_ALLOW_MCP_CONFIG") or _mcp_config_allowed_by_policy(cfg, p):
             return None
-        return Decision(Action.DENY, "mcp-config-protect",
-                        f"Write to MCP server config '{p}' is blocked — a new or "
-                        "modified server entry (command/args/url/env) runs "
-                        "automatically on every future session, a durable backdoor. "
-                        "A human confirms with AEGIS_ALLOW_MCP_CONFIG=1 after "
-                        "reviewing the change; a spawned agent cannot set this.")
+        would = Decision(action, "mcp-config-protect",
+                         f"MCP server config '{p}' is being written — a new or "
+                         "modified server entry (command/args/url/env) runs "
+                         "automatically on every future session, a durable backdoor. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_MCP_CONFIG=1; a spawned agent cannot set this.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "mcp-config-protect-monitor")
+            return None
+        return would
+
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         touches_config = bool(patterns.MCP_CONFIG_PATH_RE.search(cmd)) and (
             patterns.WRITE_REDIRECT_RE.search(cmd)
             or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd))
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd))
         cli_add = patterns.MCP_CLI_ADD_RE.search(cmd)
         if not (touches_config or cli_add):
             return None
-        if _override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MCP_CONFIG"):
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MCP_CONFIG")
+                or _mcp_config_allowed_by_policy(cfg, _cmd(ev))):
             return None
-        return Decision(Action.DENY, "mcp-config-protect",
-                        "Modifying MCP server configuration from a shell is blocked "
-                        "— this can register a new tool server that runs "
-                        "automatically on every future session. A human may append "
-                        "'# aegis-allow', or set AEGIS_ALLOW_MCP_CONFIG=1; a spawned "
-                        "agent cannot.")
+        would = Decision(action, "mcp-config-protect",
+                         "MCP server configuration is being modified from a shell — "
+                         "this can register a new tool server that runs "
+                         "automatically on every future session. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_MCP_CONFIG=1; a spawned "
+                         "agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "mcp-config-protect-monitor")
+            return None
+        return would
     return None
 
 
@@ -449,13 +488,13 @@ def rule_install_review(ev: Event, policy=None) -> Optional[Decision]:
     return would
 
 
-def _record_monitor(ev: Event, would: Decision) -> None:
+def _record_monitor(ev: Event, would: Decision, rule_note: str = "install-review-monitor") -> None:
     """Monitor mode: record the would-be decision to the audit (so a pilot can measure
     projected denials with `aegis report`) without blocking. Best-effort."""
     try:
         from . import config
         from .audit import write_event
-        note = Decision(would.action, "install-review-monitor",
+        note = Decision(would.action, rule_note,
                         f"[monitor] would {would.action.value}: {would.message}")
         write_event(ev, note, str(config.audit_path()))
     except Exception:

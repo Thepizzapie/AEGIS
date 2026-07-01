@@ -212,21 +212,45 @@ INSTALL_ANY_RE = re.compile(
 # or altering an entry here is a durable, cross-session backdoor — a distinct attack
 # surface from Aegis's own config (ENFORCEMENT_PATH_RE) or OS persistence (PERSIST_RE).
 MCP_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\])\.mcp\.json\b"                          # Claude Code (project-scoped)
-    r"|(?:^|[\s'\"/\\])\.claude\.json\b"                      # Claude Code (user-scoped, mcpServers)
-    r"|(?:^|[\s'\"/\\])claude_desktop_config\.json\b"         # Claude Desktop
-    r"|(?:^|[\s'\"/\\])\.cursor[/\\]mcp\.json\b"              # Cursor
-    r"|(?:^|[\s'\"/\\])\.vscode[/\\]mcp\.json\b"              # VS Code / Copilot
-    r"|(?:^|[\s'\"/\\])\.windsurf[/\\]mcp\.json\b"            # Windsurf (project)
-    r"|mcp_config\.json\b",                                   # Windsurf (global) / generic
+    r"(?:^|[\s'\"/\\=])\.mcp\.json\b"                          # Claude Code (project-scoped)
+    r"|(?:^|[\s'\"/\\=])\.claude\.json\b"                      # Claude Code (user-scoped, mcpServers)
+    r"|(?:^|[\s'\"/\\=])claude_desktop_config\.json\b"         # Claude Desktop
+    r"|(?:^|[\s'\"/\\=])\.cursor[/\\]mcp\.json\b"              # Cursor
+    r"|(?:^|[\s'\"/\\=])\.vscode[/\\]mcp\.json\b"              # VS Code / Copilot
+    r"|(?:^|[\s'\"/\\=])\.windsurf[/\\]mcp\.json\b"            # Windsurf (project)
+    r"|(?:^|[\s'\"/\\=])mcp_config\.json\b",                   # Windsurf (global) / generic
+    re.IGNORECASE,
+)
+
+# In-place edit / copy-over-target verbs — a config-file overwrite that is NEITHER a
+# redirect/tee NOR a delete/move (sed -i, perl -i, batch-mode vim/ex, cp/copy the file
+# over the target, dd, or a python/node/ruby/perl one-liner script that writes it).
+# Paired with MCP_CONFIG_PATH_RE (the target filename must be literally present) so
+# this stays high-signal despite the broad verb list. Deliberately excludes coreutils
+# `install` — indistinguishable by regex from `npm install`/`pip install` and would
+# false-positive whenever an unrelated install command shares a shell line with a mere
+# READ of the config file.
+INPLACE_WRITE_RE = re.compile(
+    r"\bsed\b[^|;&\n]*-i\b"
+    r"|\bperl\b[^|;&\n]*-i\b"
+    r"|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
+    r"|\bcp\b|\bcopy\b"
+    r"|\bdd\b"
+    r"|\b(?:python3?|node|ruby|perl)\b[^|;&\n]*\s-[ce]\b",
     re.IGNORECASE,
 )
 
 # CLI-based MCP server registration — mutates the same config WITHOUT a file write the
-# Edit/Write hook would ever see (`claude mcp add ...`, `codex mcp add ...`, etc.).
+# Edit/Write hook would ever see (`claude mcp add ...`, `codex mcp add ...`, etc.). The
+# vendor-qualified form is deliberately unanchored (specific enough: vendor name + mcp
+# + add together are unlikely in ordinary text). The bare `mcp add` fallback (no vendor
+# name — the reference/generic MCP CLI) IS anchored to command-start position (start of
+# string or right after a shell separator ; & | / newline, optional sudo) so it doesn't
+# false-positive on a commit message, echoed string, or comment containing the phrase
+# "mcp add" — those never begin a command.
 MCP_CLI_ADD_RE = re.compile(
     r"\b(?:claude|codex|cursor|windsurf|gemini)\b[^|;&\n]*\bmcp\b[^|;&\n]*\b(?:add|add-json|install)\b"
-    r"|\bmcp\s+add\b",
+    r"|(?:^|[;&|\n]\s*)(?:sudo\s+)?mcp\s+add\b",
     re.IGNORECASE,
 )
 
