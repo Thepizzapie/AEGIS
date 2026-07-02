@@ -51,6 +51,8 @@ def load_policy(path) -> Policy:
     project = None
     agent_label = None
     install_review: dict = {}
+    mcp_config: dict = {}
+    metadata_ssrf: dict = {}
     for f in _yaml_files(path):
         data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
         if "default_action" in data:
@@ -67,13 +69,18 @@ def load_policy(path) -> Policy:
             agent_label = str(data["agent_label"])
         if data.get("install_review"):
             install_review = dict(data["install_review"])
+        if data.get("mcp_config"):
+            mcp_config = dict(data["mcp_config"])
+        if data.get("metadata_ssrf"):
+            metadata_ssrf = dict(data["metadata_ssrf"])
         plugins.extend(data.get("plugins") or [])
         for rd in (data.get("rules") or []):
             rules.append(_rule_from_dict(rd))
     return Policy(rules=rules, default_action=default, on_error=on_error,
                   egress=egress, plugins=plugins, workspace=workspace,
                   project=project, agent_label=agent_label,
-                  install_review=install_review)
+                  install_review=install_review, mcp_config=mcp_config,
+                  metadata_ssrf=metadata_ssrf)
 
 
 def validate_file(path) -> list:

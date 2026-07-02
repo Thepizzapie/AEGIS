@@ -176,7 +176,7 @@ hijacked agent from appending the escape token to its own commands.
 | Guard | What it detects | Escapable |
 |---|---|---|
 | **Rogue-session gate** | On `SessionStart`, a process claiming an agent identity (`AEGIS_AGENT_NAME`) without a valid signed token is classified as rogue. In monitor mode the session is logged; under `AEGIS_IDENTITY_ENFORCE=1` it is denied and reaped. Surfaces an attestation-challenge honeypot that instruction-following rogues self-report to. | No |
-| **Containment** | Reads of credential stores (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.kube`, `.netrc`, gh/docker config, `id_rsa`/`id_ed25519`/`.ppk`, browser login DBs, the Windows DPAPI/vault); file **exfiltration** (`curl --upload-file`/`-T`/`-d @`, `Invoke-WebRequest -InFile`); **persistence** (registry autorun, `schtasks /create`, `Register-ScheduledTask`, new services, startup folder, cron) | No |
+| **Containment** | Reads of credential stores (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.kube`, `.netrc`, gh/docker config, `id_rsa`/`id_ed25519`/`.ppk`, browser login DBs, the Windows DPAPI/vault); **cloud instance metadata / IMDS SSRF** (`169.254.169.254` and its AWS ECS/IPv6/decimal/hex-encoded forms, GCP `metadata.google.internal` + `Metadata-Flavor: Google`, Alibaba `100.100.100.200`) — reachable over the network alone, no filesystem access needed, and caught in shell commands **and** in a `WebFetch`/MCP tool's `url` arg; file **exfiltration** (`curl --upload-file`/`-T`/`-d @`, `Invoke-WebRequest -InFile`); **persistence** (registry autorun, `schtasks /create`, `Register-ScheduledTask`, new services, startup folder, cron) | No |
 | **Self-protection** | Deleting/moving/overwriting `.aegis` or `.claude`, editing `.claude/settings.json`, policy files, **or Aegis's own engine source** (`aegis/*.py`), running `aegis uninstall` or `aegis pull`. Covers shell redirects (`>`, `>>`, `tee`, `Set-Content`, `Out-File`) to config paths — not just delete/move verbs. The governor cannot be removed or neutered by the governed. | No |
 | **Evasion blocking** | Obfuscated / encoded commands: PowerShell `-EncodedCommand`/`-enc`, `base64 -d \| bash`, `FromBase64String`, char-code construction. Encoding is itself a signal — denied outright so the policy can inspect what actually runs. (The de-obfuscation layer in *Evasion resistance* normalizes for the other guards; this guard catches the encoding as a standalone tell.) | No |
 | **Migration / destructive SQL** | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, and migration resets (Prisma, Alembic, Supabase, Rails/Rake, Django, Knex, Flyway, dbmate) — read from **shell commands and DB MCP tool args** (`execute_sql`, `apply_migration`). *Note:* the migration guard matches broad keywords (`drop`, `truncate`) to minimize false negatives; a benign `ALTER TABLE ... DROP COLUMN old_col` will trip it. Use the `-- aegis-allow` escape on legitimate migration commands, or write a declarative rule scoping the guard to your workflow. | Yes |
@@ -195,9 +195,53 @@ database — it can call a DB MCP tool's `execute_sql` directly. Aegis reads the
 out of the tool arguments, so `DROP TABLE` is caught with **no shell involved** — a
 vector most guardrails miss entirely.
 
-Containment is a *known-paths* denylist (the locations above) — deliberately
-high-signal, not exhaustive: a secret at an unlisted path, or copied first and then
-read, can slip it. Pair it with least privilege so the agent can't reach what isn't listed.
+Containment is a *known-paths/known-hosts* denylist (the locations above) —
+deliberately high-signal, not exhaustive: a secret at an unlisted path, or copied
+first and then read, can slip it. Pair it with least privilege so the agent can't
+reach what isn't listed.
+
+Cloud metadata SSRF is worth calling out on its own: it's a purely *network* form of
+credential theft that the filesystem-based part of containment (`CRED_RE`) never
+sees, and that a default, zero-config policy doesn't cover either — `rule_network_egress`
+only has an opinion once you set `policy.egress`, and even a deny-by-default egress
+allowlist naturally allows the metadata IP through if `*.internal`-style entries are
+present. An agent with *nothing but* the ability to make an HTTP request — `curl`,
+`wget`, a `WebFetch`/`fetch`-style tool, or an MCP tool that takes a `url` — can query
+`http://169.254.169.254/latest/meta-data/iam/security-credentials/<role>` (AWS),
+`http://169.254.169.254/metadata/identity/oauth2/token` (Azure), or
+`http://metadata.google.internal/computeMetadata/v1/` (GCP) and get back live,
+broadly-scoped IAM credentials for the whole instance/task role — the same class of
+theft as reading `~/.aws/credentials`, just over the wire instead of the filesystem
+— the same SSRF-to-IMDS pattern behind the 2019 Capital One breach, and a realistic
+outcome for any agent with shell or web-fetch tool access running on a cloud
+VM/container. Non-escapable, like the rest of containment — `# aegis-allow` does
+not waive it, human or agent.
+
+**Precision, not just recall.** A bare host/IP denylist would also fire on a shell
+command that only *discusses* the address instead of requesting it — `grep`-ing docs,
+`sed`-redacting it, an `iptables` rule that hardens against it, a commit message. So
+the shell form requires a request-capable verb/interpreter (`curl`, `wget`, `nc`,
+`python`, `Invoke-WebRequest`, …) in the *same* statement before the host or a
+request-only header tell (`Metadata-Flavor: Google`, `X-aws-ec2-metadata-token`); a
+dedicated `url`/`uri`/`endpoint`/… tool argument needs no such anchor, since the
+argument itself already is the request. Detection isn't gated on the tool-name
+taxonomy either — a fetch-shaped tool the classifier can't place (not `WebFetch`, no
+`mcp__` prefix) still trips it via its URL-shaped argument, one level of nesting
+included (`params`/`request`/`input`/`arguments`/`options`).
+
+**Config** (`policy.metadata_ssrf`) — built in, on by default at `mode: deny`:
+
+```yaml
+metadata_ssrf:
+  mode: deny            # deny | monitor (log the would-be decision, allow) | off
+```
+
+No `ask` and no regex `allow` list — this stays in containment's non-interactive,
+non-escapable tier, matching `CRED_RE`/`PERSIST_RE`/`EXFIL_RE`. `monitor` is for
+piloting before enforcing; `off` is the escape hatch for an environment with a
+legitimate reason to reach `169.254.169.254` (a genuine known limitation: any
+link-local `169.254.x.x` address unrelated to cloud metadata that happens to share
+the literal octets would also need this).
 
 ## Forced install review
 
@@ -476,8 +520,10 @@ Validate with `aegis validate`.
 (`{root, allow}` confinement), `project` (bind file mutations to a repo — hard-block
 out-of-project edits), `agent_label` (default record label when no `AEGIS_AGENT_NAME`
 is set), `install_review` (forced dependency-manifest review — see
-[Forced install review](#forced-install-review)), and `mcp_config` (MCP server-config
-protection mode/allowlist — see [MCP server-config protection](#mcp-server-config-protection)).
+[Forced install review](#forced-install-review)), `mcp_config` (MCP server-config
+protection mode/allowlist — see [MCP server-config protection](#mcp-server-config-protection)),
+and `metadata_ssrf` (cloud instance-metadata/IMDS SSRF containment mode — see
+[The built-in guard catalog](#the-built-in-guard-catalog)).
 `workspace`/`project` give a repo zero-config attribution + confinement.
 
 ## Configuration & state

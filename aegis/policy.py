@@ -110,3 +110,8 @@ class Policy:
     # allow: [regex on path/command]}. Empty -> defaults (mode=deny) apply.
     # See rules.rule_mcp_config_protect.
     mcp_config: dict = field(default_factory=dict)
+    # Cloud metadata / IMDS SSRF containment: {mode: deny|monitor|off}. Empty ->
+    # default (mode=deny) applies. No 'ask' — this stays in containment's
+    # non-interactive, non-escapable tier; 'monitor' is for piloting rollout.
+    # See rules.rule_containment.
+    metadata_ssrf: dict = field(default_factory=dict)

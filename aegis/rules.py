@@ -72,6 +72,27 @@ def _sql_text(ev: Event) -> str:
     return " ".join(str(p) for p in parts if p)
 
 
+_NET_ARG_KEYS = ("url", "uri", "endpoint", "target", "host", "link", "href", "address")
+_NET_ARG_WRAPPERS = ("params", "request", "input", "arguments", "options")
+
+
+def _net_text(ev: Event) -> str:
+    """URL-shaped args from ANY tool call (WebFetch's ``url``, and the common key
+    names third-party MCP/browser/fetch tools use), one level of nesting included
+    (some tools wrap their args under ``params``/``request``/...). Deliberately NOT
+    gated on ``ev.action`` — a tool that isn't literally named ``WebFetch``/
+    ``WebSearch`` and doesn't have an ``mcp__`` prefix classifies as ``OTHER``, and
+    a network-shaped arg is unambiguous evidence of a request regardless of how the
+    tool name classified. Purely additive: widens detection, never narrows it."""
+    a = ev.args or {}
+    vals = [a.get(k) for k in _NET_ARG_KEYS]
+    for wrapper in _NET_ARG_WRAPPERS:
+        inner = a.get(wrapper)
+        if isinstance(inner, dict):
+            vals.extend(inner.get(k) for k in _NET_ARG_KEYS)
+    return " ".join(str(v) for v in vals if v)
+
+
 def _egress_host(ev: Event) -> Optional[str]:
     a = ev.args or {}
     for v in (a.get("url"), a.get("command"), a.get("query")):
@@ -119,20 +140,46 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
     elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
         text = _path(ev) + " " + str((ev.args or {}).get("content") or "")
     else:
-        return None
-    if not text.strip():
-        return None
-    if patterns.CRED_RE.search(text):
-        return Decision(Action.DENY, "containment-credentials",
-                        "Access to credential stores (SSH / cloud keys, browser logins, "
-                        "OS vault) is blocked.")
-    if _is_shell(ev) and patterns.PERSIST_RE.search(text):
-        return Decision(Action.DENY, "containment-persistence",
-                        "Installing persistence (autorun, scheduled tasks, services, "
-                        "startup) is blocked.")
-    if _is_shell(ev) and patterns.EXFIL_RE.search(text):
-        return Decision(Action.DENY, "containment-exfiltration",
-                        "Uploading local files to the network is blocked.")
+        text = ""
+    # Checked for EVERY event, regardless of action classification — a url/uri/...
+    # arg is unambiguous request evidence even for a tool the taxonomy couldn't
+    # place (OTHER). See _net_text.
+    net_text = _net_text(ev)
+
+    if text.strip():
+        if patterns.CRED_RE.search(text):
+            return Decision(Action.DENY, "containment-credentials",
+                            "Access to credential stores (SSH / cloud keys, browser "
+                            "logins, OS vault) is blocked.")
+        if _is_shell(ev) and patterns.PERSIST_RE.search(text):
+            return Decision(Action.DENY, "containment-persistence",
+                            "Installing persistence (autorun, scheduled tasks, "
+                            "services, startup) is blocked.")
+        if _is_shell(ev) and patterns.EXFIL_RE.search(text):
+            return Decision(Action.DENY, "containment-exfiltration",
+                            "Uploading local files to the network is blocked.")
+
+    # Cloud metadata / IMDS SSRF — a shell command needs a request-verb anchor
+    # (patterns.CLOUD_METADATA_RE) so merely discussing/grepping/redacting the
+    # address doesn't trip a non-escapable guard; a dedicated url/uri/... arg is
+    # already unambiguous request context, so the bare host pattern is enough.
+    metadata_hit = (_is_shell(ev) and text.strip() and patterns.CLOUD_METADATA_RE.search(text)) \
+        or (net_text.strip() and patterns.CLOUD_METADATA_HOST_RE.search(net_text))
+    if metadata_hit:
+        cfg = getattr(policy, "metadata_ssrf", None) or {}
+        mode = str(cfg.get("mode", "deny")).lower()
+        if mode == "off":
+            return None
+        would = Decision(Action.DENY, "containment-cloud-metadata",
+                         "Access to the cloud instance metadata / IMDS endpoint is "
+                         "blocked — this is how network access alone (no filesystem "
+                         "reach needed) steals the instance/task's live IAM "
+                         "credentials. If you need instance metadata, use the cloud "
+                         "provider's SDK with explicit credentials instead of raw HTTP.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "containment-cloud-metadata-monitor")
+            return None
+        return would
     return None
 
 

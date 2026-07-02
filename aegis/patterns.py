@@ -138,6 +138,48 @@ CRED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cloud instance-metadata / IMDS SSRF — the network-reachable equivalent of a
+# credential-store read. Any process that can make an HTTP request (curl/wget, a
+# WebFetch-style tool, or an MCP tool with a `url` arg) can hit the well-known
+# link-local metadata service and pull the instance/task IAM role's live
+# short-lived credentials — no filesystem access needed, so CRED_RE never sees it.
+# Covers AWS (IMDSv1/v2 + ECS/Fargate task creds), Azure, GCP (legacy + hostname),
+# Alibaba Cloud, OpenStack/DigitalOcean (shared 169.254.169.254), the AWS IPv6 IMDS
+# address, an IPv6-mapped form of the same IP, and known decimal/hex IP-encoding
+# bypasses of 169.254.169.254.
+#
+# Split in two, deliberately:
+# - CLOUD_METADATA_HOST_RE is the bare host/IP/hostname alternation. It's safe to
+#   match on its own wherever the surrounding argument is ALREADY unambiguous
+#   request context — a dedicated url/uri/endpoint tool arg IS the request, so no
+#   further anchor is needed there (see rules._net_text / rule_containment).
+# - CLOUD_METADATA_RE additionally requires a request-capable verb/interpreter in
+#   the SAME shell statement before the host or a request-only header tell
+#   (GCP `Metadata-Flavor: Google`, AWS `X-aws-ec2-metadata-token`). Without that
+#   anchor, the host/IP alone would fire on a shell command that only DISCUSSES the
+#   address — grep'ing docs, redacting it with sed, an iptables DROP rule that
+#   hardens against it, a commit message — none of which actually reach the
+#   network. Anchoring to a verb is what keeps a non-escapable guard from tripping
+#   on those.
+CLOUD_METADATA_HOST_RE = re.compile(
+    r"169\.254\.169\.254"                    # AWS/Azure/GCP(legacy)/OpenStack/DigitalOcean IMDS
+    r"|169\.254\.170\.2\b"                   # AWS ECS/Fargate task metadata + credentials endpoint
+    r"|fd00:ec2::254\b"                      # AWS IMDSv2 IPv6 address
+    r"|::ffff:169\.254\.169\.254"            # IPv6-mapped form of the shared IMDS IP
+    r"|\b2852039166\b|\b0xa9fea9fe\b"        # decimal / hex encodings of 169.254.169.254 (SSRF bypass)
+    r"|metadata\.google\.internal\b"         # GCP metadata hostname
+    r"|metadata\.google\.com\b"              # GCP metadata hostname (alt)
+    r"|100\.100\.100\.200\b",                # Alibaba Cloud IMDS
+    re.IGNORECASE,
+)
+_METADATA_HEADER_TELL = r"metadata-flavor\s*:\s*google\b|x-aws-ec2-metadata-token\b"
+CLOUD_METADATA_RE = re.compile(
+    r"\b(?:curl|wget|fetch|nc|ncat|telnet|socat|python[23]?|node|perl|ruby"
+    r"|invoke-webrequest|invoke-restmethod|iwr|irm|new-object\s+net\.webclient)\b"
+    r"[^|;&\n]*?(?:" + CLOUD_METADATA_HOST_RE.pattern + "|" + _METADATA_HEADER_TELL + r")",
+    re.IGNORECASE,
+)
+
 # Persistence (autorun, scheduled tasks, services, startup).
 PERSIST_RE = re.compile(
     r"\\CurrentVersion\\Run(?:Once)?\b"
