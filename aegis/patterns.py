@@ -117,10 +117,14 @@ CONFIG_DIR_RE = re.compile(
 AEGIS_SOURCE_RE = re.compile(
     r"(?:^|[/\\])aegis[/\\](?:__init__|rules|patterns|engine|policy|gate|attest|"
     r"identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
-    r"accountability|gitsurface)\.py\b"
-    r"|(?:^|[/\\])aegis[/\\]adapters[/\\]\w+\.py\b",
+    r"accountability|gitsurface|review|context|failures|skills|distribution)\.py\b"
+    r"|(?:^|[/\\])aegis[/\\](?:adapters|lifecycle)[/\\]\w+\.py\b",
     re.IGNORECASE,
 )
+# Aegis's shipped skills (.claude/skills/aegis-*) — they carry the compliance
+# guidance a blocked agent is pointed at; rewriting them subverts the guidance.
+AEGIS_SKILL_PATH_RE = re.compile(
+    r"\.claude[/\\]skills[/\\]aegis-[\w-]+", re.IGNORECASE)
 # any move/delete verb (used together with ENFORCEMENT_PATH_RE on shell commands)
 DELETE_OR_MOVE_VERB_RE = re.compile(
     r"\b(?:rm|remove-item|ri|rmdir|rd|del|erase|mv|move-item|move|ren|rename-item)\b",
@@ -299,5 +303,20 @@ MCP_CLI_ADD_RE = re.compile(
 NOEXEC_FETCH_RE = re.compile(
     r"\bpip3?\s+download\b"
     r"|\bnpm\s+pack\b",
+    re.IGNORECASE,
+)
+
+# A test-suite invocation, across common toolchains. Backs the opt-in Stop
+# verification gate (lifecycle.session.rule_stop_verification_gate): evidence
+# that a test run HAPPENED after the last change — presence of the command, not
+# a parse of its pass/fail output. Policy can supply its own regexes instead
+# (``completion.patterns``).
+TEST_CMD_RE = re.compile(
+    r"\bpytest\b|\bpython3?\s+-m\s+(?:pytest|unittest)\b|\btox\b|\bnox\b"
+    r"|\bnpm\s+(?:run\s+)?test\b|\byarn\s+test\b|\bpnpm\s+(?:run\s+)?test\b"
+    r"|\bnpx\s+(?:jest|vitest|mocha|playwright|ava)\b|\bjest\b|\bvitest\b|\bmocha\b"
+    r"|\bcargo\s+test\b|\bgo\s+test\b|\bdotnet\s+test\b|\bctest\b"
+    r"|\bmvn\b[^|;&\n]*\b(?:test|verify)\b|\bgradlew?\b[^|;&\n]*\btest\b"
+    r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )

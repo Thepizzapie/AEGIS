@@ -52,6 +52,30 @@ def _extract_usage(event) -> dict:
     return usage
 
 
+# Cap on captured tool-output length — enough to ground a claim, not a full dump.
+_MAX_OUTPUT_CHARS = 8000
+
+# Payload keys a runtime uses to carry the tool's RESULT (the observation).
+_OUTPUT_KEYS = ("tool_response", "tool_result", "output", "result", "stdout")
+
+
+def _extract_output(event) -> str | None:
+    """Best-effort capture of what a tool RETURNED, from the raw payload — the
+    evidence a grounding check needs. Present on PostToolUse; absent on PreToolUse.
+    Truncated to keep the audit trail lean."""
+    raw = getattr(event, "raw", None) or {}
+    for k in _OUTPUT_KEYS:
+        v = raw.get(k)
+        if v is None:
+            continue
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v, default=str)
+        text = str(v)
+        if text.strip():
+            return text[:_MAX_OUTPUT_CHARS]
+    return None
+
+
 def write_event(event, decision, path) -> dict:
     """Append a structured audit record for ``(event, decision)`` to ``path``
     (JSONL). Returns the record."""
@@ -69,6 +93,9 @@ def write_event(event, decision, path) -> dict:
         "cwd": event.cwd,
         "args": event.args,
     }
+    output = _extract_output(event)
+    if output is not None:
+        rec["output"] = output
     # Lifecycle attribution fields — recorded only when the event carries them, so
     # tool-use records stay lean while subagent/team/worktree records stay traceable.
     for k in ("agent_id", "agent_type", "worktree", "matcher"):

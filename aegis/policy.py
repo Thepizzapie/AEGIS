@@ -123,3 +123,16 @@ class Policy:
     # allow: [regex on path/command]}. Empty -> defaults (mode=deny) apply.
     # See rules.rule_mcp_config_protect.
     mcp_config: dict = field(default_factory=dict)
+    # Context injection: {mode: on|off} — emit a policy-posture digest as
+    # additionalContext on SessionStart and PostCompact so the rules the agent
+    # runs under survive context compaction. Empty -> on. See aegis.context.
+    inject: dict = field(default_factory=dict)
+    # Failure-loop guard: {mode: deny|ask|monitor|off, max_repeats: int} — deny a
+    # PreToolUse whose exact (tool, args) signature already failed max_repeats
+    # times this session. Empty -> defaults (mode=deny, max_repeats=3) apply.
+    # See rules.rule_failure_loop.
+    failures: dict = field(default_factory=dict)
+    # Completion verification: {require_tests: bool, patterns: [regex]} — opt-in
+    # Stop gate: after file mutations, the session may not stop until a test run
+    # is recorded after the last change. See lifecycle.session.
+    completion: dict = field(default_factory=dict)

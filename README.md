@@ -28,6 +28,7 @@ without forking.
 - [MCP server-config protection](#mcp-server-config-protection)
 - [Evasion resistance](#evasion-resistance)
 - [Identity and rogue-agent defense](#identity-and-rogue-agent-defense)
+- [Context injection & shipped skills](#context-injection--shipped-skills)
 - [Policy](#policy)
 - [Configuration & state](#configuration--state)
 - [Extending Aegis (plugins)](#extending-aegis)
@@ -153,7 +154,7 @@ the core tool-use guards, lifecycle rules (`aegis/lifecycle/`) cover:
 |---|---|---|
 | **Config integrity** | `ConfigChange` / `FileChanged` / `CwdChanged` / `Setup` / `InstructionsLoaded` | Hard-blocks a spawned agent from rewriting the policy/settings that enforce it (the "can't neuter the guard" block); records cwd escapes and secrets-file touches for the audit trail (`CwdChanged`/`FileChanged` are observational). |
 | **Sub-agent / Teams** | `SubagentStart` / `SubagentStop` / `TaskCreated` / `TaskCompleted` / `TeammateIdle` | Spawn-depth governance at fan-out time; opt-in "did-it-do-the-task" completion gate; per-sub-agent token/cost attribution. |
-| **Session / compaction** | `SessionEnd` / `PreCompact` / `PostCompact` / `StopFailure` / `Notification` | Opt-in gate on auto-compaction (checkpoint before context is destroyed); session-lifecycle audit. |
+| **Session / compaction** | `Stop` / `SessionEnd` / `PreCompact` / `PostCompact` / `StopFailure` / `Notification` | Opt-in Stop gate (no stopping after edits until a test run is on the audit trail); opt-in gate on auto-compaction; policy-posture re-injection on `SessionStart`/`PostCompact`; session-lifecycle audit. |
 | **Interaction / MCP input** | `PostToolUseFailure` / `PermissionRequest` / `Elicitation` / `ElicitationResult` | Opt-in auto-deny of human-only permission prompts and MCP elicitation side-channels for unattended agents. |
 | **Worktree** | `WorktreeCreate` / `WorktreeRemove` | Extends workspace confinement to git worktrees — an agent can't `git worktree add ../escape` its way out of its project root. |
 
@@ -191,6 +192,7 @@ hijacked agent from appending the escape token to its own commands.
 | **Containment** | Reads of credential stores (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.kube`, `.netrc`, gh/docker config, `id_rsa`/`id_ed25519`/`.ppk`, browser login DBs, the Windows DPAPI/vault); file **exfiltration** (`curl --upload-file`/`-T`/`-d @`, `Invoke-WebRequest -InFile`); **persistence** (registry autorun, `schtasks /create`, `Register-ScheduledTask`, new services, startup folder, cron) | No |
 | **Self-protection** | Deleting/moving/overwriting `.aegis` or `.claude`, editing `.claude/settings.json`, policy files, **or Aegis's own engine source** (`aegis/*.py`), running `aegis uninstall` or `aegis pull`. Covers shell redirects (`>`, `>>`, `tee`, `Set-Content`, `Out-File`) to config paths — not just delete/move verbs. The governor cannot be removed or neutered by the governed. | No |
 | **Evasion blocking** | Obfuscated / encoded commands: PowerShell `-EncodedCommand`/`-enc`, `base64 -d \| bash`, `FromBase64String`, char-code construction. Encoding is itself a signal — denied outright so the policy can inspect what actually runs. (The de-obfuscation layer in *Evasion resistance* normalizes for the other guards; this guard catches the encoding as a standalone tell.) | No |
+| **Failure-loop guard** | The Nth **identical** retry of a tool call that already failed N times this session (default 3) — agent thrash. `PostToolUseFailure` feeds a session ledger; the block lands at `PreToolUse`, where it can actually stop the retry, with a deny reason that pushes the model to change approach. Any change to the call (args, tool) or an eventual success re-arms cleanly. Tune with `failures: {mode, max_repeats}`. | Human `# aegis-allow` / `AEGIS_ALLOW_RETRY=1`; agent cannot self-escape |
 | **Migration / destructive SQL** | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, and migration resets (Prisma, Alembic, Supabase, Rails/Rake, Django, Knex, Flyway, dbmate) — read from **shell commands and DB MCP tool args** (`execute_sql`, `apply_migration`). *Note:* the migration guard matches broad keywords (`drop`, `truncate`) to minimize false negatives; a benign `ALTER TABLE ... DROP COLUMN old_col` will trip it. Use the `-- aegis-allow` escape on legitimate migration commands, or write a declarative rule scoping the guard to your workflow. | Yes |
 | **Destructive git** | force-push, `reset --hard`, rebase, `commit --amend`, `branch -D`, `clean -f` | Yes |
 | **Recursive force delete** | `rm -rf` and equivalents across bash, PowerShell (`Remove-Item -Recurse -Force`), and cmd (`rmdir /s`, `del /s`); also `find -delete`/`-exec rm`, `shred`, `truncate -s 0`, `dd of=/dev/...` | Yes |
@@ -209,10 +211,11 @@ vector most guardrails miss entirely.
 
 ### Lifecycle guards (the rest of the hook surface)
 
-Beyond the 12 core guards above, Aegis covers the full Claude Code hook surface
-(26 events; see *Architecture*) with 9 lifecycle guards in `aegis/lifecycle/` —
-together the **21 built-in rules**. Some fire unconditionally; four are **opt-in**
-via policy knobs (`team` / `compaction` / `permission` / `mcp` — see *Policy*).
+Beyond the 13 core guards above, Aegis covers the full Claude Code hook surface
+(26 events; see *Architecture*) with 10 lifecycle guards in `aegis/lifecycle/` —
+together the **23 built-in rules**. Some fire unconditionally; five are **opt-in**
+via policy knobs (`team` / `compaction` / `permission` / `mcp` / `completion` —
+see *Policy*).
 
 | Guard | Event(s) | What it does | On by default? |
 |---|---|---|---|
@@ -225,11 +228,14 @@ via policy knobs (`team` / `compaction` / `permission` / `mcp` — see *Policy*)
 | **Pre-compact gate** | `PreCompact` (blockable) | Blocks **auto** context compaction so a human can checkpoint before context is destroyed. | Opt-in (`compaction.block_auto`) |
 | **Permission-escalation** | `PermissionRequest` (blockable) | Auto-denies a spawned/unattended agent's human-only permission prompts instead of hanging on them. | Opt-in (`permission.deny_escalation`) |
 | **Elicitation governance** | `Elicitation` / `ElicitationResult` (blockable) | Denies MCP elicitation side-channels for a spawned agent. | Opt-in (`mcp.block_elicitation`) |
+| **Stop verification gate** | `Stop` (blockable) | The "did-it-do-the-task" gate: after this session mutated files, it may not stop until the **audit trail** shows a test run after the last mutation — evidence, not the agent's self-report. Honors `stop_hook_active` so it can never wedge a turn in a deny loop. Custom runners via `completion.patterns`. | Opt-in (`completion.require_tests`) |
 
 Observational events with no enforcing rule (`PostToolUse`, `PostToolUseFailure`,
 `SubagentStop`, `TeammateIdle`, `SessionStart`/`SessionEnd`, `Setup`,
-`InstructionsLoaded`, `Stop`/`StopFailure`, `PostCompact`, `Notification`,
-`WorktreeRemove`) are still recorded to the audit log for accountability.
+`InstructionsLoaded`, `StopFailure`, `PostCompact`, `Notification`,
+`WorktreeRemove`) are still recorded to the audit log for accountability —
+and `PostToolUseFailure` additionally feeds the failure-loop ledger, while
+`SessionStart`/`PostCompact` carry the [context injection](#context-injection--shipped-skills).
 
 Containment is a *known-paths* denylist (the locations above) — deliberately
 high-signal, not exhaustive: a secret at an unlisted path, or copied first and then
@@ -471,6 +477,36 @@ agent_label: ci-bot     # label records when no AEGIS_AGENT_NAME is set
 project: .              # hard-block Edit/Write outside this repo (reads stay free)
 ```
 
+## Context injection & shipped skills
+
+Enforcement (the hooks) stops a bad action; **guidance** is what makes the agent
+take the good one on the first try. Aegis ships both halves:
+
+**Context injection.** On `SessionStart` — and again on `PostCompact`, the moment
+where a summarizer typically keeps the task and silently drops the governance —
+Aegis injects a compact policy-posture digest into the model's context: what is
+never available, which escapes are human-only, which opt-in gates are active, and
+what to do when blocked. The rules the agent runs under survive compaction instead
+of falling out of context mid-session. On by default; disable with
+`inject: {mode: off}`. Injection is advisory (the model can ignore it); the hooks
+remain the enforcement — the digest exists so the agent complies on the first try
+instead of discovering the policy one deny at a time.
+
+**Shipped skills.** `aegis install` also writes four agent skills next to the
+hooks (`.claude/skills/aegis-*`; skip with `--no-skills`):
+
+| Skill | What the agent gets |
+|---|---|
+| `aegis-explain-block` | Why the last action was denied + a rule-by-rule remedy table. Deny messages point here, turning a hard deny into course-correction instead of a retry loop. |
+| `aegis-status` | The active posture: policy validity, default action, live opt-in knobs. |
+| `aegis-report` | The accountability rap sheet — denials, usage, flagged sessions. |
+| `aegis-policy` | How to change policy *safely*: edit the YAML, `aegis validate` — never the enforcement files. |
+
+The skills follow the same merge-never-clobber contract as the hook installer:
+each carries a managed-by marker, install never overwrites a user's same-named
+skill, and uninstall removes only marked files. They are guidance the agent can't
+quietly subvert — self-protect blocks agents from rewriting `aegis-*` skill files.
+
 ## Policy
 
 Declarative YAML. First matching rule by priority wins; otherwise `default_action`
@@ -512,11 +548,14 @@ Validate with `aegis validate`.
 (`{root, allow}` confinement), `project` (bind file mutations to a repo — hard-block
 out-of-project edits), `agent_label` (default record label when no `AEGIS_AGENT_NAME`
 is set), `install_review` (forced dependency-manifest review — see
-[Forced install review](#forced-install-review)), and `mcp_config` (MCP server-config
-protection mode/allowlist — see [MCP server-config protection](#mcp-server-config-protection)).
+[Forced install review](#forced-install-review)), `mcp_config` (MCP server-config
+protection mode/allowlist — see [MCP server-config protection](#mcp-server-config-protection)),
+`inject` (context injection on/off — see
+[Context injection & shipped skills](#context-injection--shipped-skills)), and
+`failures` (failure-loop guard `{mode, max_repeats}`).
 `workspace`/`project` give a repo zero-config attribution + confinement.
 
-Four **opt-in lifecycle knobs** enable the gated lifecycle guards (see *Lifecycle
+Five **opt-in lifecycle knobs** enable the gated lifecycle guards (see *Lifecycle
 guards*); each is a small mapping, off unless set:
 
 ```yaml
@@ -524,6 +563,15 @@ team:        { require_verification: true }  # gate TaskCompleted on a verificat
 compaction:  { block_auto: true }            # block auto context compaction (PreCompact)
 permission:  { deny_escalation: true }       # auto-deny a spawned agent's permission prompts
 mcp:         { block_elicitation: true }     # block MCP elicitation side-channels
+completion:  { require_tests: true }         # Stop gate: no stopping after edits w/o a test run
+             # optional: patterns: ["./run-my-checks\\.sh"]  # custom test runners
+```
+
+And two **on-by-default reliability knobs**, tunable or disable-able:
+
+```yaml
+inject:      { mode: off }                     # posture digest on SessionStart/PostCompact
+failures:    { mode: deny, max_repeats: 3 }    # deny|ask|monitor|off identical failed retries
 ```
 
 ## Configuration & state
@@ -540,7 +588,8 @@ while a user or org sets global defaults:
 
 Switches: `AEGIS_NO_BUILTINS` (turn off the default guard set),
 `AEGIS_IDENTITY_ENFORCE` (deny + reap rogue sessions), `AEGIS_ALLOW_SUBAGENTS`,
-`AEGIS_ALLOW_INSTALL` (bypass the forced install-review gate), `AEGIS_ALLOW_STRAND` (permit
+`AEGIS_ALLOW_INSTALL` (bypass the forced install-review gate), `AEGIS_ALLOW_RETRY`
+(bypass the failure-loop guard), `AEGIS_ALLOW_STRAND` (permit
 branching with unmerged work), `AEGIS_ALLOW_MCP_CONFIG` (human confirmation to write an
 MCP server config via Edit/Write/MCP-tool — see
 [MCP server-config protection](#mcp-server-config-protection)), `AEGIS_WORKSPACE` / `AEGIS_PROJECT`
@@ -728,7 +777,10 @@ at `~/.aegis/audit.jsonl` (override with `AEGIS_AUDIT`). Point a whole team's lo
 one directory and the reports aggregate fleet-wide.
 
 - `aegis report` — the rap sheet: per-session and per-identity rollups, the full
-  denial trail, token/cost totals, and a verdict per session (flags like `many-denials`).
+  denial trail, token/cost totals, and a verdict per session (flags:
+  `many-denials`, `mostly-denied`, `high-failure-rate` — the session thrashed on
+  failing tool calls — and `orphaned-subagent` — sub-agents started but never
+  reconciled).
 - `aegis who --tool <T> --path <P>` — blame: which identities/sessions touched a tool
   or path.
 - `aegis detections` — caught rogue-agent attestations.
@@ -759,6 +811,49 @@ $ aegis report
 This gives you the answer to "how much did that agent session cost?" and "which
 identity is burning the most tokens?" — from the same audit stream that already
 tracks what each agent did and whether it was allowed.
+
+## Grounding: gate what an agent *claims*
+
+Enforcement governs what an agent **does**; grounding governs what an agent
+**claims**. The two halves share one trust model — measure against ground truth,
+never take the model's word — and one data source: the audit trail above.
+
+`aegis.grounding` (the folded-in Receipts engine) checks every claim in an agent's
+answer against a tamper-evident ledger of evidence. Three deterministic rules:
+
+- **Binding** — a claim must cite real evidence, or be demoted to an explicit
+  assumption. A guess stated as fact is illegal.
+- **Effort honesty** — "I searched / read / reviewed" must be backed by evidence of a
+  matching kind; total-coverage words ("all", "entire", "thoroughly") require
+  machine-checkable coverage counts. This is the "I reviewed the entire codebase"
+  detector.
+- **Support** — the cited evidence must actually back the claim (transparent token
+  overlap by default; a pluggable LLM/NLI judge for semantic checking).
+
+The seam with enforcement: Aegis already records every tool call and its output to
+the audit trail, so `ledger_from_audit()` turns that stream into the evidence ledger —
+an agent's final answer is gated against what it *actually did*, no separate
+instrumentation.
+
+```python
+from aegis.grounding import Gate, Answer, Claim, ClaimKind, ledger_from_audit
+
+ledger = ledger_from_audit("~/.aegis/audit.jsonl")   # what the agent actually did
+print(Gate(ledger).finalize(Answer(
+    summary="The service listens on port 8080.",
+    claims=[Claim("the port is 8080", evidence_ids=[...], kind=ClaimKind.FACT)],
+)))   # renders, or raises with a precise fix list
+```
+
+As a CI gate on a portable trace file (exit 1 when any claim is ungrounded):
+
+```bash
+aegis grounding audit trace.json          # or --from-audit to use the audit trail
+```
+
+Deterministic and dependency-free by default; the LLM support judge and free-text
+claim extractor are optional (`pip install "aegis-hooks[anthropic]"`). This engine
+was previously the standalone `receipts-gate` package, now folded into Aegis.
 
 ## Who it's for
 
@@ -805,11 +900,15 @@ a `SELECT`; the sandbox contains the novel evasion that Aegis's denylist hasn't 
 **Requirements:** Python 3.10+. Cross-platform engine; the shell-guard patterns cover
 bash, PowerShell, and cmd (a few are Windows-specific, e.g. DPAPI / registry autorun).
 
-From source (PyPI packaging planned):
+```bash
+pip install aegis-hooks     # or: pipx install aegis-hooks  (puts `aegis` on PATH for good)
+```
+
+From source:
 
 ```bash
 git clone https://github.com/Thepizzapie/AEGIS && cd AEGIS
-pip install -e .            # or: pipx install .   (puts `aegis` on PATH for good)
+pip install -e .            # or: pipx install .
 ```
 
 > **`aegis` on PATH — read this.** `pip install -e .` inside a venv only wires `aegis`
@@ -846,7 +945,7 @@ aegis report       # the decision is in the audit trail
 | Command | Purpose |
 |---|---|
 | `aegis hook <event>` | The entrypoint the runtime's hooks call — reads a tool-call JSON on stdin, evaluates policy, emits the decision. |
-| `aegis install` / `uninstall` | Wire/unwire the hooks in a Claude Code `settings.json` (merge-safe, idempotent). Flags: `--project <path>`, `--global`, `--command <cmd>`. |
+| `aegis install` / `uninstall` | Wire/unwire the hooks in a Claude Code `settings.json` **and the `aegis-*` agent skills** next to it (merge-safe, idempotent; uninstall removes only marker-tagged skills). Flags: `--project <path>`, `--global`, `--command <cmd>`, `--no-skills`. |
 | `aegis install-git [--repo .]` | Write git `pre-commit` + `pre-push` hooks (append to existing, non-clobber). The hook invokes aegis by **absolute path** (resolved automatically; override with `--command`), so it works in a venv without `aegis` on PATH. |
 | `aegis git-hook <commit\|push>` | The entrypoint the git hooks call — evaluates staged files (commit) or the push target (push). |
 | `aegis ci [--base origin/main]` | CI check: evaluate changed files vs a base ref, emit `::error` annotations, exit non-zero on violation. |
@@ -857,6 +956,7 @@ aegis report       # the decision is in the audit trail
 | `aegis detections` | List caught rogue-agent attestations. |
 | `aegis report` | Accountability rap sheet: per-session/identity rollups, denial trail, token/cost totals, session verdicts. Flags: `--audit <path>`, `--json`. |
 | `aegis who` | Blame: which identities/sessions touched a tool or path. Flags: `--tool`, `--path`, `--json`. |
+| `aegis grounding audit <trace>` | Gate an agent answer's claims against evidence (exit 1 if ungrounded). Flags: `--from-audit` (use Aegis's audit trail as the ledger), `--audit <path>`, `--json`, `--llm`. |
 | `aegis adapters` | List available runtime adapters. |
 
 ## Design principles

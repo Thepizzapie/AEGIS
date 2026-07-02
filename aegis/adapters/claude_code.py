@@ -11,6 +11,7 @@ and renders an Aegis :class:`Decision` into what Claude Code expects:
 from __future__ import annotations
 
 import json
+import os
 from typing import Tuple
 
 from ..events import BLOCKABLE, Event, HookEvent
@@ -58,11 +59,25 @@ def parse_event(payload: dict) -> Event:
     )
 
 
+def _skill_hint(event: Event) -> str:
+    """Point a denied agent at the shipped explain-block skill — but only when
+    it is actually installed (project .claude next to event.cwd, or the user's
+    home), so the hint never dangles. Best-effort; never raises."""
+    try:
+        for base in (event.cwd, os.path.expanduser("~")):
+            if base and os.path.isfile(os.path.join(
+                    base, ".claude", "skills", "aegis-explain-block", "SKILL.md")):
+                return " Use the aegis-explain-block skill for why + the compliant path."
+    except Exception:
+        pass
+    return ""
+
+
 def render_decision(event: Event, decision: Decision) -> Tuple[int, str, str]:
     """Return ``(exit_code, stdout, stderr)`` for Claude Code."""
     msg = decision.message or _default_message(decision)
     if decision.action == Action.DENY and event.event in _BLOCKABLE:
-        return 2, "", f"[Aegis] {msg}\n"
+        return 2, "", f"[Aegis] {msg}{_skill_hint(event)}\n"
     if decision.action == Action.ASK and event.event == HookEvent.PRE_TOOL_USE:
         out = json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -74,6 +89,18 @@ def render_decision(event: Event, decision: Decision) -> Tuple[int, str, str]:
         # policy says deny but this event can't be blocked — surface, don't fail
         return 0, "", f"[Aegis] (cannot block {event.event.value}) {msg}\n"
     return 0, "", ""
+
+
+def render_context(event: Event, text: str) -> str:
+    """Stdout JSON that injects ``text`` into the model's context on events that
+    support ``additionalContext`` (SessionStart / PostCompact). Empty string when
+    there is nothing to inject."""
+    if not text:
+        return ""
+    return json.dumps({"hookSpecificOutput": {
+        "hookEventName": event.event.value,
+        "additionalContext": text,
+    }})
 
 
 def _default_message(decision: Decision) -> str:

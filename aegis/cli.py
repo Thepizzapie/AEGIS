@@ -111,6 +111,15 @@ def _cmd_hook(args) -> int:
             review.observe(event)
         except Exception:
             pass
+    # PostToolUse / PostToolUseFailure: feed the failure-loop ledger so the
+    # PreToolUse guard can deny identical retries of a call that keeps failing.
+    # Side-effect only; never affects this event's decision.
+    if event.event in (HookEvent.POST_TOOL_USE, HookEvent.POST_TOOL_USE_FAILURE):
+        try:
+            from . import failures
+            failures.observe(event)
+        except Exception:
+            pass
 
     if parse_error is not None:
         # A payload we can't parse must not vanish into a silent allow: make it
@@ -134,6 +143,18 @@ def _cmd_hook(args) -> int:
         pass  # audit must never block the action
 
     code, out, err = adapter.render_decision(event, decision)
+    # Context injection (SessionStart / PostCompact): put the policy posture in
+    # front of the model so the rules it runs under survive compaction. Only on
+    # a clean exit with no competing stdout, and only for adapters that support
+    # it (render_context). Best-effort: injection failure must not fail the hook.
+    if code == 0 and not out and decision.action != Action.DENY:
+        try:
+            from . import context
+            render_ctx = getattr(adapter, "render_context", None)
+            if render_ctx and context.should_inject(event, policy):
+                out = render_ctx(event, context.compose(policy))
+        except Exception:
+            pass
     if out:
         sys.stdout.write(out)
     if err:
@@ -247,6 +268,11 @@ def _cmd_install(args) -> int:
         print(f"aegis: {exc}", file=sys.stderr)
         return 1
     print(f"aegis: ensured {len(HOOK_EVENTS)} hook event(s) ({n} newly added) in {target}")
+    if not getattr(args, "no_skills", False):
+        from . import skills
+        k = skills.install_skills(target.parent)
+        print(f"aegis: ensured {len(skills.SKILLS)} skill(s) ({k} written) in "
+              f"{skills.skills_dir(target.parent)}")
     return 0
 
 
@@ -258,6 +284,10 @@ def _cmd_uninstall(args) -> int:
         print(f"aegis: {exc}", file=sys.stderr)
         return 1
     print(f"aegis: removed {n} Aegis hook(s) from {target}")
+    from . import skills
+    k = skills.uninstall_skills(target.parent)
+    if k:
+        print(f"aegis: removed {k} Aegis skill(s) from {skills.skills_dir(target.parent)}")
     return 0
 
 
@@ -514,6 +544,54 @@ def _cmd_detections(args) -> int:
     return 0
 
 
+def _cmd_grounding(args) -> int:
+    """Gate an agent answer's claims against evidence — the folded Receipts engine.
+
+    `aegis grounding audit trace.json`  -> check a portable trace file.
+    `aegis grounding audit --from-audit` -> build the ledger from Aegis's own audit
+                                            trail (needs a --trace answer file).
+    Exits 1 when any claim is ungrounded, so it drops into CI like the other gates.
+    """
+    from .grounding import audit as ground_audit
+    from .grounding import ledger_from_audit, load_trace
+    from .grounding.verify import HeuristicVerifier
+
+    try:
+        with open(args.trace, encoding="utf-8-sig") as f:  # tolerate a BOM
+            data = json.load(f)
+    except OSError as exc:
+        print(f"aegis: cannot read {args.trace}: {exc}", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as exc:
+        print(f"aegis: {args.trace} is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+
+    ledger, answer = load_trace(data)
+    if args.from_audit:
+        # Ground the answer against what the agent ACTUALLY did, per Aegis's audit.
+        ledger = ledger_from_audit(args.audit or str(config.audit_path()))
+
+    verifier = HeuristicVerifier()
+    if args.llm:
+        from .grounding.llm import AnthropicLLM
+        from .grounding.verify import LLMSupportVerifier
+        verifier = LLMSupportVerifier(AnthropicLLM())
+
+    verdict = ground_audit(answer, ledger, verifier=verifier)
+    if args.json:
+        print(json.dumps({
+            "ok": verdict.ok,
+            "claimed_effort": verdict.claimed_effort,
+            "logged_evidence": verdict.logged_evidence,
+            "failures": [{"claim": r.claim.text, "reasons": r.failures}
+                         for r in verdict.failures],
+            "assumptions": [a.text for a in verdict.assumptions],
+        }, indent=2))
+    else:
+        print(verdict.report())
+    return 0 if verdict.ok else 1
+
+
 def _cmd_who(args) -> int:
     from .accountability import load_dir, who
     recs = load_dir(args.audit or str(config.audit_path()))
@@ -547,6 +625,8 @@ def build_parser() -> argparse.ArgumentParser:
     ins.add_argument("--project", help="write <project>/.claude/settings.json")
     ins.add_argument("--command", help="hook command to write (default: 'aegis hook'; "
                                        "use an absolute path for venv/pipx installs)")
+    ins.add_argument("--no-skills", dest="no_skills", action="store_true",
+                     help="skip installing the aegis-* agent skills")
     ins.set_defaults(func=_cmd_install)
 
     un = sub.add_parser("uninstall", help="remove Aegis hooks from a settings.json")
@@ -608,6 +688,19 @@ def build_parser() -> argparse.ArgumentParser:
     wh.add_argument("--audit")
     wh.add_argument("--json", action="store_true")
     wh.set_defaults(func=_cmd_who)
+
+    gr = sub.add_parser("grounding",
+                        help="gate an agent answer's claims against evidence (grounding)")
+    gr_sub = gr.add_subparsers(dest="grounding_cmd", required=True)
+    ga = gr_sub.add_parser("audit", help="audit a trace file; exit 1 if any claim is ungrounded")
+    ga.add_argument("trace", help="portable trace JSON (evidence + answer), or just the answer with --from-audit")
+    ga.add_argument("--from-audit", action="store_true",
+                    help="build the evidence ledger from Aegis's own audit trail instead of the trace")
+    ga.add_argument("--audit", help="audit JSONL path for --from-audit (default: resolved audit path)")
+    ga.add_argument("--json", action="store_true", help="emit JSON instead of a report")
+    ga.add_argument("--llm", action="store_true",
+                    help="use the LLM support judge (needs anthropic + ANTHROPIC_API_KEY)")
+    ga.set_defaults(func=_cmd_grounding)
     return p
 
 

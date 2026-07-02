@@ -70,6 +70,7 @@ def _add_usage(accum, usage):
 def by_session(records) -> dict:
     sessions: dict = defaultdict(
         lambda: {"total": 0, "allow": 0, "deny": 0, "ask": 0,
+                 "failures": 0, "subagent_starts": 0, "subagent_stops": 0,
                  "agent": None, "tools": Counter(), "usage": {}})
     for r in records:
         sid = r.get("session_id") or "(none)"
@@ -77,6 +78,13 @@ def by_session(records) -> dict:
         s["total"] += 1
         dec = r.get("decision", "allow")
         s[dec] = s.get(dec, 0) + 1
+        ev = r.get("event")
+        if ev == "PostToolUseFailure":
+            s["failures"] += 1
+        elif ev == "SubagentStart":
+            s["subagent_starts"] += 1
+        elif ev == "SubagentStop":
+            s["subagent_stops"] += 1
         if r.get("agent"):
             s["agent"] = r["agent"]
         if r.get("tool"):
@@ -134,6 +142,14 @@ def verdict(stats) -> dict:
         flags.append("many-denials")
     if deny and deny / total > 0.5:
         flags.append("mostly-denied")
+    # Reliability flags: a session drowning in tool failures is thrashing (or
+    # probing); sub-agents that started but never stopped are unreconciled work
+    # whose outcome/usage was never accounted for.
+    failures = stats.get("failures", 0)
+    if failures >= 3 and failures / total > 0.25:
+        flags.append("high-failure-rate")
+    if stats.get("subagent_starts", 0) > stats.get("subagent_stops", 0):
+        flags.append("orphaned-subagent")
     return {"ok": not flags, "flags": flags}
 
 

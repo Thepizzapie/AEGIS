@@ -161,6 +161,11 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
         if patterns.ENFORCEMENT_PATH_RE.search(p) or patterns.AEGIS_SOURCE_RE.search(p):
             return Decision(Action.DENY, "self-protect",
                             "Editing Aegis's own config or engine source is blocked.")
+        if patterns.AEGIS_SKILL_PATH_RE.search(p):
+            return Decision(Action.DENY, "self-protect",
+                            "Editing Aegis's shipped skills (.claude/skills/aegis-*) is "
+                            "blocked — they carry the compliance guidance blocked agents "
+                            "are pointed at.")
     return None
 
 
@@ -502,6 +507,52 @@ def _record_monitor(ev: Event, would: Decision, rule_note: str = "install-review
         pass
 
 
+# ---- failure-loop: an identical retry of a call that keeps failing -----------
+def rule_failure_loop(ev: Event, policy=None) -> Optional[Decision]:
+    """Deny the Nth identical retry of a tool call that already failed N times
+    this session — the agent-thrash loop. The enforcement point is PreToolUse
+    (blockable); the evidence comes from the ``aegis.failures`` ledger, fed by
+    PostToolUseFailure (observational). Only an *identical* call (same tool,
+    same args — see ``failures.signature``) counts: the deny reason tells the
+    model to change approach, and any change starts a fresh signature. A later
+    success of the same signature clears its streak.
+
+    Config (``policy.failures``): ``mode`` (deny|ask|monitor|off, default deny),
+    ``max_repeats`` (default 3). Escapable by a human only: '# aegis-allow' on a
+    shell command, or AEGIS_ALLOW_RETRY=1 set by the orchestrator."""
+    if ev.event != HookEvent.PRE_TOOL_USE:
+        return None
+    cfg = getattr(policy, "failures", None) or {}
+    mode = str(cfg.get("mode", "deny")).lower()
+    # YAML 1.1 parses an unquoted `off` as boolean False — accept both spellings.
+    if mode in ("off", "false") or cfg.get("mode") is False:
+        return None
+    if os.environ.get("AEGIS_ALLOW_RETRY"):
+        return None
+    try:
+        limit = max(1, int(cfg.get("max_repeats", 3)))
+    except (TypeError, ValueError):
+        limit = 3
+    from . import failures
+    session = ev.session_id or os.environ.get("AEGIS_SESSION_ID")
+    n = failures.failure_count(session, failures.signature(ev.tool, ev.args))
+    if n < limit:
+        return None
+    if _override_allowed(ev):
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+    would = Decision(action, "failure-loop",
+                     f"This exact {ev.tool or 'tool'} call already failed {n} "
+                     "time(s) this session — an identical retry is a thrash loop, "
+                     "not progress. Read the error, fix the cause or change the "
+                     "arguments/approach, then proceed. A human may append "
+                     "'# aegis-allow' or set AEGIS_ALLOW_RETRY=1.")
+    if mode == "monitor":
+        _record_monitor(ev, would, "failure-loop-monitor")
+        return None
+    return would
+
+
 # ---- fetch-and-execute / DNS-C2: remote code an agent never read -------------
 def rule_remote_exec(ev: Event, policy=None) -> Optional[Decision]:
     """Deny piping a network fetch straight into a shell (``curl … | sh``) and DNS-TXT
@@ -604,6 +655,7 @@ _CORE_RULES = (
     rule_subagent_spawn,
     rule_network_egress,
     rule_evasion,
+    rule_failure_loop,
     rule_remote_exec,
     rule_destructive_git,
     rule_destructive_delete,
