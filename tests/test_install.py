@@ -1,6 +1,8 @@
 """AEGI-2: `aegis install` / `uninstall` — merge into settings.json, never clobber."""
 import json
 
+import pytest
+
 from aegis.events import HookEvent
 from aegis import cli
 
@@ -25,6 +27,40 @@ def test_install_merges_without_clobbering(tmp_path):
     assert added == len(list(HookEvent))
     for ev in HookEvent:                               # every event wired
         assert ev.value in data["hooks"]
+
+
+def test_install_merges_settings_with_utf8_bom(tmp_path):
+    """A settings.json written with a UTF-8 BOM (common on Windows) must still be
+    parsed and MERGED — not treated as unparseable and silently overwritten."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({
+        "model": "opus",
+        "hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [{"type": "command", "command": "my-own-hook"}]}
+        ]},
+    }), encoding="utf-8-sig")  # BOM
+
+    cli.install_hooks(settings)
+    data = json.loads(settings.read_text(encoding="utf-8-sig"))
+
+    assert data["model"] == "opus"  # NOT clobbered
+    cmds = [h["command"] for e in data["hooks"]["PreToolUse"] for h in e["hooks"]]
+    assert "my-own-hook" in cmds
+    assert "aegis hook PreToolUse" in cmds
+
+
+def test_install_refuses_to_clobber_unparseable_settings(tmp_path):
+    """If settings.json exists but is not valid JSON, install must ABORT, not
+    reset it to {} and destroy the user's config."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    original = "{ this is not valid json, do not delete me }"
+    settings.write_text(original, encoding="utf-8")
+
+    with pytest.raises(cli.SettingsParseError):
+        cli.install_hooks(settings)
+    assert settings.read_text(encoding="utf-8") == original  # untouched
 
 
 def test_install_is_idempotent(tmp_path):

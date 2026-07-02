@@ -208,13 +208,30 @@ def _has_aegis(entries) -> bool:
     return any(_is_aegis_hook(h) for entry in entries for h in entry.get("hooks", []))
 
 
+class SettingsParseError(Exception):
+    """An existing settings file could not be parsed — we refuse to overwrite it."""
+
+
 def _read_json(path: Path) -> dict:
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    if not path.exists():
+        return {}
+    # utf-8-sig tolerates a BOM (Windows editors / PowerShell write one) — reading
+    # such a file as plain utf-8 makes json.loads choke on the leading BOM char.
+    raw = path.read_text(encoding="utf-8-sig")
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        # NEVER silently reset to {} and overwrite — that clobbers the user's whole
+        # settings.json (model, permissions, other hooks). Refuse instead.
+        raise SettingsParseError(
+            f"{path} exists but is not valid JSON ({exc}). Refusing to overwrite it "
+            f"and lose your settings — fix or move the file, then re-run."
+        ) from exc
+    if not isinstance(data, dict):
+        raise SettingsParseError(f"{path}: top-level must be a JSON object.")
+    return data
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -224,14 +241,22 @@ def _write_json(path: Path, data: dict) -> None:
 
 def _cmd_install(args) -> int:
     target = _settings_path(args)
-    n = install_hooks(target, command=args.command or AEGIS_COMMAND_PREFIX)
+    try:
+        n = install_hooks(target, command=args.command or AEGIS_COMMAND_PREFIX)
+    except SettingsParseError as exc:
+        print(f"aegis: {exc}", file=sys.stderr)
+        return 1
     print(f"aegis: ensured {len(HOOK_EVENTS)} hook event(s) ({n} newly added) in {target}")
     return 0
 
 
 def _cmd_uninstall(args) -> int:
     target = _settings_path(args)
-    n = uninstall_hooks(target)
+    try:
+        n = uninstall_hooks(target)
+    except SettingsParseError as exc:
+        print(f"aegis: {exc}", file=sys.stderr)
+        return 1
     print(f"aegis: removed {n} Aegis hook(s) from {target}")
     return 0
 
