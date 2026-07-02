@@ -128,9 +128,19 @@ Prefer project-scoped installs. `--global` fires for every tool call in every se
 | `aegis grounding audit <trace>` | Gate an answer's claims against evidence. Flags: `--from-audit`, `--json`, `--llm`. |
 | `aegis pull` / `adapters` | Pull org policy; list runtime adapters. |
 
+## The hard posture: pair it with a sandbox
+
+Aegis alone is a policy + audit layer, not containment. The honest strong setup runs the agent in a throwaway container (the sandbox limits what it can *reach*) with Aegis inside it (policy for what it's *allowed to do*, plus the audit). Each covers the other's blind spot: the container makes Aegis's denylist gaps survivable, and Aegis catches the intent-level things the OS reads as legal (dropping a scratch DB is a valid operation to the kernel).
+
+Ready-to-run container + VS Code devcontainer + one-command launcher are in [`sandbox/`](sandbox/):
+
+```bash
+cd sandbox && ./run.sh /path/to/repo    # or run.ps1 on Windows
+```
+
 ## Limits
 
-- **Not a sandbox.** An agent already at a raw shell can run relative commands Aegis only sees as opaque `shell` text. Pair it with an OS-restricted user or container for hostile-code isolation.
+- **Not a sandbox by itself.** An agent already at a raw shell can run relative commands Aegis only sees as opaque `shell` text. Use the [`sandbox/`](sandbox/) container, or an OS-restricted user, for hostile-code isolation.
 - **Guards are a denylist.** They catch known-dangerous shapes, not every possible one. Known gaps: cloud-CLI exfil (`aws s3 cp`, `gsutil`, `rclone`), in-place edits (`sed -i`), `git -c` inline-config force-push. Deny-by-default egress is the backstop. Found a bypass? That's a bug worth reporting.
 - **Fail-open by default.** If the hook can't run, the action proceeds unguarded rather than blocking your work. Set `AEGIS_FAIL_CLOSED=1` to invert.
 - **Identity is as strong as the keystore.** The issuer key lives on disk; a process with your privileges can read it.

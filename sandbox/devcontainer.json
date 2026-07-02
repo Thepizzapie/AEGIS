@@ -1,0 +1,11 @@
+{
+  "// note": "Copy this to .devcontainer/devcontainer.json at your repo root to use it with VS Code. The Dockerfile path is relative to that location.",
+  "name": "aegis-sandbox",
+  "build": { "dockerfile": "../sandbox/Dockerfile" },
+  "workspaceFolder": "/work",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/work,type=bind",
+  "remoteUser": "agent",
+  "runArgs": ["--cap-drop=ALL", "--security-opt=no-new-privileges"],
+  "postCreateCommand": "aegis install --project /work",
+  "// network": "VS Code bootstraps its server into the container over the network, so '--network none' is omitted here (it would break the connection). For hard network isolation, use the headless run.sh / run.ps1 wrapper instead, or route egress through an allowlist proxy."
+}
