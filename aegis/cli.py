@@ -103,6 +103,15 @@ def _cmd_hook(args) -> int:
     if not event.roles:
         event.roles = roles
 
+    # PostToolUse: record read-coverage so the install-review gate can tell a full
+    # read from a skim. Side-effect only; never affects this event's decision.
+    if event.event == HookEvent.POST_TOOL_USE:
+        try:
+            from . import review
+            review.observe(event)
+        except Exception:
+            pass
+
     if parse_error is not None:
         # A payload we can't parse must not vanish into a silent allow: make it
         # VISIBLE (stderr + audit) and honor fail-closed mode.

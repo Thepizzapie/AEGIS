@@ -16,7 +16,7 @@ import re
 import subprocess
 from typing import Optional
 
-from . import normalize, patterns
+from . import normalize, patterns, review
 from .events import ActionClass, Event, HookEvent
 from .policy import Action, Decision
 
@@ -29,7 +29,13 @@ def _cmd(ev: Event) -> str:
 
 def _path(ev: Event) -> str:
     a = ev.args or {}
-    return str(a.get("file_path") or a.get("path") or a.get("notebook_path") or "")
+    # Beyond Claude Code's own arg names, cover the common key names third-party
+    # MCP filesystem-server tools use for their target path (varies by server —
+    # e.g. target_file/filename/file/uri) so path-based guards see MCP-tool writes,
+    # not just Edit/Write. Purely additive: widens detection, never narrows it.
+    return str(a.get("file_path") or a.get("path") or a.get("notebook_path")
+               or a.get("target_file") or a.get("targetFile") or a.get("filename")
+               or a.get("file") or a.get("uri") or "")
 
 
 def _is_shell(ev: Event) -> bool:
@@ -155,6 +161,91 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
         if patterns.ENFORCEMENT_PATH_RE.search(p) or patterns.AEGIS_SOURCE_RE.search(p):
             return Decision(Action.DENY, "self-protect",
                             "Editing Aegis's own config or engine source is blocked.")
+    return None
+
+
+# ---- MCP server-config protection: escapable with human confirmation ---------
+def _mcp_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block writes to MCP server-definition config files (``.mcp.json``,
+    ``~/.claude.json``'s ``mcpServers``, and the Cursor/VS Code/Windsurf/Claude
+    Desktop equivalents) and CLI ``mcp add`` registration.
+
+    A server entry's ``command``/``args``/``url``/``env`` is auto-executed on every
+    FUTURE session start. A hijacked or prompt-injected agent that plants or edits
+    one plants a durable, cross-session backdoor — via a plain Edit/Write, an MCP
+    filesystem tool, a shell redirect/delete/in-place-edit/copy onto the path, or a
+    CLI's own ``mcp add`` subcommand (which mutates the config without any file write
+    the Edit/Write hook would see). Distinct from self-protect (Aegis's own config)
+    and containment/persistence (OS-level only) — neither covers this surface.
+
+    Config (``policy.mcp_config``): ``mode`` (deny|ask|monitor|off, default deny),
+    ``allow`` (regexes on the path/command that skip the gate — a repo's own trusted
+    setup script, say). ``ask`` surfaces the change to a human for interactive
+    approval (like ``install_review``) instead of a hard deny; ``monitor`` logs the
+    would-be decision to the audit and allows.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the *shell* form (the
+    natural place for it — there's no syntax-safe way to embed a comment inside a
+    JSON Edit/Write payload), or the env toggle ``AEGIS_ALLOW_MCP_CONFIG=1`` set by
+    the orchestrator/human before launch for the Edit/Write/MCP-tool form. A spawned
+    agent cannot set its own env for a hook invocation it doesn't control, so neither
+    path is agent-self-escapable."""
+    cfg = getattr(policy, "mcp_config", None) or {}
+    mode = str(cfg.get("mode", "deny")).lower()
+    if mode == "off":
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.MCP_CONFIG_PATH_RE.search(p):
+            return None
+        if os.environ.get("AEGIS_ALLOW_MCP_CONFIG") or _mcp_config_allowed_by_policy(cfg, p):
+            return None
+        would = Decision(action, "mcp-config-protect",
+                         f"MCP server config '{p}' is being written — a new or "
+                         "modified server entry (command/args/url/env) runs "
+                         "automatically on every future session, a durable backdoor. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_MCP_CONFIG=1; a spawned agent cannot set this.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "mcp-config-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        touches_config = bool(patterns.MCP_CONFIG_PATH_RE.search(cmd)) and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd))
+        cli_add = patterns.MCP_CLI_ADD_RE.search(cmd)
+        if not (touches_config or cli_add):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MCP_CONFIG")
+                or _mcp_config_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "mcp-config-protect",
+                         "MCP server configuration is being modified from a shell — "
+                         "this can register a new tool server that runs "
+                         "automatically on every future session. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_MCP_CONFIG=1; a spawned "
+                         "agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "mcp-config-protect-monitor")
+            return None
+        return would
     return None
 
 
@@ -304,27 +395,133 @@ def rule_evasion(ev: Event, policy=None) -> Optional[Decision]:
                     "char-code construction are how guards get bypassed).")
 
 
-# ---- bulk dependency install: supply-chain defense, escapable ----------------
-def rule_bulk_install(ev: Event, policy=None) -> Optional[Decision]:
-    """Block blind / bulk dependency installs — ``npm install``, ``pip install -r``,
-    ``poetry install``, ``cargo build``, ``go mod download``, etc. A hijacked agent
-    adding a poisoned ``requirements.txt`` or running ``npm install`` in a
-    compromised repo is a supply-chain attack vector. Targeted single-package
-    installs (``npm install lodash``) are fine. Escapable with ``# aegis-allow``
-    or ``AEGIS_ALLOW_INSTALL=1``."""
+# ---- forced install review: read-before-install, then human ask --------------
+def rule_install_review(ev: Event, policy=None) -> Optional[Decision]:
+    """Force a full read of an install's manifest, then a human ask.
+
+    A careless agent runs ``pip install -r requirements.txt`` straight from a repo's
+    setup notes and never looks at what it pulls in. This gate closes that path:
+
+    1. **Deny until read** — any install whose manifest (``requirements.txt``,
+       ``package.json`` + lock, ``pyproject.toml``/``poetry.lock``, …; plus the
+       *local* install-time scripts in ``deep`` mode) hasn't been **fully read** this
+       session is refused. A skim — a ``Read`` that stops short, or a ``grep``/``head``
+       peek — never satisfies coverage (see ``aegis.review``).
+    2. **Then ask** — once coverage is satisfied, the install is surfaced to the human
+       with a factual digest (dep count, unpinned specs, URL/VCS deps, install
+       scripts) instead of running silently.
+
+    Honest scope: this gates the *manifest* and forces a human decision. It does NOT
+    inspect a dependency's install-time code (that runs inside the package manager's
+    subprocess, below the hook boundary), so it does not by itself stop a clean-repo /
+    error-driven attack whose payload is in package code or a later step. ``deep`` mode
+    force-reads the *local* setup.py/postinstall (catching a malicious ``pip install
+    .``), not a downloaded third-party package's. Pair with egress + OS isolation.
+
+    Config (``policy.install_review``): ``mode`` (off|monitor|ask, default ask;
+    monitor logs the would-be decision to the audit and allows), ``deep``,
+    ``require_pinned`` (deny unpinned specs), ``allow`` (regex exemptions on the raw
+    command). The read-gate is non-escapable by a spawned agent (it cannot
+    ``# aegis-allow`` itself); a human may override. No-execute fetches
+    (``pip download``, ``npm pack``) and ``AEGIS_ALLOW_INSTALL=1`` bypass the gate.
+    Coverage requires the runtime to deliver Read content at PostToolUse (Claude Code
+    does); a runtime that doesn't will fail closed — use a human override or monitor."""
     if not _is_shell(ev):
         return None
+    text = _shell_scan(ev)
+    if not patterns.INSTALL_ANY_RE.search(text):
+        return None
+    if patterns.NOEXEC_FETCH_RE.search(text):
+        return None  # a no-execute fetch (download/pack) is not an install
     if os.environ.get("AEGIS_ALLOW_INSTALL"):
         return None
+    cfg = getattr(policy, "install_review", None) or {}
+    mode = str(cfg.get("mode", "ask")).lower()
+    if mode == "off":
+        return None
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), _cmd(ev), re.IGNORECASE):
+                return None
+        except re.error:
+            continue
+
+    cwd = ev.cwd or os.getcwd()
+    deep = bool(cfg.get("deep"))
+    # Detection runs on the de-obfuscated surface (catches wrapped installs); manifest
+    # / package resolution runs on the RAW command — the scan surface duplicates tokens,
+    # which would corrupt package-name and path parsing.
+    raw_cmd = _cmd(ev)
+    manifests = review.resolve_manifests(raw_cmd, cwd, deep=deep)
+    session = ev.session_id or os.environ.get("AEGIS_SESSION_ID")
+    unread = [m for m in manifests if not review.is_fully_read(session, m, cwd)]
+    if _override_allowed(ev):  # human override (a spawned agent can't reach this)
+        return None
+
+    # The decision this gate WOULD make (None -> nothing to do / allow).
+    would: Optional[Decision] = None
+    if unread:
+        names = ", ".join(os.path.basename(m) for m in unread)
+        what = "install-time script(s)/manifest(s)" if deep else "manifest(s)"
+        would = Decision(Action.DENY, "install-review",
+                         f"Install blocked — forced dependency review: {names} not fully "
+                         f"read this session. Read the entire {what} in full (no "
+                         f"limit/offset, no grep/head/tail) so the dependency list is "
+                         f"actually in context, then retry. A human may append "
+                         f"'# aegis-allow'; a spawned agent cannot.")
+    else:
+        d = review.digest(manifests, raw_cmd, cwd)
+        if cfg.get("require_pinned") and d.get("unpinned"):
+            would = Decision(Action.DENY, "install-review",
+                             f"Install blocked — {d['unpinned']} unpinned dependency "
+                             f"spec(s); the installed set must be pinned (exact '==' / a "
+                             f"lockfile) to be reviewable. Pin the versions, or append "
+                             f"'# aegis-allow' (human only). [{review.format_digest(d)}]")
+        else:
+            would = Decision(Action.ASK, "install-review",
+                             f"Dependency install — review the dependency list before "
+                             f"approving: {review.format_digest(d)}. (The manifest is "
+                             f"reviewed; package install-time code is not — see docs.)")
+
+    if mode == "monitor":
+        _record_monitor(ev, would)
+        return None
+    return would
+
+
+def _record_monitor(ev: Event, would: Decision, rule_note: str = "install-review-monitor") -> None:
+    """Monitor mode: record the would-be decision to the audit (so a pilot can measure
+    projected denials with `aegis report`) without blocking. Best-effort."""
+    try:
+        from . import config
+        from .audit import write_event
+        note = Decision(would.action, rule_note,
+                        f"[monitor] would {would.action.value}: {would.message}")
+        write_event(ev, note, str(config.audit_path()))
+    except Exception:
+        pass
+
+
+# ---- fetch-and-execute / DNS-C2: remote code an agent never read -------------
+def rule_remote_exec(ev: Event, policy=None) -> Optional[Decision]:
+    """Deny piping a network fetch straight into a shell (``curl … | sh``) and DNS-TXT
+    command/payload retrieval — remote code (or a DNS-delivered payload) that was
+    never read. This catches the common single-command *shape*; it is not exhaustive
+    — fetch-to-temp-then-exec as two statements, or an in-process resolver/HTTP call
+    inside an interpreted program, won't surface here (deny-by-default egress is the
+    backstop for those). Human-escapable like evasion; a spawned agent cannot."""
+    if not _is_shell(ev):
+        return None
     text = _shell_scan(ev)
-    if not patterns.BULK_INSTALL_RE.search(text):
+    if not (patterns.PIPE_TO_SHELL_RE.search(text) or patterns.DNS_C2_RE.search(text)):
         return None
     if _override_allowed(ev):
         return None
-    return Decision(Action.DENY, "bulk-install",
-                    "Bulk/blind dependency install is blocked — supply-chain risk. "
-                    "If this is intentional, append '# aegis-allow' to the command or "
-                    "set AEGIS_ALLOW_INSTALL=1.")
+    return Decision(Action.DENY, "remote-exec",
+                    "Fetch-piped-to-shell / DNS-TXT command retrieval is blocked — this "
+                    "runs remote code (or a DNS-delivered payload) that was never read. "
+                    "Download it, read it in full, then run the local copy. A human may "
+                    "append '# aegis-allow'.")
 
 
 # ---- branch strands: work-loss prevention, escapable ------------------------
@@ -401,14 +598,16 @@ _CORE_RULES = (
     rule_attest_session,
     rule_containment,
     rule_self_protect,
+    rule_mcp_config_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
     rule_network_egress,
     rule_evasion,
+    rule_remote_exec,
     rule_destructive_git,
     rule_destructive_delete,
-    rule_bulk_install,
+    rule_install_review,
     rule_branch_strands,
 )
 

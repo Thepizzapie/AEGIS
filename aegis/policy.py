@@ -115,3 +115,11 @@ class Policy:
     # MCP-input governance: {block_elicitation: bool} — deny MCP elicitation side
     # channels for a spawned/unattended agent.
     mcp: dict = field(default_factory=dict)
+    # Forced install review: {mode: off|monitor|ask, deep: bool,
+    # require_pinned: bool, allow: [regex on command]}. Empty -> defaults
+    # (mode=ask) apply. See rules.rule_install_review.
+    install_review: dict = field(default_factory=dict)
+    # MCP server-config protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=deny) apply.
+    # See rules.rule_mcp_config_protect.
+    mcp_config: dict = field(default_factory=dict)

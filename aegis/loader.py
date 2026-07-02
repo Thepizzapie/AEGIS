@@ -52,7 +52,7 @@ def load_policy(path) -> Policy:
     st = {
         "rules": [], "default": Action.ALLOW, "on_error": Action.ALLOW,
         "egress": {}, "plugins": [], "workspace": {}, "project": None,
-        "agent_label": None,
+        "agent_label": None, "install_review": {}, "mcp_config": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
     }
     for f in _yaml_files(path):
@@ -78,6 +78,7 @@ def load_policy(path) -> Policy:
                   on_error=st["on_error"], egress=st["egress"],
                   plugins=st["plugins"], workspace=st["workspace"],
                   project=st["project"], agent_label=st["agent_label"],
+                  install_review=st["install_review"], mcp_config=st["mcp_config"],
                   team=lc["team"], compaction=lc["compaction"],
                   permission=lc["permission"], mcp=lc["mcp"])
 
@@ -102,6 +103,12 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
         st["project"] = str(data["project"])
     if data.get("agent_label"):
         st["agent_label"] = str(data["agent_label"])
+    # Guard-config knobs (install review, MCP-config protection) — small dicts.
+    for key in ("install_review", "mcp_config"):
+        if isinstance(data.get(key), dict):
+            st[key] = dict(data[key])
+        elif data.get(key):
+            _warn(f"policy in {fname}: '{key}' must be a mapping; ignoring it")
     # opt-in lifecycle knobs — each a small dict (last file wins per key). A
     # malformed knob (not a mapping) is skipped, not crashed on.
     for key in st["lifecycle"]:
