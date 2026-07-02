@@ -13,11 +13,19 @@ OVERRIDE_RE = re.compile(r"(?:#|--)\s*aegis-allow\b", re.IGNORECASE)  # '# ' (sh
 # branch -D, clean -f).
 DESTRUCTIVE_GIT_RE = re.compile(
     r"\bgit\b[^|;&\n]*?\b(?:"
-    r"push[^|;&\n]*?(?:--force\b|--force-with-lease\b|\s-f\b)"
+    # force/destructive push: --force/-f/--mirror; a leading-'+' refspec (force-update
+    # of any ref); or a space-colon delete of a PROTECTED branch (`push origin :main`).
+    # A `src:dst` refspec (`HEAD:main`) and deleting a feature branch (`:old-feature`)
+    # are intentionally NOT matched — those are routine.
+    r"push[^|;&\n]*?(?:--force\b|--force-with-lease\b|--mirror\b|\s-f\b"
+    r"|\s\+[^\s|;&]+|\s:(?:main|master|develop|trunk|release)\b)"
     r"|reset[^|;&\n]*?--hard"
-    r"|rebase\b"
+    # rebase is destructive, but its recovery flags restore state — allow those.
+    r"|rebase\b(?![^|;&\n]*--(?:abort|continue|skip|quit|edit-todo))"
     r"|commit[^|;&\n]*?--amend"
-    r"|branch[^|;&\n]*?\s-D\b"
+    # -D force-deletes a branch; -d is the safe (refuses-unmerged) delete. Match -D
+    # case-sensitively (scoped (?-i:)) so routine `git branch -d merged` is allowed.
+    r"|branch[^|;&\n]*?\s(?-i:-D)\b"
     r"|clean[^|;&\n]*?\s-[a-zA-Z]*f"
     r")",
     re.IGNORECASE,
@@ -27,11 +35,14 @@ DESTRUCTIVE_GIT_RE = re.compile(
 # separate), PowerShell Remove-Item/aliases with -Recurse -Force (any order),
 # cmd rmdir/rd /s and del /s|/q.
 DESTRUCTIVE_DELETE_RE = re.compile(
-    r"\brm\b(?=[^|;&\n]*\s-[a-z]*r)(?=[^|;&\n]*\s-[a-z]*f)"
+    # unix rm: recursive (-r / -R / --recursive) AND force (-f / --force), any order,
+    # short-combined or GNU long-form.
+    r"\brm\b(?=[^|;&\n]*\s(?:-[a-z]*r|--recursive\b))(?=[^|;&\n]*\s(?:-[a-z]*f|--force\b))"
     r"|\b(?:remove-item|ri|rmdir|rd|del|erase)\b(?=[^|;&\n]*-recurse)(?=[^|;&\n]*-force)"
     r"|\b(?:rmdir|rd)\b[^|;&\n]*/s"
     r"|\bdel\b[^|;&\n]*/[sq]"
     r"|\bfind\b[^|;&\n]*-(?:delete\b|exec\s+rm\b)"   # find -delete / -exec rm
+    r"|\brimraf\b"                                    # npm rimraf (always recursive-force)
     r"|\bshred\b"                                     # secure delete
     r"|\btruncate\b[^|;&\n]*\s-s\s*0\b"               # zero a file
     r"|\bdd\b[^|;&\n]*\bof=/dev/",                    # overwrite a raw device
@@ -73,9 +84,13 @@ EVASION_RE = re.compile(
 )
 
 # Aegis's own enforcement surface — deleting/editing this disables Aegis.
-ENFORCEMENT_PATH_RE = re.compile(r"\.aegis\b|\.claude[/\\]settings\.json\b", re.IGNORECASE)
-# broader: shell delete/move of the whole config dirs (.aegis / .claude)
-CONFIG_DIR_RE = re.compile(r"\.aegis\b|\.claude\b", re.IGNORECASE)
+ENFORCEMENT_PATH_RE = re.compile(
+    r"\.aegis(?=[/\\]|\s|['\"]|$)|\.claude[/\\]settings\.json\b", re.IGNORECASE)
+# broader: shell delete/move of the whole config dirs (.aegis / .claude). Anchored
+# so it matches the DIR (followed by a separator / end / quote), not any filename
+# that merely contains '.aegis' or '.claude' (e.g. 'notes.aegis.bak', '.claude-x').
+CONFIG_DIR_RE = re.compile(
+    r"\.aegis(?=[/\\]|\s|['\"]|$)|\.claude(?=[/\\]|\s|['\"]|$)", re.IGNORECASE)
 # Aegis's OWN package source — editing/deleting it could neuter the engine
 AEGIS_SOURCE_RE = re.compile(
     r"(?:^|[/\\])aegis[/\\](?:__init__|rules|patterns|engine|policy|gate|attest|"
@@ -126,10 +141,32 @@ PERSIST_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Exfiltration (upload-a-local-file).
+# Exfiltration (upload-a-local-file) across common uploaders. Not exhaustive —
+# an in-process python requests.post can't be pattern-matched — but covers the
+# CLI tools an agent reaches for: curl (data/upload/form), wget --post-file,
+# PowerShell Invoke-*, scp/rsync to a remote, and nc/ncat piping a file.
 EXFIL_RE = re.compile(
-    r"\bcurl\b[^|;&\n]*?(?:-d\s*@|--data(?:-binary)?\s*@|--upload-file\b|\s-T\s)"
-    r"|Invoke-(?:RestMethod|WebRequest)\b[^|;&\n]*?-InFile\b",
+    r"\bcurl\b[^|;&\n]*?(?:-d\s*@|--data(?:-binary)?\s*@|--data-urlencode\s+\S*@"
+    r"|--upload-file\b|\s-T\s|(?:-F|--form)\b[^|;&\n]*@)"
+    r"|\bwget\b[^|;&\n]*?--post-file"
+    r"|Invoke-(?:RestMethod|WebRequest)\b[^|;&\n]*?-InFile\b"
+    # scp/rsync to a user@host: remote. The '@' anchor avoids matching a LOCAL copy
+    # of a file whose name contains a dot+colon (e.g. a timestamp 'log.12:30.txt').
+    r"|\b(?:scp|rsync)\b[^|;&\n]*\s[^\s|;&]*@[^\s|;&]*:"
+    r"|\b(?:nc|ncat|netcat)\b[^|;&\n]*<\s*\S"
+    # httpie invoked as a command, piping/attaching a local file (http POST u < f,
+    # http -f POST u field@file). Anchored to a command position so an https:// URL
+    # argument to another tool does not false-match.
+    r"|(?:^|[\s;&|(])https?\s+[^|;&\n]*(?:<\s*\S|@\S)",
+    re.IGNORECASE,
+)
+
+# Copy/write programs that can OVERWRITE a file without a delete/move verb or a
+# shell redirect — the self-protect gap (cp/dd/install onto the policy file,
+# ln over it, a python open(...,'w')). Paired with a config/source path match.
+COPY_WRITE_VERB_RE = re.compile(
+    r"\b(?:cp|copy|copy-item|cpi|dd|install|ln|link|new-item|ni)\b"
+    r"|\bpython[0-9.]*\b[^\n]*\bopen\s*\([^\n]*['\"][wax]",
     re.IGNORECASE,
 )
 

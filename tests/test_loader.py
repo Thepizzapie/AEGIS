@@ -42,8 +42,56 @@ def test_load_and_evaluate(tmp_path):
     assert other.blocked  # no rule matched -> default deny
 
 
+LIFECYCLE = """
+team:
+  require_verification: true
+compaction:
+  block_auto: true
+permission:
+  deny_escalation: true
+mcp:
+  block_elicitation: true
+"""
+
+
+def test_load_lifecycle_knobs(tmp_path):
+    """The opt-in lifecycle knobs (team/compaction/permission/mcp) must round-trip
+    from YAML onto the Policy so the lifecycle rules that read them can be enabled —
+    regression for them silently defaulting to None (dead opt-in)."""
+    pol = load_policy(_write(tmp_path, LIFECYCLE))
+    assert pol.team == {"require_verification": True}
+    assert pol.compaction == {"block_auto": True}
+    assert pol.permission == {"deny_escalation": True}
+    assert pol.mcp == {"block_elicitation": True}
+
+
+def test_lifecycle_knobs_enable_rules(tmp_path, monkeypatch):
+    """End-to-end: with the knobs set and a spawned agent, the opt-in lifecycle
+    rules actually DENY through the engine."""
+    monkeypatch.setenv("AEGIS_AGENT_NAME", "spawned")
+    pol = load_policy(_write(tmp_path, LIFECYCLE))
+    cases = {
+        HookEvent.TASK_COMPLETED: "task-completion-gate",
+        HookEvent.PRE_COMPACT: "precompact-gate",
+        HookEvent.PERMISSION_REQUEST: "permission-escalation",
+        HookEvent.ELICITATION: "elicitation-governance",
+    }
+    matcher = {HookEvent.PRE_COMPACT: "auto"}
+    for ev, rule in cases.items():
+        d = evaluate(Event.make(ev.value, matcher=matcher.get(ev)), pol)
+        assert d.blocked and d.rule == rule, (ev, d)
+
+
+def test_lifecycle_knobs_absent_by_default(tmp_path):
+    """No knobs in YAML -> empty dicts -> opt-in rules abstain (default ALLOW)."""
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.team == {} and pol.compaction == {}
+    assert pol.permission == {} and pol.mcp == {}
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
+    assert validate_policy(_write(tmp_path, LIFECYCLE)) == []
 
 
 def test_validate_catches_bad_action(tmp_path):

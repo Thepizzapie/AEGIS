@@ -315,8 +315,20 @@ def _load_policy_safe() -> Policy:
     try:
         from .loader import load_policy
         return load_policy(config.policy_dir())
-    except Exception as exc:  # noqa: BLE001 — a broken policy must not block
-        print(f"aegis: failed to load policy ({exc!r}); allowing", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — a broken policy must not silently pass
+        # A policy that fails to load has thrown away the user's default_action
+        # and rules. Failing OPEN here would turn a `default_action: deny` posture
+        # into allow-everything. Honor fail-closed so a security-conscious deploy
+        # denies instead; the built-in guards apply in either case.
+        env_closed = (os.environ.get("AEGIS_FAIL_CLOSED") or "").strip().lower() in (
+            "1", "true", "yes", "on")
+        if env_closed:
+            print(f"aegis: failed to load policy ({exc!r}); FAIL-CLOSED, "
+                  f"denying by default", file=sys.stderr)
+            return Policy(default_action=Action.DENY, on_error=Action.DENY)
+        print(f"aegis: WARNING could not load policy ({exc!r}); your declarative "
+              f"policy is NOT active (built-in guards still apply). Set "
+              f"AEGIS_FAIL_CLOSED=1 to deny by default instead.", file=sys.stderr)
         return Policy()
 
 

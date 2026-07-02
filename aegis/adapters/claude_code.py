@@ -13,14 +13,23 @@ from __future__ import annotations
 import json
 from typing import Tuple
 
-from ..events import Event, HookEvent
+from ..events import BLOCKABLE, Event, HookEvent
 from ..policy import Action, Decision
 
 # Events where exit code 2 meaningfully blocks and stderr is fed to the model.
-_BLOCKABLE = {HookEvent.PRE_TOOL_USE, HookEvent.STOP, HookEvent.USER_PROMPT_SUBMIT}
+# Sourced from the central taxonomy so adapter + engine never disagree.
+_BLOCKABLE = BLOCKABLE
 
 # Default agent label when the spawner sets no explicit identity.
 RUNTIME = "claude-code"
+
+# Per-event payload key that carries the native "matcher" value (config type,
+# notification type, compaction type, termination reason, error type). Captured
+# into Event.matcher so lifecycle rules can target it without re-reading raw.
+_MATCHER_KEYS = (
+    "matcher", "trigger", "source", "config_type", "notification_type",
+    "compact_type", "reason", "error_type", "permission_mode",
+)
 
 
 def parse_event(payload: dict) -> Event:
@@ -33,6 +42,7 @@ def parse_event(payload: dict) -> Event:
         args = {}
     else:
         args = {"value": raw_args}
+    matcher = next((str(payload[k]) for k in _MATCHER_KEYS if payload.get(k)), None)
     return Event.make(
         name,
         tool=tool,
@@ -40,6 +50,10 @@ def parse_event(payload: dict) -> Event:
         session_id=payload.get("session_id"),
         cwd=payload.get("cwd"),
         agent=payload.get("agent") or payload.get("agent_name"),
+        agent_id=payload.get("agent_id"),
+        agent_type=payload.get("agent_type"),
+        worktree=(payload.get("worktree") or payload.get("worktree_path")),
+        matcher=matcher,
         raw=payload,
     )
 

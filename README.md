@@ -112,8 +112,8 @@ agent runtime ──PreToolUse(tool, args)──> aegis hook ──> policy engi
 
 ### A blocked call, end to end
 
-1. You run `aegis install --project .` — it merges a `PreToolUse` hook (and the four
-   other events) into the project's `.claude/settings.json`.
+1. You run `aegis install --project .` — it merges a `PreToolUse` hook (and the rest
+   of the runtime's hook surface — 26 events) into the project's `.claude/settings.json`.
 2. Mid-session the agent decides to run `psql -c "DROP TABLE users"`.
 3. Before executing, Claude Code invokes `aegis hook PreToolUse`, piping it the tool
    call as JSON on stdin.
@@ -137,11 +137,23 @@ native hook payload -> adapter -> normalized Event -> policy engine -> Decision 
 ```
 
 **Event model** (`events.py`) — runtime-agnostic, so one policy works across
-runtimes. Every call normalizes to an `Event` with a `HookEvent`
-(`PreToolUse` / `PostToolUse` / `SessionStart` / `Stop` / `UserPromptSubmit`) and an
+runtimes. Every call normalizes to an `Event` with a `HookEvent` and an
 `ActionClass` taxonomy (`read` / `edit` / `write` / `shell` / `git` / `subagent` /
 `mcp` / `net` / `other`). A policy can target a whole class ("deny all shell") without
 knowing each runtime's tool names.
+
+Aegis covers the runtime's **full hook surface** (26 Claude Code events), not just
+tool calls. `BLOCKABLE` (in `events.py`) marks the 13 events where a deny actually
+stops the action; the rest are observational (recorded for accountability). Beyond
+the core tool-use guards, lifecycle rules (`aegis/lifecycle/`) cover:
+
+| Concern | Events | What it does |
+|---|---|---|
+| **Config integrity** | `ConfigChange` / `FileChanged` / `CwdChanged` / `Setup` / `InstructionsLoaded` | Hard-blocks a spawned agent from rewriting the policy/settings that enforce it (the "can't neuter the guard" block); records cwd escapes and secrets-file touches for the audit trail (`CwdChanged`/`FileChanged` are observational). |
+| **Sub-agent / Teams** | `SubagentStart` / `SubagentStop` / `TaskCreated` / `TaskCompleted` / `TeammateIdle` | Spawn-depth governance at fan-out time; opt-in "did-it-do-the-task" completion gate; per-sub-agent token/cost attribution. |
+| **Session / compaction** | `SessionEnd` / `PreCompact` / `PostCompact` / `StopFailure` / `Notification` | Opt-in gate on auto-compaction (checkpoint before context is destroyed); session-lifecycle audit. |
+| **Interaction / MCP input** | `PostToolUseFailure` / `PermissionRequest` / `Elicitation` / `ElicitationResult` | Opt-in auto-deny of human-only permission prompts and MCP elicitation side-channels for unattended agents. |
+| **Worktree** | `WorktreeCreate` / `WorktreeRemove` | Extends workspace confinement to git worktrees — an agent can't `git worktree add ../escape` its way out of its project root. |
 
 **Policy engine** (`engine.py`) — evaluates an Event in three stages,
 first-deny-wins, **fail-open per rule** (one broken rule can never brick the agent):
@@ -180,7 +192,7 @@ hijacked agent from appending the escape token to its own commands.
 | **Migration / destructive SQL** | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, and migration resets (Prisma, Alembic, Supabase, Rails/Rake, Django, Knex, Flyway, dbmate) — read from **shell commands and DB MCP tool args** (`execute_sql`, `apply_migration`). *Note:* the migration guard matches broad keywords (`drop`, `truncate`) to minimize false negatives; a benign `ALTER TABLE ... DROP COLUMN old_col` will trip it. Use the `-- aegis-allow` escape on legitimate migration commands, or write a declarative rule scoping the guard to your workflow. | Yes |
 | **Destructive git** | force-push, `reset --hard`, rebase, `commit --amend`, `branch -D`, `clean -f` | Yes |
 | **Recursive force delete** | `rm -rf` and equivalents across bash, PowerShell (`Remove-Item -Recurse -Force`), and cmd (`rmdir /s`, `del /s`); also `find -delete`/`-exec rm`, `shred`, `truncate -s 0`, `dd of=/dev/...` | Yes |
-| **Sub-agent governance** | `Agent`/`Task` fan-out from a spawned agent (uncontrolled cost/blast radius) | Configurable (`AEGIS_ALLOW_SUBAGENTS`) |
+| **Sub-agent governance** | `Agent`/`Task` fan-out from a spawned agent (uncontrolled cost/blast radius). Enforced at the tool call (`PreToolUse`, hard block) and also surfaced at `SubagentStart` for the audit trail (`SubagentStart` is observational). | Configurable (`AEGIS_ALLOW_SUBAGENTS`) |
 | **Bulk dependency install** | Blind `npm install` / `pip install -r` / `poetry install` / `bundle install` / `cargo build` / `go mod download` — a hijacked agent running a bulk install from a poisoned repo is a supply-chain attack. Targeted single-package installs (`npm install lodash`) are allowed. | Yes (`AEGIS_ALLOW_INSTALL=1`) |
 | **Branch strands** | Creating a new branch (`git checkout -b` / `git switch -c`) while the current branch has commits not in main — prevents stranding unmerged work. Checks actual git state. | Yes (`AEGIS_ALLOW_STRAND=1`) |
 | **Network egress** | Outbound destinations (tool URLs, `curl`/`Invoke-WebRequest`) against an allow/deny host list | Policy-driven |
@@ -190,6 +202,30 @@ The migration guard is worth calling out: an agent doesn't need a shell to wipe 
 database — it can call a DB MCP tool's `execute_sql` directly. Aegis reads the SQL
 out of the tool arguments, so `DROP TABLE` is caught with **no shell involved** — a
 vector most guardrails miss entirely.
+
+### Lifecycle guards (the rest of the hook surface)
+
+Beyond the 12 core guards above, Aegis covers the full Claude Code hook surface
+(26 events; see *Architecture*) with 9 lifecycle guards in `aegis/lifecycle/` —
+together the **21 built-in rules**. Some fire unconditionally; four are **opt-in**
+via policy knobs (`team` / `compaction` / `permission` / `mcp` — see *Policy*).
+
+| Guard | Event(s) | What it does | On by default? |
+|---|---|---|---|
+| **Config-change protection** | `ConfigChange` (blockable) | Hard-blocks a spawned agent from rewriting Aegis's own `policy_settings` / `local_settings` or any enforcement/config/engine-source file mid-session — the "can't neuter the guard" guarantee. Humans/orchestrators may reconfigure. | Yes |
+| **Cwd confinement** | `CwdChanged` (observational) | Records an agent stepping its working directory outside its confinement root. Surfaced for the audit trail, not blocked (`CwdChanged` is not blockable). Off unless a confinement root is set. | When confined |
+| **Secrets-file flag** | `FileChanged` (observational) | Flags (for review) a spawned agent changing a watched `.env` / `.envrc`. Surfaced, not blocked. Conservative — external/human edits stay plain audit records. | Yes |
+| **Worktree confinement** | `WorktreeCreate` (blockable) | Hard-blocks `git worktree add` to a path outside the confinement root — an agent can't worktree its way out of its project. | When confined |
+| **Sub-agent spawn depth** | `SubagentStart` (observational) | Records a spawned agent fanning out to sub-agents (mirrors the `PreToolUse` block at spawn time, for the audit trail). | Yes (records) |
+| **Task-completion gate** | `TaskCompleted` (blockable) | Blocks marking a team task done without an explicit verification signal — the "did-it-do-the-task" gate. | Opt-in (`team.require_verification`) |
+| **Pre-compact gate** | `PreCompact` (blockable) | Blocks **auto** context compaction so a human can checkpoint before context is destroyed. | Opt-in (`compaction.block_auto`) |
+| **Permission-escalation** | `PermissionRequest` (blockable) | Auto-denies a spawned/unattended agent's human-only permission prompts instead of hanging on them. | Opt-in (`permission.deny_escalation`) |
+| **Elicitation governance** | `Elicitation` / `ElicitationResult` (blockable) | Denies MCP elicitation side-channels for a spawned agent. | Opt-in (`mcp.block_elicitation`) |
+
+Observational events with no enforcing rule (`PostToolUse`, `PostToolUseFailure`,
+`SubagentStop`, `TeammateIdle`, `SessionStart`/`SessionEnd`, `Setup`,
+`InstructionsLoaded`, `Stop`/`StopFailure`, `PostCompact`, `Notification`,
+`WorktreeRemove`) are still recorded to the audit log for accountability.
 
 Containment is a *known-paths* denylist (the locations above) — deliberately
 high-signal, not exhaustive: a secret at an unlisted path, or copied first and then
@@ -332,6 +368,16 @@ Validate with `aegis validate`.
 (`{root, allow}` confinement), `project` (bind file mutations to a repo — hard-block
 out-of-project edits), and `agent_label` (default record label when no `AEGIS_AGENT_NAME`
 is set). The last two give a repo zero-config attribution + confinement.
+
+Four **opt-in lifecycle knobs** enable the gated lifecycle guards (see *Lifecycle
+guards*); each is a small mapping, off unless set:
+
+```yaml
+team:        { require_verification: true }  # gate TaskCompleted on a verification signal
+compaction:  { block_auto: true }            # block auto context compaction (PreCompact)
+permission:  { deny_escalation: true }       # auto-deny a spawned agent's permission prompts
+mcp:         { block_elicitation: true }     # block MCP elicitation side-channels
+```
 
 ## Configuration & state
 
@@ -681,10 +727,16 @@ aegis report       # the decision is in the audit trail
 - **Not a sandbox.** Aegis gates tool calls; it doesn't isolate a process. An agent
   already at a raw shell can run relative commands Aegis only sees as a `shell` action
   — pair it with an OS-restricted user/container for hostile-code isolation.
-- **Denylist guards are heuristic.** Evasion resistance raises the cost sharply, but a
-  novel obfuscation can exist. Deny-by-default (allowlist) is the stronger posture for
-  high-security setups and is supported per-surface (network egress today; a shell
-  allowlist preset is planned).
+- **Denylist guards are heuristic.** The built-in shell guards match known-dangerous
+  command shapes; they raise the cost of evasion sharply but are not exhaustive by
+  construction. Known-uncovered forms include: exfiltration via cloud CLIs
+  (`aws s3 cp`, `gsutil`, `rclone`) or an in-process `requests.post`; in-place policy
+  edits via `sed -i` / `perl -i` or a `chmod 000` on the policy file; and `git -c`
+  inline-config force-push. These fail *safe* for file mutations routed through the
+  runtime's Edit/Write tools (caught by path, not verb), but a raw shell can still
+  reach them. Deny-by-default (allowlist) is the stronger posture for high-security
+  setups and is supported per-surface (network egress today; a shell allowlist preset
+  is planned). If you find a bypass, that's a bug worth reporting.
 - **Identity is as strong as the keystore.** v1 persists the issuer key on disk; a
   process with your full privileges could read it. True unforgeability needs the key
   in a broker process plus OS privilege separation — the module isolates the key

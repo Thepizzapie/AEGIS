@@ -34,6 +34,10 @@ def parse_event(payload: dict) -> Event:
         session_id=payload.get("session_id"),
         cwd=payload.get("cwd"),
         agent=payload.get("agent"),
+        agent_id=payload.get("agent_id"),
+        agent_type=payload.get("agent_type"),
+        worktree=payload.get("worktree"),
+        matcher=payload.get("matcher"),
         raw=payload,
     )
 

@@ -69,6 +69,12 @@ def write_event(event, decision, path) -> dict:
         "cwd": event.cwd,
         "args": event.args,
     }
+    # Lifecycle attribution fields — recorded only when the event carries them, so
+    # tool-use records stay lean while subagent/team/worktree records stay traceable.
+    for k in ("agent_id", "agent_type", "worktree", "matcher"):
+        v = getattr(event, k, None)
+        if v:
+            rec[k] = v
     usage = _extract_usage(event)
     if usage:
         rec["usage"] = usage

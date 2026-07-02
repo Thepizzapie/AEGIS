@@ -144,7 +144,8 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
         if (patterns.CONFIG_DIR_RE.search(cmd) or patterns.AEGIS_SOURCE_RE.search(cmd)) and (
                 patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                 or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
-                or patterns.WRITE_REDIRECT_RE.search(cmd)):
+                or patterns.WRITE_REDIRECT_RE.search(cmd)
+                or patterns.COPY_WRITE_VERB_RE.search(cmd)):
             return Decision(Action.DENY, "self-protect",
                             "Writing/deleting/moving Aegis's own config, policy, or engine "
                             "source is blocked.")
@@ -384,7 +385,19 @@ def rule_branch_strands(ev: Event, policy=None) -> Optional[Decision]:
                     "or set AEGIS_ALLOW_STRAND=1.")
 
 
-BUILTIN_RULES = (
+def _lifecycle_rules() -> tuple:
+    """Pull in the lifecycle-hook rules (ConfigChange / SubagentStart / PreCompact /
+    PermissionRequest / WorktreeCreate / ...). Imported here (not at top) so the
+    dependency stays one-way: lifecycle submodules never import this module.
+    Fail-open: a broken lifecycle import must not strip the core guards."""
+    try:
+        from .lifecycle import lifecycle_rules
+        return lifecycle_rules()
+    except Exception:
+        return ()
+
+
+_CORE_RULES = (
     rule_attest_session,
     rule_containment,
     rule_self_protect,
@@ -398,3 +411,8 @@ BUILTIN_RULES = (
     rule_bulk_install,
     rule_branch_strands,
 )
+
+# Core PreToolUse/shell guards first, then the lifecycle-hook rules that cover the
+# rest of the runtime's event surface (config integrity, team/sub-agent, compaction,
+# worktree confinement, MCP-input governance).
+BUILTIN_RULES = _CORE_RULES + _lifecycle_rules()

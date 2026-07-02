@@ -102,3 +102,16 @@ class Policy:
     # Default agent label when no AEGIS_AGENT_NAME is set -> zero-config
     # attribution for a repo's agents.
     agent_label: Optional[str] = None
+    # --- opt-in lifecycle-hook knobs (read by aegis.lifecycle rules) ---
+    # Team / sub-agent governance: {require_verification: bool} — gate TaskCompleted
+    # on an explicit verification signal (did-it-do-the-task).
+    team: dict = field(default_factory=dict)
+    # Context-compaction control: {block_auto: bool} — deny auto PreCompact so a
+    # human can checkpoint before context is destroyed.
+    compaction: dict = field(default_factory=dict)
+    # Permission-escalation control: {deny_escalation: bool} — auto-deny a spawned
+    # agent's human-only PermissionRequest prompts instead of hanging on them.
+    permission: dict = field(default_factory=dict)
+    # MCP-input governance: {block_elicitation: bool} — deny MCP elicitation side
+    # channels for a spawned/unattended agent.
+    mcp: dict = field(default_factory=dict)

@@ -16,7 +16,7 @@ selectable via `aegis hook --runtime <name>`.
 
 | Runtime | Hook surface | Adapter | Status |
 |---|---|---|---|
-| **Claude Code** | native `PreToolUse` / `PostToolUse` / `SessionStart` / `Stop` / `UserPromptSubmit` | `claude-code` | ✅ shipped (AEGI-2) |
+| **Claude Code** | full native hook surface — 26 events (`PreToolUse` / `PostToolUse(+Failure)` / `Session{Start,End}` / `Stop(+Failure)` / `UserPromptSubmit` / `ConfigChange` / `Subagent{Start,Stop}` / `Task{Created,Completed}` / `TeammateIdle` / `Pre/PostCompact` / `Worktree{Create,Remove}` / `PermissionRequest` / `Elicitation(+Result)` / `Cwd/FileChanged` / `Setup` / `InstructionsLoaded` / `Notification`); 13 blockable | `claude-code` | ✅ shipped (AEGI-2; full surface AEGI-lifecycle) |
 | **Any command-hook runtime** | normalized JSON over stdin/stdout | `generic` | ✅ shipped (AEGI-7) |
 | **git / CI** | `pre-commit` / `pre-push` / CI action | git surface | ✅ shipped (AEGI-5) |
 | Cursor | rules + command hooks (assessing) | `generic` | ⏳ assess |
