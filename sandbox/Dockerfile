@@ -20,7 +20,8 @@ RUN pip install --user --no-cache-dir aegis-hooks
 
 WORKDIR /work
 COPY --chown=agent:agent entrypoint.sh /home/agent/entrypoint.sh
-# Invoke via bash so the entrypoint works regardless of the file's exec bit
-# (Windows-authored files don't carry one through git).
+# Strip any CRLF (Windows checkout) so bash doesn't choke on \r, and invoke via
+# bash so it works regardless of the file's exec bit.
+RUN sed -i 's/\r$//' /home/agent/entrypoint.sh
 ENTRYPOINT ["bash", "/home/agent/entrypoint.sh"]
 CMD ["bash"]

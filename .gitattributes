@@ -1,0 +1,5 @@
+# Shell scripts and the sandbox entrypoint run inside a Linux container. They must
+# stay LF — CRLF makes the container's bash fail with "\r: command not found".
+*.sh text eol=lf
+sandbox/entrypoint.sh text eol=lf
+sandbox/Dockerfile text eol=lf
