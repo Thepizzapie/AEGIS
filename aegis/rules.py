@@ -22,6 +22,64 @@ from .policy import Action, Decision
 
 _URL_RE = re.compile(r"https?://([^/\s'\"]+)", re.IGNORECASE)
 _STMT_SPLIT_RE = re.compile(r"[;&|\n]+")
+_STMT_SEP_CHARS = frozenset(";&|\n")
+
+
+def _mask_nested_separators(cmd: str) -> str:
+    """Neutralize ;/&/|/newline characters that appear INSIDE a quoted string or a
+    $(...) / `...` command substitution — they are not top-level shell-statement
+    boundaries there — by replacing just those characters with a space. Every OTHER
+    character, including any verb or path text that happens to be quoted or inside
+    a substitution for an ordinary reason, is left untouched, so the verb/path
+    regexes still see it. Without this, ``sed -i "$(echo 'x'; echo 's/../../')"
+    aegis/rules.py`` — one real in-place edit — would split on the inner ';' into
+    two fragments that individually look harmless (verb, no path / path, no verb),
+    a live bypass found in round-5 adversarial QA of
+    ``_self_protect_overwrite_in_same_statement``.
+
+    Best-effort, single linear pass; malformed/unbalanced quoting or nesting just
+    falls through with the remainder of the string unmodified, which fails toward
+    the PRE-existing, safe-by-over-splitting behavior (a stray boundary still
+    splits), not toward a new bypass."""
+    out = list(cmd)
+    n = len(cmd)
+    i = 0
+    while i < n:
+        c = cmd[i]
+        if c in ("'", '"'):
+            q = c
+            j = i + 1
+            while j < n and cmd[j] != q:
+                if cmd[j] in _STMT_SEP_CHARS:
+                    out[j] = " "
+                j += 1
+            i = j + 1 if j < n else n
+            continue
+        if c == "`":
+            j = i + 1
+            while j < n and cmd[j] != "`":
+                if cmd[j] in _STMT_SEP_CHARS:
+                    out[j] = " "
+                j += 1
+            i = j + 1 if j < n else n
+            continue
+        if c == "$" and i + 1 < n and cmd[i + 1] == "(":
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if cmd[j] == "(":
+                    depth += 1
+                elif cmd[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif cmd[j] in _STMT_SEP_CHARS:
+                    out[j] = " "
+                j += 1
+            i = j + 1 if j < n else n
+            continue
+        i += 1
+    return "".join(out)
 
 
 def _cmd(ev: Event) -> str:
@@ -147,8 +205,13 @@ def _self_protect_overwrite_in_same_statement(cmd: str) -> bool:
     round-4 adversarial QA; relies on normalize.scan_surface joining its
     de-obfuscated variants with '; ' (not a bare space) so a statement boundary
     at a part seam splits cleanly too, instead of fusing the tail of one part
-    into the head of the next."""
-    for stmt in _STMT_SPLIT_RE.split(cmd):
+    into the head of the next.
+
+    Splits on ;/&/|/newline found via ``_mask_nested_separators`` first — a
+    separator INSIDE a quoted string or a $(...) / `...` substitution is not a
+    real statement boundary and must not fracture one genuine overwrite into two
+    innocent-looking halves (round-5 adversarial QA)."""
+    for stmt in _STMT_SPLIT_RE.split(_mask_nested_separators(cmd)):
         if not stmt:
             continue
         if (patterns.CONFIG_DIR_RE.search(stmt) or patterns.AEGIS_SOURCE_SHELL_RE.search(stmt)) and (

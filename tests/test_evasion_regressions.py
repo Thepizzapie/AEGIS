@@ -315,6 +315,38 @@ def test_self_protect_same_statement_overwrite_still_blocked_in_compound_command
         _shell("echo hi && sed -i 's/deny/allow/' .aegis/policies/policy.yaml"), None)
 
 
+# --- 4k. round-5 adversarial QA: a ';'/'&'/'|' INSIDE a quoted string or a
+# $(...) / `...` command substitution is not a real statement boundary --------
+# The 4j statement-scoping fix introduced its own bypass in the other direction:
+# splitting naively on every ';' fractured ONE real in-place edit into two
+# innocent-looking halves when the ';' lived inside a $(...) substitution
+# (`sed -i "$(echo 'x'; echo 's/../../')" aegis/rules.py` — a single command,
+# but the verb landed in one fake "statement" and the path in another, so
+# neither half matched verb+path together and the whole thing sailed through
+# ALLOWED). Fixed by masking only the separator characters found inside a
+# quote/substitution (not the surrounding text) before splitting.
+
+def test_self_protect_blocks_overwrite_hidden_behind_command_substitution():
+    assert evaluate(_shell(
+        "sed -i \"$(echo 'x'; echo 's/deny/allow/')\" .aegis/policies/policy.yaml"), EMPTY).blocked
+    d = evaluate(_shell(
+        "sed -i \"$(echo 'a'; echo 'malicious')\" aegis/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_quoted_path_still_detected_after_masking():
+    # masking must neutralize ONLY separator characters inside quotes/subs, never
+    # the surrounding verb/path text itself — a quoted path must still be caught
+    assert rule_self_protect(_shell("sed -i 's/x/y/' \".aegis/policies/policy.yaml\""), None)
+    assert rule_self_protect(_shell('echo hi > "aegis/rules.py"'), None)
+
+
+def test_self_protect_quoted_separator_with_no_verb_stays_allowed():
+    # a literal ';' inside a quoted string, with no overwrite verb present at
+    # all, must not itself trigger anything
+    assert not rule_self_protect(_shell('echo "a;b" && cat aegis/rules.py'), None)
+
+
 # --- 5. malformed policy must not silently fail open -------------------------
 
 def test_malformed_lifecycle_knob_preserves_policy(tmp_path):
