@@ -206,9 +206,13 @@ EXFIL_RE = re.compile(
 
 # Copy/write programs that can OVERWRITE a file without a delete/move verb or a
 # shell redirect — the self-protect gap (cp/dd/install onto the policy file,
-# ln over it, a python open(...,'w')). Paired with a config/source path match.
+# ln over it, a python open(...,'w'), or a LOCAL rsync/scp — both also copy
+# onto a plain local destination path, not just a remote user@host:; the
+# user@host: FORM is separately caught by EXFIL_RE as exfiltration, this
+# catches the local-overwrite form that isn't). Paired with a config/source
+# path match.
 COPY_WRITE_VERB_RE = re.compile(
-    r"\b(?:cp|copy|copy-item|cpi|dd|install|ln|link|new-item|ni)\b"
+    r"\b(?:cp|copy|copy-item|cpi|dd|install|ln|link|new-item|ni|rsync|scp)\b"
     r"|\bpython[0-9.]*\b[^\n]*\bopen\s*\([^\n]*['\"][wax]",
     re.IGNORECASE,
 )
@@ -281,22 +285,32 @@ MCP_CONFIG_PATH_RE = re.compile(
 )
 
 # In-place edit / copy-over-target verbs — a config-file overwrite that is NEITHER a
-# redirect/tee NOR a delete/move (sed -i, perl -i, batch-mode vim/ex, cp/copy the file
-# over the target, dd, patch/git-apply, moreutils sponge, or a python/node/ruby/perl
-# one-liner script that writes it). Paired with MCP_CONFIG_PATH_RE and, for
-# self-protection, with CONFIG_DIR_RE / AEGIS_SOURCE_SHELL_RE (the target filename
-# must be literally present) so this stays high-signal despite the broad verb list.
-# Deliberately excludes coreutils `install` — indistinguishable by regex from `npm
-# install`/`pip install` and would false-positive whenever an unrelated install
-# command shares a shell line with a mere READ of the config file.
+# redirect/tee NOR a delete/move (sed -i / --in-place, perl -i, batch-mode vim/ex,
+# gawk -i inplace, cp/copy the file over the target, dd, patch, moreutils sponge, a
+# `git checkout`/`git restore` of a tracked path from another ref, or a
+# python/node/ruby/perl one-liner script that writes it). Paired with
+# MCP_CONFIG_PATH_RE and, for self-protection, with CONFIG_DIR_RE /
+# AEGIS_SOURCE_SHELL_RE (the target filename must be literally present) so this stays
+# high-signal despite the broad verb list. Deliberately excludes coreutils `install`
+# — indistinguishable by regex from `npm install`/`pip install` and would
+# false-positive whenever an unrelated install command shares a shell line with a
+# mere READ of the config file.
+#
+# NOT covered, and not fixable by scanning command TEXT: `git apply <diff>` — the
+# overwritten path lives inside the diff file's own content, never as a literal
+# string in the command being scanned. Same class of gap as a value built from a
+# shell variable set in an earlier, separate tool call. Deny-by-default egress plus
+# the install-review gate are the backstops for payloads that arrive this way.
 INPLACE_WRITE_RE = re.compile(
-    r"\bsed\b[^|;&\n]*-i\b"
+    r"\bsed\b[^|;&\n]*(?:-i\b|--in-place\b)"
     r"|\bperl\b[^|;&\n]*-i\b"
     r"|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
+    r"|\b(?:g?awk)\b[^|;&\n]*-i\s*inplace\b"
     r"|\bcp\b|\bcopy\b"
     r"|\bdd\b"
     r"|\bpatch\b"                                        # patch <target> [< diff] / patch -i diff <target>
     r"|\bsponge\b"                                        # moreutils: cmd | sponge <target>
+    r"|\bgit\b[^|;&\n]*\b(?:checkout|restore)\b"         # git checkout <ref> -- <path> / git restore --source=<ref> <path>
     r"|\b(?:python3?|node|ruby|perl)\b[^|;&\n]*\s-[ce]\b",
     re.IGNORECASE,
 )

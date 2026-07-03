@@ -7,6 +7,7 @@ allowed so the widened patterns don't over-block.
 from aegis.engine import evaluate
 from aegis.events import Event, HookEvent
 from aegis.policy import Action, Policy
+from aegis.rules import rule_self_protect
 
 EMPTY = Policy()  # default-allow; built-in guards still apply
 
@@ -193,6 +194,51 @@ def test_self_protect_edit_path_argument_stays_narrow():
 def test_self_protect_source_mention_plus_verb_is_position_blind_by_design():
     assert evaluate(_shell("cp aegis/rules.py /tmp/backup_rules.py"), EMPTY).blocked
     assert evaluate(_shell("cat aegis/rules.py > /tmp/review.txt"), EMPTY).blocked
+
+
+# --- 4g. round-2 adversarial QA: local rsync/scp, awk/gawk -i, sed --in-place,
+# git checkout/restore overwriting a tracked path from another ref ------------
+# All four rewrite the target file without matching any PREVIOUSLY covered verb
+# (COPY_WRITE_VERB_RE had no rsync/scp; INPLACE_WRITE_RE had no awk/gawk, only
+# sed's short '-i' not the GNU long form, and no git checkout/restore).
+
+def test_self_protect_blocks_local_rsync_and_scp():
+    assert evaluate(_shell("rsync evil.py aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("rsync evil.yaml .aegis/policies/policy.yaml"), EMPTY).blocked
+    d = evaluate(_shell("scp evil.py aegis/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_rsync_scp_elsewhere_allowed():
+    # remote (user@host:) scp/rsync isn't a self-protect concern at all — it's
+    # already caught as exfiltration by containment, a different rule
+    assert not rule_self_protect(_shell("scp file.txt user@host:/remote/"), None)
+    assert not rule_self_protect(_shell("rsync -a src/ dest/"), None)
+
+
+def test_self_protect_blocks_awk_gawk_inplace():
+    assert evaluate(_shell("awk -i inplace '{print}' .aegis/policies/policy.yaml"), EMPTY).blocked
+    d = evaluate(_shell("gawk -i inplace '{print}' aegis/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+    assert not rule_self_protect(_shell("awk '{print}' myfile.py"), None)  # no -i inplace
+
+
+def test_self_protect_blocks_sed_long_form_inplace():
+    assert evaluate(_shell("sed --in-place 's/deny/allow/' .aegis/policies/policy.yaml"), EMPTY).blocked
+
+
+def test_self_protect_blocks_git_checkout_restore_of_source():
+    assert evaluate(_shell("git checkout other-branch -- aegis/rules.py"), EMPTY).blocked
+    d = evaluate(_shell("git restore --source=HEAD~1 -- aegis/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_git_checkout_restore_elsewhere_allowed():
+    # plain branch switches / restoring an unrelated file must stay untouched by
+    # self-protect (other rules, e.g. branch-strand, may still have an opinion)
+    assert not rule_self_protect(_shell("git checkout main"), None)
+    assert not rule_self_protect(_shell("git checkout -b feature/x"), None)
+    assert not rule_self_protect(_shell("git restore myfile.py"), None)
 
 
 # --- 5. malformed policy must not silently fail open -------------------------
