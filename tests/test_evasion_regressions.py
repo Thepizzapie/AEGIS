@@ -15,6 +15,10 @@ def _shell(cmd):
     return Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd})
 
 
+def _edit(path):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={"file_path": path})
+
+
 # --- 1. git destructive-push forms -------------------------------------------
 
 def test_plus_refspec_force_push_blocked():
@@ -99,6 +103,96 @@ def test_self_protect_copy_elsewhere_allowed():
     # filenames that merely contain '.aegis'/'.claude' as a substring must NOT trip
     assert not evaluate(_shell("cp config.yaml myproject.aegis.bak"), EMPTY).blocked
     assert not evaluate(_shell("cp README.md .claude-notes.md"), EMPTY).blocked
+
+
+# --- 4b. self-protect vs in-place edit of policy/engine source ---------------
+# sed/perl -i and batch-mode vim rewrite a file in place: no delete/move verb,
+# no shell redirect, no cp/dd/install — none of which the guard checked for, so
+# this was a silent bypass of self-protection (an agent could disarm its own
+# guard by editing policy.yaml or rules.py/patterns.py directly).
+
+def test_self_protect_blocks_inplace_edit_of_policy():
+    assert evaluate(_shell("sed -i 's/deny/allow/' .aegis/policies/policy.yaml"), EMPTY).blocked
+    assert evaluate(_shell("perl -i -pe 's/deny/allow/' .aegis/policies/policy.yaml"), EMPTY).blocked
+    d = evaluate(_shell('vim -c "%s/deny/allow/g" -c wq .aegis/policies/policy.yaml'), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_blocks_inplace_edit_of_source():
+    assert evaluate(_shell("sed -i '/rule_self_protect/d' aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("perl -i -pe 1 aegis/engine.py"), EMPTY).blocked
+
+
+def test_self_protect_inplace_edit_elsewhere_allowed():
+    assert not evaluate(_shell("sed -i 's/foo/bar/' myfile.py"), EMPTY).blocked
+    assert not evaluate(_shell("sed -i 's/foo/bar/' notes.aegis.bak"), EMPTY).blocked
+
+
+# --- 4c. self-protect vs a bare relative source path (no leading './') -------
+# AEGIS_SOURCE_RE required 'aegis/<file>.py' to be preceded by a path separator
+# or start-of-string. In a shell ARGUMENT the path is preceded by whitespace or
+# a quote instead ('> aegis/rules.py', "'aegis/rules.py'"), which never matched
+# — so the single most natural way to reference the source tree from a repo
+# root (no leading './') bypassed self-protect entirely.
+
+def test_self_protect_blocks_bare_relative_source_path():
+    assert evaluate(_shell("echo pwned > aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("cat evil.py > aegis/patterns.py"), EMPTY).blocked
+    d = evaluate(_shell("echo pwned > 'aegis/rules.py'"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+    assert evaluate(_shell("cp evil.py aegis/rules.py"), EMPTY).blocked
+
+
+def test_self_protect_bare_relative_lookalike_not_blocked():
+    # 'aegis' must be a real path segment, not a substring of another name
+    assert not evaluate(_shell("echo x > myaegis/rules.py"), EMPTY).blocked
+    assert not evaluate(_shell("echo x > notaegis_rules.py"), EMPTY).blocked
+    assert not evaluate(_shell("echo x > src/other.py"), EMPTY).blocked
+
+
+# --- 4d. self-protect vs patch/sponge and a no-space redirect ----------------
+# Found in adversarial QA on 4b/4c: 'patch'/'sponge' rewrite a target file in
+# place but weren't in INPLACE_WRITE_RE's verb list, and a redirect glued
+# directly against the path with no space ('echo x>aegis/rules.py') fell outside
+# the widened-but-still-too-narrow leading-context class.
+
+def test_self_protect_blocks_patch_and_sponge():
+    assert evaluate(_shell("patch aegis/rules.py < evil.patch"), EMPTY).blocked
+    assert evaluate(_shell("patch -i evil.patch aegis/rules.py"), EMPTY).blocked
+    d = evaluate(_shell("cat evil.py | sponge aegis/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_blocks_nospace_redirect():
+    assert evaluate(_shell("echo pwned>aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("echo pwned>.aegis/policies/policy.yaml"), EMPTY).blocked
+
+
+# --- 4e. the shell-only widening must not leak into the Edit/Write path check
+# AEGIS_SOURCE_RE (path-argument checks: Edit/Write file_path, lifecycle
+# ConfigChange) stays on the narrow anchor deliberately — a fix that widened it
+# globally made 'My aegis/rules.py' (space right before the segment) false-
+# positive as self-protect on a plain Edit, with no way to override. The wider
+# boundary lives only in AEGIS_SOURCE_SHELL_RE, scanned against shell command
+# text, never a raw path argument.
+
+def test_self_protect_edit_path_argument_stays_narrow():
+    assert not evaluate(_edit("My aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_edit("aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_edit("some/proj/aegis/patterns.py"), EMPTY).blocked
+
+
+# --- 4f. documented, intentional: source path mentioned + a write verb ANYWHERE
+# in the same shell command blocks, matching the guard's pre-existing behavior
+# for '.aegis'/'.claude' (see test_self_protect_copy_over_policy_blocked): it
+# does not correlate the verb with its actual target. self-protect is
+# non-escapable by design and biases toward over-blocking, consistent with
+# CONFIG_DIR_RE's existing behavior — this is not a regression, just the same
+# trade-off extended to source .py files.
+
+def test_self_protect_source_mention_plus_verb_is_position_blind_by_design():
+    assert evaluate(_shell("cp aegis/rules.py /tmp/backup_rules.py"), EMPTY).blocked
+    assert evaluate(_shell("cat aegis/rules.py > /tmp/review.txt"), EMPTY).blocked
 
 
 # --- 5. malformed policy must not silently fail open -------------------------

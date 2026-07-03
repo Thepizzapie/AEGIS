@@ -147,11 +147,12 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
             return Decision(Action.DENY, "self-protect",
                             "Running `aegis pull` is blocked — overwriting policy from a "
                             "shell is a self-protect violation.")
-        if (patterns.CONFIG_DIR_RE.search(cmd) or patterns.AEGIS_SOURCE_RE.search(cmd)) and (
+        if (patterns.CONFIG_DIR_RE.search(cmd) or patterns.AEGIS_SOURCE_SHELL_RE.search(cmd)) and (
                 patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                 or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                 or patterns.WRITE_REDIRECT_RE.search(cmd)
-                or patterns.COPY_WRITE_VERB_RE.search(cmd)):
+                or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                or patterns.INPLACE_WRITE_RE.search(cmd)):
             return Decision(Action.DENY, "self-protect",
                             "Writing/deleting/moving Aegis's own config, policy, or engine "
                             "source is blocked.")

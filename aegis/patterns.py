@@ -113,12 +113,29 @@ ENFORCEMENT_PATH_RE = re.compile(
 # that merely contains '.aegis' or '.claude' (e.g. 'notes.aegis.bak', '.claude-x').
 CONFIG_DIR_RE = re.compile(
     r"\.aegis(?=[/\\]|\s|['\"]|$)|\.claude(?=[/\\]|\s|['\"]|$)", re.IGNORECASE)
-# Aegis's OWN package source — editing/deleting it could neuter the engine
+# Aegis's OWN package source — editing/deleting it could neuter the engine. Used
+# for PATH-ARGUMENT checks (Edit/Write file_path, lifecycle ConfigChange) where the
+# value is a clean filesystem path, so a narrow anchor (start-of-string or a path
+# separator right before 'aegis') is correct and doesn't need widening.
 AEGIS_SOURCE_RE = re.compile(
     r"(?:^|[/\\])aegis[/\\](?:__init__|rules|patterns|engine|policy|gate|attest|"
     r"identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
     r"accountability|gitsurface|review|context|failures|skills|distribution)\.py\b"
     r"|(?:^|[/\\])aegis[/\\](?:adapters|lifecycle)[/\\]\w+\.py\b",
+    re.IGNORECASE,
+)
+# Same source-file set, but for scanning a SHELL COMMAND STRING (rule_self_protect's
+# shell branch only — never used on a raw path argument). There the path is one token
+# among others, so it can be preceded by whitespace, a quote, '=' (`--file=aegis/x.py`),
+# or a shell metacharacter glued directly against it with no space
+# (`echo x>aegis/rules.py`, `cmd|sponge aegis/rules.py`) — none of which the narrow
+# anchor above sees. 'myaegis/rules.py' still does NOT match: nothing in the class
+# precedes 'aegis' there either.
+AEGIS_SOURCE_SHELL_RE = re.compile(
+    r"(?:^|[\s'\"/\\=<>|;&(])aegis[/\\](?:__init__|rules|patterns|engine|policy|gate|"
+    r"attest|identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
+    r"accountability|gitsurface|review|context|failures|skills|distribution)\.py\b"
+    r"|(?:^|[\s'\"/\\=<>|;&(])aegis[/\\](?:adapters|lifecycle)[/\\]\w+\.py\b",
     re.IGNORECASE,
 )
 # Aegis's shipped skills (.claude/skills/aegis-*) — they carry the compliance
@@ -265,18 +282,21 @@ MCP_CONFIG_PATH_RE = re.compile(
 
 # In-place edit / copy-over-target verbs — a config-file overwrite that is NEITHER a
 # redirect/tee NOR a delete/move (sed -i, perl -i, batch-mode vim/ex, cp/copy the file
-# over the target, dd, or a python/node/ruby/perl one-liner script that writes it).
-# Paired with MCP_CONFIG_PATH_RE (the target filename must be literally present) so
-# this stays high-signal despite the broad verb list. Deliberately excludes coreutils
-# `install` — indistinguishable by regex from `npm install`/`pip install` and would
-# false-positive whenever an unrelated install command shares a shell line with a mere
-# READ of the config file.
+# over the target, dd, patch/git-apply, moreutils sponge, or a python/node/ruby/perl
+# one-liner script that writes it). Paired with MCP_CONFIG_PATH_RE and, for
+# self-protection, with CONFIG_DIR_RE / AEGIS_SOURCE_SHELL_RE (the target filename
+# must be literally present) so this stays high-signal despite the broad verb list.
+# Deliberately excludes coreutils `install` — indistinguishable by regex from `npm
+# install`/`pip install` and would false-positive whenever an unrelated install
+# command shares a shell line with a mere READ of the config file.
 INPLACE_WRITE_RE = re.compile(
     r"\bsed\b[^|;&\n]*-i\b"
     r"|\bperl\b[^|;&\n]*-i\b"
     r"|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
     r"|\bcp\b|\bcopy\b"
     r"|\bdd\b"
+    r"|\bpatch\b"                                        # patch <target> [< diff] / patch -i diff <target>
+    r"|\bsponge\b"                                        # moreutils: cmd | sponge <target>
     r"|\b(?:python3?|node|ruby|perl)\b[^|;&\n]*\s-[ce]\b",
     re.IGNORECASE,
 )
