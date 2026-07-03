@@ -37,47 +37,56 @@ def _mask_nested_separators(cmd: str) -> str:
     a live bypass found in round-5 adversarial QA of
     ``_self_protect_overwrite_in_same_statement``.
 
-    Best-effort, single linear pass; malformed/unbalanced quoting or nesting just
-    falls through with the remainder of the string unmodified, which fails toward
-    the PRE-existing, safe-by-over-splitting behavior (a stray boundary still
-    splits), not toward a new bypass."""
+    A single explicit-stack scanner, not independent quote/paren branches: a QUOTE
+    context always takes priority over paren-depth counting, consuming everything
+    up to its own closing quote (including any '(' / ')' inside it) without ever
+    touching the paren depth. Round-6 adversarial QA found that scanning $(...)'s
+    depth WITHOUT quote-awareness lets an unescaped ')' inside a nested quoted
+    string end the substitution early (``$(: "x)")`` closes at the quote's ')',
+    not the real one), leaving a later ';' that is still logically inside the
+    outer $(...) unmasked — fracturing one genuine overwrite into two
+    innocent-looking statement halves and bypassing the guard entirely. Because
+    quotes now always consume their own contents first regardless of what
+    'sub'-context surrounds them, a stray ')' inside a quote can never be
+    misread as closing a substitution it isn't part of.
+
+    Best-effort, single linear pass; malformed/unbalanced quoting or nesting
+    (an unclosed quote or substitution) just consumes to the end of the string
+    under whatever context was open, which fails toward the PRE-existing,
+    safe-by-over-splitting behavior (a stray boundary still splits), not toward
+    a new bypass — never raises."""
     out = list(cmd)
     n = len(cmd)
+    stack = []  # 'sq' | 'dq' | 'bq' | 'sub' (single/double-quote, backtick, $(...))
     i = 0
     while i < n:
         c = cmd[i]
-        if c in ("'", '"'):
-            q = c
-            j = i + 1
-            while j < n and cmd[j] != q:
-                if cmd[j] in _STMT_SEP_CHARS:
-                    out[j] = " "
-                j += 1
-            i = j + 1 if j < n else n
+        top = stack[-1] if stack else None
+        if top in ("sq", "dq", "bq"):
+            close = {"sq": "'", "dq": '"', "bq": "`"}[top]
+            if c == close:
+                stack.pop()
+            elif c in _STMT_SEP_CHARS:
+                out[i] = " "
+            i += 1
             continue
-        if c == "`":
-            j = i + 1
-            while j < n and cmd[j] != "`":
-                if cmd[j] in _STMT_SEP_CHARS:
-                    out[j] = " "
-                j += 1
-            i = j + 1 if j < n else n
-            continue
-        if c == "$" and i + 1 < n and cmd[i + 1] == "(":
-            depth = 1
-            j = i + 2
-            while j < n and depth > 0:
-                if cmd[j] == "(":
-                    depth += 1
-                elif cmd[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                elif cmd[j] in _STMT_SEP_CHARS:
-                    out[j] = " "
-                j += 1
-            i = j + 1 if j < n else n
-            continue
+        # top is None (true top level) or 'sub' (inside a $(...) / nested paren) —
+        # never inside a quote here, so quote/substitution starts are recognized.
+        if c == "'":
+            stack.append("sq")
+        elif c == '"':
+            stack.append("dq")
+        elif c == "`":
+            stack.append("bq")
+        elif c == "$" and i + 1 < n and cmd[i + 1] == "(":
+            stack.append("sub")
+            i += 1  # extra advance below consumes the '(' itself
+        elif c == "(" and top == "sub":
+            stack.append("sub")           # nested paren inside an existing substitution
+        elif c == ")" and top == "sub":
+            stack.pop()
+        elif top == "sub" and c in _STMT_SEP_CHARS:
+            out[i] = " "
         i += 1
     return "".join(out)
 

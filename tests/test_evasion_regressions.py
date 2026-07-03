@@ -347,6 +347,36 @@ def test_self_protect_quoted_separator_with_no_verb_stays_allowed():
     assert not rule_self_protect(_shell('echo "a;b" && cat aegis/rules.py'), None)
 
 
+# --- 4l. round-6 adversarial QA: a stray ')' inside a nested QUOTE within
+# $(...) must not be mistaken for the substitution's own closing paren --------
+# _mask_nested_separators originally counted $(...) depth WITHOUT tracking
+# quote state, so an unescaped ')' inside a quoted string nested inside the
+# substitution (`$(: $(: "x)") ; ...)`) closed the depth-counter's idea of the
+# substitution early. A ';' that followed — still logically inside the OUTER
+# $(...), not a real statement boundary — was then left unmasked, fracturing
+# one genuine in-place edit into two innocent-looking halves and bypassing the
+# guard entirely (confirmed by actually running the resulting sed command: it
+# really did rewrite the target file). Fixed by making quote context always
+# take priority over paren-depth counting via a single explicit-stack scanner.
+
+def test_self_protect_blocks_overwrite_hidden_by_quote_confused_paren_depth():
+    cmd = 'sed -i $(: $(: "x)") ; echo s/deny/allow/) .aegis/policies/policy.yaml'
+    d = evaluate(_shell(cmd), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_mask_nested_separators_never_raises_on_malformed_input():
+    from aegis.rules import _mask_nested_separators
+
+    for cmd in (
+        "", '"', "'", "`", "$(", "$((", "$(((",
+        "$($($(echo hi)))", "$(a `b` c)", "`a $(b) c`",
+        'echo "unterminated', "echo 'unterminated", "echo )))",
+        "echo $(a) $(b) $(c)", "a\"b'c$(d\"e)f",
+    ):
+        _mask_nested_separators(cmd)  # must not raise
+
+
 # --- 5. malformed policy must not silently fail open -------------------------
 
 def test_malformed_lifecycle_knob_preserves_policy(tmp_path):
