@@ -241,6 +241,51 @@ def test_self_protect_git_checkout_restore_elsewhere_allowed():
     assert not rule_self_protect(_shell("git restore myfile.py"), None)
 
 
+# --- 4h. round-3 adversarial QA: the git checkout/restore fix (4g) was itself
+# too broad — 'git checkout -- <path>' / 'git restore <path>' with NO other-ref
+# is the standard "discard my own uncommitted edit" idiom (restores from the
+# index/HEAD, not injected content), not an attack. A non-escapable guard
+# false-positiving on routine "undo my edit to aegis/rules.py" would actively
+# break normal agent workflows. Requires an explicit --source=<ref> / -s <ref>
+# (restore) or a positional <ref> before '--' (checkout) to fire.
+
+def test_self_protect_bare_checkout_restore_of_source_allowed():
+    assert not rule_self_protect(_shell("git checkout -- aegis/rules.py"), None)
+    assert not rule_self_protect(_shell("git checkout aegis/rules.py"), None)
+    assert not rule_self_protect(_shell("git restore aegis/rules.py"), None)
+    assert not rule_self_protect(_shell("git restore .aegis/policies/policy.yaml"), None)
+
+
+def test_self_protect_checkout_restore_with_explicit_other_ref_still_blocked():
+    assert evaluate(_shell("git checkout other-branch -- aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("git restore --source=HEAD~1 -- aegis/rules.py"), EMPTY).blocked
+    d = evaluate(_shell("git restore -s HEAD~1 aegis/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+# --- 4i. round-3 adversarial QA: truncate's GNU long flag, 'ed', 'xxd -r' -----
+# truncate's short '-s 0' was matched but not '--size 0'/'--size=0'; the POSIX
+# line editor 'ed' and 'xxd -r' (hex-dump-to-binary reverse write) weren't in
+# any verb list at all.
+
+def test_self_protect_blocks_truncate_long_flag():
+    assert evaluate(_shell("truncate --size 0 aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("truncate --size=0 .aegis/policies/policy.yaml"), EMPTY).blocked
+
+
+def test_self_protect_blocks_ed_and_xxd_reverse():
+    assert evaluate(_shell("ed -s aegis/rules.py"), EMPTY).blocked
+    d = evaluate(_shell("xxd -r -p /tmp/in aegis/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_ed_anchored_to_command_position_not_bare_word():
+    # 'ed' must not fire on the bare word appearing as an argument/grep pattern/
+    # commit-hash fragment elsewhere in the command
+    assert not rule_self_protect(_shell("grep -rn 'ed' aegis/rules.py"), None)
+    assert not rule_self_protect(_shell("git show ed1234 -- aegis/rules.py"), None)
+
+
 # --- 5. malformed policy must not silently fail open -------------------------
 
 def test_malformed_lifecycle_knob_preserves_policy(tmp_path):

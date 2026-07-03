@@ -44,7 +44,7 @@ DESTRUCTIVE_DELETE_RE = re.compile(
     r"|\bfind\b[^|;&\n]*-(?:delete\b|exec\s+rm\b)"   # find -delete / -exec rm
     r"|\brimraf\b"                                    # npm rimraf (always recursive-force)
     r"|\bshred\b"                                     # secure delete
-    r"|\btruncate\b[^|;&\n]*\s-s\s*0\b"               # zero a file
+    r"|\btruncate\b[^|;&\n]*\s(?:-s\s*0\b|--size[= ]0\b)"  # zero a file (short or GNU long flag)
     r"|\bdd\b[^|;&\n]*\bof=/dev/",                    # overwrite a raw device
     re.IGNORECASE,
 )
@@ -301,16 +301,31 @@ MCP_CONFIG_PATH_RE = re.compile(
 # string in the command being scanned. Same class of gap as a value built from a
 # shell variable set in an earlier, separate tool call. Deny-by-default egress plus
 # the install-review gate are the backstops for payloads that arrive this way.
+# Also NOT covered: redundant path separators / dot-segments referring to the same
+# file (`aegis//rules.py`, `aegis/./rules.py`) — the path regexes expect a single
+# canonical separator between segments. Rare in practice (nothing routine produces
+# these) and not yet closed; flagged here rather than silently left unstated.
 INPLACE_WRITE_RE = re.compile(
     r"\bsed\b[^|;&\n]*(?:-i\b|--in-place\b)"
     r"|\bperl\b[^|;&\n]*-i\b"
     r"|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
+    # POSIX line editor 'ed' also writes its target in place. Anchored to COMMAND
+    # position (not \bed\b) — the bare word is too common as an argument/grep
+    # pattern/commit-hash fragment ('ed1234...') to safely match anywhere.
+    r"|(?:^|[;&|\n]\s*)(?:sudo\s+)?ed\b"
+    r"|\bxxd\b[^|;&\n]*\s-r\b"                             # xxd -r[-p]: reverse (hex-dump-to-binary) write
     r"|\b(?:g?awk)\b[^|;&\n]*-i\s*inplace\b"
     r"|\bcp\b|\bcopy\b"
     r"|\bdd\b"
     r"|\bpatch\b"                                        # patch <target> [< diff] / patch -i diff <target>
     r"|\bsponge\b"                                        # moreutils: cmd | sponge <target>
-    r"|\bgit\b[^|;&\n]*\b(?:checkout|restore)\b"         # git checkout <ref> -- <path> / git restore --source=<ref> <path>
+    # git checkout/restore of a path FROM ANOTHER REF only — bare 'git checkout --
+    # <path>' / 'git restore <path>' (no other-ref) is the standard "discard my own
+    # uncommitted edit" idiom (restores from the index/HEAD, not injected content)
+    # and must stay allowed; a non-escapable guard false-positiving on it would
+    # actively break routine agent workflows (found in round-3 adversarial QA).
+    r"|\bgit\b[^|;&\n]*\bcheckout\b\s+(?!--(?:\s|$))\S+\s+--(?:\s|$)"
+    r"|\bgit\b[^|;&\n]*\brestore\b[^|;&\n]*(?:--source[= ]|-s\s)"
     r"|\b(?:python3?|node|ruby|perl)\b[^|;&\n]*\s-[ce]\b",
     re.IGNORECASE,
 )
