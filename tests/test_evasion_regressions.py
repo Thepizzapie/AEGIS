@@ -286,6 +286,35 @@ def test_self_protect_ed_anchored_to_command_position_not_bare_word():
     assert not rule_self_protect(_shell("git show ed1234 -- aegis/rules.py"), None)
 
 
+# --- 4j. round-4 adversarial QA: an overwrite verb and a source-path mention in
+# DIFFERENT statements of a compound command must NOT cross-trigger -----------
+# self-protect's position-blind design (4f) was meant to scope "verb present +
+# path present" to describe one statement, but a bare-space join in
+# normalize.scan_surface's de-obfuscated variants let the tail of one part run
+# into the head of the next with no boundary — so an unrelated write earlier in
+# a chain (`echo x > scratch.txt && cat aegis/rules.py`, a mere READ) false-
+# positived as an overwrite. Fixed by joining scan_surface's parts with '; '
+# (a real statement separator) and requiring verb+path co-occur within the same
+# split statement.
+
+def test_self_protect_unrelated_verb_then_read_in_compound_command_allowed():
+    assert not rule_self_protect(
+        _shell("echo 'edited' > /tmp/scratch.txt && cat aegis/rules.py"), None)
+    assert not rule_self_protect(
+        _shell("npm test 2>&1 | tee build.log && cat aegis/rules.py"), None)
+    assert not rule_self_protect(
+        _shell("cp foo.txt bar.txt && grep -n def aegis/rules.py"), None)
+
+
+def test_self_protect_same_statement_overwrite_still_blocked_in_compound_command():
+    # the overwrite itself, chained with an unrelated statement either side,
+    # must still block — only cross-statement correlation was the bug
+    assert rule_self_protect(_shell("ls -la && echo x > .aegis/policies/p.yaml"), None)
+    assert rule_self_protect(_shell("echo x > .aegis/policies/p.yaml && ls -la"), None)
+    assert rule_self_protect(
+        _shell("echo hi && sed -i 's/deny/allow/' .aegis/policies/policy.yaml"), None)
+
+
 # --- 5. malformed policy must not silently fail open -------------------------
 
 def test_malformed_lifecycle_knob_preserves_policy(tmp_path):

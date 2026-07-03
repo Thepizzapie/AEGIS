@@ -59,4 +59,14 @@ def scan_surface(cmd, _depth=0) -> str:
             inner = m.group(m.lastindex)
             if inner:
                 parts.append(scan_surface(inner, _depth + 1))
-    return " ".join(p for p in parts if p)
+    # Joined with '; ' (a statement separator), not a bare space: each part is an
+    # independent alternate reading of the SAME command (raw / quote-stripped /
+    # decoded), never a sequence of things that actually ran one after another.
+    # A bare-space join let the tail of one part run on into the head of the next
+    # with no boundary at all — a guard that scopes a check to "the same shell
+    # statement" (splitting on ;/&/|) would see two unrelated parts' fragments
+    # fused into one fake statement at that seam. '; ' gives every consumer that
+    # already splits on statement separators a real boundary there; plain
+    # substring `.search()` matching (nearly every other guard) is unaffected —
+    # the join character was never load-bearing for those.
+    return "; ".join(p for p in parts if p)

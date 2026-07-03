@@ -59,3 +59,19 @@ def test_evasion_rule_flags_encoded_blob(monkeypatch):
     monkeypatch.delenv("AEGIS_AGENT_NAME", raising=False)
     b64 = base64.b64encode(b"harmless").decode()
     assert evaluate(_sh(f"powershell -enc {b64}"), Policy()).blocked
+
+
+def test_scan_surface_joins_parts_with_a_statement_boundary():
+    """scan_surface's alternate readings (raw / quote-stripped / decoded) are
+    independent parts, never a real sequence — joining them with a bare space
+    let the tail of one run into the head of the next with no boundary, so a
+    guard that scopes a check to 'the same shell statement' (splitting on
+    ;/&/|) could see two unrelated parts fuse into one fake statement at that
+    seam. Confirms the join now leaves a real separator there."""
+    from aegis import normalize
+
+    surface = normalize.scan_surface("echo 'hi' > /tmp/x.txt && cat aegis/rules.py")
+    # the quote-stripped duplicate's own head must not run on into the raw
+    # part's tail with nothing but a space between them
+    assert "rules.py echo" not in surface
+    assert "rules.py; echo" in surface or "rules.py;echo" in surface

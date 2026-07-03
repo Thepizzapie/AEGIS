@@ -21,6 +21,7 @@ from .events import ActionClass, Event, HookEvent
 from .policy import Action, Decision
 
 _URL_RE = re.compile(r"https?://([^/\s'\"]+)", re.IGNORECASE)
+_STMT_SPLIT_RE = re.compile(r"[;&|\n]+")
 
 
 def _cmd(ev: Event) -> str:
@@ -137,6 +138,29 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
 
 
 # ---- self-protection: never escapable ----------------------------------------
+def _self_protect_overwrite_in_same_statement(cmd: str) -> bool:
+    """A config/source-path mention and an overwrite verb must land in the SAME
+    shell statement (split on ;/&/|/newline), not just anywhere on the line —
+    otherwise an unrelated write earlier in a compound command (`echo x >
+    scratch.txt && cat aegis/rules.py`) false-positives as an overwrite of
+    aegis/rules.py itself, even though that segment only reads it. Found in
+    round-4 adversarial QA; relies on normalize.scan_surface joining its
+    de-obfuscated variants with '; ' (not a bare space) so a statement boundary
+    at a part seam splits cleanly too, instead of fusing the tail of one part
+    into the head of the next."""
+    for stmt in _STMT_SPLIT_RE.split(cmd):
+        if not stmt:
+            continue
+        if (patterns.CONFIG_DIR_RE.search(stmt) or patterns.AEGIS_SOURCE_SHELL_RE.search(stmt)) and (
+                patterns.DELETE_OR_MOVE_VERB_RE.search(stmt)
+                or patterns.DESTRUCTIVE_DELETE_RE.search(stmt)
+                or patterns.WRITE_REDIRECT_RE.search(stmt)
+                or patterns.COPY_WRITE_VERB_RE.search(stmt)
+                or patterns.INPLACE_WRITE_RE.search(stmt)):
+            return True
+    return False
+
+
 def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         cmd = _shell_scan(ev)
@@ -147,12 +171,7 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
             return Decision(Action.DENY, "self-protect",
                             "Running `aegis pull` is blocked — overwriting policy from a "
                             "shell is a self-protect violation.")
-        if (patterns.CONFIG_DIR_RE.search(cmd) or patterns.AEGIS_SOURCE_SHELL_RE.search(cmd)) and (
-                patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
-                or patterns.WRITE_REDIRECT_RE.search(cmd)
-                or patterns.COPY_WRITE_VERB_RE.search(cmd)
-                or patterns.INPLACE_WRITE_RE.search(cmd)):
+        if _self_protect_overwrite_in_same_statement(cmd):
             return Decision(Action.DENY, "self-protect",
                             "Writing/deleting/moving Aegis's own config, policy, or engine "
                             "source is blocked.")
