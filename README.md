@@ -39,7 +39,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 | Guard | Catches | Escapable |
 |---|---|---|
 | Containment | Reads of credential stores (`~/.ssh`, `~/.aws`, `.netrc`, browser logins, DPAPI), file exfiltration (`curl -T`/`-d @`, `-InFile`), persistence (cron, registry autorun, scheduled tasks, services) | No |
-| Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source — via delete/move, a shell redirect, `cp`/`dd`, an in-place edit (`sed -i`, `perl -i`, batch `vim -c wq`, `patch`, moreutils `sponge`), or a bare relative path with no leading `./`; `aegis uninstall`/`pull` | No |
+| Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source — via delete/move, a shell redirect, `cp`/`dd`/local `rsync`/`scp`, an in-place edit (`sed -i`/`--in-place`, `perl -i`, batch `vim -c wq`, `gawk -i inplace`, `patch`, moreutils `sponge`, `ed`), `git checkout`/`restore` from another ref, or a bare relative path with no leading `./`; `aegis uninstall`/`pull`. Scoped to a single shell statement — chaining an unrelated write with a mere read of Aegis's source elsewhere in the same command line doesn't trigger it, even hidden behind a `$(...)` substitution | No |
 | Evasion | Encoded/obfuscated commands (`-EncodedCommand`, `base64 -d \| bash`, char-code) | No |
 | MCP config | Writes to MCP server-config files (`.mcp.json`, `mcpServers`, etc.) that auto-run on every future session | Human only |
 | Destructive SQL | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, migration resets — from shell **and** DB tool args | Yes |
