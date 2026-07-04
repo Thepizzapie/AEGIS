@@ -133,6 +133,10 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev) and patterns.EXFIL_RE.search(text):
         return Decision(Action.DENY, "containment-exfiltration",
                         "Uploading local files to the network is blocked.")
+    if _is_shell(ev) and patterns.CLOUD_EXFIL_RE.search(text):
+        return Decision(Action.DENY, "containment-cloud-exfiltration",
+                        "Uploading local files to a cloud storage bucket/container "
+                        "(aws s3 / gsutil / az storage / rclone) is blocked.")
     return None
 
 

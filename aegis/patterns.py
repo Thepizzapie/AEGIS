@@ -187,6 +187,66 @@ EXFIL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cloud-storage CLI exfiltration — upload a local file/tree to an
+# attacker-controlled bucket/container via a cloud storage CLI. A documented gap
+# (README "Known gaps"): EXFIL_RE only covers curl/wget/scp/rsync/nc/httpie, so an
+# agent with cloud creds already on the box (env vars, an attached IAM role,
+# ~/.aws) could stage the same theft through a cloud CLI instead and sail
+# straight past the existing exfil guard. Direction-aware where a verb is
+# ambiguous (cp/sync/mv/copy can go either way): the negative lookahead requires
+# the FIRST path-like argument NOT be a remote URI/remote-name, i.e. the source
+# is local — so a legitimate DOWNLOAD (pull an artifact FROM a bucket) is not
+# blocked, and a --dryrun/-n/--dry-run preview (no data actually moves) is
+# excluded. Verbs that are upload-only regardless of argument order (s3api
+# put-object, b2 upload-file, oci os object put, az storage upload) match
+# unconditionally; `az storage copy` is direction-checked via its -s/-d flags
+# since they can appear in either order. Covers aws s3 / s5cmd (s3://), gsutil /
+# gcloud storage (gs://), az storage, rclone (incl. on-the-fly `:provider,...:`
+# remotes). Not exhaustive — bucket-to-bucket transfers, alias-only clients (mc,
+# doctl) with no scheme in the destination, and shell-level evasions shared by
+# every pattern in this module (a value split across a variable, e.g.
+# `$SCHEME://bucket`, or dangerous text sitting only in a comment/string) are a
+# residual gap, same spirit as the other documented denylist gaps.
+CLOUD_EXFIL_RE = re.compile(
+    # Each dry-run exclusion requires the flag be the token IMMEDIATELY after
+    # the verb — not "somewhere in a leading run of dash-tokens" (tried and
+    # broken: pflag-style parsers, e.g. rclone's, let a real VALUE-taking flag
+    # silently swallow a following token as its argument — `--exclude
+    # --dry-run` is really `--exclude` with the literal string "--dry-run" as
+    # its pattern, so no dry-run ever engages and the transfer is real — but a
+    # regex with no per-flag arity table can't tell "--dry-run" the flag from
+    # "--dry-run" a preceding flag's value). Two earlier attempts also failed:
+    # scanning the whole clause let the flag be spoofed inside an
+    # attacker-controlled destination argument; bounding at the destination's
+    # scheme marker then let it be spoofed inside the SOURCE argument instead.
+    # Requiring the single fixed first-token position removes any place before
+    # it for another flag to sit, so there is nothing left to swallow it —
+    # at the cost of not recognizing a dry-run flag placed after some other
+    # flag (a false positive, the safe direction for a non-escapable guard).
+    r"\baws\b[^|;&\n]*\bs3\b[^|;&\n]*\b(?:cp|sync|mv)\b"
+    r"(?!\s--dryrun(?=\s|[|;&\n]|$))"
+    r"\s+(?!s3://)\S+[^|;&\n]*\bs3://"
+    r"|\baws\b[^|;&\n]*\bs3api\b[^|;&\n]*\bput-object\b"
+    r"|\bs5cmd\b[^|;&\n]*\b(?:cp|mv|sync)\b\s+(?!s3://)\S+[^|;&\n]*\bs3://"
+    r"|\bgsutil\b[^|;&\n]*\b(?:cp|mv|rsync)\b"
+    r"(?!\s(?:-n|--dry-run)(?=\s|[|;&\n]|$))"
+    r"\s+(?!gs://)\S+[^|;&\n]*\bgs://"
+    r"|\bgcloud\b[^|;&\n]*\bstorage\b[^|;&\n]*\b(?:cp|mv|rsync)\b"
+    r"(?!\s--dry-run(?=\s|[|;&\n]|$))"
+    r"\s+(?!gs://)\S+[^|;&\n]*\bgs://"
+    r"|\baz\b[^|;&\n]*\bstorage\b[^|;&\n]*\b(?:blob|file|fs)\b[^|;&\n]*\bupload(?:-batch)?\b"
+    r"|\baz\b[^|;&\n]*\bstorage\b[^|;&\n]*\bcopy\b"
+    r"(?![^|;&\n]*(?:-s|--source)\s+https?://)[^|;&\n]*(?:-d|--destination)\s+\S*"
+    r"(?:blob|file)\.core\.\w"
+    r"|\bb2\b[^|;&\n]*\bupload-file\b"
+    r"|\boci\b[^|;&\n]*\bos\b[^|;&\n]*\bobject\b[^|;&\n]*\bput\b"
+    r"|\brclone\b[^|;&\n]*\b(?:copy|sync|move|copyto|moveto)\b"
+    r"(?!\s(?:--dry-run|-n)(?=\s|[|;&\n]|$))"
+    r"\s+(?![A-Za-z][\w.-]+:|:\w[\w,.=-]*:)\S+[^|;&\n]*"
+    r"\s(?:[A-Za-z][\w.-]+:|:\w[\w,.=-]*:)\S*",
+    re.IGNORECASE,
+)
+
 # Copy/write programs that can OVERWRITE a file without a delete/move verb or a
 # shell redirect — the self-protect gap (cp/dd/install onto the policy file,
 # ln over it, a python open(...,'w')). Paired with a config/source path match.
