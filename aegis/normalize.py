@@ -16,6 +16,7 @@ import re
 
 _MAX = 20000  # never spend unbounded effort on a giant blob
 
+_LINE_CONT_RE = re.compile(r"\\\s*\r?\n")  # bash/PowerShell backslash-newline continuation
 _QUOTE_SPLIT_RE = re.compile(r"['\"`^]")
 _PS_ENC_RE = re.compile(r"-(?:e|ec|enc|encodedcommand)\b\s+([A-Za-z0-9+/=]{12,})", re.IGNORECASE)
 _B64_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=]{20,}")
@@ -44,6 +45,7 @@ def scan_surface(cmd, _depth=0) -> str:
     if not cmd or _depth > 3:
         return cmd or ""
     cmd = str(cmd)[:_MAX]
+    cmd = _LINE_CONT_RE.sub(" ", cmd)  # join a continued line before any pattern scans it
     parts = [cmd, _QUOTE_SPLIT_RE.sub("", cmd)]  # raw + token-split-stripped
     for m in _PS_ENC_RE.finditer(cmd):           # PowerShell encoded command
         dec = _b64(m.group(1), utf16=True) or _b64(m.group(1))
