@@ -136,3 +136,8 @@ class Policy:
     # Stop gate: after file mutations, the session may not stop until a test run
     # is recorded after the last change. See lifecycle.session.
     completion: dict = field(default_factory=dict)
+    # Prompt-injection guard: {mode: deny|ask|monitor|off} — flag/deny a
+    # UserPromptSubmit carrying invisible/steganographic Unicode (Tag-block
+    # "ASCII smuggling", or a run of zero-width characters). Empty -> defaults
+    # (mode=deny) apply. See lifecycle.prompt.rule_prompt_injection.
+    prompt_injection: dict = field(default_factory=dict)

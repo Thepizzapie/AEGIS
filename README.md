@@ -50,10 +50,11 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 | Failure loop | The Nth identical retry of a call that keeps failing (default 3) | Human only |
 | Workspace confinement | Edits/writes outside the agent's project root | No, once bound |
 | Network egress | Outbound hosts against an allow/deny list | Policy-driven |
+| Prompt injection (hidden Unicode) | A submitted prompt carrying invisible Unicode "tag" characters, stacked variation selectors, or a run of zero-width characters (ASCII smuggling) — hidden instructions a human reviewer wouldn't see in a forwarded ticket/issue/email | Env var only (`AEGIS_ALLOW_HIDDEN_UNICODE=1`, human/orchestrator, pre-launch) |
 
 Built-in guards run before your declarative rules and can only deny or abstain, so a permissive rule (even `tools: ["*"]` for an admin) can't re-open a built-in. To relax one, disable it explicitly.
 
-Beyond tool calls, Aegis covers the full lifecycle surface (sub-agent fan-out, task/stop completion gates, worktree confinement, context-compaction gates). Most are opt-in via policy knobs.
+Beyond tool calls, Aegis covers the full lifecycle surface (sub-agent fan-out, task/stop completion gates, worktree confinement, context-compaction gates, and the `UserPromptSubmit` prompt-injection check above). Most are opt-in via policy knobs; the prompt-injection check ships on by default like the other secure-by-default guards — tune it with `prompt_injection: {mode: deny|ask|monitor|off}`.
 
 ## Policy
 

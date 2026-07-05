@@ -366,6 +366,102 @@ NOEXEC_FETCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Invisible / steganographic prompt injection ("ASCII smuggling") ----------
+#
+# Three rounds of adversarial review reshaped this section. The pattern that
+# emerged: any exemption/threshold carved out for a codepoint range with real,
+# FREQUENT legitimate use (regional-flag tag sequences, the common VS16 emoji-
+# presentation selector, ZWJ/ZWNJ emoji-and-script joiners) is also a channel
+# an attacker can budget against — cap it high enough to avoid false positives
+# and a chunked/interleaved payload fits under the cap; cap it low enough to
+# close the channel and ordinary busy text starts false-positiving. Splitting
+# each codepoint class into a FREQUENT-legitimate-use subset (exempt from
+# counting, run-check only) and a RARE-legitimate-use subset (aggressively
+# counted) resolves the tension: the frequent subset has too little smuggling
+# bandwidth to matter (see notes below); the rare subset has essentially zero
+# ordinary explanation for appearing at all, so it can be gated hard.
+#
+# Unicode Tag block (U+E0001 LANGUAGE TAG, U+E0020-U+E007E TAG chars, U+E007F
+# CANCEL TAG) renders as NOTHING in every mainstream font/terminal/chat client,
+# yet each tag character maps 1:1 onto an ASCII byte -- the documented "ASCII
+# smuggling" technique (Embrace The Red / Rehberger, 2024) for hiding full
+# instructions inside otherwise-innocuous text (a forwarded ticket, issue body,
+# email, webhook payload) that a human reviewer sees as clean.
+#
+# The one real-world legitimate use is a regional-flag emoji sequence (black
+# flag + tag-encoded subdivision code + cancel tag, e.g. Scotland/Wales/
+# England) — but round 3 confirmed that ANY exemption logic for it, however
+# tightly bounded (short body, single flag-closed run, capped run count), still
+# left enough budget to smuggle a complete destructive one-liner (e.g. "rm -rf
+# /" split across exactly two 5-character "flag" chunks). Regional-flag emoji
+# essentially never appear in tickets/issues/webhook payloads forwarded to a
+# coding agent, so the fix is to drop the exemption entirely: ANY Tag-block
+# character at all is flagged, full stop. The rare false positive (a message
+# that happens to contain a real flag-subdivision emoji) is judged cheaper
+# than re-opening an exploitable channel — same tradeoff this project's other
+# guards make explicitly (see README "Guards are a denylist").
+PROMPT_TAG_CHAR_RE = re.compile(r"[\U000E0001\U000E0020-\U000E007F]")
+
+# Variation Selectors: the basic block (U+FE00-U+FE0F, 16 codepoints) picks
+# text-vs-emoji presentation and is FREQUENT and legitimate (e.g. U+2764
+# U+FE0F "red heart"; a string of several such emoji glued together is
+# ordinary chat text) — round 3 confirmed a prompt-wide total-count check on
+# this block false-positives on exactly that. It also has too little capacity
+# to matter: only 16 values, and legitimate use never stacks more than one per
+# base character, so it's gated by a RUN check only (2+ consecutive, with no
+# base character between them, has no ordinary explanation) — a real emoji
+# string never puts two selectors back-to-back.
+#
+# The Variation Selectors Supplement (U+E0100-U+E01EF, 240 codepoints) is a
+# different story: it is the block real "ASCII smuggling via variation
+# selector" encoders actually use (240 values covers a full byte), and its one
+# legitimate use — selecting a standardized CJK glyph variant from the
+# Unicode Ideographic Variation Database — is rare in an ordinary prompt and
+# never stacks more than one per base character either. Gated hard: a
+# prompt-wide TOTAL of 2 or more anywhere (not just a contiguous run — closes
+# the interleaved-with-filler evasion round 2/3 demonstrated) has no ordinary
+# explanation.
+PROMPT_VARIATION_COMMON_RUN_RE = re.compile(r"[\U0000FE00-\U0000FE0F]{2,}")
+PROMPT_VARIATION_RARE_CHAR_RE = re.compile(r"[\U000E0100-\U000E01EF]")
+PROMPT_VARIATION_RARE_TOTAL_THRESHOLD = 2
+
+# Zero-width / invisible formatting characters, split the same way. ZWJ
+# (U+200D) and ZWNJ (U+200C) are FREQUENT and legitimate — ZWJ joins emoji
+# into composite sequences (family/profession emoji can use several per
+# message), ZWNJ is routine in Persian/Indic script — round 3 confirmed a
+# total-count check on these false-positives on an ordinary message
+# mentioning a few family emoji. Real usage never places more than one
+# consecutively with no base character between, so these two are gated by a
+# RUN check only (4+ consecutive has no ordinary explanation — even a complex
+# multi-join emoji sequence interleaves a base character between each ZWJ).
+#
+# Everything else in this class — ZWSP, WORD JOINER, the invisible math
+# operators (FUNCTION APPLICATION / INVISIBLE TIMES / SEPARATOR / PLUS), a
+# mid-text BOM, MONGOLIAN VOWEL SEPARATOR, and the HANGUL/fullwidth filler
+# characters some stego encoders reuse as blank filler — has close to zero
+# ordinary reason to appear in a typical prompt at all, let alone more than
+# once or twice, so it gets the aggressive prompt-wide TOTAL-count gate.
+# Built from chr(0x....) codepoints rather than literal characters in this
+# source file, so every one stays auditable in a diff instead of silently
+# vanishing on screen.
+_INVISIBLE_FREQUENT_CODEPOINTS = (0x200C, 0x200D)  # ZWNJ, ZWJ
+_INVISIBLE_RARE_CODEPOINTS = (
+    0x200B, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0xFEFF, 0x180E, 0x3164, 0xFFA0,
+)
+_INVISIBLE_FREQUENT_CLASS = "".join(chr(c) for c in _INVISIBLE_FREQUENT_CODEPOINTS)
+_INVISIBLE_RARE_CLASS = "".join(chr(c) for c in _INVISIBLE_RARE_CODEPOINTS)
+PROMPT_INVISIBLE_RARE_CHAR_RE = re.compile(f"[{_INVISIBLE_RARE_CLASS}]")
+PROMPT_INVISIBLE_RARE_TOTAL_THRESHOLD = 4
+# A run of 4+ from EITHER subset (or mixed, e.g. ZWJ next to a Mongolian vowel
+# separator) is never ordinary, regardless of the per-class total-count gates
+# above — this single run check covers both subsets so a pure-frequent run
+# (e.g. 4 consecutive ZWJ with no base character between them, which no real
+# emoji sequence ever produces) is still caught even though the frequent
+# subset is exempt from the total-count gate.
+PROMPT_INVISIBLE_ANY_RUN_RE = re.compile(
+    f"[{_INVISIBLE_FREQUENT_CLASS}{_INVISIBLE_RARE_CLASS}]{{4,}}")
+
+
 # A test-suite invocation, across common toolchains. Backs the opt-in Stop
 # verification gate (lifecycle.session.rule_stop_verification_gate): evidence
 # that a test run HAPPENED after the last change — presence of the command, not
