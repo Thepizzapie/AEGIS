@@ -63,11 +63,16 @@ Honest scope: this gates ``UserPromptSubmit`` only. Indirect injection arriving
 via a tool result (a fetched web page, a file read) is a PostToolUse event,
 which is NOT blockable — see README "Known gaps" for the same class of
 limitation on other guards. The FREQUENT-subset run-only checks leave a
-residual, low-bandwidth channel (e.g. using bare ZWJ presence/absence as a
-1-bit-per-position code, interleaved with filler, never forming a run) —
-this requires far more scattered filler text to carry a real message than
-the closed high-bandwidth channels did, and is a deliberately accepted
-residual gap, not a full closure: this is a heuristic denylist, same spirit
+residual, low-bandwidth channel: a fourth review round measured it directly —
+isolated (never-consecutive) ZWJ/ZWNJ markers as a 1-bit-per-position code
+needed ~54x the filler text of the closed high-bandwidth channels to carry
+the same short command, reading as an obviously rambling wall of text rather
+than an ordinary short ticket; a custom nibble-per-selector code on the
+common VS16 block fit more densely, but only works if the model already
+shares the attacker's decode convention out-of-band (no such convention is
+documented anywhere a model would recognize it), unlike the real, previously-
+exploitable techniques this guard targets. Both are deliberately accepted
+residual gaps, not a full closure: this is a heuristic denylist, same spirit
 as every other Aegis guard's documented residual gaps (see README "Limits"),
 not a formal guarantee. Fail-open: any internal error returns None.
 """
