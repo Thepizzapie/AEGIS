@@ -10,6 +10,18 @@ from typing import List, Tuple
 # ESCAPABLE guard to confirm intent.
 OVERRIDE_RE = re.compile(r"(?:#|--)\s*aegis-allow\b", re.IGNORECASE)  # '# ' (shell) or '-- ' (SQL)
 
+# Stricter, TRAILING-only override for the prompt secret-leak guard (rules.
+# rule_prompt_secret_leak). Deliberately not the shared OVERRIDE_RE above: a
+# prompt is far more likely than a shell/SQL command to carry a large amount
+# of forwarded/untrusted free text where the marker could appear or be quoted
+# incidentally (discussing Aegis's own docs, pasting rules.py) without being
+# an intentional override — OVERRIDE_RE's bare ``re.search`` would treat any
+# such mention as a blanket "allow everything in this prompt", confirmed by
+# adversarial QA review. Requiring the marker be the LAST thing in the
+# (stripped) prompt closes that: an incidental mid-text mention no longer
+# qualifies, only a deliberate trailing "append this to confirm" does.
+PROMPT_OVERRIDE_RE = re.compile(r"(?:#|--)\s*aegis-allow\s*$", re.IGNORECASE)
+
 # History-rewriting / destructive git (force-push, reset --hard, rebase, amend,
 # branch -D, clean -f).
 DESTRUCTIVE_GIT_RE = re.compile(
@@ -391,54 +403,114 @@ TEST_CMD_RE = re.compile(
 # credential. Once it's in the prompt it is sent to the model provider and
 # written into the runtime's transcript — this guard is the last chance to
 # catch it before either happens. Curated, high-signal formats; not exhaustive
-# (same denylist posture as every other pattern in this module) — a secret with
-# no recognizable prefix/shape (a bare high-entropy string with no assigning
-# key) is a documented gap. Each entry is ``(label, compiled_regex)`` so a hit
-# can be reported/redacted by type without ever echoing the matched value.
+# (same denylist posture as every other pattern in this module). Documented
+# gaps, confirmed by adversarial QA: a bare high-entropy string with no
+# assigning key/prefix; a secret split by inserted whitespace/newlines
+# (``AKIA ABCDEF...``). All entries are case-insensitive (a case-flipped key is
+# a zero-cost bypass otherwise). Each entry is ``(label, compiled_regex)`` so a
+# hit can be reported/redacted by type without ever echoing the matched value.
 SECRET_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
-    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", re.IGNORECASE)),
+    # Captures through to the matching END marker when present (so redaction
+    # scrubs the whole key body, not just the header line); the END clause is
+    # optional so a truncated paste (header only) still trips DETECTION.
     ("private-key-block", re.compile(
-        r"-----BEGIN\s+(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----")),
+        r"-----BEGIN\s+(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"
+        r"(?:[\s\S]*?-----END\s+(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----)?",
+        re.IGNORECASE)),
     ("github-token", re.compile(
-        r"\bgh[pousr]_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
-    ("gitlab-token", re.compile(r"\bglpat-[A-Za-z0-9\-_]{20,}\b")),
-    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+        r"\bgh[pousr]_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b", re.IGNORECASE)),
+    ("gitlab-token", re.compile(r"\bglpat-[A-Za-z0-9\-_]{20,}\b", re.IGNORECASE)),
+    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", re.IGNORECASE)),
     ("slack-webhook", re.compile(
-        r"hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+")),
-    ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b")),
-    ("openai-key", re.compile(r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9]{20,}\b")),
-    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
-    ("stripe-key", re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{10,}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+        r"hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+", re.IGNORECASE)),
+    ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b", re.IGNORECASE)),
+    ("openai-key", re.compile(r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9]{20,}\b", re.IGNORECASE)),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b", re.IGNORECASE)),
+    ("stripe-key", re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{10,}\b", re.IGNORECASE)),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+                       re.IGNORECASE)),
     # Generic "key/secret/token/password = <long value>" assignment — the
     # highest-noise entry (no fixed prefix), so it requires an explicit
-    # credential-shaped variable name AND a reasonably long value to fire.
+    # credential-shaped variable name AND a reasonably long value to fire. The
+    # value charset stops only at whitespace/quotes (not just alnum/+-/=) so
+    # redaction removes the WHOLE value, punctuation included, not just an
+    # alnum prefix of it.
     ("generic-assignment", re.compile(
         r"\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token"
-        r"|password|passwd)\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=]{16,}",
+        r"|password|passwd)\b\s*[:=]\s*['\"]?[^\s'\"]{16,}",
         re.IGNORECASE)),
 ]
+
+# Well-known placeholder/example markers that turn an otherwise credential-
+# shaped match into noise: AWS's own official example key
+# (AKIAIOSFODNN7EXAMPLE), Django's default dev SECRET_KEY
+# (django-insecure-...), and the "your_api_key_here" / "changeme" family every
+# README and .env.example uses. Same allowlisting approach real secret
+# scanners (gitleaks/trufflehog) use. Deliberately a plain substring test, not
+# word-bounded — "sk_test_..." must be caught and "test"/"fake" sit inside a
+# larger token there. Documented trade-off: a genuine secret whose random
+# value happens to contain one of these words as a substring is not flagged;
+# astronomically unlikely for a high-entropy value and consistent with this
+# module's "curated, not exhaustive" posture.
+_PLACEHOLDER_RE = re.compile(
+    r"example|insecure|changeme|placeholder|dummy|sample|redacted|fake|test"
+    r"|your[_-]?(?:api[_-]?)?(?:key|token|secret)"
+    r"|<[^>\s]{1,60}>",
+    re.IGNORECASE,
+)
+
+# Cap on scanned length — this runs on EVERY submitted prompt, so an unbounded
+# scan turns a large paste (a forwarded log/webhook body) into unbounded added
+# latency on a hot path. Mirrors normalize.py's identical rationale/cap for
+# shell-command scanning. Text beyond the cap is neither scanned nor redacted
+# (a documented scope boundary, not a silent truncation of a match already in
+# progress).
+_MAX_SCAN = 20000
+
+
+def _real_matches(text: str):
+    """``(label, match)`` for every match that isn't a documented placeholder/
+    example value (see ``_PLACEHOLDER_RE``)."""
+    out = []
+    for label, rx in SECRET_PATTERNS:
+        for m in rx.finditer(text):
+            if _PLACEHOLDER_RE.search(m.group(0)):
+                continue
+            out.append((label, m))
+    return out
 
 
 def find_secrets(text: str) -> List[str]:
     """Labels of every secret shape found in ``text`` (``[]`` = none). Order
     matches ``SECRET_PATTERNS``; a label may repeat if the same shape appears
-    more than once."""
+    more than once. Placeholder/example values (``_PLACEHOLDER_RE``) are not
+    reported."""
     if not text:
         return []
-    return [label for label, rx in SECRET_PATTERNS if rx.search(text)]
+    return [label for label, _ in _real_matches(str(text)[:_MAX_SCAN])]
 
 
 def redact_secrets(text: str) -> Tuple[str, List[str]]:
-    """Replace every matched secret span in ``text`` with a
+    """Replace every matched (non-placeholder) secret span in ``text`` with a
     ``[aegis-redacted:<label>]`` placeholder. Returns ``(redacted_text,
     labels_found)``. Used so a detected secret is stripped even from what
     Aegis itself persists (the audit trail), not just from what reaches the
     model."""
-    labels: List[str] = []
-    out = text or ""
-    for label, rx in SECRET_PATTERNS:
-        if rx.search(out):
-            labels.append(label)
-            out = rx.sub(f"[aegis-redacted:{label}]", out)
-    return out, labels
+    if not text:
+        return text or "", []
+    scanned = str(text)[:_MAX_SCAN]
+    rest = str(text)[_MAX_SCAN:]
+    matches = _real_matches(scanned)
+    if not matches:
+        return text, []
+    # Replace back-to-front by start offset so an earlier replacement's length
+    # change never shifts a later match's (already-captured) span.
+    matches.sort(key=lambda lm: lm[1].start(), reverse=True)
+    out = scanned
+    labels = []
+    for label, m in matches:
+        out = out[:m.start()] + f"[aegis-redacted:{label}]" + out[m.end():]
+        labels.append(label)
+    labels.reverse()
+    return out + rest, labels

@@ -20,7 +20,8 @@ EMPTY = Policy()
 
 AWS_KEY = "AKIAABCDEFGHIJKLMNOP"
 GITHUB_TOKEN = "ghp_" + "a" * 36
-PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow==\n-----END RSA PRIVATE KEY-----"
+PRIVATE_KEY_BODY = "MIIEowSuperSecretBase64KeyMaterialGoesHere=="
+PRIVATE_KEY = f"-----BEGIN RSA PRIVATE KEY-----\n{PRIVATE_KEY_BODY}\n-----END RSA PRIVATE KEY-----"
 SLACK_TOKEN = "xoxb-" + "1" * 12
 ANTHROPIC_KEY = "sk-ant-" + "a" * 30
 OPENAI_KEY = "sk-" + "a" * 40
@@ -82,6 +83,56 @@ def test_redact_secrets_noop_on_clean_text():
     text = "nothing sensitive here"
     redacted, labels = patterns.redact_secrets(text)
     assert redacted == text and labels == []
+
+
+# ---- QA-review regressions: redaction must remove the WHOLE secret --------------
+
+def test_redact_secrets_removes_entire_private_key_body_not_just_header():
+    """Adversarial-review finding: the old private-key-block regex matched only
+    the BEGIN header line, leaving the base64 key material to survive
+    redaction (and land in Aegis's own audit log) untouched."""
+    redacted, labels = patterns.redact_secrets(f"here is the key: {PRIVATE_KEY} thanks")
+    assert labels == ["private-key-block"]
+    assert PRIVATE_KEY_BODY not in redacted
+    assert "-----END RSA PRIVATE KEY-----" not in redacted
+    assert "here is the key:" in redacted and "thanks" in redacted
+
+
+def test_private_key_header_only_still_detected_when_truncated():
+    """A truncated paste (header with no END marker) must still trip detection
+    even though there's nothing to redact through to."""
+    assert "private-key-block" in patterns.find_secrets(
+        "oops I pasted -----BEGIN RSA PRIVATE KEY----- and then got scared")
+
+
+def test_redact_secrets_removes_punctuated_generic_assignment_value():
+    """Adversarial-review finding: the old generic-assignment charset
+    (alnum/+-/=  only) stopped at the first punctuation character, leaving the
+    rest of a real password/secret in the clear after 'redaction'."""
+    value = "abc123def456ghijklmnop!SuperSecretTail42"
+    redacted, labels = patterns.redact_secrets(f"password = '{value}' is not working")
+    assert labels == ["generic-assignment"]
+    assert value not in redacted
+    assert "SuperSecretTail42" not in redacted
+
+
+# ---- QA-review regressions: placeholder/example values must not false-positive --
+
+@pytest.mark.parametrize("text", [
+    "our docs use AKIAIOSFODNN7EXAMPLE as the sample access key id",  # AWS's own example
+    "SECRET_KEY = 'django-insecure-abc123def456ghi789jkl012mno345pqr'",  # Django dev default
+    "API_KEY=your_api_key_here_1234567890abcdef",  # .env.example placeholder
+    "password = 'changeme1234567890'",  # placeholder discussion
+    "api_key: 'test_fake_1234567890abcdef_dummy'",
+])
+def test_placeholder_and_example_values_not_flagged(text):
+    assert patterns.find_secrets(text) == []
+
+
+def test_case_flipped_secret_still_detected():
+    """Adversarial-review finding: only generic-assignment was case-insensitive;
+    a lower-cased AWS key sailed through undetected (a zero-cost bypass)."""
+    assert "aws-access-key" in patterns.find_secrets(f"key: {AWS_KEY.lower()}")
 
 
 # ---- rule: deny by default -------------------------------------------------------
@@ -153,6 +204,24 @@ def test_spawned_agent_cannot_override_with_comment(monkeypatch):
     assert evaluate(_prompt(f"{AWS_KEY}  # aegis-allow"), EMPTY).blocked
 
 
+def test_incidental_mention_of_override_phrase_does_not_disable_detection():
+    """Blocker finding from adversarial QA: the shared OVERRIDE_RE does a bare
+    substring search, so a prompt that merely DISCUSSES the escape phrase
+    (asking about Aegis's own docs, pasting rules.py for review) used to
+    silently allow an unrelated real secret anywhere else in the same prompt.
+    The trailing-anchored PROMPT_OVERRIDE_RE must reject this."""
+    text = ("I was reading the aegis docs and saw the override syntax "
+            "'# aegis-allow' is used to bypass guards. Separately, unrelated: "
+            f"can you help me debug why boto3 rejects my key {AWS_KEY}?")
+    assert evaluate(_prompt(text), EMPTY).blocked
+
+
+def test_override_must_be_trailing_not_merely_present():
+    assert evaluate(_prompt(f"# aegis-allow, ignore that, real question: {AWS_KEY}"),
+                     EMPTY).blocked
+    assert not evaluate(_prompt(f"{AWS_KEY}  # aegis-allow"), EMPTY).blocked
+
+
 # ---- policy config: mode + allow -------------------------------------------------
 
 def test_monitor_mode_logs_and_allows():
@@ -185,15 +254,32 @@ def test_adapter_extracts_prompt_field_for_user_prompt_submit():
     assert ev.args["prompt"] == f"here is my key {AWS_KEY}"
 
 
-def test_adapter_prompt_extraction_does_not_clobber_tool_input():
-    """Additive only: a runtime that somehow sent both tool_input and a prompt
-    key keeps its tool_input-derived args as the source of truth."""
+def test_adapter_top_level_prompt_is_authoritative_over_tool_input():
+    """The top-level `prompt` field is the real submitted text per the hook
+    contract, so it wins over anything incidentally already in `tool_input`
+    (Claude Code never actually populates tool_input for this event, but the
+    adapter must not let a stray/incidental value there shadow the field the
+    whole guard exists to see)."""
     ev = cc.parse_event({
         "hook_event_name": "UserPromptSubmit",
         "tool_input": {"prompt": "from-tool-input"},
         "prompt": "from-top-level",
     })
-    assert ev.args["prompt"] == "from-tool-input"
+    assert ev.args["prompt"] == "from-top-level"
+
+
+# ---- QA-review: scan is bounded (mirrors normalize.py's shell-scan cap) --------
+
+def test_secret_within_scan_cap_detected_beyond_it_is_a_documented_gap():
+    """rule fires on every UserPromptSubmit, so an unbounded scan would add
+    unbounded latency to a huge paste (a forwarded log/webhook body) — capped
+    like normalize.py's shell-command scan, for the same reason. A secret
+    inside the cap is caught; one placed well beyond it is a documented scope
+    boundary, not scanned."""
+    near = "x " * 50 + AWS_KEY
+    assert "aws-access-key" in patterns.find_secrets(near)
+    far = "x " * ((patterns._MAX_SCAN // 2) + 1000) + AWS_KEY
+    assert "aws-access-key" not in patterns.find_secrets(far)
 
 
 def test_end_to_end_adapter_to_render_blocks_and_hides_secret():
@@ -207,3 +293,21 @@ def test_end_to_end_adapter_to_render_blocks_and_hides_secret():
     assert code == 2
     assert AWS_KEY not in err
     assert AWS_KEY not in out
+
+
+def test_no_agent_skill_hint_on_user_prompt_submit_denial(tmp_path, monkeypatch):
+    """A UserPromptSubmit denial's stderr is shown to the HUMAN who typed the
+    prompt, before any agent turn is in progress — the agent-facing
+    aegis-explain-block hint (meant for a mid-turn tool-call denial) would be
+    dead advice here, even when the skill happens to be installed."""
+    skill_dir = tmp_path / ".claude" / "skills" / "aegis-explain-block"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("stub", encoding="utf-8")
+    ev = cc.parse_event({
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": AWS_KEY,
+        "cwd": str(tmp_path),
+    })
+    d = evaluate(ev, EMPTY)
+    _, _, err = cc.render_decision(ev, d)
+    assert "aegis-explain-block" not in err

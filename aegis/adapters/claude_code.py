@@ -3,8 +3,12 @@
 Translates Claude Code hook payloads into the runtime-agnostic :class:`Event`,
 and renders an Aegis :class:`Decision` into what Claude Code expects:
 
-- **deny** on a blockable event -> exit code 2 + reason on stderr. Claude Code
-  blocks the action and feeds the stderr text back to the model as the reason.
+- **deny** on a blockable event -> exit code 2 + reason on stderr. For a
+  tool-use-style event (PreToolUse and friends) Claude Code feeds that stderr
+  text back to the MODEL as the reason mid-turn. ``UserPromptSubmit`` is the
+  one exception: it fires before any agent turn begins, so its stderr is shown
+  to the HUMAN who typed the prompt, not the model — rules/messages for that
+  event should be phrased for a human reader (see ``_skill_hint`` below).
 - **ask** on PreToolUse -> ``permissionDecision: ask`` JSON on stdout, exit 0.
 - **allow** (or a deny on a non-blockable event) -> exit 0.
 """
@@ -46,10 +50,12 @@ def parse_event(payload: dict) -> Event:
     # UserPromptSubmit carries the submitted text as a top-level `prompt` key,
     # not `tool_input` (there is no tool on this event) — without this, the
     # prompt-secret-leak guard (and any future prompt-content rule) would see
-    # an always-empty args and never fire. Additive: never overrides a
-    # same-named key a runtime already put in tool_input.
+    # an always-empty args and never fire. Authoritative, not merely additive:
+    # a top-level `prompt` is the real submitted text per the hook contract, so
+    # it wins over anything incidentally already in `tool_input` (which, for
+    # this event, Claude Code never actually populates).
     if payload.get("prompt") is not None:
-        args.setdefault("prompt", payload["prompt"])
+        args["prompt"] = payload["prompt"]
     matcher = next((str(payload[k]) for k in _MATCHER_KEYS if payload.get(k)), None)
     return Event.make(
         name,
@@ -69,7 +75,14 @@ def parse_event(payload: dict) -> Event:
 def _skill_hint(event: Event) -> str:
     """Point a denied agent at the shipped explain-block skill — but only when
     it is actually installed (project .claude next to event.cwd, or the user's
-    home), so the hint never dangles. Best-effort; never raises."""
+    home), so the hint never dangles. Best-effort; never raises.
+
+    Never fires for ``UserPromptSubmit``: that denial's stderr is shown to the
+    HUMAN who typed the prompt, before any agent turn is even in progress — an
+    agent-facing "use this skill" hint is dead advice there (there is no agent
+    turn yet to read a SKILL.md from)."""
+    if event.event == HookEvent.USER_PROMPT_SUBMIT:
+        return ""
     try:
         for base in (event.cwd, os.path.expanduser("~")):
             if base and os.path.isfile(os.path.join(

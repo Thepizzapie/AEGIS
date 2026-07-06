@@ -66,11 +66,16 @@ def _override_allowed(ev: Event, extra: str = "") -> bool:
 
 
 def _prompt_override_allowed(ev: Event) -> bool:
-    """The '# aegis-allow' escape for a submitted prompt — same human-only rule
-    as ``_override_allowed``, read from the prompt text instead of a command."""
+    """The '# aegis-allow' escape for a submitted prompt — human-only like
+    ``_override_allowed``, but anchored to the TRAILING position
+    (``patterns.PROMPT_OVERRIDE_RE``) rather than a bare substring search: a
+    prompt can carry large amounts of forwarded text where the marker might be
+    mentioned incidentally, and an unanchored search would treat that mention
+    as license to allow an unrelated real secret anywhere else in the same
+    prompt (adversarial QA finding)."""
     if _is_agent():
         return False
-    return bool(patterns.OVERRIDE_RE.search(_prompt_text(ev)))
+    return bool(patterns.PROMPT_OVERRIDE_RE.search(_prompt_text(ev).rstrip()))
 
 
 def _sql_text(ev: Event) -> str:
@@ -154,12 +159,24 @@ def rule_prompt_secret_leak(ev: Event, policy=None) -> Optional[Decision]:
     ORIGINAL prompt to the model; Aegis cannot retract that, only keep its own
     copy clean.
 
+    Well-known placeholder/example values (AWS's own ``AKIAIOSFODNN7EXAMPLE``,
+    Django's ``django-insecure-...`` dev key, ``your_api_key_here``,
+    ``changeme``, ...) are not reported — see ``patterns._PLACEHOLDER_RE`` —
+    so a tutorial or a ``.env.example`` snippet doesn't hard-block a session.
+
     Config (``policy.secrets``): ``mode`` (deny|monitor|off, default deny — no
     ``ask``: Claude Code has no interactive-ask affordance on UserPromptSubmit,
     only on PreToolUse, so an ASK here would silently fall through to allow),
     ``allow`` (regexes on the raw prompt that exempt it, e.g. an org's own
     known-fake fixture pattern). Escapable only by a human appending
-    '# aegis-allow' to the prompt; a spawned agent cannot."""
+    '# aegis-allow' as the LAST thing in the prompt (``patterns.
+    PROMPT_OVERRIDE_RE`` — trailing-anchored, not a bare substring search, so
+    mentioning the phrase mid-prompt doesn't wave through an unrelated real
+    secret elsewhere in the same text); a spawned agent cannot use it at all.
+    Residual, honest limit shared with every other escapable guard in this
+    codebase: a human who blindly forwards fully attacker-authored text that
+    happens to end in the marker still overrides it — the override trusts the
+    human process, not the prompt's content."""
     if ev.event != HookEvent.USER_PROMPT_SUBMIT:
         return None
     text = _prompt_text(ev)
