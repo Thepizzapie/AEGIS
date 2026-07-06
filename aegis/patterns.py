@@ -443,9 +443,8 @@ SECRET_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
 ]
 
 # Well-known placeholder/example markers that turn an otherwise credential-
-# shaped match into noise: AWS's own official example key
-# (AKIAIOSFODNN7EXAMPLE), Django's default dev SECRET_KEY
-# (django-insecure-...), and the "your_api_key_here" / "changeme" family every
+# shaped match into noise: Django's default dev SECRET_KEY
+# (django-insecure-...) and the "your_api_key_here" / "changeme" family every
 # README and .env.example uses. Same allowlisting approach real secret
 # scanners (gitleaks/trufflehog) use.
 #
@@ -458,28 +457,35 @@ SECRET_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
 # ("con-TEST-9876...", "pro-TEST-Secret...", "fas-TEST-LiveToken...") — because
 # there ``test`` is glued directly onto a preceding word character with no
 # boundary at all, leading or trailing, so it's correctly NOT exempted.
-# "EXAMPLE" is handled separately (see ``_is_placeholder``): AWS glues it
-# directly onto the random suffix with no delimiter on EITHER side
-# (AKIAIOSFODNN7EXAMPLE), so even a leading boundary would miss it.
 _PLACEHOLDER_WORD_RE = re.compile(
-    r"\b(?:insecure|changeme|placeholder|dummy|sample|redacted|fake|test|example)"
+    r"\b(?:insecure|changeme|placeholder|dummy|sample|redacted|fake|test)"
     r"|your[_-]?(?:api[_-]?)?(?:key|token|secret)"
     r"|<[^>\s]{1,60}>",
     re.IGNORECASE,
 )
 
+# AWS's own official example access key ID, used verbatim across their docs
+# and countless tutorials. An earlier draft used a generic ``endswith
+# ("EXAMPLE")`` suffix check instead of this exact-value check — adversarial
+# QA found that was a UNIVERSAL, delimiter-free bypass: for every open-ended
+# pattern (github-token, generic-assignment, gitlab-token, ...) a real secret
+# could be exempted just by appending the literal text "example" to it, since
+# those patterns' trailing character classes happily absorb it. An exact-value
+# match doesn't generalize that way — it exempts only this one documented
+# string, never "anything ending in example."
+_KNOWN_PLACEHOLDER_VALUES = frozenset({"AKIAIOSFODNN7EXAMPLE"})
+
 
 def _is_placeholder(value: str) -> bool:
     """True when a matched secret span looks like a documented placeholder/
-    example rather than a live credential — ``_PLACEHOLDER_WORD_RE``, plus
-    AWS's ``...EXAMPLE`` suffix convention (no delimiter, so it needs an
-    anchored endswith check instead of a word boundary). Checked against the
-    matched VALUE only, never the surrounding prompt text, so a real secret
-    can't be laundered by adding an unrelated placeholder word elsewhere in
-    the same message."""
+    example rather than a live credential — ``_PLACEHOLDER_WORD_RE`` plus the
+    one known exact placeholder constant (``_KNOWN_PLACEHOLDER_VALUES``).
+    Checked against the matched VALUE only, never the surrounding prompt text,
+    so a real secret can't be laundered by adding an unrelated placeholder
+    word elsewhere in the same message."""
     if _PLACEHOLDER_WORD_RE.search(value):
         return True
-    return value.upper().endswith("EXAMPLE")
+    return value.strip().upper() in _KNOWN_PLACEHOLDER_VALUES
 
 
 # Cap on scanned length — this runs on EVERY submitted prompt, so an unbounded
@@ -491,64 +497,69 @@ def _is_placeholder(value: str) -> bool:
 _MAX_SCAN = 20000
 
 
-def _real_matches(text: str):
-    """``(label, match)`` for every match that isn't a documented placeholder/
-    example value, with overlapping matches resolved to a single non-
-    overlapping set (sorted by start position, preferring the earlier/longer
-    span). Two patterns CAN legitimately overlap — e.g. ``generic-assignment``'s
-    greedy value class swallows a whole ``access_token = <jwt>`` assignment,
-    nesting the ``jwt`` pattern's own match inside it — and redacting both
-    independently would splice at stale offsets into an already-mutated
-    string, corrupting the result (confirmed by adversarial QA). Dropping the
-    nested/overlapping match is safe: the kept, longer span already covers
-    those characters."""
+def _merged_spans(text: str):
+    """``[start, end, [labels]]`` for every non-placeholder match, with
+    OVERLAPPING matches merged (union of their spans, union of their labels) —
+    never dropped. A prior draft dropped the later-sorted match on any overlap
+    (keeping only the earlier/longer one); adversarial QA found that loses
+    coverage on a genuine PARTIAL overlap where neither span contains the
+    other (e.g. a gitlab-token match at chars 0-26 and a generic-assignment
+    match at chars 18-47 sharing chars 18-26 but each extending past the
+    other) — the dropped match's uncovered tail then survived redaction in
+    the clear. A standard sorted-interval merge has no such gap: every
+    character covered by ANY match ends up inside exactly one merged, fully-
+    redacted span."""
     raw = []
     for label, rx in SECRET_PATTERNS:
         for m in rx.finditer(text):
             if _is_placeholder(m.group(0)):
                 continue
-            raw.append((label, m))
-    raw.sort(key=lambda lm: (lm[1].start(), -(lm[1].end() - lm[1].start())))
-    kept = []
-    last_end = -1
-    for label, m in raw:
-        if m.start() < last_end:
-            continue  # overlaps an already-kept, earlier-starting/longer match
-        kept.append((label, m))
-        last_end = m.end()
-    return kept
+            raw.append((m.start(), m.end(), label))
+    if not raw:
+        return []
+    raw.sort(key=lambda t: t[0])
+    merged = [[raw[0][0], raw[0][1], [raw[0][2]]]]
+    for start, end, label in raw[1:]:
+        last = merged[-1]
+        if start <= last[1]:  # overlaps (or touches) the current merged span
+            last[1] = max(last[1], end)
+            if label not in last[2]:
+                last[2].append(label)
+        else:
+            merged.append([start, end, [label]])
+    return merged
 
 
 def find_secrets(text: str) -> List[str]:
-    """Labels of every secret shape found in ``text`` (``[]`` = none). Order
-    matches ``SECRET_PATTERNS``; a label may repeat if the same shape appears
-    more than once. Placeholder/example values (``_is_placeholder``) are not
-    reported."""
+    """Labels of every secret shape found in ``text`` (``[]`` = none). A label
+    may repeat if the same shape appears more than once (in separate,
+    non-overlapping spans). Placeholder/example values (``_is_placeholder``)
+    are not reported."""
     if not text:
         return []
-    return [label for label, _ in _real_matches(str(text)[:_MAX_SCAN])]
+    return [label for _, _, labels in _merged_spans(str(text)[:_MAX_SCAN]) for label in labels]
 
 
 def redact_secrets(text: str) -> Tuple[str, List[str]]:
-    """Replace every matched (non-placeholder) secret span in ``text`` with a
-    ``[aegis-redacted:<label>]`` placeholder. Returns ``(redacted_text,
-    labels_found)``. Used so a detected secret is stripped even from what
-    Aegis itself persists (the audit trail), not just from what reaches the
-    model. ``_real_matches`` guarantees non-overlapping spans, so back-to-front
-    replacement by start offset is safe — no match's span moves under a later
-    (earlier-in-file) replacement."""
+    """Replace every merged, non-placeholder secret span in ``text`` with a
+    ``[aegis-redacted:<label(s)>]`` placeholder (multiple labels joined with
+    ``+`` when an overlap merged more than one pattern's match). Returns
+    ``(redacted_text, labels_found)``. Used so a detected secret is stripped
+    even from what Aegis itself persists (the audit trail), not just from what
+    reaches the model. ``_merged_spans`` guarantees non-overlapping,
+    non-touching output spans, so back-to-front replacement by start offset is
+    safe — no span moves under a later (earlier-in-file) replacement, and every
+    character any pattern matched is covered by exactly one redaction."""
     if not text:
         return text or "", []
     scanned = str(text)[:_MAX_SCAN]
     rest = str(text)[_MAX_SCAN:]
-    matches = _real_matches(scanned)
-    if not matches:
+    spans = _merged_spans(scanned)
+    if not spans:
         return text, []
-    matches.sort(key=lambda lm: lm[1].start(), reverse=True)
     out = scanned
     labels = []
-    for label, m in matches:
-        out = out[:m.start()] + f"[aegis-redacted:{label}]" + out[m.end():]
-        labels.append(label)
-    labels.reverse()
+    for start, end, span_labels in sorted(spans, key=lambda s: s[0], reverse=True):
+        out = out[:start] + f"[aegis-redacted:{'+'.join(span_labels)}]" + out[end:]
+        labels = span_labels + labels
     return out + rest, labels

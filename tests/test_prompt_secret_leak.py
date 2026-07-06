@@ -152,6 +152,41 @@ def test_placeholder_word_as_substring_of_real_word_still_flagged(text):
     assert "generic-assignment" in patterns.find_secrets(text)
 
 
+def test_redact_secrets_merges_partial_non_nested_overlap_completely():
+    """Third-round adversarial-review finding: the drop-on-overlap strategy
+    only protected against corruption, not content loss. A gitlab-token match
+    (chars 0-26) and a generic-assignment match (chars 18-47) partially
+    overlap with NEITHER containing the other; dropping the later-sorted one
+    left its uncovered tail (a real secret value) surviving redaction in the
+    clear. Overlapping spans must be MERGED (union), never dropped."""
+    text = "glpat-aaaaaaaaaaa-password=cccccccccccccccccccc"
+    labels = patterns.find_secrets(text)
+    assert "gitlab-token" in labels and "generic-assignment" in labels
+    redacted, _ = patterns.redact_secrets(text)
+    assert "cccccccccccccccccccc" not in redacted
+    assert "aaaaaaaaaaa" not in redacted
+
+
+@pytest.mark.parametrize("value", [
+    "ghp_" + "a" * 40 + "example",
+    "sk-" + "a" * 40 + "example",
+    "glpat-" + "a" * 25 + "example",
+])
+def test_appending_example_suffix_does_not_launder_a_real_secret(value):
+    """Third-round adversarial-review finding: an earlier fix exempted any
+    match ending in the literal text 'example' (to catch AWS's own
+    AKIAIOSFODNN7EXAMPLE convention), but that suffix check applied uniformly
+    to every open-ended pattern — a universal, delimiter-free bypass letting
+    anyone exempt a real secret just by appending 'example' to it. Only the
+    ONE known exact AWS constant may be exempted this way, never a generic
+    suffix rule."""
+    assert patterns.find_secrets(f"here: {value}") != []
+
+
+def test_known_aws_example_constant_still_exempt():
+    assert patterns.find_secrets("AKIAIOSFODNN7EXAMPLE") == []
+
+
 def test_redact_secrets_handles_overlapping_matches_without_corruption():
     """Second-round adversarial-review finding: redact_secrets' back-to-front
     splice assumed non-overlapping spans. generic-assignment's greedy value
