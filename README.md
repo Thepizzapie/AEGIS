@@ -50,6 +50,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 | Failure loop | The Nth identical retry of a call that keeps failing (default 3) | Human only |
 | Workspace confinement | Edits/writes outside the agent's project root | No, once bound |
 | Network egress | Outbound hosts against an allow/deny list | Policy-driven |
+| Prompt secret leak | A submitted prompt carrying a live-looking key/token/private-key/JWT (AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Stripe, Google, or a generic `key=value`) | Yes |
 
 Built-in guards run before your declarative rules and can only deny or abstain, so a permissive rule (even `tools: ["*"]` for an admin) can't re-open a built-in. To relax one, disable it explicitly.
 

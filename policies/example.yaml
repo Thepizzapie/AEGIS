@@ -23,6 +23,15 @@
 #     require_pinned: false # deny unpinned specs (force exact == / a lockfile)
 #     allow: []            # regexes on the command that skip the gate
 
+# Prompt secret-leak guard (optional). Built in and ON by default (mode: deny):
+# a submitted prompt containing a live-looking secret (AWS/GitHub/GitLab/Slack/
+# OpenAI/Anthropic/Stripe/Google key, a PEM private-key block, a JWT, or a
+# generic key/secret/token/password assignment) is blocked before it reaches
+# the model. Tune it here:
+#   secrets:
+#     mode: deny           # off | monitor (log-only) | deny (default)
+#     allow: []            # regexes on the prompt text that skip the gate
+
 default_action: allow
 on_error: allow
 

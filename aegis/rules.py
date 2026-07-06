@@ -38,6 +38,10 @@ def _path(ev: Event) -> str:
                or a.get("file") or a.get("uri") or "")
 
 
+def _prompt_text(ev: Event) -> str:
+    return str((ev.args or {}).get("prompt") or "")
+
+
 def _is_shell(ev: Event) -> bool:
     return ev.action == ActionClass.SHELL
 
@@ -59,6 +63,14 @@ def _override_allowed(ev: Event, extra: str = "") -> bool:
     if _is_agent():
         return False
     return bool(patterns.OVERRIDE_RE.search(_cmd(ev) + " " + (extra or "")))
+
+
+def _prompt_override_allowed(ev: Event) -> bool:
+    """The '# aegis-allow' escape for a submitted prompt — same human-only rule
+    as ``_override_allowed``, read from the prompt text instead of a command."""
+    if _is_agent():
+        return False
+    return bool(patterns.OVERRIDE_RE.search(_prompt_text(ev)))
 
 
 def _sql_text(ev: Event) -> str:
@@ -110,6 +122,79 @@ def rule_attest_session(ev: Event, policy=None) -> Optional[Decision]:
     return Decision(Action.DENY, "rogue-agent-reaped",
                     f"Rogue agent session terminated: claims identity '{name}' without a "
                     f"valid signed token. {attest.ATTEST_CHALLENGE}")
+
+
+# ---- prompt secret-leak: escapable with '# aegis-allow' (human only) --------
+def rule_prompt_secret_leak(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a submitted prompt that carries a live-looking secret (AWS/GitHub/
+    GitLab/Slack/OpenAI/Anthropic/Stripe/Google keys, a PEM private-key block, a
+    JWT, or a generic key/secret/token/password assignment) before it reaches
+    the model.
+
+    WHY this event: ``UserPromptSubmit`` is declared BLOCKABLE but, before this
+    rule, had zero guards AND the Claude Code adapter never even surfaced the
+    prompt text into ``Event.args`` — the surface was open both in policy and in
+    the plumbing. It fires before the prompt is processed, the only point where
+    Aegis can stop a secret from being sent to the model provider and written
+    into the runtime's transcript. Covers two cases: a human accidentally
+    pasting a real credential into chat, and an unattended/spawned agent handed
+    a prompt from an untrusted upstream feed (a ticket, webhook, forwarded log)
+    that itself carries a live secret. Distinct from containment's CRED_RE
+    (paths to credential STORES) and EXFIL_RE (uploading a FILE) — this is the
+    value itself, sitting in the text of the prompt.
+
+    The DENY message names only the secret's TYPE, never the matched value —
+    echoing it would make the denial (fed back into the model's context on this
+    blockable event) a second leak of the very thing it's blocking. The matched
+    span(s) are also redacted in ``ev.args['prompt']`` in place before this
+    returns, so the raw secret doesn't end up sitting in Aegis's own audit trail
+    either (the same ``Event`` object is what the caller logs right after).
+    That redaction is scoped to Aegis's own bookkeeping only — on an ALLOW
+    (``mode: monitor``, or a human override) the runtime has already sent the
+    ORIGINAL prompt to the model; Aegis cannot retract that, only keep its own
+    copy clean.
+
+    Config (``policy.secrets``): ``mode`` (deny|monitor|off, default deny — no
+    ``ask``: Claude Code has no interactive-ask affordance on UserPromptSubmit,
+    only on PreToolUse, so an ASK here would silently fall through to allow),
+    ``allow`` (regexes on the raw prompt that exempt it, e.g. an org's own
+    known-fake fixture pattern). Escapable only by a human appending
+    '# aegis-allow' to the prompt; a spawned agent cannot."""
+    if ev.event != HookEvent.USER_PROMPT_SUBMIT:
+        return None
+    text = _prompt_text(ev)
+    if not text.strip():
+        return None
+    cfg = getattr(policy, "secrets", None) or {}
+    mode = str(cfg.get("mode", "deny")).lower()
+    if mode in ("off", "false") or cfg.get("mode") is False:
+        return None
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return None
+        except re.error:
+            continue
+    labels = patterns.find_secrets(text)
+    if not labels:
+        return None
+    overridden = _prompt_override_allowed(ev)
+    redacted, _ = patterns.redact_secrets(text)
+    ev.args["prompt"] = redacted
+    if overridden:
+        return None
+    kinds = ", ".join(sorted(set(labels)))
+    would = Decision(Action.DENY, "prompt-secret-leak",
+                     f"Submitted prompt blocked — it appears to contain a live "
+                     f"secret ({kinds}). Sending it would put the credential in "
+                     f"the model's context and the session transcript. Remove "
+                     f"it (rotate it if it was real) and resend. A human may "
+                     f"append '# aegis-allow' to confirm intent; a spawned "
+                     f"agent cannot.")
+    if mode == "monitor":
+        _record_monitor(ev, would, "prompt-secret-leak-monitor")
+        return None
+    return would
 
 
 # ---- containment: never escapable ----------------------------------------------
@@ -651,6 +736,7 @@ def _lifecycle_rules() -> tuple:
 
 _CORE_RULES = (
     rule_attest_session,
+    rule_prompt_secret_leak,
     rule_containment,
     rule_self_protect,
     rule_mcp_config_protect,

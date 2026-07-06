@@ -43,6 +43,13 @@ def parse_event(payload: dict) -> Event:
         args = {}
     else:
         args = {"value": raw_args}
+    # UserPromptSubmit carries the submitted text as a top-level `prompt` key,
+    # not `tool_input` (there is no tool on this event) — without this, the
+    # prompt-secret-leak guard (and any future prompt-content rule) would see
+    # an always-empty args and never fire. Additive: never overrides a
+    # same-named key a runtime already put in tool_input.
+    if payload.get("prompt") is not None:
+        args.setdefault("prompt", payload["prompt"])
     matcher = next((str(payload[k]) for k in _MATCHER_KEYS if payload.get(k)), None)
     return Event.make(
         name,

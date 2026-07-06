@@ -136,3 +136,9 @@ class Policy:
     # Stop gate: after file mutations, the session may not stop until a test run
     # is recorded after the last change. See lifecycle.session.
     completion: dict = field(default_factory=dict)
+    # Prompt secret-leak guard: {mode: deny|monitor|off, allow: [regex on the
+    # prompt text]}. Empty -> defaults (mode=deny) apply. No 'ask' mode: Claude
+    # Code has no interactive-ask affordance on UserPromptSubmit (only
+    # PreToolUse), so an ASK decision there would silently fall through to
+    # allow. See rules.rule_prompt_secret_leak.
+    secrets: dict = field(default_factory=dict)

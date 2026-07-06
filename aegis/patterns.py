@@ -4,6 +4,7 @@ Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
 import re
+from typing import List, Tuple
 
 # Explicit, recorded override: append '# aegis-allow' (or --aegis-allow) to an
 # ESCAPABLE guard to confirm intent.
@@ -380,3 +381,64 @@ TEST_CMD_RE = re.compile(
     r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )
+
+# Live secret VALUES — an attack surface distinct from CRED_RE (paths to
+# credential STORES) and EXFIL_RE (uploading a FILE). This is the value itself,
+# typed or forwarded straight into a submitted prompt (aegis.rules
+# rule_prompt_secret_leak, on UserPromptSubmit): a human pasting a real key into
+# chat, or an unattended agent handed a prompt from an untrusted upstream feed
+# (a ticket, webhook, forwarded log excerpt) that itself carries a live
+# credential. Once it's in the prompt it is sent to the model provider and
+# written into the runtime's transcript — this guard is the last chance to
+# catch it before either happens. Curated, high-signal formats; not exhaustive
+# (same denylist posture as every other pattern in this module) — a secret with
+# no recognizable prefix/shape (a bare high-entropy string with no assigning
+# key) is a documented gap. Each entry is ``(label, compiled_regex)`` so a hit
+# can be reported/redacted by type without ever echoing the matched value.
+SECRET_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
+    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("private-key-block", re.compile(
+        r"-----BEGIN\s+(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----")),
+    ("github-token", re.compile(
+        r"\bgh[pousr]_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
+    ("gitlab-token", re.compile(r"\bglpat-[A-Za-z0-9\-_]{20,}\b")),
+    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("slack-webhook", re.compile(
+        r"hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+")),
+    ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b")),
+    ("openai-key", re.compile(r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9]{20,}\b")),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
+    ("stripe-key", re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{10,}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    # Generic "key/secret/token/password = <long value>" assignment — the
+    # highest-noise entry (no fixed prefix), so it requires an explicit
+    # credential-shaped variable name AND a reasonably long value to fire.
+    ("generic-assignment", re.compile(
+        r"\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token"
+        r"|password|passwd)\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=]{16,}",
+        re.IGNORECASE)),
+]
+
+
+def find_secrets(text: str) -> List[str]:
+    """Labels of every secret shape found in ``text`` (``[]`` = none). Order
+    matches ``SECRET_PATTERNS``; a label may repeat if the same shape appears
+    more than once."""
+    if not text:
+        return []
+    return [label for label, rx in SECRET_PATTERNS if rx.search(text)]
+
+
+def redact_secrets(text: str) -> Tuple[str, List[str]]:
+    """Replace every matched secret span in ``text`` with a
+    ``[aegis-redacted:<label>]`` placeholder. Returns ``(redacted_text,
+    labels_found)``. Used so a detected secret is stripped even from what
+    Aegis itself persists (the audit trail), not just from what reaches the
+    model."""
+    labels: List[str] = []
+    out = text or ""
+    for label, rx in SECRET_PATTERNS:
+        if rx.search(out):
+            labels.append(label)
+            out = rx.sub(f"[aegis-redacted:{label}]", out)
+    return out, labels

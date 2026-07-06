@@ -89,6 +89,26 @@ def test_lifecycle_knobs_absent_by_default(tmp_path):
     assert pol.permission == {} and pol.mcp == {}
 
 
+SECRETS_CFG = """
+secrets:
+  mode: monitor
+  allow: ["fixture-.*"]
+"""
+
+
+def test_secrets_knob_round_trips_from_yaml(tmp_path):
+    """policy.secrets (rule_prompt_secret_leak's config) must load onto the
+    Policy like every other guard knob — regression for it silently defaulting
+    to empty (dead opt-in)."""
+    pol = load_policy(_write(tmp_path, SECRETS_CFG))
+    assert pol.secrets == {"mode": "monitor", "allow": ["fixture-.*"]}
+
+
+def test_secrets_knob_absent_by_default(tmp_path):
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.secrets == {}
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
     assert validate_policy(_write(tmp_path, LIFECYCLE)) == []
