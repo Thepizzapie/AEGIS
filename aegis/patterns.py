@@ -447,18 +447,40 @@ SECRET_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
 # (AKIAIOSFODNN7EXAMPLE), Django's default dev SECRET_KEY
 # (django-insecure-...), and the "your_api_key_here" / "changeme" family every
 # README and .env.example uses. Same allowlisting approach real secret
-# scanners (gitleaks/trufflehog) use. Deliberately a plain substring test, not
-# word-bounded — "sk_test_..." must be caught and "test"/"fake" sit inside a
-# larger token there. Documented trade-off: a genuine secret whose random
-# value happens to contain one of these words as a substring is not flagged;
-# astronomically unlikely for a high-entropy value and consistent with this
-# module's "curated, not exhaustive" posture.
-_PLACEHOLDER_RE = re.compile(
-    r"example|insecure|changeme|placeholder|dummy|sample|redacted|fake|test"
+# scanners (gitleaks/trufflehog) use.
+#
+# LEADING word-boundary only (no trailing ``\b``), confirmed by adversarial QA
+# to matter: "changeme1234567890" and "test1234567890" are common placeholder
+# shapes where digits immediately follow the word with no delimiter, so a
+# two-sided ``\bword\b`` would miss them. A leading boundary alone still
+# rejects the dangerous case a plain unbounded substring search let through —
+# a REAL secret that merely contains one of these words mid-token
+# ("con-TEST-9876...", "pro-TEST-Secret...", "fas-TEST-LiveToken...") — because
+# there ``test`` is glued directly onto a preceding word character with no
+# boundary at all, leading or trailing, so it's correctly NOT exempted.
+# "EXAMPLE" is handled separately (see ``_is_placeholder``): AWS glues it
+# directly onto the random suffix with no delimiter on EITHER side
+# (AKIAIOSFODNN7EXAMPLE), so even a leading boundary would miss it.
+_PLACEHOLDER_WORD_RE = re.compile(
+    r"\b(?:insecure|changeme|placeholder|dummy|sample|redacted|fake|test|example)"
     r"|your[_-]?(?:api[_-]?)?(?:key|token|secret)"
     r"|<[^>\s]{1,60}>",
     re.IGNORECASE,
 )
+
+
+def _is_placeholder(value: str) -> bool:
+    """True when a matched secret span looks like a documented placeholder/
+    example rather than a live credential — ``_PLACEHOLDER_WORD_RE``, plus
+    AWS's ``...EXAMPLE`` suffix convention (no delimiter, so it needs an
+    anchored endswith check instead of a word boundary). Checked against the
+    matched VALUE only, never the surrounding prompt text, so a real secret
+    can't be laundered by adding an unrelated placeholder word elsewhere in
+    the same message."""
+    if _PLACEHOLDER_WORD_RE.search(value):
+        return True
+    return value.upper().endswith("EXAMPLE")
+
 
 # Cap on scanned length — this runs on EVERY submitted prompt, so an unbounded
 # scan turns a large paste (a forwarded log/webhook body) into unbounded added
@@ -471,20 +493,36 @@ _MAX_SCAN = 20000
 
 def _real_matches(text: str):
     """``(label, match)`` for every match that isn't a documented placeholder/
-    example value (see ``_PLACEHOLDER_RE``)."""
-    out = []
+    example value, with overlapping matches resolved to a single non-
+    overlapping set (sorted by start position, preferring the earlier/longer
+    span). Two patterns CAN legitimately overlap — e.g. ``generic-assignment``'s
+    greedy value class swallows a whole ``access_token = <jwt>`` assignment,
+    nesting the ``jwt`` pattern's own match inside it — and redacting both
+    independently would splice at stale offsets into an already-mutated
+    string, corrupting the result (confirmed by adversarial QA). Dropping the
+    nested/overlapping match is safe: the kept, longer span already covers
+    those characters."""
+    raw = []
     for label, rx in SECRET_PATTERNS:
         for m in rx.finditer(text):
-            if _PLACEHOLDER_RE.search(m.group(0)):
+            if _is_placeholder(m.group(0)):
                 continue
-            out.append((label, m))
-    return out
+            raw.append((label, m))
+    raw.sort(key=lambda lm: (lm[1].start(), -(lm[1].end() - lm[1].start())))
+    kept = []
+    last_end = -1
+    for label, m in raw:
+        if m.start() < last_end:
+            continue  # overlaps an already-kept, earlier-starting/longer match
+        kept.append((label, m))
+        last_end = m.end()
+    return kept
 
 
 def find_secrets(text: str) -> List[str]:
     """Labels of every secret shape found in ``text`` (``[]`` = none). Order
     matches ``SECRET_PATTERNS``; a label may repeat if the same shape appears
-    more than once. Placeholder/example values (``_PLACEHOLDER_RE``) are not
+    more than once. Placeholder/example values (``_is_placeholder``) are not
     reported."""
     if not text:
         return []
@@ -496,7 +534,9 @@ def redact_secrets(text: str) -> Tuple[str, List[str]]:
     ``[aegis-redacted:<label>]`` placeholder. Returns ``(redacted_text,
     labels_found)``. Used so a detected secret is stripped even from what
     Aegis itself persists (the audit trail), not just from what reaches the
-    model."""
+    model. ``_real_matches`` guarantees non-overlapping spans, so back-to-front
+    replacement by start offset is safe — no match's span moves under a later
+    (earlier-in-file) replacement."""
     if not text:
         return text or "", []
     scanned = str(text)[:_MAX_SCAN]
@@ -504,8 +544,6 @@ def redact_secrets(text: str) -> Tuple[str, List[str]]:
     matches = _real_matches(scanned)
     if not matches:
         return text, []
-    # Replace back-to-front by start offset so an earlier replacement's length
-    # change never shifts a later match's (already-captured) span.
     matches.sort(key=lambda lm: lm[1].start(), reverse=True)
     out = scanned
     labels = []

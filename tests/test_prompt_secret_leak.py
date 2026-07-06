@@ -135,6 +135,41 @@ def test_case_flipped_secret_still_detected():
     assert "aws-access-key" in patterns.find_secrets(f"key: {AWS_KEY.lower()}")
 
 
+@pytest.mark.parametrize("text", [
+    "password = 'contest9876543210XYZlivevalue'",
+    "api_key = 'myProtestSecretValue1234567890'",
+    "secret_key: 'fastestLiveTokenValue1234567890'",
+    "auth_token = 'attestSignatureValue1234567890XY'",
+])
+def test_placeholder_word_as_substring_of_real_word_still_flagged(text):
+    """Second-round adversarial-review finding: the first placeholder fix did a
+    plain unbounded substring search, so a REAL secret that merely contains
+    'test'/'fake' as part of an unrelated English word ('contest', 'protest',
+    'fastest', 'attest') was wrongly exempted. A leading-word-boundary check
+    must still flag these — the placeholder word is glued onto a preceding
+    word character with no boundary, unlike a genuine 'test_...'/'...changeme'
+    placeholder."""
+    assert "generic-assignment" in patterns.find_secrets(text)
+
+
+def test_redact_secrets_handles_overlapping_matches_without_corruption():
+    """Second-round adversarial-review finding: redact_secrets' back-to-front
+    splice assumed non-overlapping spans. generic-assignment's greedy value
+    class swallows a whole 'access_token = <jwt>' assignment, nesting the jwt
+    pattern's own match inside it; splicing both against the same string at
+    their original offsets corrupted the output and destroyed trailing text
+    (including an unrelated, later, non-overlapping secret in the same
+    string)."""
+    text = (f"access_token = {JWT} and my key is {AWS_KEY} thanks")
+    redacted, labels = patterns.redact_secrets(text)
+    assert "generic-assignment" in labels
+    assert "aws-access-key" in labels
+    assert JWT not in redacted
+    assert AWS_KEY not in redacted
+    assert redacted.endswith("thanks")
+    assert "and my key is" in redacted
+
+
 # ---- rule: deny by default -------------------------------------------------------
 
 def test_aws_key_in_prompt_blocked():
