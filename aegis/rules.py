@@ -161,7 +161,7 @@ def rule_prompt_secret_leak(ev: Event, policy=None) -> Optional[Decision]:
 
     Well-known placeholder/example values (AWS's own ``AKIAIOSFODNN7EXAMPLE``,
     Django's ``django-insecure-...`` dev key, ``your_api_key_here``,
-    ``changeme``, ...) are not reported — see ``patterns._PLACEHOLDER_RE`` —
+    ``changeme``, ...) are not reported — see ``patterns._is_placeholder`` —
     so a tutorial or a ``.env.example`` snippet doesn't hard-block a session.
 
     Config (``policy.secrets``): ``mode`` (deny|monitor|off, default deny — no
