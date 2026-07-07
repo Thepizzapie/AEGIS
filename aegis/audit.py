@@ -10,6 +10,8 @@ import datetime as _dt
 import json
 from pathlib import Path
 
+from . import patterns
+
 # Common field names runtimes use to report token usage in hook payloads.
 # Checked in event.raw (the unmodified payload) so we capture whatever the
 # runtime sends without coupling to its schema.
@@ -55,6 +57,27 @@ def _extract_usage(event) -> dict:
 # Cap on captured tool-output length — enough to ground a claim, not a full dump.
 _MAX_OUTPUT_CHARS = 8000
 
+_REDACTED = "<redacted-by-aegis:secret>"
+
+
+def _redact(text: str) -> str:
+    """Mask any live-credential shape (patterns.SECRET_RE) in ``text``."""
+    return patterns.SECRET_RE.sub(_REDACTED, text)
+
+
+def _scrub(value):
+    """Recursively redact secret-shaped strings anywhere in a value (dict/list/str).
+    The audit sink must never persist a live credential in cleartext — regardless
+    of which event/field carried it or whether the action was allowed or denied
+    (a DENY still writes a record). Non-string leaves pass through unchanged."""
+    if isinstance(value, str):
+        return _redact(value)
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub(v) for v in value]
+    return value
+
 # Payload keys a runtime uses to carry the tool's RESULT (the observation).
 _OUTPUT_KEYS = ("tool_response", "tool_result", "output", "result", "stdout")
 
@@ -62,7 +85,9 @@ _OUTPUT_KEYS = ("tool_response", "tool_result", "output", "result", "stdout")
 def _extract_output(event) -> str | None:
     """Best-effort capture of what a tool RETURNED, from the raw payload — the
     evidence a grounding check needs. Present on PostToolUse; absent on PreToolUse.
-    Truncated to keep the audit trail lean."""
+    Redacted THEN truncated (in that order) to keep the audit trail lean: redacting
+    after truncation would let a secret straddling the cut get chopped mid-token,
+    dropping it below SECRET_RE's length requirement and leaking the fragment."""
     raw = getattr(event, "raw", None) or {}
     for k in _OUTPUT_KEYS:
         v = raw.get(k)
@@ -72,7 +97,7 @@ def _extract_output(event) -> str | None:
             v = json.dumps(v, default=str)
         text = str(v)
         if text.strip():
-            return text[:_MAX_OUTPUT_CHARS]
+            return _redact(text)[:_MAX_OUTPUT_CHARS]
     return None
 
 
@@ -91,7 +116,7 @@ def write_event(event, decision, path) -> dict:
         "agent": event.agent,
         "session_id": event.session_id,
         "cwd": event.cwd,
-        "args": event.args,
+        "args": _scrub(event.args),
     }
     output = _extract_output(event)
     if output is not None:

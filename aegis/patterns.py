@@ -380,3 +380,28 @@ TEST_CMD_RE = re.compile(
     r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )
+
+# Live-credential VALUE shapes (not paths — CRED_RE above is for credential-store
+# PATHS). Backs the prompt-secret guard (rules.rule_prompt_guard): a secret typed
+# or pasted straight into a prompt has no file path or shell verb for CRED_RE /
+# EXFIL_RE to key off, so it needs its own recognizer. Deliberately narrow and
+# high-signal (vendor-prefixed token shapes + PEM key headers), same "battle-
+# tested, not naive" bar as the rest of this module — a bare high-entropy string
+# is NOT enough to match (too many false positives: hashes, UUIDs, base64 blobs).
+SECRET_RE = re.compile(
+    r"\bAKIA[0-9A-Z]{16}\b"                              # AWS access key ID
+    r"|\bASIA[0-9A-Z]{16}\b"                              # AWS temp (STS) access key ID
+    r"|\bgh[pousr]_[A-Za-z0-9]{36,}\b"                    # GitHub PAT/OAuth/app/refresh token
+    r"|\bgithub_pat_[A-Za-z0-9_]{22,}\b"                  # GitHub fine-grained PAT
+    r"|\bxox[baprs]-[A-Za-z0-9-]{10,}\b"                  # Slack token
+    r"|\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}\b"  # OpenAI project/service/admin key
+    r"|\bsk-[A-Za-z0-9]{20,}\b"                           # OpenAI legacy-style secret key
+    r"|\bsk-ant-[A-Za-z0-9-]{20,}\b"                      # Anthropic API key
+    r"|\bAIza[0-9A-Za-z_-]{35}\b"                         # Google API key
+    r"|\bsk_live_[0-9A-Za-z]{20,}\b|\brk_live_[0-9A-Za-z]{20,}\b"  # Stripe live key
+    # PEM/PKCS8 private key (RSA/EC/DSA/OpenSSH/plain/encrypted) — the real header
+    # has no "BLOCK" suffix for these; PGP's ASCII-armor header does.
+    r"|-----BEGIN\s+(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED)\s+)?PRIVATE KEY-----"
+    r"|-----BEGIN\s+PGP\s+PRIVATE KEY BLOCK-----",
+    re.IGNORECASE,
+)

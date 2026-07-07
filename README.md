@@ -40,6 +40,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 |---|---|---|
 | Containment | Reads of credential stores (`~/.ssh`, `~/.aws`, `.netrc`, browser logins, DPAPI), file exfiltration (`curl -T`/`-d @`, `-InFile`, cloud-CLI uploads: `aws s3 cp`/`gsutil`/`az storage upload`/`rclone`), persistence (cron, registry autorun, scheduled tasks, services) | No |
 | Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source; `aegis uninstall`/`pull` | No |
+| Prompt secret guard | A live credential (API key/token/private key shape) pasted or smuggled into the raw prompt (`UserPromptSubmit`) | No |
 | Evasion | Encoded/obfuscated commands (`-EncodedCommand`, `base64 -d \| bash`, char-code) | No |
 | MCP config | Writes to MCP server-config files (`.mcp.json`, `mcpServers`, etc.) that auto-run on every future session | Human only |
 | Destructive SQL | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, migration resets — from shell **and** DB tool args | Yes |
@@ -141,7 +142,8 @@ cd sandbox && ./run.sh /path/to/repo    # or run.ps1 on Windows
 ## Limits
 
 - **Not a sandbox by itself.** An agent already at a raw shell can run relative commands Aegis only sees as opaque `shell` text. Use the [`sandbox/`](sandbox/) container, or an OS-restricted user, for hostile-code isolation.
-- **Guards are a denylist.** They catch known-dangerous shapes, not every possible one. Known gaps: bucket-to-bucket cloud transfers and aliased clients (`mc`, `doctl`) that the cloud-CLI exfil guard doesn't parse, in-place edits (`sed -i`), `git -c` inline-config force-push. Deny-by-default egress is the backstop. Found a bypass? That's a bug worth reporting.
+- **Guards are a denylist.** They catch known-dangerous shapes, not every possible one. Known gaps: bucket-to-bucket cloud transfers and aliased clients (`mc`, `doctl`) that the cloud-CLI exfil guard doesn't parse, in-place edits (`sed -i`), `git -c` inline-config force-push, and a credential that's been encoded/split/base64-wrapped past what the prompt secret guard's `SECRET_RE` shapes match. Deny-by-default egress is the backstop. Found a bypass? That's a bug worth reporting.
+- **Redaction touches the whole audit trail, not just prompts.** The prompt secret guard's redaction runs on every event's recorded `args`/`output`, so a false-positive `SECRET_RE` match inside legitimate tool output is masked there too — a deliberate trade (never log a live credential) that can blunt grounding evidence quoting that exact text. The `allow` regex exemption on `policy.prompt_guard` is for prompt content only; avoid writing a real secret's literal value into policy YAML to exempt it — that recreates the problem the guard exists to prevent.
 - **Fail-open by default.** If the hook can't run, the action proceeds unguarded rather than blocking your work. Set `AEGIS_FAIL_CLOSED=1` to invert.
 - **Identity is as strong as the keystore.** The issuer key lives on disk; a process with your privileges can read it.
 - **Deep hooks are Claude Code today.** Other runtimes use the `generic` adapter or the git/CI floor.

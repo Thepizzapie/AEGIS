@@ -173,6 +173,73 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- prompt secret guard: never escapable -------------------------------------
+def rule_prompt_guard(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a live credential from entering the model's context via the raw
+    user prompt (UserPromptSubmit).
+
+    Threat model: containment (above) stops READS of credential-store *paths*
+    and shell-based exfiltration, but a secret typed or pasted directly into a
+    prompt — or smuggled into one, e.g. a webhook/issue/email-driven session
+    where the "user" turn is populated from untrusted external content — has no
+    file path or shell verb for those guards to key off. It just enters context,
+    and (absent this guard) gets written to the audit trail verbatim by
+    ``audit.write_event``. That is a durable, unencrypted copy of the secret in
+    a place nothing else protects — arguably worse than the credential-file read
+    containment already blocks. UserPromptSubmit is one of the original core
+    BLOCKABLE hook points (predates the lifecycle package) but had no rule at
+    all until this one; the Claude Code adapter's ``parse_event`` now carries
+    the native ``prompt`` field into ``Event.args["prompt"]`` so this (or any
+    future) rule can see it.
+
+    Non-escapable, matching containment's tier: a real credential should never
+    reach the agent's context or the audit log, regardless of who/what typed
+    it — resubmit referencing the secret by name/location instead of its value.
+
+    Config (``policy.prompt_guard``): ``mode`` (deny|monitor|off, default deny;
+    monitor logs the would-be denial without blocking), ``allow`` (regexes on
+    the raw prompt that skip the gate — e.g. a test fixture that intentionally
+    contains a fake-shaped token). Don't put a real secret's literal value in
+    ``allow`` to exempt it — that recreates the problem this guard exists to
+    prevent; use ``monitor`` to pilot instead.
+
+    Honest scope: ``patterns.SECRET_RE`` matches known vendor-prefixed token
+    shapes and PEM/PGP key headers, not arbitrary high-entropy strings (too many
+    false positives otherwise). A credential that's been base64-wrapped, split
+    across lines, or otherwise transformed past those shapes will not match —
+    same denylist-not-exhaustive limit as the rest of ``aegis.patterns``. This
+    rule also does not by itself stop the secret from *leaving* once it's in
+    context through an allowed channel (network egress governs that).
+    """
+    if ev.event != HookEvent.USER_PROMPT_SUBMIT:
+        return None
+    text = str((ev.args or {}).get("prompt") or "")
+    if not text.strip():
+        return None
+    if not patterns.SECRET_RE.search(text):
+        return None
+    cfg = getattr(policy, "prompt_guard", None) or {}
+    mode = str(cfg.get("mode", "deny")).lower()
+    if mode == "off":
+        return None
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return None
+        except re.error:
+            continue
+    would = Decision(Action.DENY, "prompt-secret-guard",
+                     "A live credential (matches a known API-key/token/private-key "
+                     "shape) was found in the prompt text and is blocked from "
+                     "entering the model's context and audit trail. Remove the "
+                     "secret value — reference it by name/location instead — and "
+                     "resubmit.")
+    if mode == "monitor":
+        _record_monitor(ev, would, "prompt-secret-guard-monitor")
+        return None
+    return would
+
+
 # ---- MCP server-config protection: escapable with human confirmation ---------
 def _mcp_config_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -653,6 +720,7 @@ _CORE_RULES = (
     rule_attest_session,
     rule_containment,
     rule_self_protect,
+    rule_prompt_guard,
     rule_mcp_config_protect,
     rule_workspace_confine,
     rule_migration_protection,

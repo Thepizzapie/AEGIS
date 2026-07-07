@@ -136,3 +136,6 @@ class Policy:
     # Stop gate: after file mutations, the session may not stop until a test run
     # is recorded after the last change. See lifecycle.session.
     completion: dict = field(default_factory=dict)
+    # Prompt secret guard: {mode: deny|monitor|off, allow: [regex on raw prompt]}.
+    # Empty -> defaults (mode=deny) apply. See rules.rule_prompt_guard.
+    prompt_guard: dict = field(default_factory=dict)

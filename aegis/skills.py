@@ -34,6 +34,7 @@ _REMEDIES = """\
 | containment-persistence | installed autorun/service/scheduled-task persistence | don't persist; run the task in-session |
 | containment-exfiltration | uploaded local files to the network | keep data local; the human can share files deliberately |
 | self-protect | wrote/deleted Aegis config, policy, engine source, or an aegis-* skill | leave Aegis alone; ask the human to change policy via `aegis-policy` |
+| prompt-secret-guard | a live credential (API key/token/private key) was found in the raw prompt text | remove the secret value from the prompt; reference it by name/location instead |
 | mcp-config-protect | wrote an MCP server config (durable auto-run backdoor) | ask the human; they can set AEGIS_ALLOW_MCP_CONFIG=1 after review |
 | workspace-confine | wrote outside the project root the identity is bound to | stay in the project; ask for workspace.allow if a path is legitimate |
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |

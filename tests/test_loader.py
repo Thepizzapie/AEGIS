@@ -89,6 +89,35 @@ def test_lifecycle_knobs_absent_by_default(tmp_path):
     assert pol.permission == {} and pol.mcp == {}
 
 
+PROMPT_GUARD = """
+prompt_guard:
+  mode: monitor
+  allow: ["fixture-secret"]
+"""
+
+
+def test_load_prompt_guard_knob(tmp_path):
+    """prompt_guard round-trips from YAML onto the Policy, same as its sibling
+    knobs (install_review/mcp_config/failures/completion) — regression for it
+    silently defaulting to None (dead opt-in)."""
+    pol = load_policy(_write(tmp_path, PROMPT_GUARD))
+    assert pol.prompt_guard == {"mode": "monitor", "allow": ["fixture-secret"]}
+
+
+def test_prompt_guard_knob_absent_by_default(tmp_path):
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.prompt_guard == {}
+
+
+def test_prompt_guard_deny_mode_end_to_end(tmp_path):
+    """End-to-end: default mode (no knob at all) still denies a live-credential
+    prompt through the loaded policy, not just the in-memory default Policy()."""
+    pol = load_policy(_write(tmp_path, GOOD))
+    d = evaluate(Event.make(HookEvent.USER_PROMPT_SUBMIT,
+                           args={"prompt": "AKIAABCDEFGHIJKLMNOP"}), pol)
+    assert d.blocked and d.rule == "prompt-secret-guard"
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
     assert validate_policy(_write(tmp_path, LIFECYCLE)) == []

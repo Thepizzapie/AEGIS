@@ -90,8 +90,9 @@ def compose(policy) -> str:
             f"Posture: default_action={default}; built-in guards + "
             f"{n_rules} policy rule(s).",
             "Never available to you: credential stores, persistence installs, "
-            "uploading local files, editing Aegis config/policy/source, and "
-            "writing MCP server configs.",
+            "uploading local files, editing Aegis config/policy/source, "
+            "writing MCP server configs, and pasting a live credential into "
+            "the prompt.",
             "Human-only escapes: '# aegis-allow' overrides (destructive "
             "git/delete/SQL, obfuscated commands, fetch-piped-to-shell, "
             "unreviewed installs) are honored only for a human, never for a "

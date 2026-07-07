@@ -43,6 +43,12 @@ def parse_event(payload: dict) -> Event:
         args = {}
     else:
         args = {"value": raw_args}
+    # UserPromptSubmit carries no tool_input (there is no tool) — surface the
+    # native `prompt` text into args so prompt-level rules (rule_prompt_guard)
+    # can actually see it. Additive only: never overwrites a tool_input key.
+    prompt = payload.get("prompt")
+    if prompt is not None and "prompt" not in args:
+        args["prompt"] = prompt
     matcher = next((str(payload[k]) for k in _MATCHER_KEYS if payload.get(k)), None)
     return Event.make(
         name,
