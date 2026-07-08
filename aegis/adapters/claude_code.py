@@ -43,6 +43,11 @@ def parse_event(payload: dict) -> Event:
         args = {}
     else:
         args = {"value": raw_args}
+    # UserPromptSubmit carries the submitted text as a top-level 'prompt' field,
+    # not 'tool_input' (there is no tool) — normalize it into args so rules can
+    # read ev.args['prompt'] like any other argument (see rules.rule_hidden_unicode_prompt).
+    if name == HookEvent.USER_PROMPT_SUBMIT.value and payload.get("prompt") is not None:
+        args = {**args, "prompt": payload.get("prompt")}
     matcher = next((str(payload[k]) for k in _MATCHER_KEYS if payload.get(k)), None)
     return Event.make(
         name,

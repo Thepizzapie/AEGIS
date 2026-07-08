@@ -136,3 +136,7 @@ class Policy:
     # Stop gate: after file mutations, the session may not stop until a test run
     # is recorded after the last change. See lifecycle.session.
     completion: dict = field(default_factory=dict)
+    # Hidden-Unicode prompt-injection guard: {mode: deny|monitor|off,
+    # bidi_mode: deny|monitor|off}. Empty -> defaults (mode=deny,
+    # bidi_mode=monitor) apply. See rules.rule_hidden_unicode_prompt.
+    hidden_unicode: dict = field(default_factory=dict)

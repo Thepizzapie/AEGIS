@@ -61,6 +61,17 @@ def _override_allowed(ev: Event, extra: str = "") -> bool:
     return bool(patterns.OVERRIDE_RE.search(_cmd(ev) + " " + (extra or "")))
 
 
+def _prompt_text(ev: Event) -> str:
+    """The submitted prompt text on UserPromptSubmit — normalized into
+    ``args['prompt']`` by the adapter, with a fallback straight to the raw
+    payload for an adapter that hasn't been updated. Empty for every other
+    event."""
+    if ev.event != HookEvent.USER_PROMPT_SUBMIT:
+        return ""
+    a = ev.args or {}
+    return str(a.get("prompt") or (ev.raw or {}).get("prompt") or "")
+
+
 def _sql_text(ev: Event) -> str:
     """SQL/migration text from a DB tool's args (query/sql/statement/migration) and,
     for a shell call, the de-obfuscated command — so one rule covers psql AND a DB
@@ -404,6 +415,114 @@ def rule_evasion(ev: Event, policy=None) -> Optional[Decision]:
                     "char-code construction are how guards get bypassed).")
 
 
+# ---- hidden-Unicode prompt injection: the UserPromptSubmit boundary ----------
+def _has_hidden_tag_chars(text: str) -> bool:
+    """HIDDEN_TAG_RE, minus any well-formed subdivision/region flag emoji
+    (FLAG_TAG_SEQUENCE_RE) — see the rationale in ``patterns``. Stripping the
+    legitimate structure first (rather than, say, requiring a minimum run
+    length) means a payload hidden right alongside a real flag, or one that
+    merely mimics the flag/cancel-tag bookends without the rest of the exact
+    shape, still matches on the residual text."""
+    return bool(patterns.HIDDEN_TAG_RE.search(patterns.FLAG_TAG_SEQUENCE_RE.sub("", text)))
+
+
+def rule_hidden_unicode_prompt(ev: Event, policy=None) -> Optional[Decision]:
+    """Block invisible-Unicode prompt injection at the UserPromptSubmit boundary.
+
+    UserPromptSubmit fires before a prompt — human-typed, or machine-fed in a
+    headless/CI run (a GitHub issue body, a PR comment, a webhook payload
+    relayed as the turn) — is processed. Every OTHER guard in this module acts
+    on a tool call the model already decided to make; that is one step too late
+    for content whose entire purpose is to steer that decision invisibly. This
+    is the one guard that looks at the prompt itself, and it looks for
+    deterministic, near-zero-false-positive *shapes* (same philosophy as
+    ``rule_evasion``) rather than trying to semantically judge intent.
+
+    Three techniques, two severity tiers (see ``patterns`` for the full
+    rationale on each):
+
+    1. Unicode tag-block steganography (``HIDDEN_TAG_RE``, minus the one
+       standardized legitimate use — a subdivision/region flag emoji, carved
+       out by ``FLAG_TAG_SEQUENCE_RE`` — via ``_has_hidden_tag_chars``) —
+       invisible in every renderer, ASCII-decodes to hidden text. Hard DENY.
+    2. A run of 2+ chained variation selectors (``HIDDEN_VARIATION_RUN_RE``) or
+       6+ chained zero-width joiners/spacers (``HIDDEN_ZEROWIDTH_RUN_RE``) — the
+       steganographic encoding channels; ordinary text uses either singly
+       (an emoji's presentation-style selector, a ZWJ emoji sequence), never
+       chained. Hard DENY.
+    3. Bidi text-direction override/isolate controls (``BIDI_OVERRIDE_RE``) —
+       can visually reorder text so a human reviewer sees something different
+       from what the model reads (Trojan Source). Rarer but not zero legitimate
+       use, so this tier defaults to ``monitor`` (audited, not blocked).
+
+    Escapable only by an explicit env var (``AEGIS_ALLOW_HIDDEN_UNICODE=1``)
+    set by a human operator BEFORE launch — deliberately NOT the in-band
+    '# aegis-allow' convention the shell guards use. For a shell command, the
+    dangerous action and the override comment both have to be something the
+    MODEL chooses to type — an extra step that at least requires the model's
+    cooperation. Here the entire prompt, override phrase included, can be a
+    single artifact fully authored by whoever/whatever fed it in; searching
+    the text for its own escape hatch is circular and buys nothing an attacker
+    couldn't trivially append themselves. An out-of-band env var a spawned or
+    machine-fed session cannot set for its own hook invocation closes that gap.
+
+    Config (``policy.hidden_unicode``): ``mode`` (deny|monitor|off, default
+    deny) governs tiers 1-2; ``bidi_mode`` (deny|monitor|off, default monitor)
+    governs tier 3. There is no ``ask`` — UserPromptSubmit has no interactive
+    permission surface in Claude Code (only PreToolUse does), so an ``ask``
+    here would silently resolve to allow; ``monitor`` is the honest name for
+    "record it, don't block" instead of a fake ask."""
+    text = _prompt_text(ev)
+    if not text:
+        return None
+    if os.environ.get("AEGIS_ALLOW_HIDDEN_UNICODE"):
+        return None
+    cfg = getattr(policy, "hidden_unicode", None) or {}
+    override_hint = (" A human operator may set AEGIS_ALLOW_HIDDEN_UNICODE=1 "
+                      "before launch to confirm intent; nothing embedded in the "
+                      "prompt text itself can waive this guard.")
+
+    mode = str(cfg.get("mode", "deny")).lower()
+    if mode != "off":
+        hit = None
+        if _has_hidden_tag_chars(text):
+            hit = ("hidden-unicode-tag-chars",
+                   "Hidden Unicode tag-block characters (U+E0000-U+E007F) found in the "
+                   "submitted prompt — an invisible instruction-smuggling channel. It "
+                   "renders as nothing to a human but is still read by the model.")
+        elif patterns.HIDDEN_VARIATION_RUN_RE.search(text):
+            hit = ("hidden-unicode-variation",
+                   "A run of chained Unicode variation-selector characters found in the "
+                   "submitted prompt — the steganographic encoding ('emoji smuggling') "
+                   "used to hide instructions in text that looks ordinary to a human "
+                   "reviewer.")
+        elif patterns.HIDDEN_ZEROWIDTH_RUN_RE.search(text):
+            hit = ("hidden-unicode-zerowidth",
+                   "A run of chained invisible zero-width characters found in the "
+                   "submitted prompt — the steganographic encoding used to hide "
+                   "instructions in text that looks blank/ordinary to a human reviewer.")
+        if hit is not None:
+            rule_note, msg = hit
+            would = Decision(Action.DENY, rule_note, msg + override_hint)
+            if mode == "monitor":
+                _record_monitor(ev, would, f"{rule_note}-monitor")
+                return None
+            return would
+
+    bidi_mode = str(cfg.get("bidi_mode", "monitor")).lower()
+    if bidi_mode != "off" and patterns.BIDI_OVERRIDE_RE.search(text):
+        would = Decision(Action.DENY, "hidden-unicode-bidi",
+                         "Bidirectional text-direction override/isolate characters "
+                         "found in the submitted prompt — these can visually reorder "
+                         "text so a human reviewer sees something different from what "
+                         "the model reads (the 'Trojan Source' technique)." + override_hint)
+        if bidi_mode == "monitor":
+            _record_monitor(ev, would, "hidden-unicode-bidi-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- forced install review: read-before-install, then human ask --------------
 def rule_install_review(ev: Event, policy=None) -> Optional[Decision]:
     """Force a full read of an install's manifest, then a human ask.
@@ -658,6 +777,7 @@ _CORE_RULES = (
     rule_migration_protection,
     rule_subagent_spawn,
     rule_network_egress,
+    rule_hidden_unicode_prompt,
     rule_evasion,
     rule_failure_loop,
     rule_remote_exec,

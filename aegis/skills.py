@@ -39,6 +39,8 @@ _REMEDIES = """\
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |
 | subagent-spawn | a spawned agent tried to spawn sub-agents | do the work in this session, or run with AEGIS_ALLOW_SUBAGENTS=1 |
 | egress | network egress to a host outside policy | use an allowlisted host or ask for the allowlist to be widened |
+| hidden-unicode-tag-chars / hidden-unicode-variation / hidden-unicode-zerowidth | invisible Unicode (tag-block, chained variation selectors, or chained zero-width chars) in a submitted prompt | strip the hidden characters; submit plain text — a spawned/machine-fed prompt cannot self-escape this one, only a human setting AEGIS_ALLOW_HIDDEN_UNICODE=1 before launch |
+| hidden-unicode-bidi | bidi text-direction override characters in a submitted prompt | remove the override characters unless mixed RTL/LTR formatting is genuinely intended |
 | evasion | encoded/obfuscated command | run the command in the clear |
 | failure-loop | identical retry of a call that already failed repeatedly | read the error; change the arguments or the approach — don't re-run it |
 | remote-exec | fetch piped straight into a shell | download, read in full, then run the local copy |
@@ -93,7 +95,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `inject`, `failures`,
-   `completion`, `team`, `compaction`, `permission`, `mcp`).
+   `completion`, `hidden_unicode`, `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
    the `aegis-policy` skill for changes.
@@ -136,8 +138,8 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
    - declarative rule: `rules: [{{name, action: allow|deny|ask, tools/actions/
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
-     `mcp_config`, `inject`, `failures`, `completion`, `team`, `compaction`,
-     `permission`, `mcp`.
+     `mcp_config`, `inject`, `failures`, `completion`, `hidden_unicode`,
+     `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
 """,

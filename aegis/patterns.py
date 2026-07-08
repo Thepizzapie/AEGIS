@@ -366,6 +366,66 @@ NOEXEC_FETCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Hidden/invisible Unicode used to smuggle instructions past human review at the
+# UserPromptSubmit boundary — the text renders as nothing (or as ordinary text)
+# to a person reading the prompt, but the model still tokenizes and reads the
+# hidden codepoints. Three techniques with ~zero OTHER legitimate use in a
+# message TO an agent:
+#
+#  - Tag-block steganography (U+E0000-U+E007F): Unicode's deprecated language-tag
+#    plane, invisible in every renderer. Each tag codepoint is (0x20 + ascii_char),
+#    so a run of them ASCII-decodes to arbitrary hidden text. Publicly
+#    demonstrated in 2024 ("ASCII smuggling") to hide instructions inside
+#    content a human reviewer sees as blank. The ONE standardized legitimate use
+#    of this range is a subdivision/region flag emoji — a waving black flag
+#    (U+1F3F4) immediately followed by 2-7 lowercase tag-letters and terminated
+#    by the cancel tag (U+E007F), e.g. Scotland/England/Wales. That exact,
+#    fixed structure is carved out by FLAG_TAG_SEQUENCE_RE below; a tag
+#    codepoint appearing OUTSIDE it (no preceding flag, wrong length, missing
+#    the cancel tag, or free-standing elsewhere in the text) is not standard
+#    emoji usage and stays flagged.
+#  - Variation-selector steganography: the identical one-codepoint-per-byte
+#    trick in a different plane — VS1-16 (U+FE00-FE0F) and VS17-256
+#    (U+E0100-E01EF). A single variation selector is ordinary (it picks one
+#    base character's presentation style); nothing in real usage ever stacks
+#    two or more back-to-back with no base character between them.
+#  - Zero-width run: a chain of invisible joiners/spacers (ZWSP/ZWNJ/ZWJ/word
+#    joiner/BOM) with no visible character between them, encoding a hidden
+#    payload one bit per codepoint choice. Ordinary text uses these SINGLY (an
+#    emoji ZWJ sequence, an Indic ZWNJ) — never chained back-to-back for six or
+#    more codepoints running, which is why the run length (not mere presence)
+#    is the signal.
+HIDDEN_TAG_RE = re.compile("[\U000e0000-\U000e007f]")
+
+# The one standardized, publicly documented, everyday use of tag-block
+# codepoints: a subdivision/region flag emoji. rules.rule_hidden_unicode_prompt
+# strips every match of this BEFORE testing HIDDEN_TAG_RE, so a legitimate
+# flag never trips the guard while a payload hidden alongside — or instead
+# of — one still does.
+FLAG_TAG_SEQUENCE_RE = re.compile("\U0001f3f4[\U000e0061-\U000e007a]{2,7}\U000e007f")
+
+# Zero-width joiner/spacer/BOM codepoints, named by escape (never as literal
+# invisible characters in source — those would be unreviewable in a diff and,
+# for a security tool, an uncomfortably on-the-nose thing to embed): ZWSP
+# U+200B, ZWNJ U+200C, ZWJ U+200D, word joiner U+2060, ZWNBSP/BOM U+FEFF.
+_ZW_CHARS = "\u200b\u200c\u200d\u2060\ufeff"
+HIDDEN_ZEROWIDTH_RUN_RE = re.compile(f"[{_ZW_CHARS}]{{6,}}")
+
+# Variation-selector steganography (see the module comment above HIDDEN_TAG_RE):
+# VS1-16 (BMP) + the supplementary VS17-256 block. Run of 2+ is the signal.
+HIDDEN_VARIATION_RUN_RE = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]{2,}")
+
+# Bidirectional text-direction override/isolate controls: LRE U+202A, RLE
+# U+202B, PDF U+202C, LRO U+202D, RLO U+202E, LRI U+2066, RLI U+2067, FSI
+# U+2068, PDI U+2069. These can visually reorder text so a human reviewer sees
+# something different from what the model reads (the "Trojan Source" class of
+# attack). Distinct from the plain LRM/RLM direction MARKS (U+200E/U+200F),
+# which have everyday legitimate use and are deliberately excluded — ordinary
+# RTL text (Arabic/Hebrew) renders correctly via the bidi algorithm without any
+# of these explicit override/isolate controls, so this is still a meaningfully
+# rare, high-signal pattern.
+BIDI_OVERRIDE_RE = re.compile("[\u202a-\u202e\u2066-\u2069]")
+
 # A test-suite invocation, across common toolchains. Backs the opt-in Stop
 # verification gate (lifecycle.session.rule_stop_verification_gate): evidence
 # that a test run HAPPENED after the last change — presence of the command, not
