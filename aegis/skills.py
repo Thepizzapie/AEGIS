@@ -39,7 +39,7 @@ _REMEDIES = """\
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |
 | subagent-spawn | a spawned agent tried to spawn sub-agents | do the work in this session, or run with AEGIS_ALLOW_SUBAGENTS=1 |
 | egress | network egress to a host outside policy | use an allowlisted host or ask for the allowlist to be widened |
-| hidden-unicode-tag-chars / hidden-unicode-variation / hidden-unicode-zerowidth | invisible Unicode (tag-block, chained variation selectors, or chained zero-width chars) in a submitted prompt | strip the hidden characters; submit plain text — a spawned/machine-fed prompt cannot self-escape this one, only a human setting AEGIS_ALLOW_HIDDEN_UNICODE=1 before launch |
+| hidden-unicode-tag-chars / hidden-unicode-invisible-run | invisible Unicode (tag-block chars, or a chained run of zero-width/variation-selector chars in any mixture) in a submitted prompt | strip the hidden characters; submit plain text — a spawned/machine-fed prompt cannot self-escape this one, only a human setting AEGIS_ALLOW_HIDDEN_UNICODE=1 before launch |
 | hidden-unicode-bidi | bidi text-direction override characters in a submitted prompt | remove the override characters unless mixed RTL/LTR formatting is genuinely intended |
 | evasion | encoded/obfuscated command | run the command in the clear |
 | failure-loop | identical retry of a call that already failed repeatedly | read the error; change the arguments or the approach — don't re-run it |

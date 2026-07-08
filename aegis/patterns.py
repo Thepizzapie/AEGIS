@@ -367,49 +367,65 @@ NOEXEC_FETCH_RE = re.compile(
 )
 
 # Hidden/invisible Unicode used to smuggle instructions past human review at the
-# UserPromptSubmit boundary — the text renders as nothing (or as ordinary text)
+# UserPromptSubmit boundary -- the text renders as nothing (or as ordinary text)
 # to a person reading the prompt, but the model still tokenizes and reads the
-# hidden codepoints. Three techniques with ~zero OTHER legitimate use in a
+# hidden codepoints. Two techniques with ~zero OTHER legitimate use in a
 # message TO an agent:
 #
 #  - Tag-block steganography (U+E0000-U+E007F): Unicode's deprecated language-tag
 #    plane, invisible in every renderer. Each tag codepoint is (0x20 + ascii_char),
 #    so a run of them ASCII-decodes to arbitrary hidden text. Publicly
 #    demonstrated in 2024 ("ASCII smuggling") to hide instructions inside
-#    content a human reviewer sees as blank. The ONE standardized legitimate use
-#    of this range is a subdivision/region flag emoji — a waving black flag
-#    (U+1F3F4) immediately followed by 2-7 lowercase tag-letters and terminated
-#    by the cancel tag (U+E007F), e.g. Scotland/England/Wales. That exact,
-#    fixed structure is carved out by FLAG_TAG_SEQUENCE_RE below; a tag
-#    codepoint appearing OUTSIDE it (no preceding flag, wrong length, missing
-#    the cancel tag, or free-standing elsewhere in the text) is not standard
-#    emoji usage and stays flagged.
-#  - Variation-selector steganography: the identical one-codepoint-per-byte
-#    trick in a different plane — VS1-16 (U+FE00-FE0F) and VS17-256
-#    (U+E0100-E01EF). A single variation selector is ordinary (it picks one
-#    base character's presentation style); nothing in real usage ever stacks
-#    two or more back-to-back with no base character between them.
-#  - Zero-width run: a chain of invisible joiners/spacers (ZWSP/ZWNJ/ZWJ/word
-#    joiner/BOM) with no visible character between them, encoding a hidden
-#    payload one bit per codepoint choice. Ordinary text uses these SINGLY (an
-#    emoji ZWJ sequence, an Indic ZWNJ) — never chained back-to-back for six or
-#    more codepoints running, which is why the run length (not mere presence)
-#    is the signal.
+#    content a human reviewer sees as blank. The ONLY standardized legitimate
+#    use of this range is a subdivision/region flag emoji -- a waving black
+#    flag (U+1F3F4), the tag-encoding of one of a small, fixed set of real
+#    region codes, and the cancel tag (U+E007F). FLAG_TAG_SEQUENCE_RE below
+#    matches EXACTLY those known codes, not "any 2-7 tag letters shaped like
+#    one" -- matching on shape alone lets an attacker chunk an arbitrary
+#    hidden message into <=7-char pieces, wrap each in its own
+#    syntactically-valid flag+cancel bookend, and have all of them stripped
+#    before detection ever runs. Exact literal matching closes that: a chunk
+#    essentially never spells one of the handful of real codes, so it stays
+#    in the residual text HIDDEN_TAG_RE sees.
+#  - Invisible-run steganography: a chain of codepoints that render as
+#    nothing (ZWSP/ZWNJ/ZWJ/word-joiner/BOM) or as a bare
+#    presentation/selection hint with no base character of its own
+#    (variation selectors VS1-16 and VS17-256), encoding a hidden payload one
+#    unit per codepoint choice. HIDDEN_INVISIBLE_RUN_RE matches a run of
+#    EITHER kind, in ANY mixture -- not two separate per-class regexes --
+#    because a per-class run threshold has a seam: alternating classes (5
+#    zero-width chars, 1 variation selector, repeat) resets each class's own
+#    counter every cycle while the combined run of purely-invisible
+#    codepoints is unbounded. Ordinary text uses either kind SINGLY, and
+#    combines at most one of each around a real base character (e.g. a
+#    heart-based emoji sequence: VS16 then ZWJ, bracketed by visible emoji)
+#    -- never three or more purely-invisible codepoints running with nothing
+#    rendering between them, which is why the run length across the combined
+#    class (not mere presence, and not any one sub-class's count alone) is
+#    the signal.
 HIDDEN_TAG_RE = re.compile("[\U000e0000-\U000e007f]")
 
-# The one standardized, publicly documented, everyday use of tag-block
-# codepoints: a subdivision/region flag emoji. rules.rule_hidden_unicode_prompt
-# strips every match of this BEFORE testing HIDDEN_TAG_RE, so a legitimate
-# flag never trips the guard while a payload hidden alongside — or instead
-# of — one still does.
-FLAG_TAG_SEQUENCE_RE = re.compile("\U0001f3f4[\U000e0061-\U000e007a]{2,7}\U000e007f")
+# The small, fixed set of Unicode-recommended emoji_tag_sequences in current
+# use (Unicode Technical Standard #51): England, Scotland, Wales. Matched as
+# exact literal tag-encoded strings, not a shape/length pattern -- see the
+# module comment above HIDDEN_TAG_RE for why that distinction matters.
+_REAL_FLAG_CODES = ("gbeng", "gbsct", "gbwls")
+FLAG_TAG_SEQUENCE_RE = re.compile(
+    "\U0001f3f4(?:" + "|".join(
+        "".join(chr(0xE0000 + ord(c)) for c in code) for code in _REAL_FLAG_CODES
+    ) + ")\U000e007f"
+)
 
-# Zero-width joiner/spacer/BOM codepoints, named by escape (never as literal
-# invisible characters in source — those would be unreviewable in a diff and,
-# for a security tool, an uncomfortably on-the-nose thing to embed): ZWSP
-# U+200B, ZWNJ U+200C, ZWJ U+200D, word joiner U+2060, ZWNBSP/BOM U+FEFF.
+# Zero-width joiner/spacer/BOM (ZWSP U+200B, ZWNJ U+200C, ZWJ U+200D, word
+# joiner U+2060, ZWNBSP/BOM U+FEFF) union'd with variation selectors (VS1-16
+# U+FE00-FE0F, VS17-256 U+E0100-E01EF) into ONE run check -- see the module
+# comment above HIDDEN_TAG_RE for why a combined class, not two separate
+# per-class regexes, is required. Named by escape, never as literal invisible
+# characters in source (unreviewable in a diff, and an uncomfortable thing
+# for a security tool's own source to carry as raw bytes).
 _ZW_CHARS = "\u200b\u200c\u200d\u2060\ufeff"
-HIDDEN_ZEROWIDTH_RUN_RE = re.compile(f"[{_ZW_CHARS}]{{6,}}")
+_VS_CHARS = "\ufe00-\ufe0f\U000e0100-\U000e01ef"
+HIDDEN_INVISIBLE_RUN_RE = re.compile(f"[{_ZW_CHARS}{_VS_CHARS}]{{3,}}")
 
 # Variation-selector steganography (see the module comment above HIDDEN_TAG_RE):
 # VS1-16 (BMP) + the supplementary VS17-256 block. Run of 2+ is the signal.

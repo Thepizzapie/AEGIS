@@ -438,18 +438,22 @@ def rule_hidden_unicode_prompt(ev: Event, policy=None) -> Optional[Decision]:
     deterministic, near-zero-false-positive *shapes* (same philosophy as
     ``rule_evasion``) rather than trying to semantically judge intent.
 
-    Three techniques, two severity tiers (see ``patterns`` for the full
+    Two techniques, two severity tiers (see ``patterns`` for the full
     rationale on each):
 
     1. Unicode tag-block steganography (``HIDDEN_TAG_RE``, minus the one
        standardized legitimate use — a subdivision/region flag emoji, carved
-       out by ``FLAG_TAG_SEQUENCE_RE`` — via ``_has_hidden_tag_chars``) —
-       invisible in every renderer, ASCII-decodes to hidden text. Hard DENY.
-    2. A run of 2+ chained variation selectors (``HIDDEN_VARIATION_RUN_RE``) or
-       6+ chained zero-width joiners/spacers (``HIDDEN_ZEROWIDTH_RUN_RE``) — the
-       steganographic encoding channels; ordinary text uses either singly
-       (an emoji's presentation-style selector, a ZWJ emoji sequence), never
-       chained. Hard DENY.
+       out by exact match against ``FLAG_TAG_SEQUENCE_RE`` — via
+       ``_has_hidden_tag_chars``) — invisible in every renderer, ASCII-decodes
+       to hidden text. Hard DENY.
+    2. A run of 3+ chained invisible codepoints drawn from EITHER the
+       zero-width or the variation-selector class, in any mixture
+       (``HIDDEN_INVISIBLE_RUN_RE`` — one combined regex, not two per-class
+       ones: alternating between classes would otherwise reset two separate
+       counters and let an unbounded purely-invisible run slip through the
+       gap between them) — the steganographic encoding channel; ordinary
+       text uses each kind singly (an emoji's presentation-style selector, a
+       ZWJ emoji sequence), never chained. Hard DENY.
     3. Bidi text-direction override/isolate controls (``BIDI_OVERRIDE_RE``) —
        can visually reorder text so a human reviewer sees something different
        from what the model reads (Trojan Source). Rarer but not zero legitimate
@@ -490,17 +494,13 @@ def rule_hidden_unicode_prompt(ev: Event, policy=None) -> Optional[Decision]:
                    "Hidden Unicode tag-block characters (U+E0000-U+E007F) found in the "
                    "submitted prompt — an invisible instruction-smuggling channel. It "
                    "renders as nothing to a human but is still read by the model.")
-        elif patterns.HIDDEN_VARIATION_RUN_RE.search(text):
-            hit = ("hidden-unicode-variation",
-                   "A run of chained Unicode variation-selector characters found in the "
-                   "submitted prompt — the steganographic encoding ('emoji smuggling') "
-                   "used to hide instructions in text that looks ordinary to a human "
-                   "reviewer.")
-        elif patterns.HIDDEN_ZEROWIDTH_RUN_RE.search(text):
-            hit = ("hidden-unicode-zerowidth",
-                   "A run of chained invisible zero-width characters found in the "
-                   "submitted prompt — the steganographic encoding used to hide "
-                   "instructions in text that looks blank/ordinary to a human reviewer.")
+        elif patterns.HIDDEN_INVISIBLE_RUN_RE.search(text):
+            hit = ("hidden-unicode-invisible-run",
+                   "A run of chained invisible/format Unicode characters (zero-width "
+                   "joiners/spacers and/or variation selectors, in any mixture) found in "
+                   "the submitted prompt — the steganographic encoding ('emoji smuggling' "
+                   "/ zero-width encoding) used to hide instructions in text that looks "
+                   "blank or ordinary to a human reviewer.")
         if hit is not None:
             rule_note, msg = hit
             would = Decision(Action.DENY, rule_note, msg + override_hint)
