@@ -475,7 +475,16 @@ def rule_hidden_unicode_prompt(ev: Event, policy=None) -> Optional[Decision]:
     governs tier 3. There is no ``ask`` — UserPromptSubmit has no interactive
     permission surface in Claude Code (only PreToolUse does), so an ``ask``
     here would silently resolve to allow; ``monitor`` is the honest name for
-    "record it, don't block" instead of a fake ask."""
+    "record it, don't block" instead of a fake ask.
+
+    Known gap (see the full rationale in ``patterns`` above
+    ``HIDDEN_INVISIBLE_RUN_RE``): tier 2 is a consecutive-run check, so an
+    attacker who caps every invisible sub-run at 2 characters and inserts one
+    incidental visible character between each capped sub-run can still
+    encode an arbitrarily long hidden message with no run ever crossing the
+    threshold. Same spirit as this project's other documented denylist gaps
+    (README "Limits") — this guard is one layer among many, not a complete
+    content classifier."""
     text = _prompt_text(ev)
     if not text:
         return None

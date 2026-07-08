@@ -427,9 +427,23 @@ _ZW_CHARS = "\u200b\u200c\u200d\u2060\ufeff"
 _VS_CHARS = "\ufe00-\ufe0f\U000e0100-\U000e01ef"
 HIDDEN_INVISIBLE_RUN_RE = re.compile(f"[{_ZW_CHARS}{_VS_CHARS}]{{3,}}")
 
-# Variation-selector steganography (see the module comment above HIDDEN_TAG_RE):
-# VS1-16 (BMP) + the supplementary VS17-256 block. Run of 2+ is the signal.
-HIDDEN_VARIATION_RUN_RE = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]{2,}")
+# Known gap (same spirit as CLOUD_EXFIL_RE's documented gaps below): a run
+# check, by construction, only sees CONSECUTIVE invisible codepoints. An
+# attacker who caps every invisible sub-run at 2 characters (below this
+# regex's threshold of 3) and inserts one incidental visible character
+# between each capped sub-run \u2014 reusing a letter already in the cover text,
+# so nothing looks out of place \u2014 can still encode an arbitrarily long hidden
+# message with zero run ever crossing the threshold. A blind total-invisible-
+# character-count fallback is not a free fix either: legitimate multi-part
+# emoji (ZWJ family/skin-tone/gender sequences) can accumulate several
+# zero-width/variation-selector characters across a longer message with no
+# single run above 2, so a naive density check would false-positive on
+# ordinary emoji-heavy text. Closing this needs a real per-message budget
+# that accounts for expected emoji density, which is future work, not a
+# one-line patch \u2014 deny-by-default egress plus the rest of the guard suite
+# (this is one guard among many, not the only line of defense) is the
+# backstop, per the project's general "guards are a denylist, not every
+# possible shape" posture (see README "Limits").
 
 # Bidirectional text-direction override/isolate controls: LRE U+202A, RLE
 # U+202B, PDF U+202C, LRO U+202D, RLO U+202E, LRI U+2066, RLI U+2067, FSI

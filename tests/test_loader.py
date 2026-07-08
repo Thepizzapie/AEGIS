@@ -89,6 +89,35 @@ def test_lifecycle_knobs_absent_by_default(tmp_path):
     assert pol.permission == {} and pol.mcp == {}
 
 
+HIDDEN_UNICODE = """
+hidden_unicode:
+  mode: monitor
+  bidi_mode: deny
+"""
+
+
+def test_load_hidden_unicode_knob_round_trips(tmp_path):
+    """hidden_unicode must round-trip from YAML onto the Policy the same way the
+    other guard-config knobs do — regression for it silently defaulting to {}."""
+    pol = load_policy(_write(tmp_path, HIDDEN_UNICODE))
+    assert pol.hidden_unicode == {"mode": "monitor", "bidi_mode": "deny"}
+
+
+def test_hidden_unicode_knob_absent_by_default(tmp_path):
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.hidden_unicode == {}
+
+
+def test_hidden_unicode_knob_enables_rule_end_to_end(tmp_path):
+    """End-to-end: a policy-file-loaded bidi_mode: deny actually DENYs through the
+    engine, same as the lifecycle knobs test above."""
+    pol = load_policy(_write(tmp_path, HIDDEN_UNICODE))
+    rlo = chr(0x202E)
+    ev = Event.make(HookEvent.USER_PROMPT_SUBMIT, args={"prompt": f"reorder me {rlo}here"})
+    d = evaluate(ev, pol)
+    assert d.blocked and d.rule == "hidden-unicode-bidi"
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
     assert validate_policy(_write(tmp_path, LIFECYCLE)) == []

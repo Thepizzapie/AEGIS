@@ -85,6 +85,23 @@ def test_interleaved_classes_still_blocked():
     assert d.rule == "hidden-unicode-invisible-run"
 
 
+def test_known_gap_capped_subrun_interleaving_evades_detection():
+    # Documents an ACCEPTED, disclosed limitation (see patterns.py's comment
+    # above HIDDEN_INVISIBLE_RUN_RE and the README "Limits" section) rather
+    # than a silent one: capping every invisible sub-run at 2 chars (below
+    # the run-length-3 threshold) and inserting one incidental visible
+    # character — here, reusing a letter already in the cover text — between
+    # each capped sub-run evades the consecutive-run check entirely,
+    # regardless of total hidden-message length. A blind total-invisible-
+    # count fallback isn't a free fix (it would false-positive on legitimate
+    # emoji-heavy text), so this stays a known gap, not a bug to silently
+    # patch. If this ever gets closed, delete this test or flip its assertion.
+    hidden_message = "secret instructions"
+    smuggled = "".join(VS16 + ZWJ + "e" for _ in hidden_message)  # 2-char sub-runs, capped
+    d = evaluate(_prompt(f"innocuous cover text{smuggled} more cover text"), Policy())
+    assert not d.blocked
+
+
 def test_single_variation_selector_allowed_no_false_positive():
     # A single presentation-style selector after a base char (e.g. an emoji's
     # text-vs-emoji form) is everyday usage, not stego — must not be flagged.
