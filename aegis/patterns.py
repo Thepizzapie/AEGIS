@@ -175,6 +175,27 @@ DELETE_OR_MOVE_VERB_RE = re.compile(
     r"\b(?:rm|remove-item|ri|rmdir|rd|del|erase|mv|move-item|move|ren|rename-item)\b",
     re.IGNORECASE,
 )
+# `find`'s -path/-name/-wholename predicates can describe a target file WITHOUT
+# ever writing its full path as one contiguous string (`find . -path
+# '*/aegis/*' -name rules.py`), evading every substring-adjacency path check
+# above (AEGIS_SOURCE_RE / CONFIG_DIR_RE / ENFORCEMENT_PATH_RE / AEGIS_SKILL_PATH_RE)
+# even though `rm $(find . -path '*/aegis/*' -name rules.py)` deletes Aegis's
+# own engine source just as directly as a literal path would — QA review
+# (independent agent, round 6). High-signal: `find` has no legitimate reason
+# to search for a directory/file literally named "aegis" or ".claude" outside
+# of Aegis's own tree. Paired with DELETE_OR_MOVE_VERB_RE / WRITE_REDIRECT_RE /
+# COPY_WRITE_VERB_RE / INPLACE_WRITE_RE in rule_self_protect exactly like the
+# other path patterns — a bare `find ... -name` that only LISTS matches
+# (no verb, no command substitution feeding one) is not itself a write and
+# stays allowed.
+FIND_PROTECTED_RE = re.compile(
+    # (?<!\S), not \b, before '-i?path': '-' is a non-word char, so \b can never
+    # match immediately before it (no \w/\W transition between a preceding space
+    # and '-') — that silently made this whole pattern dead on arrival.
+    r"\bfind\b[^|;&\n]*(?<!\S)-i?(?:path|name|wholename)\b\s*['\"]?[^'\"\n]*?"
+    r"(?:\baegis\b|\.claude\b)",
+    re.IGNORECASE,
+)
 AEGIS_UNINSTALL_RE = re.compile(r"\baegis\b[^|;&\n]*\buninstall\b", re.IGNORECASE)
 # 'aegis pull' — overwrites the active policy; a hijacked agent that pulls a
 # permissive policy and then proceeds unguarded is the self-protect failure mode.

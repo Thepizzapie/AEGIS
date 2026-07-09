@@ -151,7 +151,11 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
             return Decision(Action.DENY, "self-protect",
                             "Running `aegis pull` is blocked — overwriting policy from a "
                             "shell is a self-protect violation.")
-        if (patterns.CONFIG_DIR_RE.search(cmd) or patterns.AEGIS_SOURCE_RE.search(cmd)) and (
+        if (patterns.CONFIG_DIR_RE.search(cmd) or patterns.AEGIS_SOURCE_RE.search(cmd)
+                # find's -path/-name predicates can name a protected file without the
+                # command ever containing its path as one contiguous string — see
+                # FIND_PROTECTED_RE's docstring in patterns.py.
+                or patterns.FIND_PROTECTED_RE.search(cmd)) and (
                 patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                 or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                 or patterns.WRITE_REDIRECT_RE.search(cmd)

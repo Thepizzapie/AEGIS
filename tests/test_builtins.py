@@ -211,6 +211,27 @@ def test_win_trim_no_catastrophic_backtracking():
     assert time.time() - start < 1.0
 
 
+def test_self_protect_blocks_find_split_path():
+    """`find`'s -path/-name predicates can describe a target file WITHOUT the
+    command ever containing its path as one contiguous string —
+    `rm $(find . -path '*/aegis/*' -name rules.py)` deletes Aegis's own
+    engine source just as directly as `rm aegis/rules.py`, but evaded every
+    substring-adjacency path pattern (AEGIS_SOURCE_RE / CONFIG_DIR_RE /
+    ENFORCEMENT_PATH_RE / AEGIS_SKILL_PATH_RE). QA review (independent agent,
+    round 6) found this. A bare find that only LISTS matches (no verb, no
+    command substitution feeding one) must stay allowed."""
+    assert evaluate(_shell("rm $(find . -path '*/aegis/*' -name rules.py)"), EMPTY).blocked
+    assert evaluate(
+        _shell("mv $(find . -path '*/aegis/*' -name rules.py) /tmp/stolen.py"), EMPTY
+    ).blocked
+    assert evaluate(
+        _shell("cat $(find . -path '*/aegis/*' -name rules.py) > /tmp/stolen.py"), EMPTY
+    ).blocked
+    assert evaluate(_shell("find . -iname rules.py -ipath '*aegis*' -delete"), EMPTY).blocked
+    assert not evaluate(_shell('find . -name "*.py"'), EMPTY).blocked
+    assert not evaluate(_shell("rm $(find . -name README.md)"), EMPTY).blocked
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked
