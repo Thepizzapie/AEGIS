@@ -180,6 +180,37 @@ def test_self_protect_blocks_windows_trailing_dot_space():
     assert not evaluate(_shell("echo 'notes.aegis.bak stuff' > x.txt"), EMPTY).blocked
 
 
+def test_self_protect_blocks_unbounded_windows_trailing_dots():
+    """Win32's path-name conversion strips trailing dots/spaces UNBOUNDEDLY,
+    not capped at any fixed count. QA review (independent agent, round 5)
+    found the round-4 fix's `_WIN_TRIM = r"[ .]{0,4}"` missed any padding past
+    4 characters — a component with 5+ trailing dots still resolves to the
+    same file on Windows but no longer matched. Widened to unbounded `[ .]*`
+    (still safe: a flat, unnested class disjoint from the separator that
+    follows it has no backtracking ambiguity)."""
+    assert evaluate(_shell("echo pwned > aegis...../rules.py"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/x/y/' aegis...../rules.py"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/a/b/' .aegis...../policies/default.yaml"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/a/b/' .claude...../settings.json"), EMPTY).blocked
+    assert evaluate(
+        _shell("sed -i 's/x/y/' .claude...../skills/aegis-blocked/SKILL.md"), EMPTY
+    ).blocked
+
+
+def test_win_trim_no_catastrophic_backtracking():
+    """Unbounding `_WIN_TRIM` to `[ .]*` must stay linear time — it's a flat
+    class immediately followed by `_SEP` (which starts with `[/\\\\]`, a
+    disjoint character class), so there's no ambiguous split and no
+    backtracking blowup. Verified on a 100k-character adversarial input
+    combining both the space/dot padding and the slash-run attack from the
+    round-3 ReDoS."""
+    import time
+    from aegis.patterns import AEGIS_SOURCE_RE
+    start = time.time()
+    AEGIS_SOURCE_RE.search("aegis" + " ." * 50_000 + "/." * 50_000 + "x")
+    assert time.time() - start < 1.0
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked

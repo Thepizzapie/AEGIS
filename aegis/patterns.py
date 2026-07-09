@@ -105,15 +105,18 @@ DNS_C2_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Win32's path parser silently STRIPS a trailing '.' or trailing space off any
-# path component before resolving it (documented Windows behavior, no POSIX
-# equivalent) — so 'aegis./rules.py' and '.aegis. /policies/x.yaml' resolve to
-# the exact same file as the unpadded form. A component boundary that requires
-# an EXACT separator immediately next is a one-character Windows-only bypass.
-# Bounded (not `*`) so it stays a flat, unambiguous class — no nesting with the
-# quantifiers around it, so no backtracking-blowup risk (see _SEP below for
-# what that failure mode looks like when a quantifier IS nested).
-_WIN_TRIM = r"[ .]{0,4}"
+# Win32's path parser silently STRIPS ALL trailing '.'/space characters off any
+# path component before resolving it (RtlpDosPathNameToRelativeNtPathName;
+# unbounded, not capped at any fixed count — the "MagicDot" research) — so
+# 'aegis...../rules.py' resolves to the exact same file as 'aegis/rules.py'.
+# A component boundary that requires an EXACT separator immediately next is a
+# Windows-only bypass. `*`, not a fixed `{0,N}` bound (a bounded class missed
+# any padding past N chars — QA review, round 5). Still safe: a flat,
+# unnested character class disjoint from what follows it (_SEP starts with
+# `[/\\]`, never a space or dot) has exactly one way to match — no ambiguity,
+# no backtracking blowup (see _SEP below for what that failure mode looks
+# like when a quantifier IS nested inside another).
+_WIN_TRIM = r"[ .]*"
 # Aegis's own enforcement surface — deleting/editing this disables Aegis.
 ENFORCEMENT_PATH_RE = re.compile(
     r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)|\.claude[/\\]settings\.json\b",
