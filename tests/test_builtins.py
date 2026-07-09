@@ -111,6 +111,17 @@ def test_self_protect_blocks_bare_relative_source_path():
     assert not evaluate(_shell("grep foo aegis/rules.py"), EMPTY).blocked
 
 
+def test_self_protect_blocks_redirect_glued_to_source_path():
+    """A redirect operator can sit directly against the path with no space
+    (`>aegis/rules.py`) — a shell metacharacter, not whitespace, immediately
+    before the bare relative path. QA review (independent agent) found this
+    still bypassed the first iteration of the bare-relative-path fix, which
+    enumerated leading characters instead of using a word boundary."""
+    assert evaluate(_shell("echo x >aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("echo x>aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("cat evil.py >>aegis/engine.py"), EMPTY).blocked
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked
