@@ -232,6 +232,20 @@ def test_self_protect_blocks_find_split_path():
     assert not evaluate(_shell("rm $(find . -name README.md)"), EMPTY).blocked
 
 
+def test_self_protect_blocks_find_regex_predicate():
+    """FIND_PROTECTED_RE's first cut (round 6) only listed -path/-name/
+    -wholename. QA review (independent agent, round 7 — final round) found
+    GNU find's -regex/-iregex predicate matches the whole path against one
+    pattern, so `.*aegis.*rules\\.py` matches `./aegis/rules.py` without ever
+    using -path/-name or spelling the target as a contiguous substring."""
+    assert evaluate(_shell(r"rm $(find . -regex '.*aegis.*rules\.py')"), EMPTY).blocked
+    assert evaluate(
+        _shell(r"mv $(find . -regex '.*aegis.*rules\.py') /tmp/stolen.py"), EMPTY
+    ).blocked
+    assert evaluate(_shell(r"rm $(find . -iregex '.*AEGIS.*rules\.py')"), EMPTY).blocked
+    assert not evaluate(_shell(r"find . -regex '.*\.txt'"), EMPTY).blocked
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked
