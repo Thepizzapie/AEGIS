@@ -105,29 +105,97 @@ DNS_C2_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Win32's path parser silently STRIPS ALL trailing '.'/space characters off any
+# path component before resolving it (RtlpDosPathNameToRelativeNtPathName;
+# unbounded, not capped at any fixed count — the "MagicDot" research) — so
+# 'aegis...../rules.py' resolves to the exact same file as 'aegis/rules.py'.
+# A component boundary that requires an EXACT separator immediately next is a
+# Windows-only bypass. `*`, not a fixed `{0,N}` bound (a bounded class missed
+# any padding past N chars — QA review, round 5). Still safe: a flat,
+# unnested character class disjoint from what follows it (_SEP starts with
+# `[/\\]`, never a space or dot) has exactly one way to match — no ambiguity,
+# no backtracking blowup (see _SEP below for what that failure mode looks
+# like when a quantifier IS nested inside another).
+_WIN_TRIM = r"[ .]*"
 # Aegis's own enforcement surface — deleting/editing this disables Aegis.
 ENFORCEMENT_PATH_RE = re.compile(
-    r"\.aegis(?=[/\\]|\s|['\"]|$)|\.claude[/\\]settings\.json\b", re.IGNORECASE)
+    r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)|\.claude[/\\]settings\.json\b",
+    re.IGNORECASE)
 # broader: shell delete/move of the whole config dirs (.aegis / .claude). Anchored
 # so it matches the DIR (followed by a separator / end / quote), not any filename
 # that merely contains '.aegis' or '.claude' (e.g. 'notes.aegis.bak', '.claude-x').
 CONFIG_DIR_RE = re.compile(
-    r"\.aegis(?=[/\\]|\s|['\"]|$)|\.claude(?=[/\\]|\s|['\"]|$)", re.IGNORECASE)
-# Aegis's OWN package source — editing/deleting it could neuter the engine
+    r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)"
+    r"|\.claude" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)",
+    re.IGNORECASE)
+# Aegis's OWN package source — editing/deleting it could neuter the engine.
+# The leading edge is a word boundary (\b), not just a path separator or
+# string-start: a shell argument almost always reaches this pattern as a BARE
+# relative path preceded by a space (`sed -i ... aegis/rules.py`) or with no
+# gap at all before a redirect operator (`>aegis/rules.py`), neither of which
+# `(?:^|[/\\])` ever matched — a gap that let any write verb (redirect, move,
+# copy, in-place edit) overwrite Aegis's engine source outright while the guard
+# stayed silent. \b covers every such case generically (any non-word character
+# or string-start before "aegis"), at the cost of also matching inside a
+# hyphenated unrelated path (e.g. `some-aegis/rules.py`) or a mention of the
+# filename in an unrelated write's text — a false positive, the safe direction
+# for a "never escapable" guard (same trade-off CONFIG_DIR_RE already makes).
+#
+# The separator between components is `_SEP` (one-or-more slashes, optionally
+# followed by more `.`-then-slashes segments), not a single `[/\\]`: the
+# OS/shell treats `aegis//rules.py` and `aegis/./rules.py` as byte-identical
+# to `aegis/rules.py`, so a lone extra `/` or a `./` component was a
+# one-character bypass of a single-separator regex. The leading `[/\\]+` sits
+# OUTSIDE the repeating group (not `(?:[/\\]+\.?)+`, which nests one unbounded
+# quantifier inside another): a mandatory literal `.` gates every subsequent
+# repetition, so a long run of bare slashes has exactly one way to match
+# instead of exponentially many — nesting the quantifiers directly caused
+# catastrophic backtracking (multi-second hang past ~25 slashes) on a crafted
+# input, which for a "never escapable" guard is itself a bypass path: the
+# README documents Aegis as fail-OPEN if the hook can't complete.
+#
+# _WIN_TRIM (defined above CONFIG_DIR_RE) sits before EVERY _SEP for the same
+# Windows trailing-dot/space reason: 'aegis./rules.py' and 'aegis ./rules.py'
+# resolve to Aegis's real engine source on Windows.
+_SEP = r"[/\\]+(?:\.[/\\]+)*"
 AEGIS_SOURCE_RE = re.compile(
-    r"(?:^|[/\\])aegis[/\\](?:__init__|rules|patterns|engine|policy|gate|attest|"
+    r"\baegis" + _WIN_TRIM + _SEP + r"(?:__init__|rules|patterns|engine|policy|gate|attest|"
     r"identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
     r"accountability|gitsurface|review|context|failures|skills|distribution)\.py\b"
-    r"|(?:^|[/\\])aegis[/\\](?:adapters|lifecycle)[/\\]\w+\.py\b",
+    r"|\baegis" + _WIN_TRIM + _SEP + r"(?:adapters|lifecycle)" + _WIN_TRIM + _SEP + r"\w+\.py\b",
     re.IGNORECASE,
 )
 # Aegis's shipped skills (.claude/skills/aegis-*) — they carry the compliance
 # guidance a blocked agent is pointed at; rewriting them subverts the guidance.
 AEGIS_SKILL_PATH_RE = re.compile(
-    r"\.claude[/\\]skills[/\\]aegis-[\w-]+", re.IGNORECASE)
+    r"\.claude" + _WIN_TRIM + _SEP + r"skills" + _WIN_TRIM + _SEP + r"aegis-[\w-]+",
+    re.IGNORECASE)
 # any move/delete verb (used together with ENFORCEMENT_PATH_RE on shell commands)
 DELETE_OR_MOVE_VERB_RE = re.compile(
     r"\b(?:rm|remove-item|ri|rmdir|rd|del|erase|mv|move-item|move|ren|rename-item)\b",
+    re.IGNORECASE,
+)
+# `find`'s -path/-name/-wholename/-regex predicates can describe a target
+# file WITHOUT ever writing its full path as one contiguous string (`find .
+# -path '*/aegis/*' -name rules.py`, or `find . -regex '.*aegis.*rules\.py'`),
+# evading every substring-adjacency path check above (AEGIS_SOURCE_RE /
+# CONFIG_DIR_RE / ENFORCEMENT_PATH_RE / AEGIS_SKILL_PATH_RE) even though
+# `rm $(find . -path '*/aegis/*' -name rules.py)` deletes Aegis's own engine
+# source just as directly as a literal path would — QA review (independent
+# agent, round 6; -regex/-iregex added in round 7 after the same reviewer
+# found the round-6 fix's predicate list was one short). High-signal: `find`
+# has no legitimate reason to search for a directory/file literally named
+# "aegis" or ".claude" outside of Aegis's own tree. Paired with
+# DELETE_OR_MOVE_VERB_RE / WRITE_REDIRECT_RE / COPY_WRITE_VERB_RE /
+# INPLACE_WRITE_RE in rule_self_protect exactly like the other path patterns
+# — a bare `find ... -name` that only LISTS matches (no verb, no command
+# substitution feeding one) is not itself a write and stays allowed.
+FIND_PROTECTED_RE = re.compile(
+    # (?<!\S), not \b, before '-i?path': '-' is a non-word char, so \b can never
+    # match immediately before it (no \w/\W transition between a preceding space
+    # and '-') — that silently made this whole pattern dead on arrival.
+    r"\bfind\b[^|;&\n]*(?<!\S)-i?(?:path|name|wholename|regex)\b\s*['\"]?[^'\"\n]*?"
+    r"(?:\baegis\b|\.claude\b)",
     re.IGNORECASE,
 )
 AEGIS_UNINSTALL_RE = re.compile(r"\baegis\b[^|;&\n]*\buninstall\b", re.IGNORECASE)
@@ -334,7 +402,9 @@ MCP_CONFIG_PATH_RE = re.compile(
 INPLACE_WRITE_RE = re.compile(
     r"\bsed\b[^|;&\n]*-i\b"
     r"|\bperl\b[^|;&\n]*-i\b"
+    r"|\bawk\b[^|;&\n]*-i\s*inplace\b"                    # gawk in-place edit
     r"|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
+    r"|\bed\b"                                            # ed writes via its own script, not -c
     r"|\bcp\b|\bcopy\b"
     r"|\bdd\b"
     r"|\b(?:python3?|node|ruby|perl)\b[^|;&\n]*\s-[ce]\b",
