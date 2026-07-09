@@ -143,6 +143,26 @@ def test_self_protect_blocks_awk_and_ed_inplace():
     assert evaluate(_shell("ed aegis/rules.py"), EMPTY).blocked
 
 
+def test_aegis_source_re_no_catastrophic_backtracking():
+    """The round-3 separator fix, `(?:[/\\\\]+\\.?)+`, nested one unbounded
+    quantifier inside another — a run of bare slashes has exponentially many
+    ways to split across repetitions, and Python's backtracking engine tries
+    them all before giving up on a non-matching tail. That is a multi-second
+    hang on ~25 slashes (measured), which for a hook that must return an exit
+    code is itself a bypass: the README documents Aegis as fail-OPEN if the
+    hook can't complete. `_SEP` was rewritten to `[/\\\\]+(?:\\.[/\\\\]+)*` —
+    the leading run sits outside the repeating group and every subsequent
+    repetition is gated by a mandatory literal '.', removing the ambiguity.
+    This must stay fast even on a large adversarial input."""
+    import time
+    from aegis.patterns import AEGIS_SOURCE_RE
+    start = time.time()
+    AEGIS_SOURCE_RE.search("aegis" + "/" * 10_000 + "x")
+    AEGIS_SOURCE_RE.search("aegis" + "/." * 10_000 + "x")
+    assert time.time() - start < 1.0
+    assert evaluate(_shell("ed aegis/rules.py"), EMPTY).blocked
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked

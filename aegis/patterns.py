@@ -127,11 +127,18 @@ CONFIG_DIR_RE = re.compile(
 # for a "never escapable" guard (same trade-off CONFIG_DIR_RE already makes).
 #
 # The separator between components is `_SEP` (one-or-more slashes, optionally
-# interleaved with a `.` segment), not a single `[/\\]`: the OS/shell treats
-# `aegis//rules.py` and `aegis/./rules.py` as byte-identical to
-# `aegis/rules.py`, so a lone extra `/` or a `./` component was a one-character
-# bypass of a single-separator regex.
-_SEP = r"(?:[/\\]+\.?)+"
+# followed by more `.`-then-slashes segments), not a single `[/\\]`: the
+# OS/shell treats `aegis//rules.py` and `aegis/./rules.py` as byte-identical
+# to `aegis/rules.py`, so a lone extra `/` or a `./` component was a
+# one-character bypass of a single-separator regex. The leading `[/\\]+` sits
+# OUTSIDE the repeating group (not `(?:[/\\]+\.?)+`, which nests one unbounded
+# quantifier inside another): a mandatory literal `.` gates every subsequent
+# repetition, so a long run of bare slashes has exactly one way to match
+# instead of exponentially many — nesting the quantifiers directly caused
+# catastrophic backtracking (multi-second hang past ~25 slashes) on a crafted
+# input, which for a "never escapable" guard is itself a bypass path: the
+# README documents Aegis as fail-OPEN if the hook can't complete.
+_SEP = r"[/\\]+(?:\.[/\\]+)*"
 AEGIS_SOURCE_RE = re.compile(
     r"\baegis" + _SEP + r"(?:__init__|rules|patterns|engine|policy|gate|attest|"
     r"identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
