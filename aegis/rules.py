@@ -155,7 +155,12 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
                 patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                 or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                 or patterns.WRITE_REDIRECT_RE.search(cmd)
-                or patterns.COPY_WRITE_VERB_RE.search(cmd)):
+                or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                # in-place edit (sed -i / perl -i / batch vim/ex) neither deletes,
+                # moves, redirects, nor copies-over — it was the one write shape this
+                # guard didn't check, letting an agent rewrite policy/settings/source
+                # in place without tripping "never escapable" self-protection.
+                or patterns.INPLACE_WRITE_RE.search(cmd)):
             return Decision(Action.DENY, "self-protect",
                             "Writing/deleting/moving Aegis's own config, policy, or engine "
                             "source is blocked.")

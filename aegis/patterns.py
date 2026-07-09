@@ -113,12 +113,19 @@ ENFORCEMENT_PATH_RE = re.compile(
 # that merely contains '.aegis' or '.claude' (e.g. 'notes.aegis.bak', '.claude-x').
 CONFIG_DIR_RE = re.compile(
     r"\.aegis(?=[/\\]|\s|['\"]|$)|\.claude(?=[/\\]|\s|['\"]|$)", re.IGNORECASE)
-# Aegis's OWN package source — editing/deleting it could neuter the engine
+# Aegis's OWN package source — editing/deleting it could neuter the engine.
+# The leading-context class must include whitespace/quotes/shell-metacharacters,
+# not just a path separator or string-start: a shell argument almost always
+# reaches this pattern as a BARE relative path preceded by a space (`sed -i ...
+# aegis/rules.py`), which `(?:^|[/\\])` alone never matches — a gap that let any
+# write verb (redirect, move, copy, in-place edit) overwrite Aegis's engine
+# source outright while the guard stayed silent. Mirrors the leading-context
+# class MCP_CONFIG_PATH_RE already uses for the same reason.
 AEGIS_SOURCE_RE = re.compile(
-    r"(?:^|[/\\])aegis[/\\](?:__init__|rules|patterns|engine|policy|gate|attest|"
+    r"(?:^|[\s'\"/\\=;&|(])aegis[/\\](?:__init__|rules|patterns|engine|policy|gate|attest|"
     r"identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
     r"accountability|gitsurface|review|context|failures|skills|distribution)\.py\b"
-    r"|(?:^|[/\\])aegis[/\\](?:adapters|lifecycle)[/\\]\w+\.py\b",
+    r"|(?:^|[\s'\"/\\=;&|(])aegis[/\\](?:adapters|lifecycle)[/\\]\w+\.py\b",
     re.IGNORECASE,
 )
 # Aegis's shipped skills (.claude/skills/aegis-*) — they carry the compliance

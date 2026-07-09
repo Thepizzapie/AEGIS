@@ -78,6 +78,39 @@ def test_self_protect_redirect_doesnt_false_positive():
     assert not evaluate(_shell("cat log.txt | tee /tmp/copy.txt"), EMPTY).blocked
 
 
+def test_self_protect_blocks_inplace_edit():
+    """An agent can't neuter policy/settings/engine via an in-place edit — the one
+    write shape (sed -i / perl -i / batch vim/ex) that isn't a delete, move,
+    redirect, or copy-over-target, and self-protect had never checked it."""
+    assert evaluate(_shell("sed -i 's/deny/allow/' .aegis/policies/default.yaml"), EMPTY).blocked
+    assert evaluate(_shell('perl -i -pe "s/deny/allow/" .aegis/policies/default.yaml'), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/x/y/' .claude/settings.json"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/x/y/' aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/x/y/' .claude/skills/aegis-blocked/SKILL.md"), EMPTY).blocked
+    assert evaluate(_shell("vim -c 'wq' .aegis/policies/default.yaml"), EMPTY).blocked
+    # override can't bypass — self-protect is never escapable
+    d = evaluate(_shell("sed -i 's/deny/allow/' .aegis/policies/default.yaml  # aegis-allow"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_inplace_edit_doesnt_false_positive():
+    """sed -i on an ordinary project file (not Aegis's own config/source) is fine."""
+    assert not evaluate(_shell("sed -i 's/foo/bar/' src/app.py"), EMPTY).blocked
+
+
+def test_self_protect_blocks_bare_relative_source_path():
+    """AEGIS_SOURCE_RE previously only matched a path preceded by '/'/'\\\\' or
+    string-start, so the everyday shell form of a relative path — 'aegis/rules.py'
+    preceded by a plain space — never matched at all. Any write verb (redirect,
+    move, copy, not just in-place edit) bypassed self-protect entirely for
+    Aegis's own engine source. Reads of the same bare path must stay allowed."""
+    assert evaluate(_shell("echo 'x' > aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("mv aegis/rules.py /tmp/backup.py"), EMPTY).blocked
+    assert evaluate(_shell("cp evil.py aegis/rules.py"), EMPTY).blocked
+    assert not evaluate(_shell("cat aegis/rules.py"), EMPTY).blocked
+    assert not evaluate(_shell("grep foo aegis/rules.py"), EMPTY).blocked
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked
