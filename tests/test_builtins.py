@@ -160,7 +160,24 @@ def test_aegis_source_re_no_catastrophic_backtracking():
     AEGIS_SOURCE_RE.search("aegis" + "/" * 10_000 + "x")
     AEGIS_SOURCE_RE.search("aegis" + "/." * 10_000 + "x")
     assert time.time() - start < 1.0
-    assert evaluate(_shell("ed aegis/rules.py"), EMPTY).blocked
+
+
+def test_self_protect_blocks_windows_trailing_dot_space():
+    """Win32's path parser silently strips a trailing '.' or trailing space off
+    any path component before resolving it — no POSIX equivalent, but a real,
+    documented Windows behavior. `aegis./rules.py` and `.claude./settings.json`
+    resolve to Aegis's real files on Windows even though the raw string looks
+    different. QA review (independent agent, round 4) found this bypassed
+    ENFORCEMENT_PATH_RE / CONFIG_DIR_RE / AEGIS_SOURCE_RE / AEGIS_SKILL_PATH_RE,
+    all of which required an exact separator immediately after the component
+    name with no tolerance for the stripped trailing character."""
+    assert evaluate(_shell("sed -i 's/a/b/' aegis./rules.py"), EMPTY).blocked
+    assert evaluate(_shell('sed -i "s/a/b/" "aegis /rules.py"'), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/a/b/' .aegis./policies/default.yaml"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/a/b/' .claude./settings.json"), EMPTY).blocked
+    # false-positive guard: an unrelated filename that merely contains the
+    # substring must NOT match (same exclusion CONFIG_DIR_RE already documents)
+    assert not evaluate(_shell("echo 'notes.aegis.bak stuff' > x.txt"), EMPTY).blocked
 
 
 def test_normal_work_allowed():
