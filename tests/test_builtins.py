@@ -122,6 +122,27 @@ def test_self_protect_blocks_redirect_glued_to_source_path():
     assert evaluate(_shell("cat evil.py >>aegis/engine.py"), EMPTY).blocked
 
 
+def test_self_protect_blocks_redundant_separators():
+    """The OS/shell treats `aegis//rules.py` and `aegis/./rules.py` as
+    byte-identical to `aegis/rules.py` — a single-`[/\\\\]`-separator regex
+    doesn't. QA review (independent agent, round 3) found this was a
+    one-character bypass of the round-2 fix, for both the direct module
+    path and the adapters/lifecycle submodule path."""
+    assert evaluate(_shell("sed -i 's/a/b/' aegis//rules.py"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/a/b/' aegis/./rules.py"), EMPTY).blocked
+    assert evaluate(_shell("cp payload aegis//rules.py"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/a/b/' aegis/adapters//foo.py"), EMPTY).blocked
+    assert evaluate(_shell("cp payload aegis//lifecycle//foo.py"), EMPTY).blocked
+
+
+def test_self_protect_blocks_awk_and_ed_inplace():
+    """awk -i inplace and ed both write a file in place without matching any
+    prior verb in INPLACE_WRITE_RE. QA review (independent agent, round 3)
+    found both as bypasses of the escapable-verb check."""
+    assert evaluate(_shell("awk -i inplace '{print}' aegis/rules.py"), EMPTY).blocked
+    assert evaluate(_shell("ed aegis/rules.py"), EMPTY).blocked
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked

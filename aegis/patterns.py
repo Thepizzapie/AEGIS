@@ -125,11 +125,18 @@ CONFIG_DIR_RE = re.compile(
 # hyphenated unrelated path (e.g. `some-aegis/rules.py`) or a mention of the
 # filename in an unrelated write's text — a false positive, the safe direction
 # for a "never escapable" guard (same trade-off CONFIG_DIR_RE already makes).
+#
+# The separator between components is `_SEP` (one-or-more slashes, optionally
+# interleaved with a `.` segment), not a single `[/\\]`: the OS/shell treats
+# `aegis//rules.py` and `aegis/./rules.py` as byte-identical to
+# `aegis/rules.py`, so a lone extra `/` or a `./` component was a one-character
+# bypass of a single-separator regex.
+_SEP = r"(?:[/\\]+\.?)+"
 AEGIS_SOURCE_RE = re.compile(
-    r"\baegis[/\\](?:__init__|rules|patterns|engine|policy|gate|attest|"
+    r"\baegis" + _SEP + r"(?:__init__|rules|patterns|engine|policy|gate|attest|"
     r"identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
     r"accountability|gitsurface|review|context|failures|skills|distribution)\.py\b"
-    r"|\baegis[/\\](?:adapters|lifecycle)[/\\]\w+\.py\b",
+    r"|\baegis" + _SEP + r"(?:adapters|lifecycle)" + _SEP + r"\w+\.py\b",
     re.IGNORECASE,
 )
 # Aegis's shipped skills (.claude/skills/aegis-*) — they carry the compliance
@@ -345,7 +352,9 @@ MCP_CONFIG_PATH_RE = re.compile(
 INPLACE_WRITE_RE = re.compile(
     r"\bsed\b[^|;&\n]*-i\b"
     r"|\bperl\b[^|;&\n]*-i\b"
+    r"|\bawk\b[^|;&\n]*-i\s*inplace\b"                    # gawk in-place edit
     r"|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
+    r"|\bed\b"                                            # ed writes via its own script, not -c
     r"|\bcp\b|\bcopy\b"
     r"|\bdd\b"
     r"|\b(?:python3?|node|ruby|perl)\b[^|;&\n]*\s-[ce]\b",
