@@ -388,32 +388,64 @@ def rule_destructive_git(ev: Event, policy=None) -> Optional[Decision]:
 
 
 def rule_git_config_injection(ev: Event, policy=None) -> Optional[Decision]:
-    """Deny git commands that weaponize CONFIG rather than a command-line flag.
+    """Deny git commands/files that weaponize CONFIG rather than a command-line
+    flag.
 
-    ``git -c key=value ...`` (one-shot) or a persistent ``git config
-    [--global|--system|--local] key value`` can turn a completely innocuous-
-    looking git subcommand (``git commit``, ``git fetch``, ``git clone <url>``)
-    into arbitrary code execution, or a hidden force-push — see
-    ``patterns.GIT_CONFIG_INJECTION_RE`` for the full breakdown (hooksPath /
-    fsmonitor / sshCommand / gitProxy delayed RCE, credential.helper=! RCE +
-    exfil, protocol.allow=always + ext:: transport RCE, remote.*.push=+refspec
-    forced push). Distinct from ``rule_destructive_git``: that guard requires
-    the force marker to appear textually AFTER "push"; a config-injected
-    refspec sits BEFORE it, in a ``-c``/``config`` assignment, so it slips past
-    that guard entirely. Escapable like destructive-git/evasion — real
-    workflows do set core.hooksPath (husky, pre-commit) — with '# aegis-allow',
-    human only."""
-    if not _is_shell(ev) or not patterns.GIT_CONFIG_INJECTION_RE.search(_shell_scan(ev)):
-        return None
-    if _override_allowed(ev):
-        return None
-    return Decision(Action.DENY, "git-config-injection",
-                    "Git config injection blocked — this sets a git config key "
-                    "(core.hooksPath/fsmonitor/sshCommand/gitProxy, "
-                    "credential.helper=!, protocol.allow=always + ext::, or a "
-                    "forced-push refspec) that turns an otherwise-innocuous git "
-                    "operation into arbitrary code execution or a hidden "
-                    "force-push. Append '# aegis-allow' to confirm intent.")
+    ``git -c key=value ...`` (one-shot), a persistent ``git config
+    [--global|--system|--local|...] key value``, or ``--config-env=key=VAR``
+    can turn a completely innocuous-looking git subcommand (``git commit``,
+    ``git fetch``, ``git clone <url>``) into arbitrary code execution or a
+    hidden force-push — see ``patterns.GIT_CONFIG_INJECTION_RE`` for the full
+    breakdown (hooksPath/fsmonitor/sshCommand/gitProxy/packObjectsHook delayed
+    RCE, credential.helper=! / alias.*=! immediate RCE + exfil,
+    protocol.allow=always + ext:: transport RCE, diff.external / gpg.program /
+    filter.*.smudge|clean / include(If).path, remote.*.push=+refspec forced
+    push). Distinct from ``rule_destructive_git``: that guard requires the
+    force marker to appear textually AFTER "push"; a config-injected refspec
+    sits BEFORE it, in a ``-c``/``config`` assignment, so it slips past that
+    guard entirely.
+
+    Also covers the same threat reaching the engine as a direct Edit/Write of
+    the config FILE itself (``.git/config``, ``.gitmodules``, ``~/.gitconfig``,
+    ``/etc/gitconfig``) rather than a CLI invocation — ``GIT_CONFIG_PATH_RE``
+    gates the path, ``GIT_CONFIG_FILE_CONTENT_RE`` the INI content, mirroring
+    ``rule_mcp_config_protect``'s shell + Edit/Write dual coverage for the same
+    class of threat (a config file as a durable backdoor).
+
+    Escapable like destructive-git/evasion — real workflows do set
+    core.hooksPath (husky, pre-commit) and plain (non-'!') aliases are
+    ubiquitous — with '# aegis-allow', human only."""
+    if _is_shell(ev):
+        if not patterns.GIT_CONFIG_INJECTION_RE.search(_shell_scan(ev)):
+            return None
+        if _override_allowed(ev):
+            return None
+        return Decision(Action.DENY, "git-config-injection",
+                        "Git config injection blocked — this sets a git config key "
+                        "(core.hooksPath/fsmonitor/sshCommand/gitProxy/"
+                        "packObjectsHook, credential.helper=!/alias.*=!, "
+                        "protocol.allow=always + ext::, diff.external/gpg.program/"
+                        "filter.*.smudge|clean/include(If).path, or a forced-push "
+                        "refspec) that turns an otherwise-innocuous git operation "
+                        "into arbitrary code execution or a hidden force-push. "
+                        "Append '# aegis-allow' to confirm intent.")
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE):
+        p = _path(ev)
+        if not p or not patterns.GIT_CONFIG_PATH_RE.search(p):
+            return None
+        content = str((ev.args or {}).get("content") or "")
+        if not patterns.GIT_CONFIG_FILE_CONTENT_RE.search(content):
+            return None
+        if _override_allowed(ev, content):
+            return None
+        return Decision(Action.DENY, "git-config-injection",
+                        f"Git config injection blocked — '{p}' is being written with a "
+                        "dangerous key (hooksPath/fsmonitor/sshCommand/gitProxy/"
+                        "packObjectsHook, credential.helper=!, protocol.allow=always, "
+                        "a forced-push refspec, diff.external/gpg.program/"
+                        "filter.*.smudge|clean/include(If).path, or an ext:: URL). "
+                        "Append '# aegis-allow' in a nearby shell step to confirm.")
+    return None
 
 
 def rule_destructive_delete(ev: Event, policy=None) -> Optional[Decision]:

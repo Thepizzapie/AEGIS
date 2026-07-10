@@ -31,6 +31,20 @@ DESTRUCTIVE_GIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Win32's path parser silently STRIPS ALL trailing '.'/space characters off any
+# path component before resolving it (RtlpDosPathNameToRelativeNtPathName;
+# unbounded, not capped at any fixed count — the "MagicDot" research) — so
+# 'aegis...../rules.py' resolves to the exact same file as 'aegis/rules.py'.
+# A component boundary that requires an EXACT separator immediately next is a
+# Windows-only bypass. `*`, not a fixed `{0,N}` bound (a bounded class missed
+# any padding past N chars — QA review, round 5). Still safe: a flat,
+# unnested character class disjoint from what follows it (_SEP starts with
+# `[/\\]`, never a space or dot) has exactly one way to match — no ambiguity,
+# no backtracking blowup (see _SEP below for what that failure mode looks
+# like when a quantifier IS nested inside another). Defined here (ahead of its
+# original use further below) because GIT_CONFIG_PATH_RE needs it too.
+_WIN_TRIM = r"[ .]*"
+
 # Git CONFIG injection — `git -c key=value ...` (one-shot) or a persistent
 # `git config [--global|--system|--local] key value` write. Distinct from
 # DESTRUCTIVE_GIT_RE (history-rewriting via a command-line FLAG): here the git
@@ -66,26 +80,123 @@ DESTRUCTIVE_GIT_RE = re.compile(
 #                                         anywhere on that command line) still
 #                                         force-pushes — the one push-force
 #                                         shape DESTRUCTIVE_GIT_RE cannot see.
+#   alias.<name>=!<cmd>                -> an inline alias whose body is a '!'
+#                                         shell-exec is IMMEDIATE RCE (no delay,
+#                                         no separate trigger needed) the moment
+#                                         the alias name is invoked, and can
+#                                         itself smuggle any of the above.
+#   diff.external / gpg.program /      -> a program git shell-invokes with
+#   filter.<driver>.smudge|clean /        attacker-influenced arguments on a
+#   include(If ...).path                  routine diff/verify/checkout/config-
+#                                          load, or a config file git loads
+#                                          and merges unconditionally.
+#
+# Two evasions an independent adversarial QA pass found in the first version of
+# this guard, both fixed here:
+#
+# 1. Only 3 `git config` SCOPE flags (--global/--system/--local) were
+#    whitelisted between "config" and the key, so ANY other flag in between —
+#    --add, --replace-all, --worktree, -f/--file <path>, --type=path, -z — made
+#    the whole pattern fail to match even though git itself honors the key
+#    (`git config --add core.hooksPath /tmp/evil-hooks` really does set it).
+#    Fixed by accepting an arbitrary run of flag-shaped tokens (dash-prefixed,
+#    with an optional `=value` or, for the handful that take a separate value
+#    token, that token too) instead of an enumerated allow-list.
+# 2. The value-match (`\s*[=\s]\s*\S`) let a value-less read (`git config
+#    core.hooksPath`) or a truly EMPTY assignment (`core.hooksPath=`) false-
+#    positive whenever *anything* non-space followed later on the line (e.g.
+#    `git -c core.hooksPath= commit -m x` was flagged for merely mentioning
+#    "commit" after the bare `=`). Fixed by requiring the value to sit
+#    immediately at that position (right after `=`, or right after the
+#    whitespace with no gap) and rejecting an explicit empty-quote pair (`""`/
+#    `''`) there — a real assignment's value now must actually be present.
+#
+# ``--config-env=<key>=<ENVVAR>`` is matched as its own alternative: the value
+# is indirected through an environment variable, so there's no literal path/
+# command text to apply the value-matcher to — presence of the key name after
+# ``--config-env=`` is itself the signal.
 #
 # Escapable like the other git/evasion guards ('# aegis-allow', human only):
-# legitimate uses exist (husky/pre-commit set core.hooksPath, some setups use a
-# real custom sshCommand wrapper), so this is a deny-then-confirm gate, not a
-# hard block. Not exhaustive — a value split across shell variables, or a raw
-# INI-format write straight to .git/config (section/key split across lines)
-# rather than a `-c`/`config` CLI invocation, shares the residual gap every
-# other pattern in this module has (see README "Known gaps").
+# legitimate uses exist (husky/pre-commit set core.hooksPath, plain `alias.co=
+# checkout`-style aliases are ubiquitous — only the '!' shell-exec alias form
+# is flagged), so this is a deny-then-confirm gate, not a hard block. Not
+# exhaustive — a value split across shell variables, or a raw INI-format write
+# straight to .git/config (section/key split across lines) rather than a
+# `-c`/`config`/`--config-env` CLI invocation, shares the residual gap every
+# other pattern in this module has (see README "Known gaps") — covered instead,
+# best-effort, by GIT_CONFIG_FILE_CONTENT_RE below for the direct-file-write path.
+# The flag-skip loop is BOUNDED ({0,8}), not `*` (unbounded): an unbounded
+# repetition here, combined with the ALSO-unbounded `[^|;&\n]*` that precedes
+# every use of this lead (once per top-level alternative below), lets the two
+# adjacent unbounded quantifiers redistribute the same run of junk tokens
+# between them in many ways — the classic multiplicative-blowup ReDoS shape
+# (same failure mode _SEP's comment above describes for nested quantifiers).
+# Confirmed by timing: the unbounded version took minutes to fail on a ~300-
+# byte string of 60 junk flags with no real key; bounded at 8 (real git
+# invocations essentially never stack more flags than that before a key), the
+# same input resolves in under a millisecond regardless of how much junk
+# precedes or follows it. Each alternative in the loop body is itself
+# unambiguous (dash-prefixed flag tokens only — `\S+`/`[\w-]+` never overlaps
+# what the OTHER alternative can match at the same position), so the bound is
+# a defense-in-depth belt-and-braces, not a papered-over deeper bug.
+_GIT_CFG_LEAD = (
+    r"(?:-c\s+|\bconfig\b(?:\s+(?:(?:-f|--file|--blob)\s+\S+"
+    r"|(?!--get(?:-all|-regexp|-urlmatch)?\b|--list\b|-l\b|--unset(?:-all)?\b)"
+    r"--?[\w-]+(?:=\S+)?)){0,8}\s+)"
+)
+_GIT_CFG_VALUE = r"(?:=(?!['\"]{2}(?:\s|[|;&\n]|$))\S|\s+(?!['\"]{2}(?:\s|[|;&\n]|$))\S)"
+_GIT_CFG_KEYS = (
+    r"core\.hooksPath|core\.fsmonitor|core\.sshCommand|core\.gitProxy"
+    r"|uploadPack\.packObjectsHook|diff\.external|gpg\.program"
+    r"|filter\.[\w.-]+\.(?:smudge|clean)|include\.path|includeIf\.[\w.-]+\.path"
+)
 GIT_CONFIG_INJECTION_RE = re.compile(
-    r"\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
-    r"(?:core\.hooksPath|core\.fsmonitor|core\.sshCommand|core\.gitProxy"
-    r"|uploadPack\.packObjectsHook)\s*[=\s]\s*\S"
-    r"|\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
-    r"credential\.helper\s*[=\s]\s*['\"]?!"
-    r"|\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
-    r"protocol(?:\.\w+)?\.allow\s*[=\s]\s*['\"]?always\b"
-    r"|\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
-    r"remote\.[\w.-]+\.push\s*[=\s]\s*['\"]?\+"
-    r"|\bgit\b[^|;&\n]*\bext::",
+    r"\bgit\b[^|;&\n]*" + _GIT_CFG_LEAD + r"(?:" + _GIT_CFG_KEYS + r")" + _GIT_CFG_VALUE
+    + r"|\bgit\b[^|;&\n]*" + _GIT_CFG_LEAD + r"credential\.helper\s*[=\s]\s*['\"]?!"
+    + r"|\bgit\b[^|;&\n]*" + _GIT_CFG_LEAD + r"alias\.[\w.-]+\s*[=\s]\s*['\"]?!"
+    + r"|\bgit\b[^|;&\n]*" + _GIT_CFG_LEAD + r"protocol(?:\.\w+)?\.allow\s*[=\s]\s*['\"]?always\b"
+    + r"|\bgit\b[^|;&\n]*" + _GIT_CFG_LEAD + r"remote\.[\w.-]+\.push\s*[=\s]\s*['\"]?\+"
+    + r"|\bgit\b[^|;&\n]*--config-env=(?:" + _GIT_CFG_KEYS +
+    r"|credential\.helper|alias\.[\w.-]+|protocol(?:\.\w+)?\.allow|remote\.[\w.-]+\.push)\s*="
+    + r"|\bgit\b[^|;&\n]*\bext::",
     re.IGNORECASE,
+)
+
+# Direct-file-write path for the same threat: an Edit/Write straight to a git
+# config FILE (raw INI, not a `-c`/`config` CLI invocation, so
+# GIT_CONFIG_INJECTION_RE's command-syntax matcher doesn't apply). Path check
+# first (GIT_CONFIG_PATH_RE), then content check (GIT_CONFIG_FILE_CONTENT_RE) —
+# mirrors MCP_CONFIG_PATH_RE's two-stage shape. The key names matched bare
+# (hooksPath / fsmonitor / sshCommand / gitProxy / packObjectsHook / smudge /
+# clean / external) are safe to match without section context because they are
+# themselves distinctive git-config vocabulary and this pattern is only ever
+# applied once the PATH already resolved to a git config file — the surrounding
+# section header a real INI parser would use for disambiguation adds little
+# extra signal here. Best-effort: a key/value pair split across a `\` line
+# continuation, or spelled through a case/whitespace variant INI parsers accept
+# but this regex doesn't, is a residual gap (see README "Known gaps").
+GIT_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[/\\])\.git" + _WIN_TRIM + r"[/\\]config(?:\.worktree)?(?:[/\\]|\s|['\"]|$)"
+    r"|(?:^|[/\\])\.gitmodules(?:\s|['\"]|$)"
+    r"|(?:^|[/\\])\.gitconfig(?:\s|['\"]|$)"
+    r"|(?:^|[/\\])etc[/\\]gitconfig(?:\s|['\"]|$)",
+    re.IGNORECASE,
+)
+GIT_CONFIG_FILE_CONTENT_RE = re.compile(
+    r"\bhooksPath\s*=\s*\S"
+    r"|\bfsmonitor\s*=\s*\S"
+    r"|\bsshCommand\s*=\s*\S"
+    r"|\bgitProxy\s*=\s*\S"
+    r"|\bpackObjectsHook\s*=\s*\S"
+    r"|\bexternal\s*=\s*\S"
+    r"|\b(?:smudge|clean)\s*=\s*\S"
+    r"|^\s*path\s*=\s*\S"
+    r"|\bhelper\s*=\s*['\"]?!"
+    r"|\ballow\s*=\s*['\"]?always\b"
+    r"|\bpush\s*=\s*['\"]?\+"
+    r"|\[alias\][^\[]*?=\s*['\"]?!"
+    r"|\bext::",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Recursive force delete across shells: unix `rm` with r+f flags (combined or
@@ -162,18 +273,6 @@ DNS_C2_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Win32's path parser silently STRIPS ALL trailing '.'/space characters off any
-# path component before resolving it (RtlpDosPathNameToRelativeNtPathName;
-# unbounded, not capped at any fixed count — the "MagicDot" research) — so
-# 'aegis...../rules.py' resolves to the exact same file as 'aegis/rules.py'.
-# A component boundary that requires an EXACT separator immediately next is a
-# Windows-only bypass. `*`, not a fixed `{0,N}` bound (a bounded class missed
-# any padding past N chars — QA review, round 5). Still safe: a flat,
-# unnested character class disjoint from what follows it (_SEP starts with
-# `[/\\]`, never a space or dot) has exactly one way to match — no ambiguity,
-# no backtracking blowup (see _SEP below for what that failure mode looks
-# like when a quantifier IS nested inside another).
-_WIN_TRIM = r"[ .]*"
 # Aegis's own enforcement surface — deleting/editing this disables Aegis.
 ENFORCEMENT_PATH_RE = re.compile(
     r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)|\.claude[/\\]settings\.json\b",
