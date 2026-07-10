@@ -327,3 +327,37 @@ def test_write_git_config_human_override_allowed():
     content = "[core]\n\thooksPath = /tmp/evil-hooks\n# aegis-allow\n"
     d = evaluate(_write(".git/config", content), EMPTY)
     assert not d.blocked
+
+
+# --- round-3 fix from a final confirmatory QA pass: bare 'path =' generic
+# false positive on ordinary .gitmodules submodule entries ---------------------
+
+def test_ordinary_gitmodules_submodule_entry_not_blocked():
+    # EVERY .gitmodules submodule stanza has a 'path = ...' line — this is the
+    # single most common, zero-malice line in the whole file and must never be
+    # mistaken for the dangerous include.path/includeIf.*.path key.
+    content = ('[submodule "vendor/lib1"]\n'
+               '\tpath = vendor/lib1\n'
+               '\turl = https://github.com/example/lib1.git\n')
+    d = evaluate(_write(".gitmodules", content), EMPTY)
+    assert not d.blocked
+
+
+def test_multiple_gitmodules_submodules_not_blocked():
+    content = ('[submodule "a"]\n\tpath = a\n\turl = https://example.com/a.git\n'
+               '[submodule "b"]\n\tpath = b\n\turl = https://example.com/b.git\n')
+    d = evaluate(_write(".gitmodules", content), EMPTY)
+    assert not d.blocked
+
+
+def test_include_path_in_git_config_still_blocked():
+    # The real dangerous key (include.path / includeIf.*.path) must still be
+    # caught when it appears in the section context it actually lives in.
+    d = evaluate(_write(".git/config", "[include]\n\tpath = ~/.gitconfig-extra\n"), EMPTY)
+    assert d.blocked
+
+
+def test_includeif_path_in_git_config_still_blocked():
+    content = '[includeIf "gitdir:~/work/"]\n\tpath = ~/.gitconfig-work\n'
+    d = evaluate(_write(".git/config", content), EMPTY)
+    assert d.blocked

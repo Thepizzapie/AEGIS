@@ -172,9 +172,18 @@ GIT_CONFIG_INJECTION_RE = re.compile(
 # themselves distinctive git-config vocabulary and this pattern is only ever
 # applied once the PATH already resolved to a git config file — the surrounding
 # section header a real INI parser would use for disambiguation adds little
-# extra signal here. Best-effort: a key/value pair split across a `\` line
-# continuation, or spelled through a case/whitespace variant INI parsers accept
-# but this regex doesn't, is a residual gap (see README "Known gaps").
+# extra signal here. ``path`` is the one exception: a FINAL confirmatory QA
+# pass (round 3) found that a bare ``^\s*path\s*=`` matches the single most
+# common line in an ordinary, zero-malice ``.gitmodules`` file — EVERY
+# submodule stanza has one (`[submodule "x"]` / `path = vendor/x` / `url = ...`)
+# — so unlike the other bare keys, "path" alone is not distinctive at all.
+# Scoped instead to an actual ``[include]``/``[includeIf ...]`` section (the
+# only context where a bare ``path =`` is the dangerous "load another config
+# file unconditionally" key), the same bounded non-greedy-to-next-section
+# shape ``[alias]`` already uses below. Best-effort: a key/value pair split
+# across a `\` line continuation, or spelled through a case/whitespace variant
+# INI parsers accept but this regex doesn't, is a residual gap (see README
+# "Known gaps").
 GIT_CONFIG_PATH_RE = re.compile(
     r"(?:^|[/\\])\.git" + _WIN_TRIM + r"[/\\]config(?:\.worktree)?(?:[/\\]|\s|['\"]|$)"
     r"|(?:^|[/\\])\.gitmodules(?:\s|['\"]|$)"
@@ -190,7 +199,7 @@ GIT_CONFIG_FILE_CONTENT_RE = re.compile(
     r"|\bpackObjectsHook\s*=\s*\S"
     r"|\bexternal\s*=\s*\S"
     r"|\b(?:smudge|clean)\s*=\s*\S"
-    r"|^\s*path\s*=\s*\S"
+    r"|\[include(?:If\b[^\]]*)?\][^\[]*?\bpath\s*=\s*\S"
     r"|\bhelper\s*=\s*['\"]?!"
     r"|\ballow\s*=\s*['\"]?always\b"
     r"|\bpush\s*=\s*['\"]?\+"
