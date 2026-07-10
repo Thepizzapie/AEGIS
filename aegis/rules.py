@@ -387,6 +387,35 @@ def rule_destructive_git(ev: Event, policy=None) -> Optional[Decision]:
                     "to confirm, or use a safe alternative (git revert, git branch -d).")
 
 
+def rule_git_config_injection(ev: Event, policy=None) -> Optional[Decision]:
+    """Deny git commands that weaponize CONFIG rather than a command-line flag.
+
+    ``git -c key=value ...`` (one-shot) or a persistent ``git config
+    [--global|--system|--local] key value`` can turn a completely innocuous-
+    looking git subcommand (``git commit``, ``git fetch``, ``git clone <url>``)
+    into arbitrary code execution, or a hidden force-push — see
+    ``patterns.GIT_CONFIG_INJECTION_RE`` for the full breakdown (hooksPath /
+    fsmonitor / sshCommand / gitProxy delayed RCE, credential.helper=! RCE +
+    exfil, protocol.allow=always + ext:: transport RCE, remote.*.push=+refspec
+    forced push). Distinct from ``rule_destructive_git``: that guard requires
+    the force marker to appear textually AFTER "push"; a config-injected
+    refspec sits BEFORE it, in a ``-c``/``config`` assignment, so it slips past
+    that guard entirely. Escapable like destructive-git/evasion — real
+    workflows do set core.hooksPath (husky, pre-commit) — with '# aegis-allow',
+    human only."""
+    if not _is_shell(ev) or not patterns.GIT_CONFIG_INJECTION_RE.search(_shell_scan(ev)):
+        return None
+    if _override_allowed(ev):
+        return None
+    return Decision(Action.DENY, "git-config-injection",
+                    "Git config injection blocked — this sets a git config key "
+                    "(core.hooksPath/fsmonitor/sshCommand/gitProxy, "
+                    "credential.helper=!, protocol.allow=always + ext::, or a "
+                    "forced-push refspec) that turns an otherwise-innocuous git "
+                    "operation into arbitrary code execution or a hidden "
+                    "force-push. Append '# aegis-allow' to confirm intent.")
+
+
 def rule_destructive_delete(ev: Event, policy=None) -> Optional[Decision]:
     if not _is_shell(ev) or not patterns.DESTRUCTIVE_DELETE_RE.search(_shell_scan(ev)):
         return None
@@ -671,6 +700,7 @@ _CORE_RULES = (
     rule_failure_loop,
     rule_remote_exec,
     rule_destructive_git,
+    rule_git_config_injection,
     rule_destructive_delete,
     rule_install_review,
     rule_branch_strands,

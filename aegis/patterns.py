@@ -31,6 +31,63 @@ DESTRUCTIVE_GIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Git CONFIG injection — `git -c key=value ...` (one-shot) or a persistent
+# `git config [--global|--system|--local] key value` write. Distinct from
+# DESTRUCTIVE_GIT_RE (history-rewriting via a command-line FLAG): here the git
+# subcommand itself can look completely innocuous (`git commit`, `git fetch`,
+# `git clone <url>`) while a config KEY silently turns it into arbitrary code
+# execution, or a forced push the flag-based guard above never sees (its force
+# marker must appear textually AFTER the word "push"; a config value sits
+# BEFORE it on the command line).
+#
+#   core.hooksPath / core.fsmonitor    -> runs an attacker script on the NEXT
+#                                         commit/checkout/merge — delayed RCE
+#                                         behind a benign-looking git command.
+#   core.sshCommand / core.gitProxy    -> substitutes an arbitrary command for
+#                                         the transport, run on every fetch/push.
+#   uploadPack.packObjectsHook         -> runs a command when objects are
+#                                         packed (a local upload-pack / clone).
+#   credential.helper=!<cmd>           -> the '!' shell-exec helper form runs
+#                                         <cmd> whenever git needs credentials —
+#                                         RCE and a credential-exfil vector both.
+#   protocol(.ext)?.allow=always       -> enables the 'ext::' transport, whose
+#                                         URL argument runs as a shell command
+#                                         (`git clone 'ext::sh -c id'` is a
+#                                         known RCE primitive).
+#   ext:: (standalone)                 -> the 'ext' transport defaults to
+#                                         allowed for a direct/interactive git
+#                                         invocation (not just when
+#                                         protocol.allow=always is set), so a
+#                                         bare `ext::` URL is dangerous on its
+#                                         own — flagged whenever it appears in
+#                                         a git command line.
+#   remote.<name>.push=+refs/...       -> configures a FORCE refspec inline, so
+#                                         a later BARE `git push` (no --force
+#                                         anywhere on that command line) still
+#                                         force-pushes — the one push-force
+#                                         shape DESTRUCTIVE_GIT_RE cannot see.
+#
+# Escapable like the other git/evasion guards ('# aegis-allow', human only):
+# legitimate uses exist (husky/pre-commit set core.hooksPath, some setups use a
+# real custom sshCommand wrapper), so this is a deny-then-confirm gate, not a
+# hard block. Not exhaustive — a value split across shell variables, or a raw
+# INI-format write straight to .git/config (section/key split across lines)
+# rather than a `-c`/`config` CLI invocation, shares the residual gap every
+# other pattern in this module has (see README "Known gaps").
+GIT_CONFIG_INJECTION_RE = re.compile(
+    r"\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
+    r"(?:core\.hooksPath|core\.fsmonitor|core\.sshCommand|core\.gitProxy"
+    r"|uploadPack\.packObjectsHook)\s*[=\s]\s*\S"
+    r"|\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
+    r"credential\.helper\s*[=\s]\s*['\"]?!"
+    r"|\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
+    r"protocol(?:\.\w+)?\.allow\s*[=\s]\s*['\"]?always\b"
+    r"|\bgit\b[^|;&\n]*(?:-c\s+|\bconfig\b\s+(?:--(?:global|system|local)\s+)?)"
+    r"remote\.[\w.-]+\.push\s*[=\s]\s*['\"]?\+"
+    r"|\bgit\b[^|;&\n]*\bext::",
+    re.IGNORECASE,
+)
+
 # Recursive force delete across shells: unix `rm` with r+f flags (combined or
 # separate), PowerShell Remove-Item/aliases with -Recurse -Force (any order),
 # cmd rmdir/rd /s and del /s|/q.
