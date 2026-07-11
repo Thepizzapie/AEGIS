@@ -43,6 +43,15 @@ def parse_event(payload: dict) -> Event:
         args = {}
     else:
         args = {"value": raw_args}
+    # UserPromptSubmit carries the submitted text as a top-level "prompt" field,
+    # not inside tool_input (there is no tool call yet) — without this, the
+    # prompt-injection guard (lifecycle.promptguard) would see empty args and
+    # never have anything to scan. Only added when tool_input didn't already
+    # supply one (e.g. a Task/Agent tool_input's own "prompt" argument), so this
+    # is purely additive and never overwrites a real tool argument.
+    if payload.get("prompt") is not None and "prompt" not in args:
+        args = dict(args)
+        args["prompt"] = payload.get("prompt")
     matcher = next((str(payload[k]) for k in _MATCHER_KEYS if payload.get(k)), None)
     return Event.make(
         name,
@@ -83,6 +92,18 @@ def render_decision(event: Event, decision: Decision) -> Tuple[int, str, str]:
             "hookEventName": "PreToolUse",
             "permissionDecision": "ask",
             "permissionDecisionReason": msg,
+        }})
+        return 0, out, ""
+    if decision.action == Action.ASK:
+        # No event besides PreToolUse has a native yes/no permission dialog in
+        # this runtime (e.g. UserPromptSubmit — rule_prompt_injection's default
+        # mode). Rendering nothing here would make "ask" a silent no-op — the
+        # submission would sail through unremarked. additionalContext is the one
+        # channel these events DO support: surface it so the model (and, through
+        # it, the human) actually sees the flag instead of it vanishing.
+        out = json.dumps({"hookSpecificOutput": {
+            "hookEventName": event.event.value,
+            "additionalContext": f"[Aegis] {msg}",
         }})
         return 0, out, ""
     if decision.action == Action.DENY:

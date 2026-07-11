@@ -450,3 +450,50 @@ TEST_CMD_RE = re.compile(
     r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )
+
+# Prompt-injection tells at the UserPromptSubmit boundary — the channel an
+# automated/headless agent (CI bot, issue-triage bot, scheduled routine) feeds
+# untrusted external text through (an issue body, a PR comment, scraped page text
+# a human pasted in) before it becomes the turn's instructions. A denylist of
+# known-dangerous SHAPES (same posture as EVASION_RE), not a semantic classifier:
+# instruction-override phrasing, a forged system/role tag trying to impersonate a
+# higher-trust message, and jailbreak/safety-bypass framing. Deliberately anchored
+# to the "instructions/prompt/rules/context" object after ignore/disregard/forget
+# so ordinary conversational use ("ignore the typo above") does not false-positive
+# — the false-positive-prone bare form was tried and rejected. Not exhaustive: an
+# attacker who avoids every one of these stock phrasings (paraphrase, translation,
+# unusual wording) still gets through — same documented-gap posture as the other
+# denylists in this module.
+PROMPT_INJECTION_RE = re.compile(
+    r"\b(?:ignore|disregard|forget)\b[^.\n]{0,30}\b(?:(?:all|any|every)\s+)?"
+    r"(?:previous|prior|above|earlier|preceding)\s+"
+    r"(?:instructions?|prompts?|rules?|context|messages?|directives?)\b"
+    r"|\byou are now\b[^.\n]{0,30}\b(?:DAN|unrestricted|jailbroken|uncensored|"
+    r"unfiltered|developer mode)\b"
+    r"|\bact as\b[^.\n]{0,20}\b(?:DAN|jailbroken|unfiltered|uncensored)\b"
+    r"|\b(?:enter|enable|switch to)\b[^.\n]{0,15}\bdeveloper mode\b"
+    r"|\b(?:bypass|override|disable)\b[^.\n]{0,20}\b(?:safety|guardrails?|filters?|"
+    r"restrictions?|content policy)\b"
+    r"|\b(?:reveal|print|show|leak)\b[^.\n]{0,20}\b(?:your |the )?(?:system prompt|"
+    r"system instructions|hidden instructions)\b"
+    r"|<\|?\s*(?:system|assistant)\s*\|?>"
+    r"|^\s*\[?(?:system|assistant)\]?\s*:\s*\S",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Zero-width / invisible Unicode used to hide an injected instruction inside text
+# that reads as innocuous on a human skim. Built from explicit code points (not
+# literal characters in this source file) so the pattern stays legible in a diff
+# instead of hiding invisible bytes inline:
+#   0x200B zero-width space        0x200C zero-width non-joiner
+#   0x200D zero-width joiner       0x2060 word joiner
+#   0xFEFF BOM / zero-width no-break space (as a stray mid-text byte)
+# Plus the Unicode Tag block (U+E0000-U+E007F), the ASCII-smuggled-as-invisible-
+# tag-codepoints technique used for 2024-era "invisible prompt injection". None of
+# these have a legitimate reason to appear in an ordinary typed prompt.
+_ZERO_WIDTH_CODEPOINTS = (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)
+_ZERO_WIDTH_CHARS = "".join(chr(_c) for _c in _ZERO_WIDTH_CODEPOINTS)
+_TAG_BLOCK_CHARS = "".join(chr(_c) for _c in range(0xE0000, 0xE0080))
+HIDDEN_UNICODE_RE = re.compile(
+    "[" + re.escape(_ZERO_WIDTH_CHARS + _TAG_BLOCK_CHARS) + "]"
+)

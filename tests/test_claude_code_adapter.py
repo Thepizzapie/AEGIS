@@ -49,3 +49,26 @@ def test_deny_on_post_tool_use_cannot_block():
     pol = Policy(rules=[Rule(name="d", action=Action.DENY, actions=["shell"])])
     code, out, err = cc.render_decision(ev, evaluate(ev, pol))
     assert code == 0 and "cannot block" in err
+
+
+def test_parse_event_extracts_top_level_prompt_for_user_prompt_submit():
+    ev = cc.parse_event({
+        "hook_event_name": "UserPromptSubmit", "prompt": "hello there",
+        "session_id": "s1", "cwd": "/repo",
+    })
+    assert ev.event == HookEvent.USER_PROMPT_SUBMIT
+    assert ev.args["prompt"] == "hello there"
+
+
+def test_render_ask_on_non_pretooluse_event_surfaces_additional_context():
+    # UserPromptSubmit (and any other blockable-but-not-PreToolUse event) has no
+    # native yes/no permission dialog — ASK must still be VISIBLE, not a silent
+    # no-op, so it's rendered as additionalContext instead of vanishing.
+    ev = cc.parse_event({"hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+    pol = Policy(rules=[Rule(name="ask-prompt", action=Action.ASK,
+                             events=["UserPromptSubmit"], message="flagged")])
+    code, out, err = cc.render_decision(ev, evaluate(ev, pol))
+    assert code == 0 and err == ""
+    data = json.loads(out)
+    assert data["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "flagged" in data["hookSpecificOutput"]["additionalContext"]
