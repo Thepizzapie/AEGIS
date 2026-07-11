@@ -460,10 +460,16 @@ TEST_CMD_RE = re.compile(
 # higher-trust message, and jailbreak/safety-bypass framing. Deliberately anchored
 # to the "instructions/prompt/rules/context" object after ignore/disregard/forget
 # so ordinary conversational use ("ignore the typo above") does not false-positive
-# — the false-positive-prone bare form was tried and rejected. Not exhaustive: an
-# attacker who avoids every one of these stock phrasings (paraphrase, translation,
-# unusual wording) still gets through — same documented-gap posture as the other
-# denylists in this module.
+# — the false-positive-prone bare form was tried and rejected. The role-tag
+# alternative is deliberately narrowed to a forged chat-template delimiter
+# (`<|system|>`, `[system]`) rather than also matching a bare `System:`/
+# `Assistant:` line start — that bare form is a common, innocuous shape in
+# exactly this guard's target input (a pasted CI log line, a chat transcript, a
+# markdown speaker label in an issue body) and was dropped after QA review (round
+# 1) flagged it as a false positive squarely in the tool's own workflow. Not
+# exhaustive: an attacker who avoids every one of these stock phrasings
+# (paraphrase, translation, unusual wording) still gets through — same
+# documented-gap posture as the other denylists in this module.
 PROMPT_INJECTION_RE = re.compile(
     r"\b(?:ignore|disregard|forget)\b[^.\n]{0,30}\b(?:(?:all|any|every)\s+)?"
     r"(?:previous|prior|above|earlier|preceding)\s+"
@@ -477,8 +483,8 @@ PROMPT_INJECTION_RE = re.compile(
     r"|\b(?:reveal|print|show|leak)\b[^.\n]{0,20}\b(?:your |the )?(?:system prompt|"
     r"system instructions|hidden instructions)\b"
     r"|<\|?\s*(?:system|assistant)\s*\|?>"
-    r"|^\s*\[?(?:system|assistant)\]?\s*:\s*\S",
-    re.IGNORECASE | re.MULTILINE,
+    r"|\[\s*(?:system|assistant)\s*\]",
+    re.IGNORECASE,
 )
 
 # Zero-width / invisible Unicode used to hide an injected instruction inside text
@@ -487,11 +493,21 @@ PROMPT_INJECTION_RE = re.compile(
 # instead of hiding invisible bytes inline:
 #   0x200B zero-width space        0x200C zero-width non-joiner
 #   0x200D zero-width joiner       0x2060 word joiner
-#   0xFEFF BOM / zero-width no-break space (as a stray mid-text byte)
 # Plus the Unicode Tag block (U+E0000-U+E007F), the ASCII-smuggled-as-invisible-
 # tag-codepoints technique used for 2024-era "invisible prompt injection". None of
 # these have a legitimate reason to appear in an ordinary typed prompt.
-_ZERO_WIDTH_CODEPOINTS = (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)
+#
+# 0xFEFF (BOM / zero-width no-break space) is deliberately NOT in this set: a
+# leading BOM is a mundane encoding artifact (pasting Windows-authored file
+# content — common in exactly this guard's target workflow) and was a false
+# positive flagged by QA review (round 1). A BOM ANYWHERE ELSE in the text has
+# no ordinary reason to appear and is the same hiding-in-plain-sight trick as the
+# other zero-width characters — callers check for that separately via BOM_CHAR
+# (see ``lifecycle.promptguard._hidden_unicode_hit``) rather than folding it into
+# this regex, which has no way to see "position 0 of the whole text" once a
+# caller has trimmed/concatenated it.
+BOM_CHAR = chr(0xFEFF)
+_ZERO_WIDTH_CODEPOINTS = (0x200B, 0x200C, 0x200D, 0x2060)
 _ZERO_WIDTH_CHARS = "".join(chr(_c) for _c in _ZERO_WIDTH_CODEPOINTS)
 _TAG_BLOCK_CHARS = "".join(chr(_c) for _c in range(0xE0000, 0xE0080))
 HIDDEN_UNICODE_RE = re.compile(

@@ -34,6 +34,17 @@ same fail-safe as ``lifecycle.interaction.rule_permission_escalation`` — so an
 ask resolves to deny rather than hanging or silently letting the payload through
 unreviewed.
 
+Trade-off worth naming explicitly (QA review, round 1): that fail-safe means the
+scenario this guard is FOR — a headless CI/issue-triage bot whose "prompt" is
+untrusted external text — is also the one where a false positive is costliest:
+UserPromptSubmit's deny is a hard stop with no human to retry it, unlike a
+PreToolUse deny where the agent sees the reason and can just try a different
+command. That is why the two patterns are kept narrow and QA-tightened against
+concrete false positives (see patterns.py's PROMPT_INJECTION_RE / BOM_CHAR
+docstrings) rather than broadened for extra recall. An operator running a new,
+noisy content source should pilot with ``policy.prompt_injection.mode: monitor``
+before trusting the default ``ask``-escalates-to-``deny`` posture unattended.
+
 Honest scope: this is a denylist of known injection SHAPES, exactly like
 EVASION_RE / PIPE_TO_SHELL_RE elsewhere in this project. An attacker who avoids
 every one of these stock phrasings (paraphrase, translation, a novel jailbreak
@@ -61,6 +72,19 @@ def _prompt_text(ev: Event) -> str:
     a = ev.args or {}
     raw = ev.raw or {}
     return str(a.get("prompt") or raw.get("prompt") or "")
+
+
+def _hidden_unicode_hit(text: str) -> bool:
+    """True if ``text`` carries a hidden-Unicode injection tell. Covers
+    ``patterns.HIDDEN_UNICODE_RE`` (zero-width chars, the Unicode tag block) plus
+    a BOM (U+FEFF) appearing anywhere EXCEPT as the very first character — a
+    leading BOM is a mundane encoding artifact (pasted Windows-authored file
+    content), but a BOM elsewhere in the text has no ordinary reason to be there.
+    See ``patterns.BOM_CHAR``'s docstring for why this lives here rather than in
+    the regex itself."""
+    if patterns.HIDDEN_UNICODE_RE.search(text):
+        return True
+    return patterns.BOM_CHAR in text[1:]
 
 
 def _pattern_hit(cfg: dict, key: str, text: str) -> bool:
@@ -113,7 +137,7 @@ def rule_prompt_injection(ev: Event, policy=None) -> Optional[Decision]:
         if not text.strip():
             return None
         hit = (patterns.PROMPT_INJECTION_RE.search(text)
-               or patterns.HIDDEN_UNICODE_RE.search(text)
+               or _hidden_unicode_hit(text)
                or _pattern_hit(cfg, "patterns", text))
         if not hit:
             return None
