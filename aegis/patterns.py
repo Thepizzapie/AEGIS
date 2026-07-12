@@ -225,6 +225,117 @@ CRED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cloud instance-metadata service — the SSRF-to-credential-theft surface. Every
+# major cloud provider exposes short-lived IAM/service-account credentials (and
+# often user-data containing secrets) over a link-local HTTP endpoint reachable
+# from inside any instance/container, no auth beyond being on-box. An agent that
+# fetches this URL — tricked by prompt injection in a fetched page, a malicious
+# repo's "helpful" setup command, or a compromised dependency's install step —
+# hands over live cloud credentials. This is the SSRF-to-IMDS path behind real
+# breaches (e.g. the 2019 Capital One breach used exactly this). Distinct from
+# CRED_RE (local credential FILES already on disk) — this is the
+# network-reachable equivalent, and deliberately NOT policy-gated like
+# rule_network_egress: no repo should have to opt in to keep an agent from
+# handing its cloud account away.
+#
+# Covers: the 169.254.169.254 link-local address shared by AWS/Azure/legacy
+# GCP/DigitalOcean/Oracle/IBM/OpenStack/Vultr/Hetzner; AWS's IPv6 IMDS endpoint
+# (fd00:ec2::254, plus its IPv4-mapped hex-group spelling ::ffff:a9fe:a9fe —
+# the dotted-decimal-embedded spelling ::ffff:169.254.169.254 already matches
+# the plain IPv4 alternative below as a substring); GCP's documented
+# metadata.google.internal hostname alternative; Alibaba Cloud's distinct
+# 100.100.100.200; and the alternate encodings of the shared IPv4 address an
+# agent might reach for or be prompt-injected into using — all of which
+# curl/wget/browsers still resolve to the same address: the plain decimal
+# integer (2852039166), the 2-part and 3-part "dotted-shorthand" folds
+# (169.16689662 / 169.254.43518 — trailing octets folded into one field,
+# inet_aton-style), the contiguous hex form (0xa9fea9fe), the per-octet hex
+# form (0xa9.0xfe.0xa9.0xfe), and the per-octet octal form (0251.0376.0251.0376
+# — a leading zero is the octal tell inet_aton itself honors). Not exhaustive:
+# further mixed-radix combinations, arbitrary IPv6 zero-expansion, DNS
+# rebinding, curl/wget's --resolve/--connect-to or a poisoned hosts file
+# (an innocent-looking https://example.com/ that actually routes to the
+# metadata address), and a redirect chain that lands on the endpoint are
+# residual gaps no static scan of literal text can close — deny-by-default
+# egress (policy-driven) is the backstop, same posture as the other
+# documented denylist gaps. Likewise out of scope here: writing a script that
+# MENTIONS the address in one tool call, then executing it in a separate
+# later call — Aegis evaluates each tool call independently with no
+# cross-call session state, so this splits every denylist guard in the
+# codebase equally, not just this one (see README's "Guards are a denylist" /
+# "Not a sandbox by itself" limits; nine rounds of adversarial QA on this
+# guard specifically (2025 QA log) confirmed nothing guard-specific survived
+# beyond what's listed above).
+#
+# QA history (each round found one concrete issue that got fixed; kept here so
+# a future change doesn't reopen one): R1 MCP arg key-name guessing and
+# Read/Edit/Write content false positives; R2 WebSearch false positive; R3
+# bare-substring false positives on grep/git-commit/echo; R4 a fetch-verb
+# allowlist fix that under-blocked worse than R3's problem (reverted); R5
+# command/process substitution smuggled past the R3/R4 exemption; R6
+# /dev/tcp|udp redirect targets smuggled past R5's fix; R7-R8 bash's $'...'
+# ANSI-C quoting (bare, then hex/octal-escaped) hid /dev/tcp from every
+# literal-substring check until normalize.py decoded it properly; R9 found
+# nothing new beyond the gaps disclosed above.
+CLOUD_METADATA_RE = re.compile(
+    r"\b169\.254\.169\.254\b"
+    r"|\b169\.254\.43518\b"
+    r"|\b169\.16689662\b"
+    r"|\b2852039166\b"
+    r"|\b0xa9fea9fe\b"
+    r"|0xa9[.]?0xfe[.]?0xa9[.]?0xfe"
+    r"|\b0251\.0376\.0251\.0376\b"
+    r"|fd00:ec2::254\b"
+    r"|::ffff:a9fe:a9fe\b"
+    r"|metadata\.google\.internal\b"
+    r"|\b100\.100\.100\.200\b",
+    re.IGNORECASE,
+)
+
+# Shell shapes that MENTION the metadata address without any ability to reach
+# it — a narrow, closed-form EXEMPTION from CLOUD_METADATA_RE's blanket
+# substring match, not a requirement gating it. QA review went through two
+# more rounds here:
+#   Round 3 found a bare CLOUD_METADATA_RE.search() over the whole shell
+#   command denied `grep -r 169.254.169.254 .`, a `git commit -m` whose
+#   message names the address, and an `echo ... >> firewall.rules` line — none
+#   of which reach the endpoint.
+#   Round 4's first fix attempt flipped this into a POSITIVE requirement (a
+#   fetch-verb allowlist alongside the address) — and that was worse: it's an
+#   enumerable list, trivially stepped around by anything not on it (bash's
+#   own `/dev/tcp` pseudo-device, perl/ruby/php one-liners, socat, openssl
+#   s_client, aria2c, axel, a compiled Go/Rust one-liner...). A prompt-injected
+#   "use perl instead of curl" defeated containment entirely — for a
+#   never-escapable guard, trading a narrow false positive for an open-ended
+#   false negative is the wrong direction (see CLOUD_METADATA_RE's own comment
+#   on false positives being the accepted, safe trade-off; AEGIS_SOURCE_RE
+#   documents the identical principle elsewhere in this file).
+# This is the inverse and much narrower: three specific verbs that CANNOT
+# reach the network at all, matched only when they are the command's ENTIRE
+# content (anchored start-to-end, no `;`/`&`/`|`/newline anywhere) — so
+# `grep ...; curl ...` (a real fetch smuggled after a semicolon behind a
+# leading benign verb) is NOT exempted, only a standalone grep/commit/echo is.
+# Also excludes `$(`/backtick command substitution and `<(`/`>(` process
+# substitution ANYWHERE in the tail (round 5 QA: neither uses `;`/`&`/`|`, so
+# `grep foo <(curl http://169.254.169.254/...)` and `echo x $(curl ...)`
+# both smuggled a real fetch straight through the round-4 fix unnoticed by the
+# separator-only exclusion). `>`/`>>` alone (the echo/printf redirect this
+# exemption exists to allow) still passes — only the two-character combination
+# with an immediately following `(` is excluded, via the lookahead below.
+# Also excludes bash's `/dev/tcp` and `/dev/udp` pseudo-devices ANYWHERE in the
+# tail (round 6 QA): `echo ... > /dev/tcp/169.254.169.254/80` opens a real TCP
+# connection through a bare `>` redirect — no `;`/`&`/`|`/`$(`/backtick/`<(`/
+# `>(` involved at all, so none of the round-5 exclusions caught it, and it's
+# the exact mechanism this file's own doc comment on CLOUD_METADATA_RE claims
+# is covered unconditionally.
+_MENTION_ONLY_TAIL = r"(?:(?!<\(|>\(|\$\(|`|/dev/(?:tcp|udp))[^|;&\n])*$"
+CLOUD_METADATA_MENTION_ONLY_RE = re.compile(
+    r"^\s*(?:sudo\s+)?(?:grep|rg|ag|ack|fgrep|egrep)\b" + _MENTION_ONLY_TAIL
+    + r"|^\s*(?:sudo\s+)?git\s+commit\b" + _MENTION_ONLY_TAIL
+    + r"|^\s*(?:echo|printf)\b" + _MENTION_ONLY_TAIL,
+    re.IGNORECASE,
+)
+
 # Persistence (autorun, scheduled tasks, services, startup).
 PERSIST_RE = re.compile(
     r"\\CurrentVersion\\Run(?:Once)?\b"

@@ -39,6 +39,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 | Guard | Catches | Escapable |
 |---|---|---|
 | Containment | Reads of credential stores (`~/.ssh`, `~/.aws`, `.netrc`, browser logins, DPAPI), file exfiltration (`curl -T`/`-d @`, `-InFile`, cloud-CLI uploads: `aws s3 cp`/`gsutil`/`az storage upload`/`rclone`), persistence (cron, registry autorun, scheduled tasks, services) | No |
+| Cloud metadata SSRF | Fetching the cloud instance-metadata service (`169.254.169.254` and its GCP/Azure/Alibaba/encoded-IP variants) — via shell, `WebFetch`, or an MCP tool — which hands out live IAM/service-account credentials to anything on-box, no auth required | No |
 | Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source; `aegis uninstall`/`pull` | No |
 | Evasion | Encoded/obfuscated commands (`-EncodedCommand`, `base64 -d \| bash`, char-code) | No |
 | MCP config | Writes to MCP server-config files (`.mcp.json`, `mcpServers`, etc.) that auto-run on every future session | Human only |
