@@ -253,9 +253,30 @@ CRED_RE = re.compile(
 # form (0xa9.0xfe.0xa9.0xfe), and the per-octet octal form (0251.0376.0251.0376
 # — a leading zero is the octal tell inet_aton itself honors). Not exhaustive:
 # further mixed-radix combinations, arbitrary IPv6 zero-expansion, DNS
-# rebinding, and a redirect chain that lands on the endpoint are residual gaps
-# no static scan can close — deny-by-default egress (policy-driven) is the
-# backstop, same posture as the other documented denylist gaps.
+# rebinding, curl/wget's --resolve/--connect-to or a poisoned hosts file
+# (an innocent-looking https://example.com/ that actually routes to the
+# metadata address), and a redirect chain that lands on the endpoint are
+# residual gaps no static scan of literal text can close — deny-by-default
+# egress (policy-driven) is the backstop, same posture as the other
+# documented denylist gaps. Likewise out of scope here: writing a script that
+# MENTIONS the address in one tool call, then executing it in a separate
+# later call — Aegis evaluates each tool call independently with no
+# cross-call session state, so this splits every denylist guard in the
+# codebase equally, not just this one (see README's "Guards are a denylist" /
+# "Not a sandbox by itself" limits; nine rounds of adversarial QA on this
+# guard specifically (2025 QA log) confirmed nothing guard-specific survived
+# beyond what's listed above).
+#
+# QA history (each round found one concrete issue that got fixed; kept here so
+# a future change doesn't reopen one): R1 MCP arg key-name guessing and
+# Read/Edit/Write content false positives; R2 WebSearch false positive; R3
+# bare-substring false positives on grep/git-commit/echo; R4 a fetch-verb
+# allowlist fix that under-blocked worse than R3's problem (reverted); R5
+# command/process substitution smuggled past the R3/R4 exemption; R6
+# /dev/tcp|udp redirect targets smuggled past R5's fix; R7-R8 bash's $'...'
+# ANSI-C quoting (bare, then hex/octal-escaped) hid /dev/tcp from every
+# literal-substring check until normalize.py decoded it properly; R9 found
+# nothing new beyond the gaps disclosed above.
 CLOUD_METADATA_RE = re.compile(
     r"\b169\.254\.169\.254\b"
     r"|\b169\.254\.43518\b"
