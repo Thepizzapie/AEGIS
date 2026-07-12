@@ -274,6 +274,27 @@ def test_grep_input_redirect_from_dev_tcp_blocked():
     assert evaluate(_shell("grep foo < /dev/tcp/169.254.169.254/80"), EMPTY).blocked
 
 
+# --- ANSI-C-quoted /dev/tcp still resolves to the same device (round-7 QA) ---
+# bash's `$'...'`/`$"..."` quoting expands to plain text before the redirect
+# target is resolved — `/dev/$'tcp'/HOST/PORT` opens the exact same socket as
+# `/dev/tcp/HOST/PORT` (verified against real bash: both produce a live
+# "Connection refused" from the kernel, not a file-not-found). This exercises
+# the fix in aegis/normalize.py (_ANSIC_QUOTE_RE) that decodes it for every
+# pattern in the codebase, not just this guard.
+
+def test_ansic_quoted_dev_tcp_echo_blocked():
+    cmd = "echo \"GET / HTTP/1.0\" > /dev/$'tcp'/169.254.169.254/80"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_ansic_quoted_dev_tcp_grep_blocked():
+    assert evaluate(_shell("grep foo < /dev/$'tcp'/169.254.169.254/80"), EMPTY).blocked
+
+
+def test_locale_quoted_dev_tcp_blocked():
+    assert evaluate(_shell('grep foo < /dev/$"tcp"/169.254.169.254/80'), EMPTY).blocked
+
+
 def test_python_inline_metadata_fetch_blocked():
     cmd = "python3 -c \"import urllib.request; urllib.request.urlopen('http://169.254.169.254/latest/meta-data/')\""
     assert evaluate(_shell(cmd), EMPTY).blocked
