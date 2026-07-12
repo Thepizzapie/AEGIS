@@ -295,6 +295,22 @@ def test_locale_quoted_dev_tcp_blocked():
     assert evaluate(_shell('grep foo < /dev/$"tcp"/169.254.169.254/80'), EMPTY).blocked
 
 
+# --- ANSI-C hex/octal escapes inside $'...' are decoded too (round-8 QA) -----
+# A first fix (round 7) only stripped the '$' marker, leaving the escape
+# sequences themselves undecoded — $'\x74\x63\x70' and $'\164\143\160' both
+# expand to the literal text "tcp" in real bash (verified), so a fix that
+# doesn't decode them left the identical bypass one encoding layer deeper.
+
+def test_hex_escaped_dev_tcp_blocked():
+    cmd = "echo x > /dev/$'\\x74\\x63\\x70'/169.254.169.254/80"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_octal_escaped_dev_tcp_blocked():
+    cmd = "echo x > /dev/$'\\164\\143\\160'/169.254.169.254/80"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
 def test_python_inline_metadata_fetch_blocked():
     cmd = "python3 -c \"import urllib.request; urllib.request.urlopen('http://169.254.169.254/latest/meta-data/')\""
     assert evaluate(_shell(cmd), EMPTY).blocked
