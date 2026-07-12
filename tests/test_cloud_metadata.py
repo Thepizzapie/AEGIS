@@ -151,11 +151,127 @@ def test_editing_this_own_test_file_not_blocked():
     assert not evaluate(_write("tests/test_cloud_metadata.py", own_content), EMPTY).blocked
 
 
+# --- scope: a shell command must REACH the endpoint, not just mention it -----
+# (round-3 QA: a bare substring search over the whole shell command denied a
+# security-audit grep, a git commit message, and a firewall-rule echo line —
+# none of which make an outbound request.)
+
+def test_shell_grep_for_ip_not_blocked():
+    assert not evaluate(_shell("grep -r 169.254.169.254 ."), EMPTY).blocked
+
+
+def test_shell_commit_message_mentioning_ip_not_blocked():
+    cmd = 'git commit -m "block 169.254.169.254 in the firewall"'
+    assert not evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_shell_echo_to_firewall_rule_not_blocked():
+    assert not evaluate(_shell('echo "deny 169.254.169.254" >> firewall.rules'), EMPTY).blocked
+
+
+# --- MCP arg scanning survives deep nesting ----------------------------------
+
+def test_mcp_deeply_nested_arg_blocked():
+    deep = {"input": {"params": {"request": {"target": {"nested":
+            "http://169.254.169.254/latest/meta-data/"}}}}}
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__browser__navigate", args=deep)
+    assert evaluate(ev, EMPTY).blocked
+
+
 # --- evasion: de-obfuscated surfaces still catch it --------------------------
 
 def test_inner_interpreter_metadata_fetch_blocked():
     cmd = "bash -c \"curl http://169.254.169.254/latest/meta-data/iam/security-credentials/\""
     assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+# --- coverage beyond curl/wget: a fetch-verb ALLOWLIST was tried and reverted
+# (round-4 QA) because it's trivially routed around by any tool not on the
+# list. These lock in that the guard catches the fetch regardless of
+# *mechanism* — bash's raw /dev/tcp device, other language runtimes, and
+# lesser-known downloaders — not just the couple of tools an allowlist would
+# have enumerated.
+
+def test_bash_dev_tcp_blocked():
+    cmd = 'exec 3<>/dev/tcp/169.254.169.254/80; echo -e "GET / HTTP/1.0\\r\\n\\r\\n" >&3; cat <&3'
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_perl_one_liner_blocked():
+    cmd = "perl -MLWP::Simple -e 'getprint(\"http://169.254.169.254/latest/meta-data/\")'"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_ruby_one_liner_blocked():
+    cmd = 'ruby -rnet/http -e \'Net::HTTP.get(URI("http://169.254.169.254/"))\''
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_php_one_liner_blocked():
+    cmd = 'php -r \'file_get_contents("http://169.254.169.254/");\''
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_socat_blocked():
+    assert evaluate(_shell("socat - TCP:169.254.169.254:80"), EMPTY).blocked
+
+
+def test_openssl_s_client_blocked():
+    assert evaluate(_shell("openssl s_client -connect 169.254.169.254:80"), EMPTY).blocked
+
+
+def test_aria2c_blocked():
+    assert evaluate(_shell("aria2c http://169.254.169.254/latest/meta-data/"), EMPTY).blocked
+
+
+def test_axel_blocked():
+    assert evaluate(_shell("axel http://169.254.169.254/latest/meta-data/"), EMPTY).blocked
+
+
+# --- the mention-only exemption cannot be abused to smuggle a real fetch -----
+
+def test_grep_prefix_cannot_smuggle_a_real_fetch():
+    # a leading benign verb followed by a REAL fetch after a separator must
+    # still be blocked — the exemption requires the ENTIRE command match the
+    # benign shape, not just its first word
+    cmd = "grep 169.254.169.254 /etc/hosts; curl http://169.254.169.254/latest/meta-data/ -o /tmp/x"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+# --- the exemption can't be smuggled past via substitution either (round-5) --
+# `;`/`&`/`|` aren't the only way to run a second command: process
+# substitution (`<(...)`/`>(...)`) and command substitution (`$(...)`/
+# backticks) run one too, without any of those separator characters.
+
+def test_grep_with_process_substitution_fetch_blocked():
+    cmd = "grep foo <(curl http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_echo_with_command_substitution_fetch_blocked():
+    cmd = "echo start $(curl http://169.254.169.254/latest/meta-data/)"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_echo_with_backtick_substitution_fetch_blocked():
+    cmd = "echo `curl http://169.254.169.254/latest/meta-data/`"
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_git_commit_with_command_substitution_fetch_blocked():
+    cmd = 'git commit -m "$(curl http://169.254.169.254/latest/meta-data/)"'
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+# --- /dev/tcp is itself a network reach, even through a bare redirect (round-6)
+
+def test_echo_redirect_to_dev_tcp_blocked():
+    cmd = 'echo "GET /latest/meta-data/ HTTP/1.0" > /dev/tcp/169.254.169.254/80'
+    assert evaluate(_shell(cmd), EMPTY).blocked
+
+
+def test_grep_input_redirect_from_dev_tcp_blocked():
+    assert evaluate(_shell("grep foo < /dev/tcp/169.254.169.254/80"), EMPTY).blocked
 
 
 def test_python_inline_metadata_fetch_blocked():

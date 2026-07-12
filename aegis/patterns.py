@@ -271,6 +271,50 @@ CLOUD_METADATA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Shell shapes that MENTION the metadata address without any ability to reach
+# it — a narrow, closed-form EXEMPTION from CLOUD_METADATA_RE's blanket
+# substring match, not a requirement gating it. QA review went through two
+# more rounds here:
+#   Round 3 found a bare CLOUD_METADATA_RE.search() over the whole shell
+#   command denied `grep -r 169.254.169.254 .`, a `git commit -m` whose
+#   message names the address, and an `echo ... >> firewall.rules` line — none
+#   of which reach the endpoint.
+#   Round 4's first fix attempt flipped this into a POSITIVE requirement (a
+#   fetch-verb allowlist alongside the address) — and that was worse: it's an
+#   enumerable list, trivially stepped around by anything not on it (bash's
+#   own `/dev/tcp` pseudo-device, perl/ruby/php one-liners, socat, openssl
+#   s_client, aria2c, axel, a compiled Go/Rust one-liner...). A prompt-injected
+#   "use perl instead of curl" defeated containment entirely — for a
+#   never-escapable guard, trading a narrow false positive for an open-ended
+#   false negative is the wrong direction (see CLOUD_METADATA_RE's own comment
+#   on false positives being the accepted, safe trade-off; AEGIS_SOURCE_RE
+#   documents the identical principle elsewhere in this file).
+# This is the inverse and much narrower: three specific verbs that CANNOT
+# reach the network at all, matched only when they are the command's ENTIRE
+# content (anchored start-to-end, no `;`/`&`/`|`/newline anywhere) — so
+# `grep ...; curl ...` (a real fetch smuggled after a semicolon behind a
+# leading benign verb) is NOT exempted, only a standalone grep/commit/echo is.
+# Also excludes `$(`/backtick command substitution and `<(`/`>(` process
+# substitution ANYWHERE in the tail (round 5 QA: neither uses `;`/`&`/`|`, so
+# `grep foo <(curl http://169.254.169.254/...)` and `echo x $(curl ...)`
+# both smuggled a real fetch straight through the round-4 fix unnoticed by the
+# separator-only exclusion). `>`/`>>` alone (the echo/printf redirect this
+# exemption exists to allow) still passes — only the two-character combination
+# with an immediately following `(` is excluded, via the lookahead below.
+# Also excludes bash's `/dev/tcp` and `/dev/udp` pseudo-devices ANYWHERE in the
+# tail (round 6 QA): `echo ... > /dev/tcp/169.254.169.254/80` opens a real TCP
+# connection through a bare `>` redirect — no `;`/`&`/`|`/`$(`/backtick/`<(`/
+# `>(` involved at all, so none of the round-5 exclusions caught it, and it's
+# the exact mechanism this file's own doc comment on CLOUD_METADATA_RE claims
+# is covered unconditionally.
+_MENTION_ONLY_TAIL = r"(?:(?!<\(|>\(|\$\(|`|/dev/(?:tcp|udp))[^|;&\n])*$"
+CLOUD_METADATA_MENTION_ONLY_RE = re.compile(
+    r"^\s*(?:sudo\s+)?(?:grep|rg|ag|ack|fgrep|egrep)\b" + _MENTION_ONLY_TAIL
+    + r"|^\s*(?:sudo\s+)?git\s+commit\b" + _MENTION_ONLY_TAIL
+    + r"|^\s*(?:echo|printf)\b" + _MENTION_ONLY_TAIL,
+    re.IGNORECASE,
+)
+
 # Persistence (autorun, scheduled tasks, services, startup).
 PERSIST_RE = re.compile(
     r"\\CurrentVersion\\Run(?:Once)?\b"

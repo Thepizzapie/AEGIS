@@ -78,8 +78,11 @@ def _flatten_strings(v, _depth: int = 0) -> list:
     depth (e.g. {"input": {"url": "..."}}) — QA review (independent agent,
     round 1) found a fixed key-name allowlist here was a bypass: any MCP tool
     naming its URL argument something other than the guessed set (url/query/
-    uri/endpoint/command) sailed straight through untouched."""
-    if _depth > 4:
+    uri/endpoint/command) sailed straight through untouched. Depth cap raised
+    12 -> deep enough for any realistic tool-arg schema (round 3 QA found the
+    original cap of 4 silently dropped a 5-level-deep target) while still
+    bounding recursion against a pathological/cyclic payload."""
+    if _depth > 12:
         return []
     if isinstance(v, str):
         return [v]
@@ -162,27 +165,36 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
     # an attacker-chosen host — the search provider does the fetching — so
     # "how does the 169.254.169.254 SSRF work" as research is not an attempt to
     # reach it and must not trip a non-escapable guard.
-    if _is_shell(ev):
-        net_text = _shell_scan(ev)
+    #
+    # The shell branch is a bare substring search (matching every other
+    # containment pattern's style) EXCEPT for the narrow, closed-form
+    # CLOUD_METADATA_MENTION_ONLY_RE carve-out (grep/git-commit/echo — see its
+    # docstring in patterns.py for why a positive fetch-verb requirement was
+    # tried and rejected: it under-blocks far worse than this over-blocks).
+    # WebFetch/MCP need no carve-out: the tool call itself IS the fetch, so
+    # mere presence of the address in its target argument is already the
+    # attempt.
+    is_shell = _is_shell(ev)
+    if is_shell:
+        text = _shell_scan(ev)
+        metadata_hit = (bool(patterns.CLOUD_METADATA_RE.search(text))
+                         and not patterns.CLOUD_METADATA_MENTION_ONLY_RE.search(text))
     elif ev.action == ActionClass.MCP or (
             ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch"):
-        net_text = _net_text(ev)
+        metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(_net_text(ev)))
+        text = None  # handled above; not a shell/read/edit/write shape below
+    elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
+        text = _path(ev) + " " + str((ev.args or {}).get("content") or "")
+        metadata_hit = False
     else:
-        net_text = ""
-    if net_text.strip() and patterns.CLOUD_METADATA_RE.search(net_text):
+        return None
+    if metadata_hit:
         return Decision(Action.DENY, "containment-cloud-metadata",
                         "Access to the cloud instance-metadata service is blocked — this "
                         "endpoint hands out live IAM/service-account credentials to "
                         "anything on-box, no auth required, and is a classic SSRF-to-"
                         "credential-theft path.")
-
-    if _is_shell(ev):
-        text = net_text
-    elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
-        text = _path(ev) + " " + str((ev.args or {}).get("content") or "")
-    else:
-        return None
-    if not text.strip():
+    if text is None or not text.strip():
         return None
     if patterns.CRED_RE.search(text):
         return Decision(Action.DENY, "containment-credentials",
