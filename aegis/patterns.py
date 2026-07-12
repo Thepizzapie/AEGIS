@@ -225,6 +225,52 @@ CRED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cloud instance-metadata service — the SSRF-to-credential-theft surface. Every
+# major cloud provider exposes short-lived IAM/service-account credentials (and
+# often user-data containing secrets) over a link-local HTTP endpoint reachable
+# from inside any instance/container, no auth beyond being on-box. An agent that
+# fetches this URL — tricked by prompt injection in a fetched page, a malicious
+# repo's "helpful" setup command, or a compromised dependency's install step —
+# hands over live cloud credentials. This is the SSRF-to-IMDS path behind real
+# breaches (e.g. the 2019 Capital One breach used exactly this). Distinct from
+# CRED_RE (local credential FILES already on disk) — this is the
+# network-reachable equivalent, and deliberately NOT policy-gated like
+# rule_network_egress: no repo should have to opt in to keep an agent from
+# handing its cloud account away.
+#
+# Covers: the 169.254.169.254 link-local address shared by AWS/Azure/legacy
+# GCP/DigitalOcean/Oracle/IBM/OpenStack/Vultr/Hetzner; AWS's IPv6 IMDS endpoint
+# (fd00:ec2::254, plus its IPv4-mapped hex-group spelling ::ffff:a9fe:a9fe —
+# the dotted-decimal-embedded spelling ::ffff:169.254.169.254 already matches
+# the plain IPv4 alternative below as a substring); GCP's documented
+# metadata.google.internal hostname alternative; Alibaba Cloud's distinct
+# 100.100.100.200; and the alternate encodings of the shared IPv4 address an
+# agent might reach for or be prompt-injected into using — all of which
+# curl/wget/browsers still resolve to the same address: the plain decimal
+# integer (2852039166), the 2-part and 3-part "dotted-shorthand" folds
+# (169.16689662 / 169.254.43518 — trailing octets folded into one field,
+# inet_aton-style), the contiguous hex form (0xa9fea9fe), the per-octet hex
+# form (0xa9.0xfe.0xa9.0xfe), and the per-octet octal form (0251.0376.0251.0376
+# — a leading zero is the octal tell inet_aton itself honors). Not exhaustive:
+# further mixed-radix combinations, arbitrary IPv6 zero-expansion, DNS
+# rebinding, and a redirect chain that lands on the endpoint are residual gaps
+# no static scan can close — deny-by-default egress (policy-driven) is the
+# backstop, same posture as the other documented denylist gaps.
+CLOUD_METADATA_RE = re.compile(
+    r"\b169\.254\.169\.254\b"
+    r"|\b169\.254\.43518\b"
+    r"|\b169\.16689662\b"
+    r"|\b2852039166\b"
+    r"|\b0xa9fea9fe\b"
+    r"|0xa9[.]?0xfe[.]?0xa9[.]?0xfe"
+    r"|\b0251\.0376\.0251\.0376\b"
+    r"|fd00:ec2::254\b"
+    r"|::ffff:a9fe:a9fe\b"
+    r"|metadata\.google\.internal\b"
+    r"|\b100\.100\.100\.200\b",
+    re.IGNORECASE,
+)
+
 # Persistence (autorun, scheduled tasks, services, startup).
 PERSIST_RE = re.compile(
     r"\\CurrentVersion\\Run(?:Once)?\b"

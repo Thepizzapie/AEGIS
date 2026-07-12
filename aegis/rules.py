@@ -72,6 +72,41 @@ def _sql_text(ev: Event) -> str:
     return " ".join(str(p) for p in parts if p)
 
 
+def _flatten_strings(v, _depth: int = 0) -> list:
+    """Every string/number leaf inside a (possibly nested) arg value. MCP tool
+    args are arbitrary JSON, so a target URL can sit under any key name, at any
+    depth (e.g. {"input": {"url": "..."}}) — QA review (independent agent,
+    round 1) found a fixed key-name allowlist here was a bypass: any MCP tool
+    naming its URL argument something other than the guessed set (url/query/
+    uri/endpoint/command) sailed straight through untouched."""
+    if _depth > 4:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return [str(v)]
+    if isinstance(v, dict):
+        out = []
+        for x in v.values():
+            out.extend(_flatten_strings(x, _depth + 1))
+        return out
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            out.extend(_flatten_strings(x, _depth + 1))
+        return out
+    return []
+
+
+def _net_text(ev: Event) -> str:
+    """All string/number argument content for a network-shaped tool call
+    (WebFetch/WebSearch, or an MCP tool that reaches the network) — scans every
+    value rather than a fixed set of key names, since the argument that carries
+    the target URL varies by tool/server with no fixed convention across MCP
+    servers."""
+    return " ".join(_flatten_strings(ev.args or {}))
+
+
 def _egress_host(ev: Event) -> Optional[str]:
     a = ev.args or {}
     for v in (a.get("url"), a.get("command"), a.get("query")):
@@ -114,8 +149,35 @@ def rule_attest_session(ev: Event, policy=None) -> Optional[Decision]:
 
 # ---- containment: never escapable ----------------------------------------------
 def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
+    # Cloud-metadata SSRF is checked on a SEPARATE surface from the rest of this
+    # function: only actions that actually reach the network (a shell command,
+    # a WebFetch, or an MCP tool call) can trigger it. It deliberately does NOT
+    # scan Read/Edit/Write path+content like CRED_RE does below — a file that
+    # merely MENTIONS the address (docs, a firewall/NetworkPolicy rule that
+    # blocks it, this guard's own tests) is not a fetch and must not be denied —
+    # QA review (independent agent, round 1) caught this as a false positive
+    # that would have made an Aegis-governed agent unable to even write about
+    # the address it's supposed to protect against. WebSearch is excluded too
+    # (round 2): a search QUERY never makes the agent's own network stack reach
+    # an attacker-chosen host — the search provider does the fetching — so
+    # "how does the 169.254.169.254 SSRF work" as research is not an attempt to
+    # reach it and must not trip a non-escapable guard.
     if _is_shell(ev):
-        text = _shell_scan(ev)
+        net_text = _shell_scan(ev)
+    elif ev.action == ActionClass.MCP or (
+            ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch"):
+        net_text = _net_text(ev)
+    else:
+        net_text = ""
+    if net_text.strip() and patterns.CLOUD_METADATA_RE.search(net_text):
+        return Decision(Action.DENY, "containment-cloud-metadata",
+                        "Access to the cloud instance-metadata service is blocked — this "
+                        "endpoint hands out live IAM/service-account credentials to "
+                        "anything on-box, no auth required, and is a classic SSRF-to-"
+                        "credential-theft path.")
+
+    if _is_shell(ev):
+        text = net_text
     elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
         text = _path(ev) + " " + str((ev.args or {}).get("content") or "")
     else:
