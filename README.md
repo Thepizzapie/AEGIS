@@ -38,7 +38,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 
 | Guard | Catches | Escapable |
 |---|---|---|
-| Containment | Reads of credential stores (`~/.ssh`, `~/.aws`, `.netrc`, browser logins, DPAPI), file exfiltration (`curl -T`/`-d @`, `-InFile`, cloud-CLI uploads: `aws s3 cp`/`gsutil`/`az storage upload`/`rclone`), persistence (cron, registry autorun, scheduled tasks, services) | No |
+| Containment | Reads of credential stores (`~/.ssh`, `~/.aws`, `.netrc`, browser logins, DPAPI), file exfiltration (`curl -T`/`-d @`, `-InFile`, cloud-CLI uploads: `aws s3 cp`/`gsutil`/`az storage upload`/`rclone`), env-var secret exfiltration (`env`/`printenv`/`Get-ChildItem Env:` dumped into curl/nc/socat/ssh/etc.), persistence (cron, registry autorun, scheduled tasks, services) | No |
 | Cloud metadata SSRF | Fetching the cloud instance-metadata service (`169.254.169.254` and its GCP/Azure/Alibaba/encoded-IP variants) — via shell, `WebFetch`, or an MCP tool — which hands out live IAM/service-account credentials to anything on-box, no auth required | No |
 | Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source; `aegis uninstall`/`pull` | No |
 | Evasion | Encoded/obfuscated commands (`-EncodedCommand`, `base64 -d \| bash`, char-code) | No |
@@ -142,7 +142,7 @@ cd sandbox && ./run.sh /path/to/repo    # or run.ps1 on Windows
 ## Limits
 
 - **Not a sandbox by itself.** An agent already at a raw shell can run relative commands Aegis only sees as opaque `shell` text. Use the [`sandbox/`](sandbox/) container, or an OS-restricted user, for hostile-code isolation.
-- **Guards are a denylist.** They catch known-dangerous shapes, not every possible one. Known gaps: bucket-to-bucket cloud transfers and aliased clients (`mc`, `doctl`) that the cloud-CLI exfil guard doesn't parse, `git -c` inline-config force-push, and shell-computed path indirection reaching self-protection's protected files — `find`'s `-path`/`-name`/`-regex` predicates are covered, but reconstructing a path from a variable split across assignments, a `for`/`xargs` loop, or `basename`/`dirname` is not. Deny-by-default egress is the backstop. Found a bypass? That's a bug worth reporting.
+- **Guards are a denylist.** They catch known-dangerous shapes, not every possible one. Known gaps: bucket-to-bucket cloud transfers and aliased clients (`mc`, `doctl`) that the cloud-CLI exfil guard doesn't parse, `git -c` inline-config force-push, shell-computed path indirection reaching self-protection's protected files — `find`'s `-path`/`-name`/`-regex` predicates are covered, but reconstructing a path from a variable split across assignments, a `for`/`xargs` loop, or `basename`/`dirname` is not — and a single named environment variable handed to a network call (e.g. an API token in an `Authorization` header) is deliberately not flagged by the env-exfil guard, which only catches a *bulk* dump piped/substituted into a network sink; there's no reliable way to tell "the vendor's own API" from "an attacker's host" by regex alone. Deny-by-default egress is the backstop. Found a bypass? That's a bug worth reporting.
 - **Fail-open by default.** If the hook can't run, the action proceeds unguarded rather than blocking your work. Set `AEGIS_FAIL_CLOSED=1` to invert.
 - **Identity is as strong as the keystore.** The issuer key lives on disk; a process with your privileges can read it.
 - **Deep hooks are Claude Code today.** Other runtimes use the `generic` adapter or the git/CI floor.

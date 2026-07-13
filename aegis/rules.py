@@ -211,6 +211,12 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
         return Decision(Action.DENY, "containment-cloud-exfiltration",
                         "Uploading local files to a cloud storage bucket/container "
                         "(aws s3 / gsutil / az storage / rclone) is blocked.")
+    if _is_shell(ev) and patterns.ENV_DUMP_EXFIL_RE.search(text):
+        return Decision(Action.DENY, "containment-env-exfiltration",
+                        "Dumping the process environment (env / printenv / export -p / "
+                        "Get-ChildItem Env:) into a network call is blocked — the "
+                        "environment routinely holds live secrets (API keys, tokens, "
+                        "DATABASE_URL) with no file ever touched.")
     return None
 
 
