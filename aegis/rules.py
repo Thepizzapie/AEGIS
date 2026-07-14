@@ -106,8 +106,32 @@ def _net_text(ev: Event) -> str:
     (WebFetch/WebSearch, or an MCP tool that reaches the network) — scans every
     value rather than a fixed set of key names, since the argument that carries
     the target URL varies by tool/server with no fixed convention across MCP
-    servers."""
-    return " ".join(_flatten_strings(ev.args or {}))
+    servers.
+
+    Also appends a percent-decoded form: unlike shell text (where
+    ``normalize.scan_surface`` only decodes on an explicit hint — a
+    ``-EncodedCommand`` flag, a ``base64 -d`` pipe — an MCP tool's path/URI
+    argument routinely carries percent-encoding with no such hint (it's just
+    how a URI-shaped argument looks), so decoding it unconditionally is cheap
+    and safe (a non-encoded value decodes to itself or to garbage that matches
+    nothing new — QA review, independent agent: confirmed
+    ``path=%2Fhome%2Fuser%2F.ssh%2Fid_rsa`` bypassed every pattern here before
+    this). Deliberately NOT extended to blind base64 decoding of every
+    argument value — that has no equivalent hint-free-but-safe signal, and
+    guessing would be expensive noise across every MCP call; a bare base64
+    blob with no decode hint is an already-accepted gap on the shell surface
+    too (see normalize.py's ``_B64_DECODE_HINT``)."""
+    raw = " ".join(_flatten_strings(ev.args or {}))
+    if not raw:
+        return raw
+    try:
+        from urllib.parse import unquote
+        decoded = unquote(raw[:20000])
+        if decoded != raw[:20000]:
+            return raw + " " + decoded
+    except Exception:
+        pass
+    return raw
 
 
 def _egress_host(ev: Event) -> Optional[str]:

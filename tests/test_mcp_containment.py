@@ -99,6 +99,67 @@ def test_websearch_mentioning_credential_path_not_blocked():
     assert not d.blocked
 
 
+# --- QA round 1 (two independent agents): confirmed bypasses, now fixed -----
+
+def test_mcp_relative_credential_path_blocked():
+    # CRED_RE's directory alternatives required a LEADING path separator
+    # (`/.aws/...`) — a bare relative path (the routine shape for a
+    # filesystem-style MCP tool's `path` argument) had no separator in front
+    # and sailed through untouched. Confirmed identically on Read/Edit/Write
+    # too (see test_builtins.py) — not new to this guard, just now closed
+    # everywhere CRED_RE is shared.
+    d = evaluate(_mcp("mcp__filesystem__read_file", {"path": ".aws/credentials"}), EMPTY)
+    assert d.blocked and d.rule == "containment-credentials"
+    d2 = evaluate(_mcp("mcp__filesystem__read_file", {"path": ".kube/config"}), EMPTY)
+    assert d2.blocked and d2.rule == "containment-credentials"
+
+
+def test_mcp_percent_encoded_credential_path_blocked():
+    # _net_text had no de-obfuscation at all (unlike the shell surface's
+    # normalize.scan_surface): a percent-encoded path defeated every pattern
+    # outright. MCP path/URI arguments routinely carry percent-encoding with
+    # no attacker intent required, so decoding it unconditionally is safe.
+    d = evaluate(_mcp("mcp__filesystem__read_file",
+                       {"path": "%2Fhome%2Fuser%2F.ssh%2Fid_rsa"}), EMPTY)
+    assert d.blocked and d.rule == "containment-credentials"
+
+
+# --- QA round 1: findings considered and deliberately NOT "fixed" -----------
+
+def test_mcp_search_tool_credential_mention_still_blocked():
+    # QA flagged that a native WebSearch query mentioning a credential path is
+    # exempt, but the identical query routed through an MCP-hosted search tool
+    # (mcp__brave-search__..., mcp__tavily__...) is NOT exempt, and asked
+    # whether that's an inconsistent false positive. It is NOT: WebSearch is
+    # the runtime's own trusted, fixed-behavior implementation, but an MCP
+    # tool is arbitrary third-party code — a compromised/malicious MCP server
+    # can name a credential-exfiltrating tool anything it likes, including
+    # something with "search" in the name, specifically to dodge a name-based
+    # carve-out. Trusting the tool NAME here would reopen the exact hole this
+    # guard exists to close, so this is locked in as intentional, not a bug.
+    d = evaluate(_mcp("mcp__brave-search__brave_web_search",
+                       {"query": "how to protect ~/.ssh/id_rsa from being read by an agent"}),
+                 EMPTY)
+    assert d.blocked and d.rule == "containment-credentials"
+
+
+def test_mcp_documentation_mentioning_credential_path_blocked():
+    # QA flagged that a PR-body/commit-message/docs-page MCP tool call merely
+    # MENTIONING a credential path (not accessing one) also trips this guard.
+    # True, but it is the IDENTICAL pre-existing trade-off the shell surface
+    # already made before this change (see test_containment_credentials's
+    # `grep`/commit-message style, and CLOUD_METADATA_MENTION_ONLY_RE's own
+    # round-4 QA history in patterns.py: a positive-verb/allowlist attempt at
+    # narrowing a non-escapable guard was tried and reverted because it
+    # under-blocks far worse than this over-blocks). Locked in as accepted
+    # behavior, not silently patched with a fragile allowlist.
+    d = evaluate(_mcp("mcp__wiki__create_page",
+                       {"content": "Detection rule: alert on writes to "
+                                   r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"}),
+                 EMPTY)
+    assert d.blocked and d.rule == "containment-persistence"
+
+
 # --- scope: exfil/cloud-exfil/env-dump patterns stay shell-only -------------
 # (shell-flag syntax like `curl -d @file` has no analogue in a tool call's JSON
 # arguments — this locks in that an unrelated MCP call isn't accidentally

@@ -213,13 +213,26 @@ WRITE_REDIRECT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Credential stores.
+# Credential stores. Every directory-shaped alternative below needs a leading
+# edge that ISN'T just a bare path separator: `~/.aws/credentials` (absolute)
+# is the common shell shape, but an MCP filesystem-style tool's `path` argument
+# is routinely handed a bare RELATIVE path with no separator at all in front —
+# `.aws/credentials`, `.kube/config` — which `[/\\]` alone never matches (QA
+# review, independent agent: confirmed this bypasses identically on the
+# pre-existing Read/Edit/Write and shell surfaces too, e.g. `Read(file_path=
+# ".aws/credentials")` — this just closes it everywhere the pattern is shared,
+# not only for MCP). `_CRED_PATH_START` accepts a real separator, OR
+# start-of-string / whitespace / an opening quote — the shapes a bare relative
+# path actually appears in (the first flattened MCP arg value, or any later one
+# in `_net_text`'s space-joined blob).
+_CRED_PATH_START = r"(?:^|[/\\]|\s|['\"])"
 CRED_RE = re.compile(
-    r"(?:[/\\]\.(?:ssh|aws|azure|gnupg|kube))(?:[/\\]|\b)"
-    r"|[/\\]\.netrc\b|[/\\]\.config[/\\]gh\b"
-    r"|[/\\]\.docker[/\\]config\.json\b"
+    _CRED_PATH_START + r"\.(?:ssh|aws|azure|gnupg|kube)(?:[/\\]|\b)"
+    r"|" + _CRED_PATH_START + r"\.netrc\b"
+    r"|" + _CRED_PATH_START + r"\.config[/\\]gh\b"
+    r"|" + _CRED_PATH_START + r"\.docker[/\\]config\.json\b"
     r"|\bid_rsa\b|\bid_ed25519\b|\.ppk\b"
-    r"|[/\\](?:Login Data|Cookies|Web Data)\b"
+    r"|" + _CRED_PATH_START + r"(?:Login Data|Cookies|Web Data)\b"
     r"|\bkey4\.db\b|\blogins\.json\b"
     r"|Microsoft[/\\](?:Credentials|Vault|Protect)\b",
     re.IGNORECASE,
