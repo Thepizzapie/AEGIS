@@ -38,7 +38,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 
 | Guard | Catches | Escapable |
 |---|---|---|
-| Containment | Reads of credential stores (`~/.ssh`, `~/.aws`, `.netrc`, browser logins, DPAPI), file exfiltration (`curl -T`/`-d @`, `-InFile`, cloud-CLI uploads: `aws s3 cp`/`gsutil`/`az storage upload`/`rclone`), env-var secret exfiltration (`env`/`printenv`/`Get-ChildItem Env:` dumped into curl/nc/socat/ssh/etc.), persistence (cron, registry autorun, scheduled tasks, services) | No |
+| Containment | Reads of credential stores (`~/.ssh`, `~/.aws`, `.netrc`, browser logins, DPAPI) and persistence (cron, registry autorun, scheduled tasks, services) — from shell, Read/Edit/Write, **and any MCP tool call's arguments** (any key name, any nesting depth, absolute or bare-relative paths, percent-encoded); file exfiltration (`curl -T`/`-d @`, `-InFile`, cloud-CLI uploads: `aws s3 cp`/`gsutil`/`az storage upload`/`rclone`), env-var secret exfiltration (`env`/`printenv`/`Get-ChildItem Env:` dumped into curl/nc/socat/ssh/etc.) — shell only | No |
 | Cloud metadata SSRF | Fetching the cloud instance-metadata service (`169.254.169.254` and its GCP/Azure/Alibaba/encoded-IP variants) — via shell, `WebFetch`, or an MCP tool — which hands out live IAM/service-account credentials to anything on-box, no auth required | No |
 | Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source; `aegis uninstall`/`pull` | No |
 | Evasion | Encoded/obfuscated commands (`-EncodedCommand`, `base64 -d \| bash`, char-code) | No |
@@ -104,7 +104,9 @@ Deterministic and dependency-free by default; the LLM judge is optional (`pip in
 
 ## Other surfaces
 
-Same policy, three places: runtime hooks (Claude Code native, others via the `generic` adapter), inside your own MCP server (`from aegis import mcp`, decorate tools with `@aegis.guarded`), and git/CI (`aegis install-git`, `aegis ci --base origin/main`) as a floor that works even where a runtime has no hooks.
+Same policy, three places: runtime hooks (Claude Code native, others via the `generic` adapter), inside your own MCP server (`from aegis import mcp`, decorate tools with `@mcp.guarded`), and git/CI (`aegis install-git`, `aegis ci --base origin/main`) as a floor that works even where a runtime has no hooks.
+
+`mcp.check`/`guard`/`guarded` treat every call as an MCP tool call by default (`ActionClass.MCP`) regardless of the tool's own name — a server's tool is arbitrary code Aegis can't audit, so its name alone (`read`, `task`, `agent`, ...) isn't trusted to pick a narrower guard. Pass `action=` explicitly (e.g. `action=ActionClass.SHELL`) if a tool is a genuine pass-through and you want its matching native guard instead.
 
 ## Install notes
 
@@ -143,6 +145,7 @@ cd sandbox && ./run.sh /path/to/repo    # or run.ps1 on Windows
 
 - **Not a sandbox by itself.** An agent already at a raw shell can run relative commands Aegis only sees as opaque `shell` text. Use the [`sandbox/`](sandbox/) container, or an OS-restricted user, for hostile-code isolation.
 - **Guards are a denylist.** They catch known-dangerous shapes, not every possible one. Known gaps: bucket-to-bucket cloud transfers and aliased clients (`mc`, `doctl`) that the cloud-CLI exfil guard doesn't parse, `git -c` inline-config force-push, shell-computed path indirection reaching self-protection's protected files — `find`'s `-path`/`-name`/`-regex` predicates are covered, but reconstructing a path from a variable split across assignments, a `for`/`xargs` loop, or `basename`/`dirname` is not — and a single named environment variable handed to a network call (e.g. an API token in an `Authorization` header) is deliberately not flagged by the env-exfil guard, which only catches a *bulk* dump piped/substituted into a network sink; there's no reliable way to tell "the vendor's own API" from "an attacker's host" by regex alone. Deny-by-default egress is the backstop. Found a bypass? That's a bug worth reporting.
+- **MCP tool-call argument scanning** (credential/persistence access via `aegis.mcp`/the hook adapter's MCP path) decodes percent-encoding and strips incidental whitespace/quoting from each argument value, but doesn't blindly base64-decode every value (no hint-free way to do that cheaply — same posture as the shell surface) and won't catch a credential-path fragment embedded inside a *larger* value it isn't the whole of (e.g. a query string glued onto a URL) — anchoring per-value, not per-substring, is deliberate (see `CRED_RELATIVE_RE`'s history) to avoid re-opening a worse false-positive class. `rule_subagent_spawn`'s MCP coverage for a spawn-shaped tool is name-based (`task`/`agent` as the tool's own bare name or its trailing `mcp__server__name` segment) — a differently-named spawn tool isn't recognized as one.
 - **Fail-open by default.** If the hook can't run, the action proceeds unguarded rather than blocking your work. Set `AEGIS_FAIL_CLOSED=1` to invert.
 - **Identity is as strong as the keystore.** The issuer key lives on disk; a process with your privileges can read it.
 - **Deep hooks are Claude Code today.** Other runtimes use the `generic` adapter or the git/CI floor.

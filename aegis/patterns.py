@@ -213,7 +213,20 @@ WRITE_REDIRECT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Credential stores.
+# Credential stores. Requires a real leading path separator before the dot —
+# a first attempt at also accepting whitespace/quote/start-of-string (to catch
+# a bare RELATIVE path with no separator, e.g. an MCP tool's path=".aws/
+# credentials") was reverted: QA review (independent agent, round 3) confirmed
+# it matched `Cookies`/`Web Data` as ordinary English words ("This site uses
+# Cookies...") and a `.gitignore`'s `.aws/`/`.ssh/` entries (routine, GOOD
+# security practice) — a substring relaxation can't tell "a real path
+# argument" from "prose that happens to contain the same characters", and that
+# false-positive class is worse than the gap it closed. The bare-relative-path
+# case is instead handled per-argument-value (full match, not substring) by
+# CRED_RELATIVE_RE below, applied ONLY to individual MCP/NET tool-call
+# arguments in rules.py — never to shell text or Read/Edit/Write content,
+# where "the whole value is exactly a path" isn't a meaningful distinction
+# (content is prose, not a single discrete argument).
 CRED_RE = re.compile(
     r"(?:[/\\]\.(?:ssh|aws|azure|gnupg|kube))(?:[/\\]|\b)"
     r"|[/\\]\.netrc\b|[/\\]\.config[/\\]gh\b"
@@ -222,6 +235,25 @@ CRED_RE = re.compile(
     r"|[/\\](?:Login Data|Cookies|Web Data)\b"
     r"|\bkey4\.db\b|\blogins\.json\b"
     r"|Microsoft[/\\](?:Credentials|Vault|Protect)\b",
+    re.IGNORECASE,
+)
+
+# Bare RELATIVE credential path — the shape an MCP filesystem/cloud-access
+# tool's own `path`/`key`/`file` argument routinely takes (no leading `/` or
+# `~/`, e.g. path=".aws/credentials"), which CRED_RE's separator-anchored
+# alternatives above never match. FULLY ANCHORED (^...$) against ONE
+# individual flattened argument value at a time — never against a joined
+# blob of multiple values or free-text content — so a value has to BE the
+# path (optionally continuing to a real file/dir past a separator), not
+# merely contain it somewhere inside a longer sentence. This is what keeps it
+# safe where the substring version (reverted above) wasn't: "This site uses
+# Cookies" and a .gitignore's ".aws/\n.ssh/\n" content are single values that
+# don't fully match ^\.(?:ssh|aws|...)$ or its separator-continuation form,
+# so neither trips this pattern, while path=".aws/credentials" (the whole
+# value, nothing else) does.
+CRED_RELATIVE_RE = re.compile(
+    r"^\.(?:ssh|aws|azure|gnupg|kube)(?:[/\\][^\n]*)?$"
+    r"|^\.netrc$|^\.config[/\\]gh$|^\.docker[/\\]config\.json$",
     re.IGNORECASE,
 )
 
@@ -343,6 +375,23 @@ PERSIST_RE = re.compile(
     r"|\bsc(?:\.exe)?\s+create\b|New-Service\b"
     r"|[/\\]Start Menu[/\\]Programs[/\\]Startup[/\\]"
     r"|\bcrontab\b|/etc/cron",
+    re.IGNORECASE,
+)
+
+# Bare RELATIVE persistence-target path — the identical gap CRED_RELATIVE_RE
+# closes for credential stores, but for the two PERSIST_RE alternatives that
+# are path-shaped rather than command-shaped: the registry Run key and the
+# Start Menu Startup folder both require a literal leading separator, so an
+# MCP filesystem/registry tool's bare relative `path`/`key` argument (e.g.
+# key="CurrentVersion\Run", path="Start Menu/Programs/Startup/evil.bat") sails
+# through untouched (QA review, independent agent, round 6). Same design as
+# CRED_RELATIVE_RE: fully anchored (^...$) against one individual flattened +
+# stripped argument value, never a substring search — the command-shaped
+# alternatives (schtasks/sc/New-Service/crontab/etc) already match a bare word
+# fine and need no companion.
+PERSIST_RELATIVE_RE = re.compile(
+    r"^CurrentVersion\\Run(?:Once)?(?:\\[^\n]*)?$"
+    r"|^Start Menu[/\\]Programs[/\\]Startup(?:[/\\][^\n]*)?$",
     re.IGNORECASE,
 )
 

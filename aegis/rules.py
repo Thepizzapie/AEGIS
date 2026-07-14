@@ -81,13 +81,28 @@ def _flatten_strings(v, _depth: int = 0) -> list:
     uri/endpoint/command) sailed straight through untouched. Depth cap raised
     12 -> deep enough for any realistic tool-arg schema (round 3 QA found the
     original cap of 4 silently dropped a 5-level-deep target) while still
-    bounding recursion against a pathological/cyclic payload."""
+    bounding recursion against a pathological/cyclic payload.
+
+    ``aegis.mcp.guarded``/``check`` is a real embedding path where ``ev.args``
+    are an MCP server's own live Python ``**kwargs``, not JSON — so a
+    filesystem-style tool handler written as ``def read_file(path: Path)``
+    (an entirely ordinary Python signature) hands this function a real
+    ``pathlib.Path``/``bytes`` object, not a ``str``. Round 7 QA found those
+    fell through every ``isinstance`` check to the empty-list default, so
+    the value vanished from scanning entirely — a fully-escapable containment
+    guard for any tool taking a non-``str`` argument type. ``os.PathLike``
+    and ``bytes``/``bytearray`` are stringified explicitly rather than left to
+    the default."""
     if _depth > 12:
         return []
     if isinstance(v, str):
         return [v]
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         return [str(v)]
+    if isinstance(v, (bytes, bytearray)):
+        return [v.decode("utf-8", "replace")]
+    if isinstance(v, os.PathLike):
+        return [os.fspath(v)]
     if isinstance(v, dict):
         out = []
         for x in v.values():
@@ -101,13 +116,84 @@ def _flatten_strings(v, _depth: int = 0) -> list:
     return []
 
 
+# whitespace (incl. NBSP) + ASCII/curly/backtick quoting + backslash — every
+# character a value-wrapping convention might leave dangling at an edge.
+# Backslash is included too: it can only ever strip an OUTER wrapping/UNC-
+# style prefix off the narrow, supplementary per-value check below (never off
+# the primary CRED_RE/PERSIST_RE substring match on the untouched blob, which
+# still sees the raw value) — round 6 QA confirmed no false positive from
+# stripping it, and any path complex enough for that to matter is still
+# caught by the substring form.
+_STRIP_CHARS = " \t\r\n\xa0\"'`\xab\xbb\u201c\u201d\u2018\u2019\\"
+
+
+def _strip_value(v: str) -> str:
+    """Trim incidental whitespace/quoting off a single flattened argument value
+    before a FULLY-ANCHORED (^...$) match — a value built by string
+    concatenation or copied with a stray leading space/tab, or quoted
+    (`"​.aws/credentials"`), is still unambiguously the same path; QA review
+    (independent agent, round 4) found the anchor otherwise silently defeated
+    by any such leading character. ``str.strip(chars)`` strips each end
+    independently, in a run, rather than requiring a MATCHED pair — round 5
+    QA found a matched-pair check left a single unmatched leading quote
+    (`'".aws/credentials'`, no closing quote) untouched, defeating the
+    anchor identically. Round 6 QA found a still-narrow charset (NBSP,
+    backtick, guillemets, a literal two-character ``\\"`` escape) had the
+    same effect. This narrows a fully-anchored per-value match; it does not
+    widen a substring search, so there's no over-block risk in stripping
+    generously here."""
+    return v.strip(_STRIP_CHARS)
+
+
+def _relative_match(ev: Event, pattern) -> bool:
+    """True if ``pattern`` fully matches at least one individual (stripped)
+    flattened argument value of a tool call — the per-value-anchored
+    counterpart to a CRED_RE/PERSIST_RE substring search, used for both
+    CRED_RELATIVE_RE and PERSIST_RELATIVE_RE."""
+    return any(pattern.match(_strip_value(v)) for v in _flatten_strings(ev.args or {}))
+
+
 def _net_text(ev: Event) -> str:
     """All string/number argument content for a network-shaped tool call
     (WebFetch/WebSearch, or an MCP tool that reaches the network) — scans every
     value rather than a fixed set of key names, since the argument that carries
     the target URL varies by tool/server with no fixed convention across MCP
-    servers."""
-    return " ".join(_flatten_strings(ev.args or {}))
+    servers.
+
+    Also appends a percent-decoded form: unlike shell text (where
+    ``normalize.scan_surface`` only decodes on an explicit hint — a
+    ``-EncodedCommand`` flag, a ``base64 -d`` pipe — an MCP tool's path/URI
+    argument routinely carries percent-encoding with no such hint (it's just
+    how a URI-shaped argument looks), so decoding it unconditionally is cheap
+    and safe (a non-encoded value decodes to itself or to garbage that matches
+    nothing new — QA review, independent agent: confirmed
+    ``path=%2Fhome%2Fuser%2F.ssh%2Fid_rsa`` bypassed every pattern here before
+    this). Decoding repeats to a fixpoint (capped) rather than running once —
+    a second QA round found a single ``unquote`` left DOUBLE-encoded input
+    (``%252F...``) one layer short of the literal text any pattern here
+    matches. Deliberately NOT extended to blind base64 decoding of every
+    argument value — that has no equivalent hint-free-but-safe signal, and
+    guessing would be expensive noise across every MCP call; a bare base64
+    blob with no decode hint is an already-accepted gap on the shell surface
+    too (see normalize.py's ``_B64_DECODE_HINT``)."""
+    raw = " ".join(_flatten_strings(ev.args or {}))
+    if not raw:
+        return raw
+    try:
+        from urllib.parse import unquote
+        parts = [raw]
+        cur = raw[:20000]
+        for _ in range(4):  # bounded: a real path is encoded at most a couple of layers deep
+            dec = unquote(cur)
+            if dec == cur:
+                break
+            parts.append(dec)
+            cur = dec
+        if len(parts) > 1:
+            return " ".join(parts)
+    except Exception:
+        pass
+    return raw
 
 
 def _egress_host(ev: Event) -> Optional[str]:
@@ -174,15 +260,31 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
     # WebFetch/MCP need no carve-out: the tool call itself IS the fetch, so
     # mere presence of the address in its target argument is already the
     # attempt.
+    #
+    # MCP/NET tool-call args are scanned for CRED_RE and PERSIST_RE too, not
+    # just the metadata address: an MCP tool is arbitrary third-party code the
+    # runtime can't audit, and its arguments are exactly where a filesystem-
+    # or cloud-access MCP server takes a target path. Before this, a call like
+    # ``mcp__filesystem__read_file(path="~/.ssh/id_rsa")`` sailed through with
+    # ZERO containment checks (the branch below discarded ``text`` as None
+    # before the credential check even ran) — a spawned agent could read any
+    # credential store or plant persistence through a compliant-looking MCP
+    # tool while the identical shell command was already blocked. EXFIL_RE /
+    # CLOUD_EXFIL_RE / ENV_DUMP_EXFIL_RE stay shell-only: they match shell-flag
+    # *syntax* (``curl -d @file``, ``aws s3 cp``) that has no analogue in a
+    # tool call's JSON arguments, so extending them here would just be dead
+    # code, not new coverage. WebSearch keeps its existing exemption (a search
+    # query doesn't make the agent's own network stack reach anything).
     is_shell = _is_shell(ev)
+    is_tool_call = ev.action == ActionClass.MCP or (
+            ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch")
     if is_shell:
         text = _shell_scan(ev)
         metadata_hit = (bool(patterns.CLOUD_METADATA_RE.search(text))
                          and not patterns.CLOUD_METADATA_MENTION_ONLY_RE.search(text))
-    elif ev.action == ActionClass.MCP or (
-            ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch"):
-        metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(_net_text(ev)))
-        text = None  # handled above; not a shell/read/edit/write shape below
+    elif is_tool_call:
+        text = _net_text(ev)
+        metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(text))
     elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
         text = _path(ev) + " " + str((ev.args or {}).get("content") or "")
         metadata_hit = False
@@ -194,13 +296,34 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
                         "endpoint hands out live IAM/service-account credentials to "
                         "anything on-box, no auth required, and is a classic SSRF-to-"
                         "credential-theft path.")
-    if text is None or not text.strip():
+    if not text or not text.strip():
         return None
     if patterns.CRED_RE.search(text):
         return Decision(Action.DENY, "containment-credentials",
                         "Access to credential stores (SSH / cloud keys, browser logins, "
                         "OS vault) is blocked.")
-    if _is_shell(ev) and patterns.PERSIST_RE.search(text):
+    if is_tool_call and _relative_match(ev, patterns.CRED_RELATIVE_RE):
+        # Per-VALUE, fully-anchored check (not a substring search over the
+        # joined blob) — catches a bare relative credential path
+        # (path=".aws/credentials") that CRED_RE's separator-anchored
+        # alternatives miss, without CRED_RE's substring version's
+        # false-positive class (an English sentence or a .gitignore entry
+        # merely CONTAINING the same characters). See CRED_RELATIVE_RE's
+        # docstring in patterns.py for the QA history behind this design.
+        return Decision(Action.DENY, "containment-credentials",
+                        "Access to credential stores (SSH / cloud keys, browser logins, "
+                        "OS vault) is blocked.")
+    if (is_shell or is_tool_call) and patterns.PERSIST_RE.search(text):
+        return Decision(Action.DENY, "containment-persistence",
+                        "Installing persistence (autorun, scheduled tasks, services, "
+                        "startup) is blocked.")
+    if is_tool_call and _relative_match(ev, patterns.PERSIST_RELATIVE_RE):
+        # Same bare-relative-path gap as CRED_RELATIVE_RE, but for the two
+        # PERSIST_RE alternatives that are path-shaped (registry Run key,
+        # Start Menu Startup folder) rather than command-shaped — QA review
+        # (independent agent, round 6) found an MCP filesystem/registry
+        # tool's relative path/key argument bypassed PERSIST_RE identically
+        # to how a relative credential path bypassed CRED_RE.
         return Decision(Action.DENY, "containment-persistence",
                         "Installing persistence (autorun, scheduled tasks, services, "
                         "startup) is blocked.")
@@ -249,7 +372,15 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
                             "Writing/deleting/moving Aegis's own config, policy, or engine "
                             "source is blocked.")
         return None
-    if ev.action in (ActionClass.EDIT, ActionClass.WRITE):
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        # ActionClass.MCP included (QA review, independent agent, round 11):
+        # aegis.mcp.check/guard/guarded default every call to MCP
+        # unconditionally (round 9 fix), so an MCP filesystem-write tool
+        # wrapped in the documented @mcp.guarded pattern never hit this
+        # branch — self-protection was fully bypassable through this
+        # module's own top-of-file example. rule_mcp_config_protect already
+        # included MCP here; this and rule_workspace_confine had not been
+        # updated to match.
         p = _path(ev)
         if patterns.ENFORCEMENT_PATH_RE.search(p) or patterns.AEGIS_SOURCE_RE.search(p):
             return Decision(Action.DENY, "self-protect",
@@ -376,7 +507,11 @@ def rule_workspace_confine(ev: Event, policy=None) -> Optional[Decision]:
     policy (workspace.root / project). Non-escapable: an agent bound to a project
     cannot wander out of it. Reads are unaffected; full SHELL confinement is an OS
     concern (restricted user / container) - see README."""
-    if ev.action not in (ActionClass.EDIT, ActionClass.WRITE):
+    if ev.action not in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        # ActionClass.MCP included (QA review, independent agent, round 11):
+        # see the identical addition + rationale on rule_self_protect above
+        # — aegis.mcp.check's unconditional MCP default left this rule
+        # unreachable for an MCP filesystem-write tool entirely.
         return None
     root = _confine_root(policy)
     if not root:
@@ -398,11 +533,32 @@ def rule_workspace_confine(ev: Event, policy=None) -> Optional[Decision]:
 
 
 # ---- sub-agent spawn governance: configurable ----------------------------------
+_SPAWN_TOOL_NAMES = frozenset({"task", "agent"})
+
+
+def _looks_like_spawn(tool: Optional[str]) -> bool:
+    """True if a tool call NAMED like a sub-agent spawn (Task/Agent), even
+    when its ActionClass isn't SUBAGENT — an MCP tool call through
+    ``aegis.mcp.check`` defaults to ``ActionClass.MCP`` unconditionally
+    (round 9 QA: trusting ``events.classify()``'s name guess for the
+    Event's action was itself an exploitable containment bypass), so a
+    genuine sub-agent-spawning MCP tool literally named ``task``/``agent``
+    no longer auto-classifies as SUBAGENT. Checked by NAME here instead,
+    inside this rule only — deliberately not by changing the Event's
+    action, which would reopen the exact bypass round 9 closed (an
+    ActionClass other than MCP/NET gets none of rule_containment's
+    credential/persistence scanning)."""
+    if not tool:
+        return False
+    return tool.strip().lower().rsplit("__", 1)[-1] in _SPAWN_TOOL_NAMES
+
+
 def rule_subagent_spawn(ev: Event, policy=None) -> Optional[Decision]:
     """Block programmatic sub-agent fan-out (Agent/Task) for a SPAWNED agent —
     uncontrolled cost / blast radius. Humans/orchestrators may delegate. Override
     with AEGIS_ALLOW_SUBAGENTS=1 (or a declarative allow rule)."""
-    if ev.action != ActionClass.SUBAGENT:
+    if ev.action != ActionClass.SUBAGENT and not (
+            ev.action == ActionClass.MCP and _looks_like_spawn(ev.tool)):
         return None
     if os.environ.get("AEGIS_ALLOW_SUBAGENTS"):
         return None
