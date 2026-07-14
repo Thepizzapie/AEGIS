@@ -101,20 +101,23 @@ def _flatten_strings(v, _depth: int = 0) -> list:
     return []
 
 
+_STRIP_CHARS = " \t\r\n\"'“”‘’"  # whitespace + ASCII/curly quotes
+
+
 def _strip_value(v: str) -> str:
-    """Trim incidental whitespace and one layer of matching quotes off a single
-    flattened argument value before a FULLY-ANCHORED (^...$) match — a value
-    built by string concatenation or copied with a stray leading space/tab, or
-    quoted (`"​.aws/credentials"`), is still unambiguously the same path; QA
-    review (independent agent, round 4) found the anchor otherwise silently
-    defeated by any such leading character. Bare ``.strip()`` handles
-    whitespace; the quote-stripping is intentionally ONE layer only (not a
-    loop) — this narrows a fully-anchored per-value match, it does not widen a
-    substring search, so there's no over-block risk in being conservative here."""
-    s = v.strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
-        s = s[1:-1].strip()
-    return s
+    """Trim incidental whitespace/quoting off a single flattened argument value
+    before a FULLY-ANCHORED (^...$) match — a value built by string
+    concatenation or copied with a stray leading space/tab, or quoted
+    (`"​.aws/credentials"`), is still unambiguously the same path; QA review
+    (independent agent, round 4) found the anchor otherwise silently defeated
+    by any such leading character. ``str.strip(chars)`` strips each end
+    independently, in a run, rather than requiring a MATCHED pair — round 5
+    QA found a matched-pair check left a single unmatched leading quote
+    (`'".aws/credentials'`, no closing quote) untouched, defeating the
+    anchor identically. This narrows a fully-anchored per-value match; it
+    does not widen a substring search, so there's no over-block risk in
+    stripping generously here."""
+    return v.strip(_STRIP_CHARS)
 
 
 def _net_text(ev: Event) -> str:

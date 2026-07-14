@@ -150,6 +150,19 @@ def test_mcp_relative_credential_path_with_incidental_whitespace_or_quotes_block
         assert d.blocked and d.rule == "containment-credentials", path
 
 
+def test_mcp_relative_credential_path_with_unmatched_leading_quote_blocked():
+    # QA round 5: _strip_value's first implementation only stripped a
+    # MATCHED quote pair (s[0] == s[-1]) — a single unmatched leading quote
+    # with no closing quote left the leading character in place, defeating
+    # the anchor identically. str.strip(chars) strips each end
+    # independently and fixes this for .aws/.azure/.gnupg/.kube/.netrc and
+    # non-keyword .ssh paths that don't happen to contain id_rsa/id_ed25519.
+    for path in ('".aws/credentials', "'.kube/config", '".ssh/authorized_keys',
+                 "'.azure/credentials", '".gnupg/id', "'.netrc"):
+        d = evaluate(_mcp("mcp__filesystem__read_file", {"path": path}), EMPTY)
+        assert d.blocked and d.rule == "containment-credentials", path
+
+
 # --- QA round 3 (independent agent): a fix that became a worse regression ---
 # The FIRST attempt at closing the relative-path gap broadened CRED_RE itself
 # to also treat whitespace/start-of-string/a quote as a valid leading edge —
