@@ -23,7 +23,7 @@ import functools
 
 from . import config, identity, plugins
 from .engine import safe_evaluate
-from .events import ActionClass, Event, classify
+from .events import ActionClass, Event
 from .policy import Decision, Policy
 
 
@@ -46,34 +46,39 @@ def _policy() -> Policy:
 
 
 def check(tool_name, arguments=None, *, identity_name=None, roles=None,
-          event="PreToolUse") -> Decision:
+          event="PreToolUse", action=None) -> Decision:
     """Evaluate an MCP tool call against policy. Returns a Decision (never raises).
     The server-side identity gate runs first: an untokened agent under enforcement
     is refused before policy is even consulted.
 
-    Every call through this API IS an MCP tool call, but ``events.classify()``
-    only recognizes that from a ``mcp__server__tool``-shaped NAME — the
-    convention Claude Code's own hook adapter uses, not an MCP server's own
-    tool names (a server calls this with its own bare name, e.g.
-    ``check("read_file", ...)``, per this module's own docstring/tests). Left
-    alone, that classified as ``ActionClass.OTHER`` and got NO containment
-    scanning at all — silently, for the entire embed-in-your-own-server API
-    this module exists for (QA review, independent agent, round 8). A caller
-    may still deliberately pass a Claude-native tool name (``"Bash"``,
-    ``"Read"``) to reuse its matching shell/file guards (this module's own
-    tests do exactly that) — so only names classify() can't already place
-    default to MCP; a name that already maps to something more specific is
-    left as-is."""
+    Every call through this API IS an MCP tool call, and now ALWAYS defaults
+    to ``ActionClass.MCP`` regardless of ``tool_name`` — pass ``action`` to
+    force a specific class instead (e.g. ``ActionClass.SHELL`` to
+    deliberately reuse Aegis's shell guards for a pass-through tool).
+
+    A first version of this fix (round 8 QA) instead fell back to
+    ``events.classify()``'s name-based guess whenever it recognized
+    ``tool_name`` as something other than an MCP shape, reasoning that a
+    caller might deliberately reuse a Claude-native name (``"Bash"``,
+    ``"Read"``) to get its matching guards. Round 9 QA found that guess
+    unsafe: ``classify()``'s table also contains ordinary, plausible names a
+    THIRD-PARTY MCP tool might use with no such intent — ``read``, ``write``,
+    ``bash``, and critically ``task``/``agent`` (-> ``ActionClass.SUBAGENT``,
+    a class ``rule_containment`` has no branch for at all) — so an MCP
+    server naming its own tool ``"agent"`` or ``"task"`` got ZERO
+    containment scanning, end-to-end through the documented ``@guarded``
+    pattern, purely by an unintentional name collision. Defaulting
+    unconditionally to MCP and requiring an explicit opt-in for anything
+    else closes that: a real collision can no longer silently downgrade
+    the scan a caller didn't ask for."""
     from . import gate as _gate
     from .policy import Action
     reason = _gate.gate(tool_name)
     if reason:
         return Decision(Action.DENY, "identity-gate", reason)
     ident, rls = identity.resolve_identity()
-    action = classify(tool_name)
-    if action == ActionClass.OTHER:
-        action = ActionClass.MCP
-    ev = Event.make(event, tool=tool_name, args=arguments or {}, action=action,
+    ev = Event.make(event, tool=tool_name, args=arguments or {},
+                    action=action or ActionClass.MCP,
                     identity=identity_name or ident, roles=roles or rls)
     return safe_evaluate(ev, _policy())
 
@@ -86,15 +91,17 @@ def guard(tool_name, arguments=None, **kw) -> Decision:
     return d
 
 
-def guarded(fn=None, *, tool_name=None):
+def guarded(fn=None, *, tool_name=None, action=None):
     """Decorator: enforce policy before a tool handler runs. The handler's kwargs are
-    the tool arguments. Raises ``Denied`` on a blocked call."""
+    the tool arguments. Raises ``Denied`` on a blocked call. Pass ``action`` to
+    force a specific ActionClass (see ``check``'s docstring) instead of the
+    ``ActionClass.MCP`` default."""
     def deco(f):
         name = tool_name or getattr(f, "__name__", "tool")
 
         @functools.wraps(f)
         def wrapper(*args, **kwargs):
-            guard(name, kwargs)
+            guard(name, kwargs, action=action)
             return f(*args, **kwargs)
         return wrapper
 
