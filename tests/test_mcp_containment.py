@@ -82,6 +82,29 @@ def test_mcp_filesystem_write_to_startup_folder_blocked():
     assert d.blocked and d.rule == "containment-persistence"
 
 
+def test_mcp_relative_persistence_path_blocked():
+    # QA round 6: PERSIST_RE has the identical bare-relative-path gap
+    # CRED_RE had — its registry-Run-key and Start-Menu-Startup alternatives
+    # both require a literal leading separator, so an MCP filesystem/
+    # registry tool's relative path/key argument bypassed it untouched.
+    # Fixed with PERSIST_RELATIVE_RE (patterns.py), same per-value-anchored
+    # design as CRED_RELATIVE_RE.
+    d = evaluate(_mcp("mcp__filesystem__write_file",
+                       {"path": "Start Menu/Programs/Startup/evil.bat", "content": "x"}), EMPTY)
+    assert d.blocked and d.rule == "containment-persistence"
+    d2 = evaluate(_mcp("mcp__registry__set_value",
+                        {"key": "CurrentVersion\\Run", "value": "evil.exe"}), EMPTY)
+    assert d2.blocked and d2.rule == "containment-persistence"
+
+
+def test_mcp_relative_startup_mention_not_blocked():
+    # regression: an ordinary mention of "Start Menu" / "Programs" text (not
+    # an actual Startup-folder path) must not trip the new relative check.
+    d = evaluate(_mcp("mcp__wiki__create_page",
+                       {"content": "Open Start Menu and go to Programs."}), EMPTY)
+    assert not d.blocked
+
+
 # --- non-escapable, same tier as the shell/Read/Edit/Write form --------------
 
 def test_mcp_credential_read_not_escapable(monkeypatch):
@@ -146,6 +169,17 @@ def test_mcp_relative_credential_path_with_incidental_whitespace_or_quotes_block
     # anchored match.
     for path in (" .aws/credentials", "\t.aws/credentials",
                  '".aws/credentials"', "'.aws/credentials'"):
+        d = evaluate(_mcp("mcp__filesystem__read_file", {"path": path}), EMPTY)
+        assert d.blocked and d.rule == "containment-credentials", path
+
+
+def test_mcp_relative_credential_path_with_wider_wrapping_blocked():
+    # QA round 6: _STRIP_CHARS was still missing NBSP, backticks, guillemets,
+    # and a literal two-character `\"` (double-JSON-escaped quote) sequence —
+    # each defeated CRED_RELATIVE_RE's anchor identically to the already-fixed
+    # curly-quote case.
+    for path in ("\xa0.aws/credentials\xa0", "`.kube/config`",
+                 "\xab.azure/credentials\xbb", "\\\".ssh/authorized_keys"):
         d = evaluate(_mcp("mcp__filesystem__read_file", {"path": path}), EMPTY)
         assert d.blocked and d.rule == "containment-credentials", path
 

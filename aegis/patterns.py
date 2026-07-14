@@ -378,6 +378,23 @@ PERSIST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bare RELATIVE persistence-target path — the identical gap CRED_RELATIVE_RE
+# closes for credential stores, but for the two PERSIST_RE alternatives that
+# are path-shaped rather than command-shaped: the registry Run key and the
+# Start Menu Startup folder both require a literal leading separator, so an
+# MCP filesystem/registry tool's bare relative `path`/`key` argument (e.g.
+# key="CurrentVersion\Run", path="Start Menu/Programs/Startup/evil.bat") sails
+# through untouched (QA review, independent agent, round 6). Same design as
+# CRED_RELATIVE_RE: fully anchored (^...$) against one individual flattened +
+# stripped argument value, never a substring search — the command-shaped
+# alternatives (schtasks/sc/New-Service/crontab/etc) already match a bare word
+# fine and need no companion.
+PERSIST_RELATIVE_RE = re.compile(
+    r"^CurrentVersion\\Run(?:Once)?(?:\\[^\n]*)?$"
+    r"|^Start Menu[/\\]Programs[/\\]Startup(?:[/\\][^\n]*)?$",
+    re.IGNORECASE,
+)
+
 # Exfiltration (upload-a-local-file) across common uploaders. Not exhaustive —
 # an in-process python requests.post can't be pattern-matched — but covers the
 # CLI tools an agent reaches for: curl (data/upload/form), wget --post-file,

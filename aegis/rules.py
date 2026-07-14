@@ -101,7 +101,15 @@ def _flatten_strings(v, _depth: int = 0) -> list:
     return []
 
 
-_STRIP_CHARS = " \t\r\n\"'“”‘’"  # whitespace + ASCII/curly quotes
+# whitespace (incl. NBSP) + ASCII/curly/backtick quoting + backslash — every
+# character a value-wrapping convention might leave dangling at an edge.
+# Backslash is included too: it can only ever strip an OUTER wrapping/UNC-
+# style prefix off the narrow, supplementary per-value check below (never off
+# the primary CRED_RE/PERSIST_RE substring match on the untouched blob, which
+# still sees the raw value) — round 6 QA confirmed no false positive from
+# stripping it, and any path complex enough for that to matter is still
+# caught by the substring form.
+_STRIP_CHARS = " \t\r\n\xa0\"'`\xab\xbb\u201c\u201d\u2018\u2019\\"
 
 
 def _strip_value(v: str) -> str:
@@ -114,10 +122,20 @@ def _strip_value(v: str) -> str:
     independently, in a run, rather than requiring a MATCHED pair — round 5
     QA found a matched-pair check left a single unmatched leading quote
     (`'".aws/credentials'`, no closing quote) untouched, defeating the
-    anchor identically. This narrows a fully-anchored per-value match; it
-    does not widen a substring search, so there's no over-block risk in
-    stripping generously here."""
+    anchor identically. Round 6 QA found a still-narrow charset (NBSP,
+    backtick, guillemets, a literal two-character ``\\"`` escape) had the
+    same effect. This narrows a fully-anchored per-value match; it does not
+    widen a substring search, so there's no over-block risk in stripping
+    generously here."""
     return v.strip(_STRIP_CHARS)
+
+
+def _relative_match(ev: Event, pattern) -> bool:
+    """True if ``pattern`` fully matches at least one individual (stripped)
+    flattened argument value of a tool call — the per-value-anchored
+    counterpart to a CRED_RE/PERSIST_RE substring search, used for both
+    CRED_RELATIVE_RE and PERSIST_RELATIVE_RE."""
+    return any(pattern.match(_strip_value(v)) for v in _flatten_strings(ev.args or {}))
 
 
 def _net_text(ev: Event) -> str:
@@ -269,8 +287,7 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
         return Decision(Action.DENY, "containment-credentials",
                         "Access to credential stores (SSH / cloud keys, browser logins, "
                         "OS vault) is blocked.")
-    if is_tool_call and any(patterns.CRED_RELATIVE_RE.match(_strip_value(v))
-                             for v in _flatten_strings(ev.args or {})):
+    if is_tool_call and _relative_match(ev, patterns.CRED_RELATIVE_RE):
         # Per-VALUE, fully-anchored check (not a substring search over the
         # joined blob) — catches a bare relative credential path
         # (path=".aws/credentials") that CRED_RE's separator-anchored
@@ -282,6 +299,16 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
                         "Access to credential stores (SSH / cloud keys, browser logins, "
                         "OS vault) is blocked.")
     if (is_shell or is_tool_call) and patterns.PERSIST_RE.search(text):
+        return Decision(Action.DENY, "containment-persistence",
+                        "Installing persistence (autorun, scheduled tasks, services, "
+                        "startup) is blocked.")
+    if is_tool_call and _relative_match(ev, patterns.PERSIST_RELATIVE_RE):
+        # Same bare-relative-path gap as CRED_RELATIVE_RE, but for the two
+        # PERSIST_RE alternatives that are path-shaped (registry Run key,
+        # Start Menu Startup folder) rather than command-shaped — QA review
+        # (independent agent, round 6) found an MCP filesystem/registry
+        # tool's relative path/key argument bypassed PERSIST_RE identically
+        # to how a relative credential path bypassed CRED_RE.
         return Decision(Action.DENY, "containment-persistence",
                         "Installing persistence (autorun, scheduled tasks, services, "
                         "startup) is blocked.")
