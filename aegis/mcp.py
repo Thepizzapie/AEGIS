@@ -23,7 +23,7 @@ import functools
 
 from . import config, identity, plugins
 from .engine import safe_evaluate
-from .events import Event
+from .events import ActionClass, Event, classify
 from .policy import Decision, Policy
 
 
@@ -49,14 +49,31 @@ def check(tool_name, arguments=None, *, identity_name=None, roles=None,
           event="PreToolUse") -> Decision:
     """Evaluate an MCP tool call against policy. Returns a Decision (never raises).
     The server-side identity gate runs first: an untokened agent under enforcement
-    is refused before policy is even consulted."""
+    is refused before policy is even consulted.
+
+    Every call through this API IS an MCP tool call, but ``events.classify()``
+    only recognizes that from a ``mcp__server__tool``-shaped NAME — the
+    convention Claude Code's own hook adapter uses, not an MCP server's own
+    tool names (a server calls this with its own bare name, e.g.
+    ``check("read_file", ...)``, per this module's own docstring/tests). Left
+    alone, that classified as ``ActionClass.OTHER`` and got NO containment
+    scanning at all — silently, for the entire embed-in-your-own-server API
+    this module exists for (QA review, independent agent, round 8). A caller
+    may still deliberately pass a Claude-native tool name (``"Bash"``,
+    ``"Read"``) to reuse its matching shell/file guards (this module's own
+    tests do exactly that) — so only names classify() can't already place
+    default to MCP; a name that already maps to something more specific is
+    left as-is."""
     from . import gate as _gate
     from .policy import Action
     reason = _gate.gate(tool_name)
     if reason:
         return Decision(Action.DENY, "identity-gate", reason)
     ident, rls = identity.resolve_identity()
-    ev = Event.make(event, tool=tool_name, args=arguments or {},
+    action = classify(tool_name)
+    if action == ActionClass.OTHER:
+        action = ActionClass.MCP
+    ev = Event.make(event, tool=tool_name, args=arguments or {}, action=action,
                     identity=identity_name or ident, roles=roles or rls)
     return safe_evaluate(ev, _policy())
 
