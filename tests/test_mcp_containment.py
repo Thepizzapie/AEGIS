@@ -17,6 +17,8 @@ The fix reuses the same key-name-agnostic deep-arg scan (`_net_text` /
 the target credential path can sit under any argument key name, at any nesting
 depth, same as a metadata-fetch URL can.
 """
+from pathlib import Path
+
 from aegis.engine import evaluate
 from aegis.events import Event, HookEvent
 from aegis.policy import Policy
@@ -60,6 +62,28 @@ def test_mcp_deeply_nested_credential_path_blocked():
 def test_mcp_browser_cookie_store_blocked():
     d = evaluate(_mcp("mcp__browser__read_file", {"path": "AppData/Local/Google/Chrome/User Data/Default/Cookies"}), EMPTY)
     assert d.blocked and d.rule == "containment-credentials"
+
+
+def test_mcp_pathlike_credential_argument_blocked():
+    # QA round 7: aegis.mcp.guarded/check is a real embedding path where
+    # ev.args are an MCP server's own live Python **kwargs, not JSON — a
+    # filesystem-style tool handler written as `def read_file(path: Path)`
+    # (an entirely ordinary signature) hands a real pathlib.Path/bytes
+    # object, not a str. _flatten_strings previously fell through every
+    # isinstance check to the empty-list default for those types, so the
+    # value vanished from scanning entirely — a fully-escapable containment
+    # guard for any tool taking a non-str argument type.
+    d = evaluate(_mcp("mcp__filesystem__read_file", {"path": Path("/home/user/.ssh/id_rsa")}), EMPTY)
+    assert d.blocked and d.rule == "containment-credentials"
+    d2 = evaluate(_mcp("mcp__filesystem__read_file", {"path": Path(".aws/credentials")}), EMPTY)
+    assert d2.blocked and d2.rule == "containment-credentials"
+    d3 = evaluate(_mcp("mcp__filesystem__read_file", {"path": b"/home/user/.ssh/id_rsa"}), EMPTY)
+    assert d3.blocked and d3.rule == "containment-credentials"
+
+
+def test_mcp_pathlike_ordinary_argument_not_blocked():
+    d = evaluate(_mcp("mcp__filesystem__read_file", {"path": Path("src/app.py")}), EMPTY)
+    assert not d.blocked
 
 
 def test_net_tool_credential_path_blocked():

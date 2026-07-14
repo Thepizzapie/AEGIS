@@ -81,13 +81,28 @@ def _flatten_strings(v, _depth: int = 0) -> list:
     uri/endpoint/command) sailed straight through untouched. Depth cap raised
     12 -> deep enough for any realistic tool-arg schema (round 3 QA found the
     original cap of 4 silently dropped a 5-level-deep target) while still
-    bounding recursion against a pathological/cyclic payload."""
+    bounding recursion against a pathological/cyclic payload.
+
+    ``aegis.mcp.guarded``/``check`` is a real embedding path where ``ev.args``
+    are an MCP server's own live Python ``**kwargs``, not JSON — so a
+    filesystem-style tool handler written as ``def read_file(path: Path)``
+    (an entirely ordinary Python signature) hands this function a real
+    ``pathlib.Path``/``bytes`` object, not a ``str``. Round 7 QA found those
+    fell through every ``isinstance`` check to the empty-list default, so
+    the value vanished from scanning entirely — a fully-escapable containment
+    guard for any tool taking a non-``str`` argument type. ``os.PathLike``
+    and ``bytes``/``bytearray`` are stringified explicitly rather than left to
+    the default."""
     if _depth > 12:
         return []
     if isinstance(v, str):
         return [v]
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         return [str(v)]
+    if isinstance(v, (bytes, bytearray)):
+        return [v.decode("utf-8", "replace")]
+    if isinstance(v, os.PathLike):
+        return [os.fspath(v)]
     if isinstance(v, dict):
         out = []
         for x in v.values():
