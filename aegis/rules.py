@@ -174,15 +174,31 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
     # WebFetch/MCP need no carve-out: the tool call itself IS the fetch, so
     # mere presence of the address in its target argument is already the
     # attempt.
+    #
+    # MCP/NET tool-call args are scanned for CRED_RE and PERSIST_RE too, not
+    # just the metadata address: an MCP tool is arbitrary third-party code the
+    # runtime can't audit, and its arguments are exactly where a filesystem-
+    # or cloud-access MCP server takes a target path. Before this, a call like
+    # ``mcp__filesystem__read_file(path="~/.ssh/id_rsa")`` sailed through with
+    # ZERO containment checks (the branch below discarded ``text`` as None
+    # before the credential check even ran) — a spawned agent could read any
+    # credential store or plant persistence through a compliant-looking MCP
+    # tool while the identical shell command was already blocked. EXFIL_RE /
+    # CLOUD_EXFIL_RE / ENV_DUMP_EXFIL_RE stay shell-only: they match shell-flag
+    # *syntax* (``curl -d @file``, ``aws s3 cp``) that has no analogue in a
+    # tool call's JSON arguments, so extending them here would just be dead
+    # code, not new coverage. WebSearch keeps its existing exemption (a search
+    # query doesn't make the agent's own network stack reach anything).
     is_shell = _is_shell(ev)
+    is_tool_call = ev.action == ActionClass.MCP or (
+            ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch")
     if is_shell:
         text = _shell_scan(ev)
         metadata_hit = (bool(patterns.CLOUD_METADATA_RE.search(text))
                          and not patterns.CLOUD_METADATA_MENTION_ONLY_RE.search(text))
-    elif ev.action == ActionClass.MCP or (
-            ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch"):
-        metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(_net_text(ev)))
-        text = None  # handled above; not a shell/read/edit/write shape below
+    elif is_tool_call:
+        text = _net_text(ev)
+        metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(text))
     elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
         text = _path(ev) + " " + str((ev.args or {}).get("content") or "")
         metadata_hit = False
@@ -194,13 +210,13 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
                         "endpoint hands out live IAM/service-account credentials to "
                         "anything on-box, no auth required, and is a classic SSRF-to-"
                         "credential-theft path.")
-    if text is None or not text.strip():
+    if not text or not text.strip():
         return None
     if patterns.CRED_RE.search(text):
         return Decision(Action.DENY, "containment-credentials",
                         "Access to credential stores (SSH / cloud keys, browser logins, "
                         "OS vault) is blocked.")
-    if _is_shell(ev) and patterns.PERSIST_RE.search(text):
+    if (is_shell or is_tool_call) and patterns.PERSIST_RE.search(text):
         return Decision(Action.DENY, "containment-persistence",
                         "Installing persistence (autorun, scheduled tasks, services, "
                         "startup) is blocked.")
