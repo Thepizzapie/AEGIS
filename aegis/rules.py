@@ -372,7 +372,15 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
                             "Writing/deleting/moving Aegis's own config, policy, or engine "
                             "source is blocked.")
         return None
-    if ev.action in (ActionClass.EDIT, ActionClass.WRITE):
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        # ActionClass.MCP included (QA review, independent agent, round 11):
+        # aegis.mcp.check/guard/guarded default every call to MCP
+        # unconditionally (round 9 fix), so an MCP filesystem-write tool
+        # wrapped in the documented @mcp.guarded pattern never hit this
+        # branch — self-protection was fully bypassable through this
+        # module's own top-of-file example. rule_mcp_config_protect already
+        # included MCP here; this and rule_workspace_confine had not been
+        # updated to match.
         p = _path(ev)
         if patterns.ENFORCEMENT_PATH_RE.search(p) or patterns.AEGIS_SOURCE_RE.search(p):
             return Decision(Action.DENY, "self-protect",
@@ -499,7 +507,11 @@ def rule_workspace_confine(ev: Event, policy=None) -> Optional[Decision]:
     policy (workspace.root / project). Non-escapable: an agent bound to a project
     cannot wander out of it. Reads are unaffected; full SHELL confinement is an OS
     concern (restricted user / container) - see README."""
-    if ev.action not in (ActionClass.EDIT, ActionClass.WRITE):
+    if ev.action not in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        # ActionClass.MCP included (QA review, independent agent, round 11):
+        # see the identical addition + rationale on rule_self_protect above
+        # — aegis.mcp.check's unconditional MCP default left this rule
+        # unreachable for an MCP filesystem-write tool entirely.
         return None
     root = _confine_root(policy)
     if not root:
