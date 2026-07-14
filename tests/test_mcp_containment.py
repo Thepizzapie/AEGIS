@@ -137,6 +137,19 @@ def test_mcp_double_percent_encoded_credential_path_blocked():
     assert d.blocked and d.rule == "containment-credentials"
 
 
+def test_mcp_relative_credential_path_with_incidental_whitespace_or_quotes_blocked():
+    # QA round 4: CRED_RELATIVE_RE's full-value anchor (^...$) was matched
+    # against the RAW flattened value — a stray leading space/tab (a value
+    # built by string concatenation, or just copied with incidental
+    # whitespace) or a value the tool call happened to hand over still quoted
+    # defeated the `^` anchor silently. _strip_value() trims both before the
+    # anchored match.
+    for path in (" .aws/credentials", "\t.aws/credentials",
+                 '".aws/credentials"', "'.aws/credentials'"):
+        d = evaluate(_mcp("mcp__filesystem__read_file", {"path": path}), EMPTY)
+        assert d.blocked and d.rule == "containment-credentials", path
+
+
 # --- QA round 3 (independent agent): a fix that became a worse regression ---
 # The FIRST attempt at closing the relative-path gap broadened CRED_RE itself
 # to also treat whitespace/start-of-string/a quote as a valid leading edge —

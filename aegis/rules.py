@@ -101,6 +101,22 @@ def _flatten_strings(v, _depth: int = 0) -> list:
     return []
 
 
+def _strip_value(v: str) -> str:
+    """Trim incidental whitespace and one layer of matching quotes off a single
+    flattened argument value before a FULLY-ANCHORED (^...$) match — a value
+    built by string concatenation or copied with a stray leading space/tab, or
+    quoted (`"​.aws/credentials"`), is still unambiguously the same path; QA
+    review (independent agent, round 4) found the anchor otherwise silently
+    defeated by any such leading character. Bare ``.strip()`` handles
+    whitespace; the quote-stripping is intentionally ONE layer only (not a
+    loop) — this narrows a fully-anchored per-value match, it does not widen a
+    substring search, so there's no over-block risk in being conservative here."""
+    s = v.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
 def _net_text(ev: Event) -> str:
     """All string/number argument content for a network-shaped tool call
     (WebFetch/WebSearch, or an MCP tool that reaches the network) — scans every
@@ -250,7 +266,7 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
         return Decision(Action.DENY, "containment-credentials",
                         "Access to credential stores (SSH / cloud keys, browser logins, "
                         "OS vault) is blocked.")
-    if is_tool_call and any(patterns.CRED_RELATIVE_RE.match(v)
+    if is_tool_call and any(patterns.CRED_RELATIVE_RE.match(_strip_value(v))
                              for v in _flatten_strings(ev.args or {})):
         # Per-VALUE, fully-anchored check (not a substring search over the
         # joined blob) — catches a bare relative credential path
