@@ -521,11 +521,32 @@ def rule_workspace_confine(ev: Event, policy=None) -> Optional[Decision]:
 
 
 # ---- sub-agent spawn governance: configurable ----------------------------------
+_SPAWN_TOOL_NAMES = frozenset({"task", "agent"})
+
+
+def _looks_like_spawn(tool: Optional[str]) -> bool:
+    """True if a tool call NAMED like a sub-agent spawn (Task/Agent), even
+    when its ActionClass isn't SUBAGENT — an MCP tool call through
+    ``aegis.mcp.check`` defaults to ``ActionClass.MCP`` unconditionally
+    (round 9 QA: trusting ``events.classify()``'s name guess for the
+    Event's action was itself an exploitable containment bypass), so a
+    genuine sub-agent-spawning MCP tool literally named ``task``/``agent``
+    no longer auto-classifies as SUBAGENT. Checked by NAME here instead,
+    inside this rule only — deliberately not by changing the Event's
+    action, which would reopen the exact bypass round 9 closed (an
+    ActionClass other than MCP/NET gets none of rule_containment's
+    credential/persistence scanning)."""
+    if not tool:
+        return False
+    return tool.strip().lower().rsplit("__", 1)[-1] in _SPAWN_TOOL_NAMES
+
+
 def rule_subagent_spawn(ev: Event, policy=None) -> Optional[Decision]:
     """Block programmatic sub-agent fan-out (Agent/Task) for a SPAWNED agent —
     uncontrolled cost / blast radius. Humans/orchestrators may delegate. Override
     with AEGIS_ALLOW_SUBAGENTS=1 (or a declarative allow rule)."""
-    if ev.action != ActionClass.SUBAGENT:
+    if ev.action != ActionClass.SUBAGENT and not (
+            ev.action == ActionClass.MCP and _looks_like_spawn(ev.tool)):
         return None
     if os.environ.get("AEGIS_ALLOW_SUBAGENTS"):
         return None
