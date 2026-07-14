@@ -100,14 +100,18 @@ def test_websearch_mentioning_credential_path_not_blocked():
 
 
 # --- QA round 1 (two independent agents): confirmed bypasses, now fixed -----
+# (round 3, a THIRD independent agent, later found the first fix for the
+# relative-path gap regressed into a false-positive — see the section below.
+# The final design: CRED_RELATIVE_RE, matched per-argument-value with full
+# anchoring, not a CRED_RE substring relaxation.)
 
 def test_mcp_relative_credential_path_blocked():
-    # CRED_RE's directory alternatives required a LEADING path separator
+    # CRED_RE's directory alternatives require a LEADING path separator
     # (`/.aws/...`) — a bare relative path (the routine shape for a
-    # filesystem-style MCP tool's `path` argument) had no separator in front
-    # and sailed through untouched. Confirmed identically on Read/Edit/Write
-    # too (see test_builtins.py) — not new to this guard, just now closed
-    # everywhere CRED_RE is shared.
+    # filesystem-style MCP tool's `path` argument) has no separator in front
+    # and would sail through untouched. Fixed via CRED_RELATIVE_RE (patterns.py),
+    # matched against each individual flattened argument value, not a joined
+    # blob — see the false-positive regression this avoided, below.
     d = evaluate(_mcp("mcp__filesystem__read_file", {"path": ".aws/credentials"}), EMPTY)
     assert d.blocked and d.rule == "containment-credentials"
     d2 = evaluate(_mcp("mcp__filesystem__read_file", {"path": ".kube/config"}), EMPTY)
@@ -122,6 +126,43 @@ def test_mcp_percent_encoded_credential_path_blocked():
     d = evaluate(_mcp("mcp__filesystem__read_file",
                        {"path": "%2Fhome%2Fuser%2F.ssh%2Fid_rsa"}), EMPTY)
     assert d.blocked and d.rule == "containment-credentials"
+
+
+def test_mcp_double_percent_encoded_credential_path_blocked():
+    # QA round 3: a single unquote() pass left double-encoded input
+    # (%252F...) one layer short of the literal text any pattern matches.
+    # _net_text now decodes to a fixpoint (bounded).
+    d = evaluate(_mcp("mcp__filesystem__read_file",
+                       {"path": "%252Fhome%252Fuser%252F.ssh%252Fid_rsa"}), EMPTY)
+    assert d.blocked and d.rule == "containment-credentials"
+
+
+# --- QA round 3 (independent agent): a fix that became a worse regression ---
+# The FIRST attempt at closing the relative-path gap broadened CRED_RE itself
+# to also treat whitespace/start-of-string/a quote as a valid leading edge —
+# and that turned "Cookies"/"Web Data" (ordinary English words/phrases) and a
+# .gitignore's `.aws/`/`.ssh/` entries (routine, GOOD security practice) into
+# false positives on a NEVER-ESCAPABLE guard. That relaxation was reverted;
+# these lock the reverted behavior in as a regression test.
+
+def test_gitignore_content_mentioning_credential_dirs_not_blocked():
+    content = ".aws/\n.ssh/\nnode_modules/\n"
+    assert not evaluate(_mcp("mcp__filesystem__write_file",
+                              {"path": ".gitignore", "content": content}), EMPTY).blocked
+
+
+def test_ordinary_word_cookies_not_blocked():
+    d = evaluate(_mcp("mcp__wiki__create_page",
+                       {"content": "This site uses Cookies to remember your preferences."}),
+                 EMPTY)
+    assert not d.blocked
+
+
+def test_ordinary_phrase_web_data_not_blocked():
+    d = evaluate(_mcp("mcp__wiki__create_page",
+                       {"content": "The report includes Web Data for the last quarter."}),
+                 EMPTY)
+    assert not d.blocked
 
 
 # --- QA round 1: findings considered and deliberately NOT "fixed" -----------

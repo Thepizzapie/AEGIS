@@ -116,7 +116,10 @@ def _net_text(ev: Event) -> str:
     and safe (a non-encoded value decodes to itself or to garbage that matches
     nothing new — QA review, independent agent: confirmed
     ``path=%2Fhome%2Fuser%2F.ssh%2Fid_rsa`` bypassed every pattern here before
-    this). Deliberately NOT extended to blind base64 decoding of every
+    this). Decoding repeats to a fixpoint (capped) rather than running once —
+    a second QA round found a single ``unquote`` left DOUBLE-encoded input
+    (``%252F...``) one layer short of the literal text any pattern here
+    matches. Deliberately NOT extended to blind base64 decoding of every
     argument value — that has no equivalent hint-free-but-safe signal, and
     guessing would be expensive noise across every MCP call; a bare base64
     blob with no decode hint is an already-accepted gap on the shell surface
@@ -126,9 +129,16 @@ def _net_text(ev: Event) -> str:
         return raw
     try:
         from urllib.parse import unquote
-        decoded = unquote(raw[:20000])
-        if decoded != raw[:20000]:
-            return raw + " " + decoded
+        parts = [raw]
+        cur = raw[:20000]
+        for _ in range(4):  # bounded: a real path is encoded at most a couple of layers deep
+            dec = unquote(cur)
+            if dec == cur:
+                break
+            parts.append(dec)
+            cur = dec
+        if len(parts) > 1:
+            return " ".join(parts)
     except Exception:
         pass
     return raw
@@ -237,6 +247,18 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
     if not text or not text.strip():
         return None
     if patterns.CRED_RE.search(text):
+        return Decision(Action.DENY, "containment-credentials",
+                        "Access to credential stores (SSH / cloud keys, browser logins, "
+                        "OS vault) is blocked.")
+    if is_tool_call and any(patterns.CRED_RELATIVE_RE.match(v)
+                             for v in _flatten_strings(ev.args or {})):
+        # Per-VALUE, fully-anchored check (not a substring search over the
+        # joined blob) — catches a bare relative credential path
+        # (path=".aws/credentials") that CRED_RE's separator-anchored
+        # alternatives miss, without CRED_RE's substring version's
+        # false-positive class (an English sentence or a .gitignore entry
+        # merely CONTAINING the same characters). See CRED_RELATIVE_RE's
+        # docstring in patterns.py for the QA history behind this design.
         return Decision(Action.DENY, "containment-credentials",
                         "Access to credential stores (SSH / cloud keys, browser logins, "
                         "OS vault) is blocked.")

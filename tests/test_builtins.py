@@ -25,16 +25,24 @@ def test_containment_credentials():
     assert evaluate(_read("/home/me/.ssh/id_ed25519"), EMPTY).blocked
 
 
-def test_containment_credentials_bare_relative_path():
-    # CRED_RE's directory alternatives required a literal separator directly
-    # before the dot (`/.aws/...`) — a bare RELATIVE path (no leading `/` or
-    # `~/`) had none and bypassed every check, on this Read surface and on
-    # the MCP surface alike (found by independent-agent QA review while
-    # extending containment to MCP tool-call args; see
-    # test_mcp_containment.py::test_mcp_relative_credential_path_blocked).
-    assert evaluate(_read(".aws/credentials"), EMPTY).blocked
-    assert evaluate(_read(".kube/config"), EMPTY).blocked
-    assert evaluate(_shell("cat .netrc"), EMPTY).blocked
+def test_containment_credentials_bare_relative_path_known_gap():
+    # CRED_RE's directory alternatives require a literal separator directly
+    # before the dot (`/.aws/...`); a bare RELATIVE path (no leading `/` or
+    # `~/`) has none. A fix broadening CRED_RE itself to also accept
+    # whitespace/start-of-string was tried and reverted (QA review,
+    # independent agent, round 3): it matched "Cookies"/"Web Data" as
+    # ordinary English words and a `.gitignore`'s `.aws/`/`.ssh/` entries — a
+    # substring check can't tell "a real path argument" from "prose that
+    # happens to contain the same characters". The MCP/NET tool-call surface
+    # gets a narrower, per-argument-value-anchored fix instead (see
+    # test_mcp_containment.py::test_mcp_relative_credential_path_blocked and
+    # CRED_RELATIVE_RE in patterns.py) because a discrete tool argument value
+    # is a much stronger signal than a substring of shell/file text. This
+    # documents the accordingly-accepted residual gap on Read/Edit/Write and
+    # shell, consistent with the "guards are a denylist" limits already in
+    # README.md.
+    assert not evaluate(_read(".aws/credentials"), EMPTY).blocked
+    assert not evaluate(_shell("cat .netrc"), EMPTY).blocked
 
 
 def test_containment_exfil_and_persistence():
