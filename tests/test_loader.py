@@ -89,6 +89,25 @@ def test_lifecycle_knobs_absent_by_default(tmp_path):
     assert pol.permission == {} and pol.mcp == {}
 
 
+def test_secret_exfil_knob_round_trips_from_yaml(tmp_path):
+    """policy.secret_exfil must round-trip from YAML onto the Policy — a
+    regression for it silently defaulting to {} (dead config knob) even
+    though rule_secret_material_exfil reads it every call."""
+    yaml_text = """
+secret_exfil:
+  mode: ask
+  allow:
+    - "^mcp__vault__"
+"""
+    pol = load_policy(_write(tmp_path, yaml_text))
+    assert pol.secret_exfil == {"mode": "ask", "allow": ["^mcp__vault__"]}
+
+
+def test_secret_exfil_knob_absent_by_default(tmp_path):
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.secret_exfil == {}
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
     assert validate_policy(_write(tmp_path, LIFECYCLE)) == []
