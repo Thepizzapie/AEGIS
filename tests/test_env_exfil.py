@@ -326,6 +326,7 @@ def test_no_catastrophic_backtracking_on_adversarial_input():
         "curl " + "<(x) " * 10000,                                         # many process-sub openers
         "curl $(" * 1500 + "notenv" + ")" * 1500,                          # deep paren nesting, no match
         "curl " * 8000,                                                    # repeated sink verb, no dump ever
+        "curl $(env " * 8000,           # round-2 QA: substitution-form _SUB_INNER unbounded tail
     ]
     for cmd in cases:
         start = time.monotonic()

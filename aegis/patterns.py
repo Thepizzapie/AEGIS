@@ -725,7 +725,14 @@ _SUB_SET = r"set"
 _SUB_PS_ENV_DRIVE = r"(?:Get-ChildItem\s+|(?:gci|dir|ls)\s+)[Ee]nv:\\?"
 _SUB_INNER = (
     r"(?:" + _SUB_ENV + r"|" + _SUB_PRINTENV + r"|" + _SUB_EXPORT_P + r"|"
-    + _SUB_DECLARE_X + r"|" + _SUB_SET + r"|" + _SUB_PS_ENV_DRIVE + r")[^)`]*"
+    # bounded (round-2 secret-material-exfil QA): an unbounded `[^)`]*` here
+    # backtracks across the whole rest of the string at every occurrence of
+    # a repeated leading verb when no closing `)`/backtick ever follows —
+    # `"curl $(env " * 8000` (~88KB) measured ~12s before this bound, same
+    # O(n^2) mechanism _PROX (below) already fixes for the other branches
+    # of this regex. 300 is the same generous, comfortably-realistic cap
+    # used everywhere else in this file.
+    + _SUB_DECLARE_X + r"|" + _SUB_SET + r"|" + _SUB_PS_ENV_DRIVE + r")[^)`]{0,300}"
 )
 
 # python/node inline one-liner: bulk env access + a network call, either
@@ -867,7 +874,16 @@ ENV_DUMP_EXFIL_RE = re.compile(
 _SECRET_ALT = (
     r"-----BEGIN\s+(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED|PGP)\s+)?PRIVATE\s+KEY"
     r"(?:\s+BLOCK)?-----"
-    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    # (?-i: ...) scoped OFF the module's overall IGNORECASE (same idiom
+    # DESTRUCTIVE_GIT_RE already uses for its `-D` branch-delete flag,
+    # earlier in this file) — round-2 QA found "asia" is an ordinary English
+    # word, and case-insensitive matching turned any MCP argument containing
+    # "asia"/"Asia" immediately followed by 16 contiguous alnum characters
+    # (a region-prefixed order ID, a geo note near a hash/timestamp) into a
+    # false positive. Real AWS access-key/session-token IDs are ALWAYS
+    # uppercase — AWS never issues a lowercase one — so scoping this
+    # alternative back to case-SENSITIVE loses no real detection at all.
+    r"|\b(?-i:(?:AKIA|ASIA)[0-9A-Z]{16})\b"
     r"|\bgh[pousr]_[A-Za-z0-9]{36,}\b"
     r"|\bxox[baprs]-[A-Za-z0-9-]{10,}\b"
     r"|hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+"

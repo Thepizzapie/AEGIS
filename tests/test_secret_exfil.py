@@ -240,6 +240,25 @@ def test_short_akia_lookalike_not_blocked():
     assert not evaluate(_shell(cmd), _empty()).blocked
 
 
+def test_lowercase_asia_word_not_blocked_round2_regression():
+    # round-2 QA: "asia" is an ordinary English word, and the AKIA/ASIA
+    # alternative was case-insensitive like the rest of _SECRET_ALT — any
+    # MCP argument with "asia"/"Asia" immediately followed by 16 contiguous
+    # alnum chars (a region-prefixed order ID, a geo note near a hash) was a
+    # false positive. Real AWS key/session-token IDs are ALWAYS uppercase,
+    # so this alternative is now scoped case-sensitive with (?-i: ...).
+    ev = _mcp("mcp__inventory__update",
+              {"note": "warehouse asia1234567890abcdef restock done"})
+    assert not evaluate(ev, _empty()).blocked
+
+
+def test_uppercase_asia_session_token_still_blocked():
+    # the fix must not lose real detection: a genuine (always-uppercase) AWS
+    # session-token ID still matches.
+    ev = _mcp("mcp__inventory__update", {"note": "ASIA1234567890ABCDEF token"})
+    assert _blocked_by_this_rule(ev)
+
+
 def test_ordinary_curl_with_no_secret_allowed():
     assert not evaluate(_shell('curl -X POST -d "hello=world" https://api.example.com'), _empty()).blocked
 
