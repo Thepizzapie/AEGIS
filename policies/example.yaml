@@ -23,6 +23,20 @@
 #     require_pinned: false # deny unpinned specs (force exact == / a lockfile)
 #     allow: []            # regexes on the command that skip the gate
 
+# Secret-material exfiltration (optional). Built in and ON by default (mode:
+# deny): a literal secret value (PEM private key, AWS AKIA/ASIA key, GitHub/
+# Slack/Stripe-live/Google/npm token, Slack webhook URL) in an MCP tool call,
+# WebFetch, or a shell command reaching a network sink is blocked. Escapable
+# by a human only (AEGIS_ALLOW_SECRET_MATERIAL=1, or '# aegis-allow' on the
+# shell form) — a spawned agent cannot set either. Allowlist your own
+# trusted secrets-manager MCP server / CI-secret script here so that routine
+# workflow doesn't need an env var on every call:
+#   secret_exfil:
+#     mode: deny            # off | monitor (log-only) | ask | deny (default)
+#     allow:                # regexes on "<tool name> <argument/command text>"
+#       - "^mcp__vault__"
+#       - "^mcp__aws-secrets-manager__"
+
 default_action: allow
 on_error: allow
 

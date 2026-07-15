@@ -42,6 +42,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 | Cloud metadata SSRF | Fetching the cloud instance-metadata service (`169.254.169.254` and its GCP/Azure/Alibaba/encoded-IP variants) — via shell, `WebFetch`, or an MCP tool — which hands out live IAM/service-account credentials to anything on-box, no auth required | No |
 | Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source; `aegis uninstall`/`pull` | No |
 | Evasion | Encoded/obfuscated commands (`-EncodedCommand`, `base64 -d \| bash`, char-code) | No |
+| Secret-material exfiltration | A literal secret VALUE (PEM private key, AWS `AKIA`/`ASIA` key, GitHub/Slack/Stripe-live/Google/npm token, Slack webhook URL) present in an MCP tool call, `WebFetch`, or a shell command reaching a network sink — closes the gap none of the shape-based guards above catch: the secret's own text, not a file path or a dump primitive | Human only |
 | MCP config | Writes to MCP server-config files (`.mcp.json`, `mcpServers`, etc.) that auto-run on every future session | Human only |
 | Destructive SQL | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, migration resets — from shell **and** DB tool args | Yes |
 | Destructive git | force-push, `reset --hard`, rebase, `branch -D`, `clean -f` | Yes |

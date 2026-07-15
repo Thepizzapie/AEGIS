@@ -136,3 +136,7 @@ class Policy:
     # Stop gate: after file mutations, the session may not stop until a test run
     # is recorded after the last change. See lifecycle.session.
     completion: dict = field(default_factory=dict)
+    # Secret-material exfiltration: {mode: deny|ask|monitor|off,
+    # allow: [regex on tool name + argument/command text]}. Empty -> defaults
+    # (mode=deny) apply. See rules.rule_secret_material_exfil.
+    secret_exfil: dict = field(default_factory=dict)

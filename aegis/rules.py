@@ -73,15 +73,21 @@ def _sql_text(ev: Event) -> str:
 
 
 def _flatten_strings(v, _depth: int = 0) -> list:
-    """Every string/number leaf inside a (possibly nested) arg value. MCP tool
-    args are arbitrary JSON, so a target URL can sit under any key name, at any
-    depth (e.g. {"input": {"url": "..."}}) — QA review (independent agent,
-    round 1) found a fixed key-name allowlist here was a bypass: any MCP tool
-    naming its URL argument something other than the guessed set (url/query/
-    uri/endpoint/command) sailed straight through untouched. Depth cap raised
-    12 -> deep enough for any realistic tool-arg schema (round 3 QA found the
-    original cap of 4 silently dropped a 5-level-deep target) while still
-    bounding recursion against a pathological/cyclic payload."""
+    """Every string/number leaf inside a (possibly nested) arg value, INCLUDING
+    dict keys. MCP tool args are arbitrary JSON, so a target URL can sit under
+    any key name, at any depth (e.g. {"input": {"url": "..."}}) — QA review
+    (independent agent, round 1) found a fixed key-name allowlist here was a
+    bypass: any MCP tool naming its URL argument something other than the
+    guessed set (url/query/uri/endpoint/command) sailed straight through
+    untouched. Depth cap raised 12 -> deep enough for any realistic tool-arg
+    schema (round 3 QA found the original cap of 4 silently dropped a
+    5-level-deep target) while still bounding recursion against a
+    pathological/cyclic payload.
+
+    Dict KEYS are flattened too, not just values (secret-material-exfil
+    bypass QA, round 1): a caller can put the sensitive string in a JSON key
+    position instead of a value (``{secret_value: "irrelevant"}``) and every
+    guard that only walked ``.values()`` was blind to it."""
     if _depth > 12:
         return []
     if isinstance(v, str):
@@ -90,7 +96,8 @@ def _flatten_strings(v, _depth: int = 0) -> list:
         return [str(v)]
     if isinstance(v, dict):
         out = []
-        for x in v.values():
+        for k, x in v.items():
+            out.extend(_flatten_strings(k, _depth + 1))
             out.extend(_flatten_strings(x, _depth + 1))
         return out
     if isinstance(v, (list, tuple)):
@@ -217,6 +224,95 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
                         "Get-ChildItem Env:) into a network call is blocked — the "
                         "environment routinely holds live secrets (API keys, tokens, "
                         "DATABASE_URL) with no file ever touched.")
+    return None
+
+
+# ---- secret-material exfiltration: escapable with human confirmation ---------
+def _secret_exfil_allowed_by_policy(cfg: dict, tool: str, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), (tool or "") + " " + text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_secret_material_exfil(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a literal secret VALUE (PEM private-key block, AWS access key,
+    GitHub/Slack/Stripe/Google/npm token, or Slack webhook URL) present in a
+    tool call that reaches the network — an MCP tool call, a non-WebSearch NET
+    call (WebFetch), or a shell command whose same statement also carries a
+    network-sink verb / inline python-node network call. See SECRET_MATERIAL_RE
+    / SECRET_EXFIL_SHELL_RE in ``aegis.patterns`` for the full design rationale.
+
+    Distinct from ``rule_containment`` (never escapable): CRED_RE/
+    CLOUD_METADATA_RE guard surfaces with NO legitimate use — there's no
+    sanctioned reason to read ``~/.ssh/id_rsa`` over the wire, or to fetch the
+    cloud-metadata endpoint. A real secret's plaintext transiting a tool call
+    is different: it's exactly what a legitimate secrets-manager MCP server, a
+    CI-secret-configuration call (``gh api .../actions/secrets/FOO``), or a
+    key-rotation script does. Independent adversarial QA (round 1,
+    false-positive hunt) confirmed this is common, everyday, sanctioned
+    agentic work, not just an edge case — so this gate is CONFIGURABLE and
+    escapable, like ``rule_mcp_config_protect`` / ``rule_install_review``, not
+    a hard, zero-override deny.
+
+    Config (``policy.secret_exfil``): ``mode`` (deny|ask|monitor|off, default
+    deny), ``allow`` (regexes tested against the tool name + argument/command
+    text — a repo's own trusted secrets-manager MCP server or CI-secret
+    script, say). Escapable by a human only: a trailing '# aegis-allow' on the
+    shell form, or ``AEGIS_ALLOW_SECRET_MATERIAL=1`` set by the
+    orchestrator/human before launch for the MCP/NET form (there's no
+    syntax-safe way to embed a comment inside a JSON tool-call payload). A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, and ``_override_allowed`` is unconditionally False for one, so
+    neither escape is agent-self-reachable."""
+    cfg = getattr(policy, "secret_exfil", None) or {}
+    mode = str(cfg.get("mode", "deny")).lower()
+    if mode == "off":
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    is_net_call = ev.action == ActionClass.MCP or (
+        ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch")
+    if is_net_call:
+        net_text = _net_text(ev)
+        if not patterns.SECRET_MATERIAL_RE.search(net_text):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_SECRET_MATERIAL")
+                or _secret_exfil_allowed_by_policy(cfg, ev.tool or "", net_text)):
+            return None
+        would = Decision(action, "secret-material-exfil",
+                         "A literal secret (private key block, cloud access key, or "
+                         "vendor API/webhook token) is present in this tool call's "
+                         "arguments. If this is a sanctioned secrets-manager/CI/"
+                         "webhook-configuration call, confirm with "
+                         "AEGIS_ALLOW_SECRET_MATERIAL=1 or add a secret_exfil.allow "
+                         "policy entry; a spawned agent cannot set either.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "secret-material-exfil-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        text = _shell_scan(ev)
+        if not patterns.SECRET_EXFIL_SHELL_RE.search(text):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_SECRET_MATERIAL")
+                or _secret_exfil_allowed_by_policy(cfg, ev.tool or "", _cmd(ev))):
+            return None
+        would = Decision(action, "secret-material-exfil",
+                         "A literal secret (private key block, cloud access key, or "
+                         "vendor API/webhook token) sent to a network tool in the same "
+                         "command is blocked — the secret's own text is the signal, no "
+                         "upload verb or bulk env dump required. Append '# aegis-allow' "
+                         "(human only), or set AEGIS_ALLOW_SECRET_MATERIAL=1 / add a "
+                         "secret_exfil.allow policy entry.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "secret-material-exfil-monitor")
+            return None
+        return would
     return None
 
 
@@ -741,6 +837,7 @@ def _lifecycle_rules() -> tuple:
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
+    rule_secret_material_exfil,
     rule_self_protect,
     rule_mcp_config_protect,
     rule_workspace_confine,
