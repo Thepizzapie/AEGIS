@@ -263,7 +263,9 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
 
 
 # ---- MCP server-config protection: escapable with human confirmation ---------
-def _mcp_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+def _regex_allowed_by_policy(cfg: dict, text: str) -> bool:
+    """Shared by any guard with a policy 'allow: [regex]' exemption list — a match
+    on the given text (path or raw command) skips the gate."""
     for pat in (cfg.get("allow") or []):
         try:
             if re.search(str(pat), text, re.IGNORECASE):
@@ -308,7 +310,7 @@ def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
         p = _path(ev)
         if not p or not patterns.MCP_CONFIG_PATH_RE.search(p):
             return None
-        if os.environ.get("AEGIS_ALLOW_MCP_CONFIG") or _mcp_config_allowed_by_policy(cfg, p):
+        if os.environ.get("AEGIS_ALLOW_MCP_CONFIG") or _regex_allowed_by_policy(cfg, p):
             return None
         would = Decision(action, "mcp-config-protect",
                          f"MCP server config '{p}' is being written — a new or "
@@ -332,7 +334,7 @@ def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
         if not (touches_config or cli_add):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MCP_CONFIG")
-                or _mcp_config_allowed_by_policy(cfg, _cmd(ev))):
+                or _regex_allowed_by_policy(cfg, _cmd(ev))):
             return None
         would = Decision(action, "mcp-config-protect",
                          "MCP server configuration is being modified from a shell — "
@@ -342,6 +344,102 @@ def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "agent cannot.")
         if mode == "monitor":
             _record_monitor(ev, would, "mcp-config-protect-monitor")
+            return None
+        return would
+    return None
+
+
+# ---- git hooks protection: escapable with human confirmation -----------------
+def rule_git_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/redirecting git hooks — a durable, cross-session backdoor.
+
+    A script placed under ``.git/hooks/`` (or a checked-in convention dir a repo
+    points ``core.hooksPath`` at — ``.githooks/``, ``.husky/``) runs automatically
+    and unattended on ordinary git operations (commit/push/checkout/merge/rebase/
+    receive): for the planting agent's own later commands, for a human teammate who
+    later clones/pulls and runs git normally, and for CI. Same shape as the MCP
+    server-config backdoor ``rule_mcp_config_protect`` already guards, but for git —
+    and previously unguarded entirely; nothing in this codebase checked a hook path
+    or ``core.hooksPath`` before this rule.
+
+    Three independent ways in, all covered:
+    1. A plain Edit/Write (or an MCP filesystem tool) targeting a file under
+       ``.git/hooks/``, ``.githooks/``, ``.husky/``, or git's own config file
+       (``.git/config`` / ``~/.gitconfig`` / ``~/.config/git/config``) directly.
+    2. A shell write (redirect/tee/in-place-edit/copy-over/move/delete) at the same
+       paths, or marking an already-planted hook executable (``chmod +x``) — git
+       only runs a hook that already has its executable bit set.
+    3. ``git config core.hooksPath <dir>`` (local/--global/--system) or inline
+       ``git -c core.hooksPath=<dir>`` — redirects hook execution to an ARBITRARY
+       directory without ever touching ``.git/hooks`` or ``.git/config`` as a
+       literal path, so (1) and (2) can't see it; a file already sitting anywhere
+       on disk becomes "the pre-commit hook" the moment this lands.
+
+    Config (``policy.git_hooks``): ``mode`` (deny|ask|monitor|off, default deny),
+    ``allow`` (regexes on the path/command that skip the gate — a repo's own trusted
+    hook-install script, say). ``ask`` surfaces the change to a human instead of a
+    hard deny; ``monitor`` logs the would-be decision to the audit and allows.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the *shell* form, or the
+    env toggle ``AEGIS_ALLOW_GIT_HOOKS=1`` set by the orchestrator/human before launch
+    for the Edit/Write/MCP-tool form. A spawned agent cannot set its own env for a
+    hook invocation it doesn't control, so neither path is agent-self-escapable."""
+    cfg = getattr(policy, "git_hooks", None) or {}
+    mode = str(cfg.get("mode", "deny")).lower()
+    if mode == "off":
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not (patterns.GIT_HOOKS_DIR_RE.search(p)
+                          or patterns.GIT_CONFIG_FILE_RE.search(p)):
+            return None
+        if os.environ.get("AEGIS_ALLOW_GIT_HOOKS") or _regex_allowed_by_policy(cfg, p):
+            return None
+        would = Decision(action, "git-hooks-protect",
+                         f"Git hook path '{p}' is being written — a planted or "
+                         "modified script here runs automatically and unattended "
+                         "on ordinary git operations, a durable backdoor. Review "
+                         "the change, then confirm with AEGIS_ALLOW_GIT_HOOKS=1; "
+                         "a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "git-hooks-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        hooks_dir_hit = bool(patterns.GIT_HOOKS_DIR_RE.search(cmd))
+        config_file_hit = bool(patterns.GIT_CONFIG_FILE_RE.search(cmd))
+        write_verb = bool(
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        touches_path = (hooks_dir_hit or config_file_hit) and write_verb
+        exec_bit = hooks_dir_hit and bool(patterns.CHMOD_EXEC_RE.search(cmd))
+        hookspath_set = bool(patterns.GIT_HOOKS_PATH_CONFIG_RE.search(cmd))
+        if not (touches_path or exec_bit or hookspath_set):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GIT_HOOKS")
+                or _regex_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        if touches_path:
+            reason = "writing a hook/config file"
+        elif exec_bit:
+            reason = "marking a planted hook executable"
+        else:
+            reason = "redirecting hook execution (core.hooksPath)"
+        would = Decision(action, "git-hooks-protect",
+                         f"Git hook configuration is being modified from a shell "
+                         f"({reason}) — this can run automatically and unattended "
+                         "on every future git operation in this repo. A human may "
+                         "append '# aegis-allow', or set AEGIS_ALLOW_GIT_HOOKS=1; "
+                         "a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "git-hooks-protect-monitor")
             return None
         return would
     return None
@@ -743,6 +841,7 @@ _CORE_RULES = (
     rule_containment,
     rule_self_protect,
     rule_mcp_config_protect,
+    rule_git_hooks_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

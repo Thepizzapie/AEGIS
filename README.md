@@ -43,6 +43,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 | Self-protection | Deleting/editing `.aegis`, `.claude/settings.json`, or Aegis's own source; `aegis uninstall`/`pull` | No |
 | Evasion | Encoded/obfuscated commands (`-EncodedCommand`, `base64 -d \| bash`, char-code) | No |
 | MCP config | Writes to MCP server-config files (`.mcp.json`, `mcpServers`, etc.) that auto-run on every future session | Human only |
+| git hooks | Planting/redirecting a git hook (`.git/hooks/*`, `.githooks/`, `.husky/`, `git config core.hooksPath`) that auto-runs on every future git operation | Human only |
 | Destructive SQL | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, migration resets — from shell **and** DB tool args | Yes |
 | Destructive git | force-push, `reset --hard`, rebase, `branch -D`, `clean -f` | Yes |
 | Recursive delete | `rm -rf` and equivalents (PowerShell, cmd, `find -delete`, `shred`, `dd`) | Yes |
