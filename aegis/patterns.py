@@ -628,9 +628,13 @@ GIT_HOOKS_PATH_CONFIG_RE = re.compile(
 # reason to appear outside of this mechanism. Deliberately does not require
 # GIT_CONFIG_VALUE_<n> in the same statement (it may be set in an earlier
 # `export` the guard never sees) — declaring the KEY mapping alone is already
-# the attack shape.
+# the attack shape. The env VAR NAME half is scoped case-SENSITIVE (`(?-i:...)`)
+# inside the otherwise case-insensitive pattern (round-2 QA, independent agent):
+# shell env-var names are themselves case-sensitive, so `git_config_key_0=...`
+# (lowercase) is inert to real git and must not false-positive just because the
+# surrounding pattern is generally case-insensitive for readability elsewhere.
 GIT_HOOKS_ENV_CONFIG_RE = re.compile(
-    r"\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?core\.hooksPath\b",
+    r"\b(?-i:GIT_CONFIG_KEY_)\d+\s*=\s*['\"]?core\.hooksPath\b",
     re.IGNORECASE,
 )
 

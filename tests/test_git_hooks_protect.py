@@ -199,6 +199,13 @@ def test_unrelated_env_assignment_allowed():
                          EMPTY).blocked
 
 
+def test_lowercase_env_var_name_not_confused_for_the_real_mechanism():
+    """QA (round 2): shell env-var names are case-sensitive, so a lowercase
+    'git_config_key_0=...' is inert to real git and must not false-positive
+    just because the surrounding pattern is otherwise case-insensitive."""
+    assert not evaluate(_shell("git_config_key_0=core.hooksPath"), EMPTY).blocked
+
+
 # ---- override semantics ----------------------------------------------------------
 
 def test_human_can_override_shell_with_comment():
