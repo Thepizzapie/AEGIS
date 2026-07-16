@@ -35,6 +35,7 @@ _REMEDIES = """\
 | containment-exfiltration | uploaded local files to the network | keep data local; the human can share files deliberately |
 | self-protect | wrote/deleted Aegis config, policy, engine source, or an aegis-* skill | leave Aegis alone; ask the human to change policy via `aegis-policy` |
 | mcp-config-protect | wrote an MCP server config (durable auto-run backdoor) | ask the human; they can set AEGIS_ALLOW_MCP_CONFIG=1 after review |
+| git-hooks-protect | wrote/redirected a git hook (durable auto-run backdoor) | ask the human; they can set AEGIS_ALLOW_GIT_HOOKS=1 after review |
 | workspace-confine | wrote outside the project root the identity is bound to | stay in the project; ask for workspace.allow if a path is legitimate |
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |
 | subagent-spawn | a spawned agent tried to spawn sub-agents | do the work in this session, or run with AEGIS_ALLOW_SUBAGENTS=1 |
