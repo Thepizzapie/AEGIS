@@ -362,7 +362,7 @@ def rule_git_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     and previously unguarded entirely; nothing in this codebase checked a hook path
     or ``core.hooksPath`` before this rule.
 
-    Three independent ways in, all covered:
+    Four independent ways in, all covered:
     1. A plain Edit/Write (or an MCP filesystem tool) targeting a file under
        ``.git/hooks/``, ``.githooks/``, ``.husky/``, or git's own config file
        (``.git/config`` / ``~/.gitconfig`` / ``~/.config/git/config``) directly.
@@ -374,6 +374,18 @@ def rule_git_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
        directory without ever touching ``.git/hooks`` or ``.git/config`` as a
        literal path, so (1) and (2) can't see it; a file already sitting anywhere
        on disk becomes "the pre-commit hook" the moment this lands.
+    4. ``GIT_CONFIG_KEY_<n>=core.hooksPath`` (paired with
+       ``GIT_CONFIG_VALUE_<n>=<dir>``) — git's own env-var config-injection
+       mechanism (git-config(1)) achieves the same redirection as (3) via
+       environment assignment instead of a CLI flag/subcommand, so neither the
+       ``git config`` nor the ``git -c`` shape in (3) sees it.
+
+    Known residual gap, same spirit as this codebase's other documented ones: once
+    ``core.hooksPath`` is redirected to a directory whose name this rule doesn't
+    recognize (anything other than ``.git/hooks``/``.githooks``/``.husky``), a
+    SUBSEQUENT write into that arbitrary directory isn't caught by (1)/(2) — the
+    redirection *attempt* itself (3)/(4) is the actual defense for that case, and
+    is non-escapable by a spawned agent same as everything else here.
 
     Config (``policy.git_hooks``): ``mode`` (deny|ask|monitor|off, default deny),
     ``allow`` (regexes on the path/command that skip the gate — a repo's own trusted
@@ -420,7 +432,8 @@ def rule_git_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
             or patterns.COPY_WRITE_VERB_RE.search(cmd))
         touches_path = (hooks_dir_hit or config_file_hit) and write_verb
         exec_bit = hooks_dir_hit and bool(patterns.CHMOD_EXEC_RE.search(cmd))
-        hookspath_set = bool(patterns.GIT_HOOKS_PATH_CONFIG_RE.search(cmd))
+        hookspath_set = bool(patterns.GIT_HOOKS_PATH_CONFIG_RE.search(cmd)
+                             or patterns.GIT_HOOKS_ENV_CONFIG_RE.search(cmd))
         if not (touches_path or exec_bit or hookspath_set):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GIT_HOOKS")

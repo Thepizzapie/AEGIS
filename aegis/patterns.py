@@ -585,17 +585,52 @@ GIT_CONFIG_FILE_RE = re.compile(
 # anywhere on disk (even disguised as a data file) becomes "the pre-commit
 # hook" the moment this lands. Requires a trailing VALUE token (not just the
 # key name) so a read (`--get core.hooksPath`) or an `--unset` (which takes no
-# value and restores the default) — both harmless — don't false-positive; the
-# value char class excludes shell operators/whitespace so `--get
-# core.hooksPath; rm -rf /` doesn't misread the following statement as a value.
-# The value must also not be a bare `git` -- normalize.scan_surface's
-# de-obfuscation pass duplicates the whole (unquoted) command verbatim
-# ("cmd cmd"), so a plain read like `git config --get core.hooksPath` would
-# otherwise see its OWN duplicate as if it were a trailing value; a real
-# hooks-path value is never literally the word "git".
+# value and restores the default) — both harmless — don't false-positive.
+#
+# Deliberately does NOT exclude a value starting with `--` (round-1 adversarial
+# QA, independent agent): an earlier draft had a `(?!--)` guard meant to stop a
+# stray flag from being misread as a value, but that let `git config
+# core.hooksPath -- /tmp/evil-hooks` sail straight through untouched (real
+# git's own arg parsing for this form is exactly the sort of surprising corner
+# a policy engine must fail SAFE on, not guess about) — the fix is to just
+# treat any trailing token as a set, `--`-prefixed or not.
+#
+# The value char class excludes shell operators/whitespace (`--get
+# core.hooksPath; rm -rf /` doesn't misread the following statement as a
+# value) AND quote characters `'"^\x60` (round-1 QA also found the quote gap:
+# `normalize.scan_surface`'s RAW-command copy keeps the command's own quoting
+# intact, so a closing quote sitting immediately after the key in a perfectly
+# ordinary quoted read — `git config --get "core.hooksPath"`, or that same
+# read wrapped in `bash -c "..."` — was being read as if it were the value).
+#
+# The value must also not be a bare `git` -- scan_surface's de-obfuscation
+# pass duplicates the whole (unquoted) command verbatim ("cmd cmd"), so a
+# plain read like `git config --get core.hooksPath` would otherwise see its
+# OWN duplicate as if it were a trailing value; a real hooks-path value is
+# never literally the word "git".
 GIT_HOOKS_PATH_CONFIG_RE = re.compile(
-    r"\bgit\b[^|;&\n]*?\bconfig\b[^|;&\n]*?\bcore\.hooksPath\b\s*=?\s*(?!--)(?!git\b)[^\s|;&\n]"
-    r"|\bgit\b[^|;&\n]*?\s-c\s*['\"]?core\.hooksPath\s*=\s*(?!git\b)[^\s|;&\n]",
+    r"\bgit\b[^|;&\n]*?\bconfig\b[^|;&\n]*?\bcore\.hooksPath\b\s*=?\s*(?!git\b)[^\s|;&\n'\"^`]"
+    r"|\bgit\b[^|;&\n]*?\s-c\s*['\"]?core\.hooksPath\s*=\s*(?!git\b)[^\s|;&\n'\"^`]",
+    re.IGNORECASE,
+)
+
+# `GIT_CONFIG_KEY_<n>=core.hooksPath` (paired with `GIT_CONFIG_VALUE_<n>=<dir>`
+# and, conventionally, `GIT_CONFIG_COUNT=<n>`) — git's environment-variable
+# config-injection mechanism (documented in git-config(1)) applies for every
+# git invocation in the shell that sees these vars, exactly like `-c
+# core.hooksPath=...` but via env assignment instead of a CLI flag, and
+# GIT_HOOKS_PATH_CONFIG_RE's "git config ... core.hooksPath" / "git -c
+# core.hooksPath=" shapes don't cover it at all (round-1 adversarial QA,
+# independent agent — confirmed live against real git: `GIT_CONFIG_COUNT=1
+# GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/tmp/evil git status`
+# actually redirects hook execution). High-signal by construction: naming a
+# GIT_CONFIG_KEY_N var's VALUE as exactly "core.hooksPath" has no legitimate
+# reason to appear outside of this mechanism. Deliberately does not require
+# GIT_CONFIG_VALUE_<n> in the same statement (it may be set in an earlier
+# `export` the guard never sees) — declaring the KEY mapping alone is already
+# the attack shape.
+GIT_HOOKS_ENV_CONFIG_RE = re.compile(
+    r"\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?core\.hooksPath\b",
     re.IGNORECASE,
 )
 

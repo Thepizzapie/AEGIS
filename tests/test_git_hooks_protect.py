@@ -156,6 +156,49 @@ def test_unrelated_git_config_allowed():
     assert not evaluate(_shell("git status"), EMPTY).blocked
 
 
+def test_quoted_read_not_confused_for_a_value():
+    """QA (round 1): a closing quote right after the key was being read as if it
+    were the value, since the RAW-command copy in normalize.scan_surface keeps
+    the command's own quoting intact. An ordinary quoted read must not block."""
+    assert not evaluate(_shell('git config --get "core.hooksPath"'), EMPTY).blocked
+    assert not evaluate(_shell("git config --get 'core.hooksPath'"), EMPTY).blocked
+    assert not evaluate(_shell('git config --unset "core.hooksPath"'), EMPTY).blocked
+
+
+def test_quoted_read_wrapped_in_interpreter_not_confused_for_a_value():
+    """Same false positive, reached via the de-obfuscation interpreter-unwrap path
+    (bash -c '...') rather than the raw command directly."""
+    assert not evaluate(_shell('bash -c "git config --get core.hooksPath"'), EMPTY).blocked
+
+
+def test_double_dash_value_dodge_blocked():
+    """QA (round 1): an earlier draft excluded any value starting with '--',
+    meant to avoid misreading a stray flag as a value — but that let 'git config
+    core.hooksPath -- /tmp/evil-hooks' through untouched. Any trailing token,
+    '--'-prefixed or not, is a set and must be blocked."""
+    d = evaluate(_shell("git config core.hooksPath -- /tmp/evil-hooks"), EMPTY)
+    assert d.blocked and d.rule == "git-hooks-protect"
+
+
+def test_env_var_config_injection_blocked():
+    """QA (round 1): git's GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> env-var
+    config-injection mechanism (git-config(1)) redirects core.hooksPath exactly
+    like '-c core.hooksPath=...' but via environment assignment — confirmed live
+    against real git that this actually takes effect."""
+    d = evaluate(_shell("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "
+                         "GIT_CONFIG_VALUE_0=/tmp/evil-hooks git status"), EMPTY)
+    assert d.blocked and d.rule == "git-hooks-protect"
+
+
+def test_env_var_config_injection_export_form_blocked():
+    assert evaluate(_shell("export GIT_CONFIG_KEY_0=core.hooksPath"), EMPTY).blocked
+
+
+def test_unrelated_env_assignment_allowed():
+    assert not evaluate(_shell("GIT_CONFIG_KEY_0=user.email git config --get user.email"),
+                         EMPTY).blocked
+
+
 # ---- override semantics ----------------------------------------------------------
 
 def test_human_can_override_shell_with_comment():
