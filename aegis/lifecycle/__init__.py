@@ -9,6 +9,7 @@ enforcement + accountability behavior for the rest, grouped by concern:
 - ``session``      — SessionEnd / PreCompact / PostCompact / StopFailure / Notification
 - ``interaction``  — PostToolUseFailure / PermissionRequest / Elicitation / ElicitationResult
 - ``worktree``     — WorktreeCreate / WorktreeRemove
+- ``injection``    — UserPromptSubmit (prompt-injection scan)
 
 Each submodule exposes ``RULES`` (a tuple of ``(Event, Policy) -> Decision | None``
 functions). ``LIFECYCLE_RULES`` flattens them for the engine to fold into its
@@ -18,7 +19,7 @@ imports this one — keep the dependency one-way).
 from __future__ import annotations
 
 
-_SUBMODULES = ("integrity", "team", "session", "interaction", "worktree")
+_SUBMODULES = ("integrity", "team", "session", "interaction", "worktree", "injection")
 
 
 def lifecycle_rules() -> tuple:

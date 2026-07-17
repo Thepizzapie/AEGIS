@@ -750,3 +750,70 @@ TEST_CMD_RE = re.compile(
     r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )
+
+# Prompt-injection override phrasing — imperative language directed AT the model
+# telling it to abandon its actual instructions, adopt an unrestricted persona, leak
+# its system prompt, or turn off Aegis specifically. Backs the opt-in
+# lifecycle.injection.rule_prompt_injection (UserPromptSubmit). Deliberately narrow
+# (imperative "ignore/disregard/forget/override ... instructions", not just the
+# word "instructions") so ordinary text that merely discusses prompt injection
+# doesn't trip it — this is a denylist over known jailbreak/override shapes, not
+# an NLP classifier; novel rephrasings will miss it (see module docstring in
+# aegis/lifecycle/injection.py for the honest scope statement).
+#
+# The verb/modifier/noun gaps are intentionally SHORT (a handful of filler words,
+# not an open span) — round 1 QA (independent agent) found an earlier version with
+# {0,40}-char gaps matched ordinary sentences where the trigger words merely
+# appeared near each other with no override phrase at all, e.g. "Ignore the
+# previous test failures and focus on the new instructions I'm giving you now"
+# (a benign CI/dev message: "ignore ... previous" and "new instructions" are two
+# unrelated clauses the loose gap bridged into one false match). Tightening the
+# gap to a few connector words removes that class of false positive while still
+# catching the actual override phrase, which is inherently short ("ignore all
+# previous instructions", not "ignore ... [40 chars of unrelated text] ...
+# instructions"). A literal, verbatim override phrase used for a genuinely benign
+# purpose (e.g. asking the agent to write example jailbreak text into a doc) is a
+# residual, inherent ambiguity of any denylist and is NOT fixed by this — it is
+# why the guard is opt-in and defaults to unattended sessions only, with `monitor`
+# mode meant to be piloted before `deny`.
+#
+# Round 3 QA (independent agent, re-verifying the round-1 fix) found the
+# tightened modifier->noun gap now MISSED a plausible attacker rephrasing with a
+# doubled-up modifier: "please ignore all of the previous instructions" has
+# THREE words ("of", "the", "previous") between "all" and "instructions", one
+# more than the {0,2} gap allowed. Widened that one gap to {0,3} — re-verified
+# this does not reopen the round-1 false positive (that sentence has no second
+# modifier word for "all"/"previous" to double up on, so the wider gap alone
+# doesn't bridge it back into a match).
+PROMPT_INJECTION_RE = re.compile(
+    r"\b(?:ignore|disregard|forget|override)\b(?:\s+\w+){0,2}\s+"
+    r"(?:previous|prior|above|earlier|all)\b(?:\s+\w+){0,3}\s+"
+    r"(?:instructions?|prompts?|rules?|system\s*prompt)\b"
+    # reordered form ("ignore the instructions given previously") — same verb
+    # anchor required, just with the previously-marker after the noun instead
+    # of before it. The verb anchor (not just noun+marker alone) is what keeps
+    # this from matching an innocent "see the instructions provided above".
+    r"|\b(?:ignore|disregard|forget|override)\b(?:\s+\w+){0,3}\s+"
+    r"(?:instructions?|prompts?|rules?)\b(?:\s+\w+){0,2}\s+"
+    r"(?:previously|before|above|earlier)\b"
+    r"|\b(?:new|updated)\s+(?:system\s*)?instructions?\s*:"
+    r"|\byou\s+are\s+now\s+(?:in\s+)?(?:dan|developer\s+mode|unrestricted|jailbroken|"
+    r"uncensored|an?\s+unrestricted\s+ai)\b"
+    r"|\bact\s+as\s+(?:an?\s+)?(?:unrestricted|jailbroken|uncensored)\b"
+    r"|\b(?:reveal|print|show|leak)\s+your\s+(?:system\s*prompt|instructions)\b"
+    r"|\b(?:bypass|disable|turn\s+off|ignore|override)\s+(?:your\s+)?(?:aegis|the\s+aegis\s+"
+    r"(?:policy|guards?)|your\s+guardrails|all\s+restrictions|safety\s+(?:rules|restrictions))\b",
+    re.IGNORECASE,
+)
+
+# Invisible/steganographic Unicode used to smuggle instructions past a human who
+# skims the visible text: zero-width space/joiner/non-joiner (U+200B-200D), word
+# joiner (U+2060), BOM (U+FEFF), bidi embedding/override controls (U+202A-202E),
+# and bidi isolate controls (U+2066-2069) — the last of which can also reorder
+# displayed text to hide a payload. Written as explicit \\u escapes (never as
+# literal invisible characters) so the pattern stays reviewable in a diff.
+# Presence alone is the signal — legitimate prompts essentially never contain
+# these codepoints.
+HIDDEN_UNICODE_RE = re.compile(
+    "[​-‍⁠﻿‪-‮⁦-⁩]"
+)

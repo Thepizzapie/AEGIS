@@ -136,3 +136,7 @@ class Policy:
     # Stop gate: after file mutations, the session may not stop until a test run
     # is recorded after the last change. See lifecycle.session.
     completion: dict = field(default_factory=dict)
+    # Prompt-injection guard: {mode: off|monitor|deny (default off),
+    # unattended_only: bool (default True)} — opt-in scan of UserPromptSubmit text
+    # for override phrasing / hidden Unicode. See lifecycle.injection.
+    prompt_injection: dict = field(default_factory=dict)
