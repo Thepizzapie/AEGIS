@@ -23,6 +23,16 @@
 #     require_pinned: false # deny unpinned specs (force exact == / a lockfile)
 #     allow: []            # regexes on the command that skip the gate
 
+# Prompt-injection scan (optional, off by default). Scans the text submitted at
+# UserPromptSubmit for override phrasing ("ignore previous instructions", "you
+# are now unrestricted", "disable aegis", ...) and hidden/invisible Unicode used
+# to smuggle instructions past a human skim. Most useful for unattended/spawned
+# sessions where untrusted external text (an issue body, a webhook payload,
+# another agent's output) can arrive as "the prompt" with no human reviewing it:
+#   prompt_injection:
+#     mode: off             # off (default) | monitor (log-only) | deny
+#     unattended_only: true # only scan spawned/unattended sessions (default)
+
 default_action: allow
 on_error: allow
 

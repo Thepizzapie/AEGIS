@@ -750,3 +750,37 @@ TEST_CMD_RE = re.compile(
     r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )
+
+# Prompt-injection override phrasing — imperative language directed AT the model
+# telling it to abandon its actual instructions, adopt an unrestricted persona, leak
+# its system prompt, or turn off Aegis specifically. Backs the opt-in
+# lifecycle.injection.rule_prompt_injection (UserPromptSubmit). Deliberately narrow
+# (imperative "ignore/disregard/forget ... instructions", not just the word
+# "instructions") so ordinary text that merely discusses prompt injection doesn't
+# trip it — this is a denylist over known jailbreak/override shapes, not an NLP
+# classifier; novel rephrasings will miss it (see module docstring in
+# aegis/lifecycle/injection.py for the honest scope statement).
+PROMPT_INJECTION_RE = re.compile(
+    r"\b(?:ignore|disregard|forget)\b[^.\n]{0,40}\b(?:previous|prior|above|earlier|all)"
+    r"\b[^.\n]{0,40}\b(?:instructions?|prompts?|rules?|system\s*prompt)\b"
+    r"|\b(?:new|updated)\s+(?:system\s*)?instructions?\s*:"
+    r"|\byou\s+are\s+now\s+(?:in\s+)?(?:dan|developer\s+mode|unrestricted|jailbroken|"
+    r"uncensored|an?\s+unrestricted\s+ai)\b"
+    r"|\bact\s+as\s+(?:an?\s+)?(?:unrestricted|jailbroken|uncensored)\b"
+    r"|\b(?:reveal|print|show|leak)\s+your\s+(?:system\s*prompt|instructions)\b"
+    r"|\b(?:bypass|disable|turn\s+off|ignore)\s+(?:your\s+)?(?:aegis|the\s+aegis\s+(?:policy|guard"
+    r"s?)|your\s+guardrails|all\s+restrictions|safety\s+(?:rules|restrictions))\b",
+    re.IGNORECASE,
+)
+
+# Invisible/steganographic Unicode used to smuggle instructions past a human who
+# skims the visible text: zero-width space/joiner/non-joiner (U+200B-200D), word
+# joiner (U+2060), BOM (U+FEFF), bidi embedding/override controls (U+202A-202E),
+# and bidi isolate controls (U+2066-2069) — the last of which can also reorder
+# displayed text to hide a payload. Written as explicit \\u escapes (never as
+# literal invisible characters) so the pattern stays reviewable in a diff.
+# Presence alone is the signal — legitimate prompts essentially never contain
+# these codepoints.
+HIDDEN_UNICODE_RE = re.compile(
+    "[​-‍⁠﻿‪-‮⁦-⁩]"
+)
