@@ -95,7 +95,14 @@ def rule_prompt_injection(ev: Event, policy=None) -> Optional[Decision]:
             return None
 
         override = patterns.PROMPT_INJECTION_RE.search(text)
-        hidden = patterns.HIDDEN_UNICODE_RE.search(text)
+        # A single BOM at position 0 is a common, benign artifact of pasted file
+        # content (Windows editors/tools prepend it) — round 2 QA (independent
+        # agent) found it a false-positive risk with no injection intent. Only
+        # that one leading occurrence is exempted; a BOM anywhere else, or any
+        # zero-width/bidi-override character anywhere (including position 0),
+        # still trips the guard.
+        hidden_scan_text = text[1:] if text.startswith("﻿") else text
+        hidden = patterns.HIDDEN_UNICODE_RE.search(hidden_scan_text)
         if not (override or hidden):
             return None
 

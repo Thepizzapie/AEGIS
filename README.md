@@ -54,7 +54,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 
 Built-in guards run before your declarative rules and can only deny or abstain, so a permissive rule (even `tools: ["*"]` for an admin) can't re-open a built-in. To relax one, disable it explicitly.
 
-Beyond tool calls, Aegis covers the full lifecycle surface (sub-agent fan-out, task/stop completion gates, worktree confinement, context-compaction gates). Most are opt-in via policy knobs.
+Beyond tool calls, Aegis covers the full lifecycle surface (sub-agent fan-out, task/stop completion gates, worktree confinement, context-compaction gates, a prompt-injection scan on the text submitted at `UserPromptSubmit` — before it ever reaches the model). Most are opt-in via policy knobs.
 
 ## Policy
 
