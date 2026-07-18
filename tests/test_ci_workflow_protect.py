@@ -223,6 +223,36 @@ def test_plain_ln_without_force_not_gated():
     assert not _gated(evaluate(_shell("ln evil.yml .github/workflows/new-file.yml"), EMPTY))
 
 
+def test_ln_long_form_force_flag_gated():
+    """`--force` (long form) must be caught, not just a short combined `-f`-style
+    flag (QA round 3: `ln --force -s ...` slipped past the first fix)."""
+    assert _gated(evaluate(_shell("ln --force -s evil.yml .github/workflows/ci.yml"), EMPTY))
+
+
+# ---- terminator / performance follow-up (QA round 3) --------------------------
+
+def test_path_immediately_followed_by_separator_gated():
+    """A workflow path with NO space before a shell separator (`;`, `&`, `|`, a
+    `$(...)` closing paren) must still match — the boundary lookahead used to
+    only recognize whitespace/quote/separator/end, missing these characters."""
+    assert _gated(evaluate(_shell("rm .github/workflows/ci.yml;echo done"), EMPTY))
+    assert _gated(evaluate(_shell("rm .github/workflows/ci.yml&echo done"), EMPTY))
+    assert _gated(evaluate(_shell("cat .github/workflows/ci.yml|rm"), EMPTY))
+
+
+def test_forced_link_regex_no_quadratic_blowup():
+    """FORCED_LINK_WRITE_RE's lookahead must be length-bounded like _CI_SEG/
+    _CI_MULTI — an earlier version had an unbounded span that reintroduced the
+    same class of blowup those two were fixed for (QA round 3: 3.4s at ~4,000
+    bare 'ln' occurrences through the real evaluate() pipeline, worse at scale)."""
+    tail = " ".join(["ln"] * 4000) + " " + " ".join(["word"] * 20000)
+    cmd = "echo .github/workflows/ci.yml " + tail
+    start = time.time()
+    evaluate(_shell(cmd), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"rule_ci_workflow_protect took {elapsed:.2f}s on adversarial input"
+
+
 # ---- escape hatches: human-only ------------------------------------------------
 
 def test_human_can_override_shell_with_comment():

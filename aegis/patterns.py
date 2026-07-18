@@ -582,7 +582,18 @@ MCP_CLI_ADD_RE = re.compile(
 # `.github/workflows/` (subdirectories aren't picked up by GitHub at all), which
 # both tightens precision and removes any path for the wildcard to re-cross a
 # later `.github/workflows/` occurrence.
-_CI_END = _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)"
+#
+# QA follow-up (independent adversarial review, round 3): a path immediately
+# followed (no space) by a shell separator/terminator — `;`, `&`, `|`, or a
+# closing `)` from a `$(...)` substitution — failed to match at all, since none
+# of those characters were in the boundary lookahead (only whitespace/quote/
+# separator/end-of-string were). `rm .github/workflows/ci.yml;echo done` (no
+# space before the `;`) sailed straight through while the identical command
+# WITH a space matched correctly. Added those four characters as valid
+# boundaries too — each is unambiguously never part of a bare filename
+# argument in shell syntax, so this only ADDS matches, the safe direction for
+# a human-gated guard.
+_CI_END = _WIN_TRIM + r"(?=[/\\;&|)]|\s|['\"]|$)"
 _CI_SEG = r"[^\s'\"/\\]{1,200}"
 _CI_MULTI = r"[^\s'\"]{0,200}"
 CI_WORKFLOW_PATH_RE = re.compile(
@@ -638,9 +649,23 @@ CI_WORKFLOW_FIND_RE = re.compile(
 # a protected path, and that false positive is worse than the narrow gap this
 # leaves (a *plain*, unforced `ln`/`New-Item`, which does not overwrite an
 # existing target and so isn't itself dangerous).
+#
+# QA follow-up (independent adversarial review, round 3): the first version of
+# this pattern used an UNBOUNDED `[^|;&\n]*` lookahead span — exactly the
+# quadratic-blowup shape `_CI_SEG`/`_CI_MULTI` above exist to avoid, just never
+# applied here. `\bln\b` anchors at every bare occurrence of "ln" in a command,
+# and each anchor rescanned the entire remaining tail looking for a `-f` flag;
+# a command with many "ln" occurrences and no real flag anywhere (verified
+# through the full evaluate() pipeline, not just the raw regex) took 3.4s at
+# ~4,000 occurrences and scaled quadratically from there — the same fail-open-
+# on-hook-timeout bypass path documented throughout this file. Fixed the same
+# way: bound the span to `{0,200}`. Also widened to catch the long-form
+# `--force` flag (round 3 also found `ln --force -s ...` slipped past a
+# short-flag-only `-[a-zA-Z]*f`), which `-force` for New-Item already covered
+# as a substring but `ln`'s check did not.
 FORCED_LINK_WRITE_RE = re.compile(
-    r"\bln\b(?=[^|;&\n]*\s-[a-zA-Z]*f)"
-    r"|\b(?:new-item|ni)\b(?=[^|;&\n]*-force\b)",
+    r"\bln\b(?=[^|;&\n]{0,200}\s(?:-[a-zA-Z]*f\b|--force\b))"
+    r"|\b(?:new-item|ni)\b(?=[^|;&\n]{0,200}-force\b)",
     re.IGNORECASE,
 )
 
