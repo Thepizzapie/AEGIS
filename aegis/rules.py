@@ -347,6 +347,110 @@ def rule_mcp_config_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- CI/CD workflow-definition protection: escapable with human confirmation --
+def _ci_workflow_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_ci_workflow_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a CI/CD pipeline-definition file (GitHub Actions
+    workflows and composite actions, GitLab CI, CircleCI, Azure Pipelines, Travis,
+    Jenkinsfile, Drone, Bitbucket Pipelines, Buildkite, Cloud Build, AppVeyor).
+
+    A pipeline step runs autonomously on a FUTURE, DIFFERENT machine (the CI
+    runner) that typically holds MORE privilege than the current session (deploy
+    keys, cloud IAM, publish tokens, a write-scoped GITHUB_TOKEN, org secrets). A
+    hijacked or prompt-injected agent that plants or edits a step here — a
+    secret-exfiltrating `run:` line, a `pull_request_target` trigger over
+    untrusted fork code, a step that leaks `${{ secrets.* }}` into a log/artifact
+    — plants a backdoor that never executes in THIS guarded session at all (no
+    shell/network guard here ever sees it fire) and self-triggers on the next
+    push/PR/build with no further agent action needed. Distinct from
+    mcp_config_protect (same-machine, next-session auto-exec) and
+    self-protect/containment (this session/host only) — neither covers a payload
+    that only runs on a remote CI runner later.
+
+    Config (``policy.ci_workflow``): ``mode`` (deny|ask|monitor|off, default ask),
+    ``allow`` (regexes on the path/command that skip the gate — a repo's own
+    trusted bot-authored dependency-bump PRs, say). Defaults to ``ask`` rather than
+    a hard deny (unlike mcp_config_protect, which defaults to deny) because editing
+    a CI workflow is routine, common dev work — bumping an action version, adding a
+    test-matrix entry — unlike planting an MCP server, which is rare; ``ask`` keeps
+    a human in the loop on every change (the agent never decides — see README) with
+    no pre-session setup required, the same reasoning ``rule_install_review`` uses
+    for defaulting to ``ask`` over ``deny``. ``deny`` is still available for a
+    stricter posture; ``monitor`` logs the would-be decision to the audit and
+    allows.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the *shell* form, or
+    the env toggle ``AEGIS_ALLOW_CI_WORKFLOW=1`` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot set its
+    own env for a hook invocation it doesn't control, so neither path is
+    agent-self-escapable."""
+    cfg = getattr(policy, "ci_workflow", None) or {}
+    mode = str(cfg.get("mode", "ask")).lower()
+    if mode == "off":
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.CI_WORKFLOW_PATH_RE.search(p):
+            return None
+        if os.environ.get("AEGIS_ALLOW_CI_WORKFLOW") or _ci_workflow_allowed_by_policy(cfg, p):
+            return None
+        would = Decision(action, "ci-workflow-protect",
+                         f"CI/CD pipeline definition '{p}' is being written — a step "
+                         "added here runs on a FUTURE CI run, on a different machine, "
+                         "typically with more privilege (deploy keys, cloud IAM, a "
+                         "write-scoped GITHUB_TOKEN) than this session. Review the "
+                         "change, then confirm with AEGIS_ALLOW_CI_WORKFLOW=1; a "
+                         "spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "ci-workflow-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        # CI_WORKFLOW_FIND_RE catches `find -path/-name/-regex` naming the target
+        # without ever writing its path as one contiguous string (same reason
+        # rule_self_protect pairs FIND_PROTECTED_RE alongside its own path
+        # patterns — see that pattern's docstring). FORCED_LINK_WRITE_RE catches
+        # `ln -f`/`New-Item -Force`, a write shape none of the other four verb
+        # patterns below recognize (QA finding, round 1).
+        names_workflow = bool(patterns.CI_WORKFLOW_PATH_RE.search(cmd)
+                               or patterns.CI_WORKFLOW_FIND_RE.search(cmd))
+        touches_workflow = names_workflow and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not touches_workflow:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CI_WORKFLOW")
+                or _ci_workflow_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "ci-workflow-protect",
+                         "CI/CD pipeline configuration is being modified from a shell "
+                         "— a step added here runs on a future CI run, on a different "
+                         "machine, typically with more privilege than this session. A "
+                         "human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CI_WORKFLOW=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "ci-workflow-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -743,6 +847,7 @@ _CORE_RULES = (
     rule_containment,
     rule_self_protect,
     rule_mcp_config_protect,
+    rule_ci_workflow_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

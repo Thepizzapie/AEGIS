@@ -536,6 +536,139 @@ MCP_CLI_ADD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# CI/CD pipeline-definition files — across the common CI providers. A pipeline
+# step executes autonomously on a FUTURE, DIFFERENT machine (the CI runner) that
+# typically holds MORE privilege than the current session: deploy keys, cloud IAM
+# roles, package-publish tokens, a write-scoped GITHUB_TOKEN, org-level secrets.
+# Planting or altering a step here — a `run:` line that curls `${{ secrets.* }}`
+# or `$(env)` to an attacker host, a new `pull_request_target` trigger that checks
+# out and runs an untrusted fork's code with base-repo secrets, a step that echoes
+# a secret into a log/artifact — is a durable, cross-session AND cross-machine
+# backdoor: the payload never executes in THIS guarded session at all (so no
+# shell/network guard here ever sees it fire) and self-triggers on the very next
+# push/PR/build with no further agent action needed. Same "runs later, unattended"
+# shape as MCP_CONFIG_PATH_RE, but worse blast radius — a CI runner's secrets
+# routinely outrank a local dev/agent session's, and a human skimming a routine
+# "bump actions/checkout" diff is exactly the reviewer likely to rubber-stamp a
+# smuggled step.
+#
+# QA history (independent adversarial review, round 1): an earlier draft joined
+# path components with a literal `[/\\]` and terminated each alternative with a
+# bare `\b` — both mistakes this file's own AEGIS_SOURCE_RE/ENFORCEMENT_PATH_RE
+# already avoid, for reasons that apply identically here. `[/\\]` alone missed
+# `.github//workflows/ci.yml` and `.github/./workflows/ci.yml` (the OS treats a
+# doubled slash / a `.` component as identical to a single slash — see _SEP's own
+# comment above), and Windows' trailing-dot/space stripping meant
+# `.github./workflows/ci.yml` also resolved to the real file while sailing past
+# the guard (see _WIN_TRIM's comment above) — both fixed the same way those two
+# patterns already do, by building the separators from `_WIN_TRIM + _SEP`. A bare
+# trailing `\b` also let a real match's extension be followed by ANYTHING
+# word-boundary-adjacent (`azure-pipelines.yml.bak`, `Jenkinsfile.disabled`,
+# `.gitlab-ci.yml.orig`) and still match, false-positiving on routine
+# disable/backup/template variants that CI never reads — fixed by replacing it
+# with `_CI_END`, a proper "real path/argument boundary next" lookahead (the same
+# shape ENFORCEMENT_PATH_RE uses), which also happens to close the Windows
+# trailing-dot bypass on the FINAL component the same way _WIN_TRIM does on every
+# component before it. Finally, the interior `[^\s'"]+`/`[^\s'"]*` wildcards were
+# unbounded, so a crafted string repeating a near-miss prefix with no real match
+# anywhere (e.g. `.github/workflows/` thousands of times) forced quadratic
+# backtracking — several seconds on a ~100KB input, and per this file's own
+# repeated principle (see ENV_DUMP_EXFIL_RE's perf note above), a non-escapable/
+# human-only guard hanging is itself a bypass path (README: fail-open if the hook
+# can't complete). Fixed with `_CI_SEG`/`_CI_MULTI`: both are LENGTH-BOUNDED
+# (`{1,200}`/`{0,200}`), which caps the backtracking work per anchor to a
+# constant instead of the remaining input length; `_CI_SEG` additionally excludes
+# `/`/`\` since a GitHub Actions workflow file must sit directly inside
+# `.github/workflows/` (subdirectories aren't picked up by GitHub at all), which
+# both tightens precision and removes any path for the wildcard to re-cross a
+# later `.github/workflows/` occurrence.
+#
+# QA follow-up (independent adversarial review, round 3): a path immediately
+# followed (no space) by a shell separator/terminator — `;`, `&`, `|`, or a
+# closing `)` from a `$(...)` substitution — failed to match at all, since none
+# of those characters were in the boundary lookahead (only whitespace/quote/
+# separator/end-of-string were). `rm .github/workflows/ci.yml;echo done` (no
+# space before the `;`) sailed straight through while the identical command
+# WITH a space matched correctly. Added those four characters as valid
+# boundaries too — each is unambiguously never part of a bare filename
+# argument in shell syntax, so this only ADDS matches, the safe direction for
+# a human-gated guard.
+_CI_END = _WIN_TRIM + r"(?=[/\\;&|)]|\s|['\"]|$)"
+_CI_SEG = r"[^\s'\"/\\]{1,200}"
+_CI_MULTI = r"[^\s'\"]{0,200}"
+CI_WORKFLOW_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"workflows" + _WIN_TRIM + _SEP
+    + _CI_SEG + r"\.ya?ml" + _CI_END                                            # GH Actions
+    + r"|(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"actions" + _WIN_TRIM + _SEP
+    + _CI_MULTI + _SEP + r"action\.ya?ml" + _CI_END                             # GH composite actions
+    + r"|(?:^|[\s'\"/\\=])\.gitlab-ci" + r"\.ya?ml" + _CI_END                   # GitLab CI
+    + r"|(?:^|[\s'\"/\\=])\.circleci" + _WIN_TRIM + _SEP + r"config"
+    + r"\.ya?ml" + _CI_END                                                      # CircleCI
+    + r"|(?:^|[\s'\"/\\=])azure-pipelines" + r"\.ya?ml" + _CI_END              # Azure Pipelines
+    + r"|(?:^|[\s'\"/\\=])\.travis" + r"\.ya?ml" + _CI_END                     # Travis CI
+    + r"|(?:^|[\s'\"/\\=])Jenkinsfile" + _CI_END                               # Jenkins
+    + r"|(?:^|[\s'\"/\\=])\.drone" + r"\.ya?ml" + _CI_END                      # Drone CI
+    + r"|(?:^|[\s'\"/\\=])bitbucket-pipelines" + r"\.ya?ml" + _CI_END          # Bitbucket Pipelines
+    + r"|(?:^|[\s'\"/\\=])\.buildkite" + _WIN_TRIM + _SEP + _CI_MULTI
+    + r"\.ya?ml" + _CI_END                                                      # Buildkite
+    + r"|(?:^|[\s'\"/\\=])cloudbuild" + r"\.ya?ml" + _CI_END                   # Google Cloud Build
+    + r"|(?:^|[\s'\"/\\=])\.appveyor" + r"\.ya?ml" + _CI_END,                  # AppVeyor
+    re.IGNORECASE,
+)
+
+# `find`'s -path/-name/-wholename/-regex predicates can describe a CI workflow
+# target WITHOUT ever writing its path as one contiguous string
+# (`find . -path '*workflows*' -name ci.yml`), evading CI_WORKFLOW_PATH_RE's
+# substring-adjacency match the exact same way FIND_PROTECTED_RE exists because
+# plain path patterns miss it for self-protect (see that pattern's own docstring
+# above) — QA finding (independent adversarial review, round 1):
+# `rm $(find . -path '*workflows*' -name ci.yml)` deleted a real workflow file
+# with zero detection. Matched on a handful of distinguishing name fragments
+# (directory names / canonical filenames) shared by no ordinary, unrelated find
+# target.
+_CI_NAME_FRAGMENTS = (
+    r"workflows?|gitlab-ci|circleci|azure-pipelines|jenkinsfile|\.drone"
+    r"|bitbucket-pipelines|buildkite|cloudbuild|appveyor|action\.ya?ml"
+)
+CI_WORKFLOW_FIND_RE = re.compile(
+    r"\bfind\b[^|;&\n]*(?<!\S)-i?(?:path|name|wholename|regex)\b\s*['\"]?[^'\"\n]*?"
+    r"(?:" + _CI_NAME_FRAGMENTS + r")",
+    re.IGNORECASE,
+)
+
+# `ln -f`/`-sf` (force a symlink/hardlink over an existing target) and
+# PowerShell's `New-Item -Force` overwrite a file without any delete/move verb,
+# shell redirect, or in-place editor invocation — none of WRITE_REDIRECT_RE /
+# DELETE_OR_MOVE_VERB_RE / DESTRUCTIVE_DELETE_RE / INPLACE_WRITE_RE catch either
+# shape (QA finding, independent adversarial review, round 1:
+# `ln -sf evil.yml .github/workflows/ci.yml` swapped the real file in unnoticed).
+# Deliberately narrower than COPY_WRITE_VERB_RE (which also matches bare
+# `install`) — see INPLACE_WRITE_RE's own docstring above for why a bare
+# `install` verb is excluded here too: it is indistinguishable by regex from an
+# ordinary `npm install`/`pip install` sharing a shell line with a mere READ of
+# a protected path, and that false positive is worse than the narrow gap this
+# leaves (a *plain*, unforced `ln`/`New-Item`, which does not overwrite an
+# existing target and so isn't itself dangerous).
+#
+# QA follow-up (independent adversarial review, round 3): the first version of
+# this pattern used an UNBOUNDED `[^|;&\n]*` lookahead span — exactly the
+# quadratic-blowup shape `_CI_SEG`/`_CI_MULTI` above exist to avoid, just never
+# applied here. `\bln\b` anchors at every bare occurrence of "ln" in a command,
+# and each anchor rescanned the entire remaining tail looking for a `-f` flag;
+# a command with many "ln" occurrences and no real flag anywhere (verified
+# through the full evaluate() pipeline, not just the raw regex) took 3.4s at
+# ~4,000 occurrences and scaled quadratically from there — the same fail-open-
+# on-hook-timeout bypass path documented throughout this file. Fixed the same
+# way: bound the span to `{0,200}`. Also widened to catch the long-form
+# `--force` flag (round 3 also found `ln --force -s ...` slipped past a
+# short-flag-only `-[a-zA-Z]*f`), which `-force` for New-Item already covered
+# as a substring but `ln`'s check did not.
+FORCED_LINK_WRITE_RE = re.compile(
+    r"\bln\b(?=[^|;&\n]{0,200}\s(?:-[a-zA-Z]*f\b|--force\b))"
+    r"|\b(?:new-item|ni)\b(?=[^|;&\n]{0,200}-force\b)",
+    re.IGNORECASE,
+)
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the
