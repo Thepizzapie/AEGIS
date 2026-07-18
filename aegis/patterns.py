@@ -536,6 +536,37 @@ MCP_CLI_ADD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# CI/CD pipeline-definition files — across the common CI providers. A pipeline
+# step executes autonomously on a FUTURE, DIFFERENT machine (the CI runner) that
+# typically holds MORE privilege than the current session: deploy keys, cloud IAM
+# roles, package-publish tokens, a write-scoped GITHUB_TOKEN, org-level secrets.
+# Planting or altering a step here — a `run:` line that curls `${{ secrets.* }}`
+# or `$(env)` to an attacker host, a new `pull_request_target` trigger that checks
+# out and runs an untrusted fork's code with base-repo secrets, a step that echoes
+# a secret into a log/artifact — is a durable, cross-session AND cross-machine
+# backdoor: the payload never executes in THIS guarded session at all (so no
+# shell/network guard here ever sees it fire) and self-triggers on the very next
+# push/PR/build with no further agent action needed. Same "runs later, unattended"
+# shape as MCP_CONFIG_PATH_RE, but worse blast radius — a CI runner's secrets
+# routinely outrank a local dev/agent session's, and a human skimming a routine
+# "bump actions/checkout" diff is exactly the reviewer likely to rubber-stamp a
+# smuggled step.
+CI_WORKFLOW_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.github[/\\]workflows[/\\][^\s'\"]+\.ya?ml\b"          # GH Actions
+    r"|(?:^|[\s'\"/\\=])\.github[/\\]actions[/\\][^\s'\"]*[/\\]action\.ya?ml\b"  # GH composite actions
+    r"|(?:^|[\s'\"/\\=])\.gitlab-ci\.ya?ml\b"                                  # GitLab CI
+    r"|(?:^|[\s'\"/\\=])\.circleci[/\\]config\.ya?ml\b"                        # CircleCI
+    r"|(?:^|[\s'\"/\\=])azure-pipelines\.ya?ml\b"                              # Azure Pipelines
+    r"|(?:^|[\s'\"/\\=])\.travis\.ya?ml\b"                                     # Travis CI
+    r"|(?:^|[\s'\"/\\=])Jenkinsfile\b"                                         # Jenkins
+    r"|(?:^|[\s'\"/\\=])\.drone\.ya?ml\b"                                      # Drone CI
+    r"|(?:^|[\s'\"/\\=])bitbucket-pipelines\.ya?ml\b"                          # Bitbucket Pipelines
+    r"|(?:^|[\s'\"/\\=])\.buildkite[/\\][^\s'\"]+\.ya?ml\b"                    # Buildkite
+    r"|(?:^|[\s'\"/\\=])cloudbuild\.ya?ml\b"                                   # Google Cloud Build
+    r"|(?:^|[\s'\"/\\=])\.appveyor\.ya?ml\b",                                  # AppVeyor
+    re.IGNORECASE,
+)
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the
