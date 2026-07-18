@@ -96,6 +96,10 @@ def compose(policy) -> str:
             "git/delete/SQL, obfuscated commands, fetch-piped-to-shell, "
             "unreviewed installs) are honored only for a human, never for a "
             "spawned agent.",
+            "CI/CD pipeline files (.github/workflows/*, .gitlab-ci.yml, "
+            "Jenkinsfile, and other provider configs) require human review "
+            "before any change lands — a step planted there runs later on the "
+            "CI runner, not in this session.",
         ]
         if fl_mode != "off":
             lines.append(

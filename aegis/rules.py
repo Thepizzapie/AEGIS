@@ -376,11 +376,17 @@ def rule_ci_workflow_protect(ev: Event, policy=None) -> Optional[Decision]:
     self-protect/containment (this session/host only) — neither covers a payload
     that only runs on a remote CI runner later.
 
-    Config (``policy.ci_workflow``): ``mode`` (deny|ask|monitor|off, default deny),
+    Config (``policy.ci_workflow``): ``mode`` (deny|ask|monitor|off, default ask),
     ``allow`` (regexes on the path/command that skip the gate — a repo's own
-    trusted bot-authored dependency-bump PRs, say). ``ask`` surfaces the change to
-    a human for interactive approval instead of a hard deny; ``monitor`` logs the
-    would-be decision to the audit and allows.
+    trusted bot-authored dependency-bump PRs, say). Defaults to ``ask`` rather than
+    a hard deny (unlike mcp_config_protect, which defaults to deny) because editing
+    a CI workflow is routine, common dev work — bumping an action version, adding a
+    test-matrix entry — unlike planting an MCP server, which is rare; ``ask`` keeps
+    a human in the loop on every change (the agent never decides — see README) with
+    no pre-session setup required, the same reasoning ``rule_install_review`` uses
+    for defaulting to ``ask`` over ``deny``. ``deny`` is still available for a
+    stricter posture; ``monitor`` logs the would-be decision to the audit and
+    allows.
 
     Escapable only by a human: a trailing '# aegis-allow' on the *shell* form, or
     the env toggle ``AEGIS_ALLOW_CI_WORKFLOW=1`` set by the orchestrator/human
@@ -388,7 +394,7 @@ def rule_ci_workflow_protect(ev: Event, policy=None) -> Optional[Decision]:
     own env for a hook invocation it doesn't control, so neither path is
     agent-self-escapable."""
     cfg = getattr(policy, "ci_workflow", None) or {}
-    mode = str(cfg.get("mode", "deny")).lower()
+    mode = str(cfg.get("mode", "ask")).lower()
     if mode == "off":
         return None
     action = Action.ASK if mode == "ask" else Action.DENY
@@ -413,11 +419,20 @@ def rule_ci_workflow_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        touches_workflow = bool(patterns.CI_WORKFLOW_PATH_RE.search(cmd)) and (
+        # CI_WORKFLOW_FIND_RE catches `find -path/-name/-regex` naming the target
+        # without ever writing its path as one contiguous string (same reason
+        # rule_self_protect pairs FIND_PROTECTED_RE alongside its own path
+        # patterns — see that pattern's docstring). FORCED_LINK_WRITE_RE catches
+        # `ln -f`/`New-Item -Force`, a write shape none of the other four verb
+        # patterns below recognize (QA finding, round 1).
+        names_workflow = bool(patterns.CI_WORKFLOW_PATH_RE.search(cmd)
+                               or patterns.CI_WORKFLOW_FIND_RE.search(cmd))
+        touches_workflow = names_workflow and (
             patterns.WRITE_REDIRECT_RE.search(cmd)
             or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
-            or patterns.INPLACE_WRITE_RE.search(cmd))
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd))
         if not touches_workflow:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CI_WORKFLOW")
