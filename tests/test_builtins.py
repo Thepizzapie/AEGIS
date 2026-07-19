@@ -246,6 +246,26 @@ def test_self_protect_blocks_find_regex_predicate():
     assert not evaluate(_shell(r"find . -regex '.*\.txt'"), EMPTY).blocked
 
 
+def test_find_protected_no_quadratic_blowup():
+    """FIND_PROTECTED_RE's original `\\bfind\\b[^|;&\\n]*(?<!\\S)-i?(?:path|...)\\b
+    \\s*['"]?[^'"\\n]*?(?:...)` shape — unbounded on both wildcards — hung for
+    90s+ on `"find . -name x " * 8000` reaching rule_self_protect through the
+    real evaluate() pipeline: a total fail-open for this NEVER-escapable guard
+    (and every guard after it in BUILTIN_RULES, since evaluate() runs rules in
+    sequence). Discovered incidentally while adversarially QA-reviewing an
+    unrelated new guard (git-hooks-protect) that reused this exact pattern
+    shape — not by exercising self-protect directly, which is why this
+    dedicated perf test didn't already exist despite 7 prior QA rounds on this
+    pattern. Fixed by splitting into two independently-bounded pieces (see
+    patterns.FIND_WORD_RE's comment)."""
+    import time
+    cmd = "find . -name x " * 8000
+    start = time.time()
+    evaluate(_shell(cmd), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"rule_self_protect took {elapsed:.2f}s on adversarial find input"
+
+
 def test_normal_work_allowed():
     assert not evaluate(_shell("ls -la"), EMPTY).blocked
     assert not evaluate(_edit("src/app.py"), EMPTY).blocked
