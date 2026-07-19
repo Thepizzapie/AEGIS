@@ -246,6 +246,26 @@ def test_self_protect_blocks_find_regex_predicate():
     assert not evaluate(_shell(r"find . -regex '.*\.txt'"), EMPTY).blocked
 
 
+def test_find_protected_requires_same_clause():
+    """The ReDoS fix (splitting the "find" word-check from the predicate
+    check into two independent regexes) must not drop the ORIGINAL's
+    same-clause locality requirement — self-protect is a NEVER-escapable
+    hard-deny guard, so a false positive here fully blocks legitimate work
+    with no override. A real, unrelated `find` in one `;`-separated clause
+    and an unrelated predicate-shaped fragment in ANOTHER clause must not
+    combine into a false match (independently verified against
+    patterns.find_protected_hit; the full evaluate() pipeline may still deny
+    such a command via a wholly separate, pre-existing mechanism — e.g.
+    CONFIG_DIR_RE's bare '.claude'/'.aegis' substring match — which is
+    unrelated to this check and out of scope here)."""
+    from aegis import patterns
+    assert not patterns.find_protected_hit(
+        "find /var/log -type f -mtime +7; rm $(something -name aegis)")
+    # same-clause forms must still match (no regression in detection power)
+    assert patterns.find_protected_hit("rm $(find . -path '*/aegis/*' -name rules.py)")
+    assert patterns.find_protected_hit("find . -iname rules.py -ipath '*aegis*' -delete")
+
+
 def test_find_protected_no_quadratic_blowup():
     """FIND_PROTECTED_RE's original `\\bfind\\b[^|;&\\n]*(?<!\\S)-i?(?:path|...)\\b
     \\s*['"]?[^'"\\n]*?(?:...)` shape — unbounded on both wildcards — hung for

@@ -302,6 +302,48 @@ def test_unzip_to_hooks_dir_gated():
     assert _gated(evaluate(_shell("unzip payload.zip -d .git/hooks/"), EMPTY))
 
 
+def test_7z_no_space_output_flag_gated():
+    """7-Zip's canonical `-oDIR` output flag attaches its argument with NO
+    separator at all — the leading-context class of the path patterns must
+    recognize a path starting right after `-o` (QA finding, independent
+    adversarial review, round 2)."""
+    assert _gated(evaluate(_shell("7za x payload.7z -o.git/hooks/"), EMPTY))
+    assert _gated(evaluate(_shell("7z x payload.7z -o.git/hooks/"), EMPTY))
+
+
+def test_tar_flag_before_target_dir_gated():
+    """`tar -C .git/hooks/ -xf payload.tar` — the extract flag is NOT the
+    first token after `tar` (an ordinary, common tar invocation order) — QA
+    (independent adversarial review, round 2) found the original check only
+    looked at the immediately-following token."""
+    assert _gated(evaluate(_shell("tar -C .git/hooks/ -xf payload.tar"), EMPTY))
+    assert _gated(evaluate(_shell("tar -C .git/hooks -x -f payload.tar"), EMPTY))
+
+
+def test_archive_verb_re_no_quadratic_blowup():
+    from aegis import patterns
+    checks = [
+        "tar " + "-a foo " * 20000,
+        "7z " * 20000,
+        "tar -C x -y z " * 8000,
+    ]
+    for adv in checks:
+        start = time.time()
+        patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(adv)
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"GIT_HOOKS_ARCHIVE_VERB_RE took {elapsed:.2f}s on {adv[:20]!r}..."
+
+
+def test_path_re_dash_o_leading_context_no_quadratic_blowup():
+    from aegis import patterns
+    adv = "-o" * 40000
+    for pat in (patterns.GIT_HOOKS_PATH_RE, patterns.GIT_HOOKS_DIR_RE):
+        start = time.time()
+        pat.search(adv)
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"{pat.pattern[:20]!r}... took {elapsed:.2f}s"
+
+
 def test_install_mode_flag_gated():
     assert _gated(evaluate(_shell("install -m 755 evil.sh .git/hooks/pre-commit"), EMPTY))
 

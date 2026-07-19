@@ -206,6 +206,28 @@ DELETE_OR_MOVE_VERB_RE = re.compile(
 # chaining that caused it — see `find_protected_hit`/`ci_workflow_find_hit`/
 # `git_hooks_find_hit` below.
 FIND_WORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
+# Shell-clause splitter (`;`/`&`/`|`/newline) — used by `_find_word_and_predicate_hit`
+# to restore same-clause locality between "find" and its dangerous predicate
+# without re-chaining them into one regex. QA (independent adversarial review,
+# round 2) found the FIRST fix — "find exists ANYWHERE" AND "predicate exists
+# ANYWHERE", checked independently with no locality at all — was too loose for
+# a NEVER-escapable hard-deny guard (self-protect): a real, wholly unrelated
+# `find` clause, an unrelated `-name`-mentioning comment/string, and an
+# unrelated `rm` in the SAME command line (joined by `;`) combined to a false
+# DENY even though no clause on its own was dangerous. Splitting on real shell
+# separators and requiring BOTH pieces match within the SAME clause is still
+# safe against the original ReDoS (each clause is checked independently with
+# the same bounded regexes, so total cost stays linear in input length — a
+# crafted string with many `;`-separated clauses just means many cheap,
+# independent per-clause checks, not one combinatorial one).
+_CLAUSE_SPLIT_RE = re.compile(r"[;&|\n]+")
+
+
+def _find_word_and_predicate_hit(cmd: str, predicate_re) -> bool:
+    for clause in _CLAUSE_SPLIT_RE.split(cmd):
+        if FIND_WORD_RE.search(clause) and predicate_re.search(clause):
+            return True
+    return False
 
 
 def _find_predicate_re(target_src: str):
@@ -257,7 +279,7 @@ FIND_PROTECTED_RE = _find_predicate_re(r"(?:\baegis\b|\.claude\b)")
 
 
 def find_protected_hit(cmd: str) -> bool:
-    return bool(FIND_WORD_RE.search(cmd)) and bool(FIND_PROTECTED_RE.search(cmd))
+    return _find_word_and_predicate_hit(cmd, FIND_PROTECTED_RE)
 
 
 AEGIS_UNINSTALL_RE = re.compile(r"\baegis\b[^|;&\n]*\buninstall\b", re.IGNORECASE)
@@ -703,7 +725,7 @@ CI_WORKFLOW_FIND_RE = _find_predicate_re(r"(?:" + _CI_NAME_FRAGMENTS + r")")
 
 
 def ci_workflow_find_hit(cmd: str) -> bool:
-    return bool(FIND_WORD_RE.search(cmd)) and bool(CI_WORKFLOW_FIND_RE.search(cmd))
+    return _find_word_and_predicate_hit(cmd, CI_WORKFLOW_FIND_RE)
 
 # `ln -f`/`-sf` (force a symlink/hardlink over an existing target) and
 # PowerShell's `New-Item -Force` overwrite a file without any delete/move verb,
@@ -773,10 +795,21 @@ _GIT_HOOK_NAMES = (
 # realistically nests only a few directories deep) for the same reason every
 # other multi-segment span in this file is bounded — see `_CI_MULTI`'s comment.
 _SUBMODULE_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+# Leading-context class widened with `-o` (in addition to the usual
+# start/whitespace/quote/separator/`=` set every other path pattern in this
+# file uses) — 7-Zip's canonical output-directory flag attaches its argument
+# with NO separator at all (`7z x payload.7z -o.git/hooks/`), so the
+# `\s`/quote/`=`-only class never recognized the path began right there (QA
+# finding, independent adversarial review, round 2: this and the two other
+# archive-verb gaps below sailed through with zero detection even though
+# GIT_HOOKS_ARCHIVE_VERB_RE correctly recognized `7z`/`7za` as an archive
+# verb — the path-anchor pattern was the piece that missed it, not the verb
+# check).
+_GIT_HOOKS_LEAD = r"(?:^|[\s'\"/\\=]|-o)"
 GIT_HOOKS_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"hooks" + _WIN_TRIM + _SEP
+    _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"hooks" + _WIN_TRIM + _SEP
     + r"(?:" + _GIT_HOOK_NAMES + r")" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"modules" + _WIN_TRIM + _SEP
+    + r"|" + _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"modules" + _WIN_TRIM + _SEP
     + r"(?:" + _SUBMODULE_SEG + r"){1,4}hooks" + _WIN_TRIM + _SEP
     + r"(?:" + _GIT_HOOK_NAMES + r")" + _CI_END,
     re.IGNORECASE,
@@ -790,8 +823,8 @@ GIT_HOOKS_PATH_RE = re.compile(
 # broadening CONFIG_DIR_RE already applies for `.aegis`/`.claude` alongside
 # AEGIS_SOURCE_RE's file-level match.
 GIT_HOOKS_DIR_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"hooks" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"modules" + _WIN_TRIM + _SEP
+    _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"hooks" + _CI_END
+    + r"|" + _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"modules" + _WIN_TRIM + _SEP
     + r"(?:" + _SUBMODULE_SEG + r"){1,4}hooks" + _CI_END,
     re.IGNORECASE,
 )
@@ -861,10 +894,13 @@ GIT_HOOKS_FIND_PREDICATE_RE = _find_predicate_re(
 
 
 def git_hooks_find_hit(cmd: str) -> bool:
-    """True if ``cmd`` both invokes ``find`` and has a -path/-name/-wholename/
-    -regex predicate naming a git-hooks target — see GIT_HOOKS_FIND_PREDICATE_RE's
-    comment for why this is two independent checks, not one chained regex."""
-    return bool(FIND_WORD_RE.search(cmd)) and bool(GIT_HOOKS_FIND_PREDICATE_RE.search(cmd))
+    """True if ``cmd`` both invokes ``find`` and has, in the SAME shell clause,
+    a -path/-name/-wholename/-regex predicate naming a git-hooks target — see
+    GIT_HOOKS_FIND_PREDICATE_RE's comment for why this is two independently-
+    bounded checks rather than one chained regex, and
+    `_find_word_and_predicate_hit`'s comment for why same-clause locality
+    matters (an earlier version matched across unrelated `;`-joined clauses)."""
+    return _find_word_and_predicate_hit(cmd, GIT_HOOKS_FIND_PREDICATE_RE)
 # `git config core.hooksPath <dir>` (repo- or user-global-scoped) redirects git
 # to run hooks from an ARBITRARY directory instead of `.git/hooks/` — a second,
 # independent way to the same outcome that a bare path match on `.git/hooks/`
@@ -976,17 +1012,22 @@ GIT_CONFIG_FILE_PATH_RE = re.compile(
 # adjacent `-m`/`--mode` flag — same reason INPLACE_WRITE_RE's own docstring
 # excludes a bare `install` verb (indistinguishable by regex from `npm
 # install`/`pip install` sharing a shell line with a mere read of a hook).
+# Up to 4 whitespace-delimited tokens scanned (lazily, each bounded to 30
+# chars) rather than only "the token immediately after tar" — QA
+# (independent adversarial review, round 2) found `tar -C .git/hooks/ -xf
+# payload.tar` (an extremely ordinary tar invocation — arguably MORE common
+# than `tar xf payload.tar -C dir`) sailed through undetected, since the
+# extract flag wasn't the first token. Each repetition is anchored by real
+# `\s+` on both sides (a genuine token boundary), which is what keeps this
+# safe from the same catastrophic-backtracking shape bounding alone didn't
+# fix elsewhere in this file: the engine can't ambiguously re-split WHERE one
+# token ends and the next begins the way two adjacent unbounded classes over
+# the SAME characters could — real whitespace resolves it deterministically.
+_TAR_TOKEN = r"\s+[^\s|;&\n]{1,30}"
 GIT_HOOKS_ARCHIVE_VERB_RE = re.compile(
     r"\brsync\b"
-    # tar's flag cluster may or may not carry a leading '-' (`tar xf x.tar`
-    # and `tar -xf x.tar` are both valid, and the no-dash form is the more
-    # common idiom in practice) — QA (independent adversarial review, round 1
-    # follow-up) found the dash-required form missed `tar xf payload.tar -C
-    # .git/hooks/` outright. Bounded to a short flag cluster right after
-    # `tar` (`{0,5}` either side of the 'x'), not an open-ended scan, so this
-    # stays a fixed, cheap check.
-    r"|\btar\b\s+-?[a-zA-Z]{0,5}x[a-zA-Z]{0,5}\b"
-    r"|\btar\b[^|;&\n]{0,50}--extract\b"
+    r"|\btar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+-{0,2}[a-zA-Z]{0,5}x[a-zA-Z]{0,5}\b)"
+    r"|\btar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+--extract\b)"
     r"|\bunzip\b"
     r"|\b7z[az]?\b(?=[^|;&\n]{0,50}\b[xe]\b)"
     r"|\binstall\b(?=[^|;&\n]{0,50}(?:-m\b|--mode\b))",
