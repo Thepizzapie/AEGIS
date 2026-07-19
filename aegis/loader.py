@@ -53,7 +53,7 @@ def load_policy(path) -> Policy:
         "rules": [], "default": Action.ALLOW, "on_error": Action.ALLOW,
         "egress": {}, "plugins": [], "workspace": {}, "project": None,
         "agent_label": None, "install_review": {}, "mcp_config": {},
-        "ci_workflow": {}, "inject": {}, "failures": {}, "completion": {},
+        "ci_workflow": {}, "git_hooks": {}, "inject": {}, "failures": {}, "completion": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
     }
     for f in _yaml_files(path):
@@ -80,7 +80,7 @@ def load_policy(path) -> Policy:
                   plugins=st["plugins"], workspace=st["workspace"],
                   project=st["project"], agent_label=st["agent_label"],
                   install_review=st["install_review"], mcp_config=st["mcp_config"],
-                  ci_workflow=st["ci_workflow"],
+                  ci_workflow=st["ci_workflow"], git_hooks=st["git_hooks"],
                   inject=st["inject"], failures=st["failures"],
                   completion=st["completion"],
                   team=lc["team"], compaction=lc["compaction"],
@@ -109,8 +109,8 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
         st["agent_label"] = str(data["agent_label"])
     # Guard-config knobs (install review, MCP-config protection, context
     # injection, failure-loop, completion verification) — small dicts.
-    for key in ("install_review", "mcp_config", "ci_workflow", "inject", "failures",
-                "completion"):
+    for key in ("install_review", "mcp_config", "ci_workflow", "git_hooks", "inject",
+                "failures", "completion"):
         if isinstance(data.get(key), dict):
             st[key] = dict(data[key])
         elif data.get(key):

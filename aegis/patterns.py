@@ -190,14 +190,98 @@ DELETE_OR_MOVE_VERB_RE = re.compile(
 # INPLACE_WRITE_RE in rule_self_protect exactly like the other path patterns
 # — a bare `find ... -name` that only LISTS matches (no verb, no command
 # substitution feeding one) is not itself a write and stays allowed.
-FIND_PROTECTED_RE = re.compile(
-    # (?<!\S), not \b, before '-i?path': '-' is a non-word char, so \b can never
-    # match immediately before it (no \w/\W transition between a preceding space
-    # and '-') — that silently made this whole pattern dead on arrival.
-    r"\bfind\b[^|;&\n]*(?<!\S)-i?(?:path|name|wholename|regex)\b\s*['\"]?[^'\"\n]*?"
-    r"(?:\baegis\b|\.claude\b)",
-    re.IGNORECASE,
-)
+# Shared by every `find -path/-name/-wholename/-regex` indirection check in
+# this file (self-protect's FIND_PROTECTED_RE, ci-workflow's
+# CI_WORKFLOW_FIND_RE, git-hooks' GIT_HOOKS_FIND_PREDICATE_RE): the "word
+# `find` appears somewhere" half of the check, kept as its OWN independent,
+# trivial-cost regex rather than chained as a leading `\bfind\b[^|;&\n]*`
+# prefix on the predicate pattern. QA (independent adversarial review) found
+# the chained form — even with the trailing gap bounded — forces catastrophic
+# backtracking whenever "find" and the predicate flag both repeat with high
+# density (`"find . -name x " * 8000` measured ~6s-90s+ across the affected
+# patterns): every occurrence of "find" retries reaching every nearby
+# occurrence of the flag independently, multiplying instead of summing. A
+# probe function combining two independently-bounded regexes (this one, and
+# a target-only predicate pattern with no leading "find" at all) removes the
+# chaining that caused it — see `find_protected_hit`/`ci_workflow_find_hit`/
+# `git_hooks_find_hit` below.
+FIND_WORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
+# Shell-clause splitter (`;`/`&`/`|`/newline) — used by `_find_word_and_predicate_hit`
+# to restore same-clause locality between "find" and its dangerous predicate
+# without re-chaining them into one regex. QA (independent adversarial review,
+# round 2) found the FIRST fix — "find exists ANYWHERE" AND "predicate exists
+# ANYWHERE", checked independently with no locality at all — was too loose for
+# a NEVER-escapable hard-deny guard (self-protect): a real, wholly unrelated
+# `find` clause, an unrelated `-name`-mentioning comment/string, and an
+# unrelated `rm` in the SAME command line (joined by `;`) combined to a false
+# DENY even though no clause on its own was dangerous. Splitting on real shell
+# separators and requiring BOTH pieces match within the SAME clause is still
+# safe against the original ReDoS (each clause is checked independently with
+# the same bounded regexes, so total cost stays linear in input length — a
+# crafted string with many `;`-separated clauses just means many cheap,
+# independent per-clause checks, not one combinatorial one).
+_CLAUSE_SPLIT_RE = re.compile(r"[;&|\n]+")
+
+
+def _find_word_and_predicate_hit(cmd: str, predicate_re) -> bool:
+    for clause in _CLAUSE_SPLIT_RE.split(cmd):
+        if FIND_WORD_RE.search(clause) and predicate_re.search(clause):
+            return True
+    return False
+
+
+def _find_predicate_re(target_src: str):
+    """Build a `-path/-name/-wholename/-regex <value>` predicate matcher for a
+    given target-fragment source string, split into quoted vs. unquoted value
+    branches (not one shared class that lets both cross whitespace) — see
+    GIT_HOOKS_FIND_PREDICATE_RE's comment for why the unquoted branch must
+    stop at the next whitespace: an UNQUOTED value is a single shell token by
+    construction, and admitting `\\s` into its scan class reintroduced the
+    same catastrophic-backtracking shape on `"-name x " * 20000`-style input
+    even after the leading `\\bfind\\b` chaining above was removed."""
+    return re.compile(
+        r"(?<!\S)-i?(?:path|name|wholename|regex)\b\s*(?:"
+        + r"['\"][^'\"\n]{0,200}?" + target_src
+        + r"|[^'\"\s\n]{0,200}?" + target_src
+        + r")",
+        re.IGNORECASE,
+    )
+
+
+# `find`'s -path/-name/-wholename/-regex predicates can describe a target
+# file WITHOUT ever writing its full path as one contiguous string (`find .
+# -path '*/aegis/*' -name rules.py`, or `find . -regex '.*aegis.*rules\.py'`),
+# evading every substring-adjacency path check above (AEGIS_SOURCE_RE /
+# CONFIG_DIR_RE / ENFORCEMENT_PATH_RE / AEGIS_SKILL_PATH_RE) even though
+# `rm $(find . -path '*/aegis/*' -name rules.py)` deletes Aegis's own engine
+# source just as directly as a literal path would — QA review (independent
+# agent, round 6; -regex/-iregex added in round 7 after the same reviewer
+# found the round-6 fix's predicate list was one short). High-signal: `find`
+# has no legitimate reason to search for a directory/file literally named
+# "aegis" or ".claude" outside of Aegis's own tree. Paired with
+# DELETE_OR_MOVE_VERB_RE / WRITE_REDIRECT_RE / COPY_WRITE_VERB_RE /
+# INPLACE_WRITE_RE in rule_self_protect exactly like the other path patterns
+# — a bare `find ... -name` that only LISTS matches (no verb, no command
+# substitution feeding one) is not itself a write and stays allowed.
+#
+# QA follow-up (independent adversarial review, round 8): the original
+# `\bfind\b[^|;&\n]*(?<!\S)-i?(?:path|...)\b\s*['"]?[^'"\n]*?(?:...)` shape —
+# unbounded on BOTH wildcards — hung for 90s+ on `"find . -name x " * 8000`
+# reaching this rule through the real evaluate() pipeline, a total fail-open
+# for this NEVER-escapable guard (and every guard after it in
+# BUILTIN_RULES, since evaluate() runs rules in sequence and a hang here
+# blocks all of them). Discovered incidentally while adversarially testing
+# an unrelated new guard, not by exercising this one directly — a reminder
+# that a shared, copied pattern shape needs its own dedicated perf test, not
+# just its original's. Fixed via the same `find_protected_hit()` two-piece
+# split described on FIND_WORD_RE above.
+FIND_PROTECTED_RE = _find_predicate_re(r"(?:\baegis\b|\.claude\b)")
+
+
+def find_protected_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, FIND_PROTECTED_RE)
+
+
 AEGIS_UNINSTALL_RE = re.compile(r"\baegis\b[^|;&\n]*\buninstall\b", re.IGNORECASE)
 # 'aegis pull' — overwrites the active policy; a hijacked agent that pulls a
 # permissive policy and then proceeds unguarded is the self-protect failure mode.
@@ -630,11 +714,18 @@ _CI_NAME_FRAGMENTS = (
     r"workflows?|gitlab-ci|circleci|azure-pipelines|jenkinsfile|\.drone"
     r"|bitbucket-pipelines|buildkite|cloudbuild|appveyor|action\.ya?ml"
 )
-CI_WORKFLOW_FIND_RE = re.compile(
-    r"\bfind\b[^|;&\n]*(?<!\S)-i?(?:path|name|wholename|regex)\b\s*['\"]?[^'\"\n]*?"
-    r"(?:" + _CI_NAME_FRAGMENTS + r")",
-    re.IGNORECASE,
-)
+# QA follow-up (independent adversarial review, round 2): the original
+# `\bfind\b[^|;&\n]*(?<!\S)-i?(?:path|...)\b\s*['"]?[^'"\n]*?(?:...)` shape —
+# unbounded on both wildcards, identical to FIND_PROTECTED_RE's own original
+# form — shares the exact same catastrophic-backtracking blowup on
+# `"find . -name x " * 8000`-scale input; see FIND_WORD_RE's comment above
+# (defined once self-protect's own version was fixed) for the mechanism and
+# the two-piece split that closes it.
+CI_WORKFLOW_FIND_RE = _find_predicate_re(r"(?:" + _CI_NAME_FRAGMENTS + r")")
+
+
+def ci_workflow_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, CI_WORKFLOW_FIND_RE)
 
 # `ln -f`/`-sf` (force a symlink/hardlink over an existing target) and
 # PowerShell's `New-Item -Force` overwrite a file without any delete/move verb,
@@ -666,6 +757,280 @@ CI_WORKFLOW_FIND_RE = re.compile(
 FORCED_LINK_WRITE_RE = re.compile(
     r"\bln\b(?=[^|;&\n]{0,200}\s(?:-[a-zA-Z]*f\b|--force\b))"
     r"|\b(?:new-item|ni)\b(?=[^|;&\n]{0,200}-force\b)",
+    re.IGNORECASE,
+)
+
+# Git hooks — the LOCAL persistence/auto-exec surface. Every standard Git hook
+# name (pre-commit, pre-push, post-checkout, ...) executes with the invoking
+# user's full privileges on the very next matching git operation — the human's
+# next commit/push/checkout, not just the agent's own session — and, unlike
+# CI_WORKFLOW_PATH_RE's targets, a hook under `.git/hooks/` is NEVER tracked by
+# git itself: it has no diff, shows in no `git status`, and survives no code
+# review, so planting one here is the single most invisible durable backdoor
+# this file's guards cover. Same "runs later, unattended" shape as
+# MCP_CONFIG_PATH_RE / CI_WORKFLOW_PATH_RE, but worse: those two are at least
+# visible as an ordinary file change.
+#
+# All standard client-side + server-side hook names (see githooks(5)); git
+# only requires the file be present and executable — no extension, and any
+# name outside this list is never invoked, so an unlisted filename dropped in
+# the same directory is inert and correctly NOT matched.
+_GIT_HOOK_NAMES = (
+    r"applypatch-msg|pre-applypatch|post-applypatch"
+    r"|pre-commit|pre-merge-commit|prepare-commit-msg|commit-msg|post-commit"
+    r"|pre-rebase|post-checkout|post-merge|pre-push|pre-receive|update"
+    r"|proc-receive|post-receive|post-update|reference-transaction"
+    r"|push-to-checkout|pre-auto-gc|post-rewrite|sendemail-validate"
+    r"|fsmonitor-watchman|p4-changelist|p4-prepare-changelist|p4-post-changelist"
+    r"|p4-pre-submit|post-index-change"
+)
+# A submodule's REAL hooks directory is `.git/modules/<name>/hooks/<hook>` in
+# the SUPERPROJECT's git dir, not `<submodule>/.git/hooks/` — `.git` inside a
+# submodule working tree is a one-line pointer FILE (`gitdir: ../.git/modules/
+# <name>`), not a directory at all, so the plain `.git/hooks/` shape never
+# appears there (QA finding, independent adversarial review, round 1: a
+# submodule is an ordinary, common repo layout, not an exotic edge case, and
+# this silently bypassed the guard with a single Write call). `_SUBMODULE_SEG`
+# is length-bounded ({1,200} per segment, {0,4} segments — a submodule name
+# realistically nests only a few directories deep) for the same reason every
+# other multi-segment span in this file is bounded — see `_CI_MULTI`'s comment.
+_SUBMODULE_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+# Leading-context class widened with `-o` (in addition to the usual
+# start/whitespace/quote/separator/`=` set every other path pattern in this
+# file uses) — 7-Zip's canonical output-directory flag attaches its argument
+# with NO separator at all (`7z x payload.7z -o.git/hooks/`), so the
+# `\s`/quote/`=`-only class never recognized the path began right there (QA
+# finding, independent adversarial review, round 2: this and the two other
+# archive-verb gaps below sailed through with zero detection even though
+# GIT_HOOKS_ARCHIVE_VERB_RE correctly recognized `7z`/`7za` as an archive
+# verb — the path-anchor pattern was the piece that missed it, not the verb
+# check).
+_GIT_HOOKS_LEAD = r"(?:^|[\s'\"/\\=]|-o)"
+GIT_HOOKS_PATH_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"hooks" + _WIN_TRIM + _SEP
+    + r"(?:" + _GIT_HOOK_NAMES + r")" + _CI_END
+    + r"|" + _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"modules" + _WIN_TRIM + _SEP
+    + r"(?:" + _SUBMODULE_SEG + r"){1,4}hooks" + _WIN_TRIM + _SEP
+    + r"(?:" + _GIT_HOOK_NAMES + r")" + _CI_END,
+    re.IGNORECASE,
+)
+# The bare `.git/hooks` DIRECTORY, no specific hook filename required — an
+# archive/sync tool (rsync/tar/unzip) writes/extracts MULTIPLE names into a
+# target directory without ever naming a specific hook in the command itself
+# (QA finding, independent adversarial review, round 1: `rsync -a evil_hooks/
+# .git/hooks/` named no hook filename at all, so GIT_HOOKS_PATH_RE's
+# name-required form never matched). Same "directory, not just named files"
+# broadening CONFIG_DIR_RE already applies for `.aegis`/`.claude` alongside
+# AEGIS_SOURCE_RE's file-level match.
+GIT_HOOKS_DIR_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"hooks" + _CI_END
+    + r"|" + _GIT_HOOKS_LEAD + r"\.git" + _WIN_TRIM + _SEP + r"modules" + _WIN_TRIM + _SEP
+    + r"(?:" + _SUBMODULE_SEG + r"){1,4}hooks" + _CI_END,
+    re.IGNORECASE,
+)
+# `find`'s -path/-name/-regex predicates can name a hook target without the
+# command ever containing its path as one contiguous string — same evasion
+# FIND_PROTECTED_RE / CI_WORKFLOW_FIND_RE exist to close for their own surfaces
+# (e.g. `find . -path '*hooks*' -name pre-commit` never puts "hooks/pre-commit"
+# together as one substring).
+#
+# Matched on `.git/hooks` (contextual) or an EXACT standard hook name — NOT a
+# bare `hooks` fragment. QA (independent adversarial review, round 1) found a
+# bare `\bhooks\b` fallback false-positived on ordinary, common non-git
+# targets sharing the same word (`find . -path '*/src/hooks/*' -name
+# '*.test.ts' -delete` — React/Vue hooks directories) with a misleadingly
+# worded ask message; the standard hook name `update` did too (`find . -iname
+# '*update*' -delete` — matches almost any update-related file). `update` is
+# the one name in `_GIT_HOOK_NAMES` that is also a common, generic English
+# word with zero git-specific signal on its own; every OTHER name is
+# hyphenated/git-specific vocabulary (`pre-commit`, `post-checkout`, ...) and
+# keeps the same "distinguishing name fragment" trade-off CI_WORKFLOW_FIND_RE
+# already accepts for ITS fragments (this guard defaults to `ask`, not a hard
+# deny, so a remaining false hit costs one human confirmation).
+#
+# Both wildcards are length-bounded (`{0,200}`) — QA (round 1) measured the
+# original unbounded `[^|;&\n]*`/`[^'"\n]*?` pair scaling quadratically
+# (~70s+ projected at the same adversarial-input scale the sibling
+# GIT_HOOKS_PATH_RE perf test uses), the identical class of blowup this
+# file's other bounded spans (`_CI_SEG`/`_CI_MULTI`) exist to prevent.
+# Built explicitly (not via string-editing `_GIT_HOOK_NAMES`, which would also
+# corrupt the "update" SUBSTRING inside "post-update"/"reference-transaction"-
+# adjacent entries) so only the standalone `update` name is dropped.
+_GIT_HOOK_FIND_NAMES = (
+    r"applypatch-msg|pre-applypatch|post-applypatch"
+    r"|pre-commit|pre-merge-commit|prepare-commit-msg|commit-msg|post-commit"
+    r"|pre-rebase|post-checkout|post-merge|pre-push|pre-receive"
+    r"|proc-receive|post-receive|post-update|reference-transaction"
+    r"|push-to-checkout|pre-auto-gc|post-rewrite|sendemail-validate"
+    r"|fsmonitor-watchman|p4-changelist|p4-prepare-changelist|p4-post-changelist"
+    r"|p4-pre-submit|post-index-change"
+)
+# Deliberately NOT a single "find ... gap ... flag ... gap ... target" chained
+# regex the way FIND_PROTECTED_RE/CI_WORKFLOW_FIND_RE are — QA (independent
+# adversarial review, round 1) measured that shape (even with BOTH gaps
+# bounded to {0,200}) taking ~6s on `"find . -name x " * 8000`: with the
+# anchor word "find" and the predicate flag "-name" both repeating every ~16
+# chars, EVERY "find" occurrence's bounded gap can reach MANY different
+# "-name" occurrences within its own window, and each of those retries the
+# second bounded gap independently — the per-anchor cost multiplies by how
+# many candidate flag positions fall inside its window instead of staying
+# flat, the same "two adjacent quantifiers overlap on repetitive text" trap
+# _CI_SEG/_CI_MULTI's own comments describe, just not eliminated by bounding
+# alone this time (bounding safely fixed the SAME trap for GIT_HOOKS_CONFIG_RE
+# above only because that pattern's anchor word "git"/flag don't repeat with
+# comparable density in realistic adversarial constructions).
+#
+# Splitting into two independently-bounded pieces — "the word `find` appears
+# somewhere" (FIND_WORD_RE, defined once above) and "a path/name/wholename/
+# regex predicate whose value contains a hook fragment" (this pattern, built
+# by the shared `_find_predicate_re()` helper — see its docstring for why the
+# quoted/unquoted value forms are separate alternatives, not one shared class
+# that lets both cross whitespace) — removes the chaining that caused the
+# multiplication FIND_WORD_RE's own comment describes: each predicate
+# occurrence is now matched independently in a single linear pass, not
+# re-derived from a shared outer anchor's backtracking.
+GIT_HOOKS_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.git[/\\]hooks\b|\b(?:" + _GIT_HOOK_FIND_NAMES + r")\b)")
+
+
+def git_hooks_find_hit(cmd: str) -> bool:
+    """True if ``cmd`` both invokes ``find`` and has, in the SAME shell clause,
+    a -path/-name/-wholename/-regex predicate naming a git-hooks target — see
+    GIT_HOOKS_FIND_PREDICATE_RE's comment for why this is two independently-
+    bounded checks rather than one chained regex, and
+    `_find_word_and_predicate_hit`'s comment for why same-clause locality
+    matters (an earlier version matched across unrelated `;`-joined clauses)."""
+    return _find_word_and_predicate_hit(cmd, GIT_HOOKS_FIND_PREDICATE_RE)
+# `git config core.hooksPath <dir>` (repo- or user-global-scoped) redirects git
+# to run hooks from an ARBITRARY directory instead of `.git/hooks/` — a second,
+# independent way to the same outcome that a bare path match on `.git/hooks/`
+# cannot see at all: an agent stages a script anywhere, then points git at it
+# with one config write. `--global`/`--system` widen the blast radius to every
+# repo the human ever touches, not just this one.
+# Beyond the `git config` subcommand, git accepts the identical setting three
+# other ways that never contain the literal word "config" adjacent to "git" —
+# each independently sufficient, so each gets its own alternative:
+#   `git -c core.hooksPath=<dir> <command>` / `--config core.hooksPath=<dir>` /
+#   `--config-env core.hooksPath=<VAR>` — the SAME inline-config-flag evasion
+#   this file's own README documents as a known gap for destructive-git
+#   force-push (`git -c ...`), so it applies identically here.
+#   `GIT_CONFIG_KEY_<n>=core.hooksPath GIT_CONFIG_VALUE_<n>=<dir> git <command>`
+#   — git's documented environment-variable config-injection mechanism
+#   (git-config(1) "ENVIRONMENT"): no `git config`/`-c` invocation at all, just
+#   two env-var assignments ahead of any git command. Matched on the KEY-side
+#   assignment naming `core.hooksPath` — sufficient on its own regardless of
+#   where the paired VALUE assignment sits or what shell form wraps it.
+# The raw INI-form `[core]...hookspath =` block, factored out as a source
+# string (not just a compiled pattern) so it can be reused BOTH inside
+# GIT_HOOKS_CONFIG_RE (the shell-text scan, where the surrounding "[core]"
+# header matters for precision against arbitrary shell text) AND standalone
+# as GIT_HOOKS_CONFIG_INI_RE below (a path-INDEPENDENT check applied to any
+# Edit/Write file content): a full "[core] ... hookspath =" block is high-
+# signal enough on its own, regardless of destination filename, to catch an
+# agent staging the payload in an arbitrarily-named file that a SEPARATE,
+# individually-innocuous-looking `GIT_CONFIG_GLOBAL=<that file> git ...`
+# invocation later points git at — two calls, each silent alone, that this
+# closes the first (and materially riskier) half of (QA finding, independent
+# adversarial review, round 1). The second half — recognizing
+# `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` itself — is deliberately NOT pattern-
+# matched: unlike `-c`/`--config`/`GIT_CONFIG_KEY_n`, these env vars redirect
+# WHICH FILE holds config without naming any key, so a blanket match would
+# flag the ordinary, common practice of pointing git at an isolated config
+# for tests/sandboxing with no dangerous key involved — see this file's
+# CLOUD_METADATA_RE comment on an equivalent split-across-calls limitation
+# every guard here shares (no cross-call session state).
+_HOOKSPATH_INI_RE_SRC = r"\[core\][^\[]{0,2000}\bhookspath\s*="
+GIT_HOOKS_CONFIG_INI_RE = re.compile(_HOOKSPATH_INI_RE_SRC, re.IGNORECASE)
+GIT_HOOKS_CONFIG_RE = re.compile(
+    # Both gaps bounded ({0,200}, not unbounded '*') — QA (independent
+    # adversarial review, round 1) measured 'git ' + 'config '*30000 taking
+    # ~49s through the bare-unbounded form, and confirmed it still cost 2.3s
+    # through the real evaluate() pipeline even after normalize.py's 20K-char
+    # truncation. Same overlapping-unbounded-quantifier shape this file's
+    # other guards bound for the identical reason (see _CI_SEG's comment).
+    r"\bgit\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,200}\bcore\.hookspath\b"
+    # No 'git ... flag' freeform gap before the flag (a first version used
+    # `\bgit\b[^|;&\n]{0,200}(?:\s-c\s*|...)` — bounding the span at {0,200}
+    # was NOT enough: '(git -c )*20000' still forced ~22s of backtracking,
+    # because within any 200-char window `[^|;&\n]{0,200}` and the following
+    # `\s-c\s*`/`\s*` overlap on the SAME repeated "-c " text, so the engine
+    # explores every way to split it between the two quantifiers before
+    # concluding no match — the identical class of blowup _CI_SEG/_CI_MULTI's
+    # own comments describe, just not fixed by bounding alone here). The flag
+    # forms are specific enough on their own (nobody types "-c
+    # core.hooksPath=" for any reason but this) that no "git" prefix or
+    # freeform gap is needed at all — anchored on a token boundary via
+    # `(?<!\S)`, not `\b` (a `-` is a non-word char, so `\b` never matches
+    # immediately before it — the same fix `FIND_PROTECTED_RE` needed).
+    r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+core\.hookspath\s*="
+    r"|\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?core\.hookspath\b"
+    r"|" + _HOOKSPATH_INI_RE_SRC,  # a raw .git/config / ~/.gitconfig INI write
+    re.IGNORECASE,
+)
+# Content-only check for an Edit/Write to a CONFIRMED git-config path (gated by
+# GIT_CONFIG_FILE_PATH_RE below, not used standalone) — deliberately does NOT
+# require a `[core]` section header to appear in the same fragment.
+# GIT_HOOKS_CONFIG_RE's own INI-form alternative does require it, which is
+# right for a SHELL command (broad text with no path confirmation, so the
+# section header matters for precision) but wrong here: an Edit tool's
+# `new_string` is typically just the couple of lines being inserted into an
+# ALREADY-EXISTING `[core]` section — the header itself is old_string context
+# that never appears in new_string — so requiring it missed the ordinary,
+# non-adversarial shape of this exact edit entirely (QA finding, independent
+# adversarial review, round 1). Once the path is confirmed as a real
+# git-config file, a bare `hookspath =` line is already high-signal on its
+# own — no other git config key is spelled this way.
+GIT_HOOKS_CONFIG_CONTENT_RE = re.compile(r"\bhookspath\s*=", re.IGNORECASE)
+# The git-config file itself (repo-local, user-global by common name, or
+# system) — gates an Edit/Write's CONTENT scan for a smuggled `hooksPath =`
+# line to just these paths, so an unrelated file that happens to mention the
+# phrase (docs, this guard's own tests) is not false-flagged.
+GIT_CONFIG_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"config" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.gitconfig" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])(?:etc|usr" + _WIN_TRIM + _SEP + r"local" + _WIN_TRIM + _SEP + r"etc)"
+    + _WIN_TRIM + _SEP + r"gitconfig" + _CI_END
+    # git's documented XDG global-config fallback ($XDG_CONFIG_HOME/git/config,
+    # defaulting to ~/.config/git/config) — read and merged unconditionally,
+    # same as .gitconfig. Missing this let a single Write to '.config/git/
+    # config' plant a hooksPath redirect with zero detection (QA finding,
+    # independent adversarial review, round 1).
+    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"git" + _WIN_TRIM + _SEP
+    + r"config" + _CI_END,
+    re.IGNORECASE,
+)
+# Archive/sync tools that place a file WITHOUT any of WRITE_REDIRECT_RE /
+# DELETE_OR_MOVE_VERB_RE / DESTRUCTIVE_DELETE_RE / INPLACE_WRITE_RE /
+# FORCED_LINK_WRITE_RE's verb shapes — `rsync`, `tar -x`/`--extract`, `unzip`,
+# and coreutils `install -m` (copy+chmod in one primitive, the canonical
+# hook-planting shape). QA finding (independent adversarial review, round 1):
+# `rsync -a evil_hooks/ .git/hooks/` and `tar xf payload.tar -C .git/hooks/`
+# both sailed through with zero detection. Scoped to THIS guard only (not
+# folded into the shared INPLACE_WRITE_RE, which self-protect/ci-workflow-
+# protect also use) to keep the blast radius of a new, less battle-tested
+# pattern contained to the guard it was written for. `install` requires an
+# adjacent `-m`/`--mode` flag — same reason INPLACE_WRITE_RE's own docstring
+# excludes a bare `install` verb (indistinguishable by regex from `npm
+# install`/`pip install` sharing a shell line with a mere read of a hook).
+# Up to 4 whitespace-delimited tokens scanned (lazily, each bounded to 30
+# chars) rather than only "the token immediately after tar" — QA
+# (independent adversarial review, round 2) found `tar -C .git/hooks/ -xf
+# payload.tar` (an extremely ordinary tar invocation — arguably MORE common
+# than `tar xf payload.tar -C dir`) sailed through undetected, since the
+# extract flag wasn't the first token. Each repetition is anchored by real
+# `\s+` on both sides (a genuine token boundary), which is what keeps this
+# safe from the same catastrophic-backtracking shape bounding alone didn't
+# fix elsewhere in this file: the engine can't ambiguously re-split WHERE one
+# token ends and the next begins the way two adjacent unbounded classes over
+# the SAME characters could — real whitespace resolves it deterministically.
+_TAR_TOKEN = r"\s+[^\s|;&\n]{1,30}"
+GIT_HOOKS_ARCHIVE_VERB_RE = re.compile(
+    r"\brsync\b"
+    r"|\btar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+-{0,2}[a-zA-Z]{0,5}x[a-zA-Z]{0,5}\b)"
+    r"|\btar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+--extract\b)"
+    r"|\bunzip\b"
+    r"|\b7z[az]?\b(?=[^|;&\n]{0,50}\b[xe]\b)"
+    r"|\binstall\b(?=[^|;&\n]{0,50}(?:-m\b|--mode\b))",
     re.IGNORECASE,
 )
 

@@ -234,8 +234,10 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
         if (patterns.CONFIG_DIR_RE.search(cmd) or patterns.AEGIS_SOURCE_RE.search(cmd)
                 # find's -path/-name predicates can name a protected file without the
                 # command ever containing its path as one contiguous string — see
-                # FIND_PROTECTED_RE's docstring in patterns.py.
-                or patterns.FIND_PROTECTED_RE.search(cmd)) and (
+                # FIND_PROTECTED_RE's docstring in patterns.py. find_protected_hit(),
+                # not a bare .search() on FIND_PROTECTED_RE alone — see FIND_WORD_RE's
+                # comment in patterns.py for why this must stay a two-piece check.
+                or patterns.find_protected_hit(cmd)) and (
                 patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                 or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                 or patterns.WRITE_REDIRECT_RE.search(cmd)
@@ -426,7 +428,7 @@ def rule_ci_workflow_protect(ev: Event, policy=None) -> Optional[Decision]:
         # `ln -f`/`New-Item -Force`, a write shape none of the other four verb
         # patterns below recognize (QA finding, round 1).
         names_workflow = bool(patterns.CI_WORKFLOW_PATH_RE.search(cmd)
-                               or patterns.CI_WORKFLOW_FIND_RE.search(cmd))
+                               or patterns.ci_workflow_find_hit(cmd))
         touches_workflow = names_workflow and (
             patterns.WRITE_REDIRECT_RE.search(cmd)
             or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
@@ -446,6 +448,142 @@ def rule_ci_workflow_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "AEGIS_ALLOW_CI_WORKFLOW=1; a spawned agent cannot.")
         if mode == "monitor":
             _record_monitor(ev, would, "ci-workflow-protect-monitor")
+            return None
+        return would
+    return None
+
+
+# ---- git-hooks protection: escapable with human confirmation -----------------
+def _git_hooks_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_git_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a Git hook (``.git/hooks/pre-commit``, ``pre-push``,
+    ``post-checkout``, ...) and redirecting git to an attacker-controlled hooks
+    directory via ``core.hooksPath``.
+
+    A hook runs with the invoking user's full privileges on the very next
+    matching git operation — the human's next commit/push/checkout, not just
+    this session — with no further agent action needed, the same "runs later,
+    unattended" shape as ``rule_mcp_config_protect`` (next-session auto-exec) and
+    ``rule_ci_workflow_protect`` (next-CI-run auto-exec). Worse than either: a
+    file under ``.git/hooks/`` is NEVER tracked by git itself, so it has no diff,
+    shows in no ``git status``, and survives no code review — the most invisible
+    durable backdoor of the three. ``core.hooksPath`` is a second, independent
+    path to the same outcome: it redirects git to run hooks from an arbitrary
+    directory the agent staged a script in beforehand, so a bare path check on
+    ``.git/hooks/`` alone cannot see it — a ``--global``/``--system`` scoped
+    redirect widens the blast radius to every repo the human ever touches.
+
+    Config (``policy.git_hooks``): ``mode`` (deny|ask|monitor|off, default ask),
+    ``allow`` (regexes on the path/command that skip the gate — a repo's own
+    trusted ``pre-commit install``/husky setup, say). Defaults to ``ask`` for the
+    same reason ``rule_ci_workflow_protect`` does: installing a pre-commit/husky
+    hook is routine, sanctioned dev work, unlike planting an MCP server.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the *shell* form, or
+    the env toggle ``AEGIS_ALLOW_GIT_HOOKS=1`` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot set
+    its own env for a hook invocation it doesn't control, so neither path is
+    agent-self-escapable.
+
+    Honest scope: this is a path-string match on the standard hook directory
+    (including a submodule's real `.git/modules/<name>/hooks/` location) and
+    hook names (see ``patterns.py`` for the full githooks(5) list) plus a
+    ``core.hooksPath`` command/content match — the same denylist trade-offs as
+    every other guard in this file (``find``-indirection, forced-link swaps,
+    and archive/sync tools (rsync/tar/unzip/`install -m`) are covered the way
+    ``rule_ci_workflow_protect``'s equivalents are). Known residual gaps, same
+    spirit as this file's other disclosed denylist limits: a hook name outside
+    the standard set; a shell command that computes the hook path indirectly
+    across variable assignments; an MCP tool naming its target argument
+    outside ``_path()``'s recognized key list; a fully relocated git dir via
+    ``--separate-git-dir``/a `.git` pointer file with no "modules" in the
+    path; and ``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM`` redirecting to a
+    payload staged in an EARLIER, separate tool call (Aegis evaluates each
+    call independently — see ``GIT_HOOKS_CONFIG_INI_RE``'s comment in
+    ``patterns.py``)."""
+    cfg = getattr(policy, "git_hooks", None) or {}
+    # YAML 1.1 parses an unquoted `off` as boolean False — accept both
+    # spellings, the same fix `rule_failure_loop` already applies for its own
+    # `mode` knob (QA finding, independent adversarial review, round 1: this
+    # guard silently stayed ACTIVE — fails safe, not open, but still a
+    # config-hygiene bug worth closing).
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        hook_hit = bool(p and patterns.GIT_HOOKS_PATH_RE.search(p))
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        config_hit = False
+        if content:
+            # Path-independent: a full "[core] ... hookspath =" block is
+            # high-signal regardless of destination filename — see
+            # GIT_HOOKS_CONFIG_INI_RE's comment in patterns.py for why.
+            if patterns.GIT_HOOKS_CONFIG_INI_RE.search(content):
+                config_hit = True
+            elif p and patterns.GIT_CONFIG_FILE_PATH_RE.search(p) and (
+                    patterns.GIT_HOOKS_CONFIG_CONTENT_RE.search(content)):
+                config_hit = True
+        if not (hook_hit or config_hit):
+            return None
+        if os.environ.get("AEGIS_ALLOW_GIT_HOOKS") or _git_hooks_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"Git hook '{p}' is being written" if hook_hit
+                  else f"'{p}' is being written with a core.hooksPath redirect")
+        would = Decision(action, "git-hooks-protect",
+                         f"{reason} — a hook script runs automatically, with the "
+                         "invoking user's full privileges, on the very next matching "
+                         "git operation, and (unlike a tracked file) is invisible to "
+                         "`git diff`/`git status`/code review. Review the change, "
+                         "then confirm with AEGIS_ALLOW_GIT_HOOKS=1; a spawned agent "
+                         "cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "git-hooks-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_hook = bool(patterns.GIT_HOOKS_PATH_RE.search(cmd)
+                           or patterns.GIT_HOOKS_DIR_RE.search(cmd)
+                           or patterns.git_hooks_find_hit(cmd))
+        touches_hook = names_hook and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd))
+        config_redirect = bool(patterns.GIT_HOOKS_CONFIG_RE.search(cmd))
+        if not (touches_hook or config_redirect):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GIT_HOOKS")
+                or _git_hooks_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("Git hook configuration is being modified from a shell" if touches_hook
+                  else "git's hooksPath is being redirected from a shell")
+        would = Decision(action, "git-hooks-protect",
+                         f"{reason} — a hook script runs automatically, with the "
+                         "invoking user's full privileges, on the very next matching "
+                         "git operation, and (unlike a tracked file) is invisible to "
+                         "`git diff`/`git status`/code review. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_GIT_HOOKS=1; a spawned "
+                         "agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "git-hooks-protect-monitor")
             return None
         return would
     return None
@@ -848,6 +986,7 @@ _CORE_RULES = (
     rule_self_protect,
     rule_mcp_config_protect,
     rule_ci_workflow_protect,
+    rule_git_hooks_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

@@ -240,6 +240,20 @@ def test_path_immediately_followed_by_separator_gated():
     assert _gated(evaluate(_shell("cat .github/workflows/ci.yml|rm"), EMPTY))
 
 
+def test_ci_workflow_find_no_quadratic_blowup():
+    """CI_WORKFLOW_FIND_RE shared FIND_PROTECTED_RE's original unbounded
+    `\\bfind\\b[^|;&\\n]*(?<!\\S)-i?(?:path|...)\\b\\s*['"]?[^'"\\n]*?(?:...)`
+    shape — same catastrophic-backtracking blowup on `"find . -name x " *
+    8000`-scale input, discovered incidentally while QA-reviewing the new
+    git-hooks-protect guard that reused this exact pattern. Fixed the same
+    way (see patterns.FIND_WORD_RE's comment)."""
+    cmd = "find . -name x " * 8000
+    start = time.time()
+    evaluate(_shell(cmd), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"rule_ci_workflow_protect took {elapsed:.2f}s on adversarial find input"
+
+
 def test_forced_link_regex_no_quadratic_blowup():
     """FORCED_LINK_WRITE_RE's lookahead must be length-bounded like _CI_SEG/
     _CI_MULTI — an earlier version had an unbounded span that reintroduced the
