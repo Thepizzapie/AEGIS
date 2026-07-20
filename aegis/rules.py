@@ -601,30 +601,47 @@ def _agent_def_allowed_by_policy(cfg: dict, text: str) -> bool:
 
 
 def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
-    """Block planting/altering project instructions (``CLAUDE.md``/``AGENTS.md``)
-    or a custom agent/command definition (``.claude/agents/*.md``,
-    ``.claude/commands/*.md``, project- or user-scoped).
+    """Block planting/altering project instructions (``CLAUDE.md``/``AGENTS.md``,
+    including the ``.local`` supplement variants) or a custom agent/command/
+    output-style definition (``.claude/agents/*.md``, ``.claude/commands/*.md``,
+    ``.claude/output-styles/*.md``, project- or user-scoped).
 
     ``CLAUDE.md``/``AGENTS.md`` is folded directly into the model's OWN context
     on every FUTURE session start — the same "runs later, unattended" shape as
     ``rule_mcp_config_protect``, except the payload is natural-language
     instructions merged straight into the system prompt rather than a shelled-
     out command, and it persists across every sub-agent spawned in that future
-    session too. A ``.claude/agents/*.md`` sub-agent whose description reads
-    like "use PROACTIVELY" is auto-selected by the orchestrator with no
-    explicit per-invocation human choice, and routinely carries its own tool
-    allowlist (up to ``tools: "*"``) independent of whatever gated the session
-    that planted it — privilege escalation via a natural-language file, not
-    code. A ``.claude/commands/*.md`` slash command only runs when a human
-    explicitly types it, but the human is trusting the command NAME each time,
-    not re-reading the file's body — the same "trusted name, unread body" trap
-    ``rule_ci_workflow_protect``/``rule_git_hooks_protect`` exist for. None of
-    the four paths were covered by any existing guard: self-protect's
-    ``AEGIS_SKILL_PATH_RE`` is scoped to Aegis's OWN shipped skills, never a
-    user's; ``CONFIG_DIR_RE`` backstops a shell-based delete/redirect under
-    ``.claude/`` but not a root-level ``CLAUDE.md``/``AGENTS.md`` (no
-    ``.claude`` substring) and not ANY plain ``Edit``/``Write`` tool call at
-    all (no shell involved) to any of the four.
+    session too. Its fuse is shorter than ``rule_ci_workflow_protect``'s/
+    ``rule_git_hooks_protect``'s: those need an EXTERNAL future trigger (a
+    push, a commit) before the payload runs; a nested-directory ``CLAUDE.md``
+    can self-trigger WITHIN the same session, the instant the agent's cwd
+    moves into that subtree, no human action in between at all. ``ask`` is
+    still the right default (below), not ``deny`` — but this asymmetry is
+    exactly why it's disclosed here rather than silently inherited. A
+    ``.claude/agents/*.md`` sub-agent whose description reads like "use
+    PROACTIVELY" is auto-selected by the orchestrator with no explicit
+    per-invocation human choice, and routinely carries its own tool allowlist
+    (up to ``tools: "*"``) independent of whatever gated the session that
+    planted it — privilege escalation via a natural-language file, not code.
+    A ``.claude/commands/*.md``/``.claude/output-styles/*.md`` definition only
+    takes effect when a human explicitly invokes/selects it, but the human is
+    trusting the NAME each time, not re-reading the file's body — the same
+    "trusted name, unread body" trap ``rule_ci_workflow_protect``/
+    ``rule_git_hooks_protect`` exist for.
+
+    NOT new coverage (QA correction, independent adversarial review, round 1
+    — an earlier draft of this docstring overstated this): a shell-based
+    delete/redirect/in-place-edit under ``.claude/`` — which includes
+    ``.claude/agents/*``/``.claude/commands/*``/``.claude/output-styles/*`` —
+    was ALREADY denied, non-escapably, by ``rule_self_protect``'s broad
+    ``CONFIG_DIR_RE`` match; this guard's shell branch is a redundant, weaker
+    (``ask``, escapable) second layer there, not new ground. What actually IS
+    new: (1) a root/nested ``CLAUDE.md``/``AGENTS.md`` in EITHER form (shell
+    or Edit/Write) — no ``.claude`` substring, so ``CONFIG_DIR_RE`` never
+    fires on it; (2) a plain ``Edit``/``Write``/MCP-tool call (no shell) to
+    ANY of these paths — self-protect's own EDIT/WRITE branch checks only
+    ``ENFORCEMENT_PATH_RE``/``AEGIS_SOURCE_RE``/``AEGIS_SKILL_PATH_RE``, never
+    the broader ``CONFIG_DIR_RE``.
 
     Config (``policy.agent_def``): ``mode`` (deny|ask|monitor|off, default
     ask), ``allow`` (regexes on the path/command that skip the gate — a
@@ -640,14 +657,28 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     neither path is agent-self-escapable.
 
     Honest scope: a path-string match, the same denylist trade-offs as every
-    other guard in this file. Known residual gaps: a project-instructions
-    filename outside the recognized set (a runtime-specific equivalent this
-    guard doesn't yet know); an MCP filesystem tool naming its target
-    argument outside ``_path()``'s recognized key list; and a shell command
-    that computes the target path indirectly across separate variable
-    assignments (the ``find``-indirection case is covered; a `for`/`xargs`
-    loop or `basename`/`dirname` reconstruction is not, the same disclosed
-    gap ``rule_self_protect``/``rule_ci_workflow_protect``/
+    other guard in this file. `AGENT_DEF_DIR_RE` + `ARCHIVE_SYNC_VERB_RE`
+    close the archive/sync-tool bypass (`rsync`/`tar`/`unzip`/`install -m`
+    placing a file with no verb this guard's other checks recognize, and no
+    filename ever named as one contiguous string) the same way
+    `GIT_HOOKS_DIR_RE`/`GIT_HOOKS_ARCHIVE_VERB_RE` close it for git hooks —
+    a fix that QA (independent adversarial review, round 1) found was never
+    carried over from that guard despite this one being modeled on it.
+    Known residual gaps, same spirit as every guard in this file: a direct
+    fetch-to-file write (`curl -o CLAUDE.md ...`, `wget -O ... `) with no
+    verb any of the five write-verb checks (or the archive/sync check)
+    recognizes — an inherited gap `rule_ci_workflow_protect`/
+    `rule_git_hooks_protect` share too, not new or worse here; a project-
+    instructions filename outside the recognized set; an MCP filesystem tool
+    naming its target argument outside ``_path()``'s recognized key list;
+    nesting past 4 levels under `.claude/agents|commands|output-styles`
+    evading the filename form of `AGENT_DEF_PATH_RE` (the bare-directory
+    backstop above still catches an archive/sync tool's own target argument
+    regardless of nesting); and a shell command that computes the target path
+    indirectly across separate variable assignments (the ``find``-indirection
+    case is covered; a `for`/`xargs` loop or `basename`/`dirname`
+    reconstruction is not, the same disclosed gap
+    ``rule_self_protect``/``rule_ci_workflow_protect``/
     ``rule_git_hooks_protect`` already carry)."""
     cfg = getattr(policy, "agent_def", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -667,9 +698,9 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
         reason = (f"Project instructions file '{p}' is being written — its content is "
                    "folded directly into every future session's context, unattended"
                    if instr_hit else
-                   f"Agent/command definition '{p}' is being written — it can be "
-                   "auto-selected or invoked in a future session, carrying its own "
-                   "tool allowlist")
+                   f"Agent/command/output-style definition '{p}' is being written — it "
+                   "can be auto-selected or invoked in a future session, carrying its "
+                   "own tool allowlist")
         would = Decision(action, "agent-def-protect",
                          f"{reason}. Review the change, then confirm with "
                          "AEGIS_ALLOW_AGENT_DEF=1; a spawned agent cannot.")
@@ -680,25 +711,33 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
+        # AGENT_DEF_DIR_RE catches a bare directory reference (no filename
+        # ever named) and ARCHIVE_SYNC_VERB_RE catches the archive/sync verb
+        # shape (rsync/tar/unzip/install -m) that places a file without
+        # tripping any of the five verb checks below — QA finding
+        # (independent adversarial review, round 1): both were missing
+        # entirely from the first draft.
         names_target = bool(patterns.AGENT_INSTRUCTIONS_PATH_RE.search(cmd)
                              or patterns.AGENT_DEF_PATH_RE.search(cmd)
+                             or patterns.AGENT_DEF_DIR_RE.search(cmd)
                              or patterns.agent_def_find_hit(cmd))
         touches_target = names_target and (
             patterns.WRITE_REDIRECT_RE.search(cmd)
             or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
             or patterns.INPLACE_WRITE_RE.search(cmd)
-            or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
         if not touches_target:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_DEF")
                 or _agent_def_allowed_by_policy(cfg, _cmd(ev))):
             return None
         would = Decision(action, "agent-def-protect",
-                         "Project instructions or an agent/command definition is being "
-                         "modified from a shell — its content is auto-loaded or "
-                         "auto-invoked in a future session with no further review. A "
-                         "human may append '# aegis-allow', or set "
+                         "Project instructions or an agent/command/output-style "
+                         "definition is being modified from a shell — its content is "
+                         "auto-loaded or auto-invoked in a future session with no "
+                         "further review. A human may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_AGENT_DEF=1; a spawned agent cannot.")
         if mode == "monitor":
             _record_monitor(ev, would, "agent-def-protect-monitor")
