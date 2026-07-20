@@ -131,6 +131,11 @@ class Policy:
     # path/command]}. Empty -> defaults (mode=ask) apply. See
     # rules.rule_git_hooks_protect.
     git_hooks: dict = field(default_factory=dict)
+    # Agent-instructions / agent-definition protection: {mode: deny|ask|
+    # monitor|off, allow: [regex on path/command]}. Empty -> defaults
+    # (mode=ask) apply. Covers CLAUDE.md/AGENTS.md and .claude/agents/*.md,
+    # .claude/commands/*.md. See rules.rule_agent_def_protect.
+    agent_def: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.
