@@ -45,6 +45,7 @@ Non-escapable guards can't be waved through. Escapable ones block but accept a r
 | MCP config | Writes to MCP server-config files (`.mcp.json`, `mcpServers`, etc.) that auto-run on every future session | Human only |
 | CI/CD workflow | Writes to CI pipeline definitions (`.github/workflows/*`, `.gitlab-ci.yml`, `Jenkinsfile`, CircleCI/Azure/Travis/Drone/Bitbucket/Buildkite/Cloud Build/AppVeyor) — a step planted there runs on a future, different, higher-privilege machine (the CI runner), not this session | Human only |
 | Git hooks | Writes to `.git/hooks/*` (pre-commit, pre-push, post-checkout, ...) or a `core.hooksPath` redirect — a hook runs with the invoking user's full privileges on the next matching git operation and, unlike a tracked file, is invisible to `git diff`/`git status`/code review | Human only |
+| Agent definitions | Writes to `CLAUDE.md`/`AGENTS.md` (folded into every future session's context) or `.claude/agents/*.md`/`.claude/commands/*.md` (custom sub-agent/slash-command definitions, project or user scope) — a planted instruction or definition is auto-loaded/auto-invoked next session with no further agent action | Human only |
 | Destructive SQL | `DROP`/`TRUNCATE`/`ALTER ... DROP`, `DELETE`/`UPDATE` without `WHERE`, migration resets — from shell **and** DB tool args | Yes |
 | Destructive git | force-push, `reset --hard`, rebase, `branch -D`, `clean -f` | Yes |
 | Recursive delete | `rm -rf` and equivalents (PowerShell, cmd, `find -delete`, `shred`, `dd`) | Yes |
