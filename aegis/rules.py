@@ -746,6 +746,149 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- shell-startup / SSH persistence protection: escapable with human confirm --
+def _shell_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a shell startup/profile file (``~/.bashrc``,
+    ``~/.zshrc``, ``~/.profile``, fish's ``config.fish``, ``/etc/profile.d/*.sh``,
+    a PowerShell ``$PROFILE``, ...) or an SSH persistence target
+    (``~/.ssh/authorized_keys``, ``~/.ssh/config``, ``/etc/ssh/sshd_config``,
+    ``/etc/ssh/ssh_config``).
+
+    The shell-startup half is reached by no existing guard at all:
+    ``rule_mcp_config_protect``/``rule_ci_workflow_protect``/
+    ``rule_git_hooks_protect``/``rule_agent_def_protect`` all fire on a session
+    start, a CI run, or a git operation — none of them fire on the single most
+    common human action there is, opening a new terminal. A shell startup file
+    executes arbitrary code, with the human's full privileges, every time they
+    open an interactive shell from now on — unlike ``CLAUDE.md`` this isn't
+    even specific to an agentic coding session.
+
+    NOT new coverage for most of the SSH half: ``rule_containment``'s
+    ``CRED_RE`` already denies, non-escapably, ANY shell/Edit/Write/MCP action
+    whose text contains a `.ssh` path segment preceded by a `/`/`\\` — which
+    matches ``~/.ssh/authorized_keys``/``~/.ssh/config`` in their ordinary,
+    absolute-or-home-relative forms and wins first (containment runs earlier
+    in ``BUILTIN_RULES`` and evaluate() is first-deny-wins), so this guard's
+    own (weaker, escapable) decision for those two paths never actually
+    surfaces in that common case. What IS new: (1) ``/etc/ssh/sshd_config``/
+    ``/etc/ssh/ssh_config`` — no dot before "ssh" in that path, so
+    ``CRED_RE``'s ``\\.ssh`` alternative never matches it at all; (2) a
+    relative reference with NO leading path separator (e.g. the literal
+    string ``.ssh/authorized_keys`` as its own shell token, as in
+    ``echo x >> .ssh/authorized_keys`` run from ``$HOME``) — ``CRED_RE``
+    requires a `/`/`\\` immediately before the dot, but this guard's patterns
+    accept whitespace/quote/start-of-string too, so they still catch it where
+    containment does not. An appended ``authorized_keys`` entry grants durable
+    remote login with no password/agent involvement at all; a
+    ``ProxyCommand``/``LocalCommand``/``PermitLocalCommand`` directive in an
+    SSH config runs an arbitrary command on the next matching connection —
+    the client-side equivalent of a git hook, on a different trigger
+    entirely — which is why this guard still declares the surface even though
+    containment pre-empts most of the traffic through it.
+
+    Config (``policy.shell_persist``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a repo's
+    own trusted dotfile-manager sync, say). Defaults to ``ask`` for the same
+    reason ``rule_ci_workflow_protect``/``rule_git_hooks_protect``/
+    ``rule_agent_def_protect`` do: editing a shell rc file (a PATH tweak, an
+    alias) or an SSH config (adding a Host block) is routine, sanctioned dev
+    work, unlike planting an MCP server.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form, or
+    the env toggle ``AEGIS_ALLOW_SHELL_PERSIST=1`` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form. A spawned agent
+    cannot set its own env for a hook invocation it doesn't control, so
+    neither path is agent-self-escapable.
+
+    Honest scope: a path-string match, the same denylist trade-offs as every
+    other guard in this file. ``SHELL_PERSIST_DIR_RE`` + ``ARCHIVE_SYNC_VERB_RE``
+    (reused as-is from ``rule_agent_def_protect`` rather than re-copied — both
+    are already generic, path-independent verb patterns with their own ReDoS
+    coverage, so reusing them carries less risk than minting a third,
+    less-battle-tested copy) close the archive/sync-tool bypass the same way
+    they do there. Known residual gaps, same spirit as every guard in this
+    file: a direct fetch-to-file write (``curl -o ~/.ssh/authorized_keys ...``,
+    ``wget -O ...``) with no verb any of the five write-verb checks recognizes
+    — the same inherited gap ``rule_ci_workflow_protect``/
+    ``rule_git_hooks_protect``/``rule_agent_def_protect`` already disclose, not
+    new or worse here; the bare filename ``config`` under ``~/.ssh/`` and the
+    bare word ``profile``/``profile.ps1`` are deliberately excluded from the
+    ``find``-indirection fallback (too generic — see ``patterns.py``'s own note
+    on this guard's patterns); and a shell command that computes the target
+    path indirectly across separate variable assignments (a `for`/`xargs` loop
+    or `basename`/`dirname` reconstruction) is not covered, the same disclosed
+    gap every other guard in this file carries."""
+    cfg = getattr(policy, "shell_persist", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        rc_hit = bool(p and patterns.SHELL_RC_PATH_RE.search(p))
+        ssh_hit = bool(p and patterns.SSH_PERSIST_PATH_RE.search(p))
+        if not (rc_hit or ssh_hit):
+            return None
+        if os.environ.get("AEGIS_ALLOW_SHELL_PERSIST") or _shell_persist_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"Shell startup file '{p}' is being written — it runs "
+                   "automatically, with the human's full privileges, the next "
+                   "time they open an interactive shell" if rc_hit else
+                   f"SSH persistence target '{p}' is being written — an added "
+                   "key or ProxyCommand/LocalCommand directive grants durable "
+                   "remote access or runs on the next matching ssh invocation")
+        would = Decision(action, "shell-persist-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_SHELL_PERSIST=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "shell-persist-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.SHELL_RC_PATH_RE.search(cmd)
+                             or patterns.SSH_PERSIST_PATH_RE.search(cmd)
+                             or patterns.SHELL_PERSIST_DIR_RE.search(cmd)
+                             or patterns.shell_persist_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_SHELL_PERSIST")
+                or _shell_persist_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "shell-persist-protect",
+                         "A shell startup file or SSH persistence target is "
+                         "being modified from a shell — it runs automatically, "
+                         "unattended, the next time the human opens a shell or "
+                         "connects over SSH. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_SHELL_PERSIST=1; "
+                         "a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "shell-persist-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -1145,6 +1288,7 @@ _CORE_RULES = (
     rule_ci_workflow_protect,
     rule_git_hooks_protect,
     rule_agent_def_protect,
+    rule_shell_persist_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

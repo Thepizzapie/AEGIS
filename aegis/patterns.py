@@ -1169,6 +1169,97 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Shell-startup / SSH persistence protection --------------------------------
+# Two more "runs later, unattended, with the human's full privileges" triggers
+# that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,
+# because none of them fire on a git operation, a CI run, or a session start —
+# these fire on the single most common human action there is (opening a new
+# terminal), or on the next `ssh`/`scp`/`git`-over-ssh invocation:
+#
+#   - Shell startup/profile files (~/.bashrc, ~/.zshrc, ~/.profile, fish's
+#     config.fish, /etc/profile.d/*.sh, a PowerShell $PROFILE, ...): each
+#     executes arbitrary shell code, with the human's full privileges, the
+#     next time they open an interactive shell — no git operation, no CI run,
+#     no agent session restart needed. Unlike CLAUDE.md this isn't even
+#     specific to an agentic coding session: it fires for every ordinary
+#     terminal the human opens until they notice and remove it.
+#   - SSH persistence: ~/.ssh/authorized_keys (appending an attacker public key
+#     grants durable remote login with no password/agent involvement at all —
+#     the single most classic SSH backdoor) and ~/.ssh/config /
+#     /etc/ssh/sshd_config / /etc/ssh/ssh_config (a `ProxyCommand`/
+#     `LocalCommand`/`PermitLocalCommand` directive runs an arbitrary shell
+#     command on the client's/server's next matching `ssh`/`scp`/
+#     `git`-over-ssh invocation — the client-side equivalent of a git hook,
+#     triggered by an entirely different everyday action).
+#
+# Deliberately excludes the bare word "config" as a find-fallback fragment for
+# ~/.ssh/config (too generic — `find . -name config` matches almost any
+# project's config file) and the bare word "profile"/"profile.ps1" for the
+# same reason — same "false positives are the safe direction, but a fragment
+# indistinguishable from ordinary unrelated files is worse than the narrow
+# disclosed gap" trade-off INPLACE_WRITE_RE's own docstring accepts for a bare
+# `install` verb.
+_SHELL_RC_END = _CI_END
+SHELL_RC_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.(?:bash_profile|bash_login|bash_logout|bashrc)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.profile" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.(?:zshrc|zprofile|zshenv|zlogin)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.(?:kshrc|cshrc|tcshrc)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"fish" + _WIN_TRIM + _SEP
+    + r"config\.fish" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])/etc/profile" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])/etc/profile\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.sh" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])/etc/bash\.bashrc" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])/etc/zsh" + _WIN_TRIM + _SEP
+    + r"(?:zshrc|zshenv|zprofile|zlogin)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])(?:Microsoft\.(?:PowerShell|VSCode)_profile|profile)\.ps1"
+    + _SHELL_RC_END,
+    re.IGNORECASE,
+)
+
+# SSH persistence targets. `.ssh/config`'s bare filename IS the generic word
+# "config" — narrower context (the `.ssh` parent segment) is required, unlike
+# every other alternative here, to keep this from firing on an unrelated
+# `foo/config` file.
+SSH_PERSIST_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"authorized_keys2?" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"config" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])/etc/ssh" + _WIN_TRIM + _SEP
+    + r"(?:sshd_config|ssh_config)" + _SHELL_RC_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — the same gap GIT_HOOKS_DIR_RE /
+# AGENT_DEF_DIR_RE exist to close: an archive/sync tool that places a file
+# without ever naming it as a discrete argument (`rsync -a keys/ ~/.ssh/`,
+# `tar xf payload.tar -C /etc/profile.d/`) never matches the path patterns
+# above at all.
+SHELL_PERSIST_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.ssh" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])/etc/profile\.d" + _SHELL_RC_END,
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# FIND_PROTECTED_RE / CI_WORKFLOW_FIND_RE / GIT_HOOKS_FIND_PREDICATE_RE /
+# AGENT_DEF_FIND_PREDICATE_RE exist for their own surfaces. Only the
+# distinctive filenames are listed (see this section's own note above on why
+# the generic "config"/"profile" words are deliberately excluded here).
+_SHELL_PERSIST_FIND_FRAGMENTS = (
+    r"bashrc|bash_profile|bash_login|bash_logout"
+    r"|zshrc|zprofile|zshenv|zlogin|kshrc|cshrc|tcshrc"
+    r"|config\.fish|profile\.d|bash\.bashrc"
+    r"|authorized_keys2?|sshd_config|ssh_config"
+    r"|PowerShell_profile|VSCode_profile"
+)
+SHELL_PERSIST_FIND_RE = _find_predicate_re(
+    r"(?:" + _SHELL_PERSIST_FIND_FRAGMENTS + r")")
+
+
+def shell_persist_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, SHELL_PERSIST_FIND_RE)
+
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the
