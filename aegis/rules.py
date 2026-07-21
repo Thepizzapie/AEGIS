@@ -746,6 +746,209 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- shell-startup / SSH persistence protection: escapable with human confirm --
+def _shell_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a shell startup/profile file (``~/.bashrc``,
+    ``~/.zshrc``, ``~/.profile``, ``~/.bash_aliases``, ``~/.xprofile``, fish's
+    ``config.fish``, ``/etc/profile.d/*.sh``, a PowerShell ``$PROFILE``, ...)
+    or an SSH persistence target (``~/.ssh/authorized_keys``, ``~/.ssh/rc``,
+    ``~/.ssh/environment``, ``~/.ssh/config``, ``/etc/ssh/sshd_config``,
+    ``/etc/ssh/ssh_config``, and their ``Include``d drop-in directories
+    ``/etc/ssh/sshd_config.d/*.conf``/``/etc/ssh/ssh_config.d/*.conf``).
+
+    The shell-startup half is reached by no existing guard at all:
+    ``rule_mcp_config_protect``/``rule_ci_workflow_protect``/
+    ``rule_git_hooks_protect``/``rule_agent_def_protect`` all fire on a session
+    start, a CI run, or a git operation — none of them fire on the single most
+    common human action there is, opening a new terminal. A shell startup file
+    executes arbitrary code, with the human's full privileges, every time they
+    open an interactive shell from now on — unlike ``CLAUDE.md`` this isn't
+    even specific to an agentic coding session.
+
+    NOT new coverage for most of the SSH half: ``rule_containment``'s
+    ``CRED_RE`` already denies, non-escapably, ANY shell/Edit/Write/MCP action
+    whose text contains a `.ssh` path segment preceded by a `/`/`\\` — which
+    matches ``~/.ssh/authorized_keys``/``~/.ssh/config`` in their ordinary,
+    absolute-or-home-relative forms and wins first (containment runs earlier
+    in ``BUILTIN_RULES`` and evaluate() is first-deny-wins), so this guard's
+    own (weaker, escapable) decision for those two paths never actually
+    surfaces in that common case. What IS new: (1) ``/etc/ssh/sshd_config``/
+    ``/etc/ssh/ssh_config`` — no dot before "ssh" in that path, so
+    ``CRED_RE``'s ``\\.ssh`` alternative never matches it at all; (2) a
+    relative reference with NO leading path separator (e.g. the literal
+    string ``.ssh/authorized_keys`` as its own shell token, as in
+    ``echo x >> .ssh/authorized_keys`` run from ``$HOME``) — ``CRED_RE``
+    requires a `/`/`\\` immediately before the dot, but this guard's patterns
+    accept whitespace/quote/start-of-string too, so they still catch it where
+    containment does not. An appended ``authorized_keys`` entry grants durable
+    remote login with no password/agent involvement at all; ``~/.ssh/rc`` runs
+    arbitrary shell on every accepted login when sshd's ``PermitUserRC`` is on
+    (the common default); a ``ProxyCommand``/``LocalCommand``/
+    ``PermitLocalCommand``/``PermitRootLogin`` directive in an SSH config or
+    one of its drop-ins runs arbitrary code or grants access on the next
+    matching connection — the client/server-side equivalent of a git hook, on
+    a different trigger entirely — which is why this guard still declares the
+    surface even though containment pre-empts most of the ordinary-path
+    traffic through it.
+
+    QA history (independent adversarial review, two parallel rounds): the
+    original draft covered only the single top-level ``sshd_config``/
+    ``ssh_config`` file, missing the ``Include``d drop-in directories
+    (``/etc/ssh/sshd_config.d/*.conf``/``/etc/ssh/ssh_config.d/*.conf``) a
+    stock Debian/Ubuntu/RHEL install already assembles its config from —
+    fixed by adding both the filename form and a ``SHELL_PERSIST_DIR_RE``
+    bare-directory entry for archive/sync-tool coverage. It also missed
+    ``~/.ssh/rc``/``~/.ssh/environment`` entirely, the macOS/upstream-zsh
+    system file layout (bare ``/etc/zshenv``/``/etc/zprofile``/etc., as
+    opposed to the Debian ``/etc/zsh/zshrc`` layout — zsh is the default
+    shell on every Mac since Catalina), ``~/.bash_aliases`` (sourced
+    unconditionally by a stock Debian/Ubuntu ``.bashrc``, same blast radius as
+    editing ``.bashrc`` itself), ``~/.xprofile`` (sourced by lightdm/gdm/sddm
+    at the next graphical login), and the PowerShell ISE profile variant —
+    all now covered.
+
+    Config (``policy.shell_persist``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a repo's
+    own trusted dotfile-manager sync, say). Defaults to ``ask`` for the same
+    reason ``rule_ci_workflow_protect``/``rule_git_hooks_protect``/
+    ``rule_agent_def_protect`` do: editing a shell rc file (a PATH tweak, an
+    alias) or an SSH config (adding a Host block) is routine, sanctioned dev
+    work, unlike planting an MCP server.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form, or
+    the env toggle ``AEGIS_ALLOW_SHELL_PERSIST=1`` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form. A spawned agent
+    cannot set its own env for a hook invocation it doesn't control, so
+    neither path is agent-self-escapable.
+
+    Honest scope: a path-string match, the same denylist trade-offs as every
+    other guard in this file. ``SHELL_PERSIST_DIR_RE`` + ``ARCHIVE_SYNC_VERB_RE``
+    (reused as-is from ``rule_agent_def_protect`` rather than re-copied — both
+    are already generic, path-independent verb patterns with their own ReDoS
+    coverage, so reusing them carries less risk than minting a third,
+    less-battle-tested copy) close the archive/sync-tool bypass the same way
+    they do there. ``SHELL_PERSIST_DIR_RE`` is checked only on the shell
+    branch, never the Edit/Write/MCP one — deliberately, matching
+    ``GIT_HOOKS_DIR_RE``/``AGENT_DEF_DIR_RE``'s identical precedent: an
+    Edit/Write/MCP file-mutation tool always names a specific file, never a
+    bare directory, so there is no equivalent of an archive/sync tool's
+    directory-only target argument on that branch to catch.
+
+    Known residual gaps, same spirit as every guard in this file: a direct
+    fetch-to-file write (``curl -o ~/.ssh/authorized_keys ...``, ``wget -O
+    ...``) with no verb any of the five write-verb checks recognizes — the
+    same inherited gap ``rule_ci_workflow_protect``/``rule_git_hooks_protect``/
+    ``rule_agent_def_protect`` already disclose, not new or worse here; the
+    bare filename ``config`` under ``~/.ssh/`` and the bare words
+    ``profile``/``profile.ps1``/``rc``/``environment`` are deliberately
+    excluded from the ``find``-indirection fallback (too generic — see
+    ``patterns.py``'s own note on this guard's patterns); a shell command that
+    computes the target path indirectly across separate variable assignments
+    (a `for`/`xargs` loop or `basename`/`dirname` reconstruction) is not
+    covered, the same disclosed gap every other guard in this file carries;
+    an MCP tool naming its target argument outside ``_path()``'s recognized
+    key list is missed the same way it is for every other ``_path()``-based
+    guard in this file (not unique or worse here — a shared limitation of the
+    helper itself, out of this guard's scope to fix); an environment-variable
+    override that RELOCATES where a shell looks for its startup file —
+    fish's ``$XDG_CONFIG_HOME`` (defaults to ``~/.config``), zsh's
+    ``$ZDOTDIR`` (defaults to ``$HOME``) — is not covered when set to a
+    directory this guard's patterns don't otherwise recognize (QA finding,
+    independent adversarial review, round 2): the actual target file is only
+    knowable by resolving an environment variable's value, the same
+    "computed indirectly, not a literal path" class of gap every guard in
+    this file already accepts for shell-computed paths in general; and, like
+    every other guard here, a write-verb only needs to appear ANYWHERE in the
+    (de-obfuscated) command alongside the matched path, not adjacent to or
+    provably operating on it — a read redirected elsewhere (``cat ~/.bashrc >
+    /tmp/backup.txt``) can gate under ``ask`` the same way a real overwrite
+    does; the cost is one unnecessary human confirmation, not a missed
+    detection, the same accepted direction every sibling guard in this file
+    takes.
+
+    QA history (independent adversarial review, round 2 — verification pass
+    on the round-1 fixes): confirmed all round-1 fixes correct and regression-
+    free, then found a new, systemic bug: every ``/etc/*`` alternative in both
+    ``SHELL_RC_PATH_RE`` and ``SSH_PERSIST_PATH_RE`` hardcoded a literal
+    single ``/`` between "etc" and the next path component instead of
+    ``_SEP`` — so ``/etc//ssh/sshd_config`` (byte-identical to the real path
+    as far as the OS is concerned) sailed through every one of them
+    undetected, the exact bug class this file's own ``_SEP``/``_WIN_TRIM``
+    exist to close elsewhere (``AEGIS_SOURCE_RE``, ``CI_WORKFLOW_PATH_RE``).
+    Fixed by routing every ``/etc/*`` alternative through ``_SEP`` instead of
+    a literal slash, the same convention those patterns already use — see
+    ``patterns.py``'s own comment on this fix for detail."""
+    cfg = getattr(policy, "shell_persist", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        rc_hit = bool(p and patterns.SHELL_RC_PATH_RE.search(p))
+        ssh_hit = bool(p and patterns.SSH_PERSIST_PATH_RE.search(p))
+        if not (rc_hit or ssh_hit):
+            return None
+        if os.environ.get("AEGIS_ALLOW_SHELL_PERSIST") or _shell_persist_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"Shell startup file '{p}' is being written — it runs "
+                   "automatically, with the human's full privileges, the next "
+                   "time they open an interactive shell" if rc_hit else
+                   f"SSH persistence target '{p}' is being written — an added "
+                   "key or ProxyCommand/LocalCommand directive grants durable "
+                   "remote access or runs on the next matching ssh invocation")
+        would = Decision(action, "shell-persist-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_SHELL_PERSIST=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "shell-persist-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.SHELL_RC_PATH_RE.search(cmd)
+                             or patterns.SSH_PERSIST_PATH_RE.search(cmd)
+                             or patterns.SHELL_PERSIST_DIR_RE.search(cmd)
+                             or patterns.shell_persist_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_SHELL_PERSIST")
+                or _shell_persist_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "shell-persist-protect",
+                         "A shell startup file or SSH persistence target is "
+                         "being modified from a shell — it runs automatically, "
+                         "unattended, the next time the human opens a shell or "
+                         "connects over SSH. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_SHELL_PERSIST=1; "
+                         "a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "shell-persist-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -1145,6 +1348,7 @@ _CORE_RULES = (
     rule_ci_workflow_protect,
     rule_git_hooks_protect,
     rule_agent_def_protect,
+    rule_shell_persist_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

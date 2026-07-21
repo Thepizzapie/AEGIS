@@ -1169,6 +1169,146 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Shell-startup / SSH persistence protection --------------------------------
+# Two more "runs later, unattended, with the human's full privileges" triggers
+# that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,
+# because none of them fire on a git operation, a CI run, or a session start —
+# these fire on the single most common human action there is (opening a new
+# terminal), or on the next `ssh`/`scp`/`git`-over-ssh invocation:
+#
+#   - Shell startup/profile files (~/.bashrc, ~/.zshrc, ~/.profile, fish's
+#     config.fish, /etc/profile.d/*.sh, a PowerShell $PROFILE, ...): each
+#     executes arbitrary shell code, with the human's full privileges, the
+#     next time they open an interactive shell — no git operation, no CI run,
+#     no agent session restart needed. Unlike CLAUDE.md this isn't even
+#     specific to an agentic coding session: it fires for every ordinary
+#     terminal the human opens until they notice and remove it.
+#   - SSH persistence: ~/.ssh/authorized_keys (appending an attacker public key
+#     grants durable remote login with no password/agent involvement at all —
+#     the single most classic SSH backdoor), ~/.ssh/rc / ~/.ssh/environment
+#     (honored when sshd's `PermitUserRC`/`PermitUserEnvironment` is on — the
+#     former runs arbitrary shell on every accepted login same as an
+#     authorized_keys `command=` prefix would), and ~/.ssh/config /
+#     /etc/ssh/sshd_config / /etc/ssh/ssh_config plus their modern `Include`d
+#     drop-in directories /etc/ssh/sshd_config.d/*.conf, /etc/ssh/ssh_config.d/
+#     *.conf (the DEFAULT sshd_config/ssh_config on current Debian/Ubuntu/RHEL
+#     already `Include`s these — QA finding, independent adversarial review:
+#     an earlier draft covered only the single top-level file, missing where
+#     a stock install's config is actually assembled from) — a `ProxyCommand`/
+#     `LocalCommand`/`PermitLocalCommand`/`PermitRootLogin` directive runs
+#     arbitrary code or grants access on the client's/server's next matching
+#     `ssh`/`scp`/`git`-over-ssh invocation, the client/server-side equivalent
+#     of a git hook, triggered by an entirely different everyday action.
+#
+# Deliberately excludes the bare word "config" as a find-fallback fragment for
+# ~/.ssh/config (too generic — `find . -name config` matches almost any
+# project's config file), the bare word "profile"/"profile.ps1" for the same
+# reason, and — QA finding, independent adversarial review — the bare words
+# "rc"/"environment" for ~/.ssh/rc / ~/.ssh/environment (both are ordinary
+# English words / common generic filenames with zero SSH-specific signal on
+# their own) — same "false positives are the safe direction, but a fragment
+# indistinguishable from ordinary unrelated files is worse than the narrow
+# disclosed gap" trade-off INPLACE_WRITE_RE's own docstring accepts for a bare
+# `install` verb.
+_SHELL_RC_END = _CI_END
+# `/etc/<segment>`'s separator between "etc" and the next component must be
+# `_SEP` (handles doubled slashes / a `.` path component), the same reason
+# `_SEP`/`_WIN_TRIM` exist at all in this file (see `AEGIS_SOURCE_RE`/
+# `CI_WORKFLOW_PATH_RE`) — QA finding (independent adversarial review, round
+# 2): an earlier draft hardcoded a literal single `/` there instead, so
+# `/etc//ssh/sshd_config` (byte-identical to `/etc/ssh/sshd_config` as far as
+# the OS is concerned) sailed through every `/etc/*` alternative in both
+# `SHELL_RC_PATH_RE` and `SSH_PERSIST_PATH_RE` undetected. "etc" itself needs
+# no hardcoded leading `/` — the leading `(?:^|[\s'"/\\=])` boundary group
+# already consumes whatever precedes it, the identical convention
+# `CI_WORKFLOW_PATH_RE` uses for `.github` (which likewise has no hardcoded
+# leading separator of its own).
+_ETC_SEP = _WIN_TRIM + _SEP
+SHELL_RC_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.(?:bash_profile|bash_login|bash_logout|bashrc|bash_aliases)"
+    + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.(?:profile|xprofile)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.(?:zshrc|zprofile|zshenv|zlogin)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.(?:kshrc|cshrc|tcshrc)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"fish" + _WIN_TRIM + _SEP
+    + r"config\.fish" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"profile" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"profile\.d" + _ETC_SEP + _CI_SEG
+    + r"\.sh" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"bash\.bashrc" + _SHELL_RC_END
+    # Both the Debian/Ubuntu layout (/etc/zsh/zshrc) AND the macOS/upstream-zsh
+    # layout (bare /etc/zshrc, no zsh/ subdirectory) — QA finding (independent
+    # adversarial review): the original only covered the former, missing the
+    # default shell on every Mac since Catalina.
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"zsh" + _ETC_SEP
+    + r"(?:zshrc|zshenv|zprofile|zlogin)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"(?:zshrc|zshenv|zprofile|zlogin)"
+    + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"csh\.(?:cshrc|login)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])(?:Microsoft\.(?:PowerShell|PowerShellISE|VSCode)_profile|profile)\.ps1"
+    + _SHELL_RC_END,
+    re.IGNORECASE,
+)
+
+# SSH persistence targets. `.ssh/config`'s bare filename IS the generic word
+# "config" — narrower context (the `.ssh` parent segment) is required, unlike
+# every other alternative here, to keep this from firing on an unrelated
+# `foo/config` file. Same reasoning for `.ssh/rc` (the word "rc") and
+# `.ssh/environment`.
+_SSH_CONF_D_SEG = _CI_SEG + r"\.conf"
+SSH_PERSIST_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"authorized_keys2?" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"config" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"rc" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"environment" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ssh" + _ETC_SEP
+    + r"(?:sshd_config|ssh_config)" + _SHELL_RC_END
+    # Drop-in directories the DEFAULT sshd_config/ssh_config on current
+    # Debian/Ubuntu/RHEL already `Include`s — QA finding (independent
+    # adversarial review): the single-file pattern above never matches these,
+    # so a planted drop-in sailed through with zero detection even though it
+    # is honored identically to the top-level file.
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ssh" + _ETC_SEP
+    + r"(?:sshd_config\.d|ssh_config\.d)" + _ETC_SEP + _SSH_CONF_D_SEG
+    + _SHELL_RC_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — the same gap GIT_HOOKS_DIR_RE /
+# AGENT_DEF_DIR_RE exist to close: an archive/sync tool that places a file
+# without ever naming it as a discrete argument (`rsync -a keys/ ~/.ssh/`,
+# `tar xf payload.tar -C /etc/profile.d/`) never matches the path patterns
+# above at all. Includes the sshd_config.d/ssh_config.d drop-in directories
+# themselves for the same reason (QA finding, independent adversarial review).
+SHELL_PERSIST_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.ssh" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"profile\.d" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ssh" + _ETC_SEP
+    + r"(?:sshd_config\.d|ssh_config\.d)" + _SHELL_RC_END,
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# FIND_PROTECTED_RE / CI_WORKFLOW_FIND_RE / GIT_HOOKS_FIND_PREDICATE_RE /
+# AGENT_DEF_FIND_PREDICATE_RE exist for their own surfaces. Only the
+# distinctive filenames are listed (see this section's own note above on why
+# the generic "config"/"profile"/"rc"/"environment" words are deliberately
+# excluded here).
+_SHELL_PERSIST_FIND_FRAGMENTS = (
+    r"bashrc|bash_profile|bash_login|bash_logout|bash_aliases|xprofile"
+    r"|zshrc|zprofile|zshenv|zlogin|kshrc|cshrc|tcshrc|csh\.cshrc|csh\.login"
+    r"|config\.fish|profile\.d|bash\.bashrc"
+    r"|authorized_keys2?|sshd_config(?:\.d)?|ssh_config(?:\.d)?"
+    r"|PowerShell_profile|PowerShellISE_profile|VSCode_profile"
+)
+SHELL_PERSIST_FIND_RE = _find_predicate_re(
+    r"(?:" + _SHELL_PERSIST_FIND_FRAGMENTS + r")")
+
+
+def shell_persist_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, SHELL_PERSIST_FIND_RE)
+
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the

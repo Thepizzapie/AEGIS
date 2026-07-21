@@ -66,7 +66,8 @@ def test_explain_block_covers_the_builtin_rules():
     text = skills.SKILLS["aegis-explain-block"]
     for rule in ("self-protect", "failure-loop", "install-review",
                  "stop-verification-gate", "workspace-confine",
-                 "destructive-git", "mcp-config-protect", "ci-workflow-protect"):
+                 "destructive-git", "mcp-config-protect", "ci-workflow-protect",
+                 "shell-persist-protect"):
         assert rule in text, rule
 
 
