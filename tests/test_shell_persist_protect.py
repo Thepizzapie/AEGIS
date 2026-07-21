@@ -93,6 +93,40 @@ def test_powershell_profile_gated():
     assert _gated(d) and d.rule == "shell-persist-protect"
 
 
+def test_powershell_ise_profile_gated():
+    d = evaluate(_write(
+        "Documents/WindowsPowerShell/Microsoft.PowerShellISE_profile.ps1"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_bash_aliases_gated():
+    """Sourced unconditionally by a stock Debian/Ubuntu ~/.bashrc — same blast
+    radius as editing .bashrc itself (QA finding, independent adversarial
+    review: missing from the original draft)."""
+    d = evaluate(_write("~/.bash_aliases"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_xprofile_gated():
+    """Sourced by lightdm/gdm/sddm at the next graphical login (QA finding)."""
+    assert _gated(evaluate(_write("~/.xprofile"), EMPTY))
+
+
+def test_macos_upstream_zsh_system_files_gated():
+    """macOS/upstream zsh's system-file layout has no zsh/ subdirectory (bare
+    /etc/zshenv etc.), unlike Debian's /etc/zsh/zshenv — QA finding
+    (independent adversarial review): the original pattern only covered the
+    Debian layout, missing the default shell on every Mac since Catalina."""
+    for name in ("zshenv", "zprofile", "zshrc", "zlogin"):
+        d = evaluate(_write(f"/etc/{name}"), EMPTY)
+        assert _gated(d) and d.rule == "shell-persist-protect", name
+
+
+def test_etc_csh_files_gated():
+    assert _gated(evaluate(_write("/etc/csh.cshrc"), EMPTY))
+    assert _gated(evaluate(_write("/etc/csh.login"), EMPTY))
+
+
 # ---- SSH persistence targets, via Edit/Write -----------------------------------
 #
 # ~/.ssh/authorized_keys and ~/.ssh/config in their ordinary absolute/home-
@@ -116,6 +150,41 @@ def test_authorized_keys_pattern_matches():
 def test_authorized_keys_already_denied_by_containment():
     d = evaluate(_write("~/.ssh/authorized_keys"), EMPTY)
     assert d.blocked and d.rule == "containment-credentials"
+
+
+def test_ssh_rc_relative_gated():
+    """~/.ssh/rc runs arbitrary shell on every accepted login when sshd's
+    PermitUserRC is on — QA finding (independent adversarial review): entirely
+    missing from the original draft. Relative form (no leading separator)
+    isolates this guard's own coverage from containment's pre-emption."""
+    d = evaluate(_write(".ssh/rc"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_ssh_environment_relative_gated():
+    d = evaluate(_write(".ssh/environment"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_sshd_config_drop_in_gated():
+    """/etc/ssh/sshd_config.d/*.conf is `Include`d by the DEFAULT sshd_config
+    on current Debian/Ubuntu/RHEL — QA finding (independent adversarial
+    review): the original pattern covered only the single top-level file,
+    missing where a stock install's config is actually assembled from."""
+    d = evaluate(_write("/etc/ssh/sshd_config.d/99-evil.conf"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_ssh_config_drop_in_gated():
+    d = evaluate(_write("/etc/ssh/ssh_config.d/99-evil.conf"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_ssh_config_drop_in_dir_pattern_matches():
+    """Bare directory reference (no filename) for archive/sync-tool coverage."""
+    from aegis import patterns
+    assert patterns.SHELL_PERSIST_DIR_RE.search("/etc/ssh/sshd_config.d/")
+    assert patterns.SHELL_PERSIST_DIR_RE.search("/etc/ssh/ssh_config.d/")
 
 
 def test_sshd_config_gated():
@@ -229,6 +298,36 @@ def test_forced_symlink_swap_gated():
     assert _gated(evaluate(_shell("ln -sf evil.sh ~/.bashrc"), EMPTY))
     d = evaluate(_shell("ln -f evil_keys .ssh/authorized_keys"), EMPTY)
     assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_rsync_to_sshd_config_drop_in_dir_gated():
+    d = evaluate(_shell("rsync -a evil/ /etc/ssh/sshd_config.d/"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_tar_extract_to_ssh_config_drop_in_dir_gated():
+    d = evaluate(_shell("tar xf payload.tar -C /etc/ssh/ssh_config.d/"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
+def test_find_indirection_for_new_fragments_gated():
+    assert _gated(evaluate(
+        _shell("cp evil.conf $(find / -name '*sshd_config.d*')"), EMPTY))
+    assert _gated(evaluate(
+        _shell("cp evil.sh $(find . -name bash_aliases)"), EMPTY))
+    assert _gated(evaluate(
+        _shell("cp evil.sh $(find . -path '*/etc/zshenv*')"), EMPTY))
+
+
+def test_bare_rc_and_environment_words_excluded_from_find_fallback():
+    """~/.ssh/rc / ~/.ssh/environment's bare filenames ("rc"/"environment")
+    are too generic to safely use as a find-predicate fallback fragment —
+    deliberately excluded, same trade-off as the "config"/"profile"
+    exclusions. Checked at the pattern level since a bare `find -name` with
+    no verb wouldn't gate through evaluate() regardless."""
+    from aegis import patterns
+    assert not patterns.shell_persist_find_hit("find . -name rc")
+    assert not patterns.shell_persist_find_hit("find . -name environment")
 
 
 def test_rsync_to_ssh_dir_gated():
@@ -365,3 +464,20 @@ def test_engine_no_quadratic_blowup():
     evaluate(_shell(cmd), EMPTY)
     elapsed = time.time() - start
     assert elapsed < 1.0, f"rule_shell_persist_protect took {elapsed:.2f}s on adversarial find input"
+
+
+def test_ssh_conf_d_no_quadratic_blowup():
+    """The drop-in-directory segment added after QA (independent adversarial
+    review) needs its own perf check, same principle GIT_HOOKS_ARCHIVE_VERB_RE's
+    own docstring notes: a shared pattern shape still needs a dedicated test,
+    not just its original's."""
+    from aegis import patterns
+    start = time.time()
+    patterns.SSH_PERSIST_PATH_RE.search("/etc/ssh/sshd_config.d/" * 8000)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"SSH_PERSIST_PATH_RE took {elapsed:.2f}s on conf.d adversarial input"
+
+    start = time.time()
+    patterns.SSH_PERSIST_PATH_RE.search("/etc/ssh/sshd_config.d/" + "a" * 200000)
+    elapsed2 = time.time() - start
+    assert elapsed2 < 1.0, f"SSH_PERSIST_PATH_RE took {elapsed2:.2f}s on long non-match segment"

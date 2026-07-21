@@ -759,10 +759,12 @@ def _shell_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
 
 def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting/altering a shell startup/profile file (``~/.bashrc``,
-    ``~/.zshrc``, ``~/.profile``, fish's ``config.fish``, ``/etc/profile.d/*.sh``,
-    a PowerShell ``$PROFILE``, ...) or an SSH persistence target
-    (``~/.ssh/authorized_keys``, ``~/.ssh/config``, ``/etc/ssh/sshd_config``,
-    ``/etc/ssh/ssh_config``).
+    ``~/.zshrc``, ``~/.profile``, ``~/.bash_aliases``, ``~/.xprofile``, fish's
+    ``config.fish``, ``/etc/profile.d/*.sh``, a PowerShell ``$PROFILE``, ...)
+    or an SSH persistence target (``~/.ssh/authorized_keys``, ``~/.ssh/rc``,
+    ``~/.ssh/environment``, ``~/.ssh/config``, ``/etc/ssh/sshd_config``,
+    ``/etc/ssh/ssh_config``, and their ``Include``d drop-in directories
+    ``/etc/ssh/sshd_config.d/*.conf``/``/etc/ssh/ssh_config.d/*.conf``).
 
     The shell-startup half is reached by no existing guard at all:
     ``rule_mcp_config_protect``/``rule_ci_workflow_protect``/
@@ -789,12 +791,31 @@ def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     requires a `/`/`\\` immediately before the dot, but this guard's patterns
     accept whitespace/quote/start-of-string too, so they still catch it where
     containment does not. An appended ``authorized_keys`` entry grants durable
-    remote login with no password/agent involvement at all; a
-    ``ProxyCommand``/``LocalCommand``/``PermitLocalCommand`` directive in an
-    SSH config runs an arbitrary command on the next matching connection —
-    the client-side equivalent of a git hook, on a different trigger
-    entirely — which is why this guard still declares the surface even though
-    containment pre-empts most of the traffic through it.
+    remote login with no password/agent involvement at all; ``~/.ssh/rc`` runs
+    arbitrary shell on every accepted login when sshd's ``PermitUserRC`` is on
+    (the common default); a ``ProxyCommand``/``LocalCommand``/
+    ``PermitLocalCommand``/``PermitRootLogin`` directive in an SSH config or
+    one of its drop-ins runs arbitrary code or grants access on the next
+    matching connection — the client/server-side equivalent of a git hook, on
+    a different trigger entirely — which is why this guard still declares the
+    surface even though containment pre-empts most of the ordinary-path
+    traffic through it.
+
+    QA history (independent adversarial review, two parallel rounds): the
+    original draft covered only the single top-level ``sshd_config``/
+    ``ssh_config`` file, missing the ``Include``d drop-in directories
+    (``/etc/ssh/sshd_config.d/*.conf``/``/etc/ssh/ssh_config.d/*.conf``) a
+    stock Debian/Ubuntu/RHEL install already assembles its config from —
+    fixed by adding both the filename form and a ``SHELL_PERSIST_DIR_RE``
+    bare-directory entry for archive/sync-tool coverage. It also missed
+    ``~/.ssh/rc``/``~/.ssh/environment`` entirely, the macOS/upstream-zsh
+    system file layout (bare ``/etc/zshenv``/``/etc/zprofile``/etc., as
+    opposed to the Debian ``/etc/zsh/zshrc`` layout — zsh is the default
+    shell on every Mac since Catalina), ``~/.bash_aliases`` (sourced
+    unconditionally by a stock Debian/Ubuntu ``.bashrc``, same blast radius as
+    editing ``.bashrc`` itself), ``~/.xprofile`` (sourced by lightdm/gdm/sddm
+    at the next graphical login), and the PowerShell ISE profile variant —
+    all now covered.
 
     Config (``policy.shell_persist``): ``mode`` (deny|ask|monitor|off, default
     ask), ``allow`` (regexes on the path/command that skip the gate — a repo's
@@ -816,18 +837,36 @@ def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     are already generic, path-independent verb patterns with their own ReDoS
     coverage, so reusing them carries less risk than minting a third,
     less-battle-tested copy) close the archive/sync-tool bypass the same way
-    they do there. Known residual gaps, same spirit as every guard in this
-    file: a direct fetch-to-file write (``curl -o ~/.ssh/authorized_keys ...``,
-    ``wget -O ...``) with no verb any of the five write-verb checks recognizes
-    — the same inherited gap ``rule_ci_workflow_protect``/
-    ``rule_git_hooks_protect``/``rule_agent_def_protect`` already disclose, not
-    new or worse here; the bare filename ``config`` under ``~/.ssh/`` and the
-    bare word ``profile``/``profile.ps1`` are deliberately excluded from the
-    ``find``-indirection fallback (too generic — see ``patterns.py``'s own note
-    on this guard's patterns); and a shell command that computes the target
-    path indirectly across separate variable assignments (a `for`/`xargs` loop
-    or `basename`/`dirname` reconstruction) is not covered, the same disclosed
-    gap every other guard in this file carries."""
+    they do there. ``SHELL_PERSIST_DIR_RE`` is checked only on the shell
+    branch, never the Edit/Write/MCP one — deliberately, matching
+    ``GIT_HOOKS_DIR_RE``/``AGENT_DEF_DIR_RE``'s identical precedent: an
+    Edit/Write/MCP file-mutation tool always names a specific file, never a
+    bare directory, so there is no equivalent of an archive/sync tool's
+    directory-only target argument on that branch to catch.
+
+    Known residual gaps, same spirit as every guard in this file: a direct
+    fetch-to-file write (``curl -o ~/.ssh/authorized_keys ...``, ``wget -O
+    ...``) with no verb any of the five write-verb checks recognizes — the
+    same inherited gap ``rule_ci_workflow_protect``/``rule_git_hooks_protect``/
+    ``rule_agent_def_protect`` already disclose, not new or worse here; the
+    bare filename ``config`` under ``~/.ssh/`` and the bare words
+    ``profile``/``profile.ps1``/``rc``/``environment`` are deliberately
+    excluded from the ``find``-indirection fallback (too generic — see
+    ``patterns.py``'s own note on this guard's patterns); a shell command that
+    computes the target path indirectly across separate variable assignments
+    (a `for`/`xargs` loop or `basename`/`dirname` reconstruction) is not
+    covered, the same disclosed gap every other guard in this file carries;
+    an MCP tool naming its target argument outside ``_path()``'s recognized
+    key list is missed the same way it is for every other ``_path()``-based
+    guard in this file (not unique or worse here — a shared limitation of the
+    helper itself, out of this guard's scope to fix); and, like every other
+    guard here, a write-verb only needs to appear ANYWHERE in the (de-
+    obfuscated) command alongside the matched path, not adjacent to or
+    provably operating on it — a read redirected elsewhere (``cat ~/.bashrc >
+    /tmp/backup.txt``) can gate under ``ask`` the same way a real overwrite
+    does; the cost is one unnecessary human confirmation, not a missed
+    detection, the same accepted direction every sibling guard in this file
+    takes."""
     cfg = getattr(policy, "shell_persist", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
