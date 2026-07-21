@@ -1211,6 +1211,19 @@ def agent_def_find_hit(cmd: str) -> bool:
 # disclosed gap" trade-off INPLACE_WRITE_RE's own docstring accepts for a bare
 # `install` verb.
 _SHELL_RC_END = _CI_END
+# `/etc/<segment>`'s separator between "etc" and the next component must be
+# `_SEP` (handles doubled slashes / a `.` path component), the same reason
+# `_SEP`/`_WIN_TRIM` exist at all in this file (see `AEGIS_SOURCE_RE`/
+# `CI_WORKFLOW_PATH_RE`) — QA finding (independent adversarial review, round
+# 2): an earlier draft hardcoded a literal single `/` there instead, so
+# `/etc//ssh/sshd_config` (byte-identical to `/etc/ssh/sshd_config` as far as
+# the OS is concerned) sailed through every `/etc/*` alternative in both
+# `SHELL_RC_PATH_RE` and `SSH_PERSIST_PATH_RE` undetected. "etc" itself needs
+# no hardcoded leading `/` — the leading `(?:^|[\s'"/\\=])` boundary group
+# already consumes whatever precedes it, the identical convention
+# `CI_WORKFLOW_PATH_RE` uses for `.github` (which likewise has no hardcoded
+# leading separator of its own).
+_ETC_SEP = _WIN_TRIM + _SEP
 SHELL_RC_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.(?:bash_profile|bash_login|bash_logout|bashrc|bash_aliases)"
     + _SHELL_RC_END
@@ -1219,17 +1232,19 @@ SHELL_RC_PATH_RE = re.compile(
     + r"|(?:^|[\s'\"/\\=])\.(?:kshrc|cshrc|tcshrc)" + _SHELL_RC_END
     + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"fish" + _WIN_TRIM + _SEP
     + r"config\.fish" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/profile" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/profile\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.sh" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/bash\.bashrc" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"profile" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"profile\.d" + _ETC_SEP + _CI_SEG
+    + r"\.sh" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"bash\.bashrc" + _SHELL_RC_END
     # Both the Debian/Ubuntu layout (/etc/zsh/zshrc) AND the macOS/upstream-zsh
     # layout (bare /etc/zshrc, no zsh/ subdirectory) — QA finding (independent
     # adversarial review): the original only covered the former, missing the
     # default shell on every Mac since Catalina.
-    + r"|(?:^|[\s'\"/\\=])/etc/zsh" + _WIN_TRIM + _SEP
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"zsh" + _ETC_SEP
     + r"(?:zshrc|zshenv|zprofile|zlogin)" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/(?:zshrc|zshenv|zprofile|zlogin)" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/csh\.(?:cshrc|login)" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"(?:zshrc|zshenv|zprofile|zlogin)"
+    + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"csh\.(?:cshrc|login)" + _SHELL_RC_END
     + r"|(?:^|[\s'\"/\\=])(?:Microsoft\.(?:PowerShell|PowerShellISE|VSCode)_profile|profile)\.ps1"
     + _SHELL_RC_END,
     re.IGNORECASE,
@@ -1246,15 +1261,15 @@ SSH_PERSIST_PATH_RE = re.compile(
     + r"|(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"config" + _SHELL_RC_END
     + r"|(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"rc" + _SHELL_RC_END
     + r"|(?:^|[\s'\"/\\=])\.ssh" + _WIN_TRIM + _SEP + r"environment" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/ssh" + _WIN_TRIM + _SEP
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ssh" + _ETC_SEP
     + r"(?:sshd_config|ssh_config)" + _SHELL_RC_END
     # Drop-in directories the DEFAULT sshd_config/ssh_config on current
     # Debian/Ubuntu/RHEL already `Include`s — QA finding (independent
     # adversarial review): the single-file pattern above never matches these,
     # so a planted drop-in sailed through with zero detection even though it
     # is honored identically to the top-level file.
-    + r"|(?:^|[\s'\"/\\=])/etc/ssh" + _WIN_TRIM + _SEP
-    + r"(?:sshd_config\.d|ssh_config\.d)" + _WIN_TRIM + _SEP + _SSH_CONF_D_SEG
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ssh" + _ETC_SEP
+    + r"(?:sshd_config\.d|ssh_config\.d)" + _ETC_SEP + _SSH_CONF_D_SEG
     + _SHELL_RC_END,
     re.IGNORECASE,
 )
@@ -1267,8 +1282,8 @@ SSH_PERSIST_PATH_RE = re.compile(
 # themselves for the same reason (QA finding, independent adversarial review).
 SHELL_PERSIST_DIR_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.ssh" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/profile\.d" + _SHELL_RC_END
-    + r"|(?:^|[\s'\"/\\=])/etc/ssh" + _WIN_TRIM + _SEP
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"profile\.d" + _SHELL_RC_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ssh" + _ETC_SEP
     + r"(?:sshd_config\.d|ssh_config\.d)" + _SHELL_RC_END,
     re.IGNORECASE,
 )

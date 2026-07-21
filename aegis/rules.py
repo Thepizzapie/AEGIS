@@ -859,14 +859,35 @@ def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     an MCP tool naming its target argument outside ``_path()``'s recognized
     key list is missed the same way it is for every other ``_path()``-based
     guard in this file (not unique or worse here — a shared limitation of the
-    helper itself, out of this guard's scope to fix); and, like every other
-    guard here, a write-verb only needs to appear ANYWHERE in the (de-
-    obfuscated) command alongside the matched path, not adjacent to or
+    helper itself, out of this guard's scope to fix); an environment-variable
+    override that RELOCATES where a shell looks for its startup file —
+    fish's ``$XDG_CONFIG_HOME`` (defaults to ``~/.config``), zsh's
+    ``$ZDOTDIR`` (defaults to ``$HOME``) — is not covered when set to a
+    directory this guard's patterns don't otherwise recognize (QA finding,
+    independent adversarial review, round 2): the actual target file is only
+    knowable by resolving an environment variable's value, the same
+    "computed indirectly, not a literal path" class of gap every guard in
+    this file already accepts for shell-computed paths in general; and, like
+    every other guard here, a write-verb only needs to appear ANYWHERE in the
+    (de-obfuscated) command alongside the matched path, not adjacent to or
     provably operating on it — a read redirected elsewhere (``cat ~/.bashrc >
     /tmp/backup.txt``) can gate under ``ask`` the same way a real overwrite
     does; the cost is one unnecessary human confirmation, not a missed
     detection, the same accepted direction every sibling guard in this file
-    takes."""
+    takes.
+
+    QA history (independent adversarial review, round 2 — verification pass
+    on the round-1 fixes): confirmed all round-1 fixes correct and regression-
+    free, then found a new, systemic bug: every ``/etc/*`` alternative in both
+    ``SHELL_RC_PATH_RE`` and ``SSH_PERSIST_PATH_RE`` hardcoded a literal
+    single ``/`` between "etc" and the next path component instead of
+    ``_SEP`` — so ``/etc//ssh/sshd_config`` (byte-identical to the real path
+    as far as the OS is concerned) sailed through every one of them
+    undetected, the exact bug class this file's own ``_SEP``/``_WIN_TRIM``
+    exist to close elsewhere (``AEGIS_SOURCE_RE``, ``CI_WORKFLOW_PATH_RE``).
+    Fixed by routing every ``/etc/*`` alternative through ``_SEP`` instead of
+    a literal slash, the same convention those patterns already use — see
+    ``patterns.py``'s own comment on this fix for detail."""
     cfg = getattr(policy, "shell_persist", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

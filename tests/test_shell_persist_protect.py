@@ -216,6 +216,32 @@ def test_windows_trailing_dot_does_not_bypass():
     assert _gated(evaluate(_write("~/.ssh./authorized_keys"), EMPTY))
 
 
+def test_etc_doubled_slash_does_not_bypass():
+    """QA finding (independent adversarial review, round 2): every /etc/*
+    alternative hardcoded a literal single `/` between "etc" and the next
+    component instead of the shared _SEP, so a doubled slash (byte-identical
+    to the real path as far as the OS is concerned) sailed through
+    undetected on all of them. Not masked by containment (CRED_RE doesn't
+    match /etc paths at all), so these exercise this guard directly."""
+    for path in (
+        "/etc//profile",
+        "/etc/./profile",
+        "/etc//bash.bashrc",
+        "/etc//zsh/zshrc",
+        "/etc//zshenv",
+        "/etc//csh.cshrc",
+        "/etc//ssh/sshd_config",
+        "/etc//ssh/sshd_config.d/99-evil.conf",
+    ):
+        d = evaluate(_write(path), EMPTY)
+        assert _gated(d) and d.rule == "shell-persist-protect", path
+
+
+def test_etc_doubled_slash_shell_form_does_not_bypass():
+    d = evaluate(_shell("echo 'PermitRootLogin yes' >> /etc//ssh/sshd_config"), EMPTY)
+    assert _gated(d) and d.rule == "shell-persist-protect"
+
+
 # ---- suffix / unlisted-name false-positive guards ------------------------------
 
 def test_backup_variant_not_gated():
