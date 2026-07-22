@@ -1509,6 +1509,88 @@ ENV_DUMP_EXFIL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# High-confidence LITERAL secret material (private-key blocks, vendor-format
+# API tokens) reaching the network — via a shell command, WebFetch, or an MCP
+# tool call. Distinct from ENV_DUMP_EXFIL_RE (a BULK env dump) and CRED_RE (a
+# credential FILE PATH): this catches the VALUE of a live secret pasted
+# directly into an outbound call — a shape neither of those recognizes, and
+# the first containment check that inspects an MCP tool call's argument
+# CONTENT at all (the pre-existing containment checks below are all
+# shell-only; MCP previously got only the cloud-metadata check). The threat:
+# an agent that already has a secret in hand (read from a file, echoed back by
+# an earlier tool, planted in its context by a prompt injection) hands it to
+# an external sink — a curl endpoint an attacker controls, or, the surface
+# this specifically adds coverage for, an ordinary-looking MCP tool (post a
+# chat message, file an issue/gist, send an email) that a malicious or
+# compromised MCP server — or a prompt-injected agent using a perfectly
+# legitimate one — can use to walk a secret straight out, invisible to every
+# shell-oriented guard in this file.
+#
+# Vendor-format prefixes (AKIA/ghp_/xox?-/sk_live_/AIza/...) are used because
+# they are near-unique to a live credential — unlike a bare env-VAR REFERENCE
+# ($GITHUB_TOKEN), which is the ordinary, sanctioned way to authenticate to a
+# service and stays uncaught (see ENV_DUMP_EXFIL_RE's "single named var to
+# its own API" carve-out above: no regex can tell "the vendor's own API" from
+# "an attacker's host" from a variable NAME alone). A hardcoded LITERAL secret
+# VALUE is a different, rarer, higher-signal shape: real workflows put
+# secrets in env vars or config, not inline in a command or a tool-call
+# argument, precisely because an inline literal leaks into shell history and
+# process listings — so requiring the literal (not a reference) trades a
+# little recall for a lot of precision. Private-key PEM blocks get no such
+# hedge: there is no legitimate reason for a raw private key to appear inline
+# in a network-bound call at all.
+#
+# Deliberately excludes: JWTs (three dot-separated base64 segments) — too
+# noisy, since ordinary bearer/session tokens are legitimately passed around
+# in API calls and any base64 JSON blob can coincidentally shape-match; and
+# vendors' explicit TEST-mode key formats (Stripe's sk_test_/rk_test_, etc.)
+# — common, harmless placeholders in docs and fixtures, including this
+# guard's own test file.
+#
+# Scope mirrors CLOUD_METADATA_RE: Read/Edit/Write are NOT scanned. A file
+# that merely CONTAINS a secret-shaped string (this guard's own test
+# fixtures, a security tool's denylist, a `.env.example` placeholder) is not
+# an exfiltration; only an action that actually reaches the network is in
+# scope. For shell, the token must co-occur with a network sink in the same
+# clause (mirrors ENV_DUMP_EXFIL_RE's dump<->sink pairing below) — a secret
+# written to a local file, or mentioned in a comment/commit message/grep, is
+# out of scope, same carve-out reasoning as the cloud-metadata guard's
+# mention-only exclusion. For MCP/WebFetch (SECRET_TOKEN_RE checked directly
+# against every arg value — see _net_text), the tool call itself IS already
+# network-reaching, so no separate sink co-occurrence is needed, matching how
+# the cloud-metadata check treats that branch.
+#
+# Not exhaustive: this is a denylist of well-known, structurally distinctive
+# vendor formats (the same style gitleaks/trufflehog ship as high-confidence,
+# no-context-needed rules), not a generic secret-entropy scanner — an
+# unrecognized token format, a secret split across a variable, or one that
+# never leaves this exact clause (staged now, sent in a later, separate tool
+# call) is a residual gap in the same spirit as this file's other documented
+# denylist gaps.
+SECRET_TOKEN_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"
+    r"|-----BEGIN PGP PRIVATE KEY BLOCK-----"
+    # AWS access-key-ID family (long-term, temporary/STS, and other resource
+    # prefixes sharing the same 16-char-suffix shape).
+    r"|\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b"
+    # GitHub fine-grained/classic PAT and other gh*_ token kinds; GitLab PAT.
+    r"|\bgh[pousr]_[A-Za-z0-9]{36}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b"
+    r"|\bglpat-[A-Za-z0-9_-]{20,}\b"
+    # Slack bot/user/app/legacy tokens.
+    r"|\bxox[baprs]-[A-Za-z0-9-]{10,}\b"
+    # Stripe LIVE secret/restricted keys only — see TEST-mode exclusion above.
+    r"|\b(?:sk|rk)_live_[A-Za-z0-9]{20,}\b"
+    r"|\bAIza[0-9A-Za-z_-]{35}\b"                        # Google API key
+    r"|\bnpm_[A-Za-z0-9]{36}\b"                          # npm access token
+    r"|\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{20,}\b"         # Anthropic API key
+    r"|\bsk-proj-[A-Za-z0-9_-]{20,}\b"                   # OpenAI project key
+)
+
+SECRET_EXFIL_RE = re.compile(
+    r"(?i:" + _SINK_OR_DEVNET + r")[^;&\n]*(?:" + SECRET_TOKEN_RE.pattern + r")"
+    r"|(?:" + SECRET_TOKEN_RE.pattern + r")[^;&\n]*(?i:" + _SINK_OR_DEVNET + r")"
+)
+
 # A test-suite invocation, across common toolchains. Backs the opt-in Stop
 # verification gate (lifecycle.session.rule_stop_verification_gate): evidence
 # that a test run HAPPENED after the last change — presence of the command, not

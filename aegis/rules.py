@@ -179,13 +179,17 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
         text = _shell_scan(ev)
         metadata_hit = (bool(patterns.CLOUD_METADATA_RE.search(text))
                          and not patterns.CLOUD_METADATA_MENTION_ONLY_RE.search(text))
+        secret_hit = bool(patterns.SECRET_EXFIL_RE.search(text))
     elif ev.action == ActionClass.MCP or (
             ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch"):
-        metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(_net_text(ev)))
+        net_text = _net_text(ev)
+        metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(net_text))
+        secret_hit = bool(patterns.SECRET_TOKEN_RE.search(net_text))
         text = None  # handled above; not a shell/read/edit/write shape below
     elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
         text = _path(ev) + " " + str((ev.args or {}).get("content") or "")
         metadata_hit = False
+        secret_hit = False
     else:
         return None
     if metadata_hit:
@@ -194,6 +198,11 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
                         "endpoint hands out live IAM/service-account credentials to "
                         "anything on-box, no auth required, and is a classic SSRF-to-"
                         "credential-theft path.")
+    if secret_hit:
+        return Decision(Action.DENY, "containment-secret-exfiltration",
+                        "A live-looking secret (a private key or a vendor-format API "
+                        "token) reaching the network is blocked — whether via a shell "
+                        "command or an MCP tool call.")
     if text is None or not text.strip():
         return None
     if patterns.CRED_RE.search(text):
