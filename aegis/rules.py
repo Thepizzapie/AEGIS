@@ -72,33 +72,48 @@ def _sql_text(ev: Event) -> str:
     return " ".join(str(p) for p in parts if p)
 
 
-def _flatten_strings(v, _depth: int = 0) -> list:
-    """Every string/number leaf inside a (possibly nested) arg value. MCP tool
-    args are arbitrary JSON, so a target URL can sit under any key name, at any
-    depth (e.g. {"input": {"url": "..."}}) — QA review (independent agent,
-    round 1) found a fixed key-name allowlist here was a bypass: any MCP tool
-    naming its URL argument something other than the guessed set (url/query/
-    uri/endpoint/command) sailed straight through untouched. Depth cap raised
-    12 -> deep enough for any realistic tool-arg schema (round 3 QA found the
-    original cap of 4 silently dropped a 5-level-deep target) while still
-    bounding recursion against a pathological/cyclic payload."""
-    if _depth > 12:
-        return []
-    if isinstance(v, str):
-        return [v]
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return [str(v)]
-    if isinstance(v, dict):
-        out = []
-        for x in v.values():
-            out.extend(_flatten_strings(x, _depth + 1))
-        return out
-    if isinstance(v, (list, tuple)):
-        out = []
-        for x in v:
-            out.extend(_flatten_strings(x, _depth + 1))
-        return out
-    return []
+_FLATTEN_NODE_BUDGET = 5000
+
+
+def _flatten_strings(v) -> list:
+    """Every string/number leaf, AND dict key, inside a (possibly deeply
+    nested) arg value. MCP tool args are arbitrary JSON, so a target URL (or,
+    for the secret-exfiltration guard, a leaked token) can sit under any key
+    name, at any depth (e.g. {"input": {"url": "..."}}) — QA review
+    (independent agent, round 1) found a fixed key-name allowlist here was a
+    bypass: any MCP tool naming its argument something other than the
+    guessed set (url/query/uri/endpoint/command) sailed straight through
+    untouched.
+
+    Iterative (an explicit stack, not recursion) with a total-NODE budget
+    rather than a fixed nesting-depth cap: the secret-exfiltration guard's
+    own QA (round 1, independent bypass hunt) found the previous depth-12
+    cutoff silently dropped anything nested one level deeper — and since MCP
+    args are arbitrary JSON a malicious/compromised server fully controls,
+    ANY fixed depth cap is trivially cleared by nesting one level past it.
+    A node budget degrades gracefully instead of having an exact, gameable
+    threshold, and also protects a pathologically wide (not just deep)
+    payload — a case a depth-only cap never covered. Also walks dict KEYS,
+    not just values (the same round-1 bypass hunt: a tool that accepts
+    ``{"<secret>": ...}`` leaked the literal with zero coverage when only
+    values were scanned)."""
+    out = []
+    stack = [v]
+    budget = _FLATTEN_NODE_BUDGET
+    while stack and budget > 0:
+        budget -= 1
+        cur = stack.pop()
+        if isinstance(cur, str):
+            out.append(cur)
+        elif isinstance(cur, (int, float)) and not isinstance(cur, bool):
+            out.append(str(cur))
+        elif isinstance(cur, dict):
+            for k, x in cur.items():
+                stack.append(k)
+                stack.append(x)
+        elif isinstance(cur, (list, tuple)):
+            stack.extend(cur)
+    return out
 
 
 def _net_text(ev: Event) -> str:
@@ -179,12 +194,12 @@ def rule_containment(ev: Event, policy=None) -> Optional[Decision]:
         text = _shell_scan(ev)
         metadata_hit = (bool(patterns.CLOUD_METADATA_RE.search(text))
                          and not patterns.CLOUD_METADATA_MENTION_ONLY_RE.search(text))
-        secret_hit = bool(patterns.SECRET_EXFIL_RE.search(text))
+        secret_hit = patterns.secret_exfil_hit(text)
     elif ev.action == ActionClass.MCP or (
             ev.action == ActionClass.NET and (ev.tool or "").strip().lower() != "websearch"):
         net_text = _net_text(ev)
         metadata_hit = bool(patterns.CLOUD_METADATA_RE.search(net_text))
-        secret_hit = bool(patterns.SECRET_TOKEN_RE.search(net_text))
+        secret_hit = patterns.secret_token_hit(net_text)
         text = None  # handled above; not a shell/read/edit/write shape below
     elif ev.action in (ActionClass.READ, ActionClass.EDIT, ActionClass.WRITE):
         text = _path(ev) + " " + str((ev.args or {}).get("content") or "")

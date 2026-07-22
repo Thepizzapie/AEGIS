@@ -1558,7 +1558,20 @@ ENV_DUMP_EXFIL_RE = re.compile(
 # mention-only exclusion. For MCP/WebFetch (SECRET_TOKEN_RE checked directly
 # against every arg value — see _net_text), the tool call itself IS already
 # network-reaching, so no separate sink co-occurrence is needed, matching how
-# the cloud-metadata check treats that branch.
+# the cloud-metadata check treats that branch. This deliberately includes an
+# MCP tool that WRITES content to a git-hosted repo (e.g. push a file via a
+# GitHub MCP server) even when the content is innocuous fixture/test data —
+# Aegis cannot distinguish "push to my own already-trusted repo" from "post
+# to an arbitrary external service" by tool name alone without an allowlist
+# that a same-shaped attacker-controlled tool name would trivially clear;
+# use local Write + `git push` (which this guard does not scan — see above)
+# for content that legitimately contains example/fixture secrets. The same
+# reasoning applies to a legitimate secrets-manager/vault MCP tool storing a
+# real credential: indistinguishable, by argument shape alone, from handing
+# that credential to an attacker, so it is denied like any other MCP secret
+# sighting — see tests/test_secret_exfil.py for both cases, kept as
+# explicitly accepted tradeoffs (independent QA flagged both; deliberately
+# not "fixed" with a tool-name allowlist for the reason above).
 #
 # Not exhaustive: this is a denylist of well-known, structurally distinctive
 # vendor formats (the same style gitleaks/trufflehog ship as high-confidence,
@@ -1586,10 +1599,98 @@ SECRET_TOKEN_RE = re.compile(
     r"|\bsk-proj-[A-Za-z0-9_-]{20,}\b"                   # OpenAI project key
 )
 
-SECRET_EXFIL_RE = re.compile(
-    r"(?i:" + _SINK_OR_DEVNET + r")[^;&\n]*(?:" + SECRET_TOKEN_RE.pattern + r")"
-    r"|(?:" + SECRET_TOKEN_RE.pattern + r")[^;&\n]*(?i:" + _SINK_OR_DEVNET + r")"
+# Obvious placeholder/example tokens that structurally match a vendor format
+# but are documented conventions for "not a real value" — a README's
+# `ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` convention, or AWS's own
+# official example access key `AKIAIOSFODNN7EXAMPLE` used throughout its
+# docs. Round-1 independent QA (false-positive hunt) found both hard-blocked
+# by a non-escapable guard with no override — the single most common
+# real-world way to trip this guard on purpose-free, everyday doc-writing.
+# Checked against the MATCHED TOKEN SUBSTRING only (not the surrounding
+# text), so a real secret sitting near an unrelated word like "example"
+# elsewhere in the same string is unaffected. A run of 6+ identical
+# characters is vanishingly unlikely in a real random token (~1 in 36^6 for
+# base36) and catches masked/redacted forms generally, not just the literal
+# "xxxx" convention.
+_PLACEHOLDER_MARKER_RE = re.compile(
+    r"EXAMPLE|PLACEHOLDER|REDACTED|YOUR[_-]?TOKEN|(.)\1{5,}", re.IGNORECASE)
+
+
+def _is_placeholder_token(token: str) -> bool:
+    return bool(_PLACEHOLDER_MARKER_RE.search(token))
+
+
+def find_secret_token(text: str):
+    """First SECRET_TOKEN_RE match in ``text`` that isn't an obvious
+    placeholder/example (see _is_placeholder_token), or None."""
+    for m in SECRET_TOKEN_RE.finditer(text):
+        if not _is_placeholder_token(m.group(0)):
+            return m
+    return None
+
+
+def secret_token_hit(text: str) -> bool:
+    """MCP/WebFetch check: any non-placeholder secret literal anywhere in the
+    flattened argument text (the call itself already reaches the network)."""
+    return find_secret_token(text) is not None
+
+
+def _strip_placeholder_tokens(text: str) -> str:
+    return SECRET_TOKEN_RE.sub(
+        lambda m: "" if _is_placeholder_token(m.group(0)) else m.group(0), text)
+
+
+# Network sinks for the shell co-occurrence check below. Starts from
+# _NET_SINK (shared with ENV_DUMP_EXFIL_RE above) but round-1 independent QA
+# (bypass hunt) found two gaps specific to this guard's threat model — a
+# malicious/compromised MCP server or a prompt-injected agent reaching for
+# whatever transport is on hand, not just curl/wget:
+#   - `\bftp\b` requires a word BOUNDARY before 'f', so it never matches
+#     inside "sftp"/"tftp" (no boundary between 's'/'t' and 'f' — both word
+#     characters) — sftp/tftp are added as their own explicit alternatives,
+#     not left to (incorrectly) fall out of the existing ftp entry.
+#   - raw-socket / SMTP / websocket / rsync transports have no recognizable
+#     "fetch verb" at all when no http(s):// URL literal is present (the
+#     existing 'http' keyword only catches these by accident, via a URL
+#     substring) — explicit python/node/rsync primitives are added so the
+#     check doesn't depend on that accident.
+# Not exhaustive (same posture as _NET_SINK itself): a raw socket opened via
+# some other language/library, or a secret handed to send()/write() in a
+# SEPARATE statement from the one that opened the connection (common in a
+# realistic multi-line script — this checker, like every other in this file,
+# only sees co-occurrence WITHIN one ';'/'&'/newline-delimited clause) is a
+# residual, documented gap.
+_SECRET_SINK_RE = re.compile(
+    r"\b(?:curl|wget|nc|ncat|netcat|http|sftp|tftp|rsync|Invoke-WebRequest|"
+    r"Invoke-RestMethod|iwr|irm|socat|telnet|ftp|ssh|openssl\s+s_client)\b"
+    r"|" + _DEV_NET_RE_FRAG
+    + r"|\b(?:requests\.(?:post|put|get|patch)|urlopen|fetch|axios\.\w+|"
+    r"http\.client|socket\.(?:create_connection|socket)|smtplib\.SMTP|"
+    r"net\.connect|websocket\.create_connection)\s*\("
+    r"|\bwss?://",
+    re.IGNORECASE,
 )
+
+
+def secret_exfil_hit(text: str) -> bool:
+    """Shell check: a live (non-placeholder) secret token co-occurring with a
+    network sink in the same command clause.
+
+    Deliberately NOT a single ``sink...token | token...sink`` regex
+    alternation: independent code-quality QA measured that shape at multiple
+    seconds on a crafted ~10-15KB input with many repeated sink/token-shaped
+    substrings — `.search()` retries the whole `[^;&\\n]*` + alternation scan
+    from every sink occurrence, which is quadratic in input size. A
+    non-escapable guard hanging is itself a bypass (Aegis fails OPEN on a
+    hook timeout — see README). Splitting on the same ';'/'&'/newline
+    boundary every other exfil check in this file already treats as a
+    statement separator, then doing a bounded, linear search per clause,
+    gives the identical semantics (same-clause co-occurrence) in linear
+    time."""
+    for clause in re.split(r"[;&\n]", text):
+        if _SECRET_SINK_RE.search(clause) and find_secret_token(clause):
+            return True
+    return False
 
 # A test-suite invocation, across common toolchains. Backs the opt-in Stop
 # verification gate (lifecycle.session.rule_stop_verification_gate): evidence
