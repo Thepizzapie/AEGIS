@@ -72,7 +72,8 @@ def _sql_text(ev: Event) -> str:
     return " ".join(str(p) for p in parts if p)
 
 
-_FLATTEN_NODE_BUDGET = 5000
+_FLATTEN_NODE_BUDGET = 200_000
+_FLATTEN_CHAR_BUDGET = 2_000_000
 
 
 def _flatten_strings(v) -> list:
@@ -85,34 +86,51 @@ def _flatten_strings(v) -> list:
     guessed set (url/query/uri/endpoint/command) sailed straight through
     untouched.
 
-    Iterative (an explicit stack, not recursion) with a total-NODE budget
-    rather than a fixed nesting-depth cap: the secret-exfiltration guard's
-    own QA (round 1, independent bypass hunt) found the previous depth-12
-    cutoff silently dropped anything nested one level deeper — and since MCP
-    args are arbitrary JSON a malicious/compromised server fully controls,
-    ANY fixed depth cap is trivially cleared by nesting one level past it.
-    A node budget degrades gracefully instead of having an exact, gameable
-    threshold, and also protects a pathologically wide (not just deep)
-    payload — a case a depth-only cap never covered. Also walks dict KEYS,
-    not just values (the same round-1 bypass hunt: a tool that accepts
-    ``{"<secret>": ...}`` leaked the literal with zero coverage when only
-    values were scanned)."""
+    Iterative (an explicit stack, not recursion), walking dict KEYS as well
+    as values (round-1 bypass hunt: a tool that accepts ``{"<secret>": ...}``
+    leaked the literal with zero coverage when only values were scanned), in
+    natural (first-added-processed-first) order — lists/dict items are
+    pushed in reverse so the stack pops them back out in original order.
+
+    Bounded by a total-NODE budget AND a total-CHARACTER budget, not a fixed
+    nesting-depth cap: round-1 QA found a depth-12 cutoff silently dropped
+    anything nested one level deeper, trivially cleared by an adversarial MCP
+    server nesting one level past whatever fixed depth is chosen. A
+    node/char budget degrades gracefully instead of having an exact, gameable
+    threshold — BUT round-2 verification QA found even a 5000-node budget is
+    itself gameable with an entirely ordinary-shaped (flat, no deep nesting)
+    payload: a few thousand short "decoy" strings ahead of the real target
+    exhausts the budget before the target is ever visited. Raising both
+    budgets substantially (200k nodes / 2MB of text — comfortably fast to
+    join and regex-scan, verified by this file's own perf tests) raises the
+    bar from "a few thousand ordinary-looking decoy fields" (an unremarkable
+    payload) to "hundreds of thousands of fields or several megabytes of
+    decoy text" (a distinctly anomalous one for an ordinary tool call) but
+    does not eliminate the class: ANY finite budget can in principle be
+    exhausted by enough decoy content placed ahead of the target. This is the
+    same residual, denylist-style gap this file already accepts elsewhere —
+    not something a bounded scanner can fully close — documented here rather
+    than silently assumed away."""
     out = []
+    total_chars = 0
     stack = [v]
-    budget = _FLATTEN_NODE_BUDGET
-    while stack and budget > 0:
-        budget -= 1
+    nodes_left = _FLATTEN_NODE_BUDGET
+    while stack and nodes_left > 0 and total_chars < _FLATTEN_CHAR_BUDGET:
+        nodes_left -= 1
         cur = stack.pop()
         if isinstance(cur, str):
             out.append(cur)
+            total_chars += len(cur)
         elif isinstance(cur, (int, float)) and not isinstance(cur, bool):
-            out.append(str(cur))
+            s = str(cur)
+            out.append(s)
+            total_chars += len(s)
         elif isinstance(cur, dict):
-            for k, x in cur.items():
+            for k, x in reversed(list(cur.items())):
                 stack.append(k)
                 stack.append(x)
         elif isinstance(cur, (list, tuple)):
-            stack.extend(cur)
+            stack.extend(reversed(cur))
     return out
 
 

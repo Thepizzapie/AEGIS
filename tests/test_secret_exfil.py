@@ -215,6 +215,38 @@ def test_mcp_secret_as_dict_key_blocked():
     assert d.blocked and d.rule == "containment-secret-exfiltration"
 
 
+# --- QA round-2 (verification pass): decoy-flood bypass of the node budget --
+# The round-1 fix (depth cap -> node budget) was itself found gameable: an
+# entirely ORDINARY-shaped payload (flat, no deep nesting) with a few
+# thousand short decoy strings ahead of the real secret exhausted the old
+# 5000-node budget before the secret was ever visited — same bug class, just
+# "wide" instead of "deep". Budgets raised substantially (200k nodes / 2MB of
+# text) to raise the bar from "a few thousand ordinary fields" to "hundreds
+# of thousands" — see _flatten_strings' docstring for why this narrows,
+# rather than eliminates, the class.
+
+def test_mcp_decoy_flood_before_secret_blocked():
+    payload = {"items": [AWS_AKIA] + ["decoy"] * 6000}
+    d = _rule(_mcp("mcp__bulk__upload", payload))
+    assert d.blocked and d.rule == "containment-secret-exfiltration"
+
+
+def test_mcp_decoy_flood_after_secret_blocked():
+    payload = {"items": ["decoy"] * 6000 + [AWS_AKIA]}
+    d = _rule(_mcp("mcp__bulk__upload", payload))
+    assert d.blocked and d.rule == "containment-secret-exfiltration"
+
+
+def test_mcp_large_benign_payload_stays_fast():
+    import time
+    payload = {"items": ["benign decoy text " + str(i) for i in range(6000)]}
+    start = time.monotonic()
+    d = _rule(_mcp("mcp__bulk__upload", payload))
+    elapsed = time.monotonic() - start
+    assert not d.blocked
+    assert elapsed < 1.0, f"took {elapsed:.2f}s scanning a large benign MCP payload"
+
+
 # --- MCP: any tool call carrying a secret in its arguments is blocked --------
 
 def test_mcp_slack_style_message_with_token_blocked():
