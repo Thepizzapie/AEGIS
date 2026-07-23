@@ -949,6 +949,216 @@ def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- package-manifest lifecycle-script / registry-hijack protection ----------
+def _package_manifest_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_package_manifest_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a lifecycle-script hook in a package manifest
+    (``package.json``'s ``preinstall``/``install``/``postinstall``/
+    ``preuninstall``/``postuninstall``/``prepare``/``prepublish``/
+    ``prepublishOnly``, or ``composer.json``'s ``pre-install-cmd``/
+    ``post-install-cmd``/``pre-update-cmd``/``post-update-cmd``/
+    ``pre-autoload-dump``/``post-autoload-dump``/``pre-package-install``/
+    ``post-package-install``/``pre-archive-cmd``/``post-archive-cmd``), or
+    redirecting a package registry/index (``.npmrc``, ``.yarnrc``/
+    ``.yarnrc.yml``, ``pip.conf``/``pip.ini``, ``.cargo/config.toml``,
+    ``pyproject.toml``'s ``[[tool.poetry.source]]``).
+
+    THREAT MODEL: ``rule_install_review`` forces a full read of a manifest
+    before an install proceeds — it guards against installing a THIRD PARTY
+    package that already carries a malicious lifecycle script. Nothing
+    guarded the other direction: an agent (hijacked, prompt-injected, or
+    just careless) EDITING a manifest to plant the script itself. A
+    lifecycle hook runs with zero confirmation, zero explicit invocation by
+    name, on the very next ``npm install``/``npm ci``/``composer install`` —
+    by this same agent moments later, a teammate, or an unattended CI
+    runner — and reads in a diff as a one-line, routine-looking addition to
+    a ``scripts`` object, not as a backdoor. This is the exact mechanism
+    behind real supply-chain compromises (eslint-scope, ua-parser-js,
+    event-stream all shipped a malicious ``postinstall``). The registry half
+    is the same "trusted name, poisoned source" shape ``ci_workflow``/
+    ``git_hooks``/``agent_def``/``shell_persist`` all share: silently
+    swapping WHERE every future, completely ordinary-looking
+    ``npm install lodash`` fetches from.
+
+    Distinct from every other ``*_protect`` guard in this file: those gate
+    on PATH alone, because their target files (a CI workflow, a git hook, a
+    shell rc file) are rarely touched for benign reasons. ``package.json``/
+    ``composer.json``/``pyproject.toml`` are not — they're edited on nearly
+    every commit to add a dependency or bump a version. Gating on path alone
+    here would fire on almost every routine change and get this guard
+    disabled from ask-fatigue, so both the manifest and registry checks also
+    require the CONTENT of the edit to name one of a curated, narrow set of
+    lifecycle-script/registry keys — names that essentially only ever appear
+    in these files for the one reason this guard exists to catch. A benign
+    edit adding a "test"/"build"/"start"/"lint" script (requires an explicit
+    ``npm run <name>``, never auto-executed) never matches and stays
+    allowed.
+
+    Config (``policy.package_manifest``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted private-registry setup, say). Defaults to ``ask``
+    for the same reason ``ci_workflow``/``git_hooks``/``agent_def``/
+    ``shell_persist`` do: a ``postinstall: "patch-package"`` or a private
+    Artifactory/Verdaccio registry pin is routine, sanctioned dev work, not
+    inherently malicious — it just needs a human to have actually looked at
+    it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_PACKAGE_MANIFEST=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    QA history (two independent adversarial reviews, run in parallel): both
+    rounds confirmed real bypasses, since fixed — ``pnpm pkg set`` (round A;
+    ``NPM_PKG_SET_LIFECYCLE_RE`` hardcoded literal ``npm`` only), a
+    jq-piped-through-``sponge`` in-place edit and jq's own ``--arg``
+    key-indirection form (round A + round B; closed by
+    ``JQ_SCRIPTS_LIFECYCLE_RE``, checked unconditionally like
+    ``NPM_PKG_SET_LIFECYCLE_RE``/``REGISTRY_HIJACK_CLI_RE``), Yarn Classic's
+    real space-delimited ``.yarnrc`` syntax (round B; the guard's own stated
+    coverage for that file was dead code against an ``=``-only pattern), a
+    reference MCP filesystem server's real ``edit_file`` shape (round A;
+    ``{path, edits: [{oldText, newText}]}`` carries no top-level
+    content/new_string key, so the original extraction always resolved
+    empty), a too-tight ``{0,300}`` bound on the poetry-source content check
+    (round A; widened to ``{0,2000}``, matching ``_HOOKSPATH_INI_RE_SRC``'s
+    precedent), and thin CLI-only registry-hijack coverage for
+    poetry/composer/cargo (round B; now covered by ``REGISTRY_HIJACK_CLI_RE``
+    alongside npm/pnpm/yarn/pip).
+
+    Known residual gaps, same spirit as every guard in this file, disclosed
+    rather than fixed: a direct fetch-to-file write (``curl -o package.json
+    ...``) is caught by none of the shell branch's write-verb checks, the
+    same inherited gap every sibling guard already discloses; ``find
+    -path``/``-name`` indirection around the manifest/config filename is not
+    covered (no ``*_find_hit``-style fallback here, unlike self-protect/
+    ci-workflow/git-hooks/agent-def/shell-persist); a value assembled via the
+    target language's own string-building (Python ``'post'+'install'``, an
+    f-string, ``.join()``) rather than appearing as one contiguous literal in
+    the scanned text defeats both content checks — ``normalize.scan_surface``
+    de-obfuscates shell-level quoting/encoding, not an embedded interpreter's
+    own runtime string construction, the same "computed indirectly" class of
+    gap every other guard in this file already accepts for shell-computed
+    paths in general (round B, verified, not fixed — solving it in general is
+    equivalent to evaluating arbitrary code); a lifecycle-script key split
+    across two separate tool calls — an innocuous placeholder value planted
+    and approved first, then swapped for the real payload in a second Edit
+    whose ``old_string``/``new_string`` never repeats the key name — evades
+    detection on the second call, since (like every guard in this file) there
+    is no cross-call session state to notice the two edits target the same
+    key (round A, verified, not fixed — the same "each tool call is evaluated
+    independently" limitation ``git_hooks``' ``GIT_CONFIG_GLOBAL``/
+    ``GIT_CONFIG_SYSTEM`` gap and every other guard's split-across-calls gap
+    already accept); a commented-out example line in a registry-config file
+    (a ``# index-url = ...`` template line, common generated-file boilerplate)
+    still matches ``REGISTRY_HIJACK_RE`` and asks unnecessarily (round A,
+    verified, not fixed — the accepted false-positive-over-false-negative
+    trade-off every guard in this file already takes, and requiring
+    line-start-anchoring to exclude it would have broken real detection on
+    the shell branch, where a whole multi-clause command is one unbroken
+    line with no comment/line-start distinction to anchor on); and, like
+    every other guard here, a write-verb only needs to appear ANYWHERE in
+    the command alongside the matched path, not adjacent to or provably
+    operating on it — the accepted false-positive-over-false-negative
+    trade-off every sibling guard in this file already takes."""
+    cfg = getattr(policy, "package_manifest", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "package-manifest-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        # Claude Code's native Edit/Write always carry the changed text under
+        # content/new_string, but a third-party MCP filesystem server's own
+        # edit tool doesn't follow that convention — the reference
+        # filesystem server's `edit_file`, for one, nests each change as
+        # {path, edits: [{oldText, newText}]}, with no top-level content/
+        # new_string key at all (QA finding, independent adversarial review,
+        # round A): the original `a.get("content") or a.get("new_string")`
+        # extraction resolved to "" for that real, common shape, so the
+        # guard exited immediately and never saw the planted script. Falling
+        # back to every string/number leaf in the MCP call's args (the same
+        # `_flatten_strings` helper `_net_text` uses, for the identical
+        # "arbitrary JSON shape, no fixed key convention across servers"
+        # reason) closes it — Edit/Write keep the precise, narrower
+        # extraction since their shape is fixed and known.
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        script_hit = bool(patterns.PACKAGE_SCRIPTS_PATH_RE.search(p)
+                           and patterns.LIFECYCLE_SCRIPT_KEY_RE.search(content))
+        registry_hit = bool(patterns.REGISTRY_CONFIG_PATH_RE.search(p)
+                             and patterns.REGISTRY_HIJACK_RE.search(content))
+        if not (script_hit or registry_hit):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PACKAGE_MANIFEST")
+                or _package_manifest_allowed_by_policy(cfg, p)):
+            return None
+        reason = (f"Package manifest '{p}' is being written with a lifecycle-"
+                  "script hook — it runs automatically, with no explicit "
+                  "invocation, on the next install" if script_hit else
+                  f"Package registry config '{p}' is being written — it "
+                  "redirects where every future dependency install fetches "
+                  "from")
+        return _finish(Decision(action, "package-manifest-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_PACKAGE_MANIFEST=1; a spawned agent "
+                         "cannot set this."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        script_hit = bool(patterns.NPM_PKG_SET_LIFECYCLE_RE.search(cmd)
+                           or patterns.JQ_SCRIPTS_LIFECYCLE_RE.search(cmd)
+                           or (write_verb
+                               and patterns.PACKAGE_SCRIPTS_PATH_RE.search(cmd)
+                               and patterns.LIFECYCLE_SCRIPT_KEY_RE.search(cmd)))
+        registry_hit = bool(patterns.REGISTRY_HIJACK_CLI_RE.search(cmd)
+                             or (write_verb
+                                 and patterns.REGISTRY_CONFIG_PATH_RE.search(cmd)
+                                 and patterns.REGISTRY_HIJACK_RE.search(cmd)))
+        if not (script_hit or registry_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PACKAGE_MANIFEST")
+                or _package_manifest_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A lifecycle-script hook is being planted in a package "
+                  "manifest from a shell — it runs automatically on the "
+                  "next install" if script_hit else
+                  "A package registry/index is being redirected from a "
+                  "shell — every future dependency install will fetch from "
+                  "the new source")
+        return _finish(Decision(action, "package-manifest-protect",
+                         f"{reason}. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_PACKAGE_MANIFEST=1; a spawned "
+                         "agent cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -1349,6 +1559,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_agent_def_protect,
     rule_shell_persist_protect,
+    rule_package_manifest_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

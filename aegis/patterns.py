@@ -1523,3 +1523,186 @@ TEST_CMD_RE = re.compile(
     r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )
+
+# ---- Package-manifest lifecycle-script / registry-hijack protection -----------
+# Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
+# install_review forces a READ of a manifest before an install proceeds (guards
+# against installing a THIRD PARTY package that already carries a malicious
+# script), but nothing stops an agent from being the one who PLANTS the script
+# in package.json/composer.json in the first place, for a FUTURE `npm install`/
+# `composer install` — by this same agent moments later, a teammate, or CI — to
+# run unattended. Same shape as mcp_config/ci_workflow/git_hooks/agent_def:
+# write today, auto-exec on a different, later trigger, with no further agent
+# action needed. The registry half is the "trusted name, poisoned source"
+# variant: redirecting `.npmrc`/`.yarnrc*`/`pip.conf`/`.cargo/config.toml`/
+# `pyproject.toml`'s registry/index-url away from the real registry silently
+# swaps every future ordinary-looking `npm install lodash` for a fetch from an
+# attacker-controlled host.
+#
+# Deliberately gated on PATH *and* CONTENT for the Edit/Write/MCP branch,
+# unlike the path-only gate every sibling *_protect guard uses: package.json/
+# pyproject.toml/composer.json are ordinary files edited constantly for
+# routine reasons (bumping a dependency, adding a devDependency, a version
+# bump) — gating on path alone here would make this guard fire on nearly
+# every commit to a Node/PHP/Python project, the ask-fatigue failure mode
+# that would get it disabled. The dangerous lifecycle-script/registry key
+# names below essentially only ever appear in these files for the one
+# reason this guard exists to catch, so requiring BOTH stays high-signal
+# without the false-positive rate a path-only gate would carry.
+_NPM_LIFECYCLE_KEYS = (
+    r"preinstall|install|postinstall|preuninstall|postuninstall"
+    r"|prepare|prepublish|prepublishOnly"
+)
+_COMPOSER_LIFECYCLE_KEYS = (
+    r"pre-install-cmd|post-install-cmd|pre-update-cmd|post-update-cmd"
+    r"|pre-autoload-dump|post-autoload-dump|pre-package-install"
+    r"|post-package-install|pre-archive-cmd|post-archive-cmd"
+)
+_LIFECYCLE_KEYS = _NPM_LIFECYCLE_KEYS + r"|" + _COMPOSER_LIFECYCLE_KEYS
+# Bare-word form for the JQ_SCRIPTS_LIFECYCLE_RE co-occurrence check below —
+# deliberately excludes the bare "install" (see that pattern's own comment):
+# scoped narrowly enough elsewhere, "install" alone is too generic a token to
+# bare-word-match even inside a jq-invocation window.
+_NPM_LIFECYCLE_BAREWORD_KEYS = (
+    r"preinstall|postinstall|preuninstall|postuninstall"
+    r"|prepare|prepublish|prepublishOnly"
+)
+_LIFECYCLE_BAREWORD_KEYS = _NPM_LIFECYCLE_BAREWORD_KEYS + r"|" + _COMPOSER_LIFECYCLE_KEYS
+
+# The manifest files that carry auto-run lifecycle scripts.
+PACKAGE_SCRIPTS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])package\.json" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])composer\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Content-only check for a CONFIRMED package-manifest path: a lifecycle-script
+# key, in either its JSON-object form (`"postinstall": "..."`, the ordinary
+# Edit/Write shape), its bracket form (`"postinstall"]`, jq's `.scripts["x"]`),
+# or its dot-path form (`scripts.postinstall=`, the shape `npm pkg set` and jq
+# use from a shell — no quotes, no colon). A benign edit that adds a "test"/
+# "build"/"start"/"lint" script (require an explicit `npm run <name>`, never
+# auto-executed) never matches this key list and stays allowed.
+LIFECYCLE_SCRIPT_KEY_RE = re.compile(
+    r"[\"'](?:" + _LIFECYCLE_KEYS + r")[\"']\s*(?::|\])"
+    r"|\bscripts\s*[.\[][\"']?(?:" + _LIFECYCLE_KEYS + r")\b",
+    re.IGNORECASE,
+)
+
+# `npm pkg set` mutates package.json's scripts WITHOUT the command ever
+# mentioning "package.json" as a path — it resolves the target implicitly
+# from cwd, so the path+content pairing above can't gate it (no path to
+# confirm). High-signal on its own: no legitimate reason to script-set a
+# lifecycle hook to anything but a locally-reviewed command. `pnpm` ships an
+# identical, documented `pnpm pkg set` subcommand — QA finding (independent
+# adversarial review, round A): the original pattern hardcoded literal `npm`
+# only, missing `pnpm pkg set scripts.postinstall=...` entirely.
+# Gap bounded ({0,200}, not unbounded) — perf self-check found the unbounded
+# form quadratic-blows-up (each of many repeated "npm pkg set" occurrences in
+# an adversarial input re-scans the full remaining string before failing) the
+# same way REGISTRY_HIJACK_CLI_RE's own fix below documents.
+NPM_PKG_SET_LIFECYCLE_RE = re.compile(
+    r"\b(?:npm|pnpm)\s+pkg\s+set\b[^|;&\n]{0,200}\bscripts\.(?:" + _NPM_LIFECYCLE_KEYS + r")\s*=",
+    re.IGNORECASE,
+)
+
+# `jq` is the standard, LLM-favored CLI for a scripted JSON edit — and it has
+# no `-i` flag, so the ordinary idiom is either a temp-file-then-`mv`/`cp`
+# (already caught by the shared write-verb check below) OR piping through
+# `sponge` (moreutils), which is on no write-verb list at all (QA finding,
+# independent adversarial review, round A). Separately, `jq --arg k
+# postinstall '.scripts[$k]=...'` never puts the key name adjacent to a
+# quote+colon/bracket the way LIFECYCLE_SCRIPT_KEY_RE requires — the key
+# is a bare `--arg` value (QA finding, round B). This pattern closes both:
+# unconditional on its own (no write-verb requirement, matching
+# NPM_PKG_SET_LIFECYCLE_RE/REGISTRY_HIJACK_CLI_RE's precedent below) as long
+# as `jq`, a `.scripts` target, and a lifecycle key name (bare word, not
+# necessarily adjacent to `.scripts`) all co-occur within the same bounded
+# window — bounded lookaheads ({0,300}), not unbounded, for the same
+# ReDoS-avoidance reason every other bounded gap in this file is bounded.
+JQ_SCRIPTS_LIFECYCLE_RE = re.compile(
+    r"\bjq\b(?=[^|;&\n]{0,300}\.scripts\b)"
+    r"(?=[^|;&\n]{0,300}\b(?:" + _LIFECYCLE_BAREWORD_KEYS + r")\b)",
+    re.IGNORECASE,
+)
+
+# Registry/index config files across the common package ecosystems — a
+# redirect here silently swaps the source of every future dependency fetch.
+REGISTRY_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.npmrc" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.yarnrc(?:\.yml)?" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pip\.(?:conf|ini)" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pyproject\.toml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Content-only check for a CONFIRMED registry-config path: an assignment that
+# points the registry/index at a URL, or a Cargo source replacement. Bounded
+# span ({0,2000}, not unbounded — same bound _HOOKSPATH_INI_RE_SRC uses, for
+# the same reason: real INI/TOML sections carry several other keys/comments
+# before the one that matters) on the poetry-source alternative for the same
+# ReDoS-avoidance reason every other bounded gap in this file is bounded. QA
+# (independent adversarial review, round A) found the original {0,300} bound
+# too tight — a poetry source stanza padded with a name/priority/description
+# past 300 chars pushed `url =` out of range and missed entirely.
+# Tolerates a backslash-escaped '/' (\/) between the scheme and host — the
+# ordinary shape a URL takes inside a `sed -i 's/registry=.*/registry=http:\/
+# \/evil\//'` replacement when '/' is also the sed delimiter, the single most
+# common way this kind of edit is made from a shell one-liner. Bounded to a
+# literal one-or-zero backslash per slash, not a repeatable class, so it adds
+# no new backtracking surface.
+_URL = r"https?:\\?/\\?/"
+REGISTRY_HIJACK_RE = re.compile(
+    r"\bregistry\s*=\s*[\"']?" + _URL                        # .npmrc / .yarnrc(.yml)
+    # Yarn Classic's actual .yarnrc syntax is space-delimited, not `key=value`
+    # (`registry "https://..."`) — QA finding (independent adversarial
+    # review, round B): the `=`-only form above can never match this file's
+    # real syntax at all, making the guard's own stated `.yarnrc` coverage
+    # dead code for the one form that file actually uses.
+    + r"|\bregistry\s+[\"']" + _URL                           # .yarnrc (Yarn Classic)
+    + r"|\bnpmRegistryServer\s*:\s*[\"']?" + _URL             # .yarnrc.yml (Yarn Berry)
+    + r"|\bindex-url\s*=\s*[\"']?" + _URL                     # pip.conf/.ini
+    + r"|\bindex_url\s*=\s*[\"']?" + _URL
+    + r"|\bextra-index-url\s*=\s*[\"']?" + _URL
+    + r"|\breplace-with\s*=\s*[\"']"                          # .cargo/config.toml [source]
+    + r"|\[\[tool\.poetry\.source\]\][^\[]{0,2000}\burl\s*=\s*[\"']" + _URL,
+    re.IGNORECASE,
+)
+
+# CLI forms that redirect a registry WITHOUT ever writing/mentioning the
+# config file path in the command — `npm/yarn/pnpm config set registry`,
+# `pip config set global.index-url`, `poetry source add`/`poetry config
+# repositories.*`, `composer config repositories.*`, `cargo ... config set
+# source.*.replace-with`. QA (independent adversarial review, round B) rated
+# the original npm/pnpm/yarn/pip-only coverage a significant gap given
+# registry hijack is half this guard's stated purpose — poetry/composer/
+# cargo now have dedicated coverage alongside the file-content form above.
+# Every gap bounded ({0,200}, not unbounded) and — critically — only ONE gap
+# per alternative, never chained. Perf self-check (found while adversarially
+# testing this guard's own new patterns, not by exercising them directly,
+# the same "reminder that a shared shape needs its own perf test"
+# FIND_PROTECTED_RE's comment describes for an unrelated guard) caught TWO
+# distinct ReDoS shapes here: a single UNBOUNDED `[^|;&\n]*` gap after a
+# short, frequently-repeating leading literal ("npm config set ") re-scans
+# the full remaining string from EVERY repeated occurrence before failing —
+# quadratic, confirmed hanging 5s+ on a ~75K-char input; an original cargo
+# alternative chaining THREE separate `{0,200}`-bounded gaps still hung 4.8s
+# on a 136K-char input despite the bound — each short intervening literal
+# ("config"/"set") recurs many times inside its own 200-char window, so the
+# two adjacent bounded gaps still overlap on the SAME repeated text, the
+# identical shape GIT_HOOKS_CONFIG_RE's own comment describes for `(git -c
+# )*20000` even after bounding alone. Fixed the same way that comment's
+# ultimate fix did: drop the freeform middle gaps entirely rather than bound
+# them tighter — "replace-with" is distinctive enough (virtually no
+# legitimate reason for that literal to appear except this exact Cargo
+# registry-override context) that anchoring only "cargo" and "replace-with"
+# within one bounded gap is still high-signal, at no compounding cost.
+REGISTRY_HIJACK_CLI_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn)\s+config\s+set\b[^|;&\n]{0,200}\b(?:registry|npmRegistryServer)\b"
+    r"|\bpip3?\s+config\s+set\b[^|;&\n]{0,200}\bindex-url\b"
+    r"|\bpoetry\s+(?:source\s+add\b|config\s+repositories\.)"
+    r"|\bcomposer\s+config\s+repositories\."
+    r"|\bcargo\b[^|;&\n]{0,200}\breplace-with\b",
+    re.IGNORECASE,
+)

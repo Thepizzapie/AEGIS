@@ -97,7 +97,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `shell_persist`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `shell_persist`, `package_manifest`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -142,7 +142,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
      `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `shell_persist`,
-     `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
+     `package_manifest`, `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
 """,
