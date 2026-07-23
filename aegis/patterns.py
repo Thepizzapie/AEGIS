@@ -1523,3 +1523,112 @@ TEST_CMD_RE = re.compile(
     r"|\brake\s+test\b|\brspec\b|\bphpunit\b|\bmix\s+test\b",
     re.IGNORECASE,
 )
+
+# ---- Package-manifest lifecycle-script / registry-hijack protection -----------
+# Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
+# install_review forces a READ of a manifest before an install proceeds (guards
+# against installing a THIRD PARTY package that already carries a malicious
+# script), but nothing stops an agent from being the one who PLANTS the script
+# in package.json/composer.json in the first place, for a FUTURE `npm install`/
+# `composer install` — by this same agent moments later, a teammate, or CI — to
+# run unattended. Same shape as mcp_config/ci_workflow/git_hooks/agent_def:
+# write today, auto-exec on a different, later trigger, with no further agent
+# action needed. The registry half is the "trusted name, poisoned source"
+# variant: redirecting `.npmrc`/`.yarnrc*`/`pip.conf`/`.cargo/config.toml`/
+# `pyproject.toml`'s registry/index-url away from the real registry silently
+# swaps every future ordinary-looking `npm install lodash` for a fetch from an
+# attacker-controlled host.
+#
+# Deliberately gated on PATH *and* CONTENT for the Edit/Write/MCP branch,
+# unlike the path-only gate every sibling *_protect guard uses: package.json/
+# pyproject.toml/composer.json are ordinary files edited constantly for
+# routine reasons (bumping a dependency, adding a devDependency, a version
+# bump) — gating on path alone here would make this guard fire on nearly
+# every commit to a Node/PHP/Python project, the ask-fatigue failure mode
+# that would get it disabled. The dangerous lifecycle-script/registry key
+# names below essentially only ever appear in these files for the one
+# reason this guard exists to catch, so requiring BOTH stays high-signal
+# without the false-positive rate a path-only gate would carry.
+_NPM_LIFECYCLE_KEYS = (
+    r"preinstall|install|postinstall|preuninstall|postuninstall"
+    r"|prepare|prepublish|prepublishOnly"
+)
+_COMPOSER_LIFECYCLE_KEYS = (
+    r"pre-install-cmd|post-install-cmd|pre-update-cmd|post-update-cmd"
+    r"|pre-autoload-dump|post-autoload-dump|pre-package-install"
+    r"|post-package-install|pre-archive-cmd|post-archive-cmd"
+)
+_LIFECYCLE_KEYS = _NPM_LIFECYCLE_KEYS + r"|" + _COMPOSER_LIFECYCLE_KEYS
+
+# The manifest files that carry auto-run lifecycle scripts.
+PACKAGE_SCRIPTS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])package\.json" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])composer\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Content-only check for a CONFIRMED package-manifest path: a lifecycle-script
+# key, in either its JSON-object form (`"postinstall": "..."`, the ordinary
+# Edit/Write shape), its bracket form (`"postinstall"]`, jq's `.scripts["x"]`),
+# or its dot-path form (`scripts.postinstall=`, the shape `npm pkg set` and jq
+# use from a shell — no quotes, no colon). A benign edit that adds a "test"/
+# "build"/"start"/"lint" script (require an explicit `npm run <name>`, never
+# auto-executed) never matches this key list and stays allowed.
+LIFECYCLE_SCRIPT_KEY_RE = re.compile(
+    r"[\"'](?:" + _LIFECYCLE_KEYS + r")[\"']\s*(?::|\])"
+    r"|\bscripts\s*[.\[][\"']?(?:" + _LIFECYCLE_KEYS + r")\b",
+    re.IGNORECASE,
+)
+
+# `npm pkg set` mutates package.json's scripts WITHOUT the command ever
+# mentioning "package.json" as a path — it resolves the target implicitly
+# from cwd, so the path+content pairing above can't gate it (no path to
+# confirm). High-signal on its own: no legitimate reason to script-set a
+# lifecycle hook to anything but a locally-reviewed command.
+NPM_PKG_SET_LIFECYCLE_RE = re.compile(
+    r"\bnpm\s+pkg\s+set\b[^|;&\n]*\bscripts\.(?:" + _NPM_LIFECYCLE_KEYS + r")\s*=",
+    re.IGNORECASE,
+)
+
+# Registry/index config files across the common package ecosystems — a
+# redirect here silently swaps the source of every future dependency fetch.
+REGISTRY_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.npmrc" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.yarnrc(?:\.yml)?" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pip\.(?:conf|ini)" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pyproject\.toml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Content-only check for a CONFIRMED registry-config path: an assignment that
+# points the registry/index at a URL, or a Cargo source replacement. Bounded
+# span ({0,300}, not unbounded) on the poetry-source alternative for the same
+# ReDoS-avoidance reason every other bounded gap in this file is bounded.
+# Tolerates a backslash-escaped '/' (\/) between the scheme and host — the
+# ordinary shape a URL takes inside a `sed -i 's/registry=.*/registry=http:\/
+# \/evil\//'` replacement when '/' is also the sed delimiter, the single most
+# common way this kind of edit is made from a shell one-liner. Bounded to a
+# literal one-or-zero backslash per slash, not a repeatable class, so it adds
+# no new backtracking surface.
+_URL = r"https?:\\?/\\?/"
+REGISTRY_HIJACK_RE = re.compile(
+    r"\bregistry\s*=\s*[\"']?" + _URL                        # .npmrc / .yarnrc
+    + r"|\bnpmRegistryServer\s*:\s*[\"']?" + _URL             # .yarnrc.yml
+    + r"|\bindex-url\s*=\s*[\"']?" + _URL                     # pip.conf/.ini
+    + r"|\bindex_url\s*=\s*[\"']?" + _URL
+    + r"|\bextra-index-url\s*=\s*[\"']?" + _URL
+    + r"|\breplace-with\s*=\s*[\"']"                          # .cargo/config.toml [source]
+    + r"|\[\[tool\.poetry\.source\]\][^\[]{0,300}\burl\s*=\s*[\"']" + _URL,
+    re.IGNORECASE,
+)
+
+# CLI forms that redirect a registry WITHOUT ever writing/mentioning the
+# config file path in the command — `npm/yarn/pnpm config set registry`,
+# `pip config set global.index-url`. Same "no path to confirm" shape
+# NPM_PKG_SET_LIFECYCLE_RE exists for above.
+REGISTRY_HIJACK_CLI_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn)\s+config\s+set\b[^|;&\n]*\b(?:registry|npmRegistryServer)\b"
+    r"|\bpip3?\s+config\s+set\b[^|;&\n]*\bindex-url\b",
+    re.IGNORECASE,
+)

@@ -142,6 +142,13 @@ class Policy:
     # /etc/profile.d/*.sh/a PowerShell $PROFILE and ~/.ssh/authorized_keys/
     # ~/.ssh/config/sshd_config/ssh_config. See rules.rule_shell_persist_protect.
     shell_persist: dict = field(default_factory=dict)
+    # Package-manifest lifecycle-script / registry-hijack protection:
+    # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers package.json/composer.json lifecycle
+    # scripts (preinstall/postinstall/prepare/...) and registry-redirect
+    # config (.npmrc/.yarnrc*/pip.conf/.cargo/config.toml/pyproject.toml's
+    # [[tool.poetry.source]]). See rules.rule_package_manifest_protect.
+    package_manifest: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.
