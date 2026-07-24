@@ -149,6 +149,12 @@ class Policy:
     # config (.npmrc/.yarnrc*/pip.conf/.cargo/config.toml/pyproject.toml's
     # [[tool.poetry.source]]). See rules.rule_package_manifest_protect.
     package_manifest: dict = field(default_factory=dict)
+    # Git-config credential/exec-hijack protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply. Covers `credential.helper` redirection and any git-config key
+    # given a `!`-prefixed shell-command value (alias.*, core.pager, ...).
+    # See rules.rule_git_config_exec_protect.
+    git_config_exec: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.
