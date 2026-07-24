@@ -996,7 +996,27 @@ GIT_CONFIG_FILE_PATH_RE = re.compile(
     # config' plant a hooksPath redirect with zero detection (QA finding,
     # independent adversarial review, round 1).
     + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"git" + _WIN_TRIM + _SEP
-    + r"config" + _CI_END,
+    + r"config" + _CI_END
+    # A submodule's REAL config lives at `.git/modules/<name>/config` in the
+    # superproject's git dir, not `<submodule>/.git/config` — the same
+    # non-exotic, common-layout gap GIT_HOOKS_PATH_RE's own submodule
+    # alternative exists to close, reusing the identical `_SUBMODULE_SEG`
+    # bound (QA finding, independent adversarial review, round B, on
+    # rule_git_config_exec_protect: a bare single-line Edit into this real,
+    # git-recognized file sailed through with zero detection).
+    + r"|(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"modules" + _WIN_TRIM + _SEP
+    + r"(?:" + _SUBMODULE_SEG + r"){1,4}config" + _CI_END
+    # A bare repository's config lives directly at `<name>.git/config` (no
+    # leading dot, no working tree, no separate `.git/` — the bare dir IS
+    # the git dir) — an ordinary, common hosting-side/mirror layout, not an
+    # exotic edge case (same QA finding as above).
+    + r"|(?:^|[\s'\"/\\=])[^\s'\"/\\]{1,200}\.git" + _WIN_TRIM + _SEP + r"config" + _CI_END
+    # A linked worktree's own config override lives at
+    # `.git/worktrees/<name>/config.worktree` (merged on top of the main
+    # `.git/config` when `extensions.worktreeConfig` is set) — same QA
+    # finding as above.
+    + r"|(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"worktrees" + _WIN_TRIM + _SEP
+    + r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP + r"config(?:\.worktree)?" + _CI_END,
     re.IGNORECASE,
 )
 # Archive/sync tools that place a file WITHOUT any of WRITE_REDIRECT_RE /
@@ -1720,11 +1740,30 @@ REGISTRY_HIJACK_CLI_RE = re.compile(
 # `credential.helper` is gated on the KEY alone (any value) — unlike a bare
 # alias, there is no safe/dangerous split by value: EVERY value (even a
 # built-in like `cache`/`store`/`manager`) names a program git will run and
-# hand real credentials to before the actual request goes out.
+# hand real credentials to before the actual request goes out. The key
+# fragment accepts git's real URL-scoped form (`credential.<url>.helper`,
+# e.g. `credential.https://github.com.helper`) as well as the bare
+# `credential.helper` — QA (independent adversarial review, round A) found
+# the original bare-only pattern let `git config
+# credential.https://github.com.helper /tmp/evil` sail through with zero
+# detection despite naming the exact same dangerous key, just URL-scoped.
+# The trailing `(?!\.[\w-])` keeps a DISTINCT, longer key
+# (`credential.helper.timeout`, hypothetical but not this guard's target)
+# from false-matching on the "helper" substring alone (round A, false
+# positive).
+_CRED_HELPER_KEY = r"\bcredential\.(?:[^\s'\"=]{1,300}\.)?helper\b(?!\.[\w-])"
+# `--get`/`--get-all`/`--get-regexp`/`--get-urlmatch` are read-only queries —
+# gating them costs a false "ask" on an entirely safe diagnostic command with
+# no risk at all (QA finding, independent adversarial review, round A). The
+# exclusion only applies to the plain `git config` alternative below: the
+# inline `-c`/`--config`/`--config-env`/`GIT_CONFIG_KEY_n` forms are never a
+# read (there is no `--get` equivalent for them), so they need no carve-out.
+_GIT_CONFIG_NOT_GET_LOOKAHEAD = r"(?![^|;&\n]{0,60}--get(?:-all|-regexp|-urlmatch)?\b)"
 GIT_CONFIG_CREDENTIAL_HELPER_RE = re.compile(
-    r"\bgit\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,200}\bcredential\.helper\b"
-    r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+credential\.helper\b"
-    r"|\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?credential\.helper\b",
+    r"\bgit\b[^|;&\n]{0,200}\bconfig\b" + _GIT_CONFIG_NOT_GET_LOOKAHEAD
+    + r"[^|;&\n]{0,200}" + _CRED_HELPER_KEY
+    + r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+" + _CRED_HELPER_KEY
+    + r"|\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?" + _CRED_HELPER_KEY,
     re.IGNORECASE,
 )
 # A `[credential]` (optionally URL-scoped, `[credential "https://github.com"]`
@@ -1733,16 +1772,27 @@ GIT_CONFIG_CREDENTIAL_HELPER_RE = re.compile(
 # reasoning `GIT_HOOKS_CONFIG_INI_RE`'s own comment documents, and also folded
 # into the shell-scan form below to catch the identical shape arriving via a
 # heredoc (`cat > .git/config <<EOF`) rather than the `git config` subcommand.
+# The `\bhelper` alternative is paired with a literal `\\nhelper` one — QA
+# (independent adversarial review, round A) found that a shell command
+# building the file via `printf '[credential]\nhelper=...'` puts a LITERAL
+# two-character `\n` (backslash + "n", not a real newline — printf itself
+# interprets it at runtime, not the shell) immediately before "helper",
+# which merges into "nhelper" as one word run and breaks `\b`'s boundary
+# requirement; the identical payload via a heredoc (real newlines) was
+# already caught. `\\n` is a fixed two-char literal, so this costs nothing
+# against the ordinary real-newline case, which `\b` alone already covers.
 GIT_CONFIG_CREDENTIAL_HELPER_INI_RE = re.compile(
-    r"\[credential(?:\s+\"[^\"\n]{0,200}\")?\][^\[]{0,2000}\bhelper\s*=", re.IGNORECASE)
+    r"\[credential(?:\s+\"[^\"\n]{0,200}\")?\][^\[]{0,2000}(?:\bhelper|\\nhelper)\s*=",
+    re.IGNORECASE)
 # Content-only check for a CONFIRMED git-config path (gated by
 # GIT_CONFIG_FILE_PATH_RE, not used standalone) — same "an Edit's new_string is
 # typically just the inserted line, the `[credential]` header itself is
 # old_string context that never appears in new_string" reasoning
 # GIT_HOOKS_CONFIG_CONTENT_RE's own comment documents. `helper` alone (not
 # `credential\.helper`) because the dot-path form never appears inside a real
-# INI file — only the CLI/`-c` forms use it.
-GIT_CONFIG_HELPER_CONTENT_RE = re.compile(r"\bhelper\s*=", re.IGNORECASE)
+# INI file — only the CLI/`-c` forms use it. Same literal-`\n` pairing as
+# GIT_CONFIG_CREDENTIAL_HELPER_INI_RE above, for the identical reason.
+GIT_CONFIG_HELPER_CONTENT_RE = re.compile(r"(?:\bhelper|\\nhelper)\s*=", re.IGNORECASE)
 
 # Any git-config key given a `!`-prefixed value is git's general "run this
 # through the shell" convention — not just `alias.<name>`, the same marker
@@ -1752,20 +1802,63 @@ GIT_CONFIG_HELPER_CONTENT_RE = re.compile(r"\bhelper\s*=", re.IGNORECASE)
 # setup, and a key-only gate on `alias.*` would fire on nearly every
 # dev-environment bootstrap script — the same ask-fatigue trade-off
 # `rule_package_manifest_protect`'s content-vs-path-only gate already made.
+#
+# The plain `git config <key> <value>` alternative anchors on an explicit
+# git-config KEY token (bounded, dot/dash/word chars) preceded by up to 8
+# bounded flag tokens, immediately followed by whitespace then the
+# optionally-quoted `!` — NOT a freeform "a `!` appears somewhere later,
+# preceded by whitespace/quote" scan. QA (independent adversarial review,
+# round B) found the original freeform-gap form gated `git config
+# alias.checkfail "log --grep='fixed !important'"` and `git config
+# core.pager 'less -R  !weird-but-not-a-shell-cmd'` — neither VALUE starts
+# with `!`, the `!` merely appears later inside an otherwise-ordinary quoted
+# argument, and the original `[^|;&\n]{0,150}` gap could skip past the real
+# key/value boundary to match it anyway. Anchoring on "value is the token
+# immediately after the key" (the real git config CLI grammar — this form
+# never uses `key=value`, only `-c`/`--config` do) closes it while still
+# catching every real `!`-prefixed assignment. The `-c`/`--config-env`/
+# `GIT_CONFIG_VALUE_n` alternatives were already correctly anchored (their
+# `=` is unambiguous) and are unchanged.
+_GIT_CONFIG_KEY_TOKEN = r"[A-Za-z0-9][\w.-]{0,80}"
+_GIT_CONFIG_FLAG_TOKEN = r"--?[A-Za-z][\w-]{0,40}(?:=[^\s|;&\n]{0,100})?"
 GIT_CONFIG_BANG_VALUE_RE = re.compile(
-    r"\bgit\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,150}[\s=]['\"]?!"
+    r"\bgit\b[^|;&\n]{0,60}\bconfig\b(?:\s+" + _GIT_CONFIG_FLAG_TOKEN + r"){0,8}\s+"
+    + _GIT_CONFIG_KEY_TOKEN + r"\s+['\"]?!"
     r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+[\w.-]{1,100}=['\"]?!"
     r"|\bGIT_CONFIG_VALUE_\d+\s*=\s*['\"]?!",
     re.IGNORECASE,
 )
-# Path-independent staged-elsewhere-then-redirected form: any `[section]`
-# header followed (within the same section body) by a `= !` value — mirrors
-# `_HOOKSPATH_INI_RE_SRC`'s shape exactly, generalized past just `[alias]`
-# since the same `!`-prefix marker is meaningful under any section.
+# Path-independent staged-elsewhere-then-redirected form: a KNOWN git
+# section header (not an arbitrary bracketed name) followed (within the
+# same section body) by a `= !` value — mirrors `_HOOKSPATH_INI_RE_SRC`'s
+# shape, generalized past just `[alias]` since the same `!`-prefix marker
+# is meaningful under any of these sections. QA (independent adversarial
+# review, round A) found the original arbitrary-`[section]` form false-
+# positived on entirely unrelated INI-shaped files that share the same "="
+# + "!" convention for a different reason — a systemd unit's
+# `ExecStart=!/usr/bin/foo` under `[Service]`, or a `.desktop` file — since
+# `!` as a value prefix is not a git-exclusive idiom. Scoping to git's own
+# section vocabulary keeps the "staged in an arbitrarily-named file"
+# detection while dropping the false-positive surface; an attacker crafting
+# a real gitconfig payload uses these section names regardless.
+_GIT_CONFIG_KNOWN_SECTIONS = (
+    r"alias|core|credential|diff|difftool|merge|mergetool|pager|http|https"
+    r"|url|remote|push|pull|fetch|branch|advice|color|interactive|log"
+    r"|format|rebase|apply|status|commit|tag|stash|submodule|worktree|user"
+    r"|init|safe|sendemail|filter"
+)
 GIT_CONFIG_BANG_VALUE_INI_RE = re.compile(
-    r"\[[\w.\" -]{1,100}\][^\[]{0,2000}=\s*['\"]?!", re.IGNORECASE)
+    r"\[(?:" + _GIT_CONFIG_KNOWN_SECTIONS + r")(?:\s+\"[^\"\n]{0,200}\")?\]"
+    r"[^\[]{0,2000}=\s*['\"]?!",
+    re.IGNORECASE,
+)
 # Content-only check for a CONFIRMED git-config path — same reasoning as
 # GIT_CONFIG_HELPER_CONTENT_RE above: the section header is old_string
 # context, so an Edit's new_string is typically just the bare `name = !...`
-# line with no `[alias]`/`[core]` prefix in it at all.
+# line with no `[alias]`/`[core]` prefix in it at all. Unlike the path-
+# independent INI form above, no section-name scoping is needed here — the
+# path is ALREADY confirmed to be a real git-config file, so a bare
+# `= !value` line in it is high-signal regardless of which section it's
+# under (the same precision tradeoff GIT_CONFIG_HELPER_CONTENT_RE's own
+# bare `helper =` check already makes once the path is confirmed).
 GIT_CONFIG_BANG_VALUE_CONTENT_RE = re.compile(r"=\s*['\"]?!", re.IGNORECASE)

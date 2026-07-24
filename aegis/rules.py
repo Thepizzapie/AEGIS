@@ -1236,7 +1236,47 @@ def rule_git_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     than confirming the two actually pair up — the same "each tool
     call/text span is evaluated independently, no cross-reference state"
     limitation ``git_hooks``'s ``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM``
-    gap already accepts."""
+    gap already accepts. A value quoted with a leading space before ``!``
+    (``alias.foo ' !cmd'`` — real git does NOT treat this as shell-exec,
+    the raw value's first character is the space, not ``!``) is still
+    conservatively gated: ``normalize.scan_surface``'s shared quote-
+    stripping de-obfuscation layer (used by every guard in this file, not
+    unique to this one) collapses the quote-then-space into plain
+    whitespace before this guard ever sees the text, indistinguishable at
+    that point from a genuinely unquoted bang-prefixed value (round A,
+    verified, not fixed — a disclosed, accepted false positive, the same
+    "false positives are the safe direction" trade-off every guard here
+    already takes, not worth threading quote-adjacency state through
+    normalization for).
+
+    QA history (two independent adversarial reviews, run in parallel):
+    both rounds confirmed real, since-fixed issues — a URL-scoped
+    ``credential.<url>.helper`` (real git syntax) bypassed the original
+    bare-``credential.helper``-only key check entirely (round A); a
+    literal two-character ``\\n`` immediately before ``helper`` (as a
+    ``printf``/``echo`` format string produces, before runtime
+    interpretation — as opposed to a heredoc's real newline) broke the INI
+    check's word-boundary requirement (round A); the path-independent
+    staged-elsewhere INI check false-positived on unrelated files sharing
+    the same ``[section]``/``=!`` shape for a different reason (a systemd
+    unit's ``ExecStart=!...``, a ``.desktop`` file) — fixed by scoping it
+    to git's own section-name vocabulary (round A); a read-only ``git
+    config --get``/``--get-all``/``--get-regexp``/``--get-urlmatch`` query
+    was gated identically to an actual set (round A); a distinct, longer
+    key merely containing ``credential.helper`` as a substring
+    (``credential.helper.timeout``) false-positived on the key-only gate
+    (round A); ``GIT_CONFIG_FILE_PATH_RE`` (reused from the hooksPath
+    guard) missed a submodule's real config (``.git/modules/<name>/
+    config``), a bare repo's config (``<name>.git/config``), and a linked
+    worktree's config override (``.git/worktrees/<name>/config.worktree``)
+    — widened, which also benefits ``rule_git_hooks_protect``'s own reuse
+    of the same pattern (round B); and the plain ``git config <key>
+    <value>`` bang-value check's original freeform gap could skip past the
+    true key/value boundary and match a ``!`` appearing later inside an
+    otherwise-ordinary quoted argument's own content, gating values that
+    don't actually start with ``!`` at all — fixed by anchoring on an
+    explicit key token immediately followed by the value position (round
+    B)."""
     cfg = getattr(policy, "git_config_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
