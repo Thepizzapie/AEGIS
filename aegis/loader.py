@@ -54,7 +54,7 @@ def load_policy(path) -> Policy:
         "egress": {}, "plugins": [], "workspace": {}, "project": None,
         "agent_label": None, "install_review": {}, "mcp_config": {},
         "ci_workflow": {}, "git_hooks": {}, "agent_def": {}, "shell_persist": {},
-        "package_manifest": {}, "inject": {}, "failures": {},
+        "package_manifest": {}, "git_config_exec": {}, "inject": {}, "failures": {},
         "completion": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
     }
@@ -85,6 +85,7 @@ def load_policy(path) -> Policy:
                   ci_workflow=st["ci_workflow"], git_hooks=st["git_hooks"],
                   agent_def=st["agent_def"], shell_persist=st["shell_persist"],
                   package_manifest=st["package_manifest"],
+                  git_config_exec=st["git_config_exec"],
                   inject=st["inject"], failures=st["failures"],
                   completion=st["completion"],
                   team=lc["team"], compaction=lc["compaction"],
@@ -114,7 +115,8 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
     # Guard-config knobs (install review, MCP-config protection, context
     # injection, failure-loop, completion verification) — small dicts.
     for key in ("install_review", "mcp_config", "ci_workflow", "git_hooks", "agent_def",
-                "shell_persist", "package_manifest", "inject", "failures", "completion"):
+                "shell_persist", "package_manifest", "git_config_exec", "inject",
+                "failures", "completion"):
         if isinstance(data.get(key), dict):
             st[key] = dict(data[key])
         elif data.get(key):

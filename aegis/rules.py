@@ -1159,6 +1159,153 @@ def rule_package_manifest_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _git_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_git_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block two git-config-driven persistence/exfiltration primitives
+    ``rule_git_hooks_protect`` doesn't reach (it only watches
+    ``core.hooksPath``): redirecting ``credential.helper``, and planting a
+    ``!``-prefixed shell-command value on any git-config key (most
+    commonly ``alias.<name>``, but the same convention applies to
+    ``core.pager``/``core.editor``/``diff.external``/
+    ``mergetool.<name>.cmd``/...).
+
+    THREAT MODEL: a git alias whose value starts with ``!`` runs through
+    the shell, in full, on the very next ``git <name>`` invocation — by
+    the human, a teammate, or an unattended CI runner — with that
+    invoker's full privileges, no confirmation, and a diff that reads as
+    an ordinary one-line config addition, not a backdoor. Same "write now,
+    auto-exec later, unattended" shape as a git hook, just reached through
+    ``git config`` instead of ``.git/hooks/*``. ``credential.helper`` is
+    the credential-EXFILTRATION variant: on every future authenticated
+    ``fetch``/``push``/``pull``, git invokes the configured helper and
+    hands it the target host — and, on a ``store`` verb, the actual
+    username/password/PAT — before the real request even goes out. An
+    attacker-controlled helper silently captures every credential the
+    human types from then on; ``--global``/``--system`` widen that to
+    every repo they ever touch, not just this one.
+
+    Config (``policy.git_config_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the
+    gate — a repo's own trusted credential-manager bootstrap, say).
+    Defaults to ``ask`` for the same reason every sibling ``*_protect``
+    guard does: setting a credential helper or a shell alias is routine,
+    sanctioned dev work (``git config credential.helper cache``,
+    ``alias.undo = !git reset --soft HEAD^``) — it just needs a human to
+    have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_GIT_CONFIG_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    ``credential.helper`` is gated on the KEY alone (any value) — every
+    value, even a built-in (``cache``/``store``/``manager``), names a
+    program git will run and hand real credentials to, so there is no
+    safe/dangerous split by value the way there is for a bare alias. Every
+    OTHER exec-capable key is gated on the VALUE starting with ``!``
+    instead — an ordinary alias (``co = checkout``) is completely benign,
+    and a key-only gate on ``alias.*`` would fire on nearly every
+    dev-environment bootstrap script, the same ask-fatigue trade-off
+    ``rule_package_manifest_protect``'s content-vs-path-only gate already
+    made.
+
+    Honest scope, same denylist trade-offs as every guard in this file: a
+    value assembled indirectly (shell variable concatenation, a wrapper
+    script that itself invokes ``git config``) rather than appearing as
+    one contiguous literal in the scanned text is not caught; ``find``
+    -path/-name indirection around the git-config file path is not
+    covered (no ``*_find_hit``-style fallback here, unlike git_hooks/
+    ci_workflow/agent_def/shell_persist); a direct fetch-to-file write
+    (``curl -o .git/config``) is caught by none of the shell branch's
+    write-verb checks — this guard's shell branch doesn't gate on a
+    write-verb at all (unlike its siblings), since the CLI/inline-config
+    forms are already the dominant, expected way this surface is reached
+    from a shell; and the paired ``GIT_CONFIG_KEY_n``/``GIT_CONFIG_VALUE_n``
+    env-injection form is matched independently per side (key-side for
+    ``credential.helper``, value-side for a bang-prefixed value) rather
+    than confirming the two actually pair up — the same "each tool
+    call/text span is evaluated independently, no cross-reference state"
+    limitation ``git_hooks``'s ``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM``
+    gap already accepts."""
+    cfg = getattr(policy, "git_config_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "git-config-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        path_confirmed = bool(p and patterns.GIT_CONFIG_FILE_PATH_RE.search(p))
+        helper_hit = bool(
+            patterns.GIT_CONFIG_CREDENTIAL_HELPER_INI_RE.search(content)
+            or (path_confirmed and patterns.GIT_CONFIG_HELPER_CONTENT_RE.search(content)))
+        bang_hit = bool(
+            patterns.GIT_CONFIG_BANG_VALUE_INI_RE.search(content)
+            or (path_confirmed and patterns.GIT_CONFIG_BANG_VALUE_CONTENT_RE.search(content)))
+        if not (helper_hit or bang_hit):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_GIT_CONFIG_EXEC")
+                or _git_config_exec_allowed_by_policy(cfg, p)):
+            return None
+        reason = (f"'{p}' is being written with a credential.helper redirect"
+                  if helper_hit else
+                  f"'{p}' is being written with a '!'-prefixed shell-command "
+                  "config value (alias or similar)")
+        return _finish(Decision(action, "git-config-exec-protect",
+                         f"{reason} — it runs automatically, with the "
+                         "invoking user's full privileges, on the next "
+                         "matching git operation. Review the change, then "
+                         "confirm with AEGIS_ALLOW_GIT_CONFIG_EXEC=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        helper_hit = bool(patterns.GIT_CONFIG_CREDENTIAL_HELPER_RE.search(cmd)
+                           or patterns.GIT_CONFIG_CREDENTIAL_HELPER_INI_RE.search(cmd))
+        bang_hit = bool(patterns.GIT_CONFIG_BANG_VALUE_RE.search(cmd)
+                         or patterns.GIT_CONFIG_BANG_VALUE_INI_RE.search(cmd))
+        if not (helper_hit or bang_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GIT_CONFIG_EXEC")
+                or _git_config_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A credential.helper redirect is being set from a shell"
+                  if helper_hit else
+                  "A '!'-prefixed shell-command config value is being set "
+                  "from a shell")
+        return _finish(Decision(action, "git-config-exec-protect",
+                         f"{reason} — it runs automatically, with the "
+                         "invoking user's full privileges, on the next "
+                         "matching git operation. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_GIT_CONFIG_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -1560,6 +1707,7 @@ _CORE_RULES = (
     rule_agent_def_protect,
     rule_shell_persist_protect,
     rule_package_manifest_protect,
+    rule_git_config_exec_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

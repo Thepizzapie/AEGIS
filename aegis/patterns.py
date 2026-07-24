@@ -1706,3 +1706,66 @@ REGISTRY_HIJACK_CLI_RE = re.compile(
     r"|\bcargo\b[^|;&\n]{0,200}\breplace-with\b",
     re.IGNORECASE,
 )
+
+# ---- Git-config credential/exec hijack protection ------------------------------
+# Two git-config-driven persistence/exfiltration primitives `git_hooks_protect`
+# doesn't reach (it only watches `core.hooksPath`): `credential.helper` and a
+# `!`-prefixed shell-command value on any git-config key. Both are set the same
+# way `core.hooksPath` is (`git config`, inline `-c`/`--config`/`--config-env`,
+# `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` env-injection, or a raw write to the
+# git-config file itself), so this section reuses GIT_CONFIG_FILE_PATH_RE
+# (defined above for the hooksPath guard) for the Edit/Write path check — same
+# file, different dangerous keys.
+#
+# `credential.helper` is gated on the KEY alone (any value) — unlike a bare
+# alias, there is no safe/dangerous split by value: EVERY value (even a
+# built-in like `cache`/`store`/`manager`) names a program git will run and
+# hand real credentials to before the actual request goes out.
+GIT_CONFIG_CREDENTIAL_HELPER_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,200}\bcredential\.helper\b"
+    r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+credential\.helper\b"
+    r"|\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?credential\.helper\b",
+    re.IGNORECASE,
+)
+# A `[credential]` (optionally URL-scoped, `[credential "https://github.com"]`
+# — real git syntax) INI section assigning `helper =` — path-INDEPENDENT, same
+# "staged in an arbitrarily-named file, redirected at in a separate call"
+# reasoning `GIT_HOOKS_CONFIG_INI_RE`'s own comment documents, and also folded
+# into the shell-scan form below to catch the identical shape arriving via a
+# heredoc (`cat > .git/config <<EOF`) rather than the `git config` subcommand.
+GIT_CONFIG_CREDENTIAL_HELPER_INI_RE = re.compile(
+    r"\[credential(?:\s+\"[^\"\n]{0,200}\")?\][^\[]{0,2000}\bhelper\s*=", re.IGNORECASE)
+# Content-only check for a CONFIRMED git-config path (gated by
+# GIT_CONFIG_FILE_PATH_RE, not used standalone) — same "an Edit's new_string is
+# typically just the inserted line, the `[credential]` header itself is
+# old_string context that never appears in new_string" reasoning
+# GIT_HOOKS_CONFIG_CONTENT_RE's own comment documents. `helper` alone (not
+# `credential\.helper`) because the dot-path form never appears inside a real
+# INI file — only the CLI/`-c` forms use it.
+GIT_CONFIG_HELPER_CONTENT_RE = re.compile(r"\bhelper\s*=", re.IGNORECASE)
+
+# Any git-config key given a `!`-prefixed value is git's general "run this
+# through the shell" convention — not just `alias.<name>`, the same marker
+# applies to `core.pager`, `core.editor`, `diff.external`,
+# `mergetool.<name>.cmd`, and others. Gated on the VALUE, not the key: an
+# ordinary (non-`!`) alias (`co = checkout`) is extremely common, sanctioned
+# setup, and a key-only gate on `alias.*` would fire on nearly every
+# dev-environment bootstrap script — the same ask-fatigue trade-off
+# `rule_package_manifest_protect`'s content-vs-path-only gate already made.
+GIT_CONFIG_BANG_VALUE_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,150}[\s=]['\"]?!"
+    r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+[\w.-]{1,100}=['\"]?!"
+    r"|\bGIT_CONFIG_VALUE_\d+\s*=\s*['\"]?!",
+    re.IGNORECASE,
+)
+# Path-independent staged-elsewhere-then-redirected form: any `[section]`
+# header followed (within the same section body) by a `= !` value — mirrors
+# `_HOOKSPATH_INI_RE_SRC`'s shape exactly, generalized past just `[alias]`
+# since the same `!`-prefix marker is meaningful under any section.
+GIT_CONFIG_BANG_VALUE_INI_RE = re.compile(
+    r"\[[\w.\" -]{1,100}\][^\[]{0,2000}=\s*['\"]?!", re.IGNORECASE)
+# Content-only check for a CONFIRMED git-config path — same reasoning as
+# GIT_CONFIG_HELPER_CONTENT_RE above: the section header is old_string
+# context, so an Edit's new_string is typically just the bare `name = !...`
+# line with no `[alias]`/`[core]` prefix in it at all.
+GIT_CONFIG_BANG_VALUE_CONTENT_RE = re.compile(r"=\s*['\"]?!", re.IGNORECASE)
