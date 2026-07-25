@@ -1354,6 +1354,12 @@ def shell_persist_find_hit(cmd: str) -> bool:
 # unit — the "hijack a legitimate target that's already wired up" shape, not
 # a brand-new suspicious file.
 _SVC_END = _CI_END
+# Only unit TYPES that can carry an ExecStart=-equivalent code-execution
+# directive (or, for .path/.mount, trigger one indirectly by activating a
+# paired .service). Deliberately excludes .slice/.scope/.device/.swap/
+# .automount/.netdev/.target — synchronization points, cgroup config, or
+# kernel/udev-generated units with no execution directive of their own, so
+# planting one carries no code-execution risk this guard exists to catch.
 _UNIT_EXT = r"(?:service|timer|socket|path|mount)"
 SYSTEMD_UNIT_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])systemd" + _WIN_TRIM + _SEP + r"(?:system|user)" + _WIN_TRIM + _SEP
@@ -1412,17 +1418,26 @@ def service_persist_find_hit(cmd: str) -> bool:
 # action, with no file write in the same command at all. `systemd-run`'s
 # `--on-*` scheduling flags create a live, running timer-triggered unit
 # directly from the command line, no unit file ever written to disk.
-# Spans are bounded ({0,40}/{0,60}) for the same reason every other
-# ReDoS-conscious pattern in this file bounds its scan gap: an unbounded
-# `[^|;&\n]*` here would let a long adversarial command line search for the
-# tail token from every position in the head, multiplying instead of
-# summing (see FIND_WORD_RE's comment above for the mechanism this file's
-# own guards were bitten by before).
+# Spans are bounded ({0,200}) for the same reason every other ReDoS-conscious
+# pattern in this file bounds its scan gap: an unbounded `[^|;&\n]*` here
+# would let a long adversarial command line search for the tail token from
+# every position in the head, multiplying instead of summing (see
+# FIND_WORD_RE's comment above for the mechanism this file's own guards were
+# bitten by before) — 200, not a tighter bound, because a tighter one is
+# itself a bypass: QA (independent adversarial review, round 1) found the
+# original 40/60/20-char bounds were crossed by entirely ordinary intervening
+# flags (`systemctl --root=/mnt/some/long/alternate/rootfs enable
+# evil.service`, `launchctl asuser <uid> load ...`), pushing the verb outside
+# the window and letting the whole command sail through unflagged even
+# though the target path was present verbatim in the text. 200 matches the
+# bound `_find_predicate_re` already uses for the same "verb...target can be
+# arbitrarily far apart within one clause" shape, and is still linear-time
+# (a fixed-width bounded gap, not a nested/unbounded quantifier).
 SERVICE_ACTIVATE_CMD_RE = re.compile(
-    r"\bsystemctl\b[^|;&\n]{0,40}?\b(?:enable|reenable|link|edit)\b"
-    r"|\bsystemd-run\b[^|;&\n]{0,60}?--on-(?:calendar|boot|startup|active"
+    r"\bsystemctl\b[^|;&\n]{0,200}?\b(?:enable|reenable|link|edit)\b"
+    r"|\bsystemd-run\b[^|;&\n]{0,200}?--on-(?:calendar|boot|startup|active"
     r"|unit-active|unit-inactive)\b"
-    r"|\blaunchctl\b[^|;&\n]{0,20}?\b(?:load|bootstrap|enable)\b",
+    r"|\blaunchctl\b[^|;&\n]{0,200}?\b(?:load|bootstrap|enable)\b",
     re.IGNORECASE,
 )
 

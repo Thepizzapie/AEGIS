@@ -1444,7 +1444,35 @@ def rule_service_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     guard's patterns don't otherwise recognize — the same
     "computed-indirectly, not a literal path" class of gap
     ``rule_shell_persist_protect``'s own docstring already accepts for
-    ``$ZDOTDIR``/fish's ``$XDG_CONFIG_HOME``."""
+    ``$ZDOTDIR``/fish's ``$XDG_CONFIG_HOME``; ``launchctl submit`` (runs a
+    command immediately, directly from argv, no plist ever written) and
+    ``launchctl kickstart -k`` (restarts an already-loaded job) are, like a
+    plain ``systemd-run`` with no ``--on-*`` flag (see
+    ``test_systemd_run_oneshot_not_gated``), an IMMEDIATE run rather than a
+    persistence-installing one and so deliberately not gated — consistent
+    with, not new relative to, this guard's own "activation, not execution,
+    is what's gated" design; and only unit types capable of carrying an
+    ``ExecStart=``-equivalent directive are covered — see ``_UNIT_EXT``'s own
+    comment in ``patterns.py`` for the excluded, execution-incapable types.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention ``rule_git_config_exec_protect`` used): round A (bypass
+    hunting) found ``SERVICE_ACTIVATE_CMD_RE``'s original scan-gap bound
+    (40/60/20 chars between the command and its verb) was ITSELF a bypass —
+    an entirely ordinary intervening flag (``systemctl --root=/mnt/some/
+    long/alternate/rootfs enable evil.service``, ``launchctl asuser <uid>
+    load ...``) pushed the verb outside the window and the whole command
+    sailed through unflagged even with the target path present verbatim in
+    the text; fixed by widening to 200, the same bound
+    ``_find_predicate_re`` already uses for an analogous "verb...target can
+    be arbitrarily far apart within one clause" shape (see
+    ``SERVICE_ACTIVATE_CMD_RE``'s own comment in ``patterns.py``). Round B
+    (design/consistency) confirmed the guard's structure, escape hatches,
+    and registration (``_CORE_RULES``, ``Policy``, README, ``skills.py``)
+    all match sibling-guard convention with no gaps, and flagged the missing
+    doubled-separator/Windows-trim regression coverage this docstring's
+    sibling tests already carry — added, see
+    ``test_doubled_separator_does_not_bypass`` in this guard's test file."""
     cfg = getattr(policy, "service_persist", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
