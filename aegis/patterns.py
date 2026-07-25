@@ -1329,6 +1329,104 @@ def shell_persist_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, SHELL_PERSIST_FIND_RE)
 
 
+# ---- systemd unit / launchd persistence protection --------------------------
+# The Linux/macOS analog of Windows' scheduled-tasks/services (already caught,
+# non-escapably, by PERSIST_RE inside rule_containment) and of the same
+# "runs later, unattended" shape the mcp_config/ci_workflow/git_hooks/
+# agent_def/shell_persist family already covers — yet NEITHER surface has any
+# coverage anywhere in this file. A systemd unit's `ExecStart=` (or launchd's
+# `ProgramArguments`) runs arbitrary code:
+#   - on every boot, with root, once a SYSTEM unit is enabled (or a
+#     LaunchDaemon under /Library/LaunchDaemons is loaded)
+#   - on every login, with the human's privileges, for a USER unit under
+#     ~/.config/systemd/user or /etc/systemd/user (or a LaunchAgent under
+#     ~/Library/LaunchAgents)
+#   - on a recurring schedule, for a paired *.timer unit or a launchd
+#     StartInterval/StartCalendarInterval key
+# and, like a git hook or a shell rc file, is normally untracked by the
+# project's own repo — invisible to `git status`/`git diff`/code review, the
+# same blind spot CI_WORKFLOW_PATH_RE's own comment describes for a pipeline
+# step, except this one never even touches a remote CI runner: it fires
+# locally, on THIS machine, the next time it boots or the human logs in.
+#
+# A systemd drop-in override directory (`<unit>.service.d/*.conf`) is covered
+# too: it merges ON TOP of an existing, already-enabled, ostensibly-trusted
+# unit — the "hijack a legitimate target that's already wired up" shape, not
+# a brand-new suspicious file.
+_SVC_END = _CI_END
+_UNIT_EXT = r"(?:service|timer|socket|path|mount)"
+SYSTEMD_UNIT_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])systemd" + _WIN_TRIM + _SEP + r"(?:system|user)" + _WIN_TRIM + _SEP
+    + _CI_SEG + r"\." + _UNIT_EXT + _SVC_END
+    # drop-in override: <unit>.service.d/override.conf (or any *.conf inside)
+    + r"|(?:^|[\s'\"/\\=])" + _CI_SEG + r"\.(?:service|timer)\.d" + _WIN_TRIM + _SEP
+    + _CI_SEG + r"\.conf" + _SVC_END,
+    re.IGNORECASE,
+)
+# LaunchAgents (per-user, runs at login) / LaunchDaemons (system-wide, runs at
+# boot with root) — "Launch(Agents|Daemons)" is distinctive enough on its own
+# (no ordinary project has a directory literally named that) that anchoring
+# the full ~/Library / /Library / /System/Library prefix isn't needed, the
+# same "match the distinctive tail, not the whole prefix" convention
+# AGENT_DEF_DIR_RE already uses for `.claude`.
+LAUNCHD_PLIST_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])Launch(?:Agents|Daemons)" + _WIN_TRIM + _SEP
+    + _CI_SEG + r"\.plist" + _SVC_END,
+    re.IGNORECASE,
+)
+# Bare directory reference (no filename) — the same archive/sync-tool gap
+# GIT_HOOKS_DIR_RE / AGENT_DEF_DIR_RE / SHELL_PERSIST_DIR_RE exist to close:
+# `rsync -a evil/ ~/.config/systemd/user/` or `tar xf payload.tar -C
+# ~/Library/LaunchAgents/` never name a discrete target file at all.
+SERVICE_PERSIST_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])systemd" + _WIN_TRIM + _SEP + r"(?:system|user)" + _SVC_END
+    + r"|(?:^|[\s'\"/\\=])Launch(?:Agents|Daemons)" + _SVC_END,
+    re.IGNORECASE,
+)
+# `find -path/-name/-wholename/-regex` indirection, same reason every other
+# `*_FIND_RE` in this file exists. Deliberately excludes the bare extensions
+# ".plist"/".timer"/".service" as fallback fragments — both are common,
+# unrelated filenames elsewhere (Info.plist/entitlements.plist in ordinary
+# iOS/macOS app projects, an unrelated ".service" config in some other
+# tool's convention) with no systemd/launchd-specific signal on their own,
+# the same "too generic" exclusion SHELL_PERSIST_FIND_RE already makes for
+# the bare words "config"/"profile"/"rc"/"environment".
+_SERVICE_PERSIST_FIND_FRAGMENTS = (
+    r"systemd[/\\]system|systemd[/\\]user|LaunchAgents|LaunchDaemons"
+    r"|\.service\.d|\.timer\.d"
+)
+SERVICE_PERSIST_FIND_RE = _find_predicate_re(
+    r"(?:" + _SERVICE_PERSIST_FIND_FRAGMENTS + r")")
+
+
+def service_persist_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, SERVICE_PERSIST_FIND_RE)
+
+
+# Activation commands — the OTHER way this surface is reached, distinct from
+# writing a unit/plist file: `systemctl enable`/`launchctl load` flips a
+# unit that already exists (planted by an earlier, separate tool call this
+# guard's write-verb checks never saw; shipped by a compromised package;
+# left disabled-but-present by a previous session) into "runs automatically
+# from now on" — the activation step itself is the persistence-installing
+# action, with no file write in the same command at all. `systemd-run`'s
+# `--on-*` scheduling flags create a live, running timer-triggered unit
+# directly from the command line, no unit file ever written to disk.
+# Spans are bounded ({0,40}/{0,60}) for the same reason every other
+# ReDoS-conscious pattern in this file bounds its scan gap: an unbounded
+# `[^|;&\n]*` here would let a long adversarial command line search for the
+# tail token from every position in the head, multiplying instead of
+# summing (see FIND_WORD_RE's comment above for the mechanism this file's
+# own guards were bitten by before).
+SERVICE_ACTIVATE_CMD_RE = re.compile(
+    r"\bsystemctl\b[^|;&\n]{0,40}?\b(?:enable|reenable|link|edit)\b"
+    r"|\bsystemd-run\b[^|;&\n]{0,60}?--on-(?:calendar|boot|startup|active"
+    r"|unit-active|unit-inactive)\b"
+    r"|\blaunchctl\b[^|;&\n]{0,20}?\b(?:load|bootstrap|enable)\b",
+    re.IGNORECASE,
+)
+
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the

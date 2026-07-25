@@ -1346,6 +1346,168 @@ def rule_git_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _service_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_service_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a systemd unit (``/etc/systemd/system/*.service``,
+    ``/etc/systemd/user/*.service``, ``~/.config/systemd/user/*.service``,
+    ``/usr/lib/systemd/{system,user}/*.service``, a ``*.timer``/``*.socket``/
+    ``*.path``/``*.mount`` sibling, or a ``<unit>.service.d/override.conf``
+    drop-in) or a launchd property list (``~/Library/LaunchAgents/*.plist``,
+    ``/Library/LaunchAgents/*.plist``, ``/Library/LaunchDaemons/*.plist``),
+    and block the two activation commands that flip an already-present unit
+    into "runs automatically" without any file write of its own
+    (``systemctl enable``/``reenable``/``link``/``edit``, ``launchctl load``/
+    ``bootstrap``/``enable``, ``systemd-run --on-calendar``/``--on-boot``/...).
+
+    THREAT MODEL: this is the Linux/macOS analog of the Windows scheduled-
+    task/service persistence ``rule_containment``'s ``PERSIST_RE`` already
+    denies non-escapably (``schtasks /create``, ``New-Service``, the
+    ``...\\CurrentVersion\\Run`` registry key) — and shares the exact "runs
+    later, unattended, with elevated or the human's full privileges" shape
+    every ``*_protect`` guard in this file covers (``rule_mcp_config_protect``/
+    ``rule_ci_workflow_protect``/``rule_git_hooks_protect``/
+    ``rule_agent_def_protect``/``rule_shell_persist_protect``/
+    ``rule_package_manifest_protect``/``rule_git_config_exec_protect``) — yet
+    neither systemd nor launchd is reached by ANY existing guard: PERSIST_RE
+    has zero systemd/launchd alternatives, and none of the path-based
+    ``*_protect`` guards' patterns mention a unit file or a plist. A unit's
+    ``ExecStart=`` (or a plist's ``ProgramArguments``) runs arbitrary code —
+    on every future boot with root for a system unit or a LaunchDaemon, on
+    every future login with the human's full privileges for a user unit or a
+    LaunchAgent, or on a recurring ``OnCalendar``/``StartCalendarInterval``
+    schedule for a timer — with no git operation, CI run, or agent-session
+    restart required, and (like a git hook or a shell rc file) normally
+    untracked by the project's own repo: invisible to ``git status``/
+    ``git diff``/code review. Unlike the CI/CD workflow guard's target, the
+    payload here never even leaves this machine to run on a remote runner —
+    it fires locally, the very next time this machine boots or the human
+    logs back in.
+
+    Two file surfaces plus one command surface, matching the shape
+    ``rule_shell_persist_protect``/``rule_git_config_exec_protect`` already
+    split into "written directly" vs. "reached without ever appearing as a
+    literal path/value in this call": (1) writing a NEW unit/plist file, (2)
+    writing a drop-in override that hijacks an EXISTING, already-enabled,
+    ostensibly-trusted unit — the same "hijack a legitimate target that's
+    already wired up" shape ``CI_WORKFLOW_PATH_RE``'s own comment describes
+    for a pipeline step, and (3) the activation command itself, which is
+    dangerous even with no accompanying file write in the same shell call —
+    a unit planted by an earlier, separate tool call this guard's write-verb
+    checks never saw, shipped disabled by a compromised package, or merely
+    left present-but-inactive by a previous session, all become "runs
+    automatically from now on" the moment ``systemctl enable``/
+    ``launchctl load`` runs.
+
+    Config (``policy.service_persist``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted systemd-unit deploy script, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard does:
+    shipping a systemd unit for one's own application, or enabling a
+    launchd agent for a dev tool, is routine, sanctioned work — it just
+    needs a human to have actually looked at it before it goes live.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_SERVICE_PERSIST=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable — the same "an agent
+    can't wave itself past its own guard" invariant every escapable guard in
+    this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path assembled indirectly (shell variable concatenation
+    across separate assignments, a ``for``/``xargs`` loop, ``basename``/
+    ``dirname`` reconstruction) rather than appearing as one contiguous
+    literal is not caught; the bare extensions ``.plist``/``.timer``/
+    ``.service`` are deliberately excluded from the ``find``-indirection
+    fallback (too generic — an ordinary iOS/macOS project's ``Info.plist``,
+    or an unrelated tool's own ``.service`` convention, carries no
+    systemd/launchd-specific signal on its own, the same "too generic"
+    trade-off ``SHELL_PERSIST_FIND_RE`` already accepts for the bare words
+    "config"/"profile"); a direct fetch-to-file write (``curl -o
+    ~/Library/LaunchAgents/x.plist``) is caught by none of the shell
+    branch's five write-verb checks — the same inherited gap
+    ``rule_ci_workflow_protect``/``rule_git_hooks_protect``/
+    ``rule_agent_def_protect``/``rule_shell_persist_protect`` already
+    disclose, not new or worse here; and an environment-variable override
+    that relocates where systemd looks for user units (``$XDG_CONFIG_HOME``,
+    defaulting to ``~/.config``) is not covered when set to a directory this
+    guard's patterns don't otherwise recognize — the same
+    "computed-indirectly, not a literal path" class of gap
+    ``rule_shell_persist_protect``'s own docstring already accepts for
+    ``$ZDOTDIR``/fish's ``$XDG_CONFIG_HOME``."""
+    cfg = getattr(policy, "service_persist", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "service-persist-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        unit_hit = bool(p and patterns.SYSTEMD_UNIT_PATH_RE.search(p))
+        plist_hit = bool(p and patterns.LAUNCHD_PLIST_PATH_RE.search(p))
+        if not (unit_hit or plist_hit):
+            return None
+        if os.environ.get("AEGIS_ALLOW_SERVICE_PERSIST") or _service_persist_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"Systemd unit '{p}' is being written — its ExecStart runs "
+                   "automatically, on a future boot or login, once enabled"
+                   if unit_hit else
+                   f"Launchd property list '{p}' is being written — its "
+                   "ProgramArguments runs automatically the next time this "
+                   "machine boots or the human logs in")
+        return _finish(Decision(action, "service-persist-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_SERVICE_PERSIST=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.SYSTEMD_UNIT_PATH_RE.search(cmd)
+                             or patterns.LAUNCHD_PLIST_PATH_RE.search(cmd)
+                             or patterns.SERVICE_PERSIST_DIR_RE.search(cmd)
+                             or patterns.service_persist_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        activates = bool(patterns.SERVICE_ACTIVATE_CMD_RE.search(cmd))
+        if not (touches_target or activates):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_SERVICE_PERSIST")
+                or _service_persist_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A systemd unit/timer or launchd plist is being modified "
+                   "from a shell" if touches_target else
+                   "A systemd/launchd unit is being enabled/loaded, running "
+                   "its target automatically")
+        return _finish(Decision(action, "service-persist-protect",
+                         f"{reason} — it runs automatically, unattended, on a "
+                         "future boot or login. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_SERVICE_PERSIST=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -1748,6 +1910,7 @@ _CORE_RULES = (
     rule_shell_persist_protect,
     rule_package_manifest_protect,
     rule_git_config_exec_protect,
+    rule_service_persist_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
