@@ -155,6 +155,15 @@ class Policy:
     # given a `!`-prefixed shell-command value (alias.*, core.pager, ...).
     # See rules.rule_git_config_exec_protect.
     git_config_exec: dict = field(default_factory=dict)
+    # Systemd unit / launchd persistence protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply. Covers /etc/systemd/{system,user}/*.service (+ .timer/.socket/
+    # .path/.mount and *.service.d/*.conf drop-ins) and
+    # ~/Library/LaunchAgents, /Library/LaunchAgents, /Library/LaunchDaemons
+    # *.plist, plus the systemctl enable/link/edit and launchctl
+    # load/bootstrap/enable activation commands. See
+    # rules.rule_service_persist_protect.
+    service_persist: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.
