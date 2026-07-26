@@ -1419,16 +1419,31 @@ def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decisio
     matched on the key alone rather than confirmed to pair with any
     particular value — moot here anyway, since these keys are gated
     key-only regardless of value. `_GIT_ATTRS_EXEC_KEY`'s subsection-name
-    class excludes whitespace/quotes, so a quoted git-config subsection
-    containing a space (`git config 'filter.evil driver.smudge' /tmp/x`,
-    real, git-accepted syntax) evades the CLI-form key check (QA finding,
+    class excludes ASCII whitespace/quotes/`=` (see `_GIT_CONFIG_SUBSECTION_
+    CHAR`), so an OUTER-SHELL-quoted subsection containing a literal ASCII
+    space (`git config 'filter.evil driver.smudge' /tmp/x`, real,
+    git-accepted syntax) still evades the CLI-form key check (QA finding,
     independent adversarial review, round A) — disclosed, not fixed;
-    verified NOT independently exploitable end-to-end, though, since
-    `.gitattributes` values are whitespace-delimited, so a spaced driver
-    name can never actually be referenced by a `filter=`/`diff=`/`merge=`
-    attribute in the first place — the arming step alone would still be
-    invisible to a human/audit review, just unable to complete the full
-    wiring+arming chain this guard's threat model describes."""
+    verified NOT independently exploitable end-to-end, since `.gitattributes`
+    values are ASCII-space/tab-delimited, so an ASCII-spaced driver name can
+    never actually be referenced by a `filter=`/`diff=`/`merge=` attribute in
+    the first place. A DISTINCT, initially-missed variant of this same class
+    WAS independently exploitable and has been fixed (QA finding, round C,
+    follow-up verification, confirmed end-to-end against real git): a
+    subsection name containing NON-ASCII whitespace (U+00A0 NO-BREAK SPACE)
+    needs no shell quoting at all — bash only treats ASCII space/tab/newline
+    as word separators — so it survives as one plain shell token, AND
+    `.gitattributes` itself only delimits on ASCII space/tab too, so a
+    NBSP-bearing driver name CAN be referenced and CAN complete the full
+    chain; the original class (excluding Python's Unicode-aware whitespace
+    metacharacter, not just ASCII whitespace) also treated NBSP as
+    whitespace, unlike bash and unlike gitattributes, truncating the match
+    before it ever reached the exec-capable
+    leaf key and leaving the arm command with zero detection at any mode,
+    not even a disclosed-but-visible gap. `_GIT_CONFIG_SUBSECTION_CHAR` now
+    excludes only the ASCII separators real shell/gitattributes tokenization
+    actually uses, closing the NBSP variant while leaving the ASCII-spaced,
+    genuinely-inert one as the sole remaining disclosed gap."""
     cfg = getattr(policy, "git_attributes_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

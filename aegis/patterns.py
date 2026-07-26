@@ -1864,7 +1864,28 @@ REGISTRY_HIJACK_CLI_RE = re.compile(
 # (`credential.helper.timeout`, hypothetical but not this guard's target)
 # from false-matching on the "helper" substring alone (round A, false
 # positive).
-_CRED_HELPER_KEY = r"\bcredential\.(?:[^\s'\"=]{1,300}\.)?helper\b(?!\.[\w-])"
+#
+# ASCII whitespace only (space/tab/CR/LF), not Python's Unicode-aware `\s`
+# — QA finding (independent adversarial review, round C, on
+# `rule_git_attributes_exec_protect`'s `GIT_ATTRS_EXEC_KEY_RE`, which
+# shares this exact subsection-name shape): bash only treats ASCII
+# space/tab/newline as a word separator, so a git-config subsection name
+# containing a NON-ASCII whitespace character (U+00A0 NO-BREAK SPACE,
+# confirmed against real git — `git config filter.evil<NBSP>driver.smudge
+# <cmd>` sets it, no shell quoting needed at all since NBSP doesn't split
+# a bash word) needs no outer quoting and survives as ONE shell token —
+# but Python's default Unicode-aware `\s` treats U+00A0 as whitespace too,
+# so a `[^\s'"=]`-shaped class stopped the match short of it, truncating
+# BEFORE the match ever reached the exec-capable leaf key (`.helper`/
+# `.smudge`/...) and leaving the actual arm command with ZERO detection —
+# worse than a merely disclosed gap, since even `deny` mode never fires at
+# all. Excluding only the ASCII separators actually meaningful to shell
+# tokenization (plus quotes/`=`, still excluded for the token-boundary/
+# value-separator reasons this comment documents above) closes it here and
+# for `_GIT_ATTRS_EXEC_KEY` below, which reuses the same shape.
+_GIT_CONFIG_SUBSECTION_CHAR = r"[^ \t\r\n'\"=]"
+_CRED_HELPER_KEY = (
+    r"\bcredential\.(?:" + _GIT_CONFIG_SUBSECTION_CHAR + r"{1,300}\.)?helper\b(?!\.[\w-])")
 # `--get`/`--get-all`/`--get-regexp`/`--get-urlmatch` are read-only queries —
 # gating them costs a false "ask" on an entirely safe diagnostic command with
 # no risk at all (QA finding, independent adversarial review, round A). The
@@ -2060,9 +2081,9 @@ GIT_ATTRS_DRIVER_ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 _GIT_ATTRS_EXEC_KEY = (
-    r"\bfilter\.[^\s'\"=]{1,300}\.(?:clean|smudge|process)\b(?!\.[\w-])"
-    r"|\bdiff\.[^\s'\"=]{1,300}\.(?:textconv|command)\b(?!\.[\w-])"
-    r"|\bmerge\.[^\s'\"=]{1,300}\.driver\b(?!\.[\w-])"
+    r"\bfilter\." + _GIT_CONFIG_SUBSECTION_CHAR + r"{1,300}\.(?:clean|smudge|process)\b(?!\.[\w-])"
+    r"|\bdiff\." + _GIT_CONFIG_SUBSECTION_CHAR + r"{1,300}\.(?:textconv|command)\b(?!\.[\w-])"
+    r"|\bmerge\." + _GIT_CONFIG_SUBSECTION_CHAR + r"{1,300}\.driver\b(?!\.[\w-])"
     r"|\bcore\.fsmonitor\b(?!\.[\w-])"
     r"|\bcore\.sshcommand\b(?!\.[\w-])"
 )
@@ -2107,12 +2128,42 @@ def git_attrs_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, GIT_ATTRS_FIND_RE)
 
 
+# Deliberately excludes `\n` from the split, unlike the shared
+# `_CLAUSE_SPLIT_RE` — QA finding (independent adversarial review, round C,
+# follow-up verification): the first clause-scoping fix reused
+# `_CLAUSE_SPLIT_RE` (which DOES split on `\n`), and that broke the single
+# most ordinary way to write a multi-line file from a shell — a heredoc:
+#
+#     cat >> .gitattributes <<'EOF'
+#     *.bin filter=evil
+#     EOF
+#
+# is ONE real shell command/clause; splitting it on its internal newlines
+# put the line naming `.gitattributes` and the line carrying the
+# `filter=evil` payload into two DIFFERENT "clauses", so neither one
+# contained both conditions and the whole command sailed through as
+# `allow` — confirmed end-to-end against real git (`git checkout` on a
+# matching path actually ran the planted filter). This was a strictly
+# worse regression than the false positive the newline-inclusive split was
+# fixing: a false ALLOW on a mainstream, unremarkable write pattern, versus
+# a false ASK on an unusual multi-command one-liner. Not splitting on bare
+# `\n` re-admits a narrower version of the ORIGINAL false positive (two
+# genuinely unrelated statements on separate lines with no `;`/`&`/`|`
+# between them, each independently satisfying one half of the check) —
+# accepted, the same "false positives are the safe direction" trade-off
+# this file takes throughout; a false ASK is recoverable, a false ALLOW on
+# a working exploit is not.
+_SHELL_STATEMENT_SPLIT_RE = re.compile(r"[;&|]+")
+
+
 def shell_clauses(cmd: str) -> list:
     """Split a RAW (not yet de-obfuscated) shell command into its clauses —
     exposed so a caller can normalize/scan each clause independently. See
     `gitattrs_wiring_hit`'s docstring for why splitting the ALREADY-scanned
-    (post `normalize.scan_surface`) text isn't enough on its own."""
-    return _CLAUSE_SPLIT_RE.split(cmd)
+    (post `normalize.scan_surface`) text isn't enough on its own, and
+    `_SHELL_STATEMENT_SPLIT_RE`'s own comment for why this does NOT split on
+    `\\n` the way the shared `_CLAUSE_SPLIT_RE` does."""
+    return _SHELL_STATEMENT_SPLIT_RE.split(cmd)
 
 
 def gitattrs_wiring_hit(cmd: str) -> bool:
@@ -2128,12 +2179,15 @@ def gitattrs_wiring_hit(cmd: str) -> bool:
     other file entirely (documentation, a changelog) got flagged even though
     neither clause on its own does anything dangerous.
 
-    Callers should pass an ALREADY-normalized (`normalize.scan_surface`)
-    single clause, not the whole multi-clause scanned command — see
-    `shell_clauses()`'s docstring for why splitting post-scan text is not
-    equivalent to splitting pre-scan text on its own clause boundaries."""
-    for clause in _CLAUSE_SPLIT_RE.split(cmd):
-        names = bool(GIT_ATTRS_PATH_RE.search(clause) or git_attrs_find_hit(clause))
-        if names and GIT_ATTRS_DRIVER_ASSIGN_RE.search(clause):
-            return True
-    return False
+    Callers must pass an ALREADY-clause-isolated, ALREADY-normalized
+    (`normalize.scan_surface`) single clause — see `shell_clauses()`'s
+    docstring for why splitting post-scan text is not equivalent to
+    splitting pre-scan text on its own clause boundaries. This function does
+    NOT re-split its input (an earlier draft did, using the newline-
+    inclusive `_CLAUSE_SPLIT_RE` — round C's QA found that re-split a
+    single, already-isolated clause's own INTERNAL newlines, such as a
+    heredoc body's line breaks, right back apart, reintroducing the
+    newline-splitting regression `shell_clauses()`'s own comment
+    describes)."""
+    names = bool(GIT_ATTRS_PATH_RE.search(cmd) or git_attrs_find_hit(cmd))
+    return names and bool(GIT_ATTRS_DRIVER_ASSIGN_RE.search(cmd))

