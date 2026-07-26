@@ -155,6 +155,15 @@ class Policy:
     # given a `!`-prefixed shell-command value (alias.*, core.pager, ...).
     # See rules.rule_git_config_exec_protect.
     git_config_exec: dict = field(default_factory=dict)
+    # .gitattributes filter/diff/merge driver hijack + non-bang direct-exec
+    # git-config key protection: {mode: deny|ask|monitor|off, allow: [regex
+    # on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # .gitattributes/.git/info/attributes wiring a path to filter=/diff=/
+    # merge=, and filter.<name>.clean/smudge/process, diff.<name>.textconv/
+    # command, merge.<name>.driver, core.fsmonitor, core.sshCommand — keys
+    # git_config_exec's bang-only value check can't reach (no `!` required).
+    # See rules.rule_git_attributes_exec_protect.
+    git_attributes_exec: dict = field(default_factory=dict)
     # Systemd unit / launchd persistence protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers /etc/systemd/{system,user}/*.service (+ .timer/.socket/

@@ -411,6 +411,21 @@ def test_url_scoped_credential_helper_gated():
     assert _gated(evaluate(_shell("git config credential.example.com.helper /tmp/evil"), EMPTY))
 
 
+def test_nbsp_url_scoped_credential_helper_gated():
+    """QA finding (independent adversarial review, round C, found on the
+    sibling `rule_git_attributes_exec_protect` guard's identically-shaped
+    subsection-name class, then confirmed here too since both share
+    `_GIT_CONFIG_SUBSECTION_CHAR`): a URL-scope containing U+00A0 (NO-BREAK
+    SPACE, not ASCII space) needs no shell quoting and survived as one
+    plain token, but the original `[^\\s'\"=]`-shaped class used Python's
+    Unicode-aware `\\s`, which also treats NBSP as whitespace and
+    truncated the match before it ever reached `.helper` — zero detection
+    at any mode. Fixed by scoping the exclusion to ASCII separators only."""
+    nbsp = " "
+    d = evaluate(_shell(f"git config credential.evil{nbsp}host.com.helper /tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == "git-config-exec-protect"
+
+
 def test_printf_literal_backslash_n_before_helper_gated():
     """A shell command building the config via `printf '...\\nhelper=...'`
     puts a LITERAL two-character `\\n` (not a real newline) immediately
@@ -447,6 +462,23 @@ def test_get_flag_does_not_suppress_actual_set():
     """The --get carve-out must not accidentally swallow a real set that
     merely mentions '--get' nowhere in it."""
     assert _gated(evaluate(_shell("git config credential.helper cache"), EMPTY))
+
+
+def test_get_substring_in_value_does_not_suppress_actual_set():
+    """QA finding (independent adversarial review, on the sibling
+    `rule_git_attributes_exec_protect` guard, which shares this exact
+    lookahead via `_GIT_CONFIG_NOT_GET_LOOKAHEAD`): the original carve-out
+    scanned the next 60 characters after 'config' for the literal substring
+    '--get' with no token-position anchor, so a real SET whose VALUE merely
+    CONTAINS '--get' anywhere (an attacker-chosen path/string, no quoting
+    needed) silently suppressed detection on an otherwise-ordinary
+    `git config <key> <value>` invocation — the single most common way to
+    set config. Fixed by anchoring the carve-out to require '--get' appear
+    as one of a bounded run of FLAG tokens immediately after 'config' (real
+    git CLI grammar), not anywhere in the trailing value."""
+    d = evaluate(_shell(
+        "git config credential.helper 'store --file /tmp/x --get'"), EMPTY)
+    assert _gated(d) and d.rule == "git-config-exec-protect"
 
 
 def test_distinct_longer_key_not_gated():
