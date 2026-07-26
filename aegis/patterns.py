@@ -2128,115 +2128,53 @@ def git_attrs_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, GIT_ATTRS_FIND_RE)
 
 
-# Deliberately excludes `\n` from the split, unlike the shared
-# `_CLAUSE_SPLIT_RE` — QA finding (independent adversarial review, round C,
-# follow-up verification): the first clause-scoping fix reused
-# `_CLAUSE_SPLIT_RE` (which DOES split on `\n`), and that broke the single
-# most ordinary way to write a multi-line file from a shell — a heredoc:
+# QA history (independent adversarial review, rounds A/C/D/E -- four
+# consecutive rounds on this exact check): round A found that requiring
+# `.gitattributes` to be NAMED and a `filter=`/`diff=`/`merge=` assignment
+# to appear, checked independently over the WHOLE command string, false-
+# positived across unrelated shell clauses joined by `&&`/`;` (a command
+# that merely READS `.gitattributes` in one clause and, in a completely
+# unrelated clause, writes ordinary prose containing a `diff=lfs`/
+# `merge=ours`-shaped substring to some other file, got flagged even though
+# neither clause does anything dangerous). Three successive attempts at
+# clause-SCOPED matching (splitting on the already-scanned text; splitting
+# raw text but on a newline-inclusive separator; splitting on a
+# newline-exclusive separator plus masking `;`/`&`/`|` found inside
+# regex-detected heredoc/quote spans) each closed the reported gap but
+# opened a NEW one -- round C found the newline-inclusive split broke
+# ordinary heredocs (a false ALLOW on a mainstream write pattern, confirmed
+# to let a real exploit run); round D found `;`/`&`/`|` inside a heredoc
+# body or quoted string still split a clause (another false ALLOW, on
+# ordinary content like a URL query string in a comment); round E found
+# the heredoc/quote-span detection regex still missed real, valid shapes
+# (non-`\w` heredoc delimiters, multi-line single-quoted strings) --
+# another false ALLOW -- AND that the same detection regex has a
+# quadratic-time blowup on adversarial input (many heredoc-shaped
+# fragments with no real terminator), a DoS on the synchronous hook path.
 #
-#     cat >> .gitattributes <<'EOF'
-#     *.bin filter=evil
-#     EOF
-#
-# is ONE real shell command/clause; splitting it on its internal newlines
-# put the line naming `.gitattributes` and the line carrying the
-# `filter=evil` payload into two DIFFERENT "clauses", so neither one
-# contained both conditions and the whole command sailed through as
-# `allow` — confirmed end-to-end against real git (`git checkout` on a
-# matching path actually ran the planted filter). This was a strictly
-# worse regression than the false positive the newline-inclusive split was
-# fixing: a false ALLOW on a mainstream, unremarkable write pattern, versus
-# a false ASK on an unusual multi-command one-liner. Not splitting on bare
-# `\n` re-admits a narrower version of the ORIGINAL false positive (two
-# genuinely unrelated statements on separate lines with no `;`/`&`/`|`
-# between them, each independently satisfying one half of the check) —
-# accepted, the same "false positives are the safe direction" trade-off
-# this file takes throughout; a false ASK is recoverable, a false ALLOW on
-# a working exploit is not.
-_SHELL_STATEMENT_SPLIT_RE = re.compile(r"[;&|]+")
-
-# QA finding (independent adversarial review, round D, follow-up
-# verification of the round-C heredoc fix): splitting on a BARE `;`/`&`/`|`
-# anywhere in the raw text — with no awareness that a heredoc body or a
-# quoted string is literal, uninterpreted data at the real shell level —
-# reopened the same class of bug the round-C fix closed, just one level
-# down. Any occurrence of `;`/`&`/`|` INSIDE a heredoc body (a URL's `&` in
-# a comment, a stray `;`) or inside an ordinary single/double-quoted
-# argument (`echo "*.bin filter=evil; note" >> .gitattributes`) still got
-# split apart, landing the `.gitattributes`-naming half and the
-# `filter=`/`diff=`/`merge=`-carrying half in two different "clauses" —
-# zero detection, every mode, on completely mundane input (a setup script
-# with a URL query string in a comment, not a contrived adversarial
-# construction). Fixed by MASKING `;`/`&`/`|` characters that fall inside a
-# detected heredoc span or quoted-string span before splitting (private-use
-# Unicode sentinels, chosen because they cannot appear in real shell input
-# scanned as text), then restoring them in each resulting clause — the
-# split points themselves shift to only the `;`/`&`/`|` that are actually
-# at the top level of shell syntax, closer to how a real shell parses
-# clause boundaries than a flat character-class split ever can be, without
-# writing a full shell lexer. Known, disclosed limit of this pass (same
-# "denylist trade-offs" spirit as every guard in this file): backslash-
-# escaped characters OUTSIDE a quoted string, ANSI-C `$'...'` quoting, and
-# command substitution `$(...)` containing its own unescaped quotes are not
-# specially handled — a sufficiently adversarial combination of those forms
-# could still relocate a `;`/`&`/`|` across the mask's boundary undetected;
-# this pass targets the two REPORTED, confirmed-exploitable shapes (heredoc
-# bodies, ordinary quoted arguments) rather than full shell grammar.
-_HEREDOC_OR_QUOTE_SPAN_RE = re.compile(
-    r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2(?=\s|$)"  # heredoc: intro..body..terminator
-    r"|'[^'\n]*'"                                            # single-quoted (no escapes in bash)
-    r"|\"(?:[^\"\\]|\\.)*\"",                                 # double-quoted (backslash-escaped)
-    re.DOTALL,
-)
-_CLAUSE_SENTINELS = {";": "", "&": "", "|": ""}
-
-
-def _mask_clause_chars_in_span(m) -> str:
-    span = m.group(0)
-    for ch, sentinel in _CLAUSE_SENTINELS.items():
-        span = span.replace(ch, sentinel)
-    return span
-
-
-def shell_clauses(cmd: str) -> list:
-    """Split a RAW (not yet de-obfuscated) shell command into its clauses —
-    exposed so a caller can normalize/scan each clause independently. See
-    `gitattrs_wiring_hit`'s docstring for why splitting the ALREADY-scanned
-    (post `normalize.scan_surface`) text isn't enough on its own,
-    `_SHELL_STATEMENT_SPLIT_RE`'s own comment for why this does NOT split on
-    `\\n` the way the shared `_CLAUSE_SPLIT_RE` does, and
-    `_HEREDOC_OR_QUOTE_SPAN_RE`'s comment for why `;`/`&`/`|` occurring
-    INSIDE a heredoc body or a quoted string must not split a clause
-    either."""
-    masked = _HEREDOC_OR_QUOTE_SPAN_RE.sub(_mask_clause_chars_in_span, cmd)
-    clauses = _SHELL_STATEMENT_SPLIT_RE.split(masked)
-    for ch, sentinel in _CLAUSE_SENTINELS.items():
-        clauses = [c.replace(sentinel, ch) for c in clauses]
-    return clauses
-
-
+# Reaching for a fully correct shell lexer here is the wrong trade: every
+# additional layer of "detect this specific quoting/heredoc shape" fixed
+# one confirmed bypass at the cost of a new, less obvious one, and the
+# last attempt introduced an algorithmic-complexity bug on top. This
+# file's own stated principle, applied throughout every other guard, is
+# the way out: a false ASK is recoverable, a false ALLOW on a working
+# exploit is not -- so `gitattrs_wiring_hit` checks BOTH conditions over
+# the WHOLE given text, no clause-splitting attempt at all. This restores
+# the ORIGINAL round-A false positive (an unusual `&&`/`;`-joined
+# one-liner naming `.gitattributes` in one part and an unrelated
+# `filter=`/`diff=`/`merge=`-shaped substring in another) as a disclosed,
+# accepted trade-off -- the same one every sibling `*_protect` guard in
+# this file already accepts for its own denylist gaps -- in exchange for
+# zero false-negative surface and zero backtracking-driven DoS surface
+# from this check.
 def gitattrs_wiring_hit(cmd: str) -> bool:
-    """Does `.gitattributes`/`.git/info/attributes` get NAMED and a
-    `filter=`/`diff=`/`merge=` assignment appear, in the SAME shell clause?
-    Checking the two conditions independently over the WHOLE command string
-    (rather than clause-scoped, the same discipline `_find_word_and_
-    predicate_hit` already applies for the `find`-indirection surface) was a
-    confirmed false positive (QA finding, independent adversarial review,
-    round A): a command that merely READS `.gitattributes` in one clause
-    (`cat .gitattributes`) and, in a completely unrelated clause, writes
-    ordinary prose containing the substring `diff=lfs`/`merge=ours` to some
-    other file entirely (documentation, a changelog) got flagged even though
-    neither clause on its own does anything dangerous.
-
-    Callers must pass an ALREADY-clause-isolated, ALREADY-normalized
-    (`normalize.scan_surface`) single clause — see `shell_clauses()`'s
-    docstring for why splitting post-scan text is not equivalent to
-    splitting pre-scan text on its own clause boundaries. This function does
-    NOT re-split its input (an earlier draft did, using the newline-
-    inclusive `_CLAUSE_SPLIT_RE` — round C's QA found that re-split a
-    single, already-isolated clause's own INTERNAL newlines, such as a
-    heredoc body's line breaks, right back apart, reintroducing the
-    newline-splitting regression `shell_clauses()`'s own comment
-    describes)."""
+    """Does `.gitattributes`/`.git/info/attributes` get NAMED, and does a
+    `filter=`/`diff=`/`merge=` assignment appear, ANYWHERE in the given
+    text? Deliberately NOT clause-scoped -- see the comment above this
+    function for the QA history of why: three successive attempts at
+    clause-scoped matching each fixed one confirmed false-ALLOW bypass by
+    introducing a different one (or, in the last attempt, a DoS), so this
+    reverted to the simple, safe check every other guard in this file
+    already accepts the equivalent trade-off for."""
     names = bool(GIT_ATTRS_PATH_RE.search(cmd) or git_attrs_find_hit(cmd))
     return names and bool(GIT_ATTRS_DRIVER_ASSIGN_RE.search(cmd))

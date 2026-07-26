@@ -1406,15 +1406,30 @@ def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decisio
     spawned agent cannot set its own env for a hook invocation it doesn't
     control, so neither path is agent-self-escapable.
 
-    Honest scope, same denylist trade-offs as every guard in this file: a
-    `.gitattributes`/config value assembled indirectly (shell variable
-    concatenation, a wrapper script) rather than one contiguous literal is not
-    caught; a submodule's real `.git/modules/<name>/info/attributes` path is
-    not covered (unlike `GIT_CONFIG_FILE_PATH_RE`'s own submodule handling —
-    disclosed, not fixed, to keep this guard's first pass proportionate);
-    archive/sync tools (`rsync`/`tar`/`unzip`) placing `.gitattributes`
-    without naming it as a discrete write-verb argument are not covered (no
-    `ARCHIVE_SYNC_VERB_RE`-style check here); and, like `git_config_exec`,
+    Honest scope, same denylist trade-offs as every guard in this file: the
+    shell branch's `.gitattributes`-wiring check (`patterns.gitattrs_wiring_
+    hit`) is deliberately NOT clause-scoped — it checks "is `.gitattributes`/
+    `.git/info/attributes` named, and does a `filter=`/`diff=`/`merge=`
+    assignment appear" over the WHOLE scanned command, not per-clause. This
+    costs a false ASK on an unusual `&&`/`;`-joined one-liner that names
+    `.gitattributes` in one part and happens to contain an unrelated
+    `filter=`/`diff=`/`merge=`-shaped substring (ordinary prose) in another,
+    completely unrelated part. Accepted deliberately, after QA (independent
+    adversarial review, four consecutive rounds — see `gitattrs_wiring_hit`'s
+    own module-level comment in patterns.py for the full history) found that
+    every attempt at clause-SCOPED matching to avoid this false positive
+    introduced a WORSE false-NEGATIVE bypass in exchange — a false ASK is
+    recoverable, a false ALLOW on a working exploit is not, the same
+    principle every guard in this file already applies to its own denylist
+    gaps. A `.gitattributes`/config value assembled indirectly (shell
+    variable concatenation, a wrapper script) rather than one contiguous
+    literal is not caught; a submodule's real `.git/modules/<name>/info/
+    attributes` path is not covered (unlike `GIT_CONFIG_FILE_PATH_RE`'s own
+    submodule handling — disclosed, not fixed, to keep this guard's first
+    pass proportionate); archive/sync tools (`rsync`/`tar`/`unzip`) placing
+    `.gitattributes` without naming it as a discrete write-verb argument are
+    not covered (no `ARCHIVE_SYNC_VERB_RE`-style check here); and, like
+    `git_config_exec`,
     the paired `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` env-injection form is
     matched on the key alone rather than confirmed to pair with any
     particular value — moot here anyway, since these keys are gated
@@ -1514,22 +1529,16 @@ def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decisio
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        # Clause-scoped — NOT "does .gitattributes appear anywhere in the
-        # whole command AND does filter=/diff=/merge= appear anywhere",
-        # which false-positived across unrelated clauses joined by `&&`/`;`
-        # (QA finding, independent adversarial review, round A). Splitting
-        # the RAW command into clauses FIRST, then normalizing each clause
-        # independently (rather than splitting the already-scanned `cmd`
-        # blob), matters: `normalize.scan_surface` joins the raw command and
-        # its de-quoted/decoded copies with a plain space and no clause
-        # separator between them, so splitting post-scan text can still
-        # stitch the tail of one real clause to the head of an unrelated
-        # clause's re-encoded copy — a follow-up the first, simpler
-        # clause-split attempt (split the post-scan blob) did not fully
-        # close.
-        attrs_hit = any(
-            patterns.gitattrs_wiring_hit(normalize.scan_surface(clause))
-            for clause in patterns.shell_clauses(_cmd(ev)))
+        # NOT clause-scoped — see `patterns.gitattrs_wiring_hit`'s own
+        # comment for the QA history (rounds A/C/D/E) of why three
+        # successive clause-scoping attempts each closed one confirmed
+        # false-ALLOW bypass while opening a different one (or, in the
+        # last attempt, a ReDoS), and why checking both conditions over the
+        # whole scanned command — accepting the narrower, disclosed
+        # cross-clause false positive every sibling `*_protect` guard in
+        # this file already accepts an equivalent of — is the safe
+        # direction here.
+        attrs_hit = patterns.gitattrs_wiring_hit(cmd)
         key_hit = bool(patterns.GIT_ATTRS_EXEC_KEY_RE.search(cmd)
                         or patterns.GIT_ATTRS_EXEC_INI_RE.search(cmd))
         if not (attrs_hit or key_hit):

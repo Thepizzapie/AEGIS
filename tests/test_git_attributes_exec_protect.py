@@ -324,9 +324,12 @@ def test_unrelated_edit_allowed():
 # value was actually a plain string.
 #
 # All four are fixed; see the docstrings on `_GIT_CONFIG_NOT_GET_LOOKAHEAD`
-# (patterns.py), the content-extraction block and `gitattrs_wiring_hit`'s
-# raw-clause-first splitting (rules.py's shell branch), and `gitattrs_
-# wiring_hit`/`shell_clauses` (patterns.py) for the fix mechanics.
+# and `gitattrs_wiring_hit` (both in patterns.py), and the content-
+# extraction block in rules.py's Edit/Write/MCP branch, for the fix
+# mechanics. Finding (4), the cross-clause false positive, went through
+# several more QA rounds after this one before landing on its final,
+# simplest form — see the "cross-clause combination" test and
+# `gitattrs_wiring_hit`'s module-level comment below for that history.
 
 def test_get_substring_in_value_no_longer_bypasses_gate():
     """QA finding, round A: `--get` merely appearing INSIDE the value (well
@@ -400,47 +403,50 @@ def test_mcp_nested_content_block_gitattributes_gated():
     assert _gated(d) and d.rule == "git-attributes-exec-protect"
 
 
-def test_cross_clause_conflation_not_gated():
-    """QA finding, round A: naming `.gitattributes` in one clause and having
-    an unrelated `filter=`/`diff=`/`merge=`-shaped substring in a completely
-    different, unrelated clause (ordinary prose written to another file)
-    must not combine into a false gate."""
+def test_cross_clause_combination_is_a_disclosed_accepted_false_positive():
+    """QA history, rounds A/C/D/E: naming `.gitattributes` in one part of a
+    command and having an unrelated `filter=`/`diff=`/`merge=`-shaped
+    substring in another, unrelated part (ordinary prose written to
+    another file) is checked over the WHOLE command with no clause
+    scoping — a deliberate, disclosed reversion after three successive
+    clause-scoping attempts each closed one confirmed false-ALLOW bypass
+    while opening a different one (see `patterns.gitattrs_wiring_hit`'s
+    module-level comment for the full QA history). This is now ASK, not
+    ALLOW — the accepted trade-off, not a bug. Pinned here so a future
+    change doesn't silently reopen the false-negative class this reversion
+    exists to prevent."""
     d = evaluate(_shell(
         'echo "supported formats: diff=lfs" > NOTES.md && cat .gitattributes'), EMPTY)
-    assert not _gated(d)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
     d2 = evaluate(_shell(
         'cat .gitattributes; echo "merge=ours is a valid strategy name" >> CHANGELOG.md'),
         EMPTY)
-    assert not _gated(d2)
+    assert _gated(d2) and d2.rule == "git-attributes-exec-protect"
 
 
-def test_same_clause_true_positive_survives_clause_scoping():
-    """The clause-scoping fix must not blind the guard to the ordinary
-    same-clause case it exists to catch."""
+def test_same_clause_true_positive_still_gated():
     d = evaluate(_shell('echo "*.bin filter=evil" >> .gitattributes'), EMPTY)
     assert _gated(d) and d.rule == "git-attributes-exec-protect"
     d2 = evaluate(_shell('echo "*.bin filter=evil" >> .gitattributes; echo done'), EMPTY)
     assert _gated(d2) and d2.rule == "git-attributes-exec-protect"
 
 
-# ---- QA round C (follow-up verification of the round A/B fixes) --------------------
+# ---- QA rounds C/D/E: heredocs and quoted content, now moot by design -------------
 #
-# Round C found the first clause-scoping fix introduced a NEW, more severe
-# regression (a false ALLOW on a mainstream heredoc write, confirmed to
-# actually execute a planted filter against real git) and that the
-# "verified non-exploitable" claim for the spaced-subsection-name gap was
-# wrong for a non-ASCII-whitespace variant (confirmed end-to-end against
-# real git, including the payload command actually running on checkout).
-# Both are now fixed — see `_SHELL_STATEMENT_SPLIT_RE`/`gitattrs_wiring_hit`
-# and `_GIT_CONFIG_SUBSECTION_CHAR` in patterns.py for the fix mechanics.
+# Rounds C, D, and E each found a real false-ALLOW bypass in successive
+# attempts at clause-SCOPED matching for `.gitattributes` wiring — a
+# heredoc write, a heredoc body or quoted argument containing `;`/`&`/`|`,
+# and a heredoc/quote-detection regex that missed real delimiter/quoting
+# shapes (plus a ReDoS in that same detection regex). All were symptoms of
+# the same root problem: approximating real shell lexing with regex.
+# `gitattrs_wiring_hit` no longer attempts clause scoping AT ALL (see its
+# module-level comment in patterns.py) — it just checks both conditions
+# over the whole scanned command, which makes every one of these cases
+# correctly gated as an ordinary side effect (no heredoc/quote parsing
+# needed when there's no clause boundary to get wrong), not because of any
+# heredoc/quote-specific logic. These tests remain to prove that.
 
 def test_heredoc_gitattributes_write_gated():
-    """QA finding, round C: the round-A clause-scoping fix reused the
-    newline-inclusive shared `_CLAUSE_SPLIT_RE`, which split a heredoc's
-    payload line from the line naming `.gitattributes` into two different
-    'clauses' — neither satisfied both conditions, so the whole write
-    sailed through as `allow` even in `deny` mode. A heredoc is ONE shell
-    command/clause; splitting must not happen on its internal newlines."""
     cmd = "cat >> .gitattributes <<'EOF'\n*.bin filter=evil\nEOF"
     d = evaluate(_shell(cmd), EMPTY)
     assert _gated(d) and d.rule == "git-attributes-exec-protect"
@@ -455,16 +461,8 @@ def test_heredoc_gitconfig_arm_gated():
 
 
 def test_heredoc_body_containing_ampersand_still_gated():
-    """QA finding, round D (follow-up verification of the round-C heredoc
-    fix): `_SHELL_STATEMENT_SPLIT_RE` split on ANY `;`/`&`/`|` character
-    with no awareness that it might be sitting inside a heredoc body's
-    literal, uninterpreted text — an ordinary URL query string in a
-    comment (`...setup?ref=main&mode=auto`) was enough to land the
-    `.gitattributes`-naming line and the `filter=`-carrying line in two
-    different 'clauses', a silent bypass at every mode including `deny`.
-    Confirmed against real git that the payload is fully functional.
-    `shell_clauses()` now masks `;`/`&`/`|` inside detected heredoc/quote
-    spans before splitting."""
+    """An ordinary URL query string in a heredoc comment
+    (`...setup?ref=main&mode=auto`) — real QA-round-D repro content."""
     cmd = ("cat >> .gitattributes <<'EOF'\n"
            "# docs: https://git-lfs.example.com/setup?ref=main&mode=auto\n"
            "*.bin filter=evil\n"
@@ -491,11 +489,28 @@ def test_heredoc_body_containing_pipe_still_gated():
     assert _gated(evaluate(_shell(cmd), EMPTY))
 
 
+def test_heredoc_with_non_word_delimiter_still_gated():
+    """QA finding, round E: a heredoc-detection regex requiring a `\\w+`
+    delimiter missed real, valid delimiters like `EOF-1`. Moot now — no
+    detection regex is involved at all, the whole command is just scanned
+    as text."""
+    cmd = ("cat >> .gitattributes <<'EOF-1'\n"
+           "# a;b&c ref=1&x=2\n"
+           "*.bin filter=evil\n"
+           "EOF-1")
+    assert _gated(evaluate(_shell(cmd), EMPTY))
+
+
+def test_multiline_single_quoted_string_still_gated():
+    """QA finding, round E: real bash single-quotes can span a literal
+    newline with no escape mechanism; a `[^'\\n]*`-shaped span-detection
+    regex missed that shape. Moot now for the same reason as the
+    non-word-delimiter case above."""
+    cmd = "echo '*.bin filter=evil\n;more text' >> .gitattributes"
+    assert _gated(evaluate(_shell(cmd), EMPTY))
+
+
 def test_quoted_argument_containing_semicolon_still_gated():
-    """The same masking closes the non-heredoc variant of this bug too: an
-    ordinary quoted shell argument (no heredoc at all) whose text happens
-    to contain a literal `;`/`&`/`|` used to split the naming half from
-    the assignment half just as effectively as the heredoc case."""
     d = evaluate(_shell('echo "*.bin filter=evil; note" >> .gitattributes'), EMPTY)
     assert _gated(d) and d.rule == "git-attributes-exec-protect"
 
@@ -510,26 +525,19 @@ def test_quoted_argument_containing_pipe_still_gated():
     assert _gated(d) and d.rule == "git-attributes-exec-protect"
 
 
-def test_shell_clauses_masking_no_quadratic_blowup():
+def test_gitattrs_wiring_hit_no_quadratic_blowup():
+    """QA finding, round E: the heredoc/quote-span DETECTION regex a prior
+    attempt used had a confirmed quadratic-time blowup on adversarial
+    input (many heredoc-shaped fragments with no real terminator) —
+    O(n^2) from repeated failed `.*?` backtracking. That detection regex
+    no longer exists; this pins that the current, simpler whole-text check
+    stays fast on the same adversarial shape."""
     from aegis import patterns
     start = time.monotonic()
-    patterns.shell_clauses("<<X " * 3000)
-    patterns.shell_clauses('"a" ' * 5000)
-    patterns.shell_clauses("'" + ("a;b&c|d" * 5000) + "'")
-    patterns.shell_clauses('"' + ("\\\\" * 20000))
+    for n in (4000, 6000, 8000):
+        cmd = ("<<'A" + "x" * 20 + "' \n") * n
+        patterns.gitattrs_wiring_hit(cmd)
     assert time.monotonic() - start < 2.0
-
-
-def test_bare_newline_joined_unrelated_statements_still_a_disclosed_false_positive():
-    """Deliberate, disclosed trade-off (see `_SHELL_STATEMENT_SPLIT_RE`'s
-    docstring): NOT splitting on bare `\\n` (to keep heredocs safe) means
-    two genuinely unrelated statements joined by only a raw newline (no
-    `;`/`&`/`|`) can still combine into a false ask — accepted, since a
-    false ask is recoverable and a false allow on a working exploit is
-    not. This test documents the accepted behavior, not a bug."""
-    d = evaluate(_shell('cat .gitattributes\necho "merge=ours is a valid strategy" >> x.md'),
-                 EMPTY)
-    assert _gated(d)
 
 
 def test_nbsp_subsection_name_gated():
@@ -555,14 +563,6 @@ def test_ascii_spaced_subsection_name_remains_disclosed_gap():
     goes stale."""
     d = evaluate(_shell("git config 'filter.evil driver.smudge' /tmp/payload"), EMPTY)
     assert not _gated(d)
-
-
-def test_clause_scoped_check_no_quadratic_blowup_on_many_clauses():
-    from aegis import patterns
-    cmd = "echo hi;" * 5000
-    start = time.monotonic()
-    any(patterns.gitattrs_wiring_hit(patterns.shell_clauses(cmd)[0]) for _ in range(1))
-    assert time.monotonic() - start < 2.0
 
 
 # ---- escape hatch -------------------------------------------------------------------
