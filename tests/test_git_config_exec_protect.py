@@ -449,6 +449,23 @@ def test_get_flag_does_not_suppress_actual_set():
     assert _gated(evaluate(_shell("git config credential.helper cache"), EMPTY))
 
 
+def test_get_substring_in_value_does_not_suppress_actual_set():
+    """QA finding (independent adversarial review, on the sibling
+    `rule_git_attributes_exec_protect` guard, which shares this exact
+    lookahead via `_GIT_CONFIG_NOT_GET_LOOKAHEAD`): the original carve-out
+    scanned the next 60 characters after 'config' for the literal substring
+    '--get' with no token-position anchor, so a real SET whose VALUE merely
+    CONTAINS '--get' anywhere (an attacker-chosen path/string, no quoting
+    needed) silently suppressed detection on an otherwise-ordinary
+    `git config <key> <value>` invocation — the single most common way to
+    set config. Fixed by anchoring the carve-out to require '--get' appear
+    as one of a bounded run of FLAG tokens immediately after 'config' (real
+    git CLI grammar), not anywhere in the trailing value."""
+    d = evaluate(_shell(
+        "git config credential.helper 'store --file /tmp/x --get'"), EMPTY)
+    assert _gated(d) and d.rule == "git-config-exec-protect"
+
+
 def test_distinct_longer_key_not_gated():
     """A distinct, longer key that merely CONTAINS 'credential.helper' as a
     substring (not the actual key) must not false-positive — QA (round A)

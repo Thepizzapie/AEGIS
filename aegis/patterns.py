@@ -1871,7 +1871,23 @@ _CRED_HELPER_KEY = r"\bcredential\.(?:[^\s'\"=]{1,300}\.)?helper\b(?!\.[\w-])"
 # exclusion only applies to the plain `git config` alternative below: the
 # inline `-c`/`--config`/`--config-env`/`GIT_CONFIG_KEY_n` forms are never a
 # read (there is no `--get` equivalent for them), so they need no carve-out.
-_GIT_CONFIG_NOT_GET_LOOKAHEAD = r"(?![^|;&\n]{0,60}--get(?:-all|-regexp|-urlmatch)?\b)"
+#
+# Anchored to the real git CLI grammar (`git [flags] config [flags] --get
+# <key> [value-pattern]` — `--get` always precedes the key, never follows
+# it): a bounded run of flag-shaped tokens (`--?...`) immediately after
+# `config`, then `--get`. QA (independent adversarial review, round A, on
+# `rule_git_attributes_exec_protect` — this pattern is shared with that
+# guard's `GIT_ATTRS_EXEC_KEY_RE`) found the ORIGINAL form — "`--get` occurs
+# anywhere in the next 60 chars after `config`" with no token-position
+# anchor — let the literal 5 characters `--get` appear ANYWHERE, including
+# inside an attacker-chosen VALUE well past the key (`git config
+# core.sshCommand 'ssh ... --get'`), and silently suppress detection on a
+# plain, ordinary `git config <key> <value>` SET — the single most common
+# way to set config, and a complete bypass with no override needed.
+_GIT_CONFIG_FLAG_TOKEN_SRC = r"--?[A-Za-z][\w-]{0,40}(?:=[^\s|;&\n]{0,100})?"
+_GIT_CONFIG_NOT_GET_LOOKAHEAD = (
+    r"(?!\s*(?:" + _GIT_CONFIG_FLAG_TOKEN_SRC + r"\s+){0,8}--get(?:-all|-regexp|-urlmatch)?\b)"
+)
 GIT_CONFIG_CREDENTIAL_HELPER_RE = re.compile(
     r"\bgit\b[^|;&\n]{0,200}\bconfig\b" + _GIT_CONFIG_NOT_GET_LOOKAHEAD
     + r"[^|;&\n]{0,200}" + _CRED_HELPER_KEY
@@ -2089,3 +2105,35 @@ GIT_ATTRS_FIND_RE = _find_predicate_re(
 
 def git_attrs_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, GIT_ATTRS_FIND_RE)
+
+
+def shell_clauses(cmd: str) -> list:
+    """Split a RAW (not yet de-obfuscated) shell command into its clauses —
+    exposed so a caller can normalize/scan each clause independently. See
+    `gitattrs_wiring_hit`'s docstring for why splitting the ALREADY-scanned
+    (post `normalize.scan_surface`) text isn't enough on its own."""
+    return _CLAUSE_SPLIT_RE.split(cmd)
+
+
+def gitattrs_wiring_hit(cmd: str) -> bool:
+    """Does `.gitattributes`/`.git/info/attributes` get NAMED and a
+    `filter=`/`diff=`/`merge=` assignment appear, in the SAME shell clause?
+    Checking the two conditions independently over the WHOLE command string
+    (rather than clause-scoped, the same discipline `_find_word_and_
+    predicate_hit` already applies for the `find`-indirection surface) was a
+    confirmed false positive (QA finding, independent adversarial review,
+    round A): a command that merely READS `.gitattributes` in one clause
+    (`cat .gitattributes`) and, in a completely unrelated clause, writes
+    ordinary prose containing the substring `diff=lfs`/`merge=ours` to some
+    other file entirely (documentation, a changelog) got flagged even though
+    neither clause on its own does anything dangerous.
+
+    Callers should pass an ALREADY-normalized (`normalize.scan_surface`)
+    single clause, not the whole multi-clause scanned command — see
+    `shell_clauses()`'s docstring for why splitting post-scan text is not
+    equivalent to splitting pre-scan text on its own clause boundaries."""
+    for clause in _CLAUSE_SPLIT_RE.split(cmd):
+        names = bool(GIT_ATTRS_PATH_RE.search(clause) or git_attrs_find_hit(clause))
+        if names and GIT_ATTRS_DRIVER_ASSIGN_RE.search(clause):
+            return True
+    return False

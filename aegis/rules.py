@@ -1418,7 +1418,17 @@ def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decisio
     the paired `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` env-injection form is
     matched on the key alone rather than confirmed to pair with any
     particular value — moot here anyway, since these keys are gated
-    key-only regardless of value."""
+    key-only regardless of value. `_GIT_ATTRS_EXEC_KEY`'s subsection-name
+    class excludes whitespace/quotes, so a quoted git-config subsection
+    containing a space (`git config 'filter.evil driver.smudge' /tmp/x`,
+    real, git-accepted syntax) evades the CLI-form key check (QA finding,
+    independent adversarial review, round A) — disclosed, not fixed;
+    verified NOT independently exploitable end-to-end, though, since
+    `.gitattributes` values are whitespace-delimited, so a spaced driver
+    name can never actually be referenced by a `filter=`/`diff=`/`merge=`
+    attribute in the first place — the arming step alone would still be
+    invisible to a human/audit review, just unable to complete the full
+    wiring+arming chain this guard's threat model describes."""
     cfg = getattr(policy, "git_attributes_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1435,8 +1445,31 @@ def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decisio
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
+        # QA findings (independent adversarial review, rounds A and B) on
+        # this exact extraction: (1) `MultiEdit`/`NotebookEdit` are
+        # ActionClass.EDIT (see events.py), not MCP, but put their text
+        # under `edits: [{new_string}, ...]`/`new_source` — neither key this
+        # scan checked — so the old MCP-only flatten fallback never ran for
+        # them and both content/new_string came back empty, a silent total
+        # bypass for two mainstream builtin tools. (2) an MCP tool whose
+        # `content` argument is a non-empty NESTED structure (the common
+        # "content block" list-of-dicts shape) was still truthy, so the old
+        # code did `str(a_list_of_dicts)` instead of falling through to the
+        # flatten path (that branch only ran when content was EMPTY) —
+        # `str()` on a nested structure renders an embedded string via
+        # `repr()`, turning real newlines/tabs into literal two-character
+        # `\n`/`\t` sequences that break every `\b`-anchored pattern below
+        # expecting real whitespace immediately before a key. Fixed by
+        # always falling through to the depth-capped `_flatten_strings`
+        # walker (which reads real leaf strings as-is, no repr() mangling)
+        # whenever direct extraction doesn't yield a non-empty plain string
+        # — for EVERY action class, not just MCP.
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
@@ -1466,9 +1499,22 @@ def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decisio
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        names_attrs = bool(patterns.GIT_ATTRS_PATH_RE.search(cmd)
-                            or patterns.git_attrs_find_hit(cmd))
-        attrs_hit = names_attrs and bool(patterns.GIT_ATTRS_DRIVER_ASSIGN_RE.search(cmd))
+        # Clause-scoped — NOT "does .gitattributes appear anywhere in the
+        # whole command AND does filter=/diff=/merge= appear anywhere",
+        # which false-positived across unrelated clauses joined by `&&`/`;`
+        # (QA finding, independent adversarial review, round A). Splitting
+        # the RAW command into clauses FIRST, then normalizing each clause
+        # independently (rather than splitting the already-scanned `cmd`
+        # blob), matters: `normalize.scan_surface` joins the raw command and
+        # its de-quoted/decoded copies with a plain space and no clause
+        # separator between them, so splitting post-scan text can still
+        # stitch the tail of one real clause to the head of an unrelated
+        # clause's re-encoded copy — a follow-up the first, simpler
+        # clause-split attempt (split the post-scan blob) did not fully
+        # close.
+        attrs_hit = any(
+            patterns.gitattrs_wiring_hit(normalize.scan_surface(clause))
+            for clause in patterns.shell_clauses(_cmd(ev)))
         key_hit = bool(patterns.GIT_ATTRS_EXEC_KEY_RE.search(cmd)
                         or patterns.GIT_ATTRS_EXEC_INI_RE.search(cmd))
         if not (attrs_hit or key_hit):
