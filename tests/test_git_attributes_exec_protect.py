@@ -454,6 +454,72 @@ def test_heredoc_gitconfig_arm_gated():
     assert _gated(d) and d.rule == "git-attributes-exec-protect"
 
 
+def test_heredoc_body_containing_ampersand_still_gated():
+    """QA finding, round D (follow-up verification of the round-C heredoc
+    fix): `_SHELL_STATEMENT_SPLIT_RE` split on ANY `;`/`&`/`|` character
+    with no awareness that it might be sitting inside a heredoc body's
+    literal, uninterpreted text — an ordinary URL query string in a
+    comment (`...setup?ref=main&mode=auto`) was enough to land the
+    `.gitattributes`-naming line and the `filter=`-carrying line in two
+    different 'clauses', a silent bypass at every mode including `deny`.
+    Confirmed against real git that the payload is fully functional.
+    `shell_clauses()` now masks `;`/`&`/`|` inside detected heredoc/quote
+    spans before splitting."""
+    cmd = ("cat >> .gitattributes <<'EOF'\n"
+           "# docs: https://git-lfs.example.com/setup?ref=main&mode=auto\n"
+           "*.bin filter=evil\n"
+           "EOF")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
+    d2 = evaluate(_shell(cmd), Policy(git_attributes_exec={"mode": "deny"}))
+    assert d2.action == Action.DENY
+
+
+def test_heredoc_body_containing_semicolon_still_gated():
+    cmd = ("cat >> .gitattributes <<'EOF'\n"
+           "# note: a;b are unrelated tokens here\n"
+           "*.bin filter=evil\n"
+           "EOF")
+    assert _gated(evaluate(_shell(cmd), EMPTY))
+
+
+def test_heredoc_body_containing_pipe_still_gated():
+    cmd = ("cat >> .gitattributes <<'EOF'\n"
+           "# pipe example: a|b\n"
+           "*.bin filter=evil\n"
+           "EOF")
+    assert _gated(evaluate(_shell(cmd), EMPTY))
+
+
+def test_quoted_argument_containing_semicolon_still_gated():
+    """The same masking closes the non-heredoc variant of this bug too: an
+    ordinary quoted shell argument (no heredoc at all) whose text happens
+    to contain a literal `;`/`&`/`|` used to split the naming half from
+    the assignment half just as effectively as the heredoc case."""
+    d = evaluate(_shell('echo "*.bin filter=evil; note" >> .gitattributes'), EMPTY)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
+
+
+def test_quoted_argument_containing_ampersand_still_gated():
+    d = evaluate(_shell('echo "*.bin filter=evil & background" >> .gitattributes'), EMPTY)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
+
+
+def test_quoted_argument_containing_pipe_still_gated():
+    d = evaluate(_shell("echo '*.bin filter=evil | note' >> .gitattributes"), EMPTY)
+    assert _gated(d) and d.rule == "git-attributes-exec-protect"
+
+
+def test_shell_clauses_masking_no_quadratic_blowup():
+    from aegis import patterns
+    start = time.monotonic()
+    patterns.shell_clauses("<<X " * 3000)
+    patterns.shell_clauses('"a" ' * 5000)
+    patterns.shell_clauses("'" + ("a;b&c|d" * 5000) + "'")
+    patterns.shell_clauses('"' + ("\\\\" * 20000))
+    assert time.monotonic() - start < 2.0
+
+
 def test_bare_newline_joined_unrelated_statements_still_a_disclosed_false_positive():
     """Deliberate, disclosed trade-off (see `_SHELL_STATEMENT_SPLIT_RE`'s
     docstring): NOT splitting on bare `\\n` (to keep heredocs safe) means

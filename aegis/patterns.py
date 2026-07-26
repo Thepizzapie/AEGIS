@@ -2155,15 +2155,64 @@ def git_attrs_find_hit(cmd: str) -> bool:
 # a working exploit is not.
 _SHELL_STATEMENT_SPLIT_RE = re.compile(r"[;&|]+")
 
+# QA finding (independent adversarial review, round D, follow-up
+# verification of the round-C heredoc fix): splitting on a BARE `;`/`&`/`|`
+# anywhere in the raw text — with no awareness that a heredoc body or a
+# quoted string is literal, uninterpreted data at the real shell level —
+# reopened the same class of bug the round-C fix closed, just one level
+# down. Any occurrence of `;`/`&`/`|` INSIDE a heredoc body (a URL's `&` in
+# a comment, a stray `;`) or inside an ordinary single/double-quoted
+# argument (`echo "*.bin filter=evil; note" >> .gitattributes`) still got
+# split apart, landing the `.gitattributes`-naming half and the
+# `filter=`/`diff=`/`merge=`-carrying half in two different "clauses" —
+# zero detection, every mode, on completely mundane input (a setup script
+# with a URL query string in a comment, not a contrived adversarial
+# construction). Fixed by MASKING `;`/`&`/`|` characters that fall inside a
+# detected heredoc span or quoted-string span before splitting (private-use
+# Unicode sentinels, chosen because they cannot appear in real shell input
+# scanned as text), then restoring them in each resulting clause — the
+# split points themselves shift to only the `;`/`&`/`|` that are actually
+# at the top level of shell syntax, closer to how a real shell parses
+# clause boundaries than a flat character-class split ever can be, without
+# writing a full shell lexer. Known, disclosed limit of this pass (same
+# "denylist trade-offs" spirit as every guard in this file): backslash-
+# escaped characters OUTSIDE a quoted string, ANSI-C `$'...'` quoting, and
+# command substitution `$(...)` containing its own unescaped quotes are not
+# specially handled — a sufficiently adversarial combination of those forms
+# could still relocate a `;`/`&`/`|` across the mask's boundary undetected;
+# this pass targets the two REPORTED, confirmed-exploitable shapes (heredoc
+# bodies, ordinary quoted arguments) rather than full shell grammar.
+_HEREDOC_OR_QUOTE_SPAN_RE = re.compile(
+    r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2(?=\s|$)"  # heredoc: intro..body..terminator
+    r"|'[^'\n]*'"                                            # single-quoted (no escapes in bash)
+    r"|\"(?:[^\"\\]|\\.)*\"",                                 # double-quoted (backslash-escaped)
+    re.DOTALL,
+)
+_CLAUSE_SENTINELS = {";": "", "&": "", "|": ""}
+
+
+def _mask_clause_chars_in_span(m) -> str:
+    span = m.group(0)
+    for ch, sentinel in _CLAUSE_SENTINELS.items():
+        span = span.replace(ch, sentinel)
+    return span
+
 
 def shell_clauses(cmd: str) -> list:
     """Split a RAW (not yet de-obfuscated) shell command into its clauses —
     exposed so a caller can normalize/scan each clause independently. See
     `gitattrs_wiring_hit`'s docstring for why splitting the ALREADY-scanned
-    (post `normalize.scan_surface`) text isn't enough on its own, and
+    (post `normalize.scan_surface`) text isn't enough on its own,
     `_SHELL_STATEMENT_SPLIT_RE`'s own comment for why this does NOT split on
-    `\\n` the way the shared `_CLAUSE_SPLIT_RE` does."""
-    return _SHELL_STATEMENT_SPLIT_RE.split(cmd)
+    `\\n` the way the shared `_CLAUSE_SPLIT_RE` does, and
+    `_HEREDOC_OR_QUOTE_SPAN_RE`'s comment for why `;`/`&`/`|` occurring
+    INSIDE a heredoc body or a quoted string must not split a clause
+    either."""
+    masked = _HEREDOC_OR_QUOTE_SPAN_RE.sub(_mask_clause_chars_in_span, cmd)
+    clauses = _SHELL_STATEMENT_SPLIT_RE.split(masked)
+    for ch, sentinel in _CLAUSE_SENTINELS.items():
+        clauses = [c.replace(sentinel, ch) for c in clauses]
+    return clauses
 
 
 def gitattrs_wiring_hit(cmd: str) -> bool:
