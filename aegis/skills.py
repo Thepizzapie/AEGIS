@@ -40,6 +40,7 @@ _REMEDIES = """\
 | agent-def-protect | wrote CLAUDE.md/AGENTS.md or a .claude/agents or .claude/commands definition (auto-loaded/auto-invoked next session) | ask the human; they can set AEGIS_ALLOW_AGENT_DEF=1 after review |
 | shell-persist-protect | wrote a shell startup/profile file or an SSH persistence target (runs on the next shell open / ssh connection) | ask the human; they can set AEGIS_ALLOW_SHELL_PERSIST=1 after review |
 | service-persist-protect | wrote a systemd unit/timer or launchd plist, or ran systemctl enable / launchctl load (runs on the next boot / login) | ask the human; they can set AEGIS_ALLOW_SERVICE_PERSIST=1 after review |
+| devcontainer-exec-protect | wrote a devcontainer.json lifecycle command (initializeCommand/onCreateCommand/postCreateCommand/postStartCommand/postAttachCommand/updateContentCommand) | ask the human; they can set AEGIS_ALLOW_DEVCONTAINER_EXEC=1 after review |
 | workspace-confine | wrote outside the project root the identity is bound to | stay in the project; ask for workspace.allow if a path is legitimate |
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |
 | subagent-spawn | a spawned agent tried to spawn sub-agents | do the work in this session, or run with AEGIS_ALLOW_SUBAGENTS=1 |
@@ -98,7 +99,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `shell_persist`, `package_manifest`, `service_persist`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `shell_persist`, `package_manifest`, `service_persist`, `devcontainer_exec`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -143,7 +144,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
      `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `shell_persist`,
-     `package_manifest`, `service_persist`, `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
+     `package_manifest`, `service_persist`, `devcontainer_exec`, `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
 """,

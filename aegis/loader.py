@@ -55,6 +55,7 @@ def load_policy(path) -> Policy:
         "agent_label": None, "install_review": {}, "mcp_config": {},
         "ci_workflow": {}, "git_hooks": {}, "agent_def": {}, "shell_persist": {},
         "package_manifest": {}, "git_config_exec": {}, "git_attributes_exec": {},
+        "service_persist": {}, "devcontainer_exec": {},
         "inject": {}, "failures": {},
         "completion": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
@@ -88,6 +89,8 @@ def load_policy(path) -> Policy:
                   package_manifest=st["package_manifest"],
                   git_config_exec=st["git_config_exec"],
                   git_attributes_exec=st["git_attributes_exec"],
+                  service_persist=st["service_persist"],
+                  devcontainer_exec=st["devcontainer_exec"],
                   inject=st["inject"], failures=st["failures"],
                   completion=st["completion"],
                   team=lc["team"], compaction=lc["compaction"],
@@ -118,7 +121,8 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
     # injection, failure-loop, completion verification) — small dicts.
     for key in ("install_review", "mcp_config", "ci_workflow", "git_hooks", "agent_def",
                 "shell_persist", "package_manifest", "git_config_exec",
-                "git_attributes_exec", "inject", "failures", "completion"):
+                "git_attributes_exec", "service_persist", "devcontainer_exec",
+                "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
             st[key] = dict(data[key])
         elif data.get(key):
