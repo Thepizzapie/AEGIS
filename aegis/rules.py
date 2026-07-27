@@ -1752,6 +1752,163 @@ def rule_service_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _devcontainer_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering an auto-run lifecycle command in a dev-container
+    config (``.devcontainer/devcontainer.json``, ``.devcontainer/<name>/
+    devcontainer.json``, or the root-level ``.devcontainer.json``
+    shorthand): ``initializeCommand``, ``onCreateCommand``,
+    ``updateContentCommand``, ``postCreateCommand``, ``postStartCommand``,
+    ``postAttachCommand``.
+
+    THREAT MODEL: none of this file's other ``*_protect`` guards reach this
+    surface — the closest, ``rule_ci_workflow_protect``, only watches CI
+    pipeline definitions, and a devcontainer config carries no CI-workflow-
+    shaped path segment (no ``.github/workflows``, no ``.gitlab-ci.yml``).
+    Yet a devcontainer's lifecycle commands run with LESS friction than
+    almost every other persistence surface this file covers: no git
+    operation, no CI run, no boot/login, and — for
+    ``initializeCommand`` specifically — no container isolation at all,
+    since it runs on the HOST, before the container that would otherwise
+    sandbox it is even created. The trigger is simply "the dev environment
+    (re)builds or (re)starts" — VS Code's "Reopen in Container", a GitHub
+    Codespaces create/prebuild, or a plain ``devcontainer up``/``devcontainer
+    build`` — which happens routinely, often automatically, and is exactly
+    the moment an agentic coding session's own environment comes up. A
+    planted ``postCreateCommand``/``postStartCommand`` runs with the same
+    privileges the rest of that dev session has (including this agent's own,
+    the next time ITS environment restarts), and a planted
+    ``initializeCommand`` runs with the HOST user's full privileges, outside
+    whatever container boundary the README's "pair it with a sandbox"
+    posture relies on as the other half of the honest-strong setup — so this
+    guard closes a gap in that boundary itself, not just in the policy
+    layer sitting inside it. Like ``.gitattributes``/CI workflow files, a
+    devcontainer config is normally TRACKED and reviewed as routine repo
+    tooling (base image, extensions, port forwards), so a one-line lifecycle
+    command reads as ordinary dev-environment configuration in a diff, not
+    as a planted detonator.
+
+    Distinct from the path-only guards in this file for the same reason
+    ``rule_package_manifest_protect`` is: ``devcontainer.json`` legitimately
+    carries ``postCreateCommand: "npm install"`` in a large fraction of real
+    repos, so gating on path alone would ask on nearly every devcontainer
+    edit. Gated on PATH *and* CONTENT — the edit must name a
+    devcontainer.json-shaped path AND contain one of the six lifecycle-
+    command keys, which exist for no other purpose than naming a command to
+    run (same "key alone is enough" reasoning
+    ``rule_git_attributes_exec_protect`` applies to ``core.fsmonitor``).
+
+    Config (``policy.devcontainer_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted devcontainer bootstrap, say). Defaults to
+    ``ask`` for the same reason ``package_manifest``/``ci_workflow`` do: a
+    real ``postCreateCommand`` is routine, sanctioned dev-environment setup
+    — it just needs a human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_DEVCONTAINER_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: only one optional named subdirectory is matched under
+    ``.devcontainer/`` (``.devcontainer/<name>/devcontainer.json``) — a
+    deeper, unusual nesting is not; a lifecycle-command value assembled
+    indirectly (shell variable concatenation, a templating step) rather than
+    appearing as a literal JSON key is not caught; a direct fetch-to-file
+    write (``curl -o .devcontainer/devcontainer.json ...``) is caught by
+    none of the shell branch's write-verb checks, the same inherited gap
+    every sibling ``*_protect`` guard in this file already discloses; and,
+    like ``package_manifest``, no ``find``-path-indirection fallback is
+    implemented for this guard's first pass. ``jq``-scripted edits (bare
+    dot-path key, no adjacent quote+colon, and no ``-i`` flag — often piped
+    through ``sponge`` instead, which is on no write-verb list at all) are
+    covered unconditionally by ``DEVCONTAINER_EXEC_JQ_RE``, the same fix
+    ``JQ_SCRIPTS_LIFECYCLE_RE`` applies for the identical gap against
+    ``package_manifest`` — found here during this guard's own build, before
+    ever shipping, by testing that exact real-world editing idiom rather
+    than only the Edit/Write/heredoc shapes. A companion, editor-level
+    auto-run surface — a VS Code ``.vscode/tasks.json`` entry with
+    ``"runOptions": {"runOn": "folderOpen"}``, or a JetBrains ``.idea/``
+    run-configuration's "Before launch" step — is a related but distinct
+    attack shape (an IDE, not a devcontainer runtime, does the auto-running,
+    and VS Code gates it behind a one-time folder-trust prompt) and is
+    disclosed here, not covered, as a candidate for a follow-up guard."""
+    cfg = getattr(policy, "devcontainer_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "devcontainer-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content:
+            content = " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not (patterns.DEVCONTAINER_PATH_RE.search(p)
+                 and patterns.DEVCONTAINER_EXEC_KEY_RE.search(content)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_DEVCONTAINER_EXEC")
+                or _devcontainer_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "devcontainer-exec-protect",
+                         f"'{p}' is being written with a dev-container "
+                         "lifecycle command (initializeCommand/onCreateCommand/"
+                         "updateContentCommand/postCreateCommand/"
+                         "postStartCommand/postAttachCommand) — it runs "
+                         "automatically, unattended, the next time this dev "
+                         "environment builds or starts (VS Code 'Reopen in "
+                         "Container', a Codespace, `devcontainer up`), and "
+                         "initializeCommand runs on the HOST with no container "
+                         "isolation at all. Review the change, then confirm "
+                         "with AEGIS_ALLOW_DEVCONTAINER_EXEC=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not (patterns.DEVCONTAINER_EXEC_JQ_RE.search(cmd)
+                or (write_verb and patterns.DEVCONTAINER_PATH_RE.search(cmd)
+                    and patterns.DEVCONTAINER_EXEC_KEY_RE.search(cmd))):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DEVCONTAINER_EXEC")
+                or _devcontainer_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "devcontainer-exec-protect",
+                         "A dev-container lifecycle command is being planted "
+                         "in a devcontainer.json from a shell — it runs "
+                         "automatically, unattended, the next time this dev "
+                         "environment builds or starts, and initializeCommand "
+                         "runs on the HOST with no container isolation at "
+                         "all. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_DEVCONTAINER_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -2156,6 +2313,7 @@ _CORE_RULES = (
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_service_persist_protect,
+    rule_devcontainer_exec_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
