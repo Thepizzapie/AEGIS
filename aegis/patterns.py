@@ -1457,6 +1457,30 @@ DEVCONTAINER_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# QA finding (independent adversarial review, round C): `DEVCONTAINER_PATH_RE`
+# requires `.devcontainer` and `devcontainer.json` in one CONTIGUOUS match —
+# an entirely ordinary `cd .devcontainer && jq '.postCreateCommand="..."'
+# devcontainer.json | sponge devcontainer.json` (or `pushd`) never produces
+# that adjacency, even though the command unambiguously targets the file with
+# zero obfuscation. Companion pair, used together (both required) at the
+# shell branch's call site in `rule_devcontainer_exec_protect`, the same
+# "two co-occurring signals, ANDed at the python level" shape
+# `DEVCONTAINER_EXEC_JQ_RE`'s own path check already uses: `DEVCONTAINER_CD_RE`
+# flags a `cd`/`pushd` INTO `.devcontainer` (or a subdirectory of it)
+# anywhere in the command, and `DEVCONTAINER_BARE_FILENAME_RE` flags a bare
+# `devcontainer.json` reference with no `.devcontainer/` prefix required.
+# Neither alone is high-signal (a bare `cd .devcontainer` doesn't touch the
+# config; a bare `devcontainer.json` filename could belong to an unrelated
+# tool) — both co-occurring in the same whole command is.
+DEVCONTAINER_CD_RE = re.compile(
+    r"\b(?:cd|pushd)\s+[\"']?\.devcontainer\b",
+    re.IGNORECASE,
+)
+DEVCONTAINER_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])devcontainer\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
 # The lifecycle-command keys that run unattended, with no explicit
 # invocation, at a fixed point in the container's build/start sequence:
 # `initializeCommand` runs on the HOST, before the container even exists
