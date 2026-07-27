@@ -1472,8 +1472,17 @@ DEVCONTAINER_PATH_RE = re.compile(
 # Neither alone is high-signal (a bare `cd .devcontainer` doesn't touch the
 # config; a bare `devcontainer.json` filename could belong to an unrelated
 # tool) — both co-occurring in the same whole command is.
+#
+# QA finding (independent adversarial review, round D): the original
+# version required `.devcontainer` immediately after `cd`/`pushd` (plus an
+# optional quote) with no path prefix allowed at all — `cd
+# "./.devcontainer"`, `cd ~/project/.devcontainer`, and `cd
+# $HOME/.devcontainer` all broke the match, a silent bypass for three
+# completely ordinary ways to reference the same directory. Widened with a
+# bounded (``{0,200}``, not unbounded — the same ReDoS-avoidance bound used
+# throughout this file) optional leading-path-segment group ending in `/`.
 DEVCONTAINER_CD_RE = re.compile(
-    r"\b(?:cd|pushd)\s+[\"']?\.devcontainer\b",
+    r"\b(?:cd|pushd)\s+[\"']?(?:[^\s;&|\"'\n]{0,200}/)?\.devcontainer\b",
     re.IGNORECASE,
 )
 DEVCONTAINER_BARE_FILENAME_RE = re.compile(

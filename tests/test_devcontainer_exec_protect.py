@@ -231,6 +231,62 @@ def test_shell_cd_elsewhere_then_bare_devcontainer_json_not_gated():
         'cd /tmp && echo "see devcontainer.json for setup notes"'), EMPTY))
 
 
+def test_shell_cd_dot_slash_prefix_then_bare_filename_gated():
+    """QA finding (independent adversarial review, round D): the original
+    DEVCONTAINER_CD_RE required `.devcontainer` immediately after cd/pushd
+    with NO path prefix allowed at all — `cd "./.devcontainer"` (a
+    completely ordinary way to reference the same directory) bypassed it
+    silently."""
+    d = evaluate(_shell(
+        'cd "./.devcontainer" && jq \'.postCreateCommand="echo hi"\' '
+        'devcontainer.json | sponge devcontainer.json'), EMPTY)
+    assert _gated(d) and d.rule == "devcontainer-exec-protect"
+
+
+def test_shell_cd_home_relative_prefix_then_bare_filename_gated():
+    """QA finding (round D): `cd ~/project/.devcontainer` — a leading
+    tilde-relative path prefix — bypassed the original pattern too."""
+    d = evaluate(_shell(
+        "cd ~/project/.devcontainer && jq '.postCreateCommand=\"echo hi\"' "
+        "devcontainer.json | sponge devcontainer.json"), EMPTY)
+    assert _gated(d) and d.rule == "devcontainer-exec-protect"
+
+
+def test_shell_cd_env_var_prefix_then_bare_filename_gated():
+    """QA finding (round D): `cd $HOME/.devcontainer` — an env-var path
+    prefix — bypassed the original pattern too."""
+    d = evaluate(_shell(
+        "cd $HOME/.devcontainer && jq '.postCreateCommand=\"echo hi\"' "
+        "devcontainer.json | sponge devcontainer.json"), EMPTY)
+    assert _gated(d) and d.rule == "devcontainer-exec-protect"
+
+
+def test_shell_cd_devcontainer_trailing_slash_still_gated():
+    """Regression guard for the round-D widening: the plain `cd
+    .devcontainer/` (trailing slash, no prefix) case round C already
+    covered must keep working."""
+    d = evaluate(_shell(
+        "cd .devcontainer/ && jq '.postCreateCommand=\"echo hi\"' "
+        "devcontainer.json | sponge devcontainer.json"), EMPTY)
+    assert _gated(d) and d.rule == "devcontainer-exec-protect"
+
+
+def test_whole_command_scoping_false_ask_is_accepted_tradeoff():
+    """QA finding (round D): the cd+bare-filename pair is whole-command,
+    not clause-scoped (deliberately — see the guard's own docstring for
+    why, matching gitattrs_wiring_hit's precedent) — a `cd .devcontainer`
+    in one clause plus an UNRELATED write-verb/redirect in a second clause
+    plus an unrelated devcontainer.json/key mention in a third can coincide
+    and produce a false ASK on a command that never actually touches the
+    config. This is a documented, accepted trade-off, not a bug — this
+    test pins the current (imperfect but deliberate) behavior so it
+    doesn't silently change unnoticed."""
+    d = evaluate(_shell(
+        'cd .devcontainer && grep -n \'"postCreateCommand":\' README.md '
+        '> /tmp/matches.txt && echo "see devcontainer.json for schema"'), EMPTY)
+    assert _gated(d) and d.rule == "devcontainer-exec-protect"
+
+
 # ---- shell forms --------------------------------------------------------------------
 
 def test_shell_redirect_post_create_command_gated():

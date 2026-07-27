@@ -1870,10 +1870,22 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     related but distinct attack shape (an IDE, not a devcontainer runtime,
     does the auto-running, and VS Code gates it behind a one-time
     folder-trust prompt) and is disclosed here, not covered, as a candidate
-    for a follow-up guard.
+    for a follow-up guard. The ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
+    FILENAME_RE`` co-occurrence pair is, deliberately, whole-command rather
+    than clause-scoped — the same "false ask is recoverable, a false allow
+    on a working exploit is not" trade-off ``gitattrs_wiring_hit``'s own
+    QA history converged on after three separate clause-scoping attempts
+    each closed one bypass while opening a worse one. Cost: a `cd
+    .devcontainer` in one clause of a compound command, a write-verb
+    targeting something else entirely in a second clause, and an unrelated
+    mention of `devcontainer.json`/a lifecycle key in a third (a comment, a
+    `grep` match) can co-occur and produce a false ASK on a command that
+    never actually touches the config — confirmed, accepted, not fixed
+    (QA finding, round D).
 
-    QA history (three independent adversarial reviews, rounds A and B run
-    in parallel, round C a follow-up verification pass, same convention
+    QA history (four independent adversarial reviews — rounds A and B run
+    in parallel, rounds C and D each a follow-up verification pass over
+    the prior round's fixes, same convention
     ``rule_service_persist_protect``/``rule_package_manifest_protect``
     used): round A (bypass hunting) found the original Edit/Write/MCP
     branch's quoted ``"key":`` check had a silent full bypass for two real
@@ -1913,9 +1925,22 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     ``DEVCONTAINER_PATH_RE``'s single-contiguous-match requirement
     entirely; fixed with the ``DEVCONTAINER_CD_RE`` + ``DEVCONTAINER_
     BARE_FILENAME_RE`` co-occurrence pair (see their own comment in
-    patterns.py). Full suite green and a fresh perf/ReDoS pass clean after
-    every round, each confirmed independently rather than by re-running
-    the existing test file."""
+    patterns.py). Round D (follow-up verification of round C's fixes)
+    confirmed the round-A/B/C fixes hold, then found the brand-new
+    ``DEVCONTAINER_CD_RE`` itself was too narrow — it required
+    ``.devcontainer`` immediately after ``cd``/``pushd`` with no path
+    prefix allowed, so ``cd "./.devcontainer"``, ``cd
+    ~/project/.devcontainer``, and ``cd $HOME/.devcontainer`` (three
+    completely ordinary ways to reference the same directory) all bypassed
+    it silently; fixed by widening it to accept a bounded optional
+    leading-path-segment group (see its own comment in patterns.py). Round
+    D also surfaced the whole-command-scoping false-ask cost documented in
+    the "Honest scope" paragraph above — reviewed against ``gitattrs_
+    wiring_hit``'s own, more extensive clause-scoping-attempt history and
+    accepted deliberately rather than fixed, for the identical reason.
+    Full suite green and a fresh perf/ReDoS pass clean after every round,
+    each confirmed independently rather than by re-running the existing
+    test file."""
     cfg = getattr(policy, "devcontainer_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
