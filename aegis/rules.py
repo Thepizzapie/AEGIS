@@ -1762,6 +1762,35 @@ def _devcontainer_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
+_DEVCONTAINER_EXEC_KEY_NAMES = frozenset({
+    "initializecommand", "oncreatecommand", "updatecontentcommand",
+    "postcreatecommand", "poststartcommand", "postattachcommand",
+})
+
+
+def _devcontainer_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for one of
+    the six lifecycle-command names as an actual DICT KEY, not a string
+    value — closes the bypass where a structural MCP arg shape (a filesystem
+    server's own ``{"json": {"postCreateCommand": ...}}`` edit-tool
+    convention, say) never puts the key name anywhere `_flatten_strings`
+    (which only walks dict VALUES) would see it. Same depth cap (12) as
+    `_flatten_strings` for the identical cyclic/pathological-payload
+    protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() in _DEVCONTAINER_EXEC_KEY_NAMES:
+                return True
+            if _devcontainer_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_devcontainer_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
 def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting/altering an auto-run lifecycle command in a dev-container
     config (``.devcontainer/devcontainer.json``, ``.devcontainer/<name>/
@@ -1833,17 +1862,40 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     implemented for this guard's first pass. ``jq``-scripted edits (bare
     dot-path key, no adjacent quote+colon, and no ``-i`` flag — often piped
     through ``sponge`` instead, which is on no write-verb list at all) are
-    covered unconditionally by ``DEVCONTAINER_EXEC_JQ_RE``, the same fix
-    ``JQ_SCRIPTS_LIFECYCLE_RE`` applies for the identical gap against
-    ``package_manifest`` — found here during this guard's own build, before
-    ever shipping, by testing that exact real-world editing idiom rather
-    than only the Edit/Write/heredoc shapes. A companion, editor-level
-    auto-run surface — a VS Code ``.vscode/tasks.json`` entry with
-    ``"runOptions": {"runOn": "folderOpen"}``, or a JetBrains ``.idea/``
-    run-configuration's "Before launch" step — is a related but distinct
-    attack shape (an IDE, not a devcontainer runtime, does the auto-running,
-    and VS Code gates it behind a one-time folder-trust prompt) and is
-    disclosed here, not covered, as a candidate for a follow-up guard."""
+    covered by ``DEVCONTAINER_EXEC_JQ_RE`` requiring the assignment shape
+    plus a whole-command devcontainer-path check (see QA history below). A
+    companion, editor-level auto-run surface — a VS Code ``.vscode/
+    tasks.json`` entry with ``"runOptions": {"runOn": "folderOpen"}``, or a
+    JetBrains ``.idea/`` run-configuration's "Before launch" step — is a
+    related but distinct attack shape (an IDE, not a devcontainer runtime,
+    does the auto-running, and VS Code gates it behind a one-time
+    folder-trust prompt) and is disclosed here, not covered, as a candidate
+    for a follow-up guard.
+
+    QA history (two independent adversarial reviews, run in parallel,
+    same convention ``rule_service_persist_protect``/``rule_package_
+    manifest_protect`` used): round A (bypass hunting) found the original
+    Edit/Write/MCP branch's quoted ``"key":`` check had a silent full
+    bypass for two real MCP-tool arg shapes — ``{"key":
+    "postCreateCommand", "value": "..."}`` (the key sits as a bare leaf
+    value, never adjacent to a colon) and ``{"json": {"postCreateCommand":
+    "..."}}`` (the key is a dict KEY that ``_flatten_strings`` — value-only
+    by design — never surfaces at all, so it's completely absent from the
+    old scanned text); fixed by ``_devcontainer_struct_key_hit`` (walks raw
+    arg dict keys directly) plus a bareword fallback, both scoped to only
+    fire when ``content`` had to be reconstructed via ``_flatten_strings``
+    (never for literal Edit/Write file text, to avoid a new false ask on an
+    inert JSONC comment mentioning a lifecycle key by name). Round B
+    (design/consistency) confirmed registration completeness across every
+    sibling-guard wiring point, independently verified a genuinely
+    pre-existing (not this-session-introduced) ``loader.py`` gap where
+    ``policy.service_persist`` YAML was parsed but never reached the
+    ``Policy`` object — now fixed alongside this guard's own wiring — and
+    found the original ``DEVCONTAINER_EXEC_JQ_RE`` false-positived on a
+    plain non-mutating ``jq`` read and on an unrelated file merely
+    mentioning a lifecycle key in a trailing comment; fixed by requiring
+    the assignment shape and ANDing with a whole-command path check
+    instead of trusting the six key names to carry high signal alone."""
     cfg = getattr(policy, "devcontainer_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1860,13 +1912,38 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content:
-            content = " ".join(_flatten_strings(a))
+        literal = a.get("content") or a.get("new_string")
+        used_fallback = not (isinstance(literal, str) and literal)
+        content = literal if not used_fallback else " ".join(_flatten_strings(a))
         if not p or not content:
             return None
-        if not (patterns.DEVCONTAINER_PATH_RE.search(p)
-                 and patterns.DEVCONTAINER_EXEC_KEY_RE.search(content)):
+        if not patterns.DEVCONTAINER_PATH_RE.search(p):
+            return None
+        key_hit = bool(patterns.DEVCONTAINER_EXEC_KEY_RE.search(content))
+        # QA finding (independent adversarial review, round A): an MCP tool
+        # that represents the target JSON STRUCTURALLY rather than as a
+        # literal string blob defeats the quoted "key": check above
+        # entirely — {"key": "postCreateCommand", "value": "..."} (the key
+        # never sits adjacent to a colon; `_flatten_strings` only flattens
+        # it as a bare leaf value) and {"json": {"postCreateCommand":
+        # "..."}} (the key never appears as a string value AT ALL —
+        # `_flatten_strings` walks dict VALUES only, never dict KEYS, so
+        # the key name is completely absent from the scanned text). Both
+        # were confirmed silent full bypasses (Action.ALLOW, no monitor
+        # record). Closed by falling back to a bareword key match, and to
+        # `_devcontainer_struct_key_hit` walking the raw arg structure's
+        # dict keys directly — but ONLY when `content` itself had to be
+        # reconstructed via `_flatten_strings` (no literal content/
+        # new_string was present), never for the ordinary Edit/Write case
+        # where `content` is real file text: a JSONC comment mentioning a
+        # lifecycle key by name in an otherwise-benign edit (valid,
+        # supported syntax in a real devcontainer.json) would otherwise
+        # newly false-positive under a broader, unconditional bareword
+        # check.
+        if not key_hit and used_fallback:
+            key_hit = bool(patterns.DEVCONTAINER_EXEC_KEY_BAREWORD_RE.search(content)
+                            or _devcontainer_struct_key_hit(a))
+        if not key_hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_DEVCONTAINER_EXEC")
                 or _devcontainer_exec_allowed_by_policy(cfg, p)):
@@ -1890,7 +1967,23 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                            or patterns.INPLACE_WRITE_RE.search(cmd)
                            or patterns.FORCED_LINK_WRITE_RE.search(cmd))
-        if not (patterns.DEVCONTAINER_EXEC_JQ_RE.search(cmd)
+        # QA finding (independent adversarial review, round B): the jq
+        # alternative originally fired on `jq` co-occurring with a bare
+        # lifecycle keyword ALONE — no devcontainer-path anchor, no
+        # assignment requirement — so a plain, non-mutating read
+        # (`jq '.postCreateCommand' devcontainer.json`) or an unrelated
+        # comment/file mentioning the word (`jq '.image' x.json # note:
+        # postCreateCommand runs after this`) both false-positived.
+        # `DEVCONTAINER_EXEC_JQ_RE` itself now requires the assignment
+        # shape (`.<key>\s*=`, not a bare reference); ANDing it here with a
+        # whole-command devcontainer-path check (the same "whole scanned
+        # command, not clause-scoped" trade-off `gitattrs_wiring_hit`
+        # documents electing after its own QA history) closes the
+        # unrelated-file case without needing the path to sit inside a
+        # narrow, easily-dodged window right next to `jq`.
+        jq_hit = bool(patterns.DEVCONTAINER_EXEC_JQ_RE.search(cmd)
+                       and patterns.DEVCONTAINER_PATH_RE.search(cmd))
+        if not (jq_hit
                 or (write_verb and patterns.DEVCONTAINER_PATH_RE.search(cmd)
                     and patterns.DEVCONTAINER_EXEC_KEY_RE.search(cmd))):
             return None

