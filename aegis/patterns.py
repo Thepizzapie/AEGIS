@@ -1480,9 +1480,18 @@ DEVCONTAINER_PATH_RE = re.compile(
 # $HOME/.devcontainer` all broke the match, a silent bypass for three
 # completely ordinary ways to reference the same directory. Widened with a
 # bounded (``{0,200}``, not unbounded — the same ReDoS-avoidance bound used
-# throughout this file) optional leading-path-segment group ending in `/`.
+# throughout this file) optional leading-path-segment group.
+#
+# QA finding (round E, follow-up verification of round D's own fix): that
+# widened prefix group required its terminating separator to be a literal
+# `/` — no `\` alternative, unlike `_SEP` (used everywhere else in this
+# file, including `DEVCONTAINER_PATH_RE` itself) — so a backslash-separated
+# `cd`/`pushd` (`cd C:\Users\dev\myrepo\.devcontainer`, `cd
+# ~\project\.devcontainer`) silently bypassed it even though the round-D
+# fix was written specifically to close this class of prefix gap. Fixed by
+# accepting either separator as the prefix terminator.
 DEVCONTAINER_CD_RE = re.compile(
-    r"\b(?:cd|pushd)\s+[\"']?(?:[^\s;&|\"'\n]{0,200}/)?\.devcontainer\b",
+    r"\b(?:cd|pushd)\s+[\"']?(?:[^\s;&|\"'\n]{0,200}[/\\])?\.devcontainer\b",
     re.IGNORECASE,
 )
 DEVCONTAINER_BARE_FILENAME_RE = re.compile(

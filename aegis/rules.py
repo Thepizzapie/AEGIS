@@ -1883,9 +1883,10 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     never actually touches the config — confirmed, accepted, not fixed
     (QA finding, round D).
 
-    QA history (four independent adversarial reviews — rounds A and B run
-    in parallel, rounds C and D each a follow-up verification pass over
-    the prior round's fixes, same convention
+    QA history (five independent adversarial reviews — rounds A and B run
+    in parallel, rounds C/D/E each a follow-up verification pass over the
+    prior round's fixes, matching ``rule_git_attributes_exec_protect``'s
+    own five-round precedent, same convention
     ``rule_service_persist_protect``/``rule_package_manifest_protect``
     used): round A (bypass hunting) found the original Edit/Write/MCP
     branch's quoted ``"key":`` check had a silent full bypass for two real
@@ -1938,6 +1939,14 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     the "Honest scope" paragraph above — reviewed against ``gitattrs_
     wiring_hit``'s own, more extensive clause-scoping-attempt history and
     accepted deliberately rather than fixed, for the identical reason.
+    Round E (follow-up verification of round D's own fix) confirmed rounds
+    A/B/C hold, then found round D's widened ``DEVCONTAINER_CD_RE`` prefix
+    group required its terminating separator to be a literal ``/`` — no
+    ``\\`` alternative, unlike ``_SEP`` (used everywhere else in this file,
+    including ``DEVCONTAINER_PATH_RE`` itself) — so a backslash-separated
+    ``cd``/``pushd`` (``cd C:\\Users\\dev\\myrepo\\.devcontainer``)
+    silently bypassed the very fix written to close this exact class of
+    prefix gap; fixed by accepting either separator as the terminator.
     Full suite green and a fresh perf/ReDoS pass clean after every round,
     each confirmed independently rather than by re-running the existing
     test file."""

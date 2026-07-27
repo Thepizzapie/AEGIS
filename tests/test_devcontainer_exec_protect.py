@@ -271,6 +271,26 @@ def test_shell_cd_devcontainer_trailing_slash_still_gated():
     assert _gated(d) and d.rule == "devcontainer-exec-protect"
 
 
+def test_shell_cd_windows_backslash_prefix_then_bare_filename_gated():
+    """QA finding (independent adversarial review, round E, verifying
+    round D's own fix): the round-D widened prefix group required its
+    terminating separator to be a literal '/' with no '\\' alternative —
+    a backslash-separated `cd` into `.devcontainer` (an ordinary Windows
+    path) silently bypassed the very fix written to close this class of
+    gap."""
+    d = evaluate(_shell(
+        'cd C:\\Users\\dev\\myrepo\\.devcontainer && '
+        'echo \'"postCreateCommand": "touch /tmp/pwned"\' >> devcontainer.json'), EMPTY)
+    assert _gated(d) and d.rule == "devcontainer-exec-protect"
+
+
+def test_shell_cd_windows_relative_backslash_then_bare_filename_gated():
+    d = evaluate(_shell(
+        'cd project\\.devcontainer && '
+        'echo \'"postCreateCommand": "touch /tmp/pwned"\' >> devcontainer.json'), EMPTY)
+    assert _gated(d) and d.rule == "devcontainer-exec-protect"
+
+
 def test_whole_command_scoping_false_ask_is_accepted_tradeoff():
     """QA finding (round D): the cd+bare-filename pair is whole-command,
     not clause-scoped (deliberately — see the guard's own docstring for
