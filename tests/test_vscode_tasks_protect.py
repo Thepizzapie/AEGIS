@@ -226,6 +226,28 @@ def test_jsonc_comment_mentioning_key_not_gated_for_literal_edit():
     assert not _gated(d)
 
 
+def test_mcp_unrelated_tokens_anywhere_in_args_false_ask_is_accepted_tradeoff():
+    """QA finding (independent adversarial review, round C, verifying round
+    A's own fix): `_vscode_mcp_bareword_kv_hit` requires no structural
+    relationship between the key/value tokens at all, so an MCP call whose
+    args contain both exact leaf strings ANYWHERE — entirely unrelated to
+    each other, e.g. an enum/preset-name list — produces a false ASK even
+    though the REAL config value present elsewhere is the safe one. This is
+    a documented, accepted trade-off (fails toward ASK, never ALLOW, and is
+    human-escapable), not a bug — this test pins the current (imperfect but
+    deliberate) behavior so it doesn't silently change unnoticed, the same
+    role `test_whole_command_scoping_false_ask_is_accepted_tradeoff` plays
+    for `rule_devcontainer_exec_protect`."""
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_json",
+                     action=ActionClass.MCP,
+                     args={"path": ".vscode/tasks.json",
+                           "json": {"presetNames": ["runOn", "folderOpen"],
+                                    "tasks": [{"label": "build", "command": "echo hi",
+                                               "runOptions": {"runOn": "default"}}]}})
+    d = evaluate(ev, EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
 def test_mcp_list_wrapped_value_gated():
     """QA finding (independent adversarial review, round A): a value wrapped
     in a one-element list (`{"key": "runOn", "value": ["folderOpen"]}`) —
@@ -389,6 +411,25 @@ def test_shell_cd_elsewhere_then_bare_tasks_json_not_gated():
     the cd alone."""
     assert not _gated(evaluate(_shell(
         'cd /tmp && echo "see tasks.json for the build task"'), EMPTY))
+
+
+def test_shell_cd_into_lookalike_dir_not_gated():
+    """QA finding (independent adversarial review, round C, verifying round
+    A/B's own fix): the original `VSCODE_CD_RE` terminated the directory
+    name with a bare `\\b` (a word/non-word transition, not "end of this
+    specific name"), so an ordinary backup/staging directory whose name
+    merely STARTS with `.vscode` followed by a non-word character —
+    `.vscode-old`, `.vscode.bak`, `.vscode-backup-dir` — false-positived.
+    Fixed by reusing `_CI_END` (the same real path-segment terminator every
+    other path-shaped pattern in this file uses) in place of the bare
+    `\\b`."""
+    for cmd in (
+        'cd .vscode-old && jq \'.runOn="folderOpen"\' tasks.json | sponge tasks.json',
+        'cd .vscode.bak && jq \'.runOn="folderOpen"\' tasks.json | sponge tasks.json',
+        'cd /some/other/.vscode-backup-dir && jq \'.runOn="folderOpen"\' '
+        'tasks.json | sponge tasks.json',
+    ):
+        assert not _gated(evaluate(_shell(cmd), EMPTY)), cmd
 
 
 def test_jq_plain_read_not_gated():

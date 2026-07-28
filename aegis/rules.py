@@ -2132,7 +2132,21 @@ def _vscode_mcp_bareword_kv_hit(a: dict, key_name: str, value: str) -> bool:
     already relies on. Deliberately scoped to MCP only: an Edit/Write's
     literal file content legitimately contains both words separately (a
     comment, an unrelated field) far more often than an MCP tool's own args
-    would by coincidence."""
+    would by coincidence.
+
+    QA finding (independent adversarial review, round C, verifying round
+    A's own fix): this "no structural relationship required" breadth is a
+    real, disclosed trade-off, not a bug — an MCP call whose args contain
+    the two exact leaf strings ANYWHERE, entirely unrelated to each other
+    (an enum/preset-name list happening to enumerate both words, alongside
+    a real config value elsewhere that's actually the safe one), produces a
+    false ASK. Confirmed non-exploitable (fails toward ASK, never ALLOW,
+    and is human-escapable the same as every other finding here) and kept
+    deliberately, the same "false ask is recoverable, a false allow on a
+    working exploit is not" trade-off this codebase applies whenever a
+    narrower, structurally-precise check has already been shown (by the
+    three real shapes this function was written to catch) to have a
+    worse, silent false-ALLOW failure mode instead."""
     strs = {s.strip().lower() for s in _flatten_strings(a) if isinstance(s, str)}
     return key_name in strs and value in strs
 
@@ -2209,9 +2223,11 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     none of the shell branch's write-verb checks, the same inherited gap
     every sibling ``*_protect`` guard in this file already discloses.
 
-    QA history (two independent adversarial reviews, run in parallel —
-    round A bypass-hunting, round B design/consistency — matching this
-    codebase's established process): both rounds independently found and
+    QA history (three independent adversarial reviews — rounds A and B run
+    in parallel, round A bypass-hunting and round B design/consistency;
+    round C a follow-up verification pass over both rounds' fixes —
+    matching this codebase's established process): rounds A and B both
+    independently found and
     confirmed the SAME critical bug — the shell branch had no `cd`/`pushd`-
     into-`.vscode`-then-bare-filename fallback at all (unlike
     `rule_devcontainer_exec_protect`, which added exactly this fallback
@@ -2242,9 +2258,22 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     `_vscode_mcp_bareword_kv_hit`, a flatten-based check requiring no
     structural relationship between the two tokens at all (mirroring
     `DEVCONTAINER_EXEC_KEY_BAREWORD_RE`'s own single-token bareword
-    fallback), which closes both uniformly. Full suite green throughout
-    (1201 passed) and a fresh perf/ReDoS pass clean on every new/widened
-    pattern."""
+    fallback), which closes both uniformly. Round C (follow-up verification
+    of rounds A/B's fixes) confirmed all four original findings closed and
+    the safe-value regression checks clean, then found two issues in the
+    fixes themselves: (1) `VSCODE_CD_RE`'s directory-name terminator was a
+    bare `\\b` — a word/non-word transition, not "end of this specific
+    name" — so an ordinary lookalike directory (`.vscode-old`,
+    `.vscode.bak`) false-positived; fixed by reusing `_CI_END` (see its own
+    comment in patterns.py). (2) confirmed `_vscode_mcp_bareword_kv_hit`'s
+    "no structural relationship required" breadth is real — an MCP call
+    with both exact tokens present but unrelated to each other (e.g. an
+    enum/preset-name list) produces a false ASK; reviewed and accepted
+    deliberately (fails toward ASK, never ALLOW; see the function's own
+    docstring) rather than fixed, for the same reason
+    `gitattrs_wiring_hit`'s/`DEVCONTAINER_CD_RE`'s own whole-command-scoping
+    trade-offs were. Full suite green throughout (1201 passed) and a fresh
+    perf/ReDoS pass clean on every new/widened pattern."""
     cfg = getattr(policy, "vscode_tasks_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

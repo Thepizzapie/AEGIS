@@ -1590,9 +1590,21 @@ VSCODE_TASKS_PATH_RE = re.compile(
 # Additionally accepts `Set-Location`/`sl`/`chdir` (PowerShell/cmd aliases),
 # not just `cd`/`pushd` — round A demonstrated `Set-Location .vscode;
 # Set-Content tasks.json ...` as a live bypass using this exact form.
+# QA finding (independent adversarial review, round C, verifying round A/B's
+# own fixes): the original version terminated the directory name with a bare
+# `\b` — a word/non-word transition, not "end of this specific directory
+# name" — so it also matched an unrelated LOOKALIKE directory whose name
+# merely starts with `.vscode` followed by a non-word character:
+# `.vscode-old`, `.vscode.bak`, `.vscode-backup-dir` (an ordinary backup/
+# staging directory naming habit, nothing to do with the real `.vscode/` VS
+# Code reads) all false-positived. Fixed by reusing `_CI_END` (the same
+# "real path-segment terminator: separator, quote, shell metachar, or end of
+# string — not a bare `\b`" boundary every path-shaped pattern in this file
+# already uses, including `VSCODE_TASKS_PATH_RE` itself two patterns above)
+# in place of the bare `\b`.
 VSCODE_CD_RE = re.compile(
     r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
-    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.vscode\b",
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.vscode" + _CI_END,
     re.IGNORECASE,
 )
 VSCODE_TASKS_BARE_FILENAME_RE = re.compile(
