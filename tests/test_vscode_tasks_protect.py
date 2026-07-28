@@ -365,6 +365,63 @@ def test_jq_settings_assignment_to_safe_value_not_gated():
     assert not _gated(d)
 
 
+def test_jq_bracket_index_notation_tasks_gated():
+    """QA finding (independent adversarial review, round D, verifying round
+    C's own fixes): `VSCODE_TASKS_JQ_RE` (unlike its settings sibling) never
+    anticipated bracket-index key notation (`["runOn"]`) — a confirmed,
+    silent bypass on a realistic one-liner."""
+    d = evaluate(_shell(
+        'jq \'.runOptions["runOn"]="folderOpen"\' .vscode/tasks.json '
+        '| sponge .vscode/tasks.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_update_assign_operator_tasks_gated():
+    """QA finding (round D): jq's UPDATE-ASSIGN operator (`|=`, at least as
+    idiomatic as `=`/`+=` for mutating an existing scalar) was never
+    anticipated by either the direct-assignment or merge-object pattern —
+    a confirmed, silent bypass."""
+    d = evaluate(_shell(
+        'jq \'.runOptions.runOn |= "folderOpen"\' .vscode/tasks.json '
+        '| sponge .vscode/tasks.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_bracket_update_assign_settings_gated():
+    """QA finding (round D): the bracket-index and `|=`-operator gaps
+    compound for the settings side too."""
+    d = evaluate(_shell(
+        'jq \'.["task.allowAutomaticTasks"] |= "on"\' .vscode/settings.json '
+        '| sponge .vscode/settings.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_dot_update_assign_settings_gated():
+    d = evaluate(_shell(
+        'jq \'.task.allowAutomaticTasks |= "on"\' .vscode/settings.json '
+        '| sponge .vscode/settings.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_update_assign_to_safe_value_not_gated():
+    """The redesigned jq check (three independent lookaheads rather than an
+    exact-shape match) must still preserve the value-gating fix from round
+    B for the new `|=` operator form."""
+    d = evaluate(_shell(
+        'jq \'.runOptions.runOn |= "default"\' .vscode/tasks.json '
+        '| sponge .vscode/tasks.json'), EMPTY)
+    assert not _gated(d)
+
+
+def test_jq_equality_comparison_not_gated():
+    """jq's equality operator (`==`, e.g. inside a `select()` filter) is a
+    READ, not a write — must not be mistaken for the `=`/`+=`/`|=`
+    assignment-shaped operators this guard gates on."""
+    d = evaluate(_shell(
+        "jq 'select(.runOptions.runOn == \"folderOpen\")' .vscode/tasks.json"), EMPTY)
+    assert not _gated(d)
+
+
 def test_shell_cd_into_vscode_dir_then_jq_bare_filename_gated():
     """QA finding (independent adversarial review, rounds A and B, run in
     parallel — each independently found and confirmed this same bypass): a

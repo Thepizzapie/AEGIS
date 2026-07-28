@@ -2223,11 +2223,11 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     none of the shell branch's write-verb checks, the same inherited gap
     every sibling ``*_protect`` guard in this file already discloses.
 
-    QA history (three independent adversarial reviews — rounds A and B run
+    QA history (four independent adversarial reviews — rounds A and B run
     in parallel, round A bypass-hunting and round B design/consistency;
-    round C a follow-up verification pass over both rounds' fixes —
-    matching this codebase's established process): rounds A and B both
-    independently found and
+    rounds C and D each a follow-up verification pass over the prior
+    round's fixes — matching this codebase's established process): rounds
+    A and B both independently found and
     confirmed the SAME critical bug — the shell branch had no `cd`/`pushd`-
     into-`.vscode`-then-bare-filename fallback at all (unlike
     `rule_devcontainer_exec_protect`, which added exactly this fallback
@@ -2272,8 +2272,25 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     deliberately (fails toward ASK, never ALLOW; see the function's own
     docstring) rather than fixed, for the same reason
     `gitattrs_wiring_hit`'s/`DEVCONTAINER_CD_RE`'s own whole-command-scoping
-    trade-offs were. Full suite green throughout (1201 passed) and a fresh
-    perf/ReDoS pass clean on every new/widened pattern."""
+    trade-offs were. Round D (follow-up verification of round C's fixes)
+    confirmed both round-C fixes hold, then found jq's UPDATE-ASSIGN
+    operator (`|=`) was never anticipated by either jq pattern at all, and
+    that `VSCODE_TASKS_JQ_RE` never anticipated bracket-index key notation
+    (`["runOn"]`) either — both live, silent-ALLOW bypasses on realistic,
+    unremarkable one-liners. Rather than add a fourth exact-shape
+    alternative, both jq patterns were rewritten as three independent,
+    order-agnostic lookaheads (assignment-shaped operator, bare key,
+    dangerous value — see `VSCODE_TASKS_JQ_RE`'s own comment in
+    patterns.py) — which, while fixing it, surfaced one more
+    self-inflicted gap: the lookaheads' own scan-gap excluded `|` (the
+    usual "don't cross a real shell pipe" convention), which also
+    prevented them from scanning PAST `|=`'s own literal pipe character to
+    reach a value sitting on its far side — fixed by not excluding `|`
+    from these three lookaheads specifically, accepting the narrower cost
+    of now also being able to see across a genuine shell pipe into an
+    unrelated next command (bounded, same accepted-trade-off direction).
+    Full suite green throughout (1203 passed) and a fresh perf/ReDoS pass
+    clean on every new/widened pattern."""
     cfg = getattr(policy, "vscode_tasks_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

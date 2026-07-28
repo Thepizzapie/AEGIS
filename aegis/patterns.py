@@ -1663,35 +1663,63 @@ VSCODE_ALLOW_AUTOTASKS_RE = re.compile(
 # principle (see the rule's docstring) — both patterns below require the
 # assigned VALUE itself, not just the assignment shape.
 #
-# Two independent forms are covered: (1) direct dot-path assignment
-# (`.runOn = "folderOpen"`, operator AFTER the key), and (2) jq's object
-# MERGE idiom (`.runOptions += {runOn: "folderOpen"}`, operator BEFORE the
-# key, key/value pair nested inside the merged `{...}` object). QA finding
-# (independent adversarial review, round A): the original version of this
-# pattern only covered form (1) — a realistic, idiomatic merge one-liner
-# using form (2), with the key left UNQUOTED (a valid, ordinary jq object-
-# construction key — `runOn` is a legal bare identifier, unlike
-# `task.allowAutomaticTasks`, whose literal `.` forces it to stay quoted
-# even in merge form) sailed through as a silent, confirmed bypass. Form
-# (2)'s key match (`\brunOn\b`) is deliberately quote-agnostic for this
-# reason; form (1)'s key is a jq PATH expression, which is never quoted in
-# real jq syntax either way.
+# QA history (rounds A, B, D — each a fresh jq-syntax shape the prior
+# version missed): round A found jq's object-MERGE idiom (`+=`, operator
+# BEFORE the key) with the key left unquoted; round B found the fix for
+# that was itself value-agnostic (asked even on a safe-value assignment);
+# round D (a follow-up verification pass) found jq's UPDATE-ASSIGN operator
+# (`|=`, at least as idiomatic as `=`/`+=` for mutating an existing scalar)
+# was never anticipated at all, and that `VSCODE_TASKS_JQ_RE` (unlike its
+# settings sibling) never anticipated BRACKET-INDEX key notation
+# (`["runOn"]`) either — both live, silent-ALLOW bypasses on realistic,
+# unremarkable one-liners (`.runOptions["runOn"]="folderOpen"`,
+# `.runOptions.runOn |= "folderOpen"`, `.["task.allowAutomaticTasks"] |=
+# "on"`).
 #
-# ANDed with a whole-command path check at the rule's call site, the same
-# two-part design `DEVCONTAINER_EXEC_JQ_RE`'s own QA history (round B)
-# converged on to avoid false-positiving on a plain read or an unrelated
-# comment.
+# Rather than keep enumerating jq's path-expression grammar (dot vs.
+# bracket, quoted vs. bare, `=` vs. `+=` vs. `|=`) one shape at a time —
+# the same trap `gitattrs_wiring_hit`'s own QA history describes falling
+# into and deliberately climbing back out of, in favor of whole-scan,
+# non-structural matching — both patterns are three INDEPENDENT,
+# order-agnostic lookaheads instead of an exact-shape match: an
+# assignment-shaped operator (`=`, `+=`, or `|=` — explicitly NOT
+# `==`/`!=`/`<=`/`>=`, jq's comparison operators, excluded via the
+# surrounding lookaround), the target KEY as a bare substring (so any path
+# syntax reaching it is covered without being individually named), and the
+# dangerous VALUE as a bare substring (preserving "gate the key AND its
+# dangerous value" — a safe-value assignment/update still doesn't match,
+# since neither `"default"` nor `"off"` contains `folderOpen`/a
+# word-bounded `on`). No structural relationship between the three signals
+# is required — the same trade-off `_vscode_mcp_bareword_kv_hit` already
+# accepts for the MCP fallback — ANDed with a whole-command path check at
+# the rule's call site as before.
+#
+# The scan-gap character class deliberately does NOT exclude `|` (unlike
+# almost every other bounded gap in this file, which excludes it to avoid
+# crossing a real shell-pipe boundary into an unrelated next command): jq's
+# own `|=` operator is itself built from a literal `|`, sitting textually
+# BETWEEN the key and the dangerous value in `.runOptions.runOn |=
+# "folderOpen"` — a `|`-excluding gap can never scan past that operator to
+# reach the value on its far side, a self-inflicted bypass caught while
+# fixing this exact `|=` gap and confirmed non-obvious (it only manifests
+# when the target token sits textually AFTER the `|=`, not before). Cost:
+# these three lookaheads can now also see across a GENUINE shell pipe into
+# an unrelated next command in the same compound line — a narrower version
+# of the same whole-command trade-off already accepted throughout this
+# file, still bounded, still fails toward ASK not ALLOW.
+_VSCODE_JQ_ASSIGN_OP = r"(?:\|=|\+=|(?<![!<>=])=(?!=))"
 VSCODE_TASKS_JQ_RE = re.compile(
-    r"\bjq\b(?=[^|;&\n]{0,400}\.(?:runOptions\s*\.\s*)?runOn\s*=\s*[\"']folderOpen[\"'])"
-    r"|\bjq\b(?=[^|;&\n]{0,400}\+=\s*\{[^|;&\n]{0,150}\brunOn\b\s*:\s*[\"']folderOpen[\"'])",
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _VSCODE_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}\brunOn\b)"
+    r"(?=[^;&\n]{0,400}folderOpen)",
     re.IGNORECASE,
 )
 VSCODE_SETTINGS_JQ_RE = re.compile(
-    r"\bjq\b(?=[^|;&\n]{0,400}"
-    r"(?:\.[\"']?task\.allowAutomaticTasks[\"']?|\[[\"']task\.allowAutomaticTasks[\"']\])"
-    r"\s*=\s*[\"']on[\"'])"
-    r"|\bjq\b(?=[^|;&\n]{0,400}\+=\s*\{[^|;&\n]{0,150}"
-    r"[\"']task\.allowAutomaticTasks[\"']\s*:\s*[\"']on[\"'])",
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _VSCODE_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}task\.allowAutomaticTasks)"
+    r"(?=[^;&\n]{0,400}\bon\b)",
     re.IGNORECASE,
 )
 
