@@ -2078,6 +2078,341 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+def _vscode_tasks_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _vscode_struct_kv_hit(v, key_name: str, value: str, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for a specific
+    KEY (case/whitespace-insensitive) mapped to a specific string VALUE
+    (case/whitespace-insensitive) — the same structural-arg fallback shape
+    `_devcontainer_struct_key_hit` uses, but keyed on the value too, since
+    (unlike a devcontainer lifecycle-command key) `runOn` and
+    `task.allowAutomaticTasks` both have an ordinary, safe value
+    (``"default"``, ``"off"``) as well as the dangerous one gated here. Same
+    depth cap (12) as `_flatten_strings`/`_devcontainer_struct_key_hit` for
+    the identical cyclic/pathological-payload protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if (isinstance(k, str) and k.strip().lower() == key_name
+                    and isinstance(val, str) and val.strip().lower() == value):
+                return True
+            if _vscode_struct_kv_hit(val, key_name, value, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_vscode_struct_kv_hit(x, key_name, value, _depth + 1) for x in v)
+    return False
+
+
+def _vscode_mcp_bareword_kv_hit(a: dict, key_name: str, value: str) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: both the key name and
+    the dangerous value appear, ANYWHERE, as string leaves in the full
+    (recursively) flattened raw MCP args — closes every "key and value both
+    present but not adjacent, not a dict key, split across sibling
+    structures" shape QA (round A) found, including the
+    ``{"key": "runOn", "value": "folderOpen"}`` "set a config value" shape
+    (the key name is a bare sibling VALUE, never a dict key or adjacent to a
+    colon), a value wrapped in a one-element list
+    (``{"key": "runOn", "value": ["folderOpen"]}``), and a "cousin" shape
+    splitting the key and value across two different sibling list items
+    (``{"edits": [{"key": "runOn"}, {"value": "folderOpen"}]}``) —
+    `_flatten_strings` already recurses through every list/dict nesting
+    shape uniformly, so no structural relationship between the two tokens is
+    required, the same low-structure, high-recall signal
+    `DEVCONTAINER_EXEC_KEY_BAREWORD_RE`'s own single-token bareword fallback
+    already relies on. Deliberately scoped to MCP only: an Edit/Write's
+    literal file content legitimately contains both words separately (a
+    comment, an unrelated field) far more often than an MCP tool's own args
+    would by coincidence.
+
+    QA finding (independent adversarial review, round C, verifying round
+    A's own fix): this "no structural relationship required" breadth is a
+    real, disclosed trade-off, not a bug — an MCP call whose args contain
+    the two exact leaf strings ANYWHERE, entirely unrelated to each other
+    (an enum/preset-name list happening to enumerate both words, alongside
+    a real config value elsewhere that's actually the safe one), produces a
+    false ASK. Confirmed non-exploitable (fails toward ASK, never ALLOW,
+    and is human-escapable the same as every other finding here) and kept
+    deliberately, the same "false ask is recoverable, a false allow on a
+    working exploit is not" trade-off this codebase applies whenever a
+    narrower, structurally-precise check has already been shown (by the
+    three real shapes this function was written to catch) to have a
+    worse, silent false-ALLOW failure mode instead."""
+    strs = {s.strip().lower() for s in _flatten_strings(a) if isinstance(s, str)}
+    return key_name in strs and value in strs
+
+
+def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a VS Code auto-run task (``.vscode/tasks.json``
+    with ``"runOptions": {"runOn": "folderOpen"}``) or silencing the one
+    human checkpoint that gates it (``.vscode/settings.json`` with
+    ``"task.allowAutomaticTasks": "on"``).
+
+    THREAT MODEL: no existing guard reaches this surface —
+    `rule_devcontainer_exec_protect`'s own docstring explicitly disclosed it
+    as a "related but distinct" auto-run primitive and a candidate for a
+    follow-up guard, since an IDE, not a devcontainer runtime, does the
+    auto-running here. A task with ``runOn: folderOpen`` runs automatically
+    the next time this workspace folder is opened in VS Code — no git
+    operation, no CI run, no boot/login, no container (re)build required,
+    just the editor opening the folder, which (like a devcontainer
+    (re)build) is often the very moment an agentic coding session's own
+    environment comes up. Unlike `rule_devcontainer_exec_protect`'s surface,
+    VS Code does interpose one piece of friction: the first time a folder
+    with an automatic task is opened, it shows an "Allow Automatic Tasks in
+    Folder..." prompt, and a human must accept it once. But that friction is
+    itself a single config value away from being silently removed —
+    ``.vscode/settings.json``'s ``task.allowAutomaticTasks: "on"`` disables
+    the prompt entirely, so an agent that plants both files in the same
+    session removes the human's last checkpoint before it ever fires. Both
+    files are normally TRACKED and reviewed as routine editor/workspace
+    configuration (recommended extensions, format-on-save, build tasks), so
+    a one-line addition reads as ordinary tooling in a diff, not as a
+    planted detonator — the same "hidden in plain sight" property
+    `rule_devcontainer_exec_protect`'s own docstring describes for
+    ``devcontainer.json``.
+
+    Distinct from a path-only guard for the same reason
+    `rule_devcontainer_exec_protect`/`rule_package_manifest_protect` are:
+    ``tasks.json`` legitimately carries build/test/watch tasks with
+    ``runOn: "default"`` (manual trigger only) in a large fraction of real
+    repos, and ``settings.json`` is edited constantly for benign reasons —
+    gating on path alone would ask on nearly every ``.vscode/`` edit. Gated
+    on PATH *and* the specific DANGEROUS VALUE: ``tasks.json`` must carry
+    ``runOn`` set to ``folderOpen`` specifically (not ``default``), and
+    ``settings.json`` must carry ``task.allowAutomaticTasks`` set to ``on``
+    specifically (not ``off``) — the same "gate the key AND its dangerous
+    value, not the key alone" shape `rule_git_config_exec_protect` applies
+    to `credential.helper` versus an ordinary alias value.
+
+    Config (``policy.vscode_tasks_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted, reviewed automatic task, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard in this
+    file does: a real automatic task can be legitimate, sanctioned
+    workspace setup — it just needs a human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_VSCODE_TASKS_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a multi-root ``*.code-workspace`` file can embed the same
+    ``"tasks"`` object (and the same ``task.allowAutomaticTasks`` setting)
+    directly inside itself, with no ``.vscode/`` path segment at all — not
+    covered by this first pass, the same "one config surface first, siblings
+    disclosed as a follow-up" approach `rule_devcontainer_exec_protect` took
+    for its own ``.devcontainer/<name>/`` nesting; a JetBrains ``.idea/``
+    run-configuration's "Before launch" step is a related but distinct
+    IDE-auto-run primitive, also not covered; a ``runOn``/
+    ``allowAutomaticTasks`` value assembled indirectly (a templating step, a
+    build script that writes the JSON) rather than appearing as a literal is
+    not caught; and, like `rule_devcontainer_exec_protect`, a direct
+    fetch-to-file write (``curl -o .vscode/tasks.json ...``) is caught by
+    none of the shell branch's write-verb checks, the same inherited gap
+    every sibling ``*_protect`` guard in this file already discloses.
+
+    QA history (four independent adversarial reviews — rounds A and B run
+    in parallel, round A bypass-hunting and round B design/consistency;
+    rounds C and D each a follow-up verification pass over the prior
+    round's fixes — matching this codebase's established process): rounds
+    A and B both independently found and
+    confirmed the SAME critical bug — the shell branch had no `cd`/`pushd`-
+    into-`.vscode`-then-bare-filename fallback at all (unlike
+    `rule_devcontainer_exec_protect`, which added exactly this fallback
+    after its own QA round C), a silent, total bypass of every shell-branch
+    check (`cd .vscode && jq '.runOptions.runOn="folderOpen"' tasks.json |
+    sponge tasks.json`). Fixed with `VSCODE_CD_RE` + `VSCODE_TASKS_BARE_
+    FILENAME_RE`/`VSCODE_SETTINGS_BARE_FILENAME_RE`, additionally covering
+    `Set-Location`/`sl`/`chdir` (not just `cd`/`pushd`) after round A
+    demonstrated a live PowerShell bypass (`Set-Location .vscode; Set-
+    Content tasks.json ...`) neither `DEVCONTAINER_CD_RE` nor its own first
+    draft covered. Round A separately found jq's object-MERGE idiom (`+=`,
+    operator BEFORE the key, e.g. `.runOptions += {runOn:"folderOpen"}`
+    with the key left unquoted — a legal, idiomatic bare jq identifier)
+    evaded the original assignment-only (`.runOn =`, operator AFTER the
+    key) jq pattern entirely; round B, independently, found that same
+    pattern's fix-target was itself over-broad in the other direction — it
+    matched ANY assignment to `runOn` regardless of value, asking even on a
+    jq script resetting the task to its safe `"default"` value, contradicting
+    the guard's own stated "gate the key AND its dangerous value" design.
+    Both fixed together: `VSCODE_TASKS_JQ_RE`/`VSCODE_SETTINGS_JQ_RE` now
+    match BOTH the direct-assignment and merge-object forms, and BOTH
+    require the specific dangerous value adjacent to the key in either
+    form — closing the false-ALLOW without reopening the false-ASK. Round A
+    also found two lower-confidence MCP structural-argument bypasses (a
+    value wrapped in a one-element list, and the key/value split across two
+    different sibling list items rather than one shared dict) past the
+    original dict-siblings-only fallback; replaced with
+    `_vscode_mcp_bareword_kv_hit`, a flatten-based check requiring no
+    structural relationship between the two tokens at all (mirroring
+    `DEVCONTAINER_EXEC_KEY_BAREWORD_RE`'s own single-token bareword
+    fallback), which closes both uniformly. Round C (follow-up verification
+    of rounds A/B's fixes) confirmed all four original findings closed and
+    the safe-value regression checks clean, then found two issues in the
+    fixes themselves: (1) `VSCODE_CD_RE`'s directory-name terminator was a
+    bare `\\b` — a word/non-word transition, not "end of this specific
+    name" — so an ordinary lookalike directory (`.vscode-old`,
+    `.vscode.bak`) false-positived; fixed by reusing `_CI_END` (see its own
+    comment in patterns.py). (2) confirmed `_vscode_mcp_bareword_kv_hit`'s
+    "no structural relationship required" breadth is real — an MCP call
+    with both exact tokens present but unrelated to each other (e.g. an
+    enum/preset-name list) produces a false ASK; reviewed and accepted
+    deliberately (fails toward ASK, never ALLOW; see the function's own
+    docstring) rather than fixed, for the same reason
+    `gitattrs_wiring_hit`'s/`DEVCONTAINER_CD_RE`'s own whole-command-scoping
+    trade-offs were. Round D (follow-up verification of round C's fixes)
+    confirmed both round-C fixes hold, then found jq's UPDATE-ASSIGN
+    operator (`|=`) was never anticipated by either jq pattern at all, and
+    that `VSCODE_TASKS_JQ_RE` never anticipated bracket-index key notation
+    (`["runOn"]`) either — both live, silent-ALLOW bypasses on realistic,
+    unremarkable one-liners. Rather than add a fourth exact-shape
+    alternative, both jq patterns were rewritten as three independent,
+    order-agnostic lookaheads (assignment-shaped operator, bare key,
+    dangerous value — see `VSCODE_TASKS_JQ_RE`'s own comment in
+    patterns.py) — which, while fixing it, surfaced one more
+    self-inflicted gap: the lookaheads' own scan-gap excluded `|` (the
+    usual "don't cross a real shell pipe" convention), which also
+    prevented them from scanning PAST `|=`'s own literal pipe character to
+    reach a value sitting on its far side — fixed by not excluding `|`
+    from these three lookaheads specifically, accepting the narrower cost
+    of now also being able to see across a genuine shell pipe into an
+    unrelated next command (bounded, same accepted-trade-off direction).
+    Round E (follow-up verification of round D's fixes) confirmed no new
+    false-ALLOW anywhere (independent lookaheads only strengthen, never
+    suppress, detection — verified, not assumed), confirmed the
+    `&&`/`;`/newline command-boundary handling and settings-side parity
+    hold, confirmed a multi-line jq script (heredoc / `-f script.jq`) goes
+    undetected but traced this to a pre-existing gap (newlines were already
+    excluded from the scan gap before round D) rather than a regression,
+    and found the round-D pipe-crossing trade-off has a sharper, more
+    concrete instance than originally disclosed: it also fires within a
+    SINGLE, non-piped jq script on coincidental unrelated substrings (e.g.
+    setting `task.allowAutomaticTasks` to its SAFE `"off"` value while
+    separately toggling the common, unrelated `files.autoSave` setting to
+    `"on"` in the same one-liner) — same accepted direction, now disclosed
+    explicitly (see `VSCODE_TASKS_JQ_RE`'s own comment) and pinned with a
+    regression test. Recommended PASS, no round F needed. Full suite green
+    throughout (1209 passed) and a fresh perf/ReDoS pass (including a
+    50,000-repetition adversarial probe, ~756ms, linear scaling) clean on
+    every new/widened pattern."""
+    cfg = getattr(policy, "vscode_tasks_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "vscode-tasks-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        is_tasks = bool(patterns.VSCODE_TASKS_PATH_RE.search(p))
+        is_settings = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(p))
+        if not (is_tasks or is_settings):
+            return None
+        if is_tasks:
+            hit = bool(patterns.VSCODE_TASKS_RUNON_RE.search(content))
+            if not hit and ev.action == ActionClass.MCP:
+                hit = bool(_vscode_struct_kv_hit(a, "runon", "folderopen")
+                           or _vscode_mcp_bareword_kv_hit(a, "runon", "folderopen"))
+            reason = ("'{p}' is being written with an automatic task "
+                      '(`"runOptions": {{"runOn": "folderOpen"}}`) — it runs '
+                      "automatically, unattended, the next time this "
+                      "workspace folder is opened in VS Code.")
+        else:
+            hit = bool(patterns.VSCODE_ALLOW_AUTOTASKS_RE.search(content))
+            if not hit and ev.action == ActionClass.MCP:
+                hit = bool(_vscode_struct_kv_hit(a, "task.allowautomatictasks", "on")
+                           or _vscode_mcp_bareword_kv_hit(a, "task.allowautomatictasks", "on"))
+            reason = ("'{p}' is being written with "
+                      '`"task.allowAutomaticTasks": "on"` — it silences the '
+                      "one human confirmation prompt that otherwise gates "
+                      "an automatic task from running unattended.")
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_VSCODE_TASKS_EXEC")
+                or _vscode_tasks_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "vscode-tasks-protect",
+                         reason.format(p=p) + " Review the change, then confirm "
+                         "with AEGIS_ALLOW_VSCODE_TASKS_EXEC=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        # QA finding (independent adversarial review, rounds A and B, run in
+        # parallel, each independently confirming the other): a prior `cd`/
+        # `pushd`/`Set-Location` into `.vscode` in the SAME command lets
+        # every later reference drop the `.vscode/` prefix entirely (`cd
+        # .vscode && jq '.runOptions.runOn="folderOpen"' tasks.json | sponge
+        # tasks.json`) — `VSCODE_TASKS_PATH_RE`/`VSCODE_SETTINGS_PATH_RE`'s
+        # single-contiguous-match requirement never sees this, and it was a
+        # SILENT, TOTAL bypass (every one of `tasks_jq_hit`/`settings_jq_hit`/
+        # `tasks_write_hit`/`settings_write_hit` depends on one of these two
+        # flags). `*_path_hit` now accepts either the direct match OR the
+        # cd-into-dir + bare-filename pair, mirroring
+        # `rule_devcontainer_exec_protect`'s own `DEVCONTAINER_CD_RE`/
+        # `DEVCONTAINER_BARE_FILENAME_RE` fix for the identical gap (see
+        # `VSCODE_CD_RE`'s own comment in patterns.py).
+        vscode_cd_hit = bool(patterns.VSCODE_CD_RE.search(cmd))
+        tasks_path_hit = bool(patterns.VSCODE_TASKS_PATH_RE.search(cmd)
+                               or (vscode_cd_hit
+                                   and patterns.VSCODE_TASKS_BARE_FILENAME_RE.search(cmd)))
+        settings_path_hit = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(cmd)
+                                  or (vscode_cd_hit
+                                      and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        tasks_jq_hit = bool(patterns.VSCODE_TASKS_JQ_RE.search(cmd) and tasks_path_hit)
+        settings_jq_hit = bool(patterns.VSCODE_SETTINGS_JQ_RE.search(cmd) and settings_path_hit)
+        tasks_write_hit = bool(write_verb and tasks_path_hit
+                                and patterns.VSCODE_TASKS_RUNON_RE.search(cmd))
+        settings_write_hit = bool(write_verb and settings_path_hit
+                                   and patterns.VSCODE_ALLOW_AUTOTASKS_RE.search(cmd))
+        if not (tasks_jq_hit or settings_jq_hit or tasks_write_hit or settings_write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_VSCODE_TASKS_EXEC")
+                or _vscode_tasks_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        is_settings_hit = settings_jq_hit or settings_write_hit
+        reason = ('`"task.allowAutomaticTasks": "on"` is being planted in '
+                   ".vscode/settings.json from a shell — it silences the "
+                   "one human confirmation prompt that otherwise gates an "
+                   "automatic task from running unattended" if is_settings_hit
+                   else "An automatic task (`runOn: \"folderOpen\"`) is being "
+                   "planted in .vscode/tasks.json from a shell — it runs "
+                   "automatically, unattended, the next time this workspace "
+                   "folder is opened in VS Code")
+        return _finish(Decision(action, "vscode-tasks-protect",
+                         f"{reason}. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_VSCODE_TASKS_EXEC=1; a spawned "
+                         "agent cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -2483,6 +2818,7 @@ _CORE_RULES = (
     rule_git_attributes_exec_protect,
     rule_service_persist_protect,
     rule_devcontainer_exec_protect,
+    rule_vscode_tasks_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

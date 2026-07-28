@@ -182,6 +182,13 @@ class Policy:
     # build/start, initializeCommand on the HOST with no container isolation.
     # See rules.rule_devcontainer_exec_protect.
     devcontainer_exec: dict = field(default_factory=dict)
+    # VS Code auto-run task protection: {mode: deny|ask|monitor|off, allow:
+    # [regex on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # .vscode/tasks.json carrying "runOptions": {"runOn": "folderOpen"} and
+    # .vscode/settings.json carrying "task.allowAutomaticTasks": "on" (which
+    # silences VS Code's one-time confirmation prompt for the former). See
+    # rules.rule_vscode_tasks_protect.
+    vscode_tasks_exec: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.

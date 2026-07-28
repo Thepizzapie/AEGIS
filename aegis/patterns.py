@@ -1556,6 +1556,187 @@ DEVCONTAINER_EXEC_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# VS Code auto-run task config: `.vscode/tasks.json` (workspace-folder scope
+# only — a multi-root `*.code-workspace` file can embed the same `"tasks"`
+# object directly and is a disclosed, not-covered gap; see
+# `rule_vscode_tasks_protect`'s own docstring). This is the file VS Code
+# reads, on ordinary folder-open, for tasks carrying `"runOptions":
+# {"runOn": "folderOpen"}` — the editor-level auto-run surface
+# `rule_devcontainer_exec_protect`'s own docstring flagged as a disclosed,
+# not-covered candidate for a follow-up guard.
+VSCODE_TASKS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.vscode" + _WIN_TRIM + _SEP + r"tasks\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# QA finding (independent adversarial review, rounds A and B, run in
+# parallel): `VSCODE_TASKS_PATH_RE`/`VSCODE_SETTINGS_PATH_RE` (below) require
+# `.vscode` and the filename in one CONTIGUOUS match — an entirely ordinary
+# `cd .vscode && jq '.runOptions.runOn="folderOpen"' tasks.json | sponge
+# tasks.json` (or `pushd`, or PowerShell's `Set-Location`) never produces
+# that adjacency, even with zero obfuscation, and was confirmed by BOTH
+# independent reviewers as a silent full bypass of every check in the shell
+# branch. Same companion-pair shape `DEVCONTAINER_CD_RE`/
+# `DEVCONTAINER_BARE_FILENAME_RE` uses for the identical gap in
+# `rule_devcontainer_exec_protect` (used together, both required, at the
+# shell branch's call site in `rule_vscode_tasks_protect`): `VSCODE_CD_RE`
+# flags a `cd`/`pushd`/`Set-Location` into `.vscode` (or a subdirectory)
+# anywhere in the command, and the two bare-filename patterns below flag a
+# bare `tasks.json`/`settings.json` reference with no `.vscode/` prefix
+# required. Neither alone is high-signal; both co-occurring in the same
+# whole command is (same whole-command, not clause-scoped, trade-off
+# `gitattrs_wiring_hit`/`DEVCONTAINER_CD_RE` already document).
+#
+# Additionally accepts `Set-Location`/`sl`/`chdir` (PowerShell/cmd aliases),
+# not just `cd`/`pushd` — round A demonstrated `Set-Location .vscode;
+# Set-Content tasks.json ...` as a live bypass using this exact form.
+# QA finding (independent adversarial review, round C, verifying round A/B's
+# own fixes): the original version terminated the directory name with a bare
+# `\b` — a word/non-word transition, not "end of this specific directory
+# name" — so it also matched an unrelated LOOKALIKE directory whose name
+# merely starts with `.vscode` followed by a non-word character:
+# `.vscode-old`, `.vscode.bak`, `.vscode-backup-dir` (an ordinary backup/
+# staging directory naming habit, nothing to do with the real `.vscode/` VS
+# Code reads) all false-positived. Fixed by reusing `_CI_END` (the same
+# "real path-segment terminator: separator, quote, shell metachar, or end of
+# string — not a bare `\b`" boundary every path-shaped pattern in this file
+# already uses, including `VSCODE_TASKS_PATH_RE` itself two patterns above)
+# in place of the bare `\b`.
+VSCODE_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.vscode" + _CI_END,
+    re.IGNORECASE,
+)
+VSCODE_TASKS_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])tasks\.json" + _CI_END,
+    re.IGNORECASE,
+)
+VSCODE_SETTINGS_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])settings\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The companion workspace-settings file: `.vscode/settings.json`. Carries no
+# lifecycle command of its own, but a `"task.allowAutomaticTasks": "on"`
+# entry silences VS Code's one-time "Allow Automatic Tasks in Folder..."
+# confirmation prompt — the only human-in-the-loop friction standing between
+# a planted `runOn: folderOpen` task and it actually auto-executing. Gating
+# only the tasks.json half and leaving this one unguarded would still let an
+# agent quietly clear the human's own last checkpoint.
+VSCODE_SETTINGS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.vscode" + _WIN_TRIM + _SEP + r"settings\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The auto-run marker itself: a `"runOn"` key set specifically to
+# `"folderOpen"` (the only value that arms unattended execution — VS Code's
+# other documented value, `"default"`, means "manual trigger only" and is
+# deliberately NOT matched, the same "gate the specific dangerous value, not
+# the key alone" shape `GIT_CONFIG_BANG_VALUE_RE` uses for git-config keys
+# that have a safe, ordinary value too). Requires the key/value PAIR, not
+# just the bareword "folderOpen", so an unrelated string literal containing
+# that word doesn't false-positive.
+VSCODE_TASKS_RUNON_RE = re.compile(
+    r"[\"']runOn[\"']\s*:\s*[\"']folderOpen[\"']",
+    re.IGNORECASE,
+)
+
+# The prompt-silencing marker: `"task.allowAutomaticTasks"` set to `"on"`
+# (VS Code's other value, `"off"`, is the safe default and is deliberately
+# NOT matched — same key-plus-dangerous-value shape as
+# ``VSCODE_TASKS_RUNON_RE`` above).
+VSCODE_ALLOW_AUTOTASKS_RE = re.compile(
+    r"[\"']task\.allowAutomaticTasks[\"']\s*:\s*[\"']on[\"']",
+    re.IGNORECASE,
+)
+
+# `jq`-scripted edits reach both files the same way `DEVCONTAINER_EXEC_JQ_RE`
+# documents for devcontainer.json: a bare dot-path ASSIGNMENT
+# (`.tasks[0].runOptions.runOn="folderOpen"`, `.["task.allowAutomaticTasks"]
+# ="on"`), never adjacent to a quote+colon the way the two key/value
+# patterns above require, usually piped through `sponge` (jq has no `-i`
+# flag, so it's on no write-verb list at all). Unlike
+# `DEVCONTAINER_EXEC_JQ_RE` (whose six keys have no safe value — any
+# assignment is dangerous), `runOn`/`task.allowAutomaticTasks` each have an
+# everyday SAFE value too (`"default"`, `"off"`), so — matching this guard's
+# own "gate the key AND its dangerous value, not the key alone" design
+# principle (see the rule's docstring) — both patterns below require the
+# assigned VALUE itself, not just the assignment shape.
+#
+# QA history (rounds A, B, D — each a fresh jq-syntax shape the prior
+# version missed): round A found jq's object-MERGE idiom (`+=`, operator
+# BEFORE the key) with the key left unquoted; round B found the fix for
+# that was itself value-agnostic (asked even on a safe-value assignment);
+# round D (a follow-up verification pass) found jq's UPDATE-ASSIGN operator
+# (`|=`, at least as idiomatic as `=`/`+=` for mutating an existing scalar)
+# was never anticipated at all, and that `VSCODE_TASKS_JQ_RE` (unlike its
+# settings sibling) never anticipated BRACKET-INDEX key notation
+# (`["runOn"]`) either — both live, silent-ALLOW bypasses on realistic,
+# unremarkable one-liners (`.runOptions["runOn"]="folderOpen"`,
+# `.runOptions.runOn |= "folderOpen"`, `.["task.allowAutomaticTasks"] |=
+# "on"`).
+#
+# Rather than keep enumerating jq's path-expression grammar (dot vs.
+# bracket, quoted vs. bare, `=` vs. `+=` vs. `|=`) one shape at a time —
+# the same trap `gitattrs_wiring_hit`'s own QA history describes falling
+# into and deliberately climbing back out of, in favor of whole-scan,
+# non-structural matching — both patterns are three INDEPENDENT,
+# order-agnostic lookaheads instead of an exact-shape match: an
+# assignment-shaped operator (`=`, `+=`, or `|=` — explicitly NOT
+# `==`/`!=`/`<=`/`>=`, jq's comparison operators, excluded via the
+# surrounding lookaround), the target KEY as a bare substring (so any path
+# syntax reaching it is covered without being individually named), and the
+# dangerous VALUE as a bare substring (preserving "gate the key AND its
+# dangerous value" — a safe-value assignment/update still doesn't match,
+# since neither `"default"` nor `"off"` contains `folderOpen`/a
+# word-bounded `on`). No structural relationship between the three signals
+# is required — the same trade-off `_vscode_mcp_bareword_kv_hit` already
+# accepts for the MCP fallback — ANDed with a whole-command path check at
+# the rule's call site as before.
+#
+# The scan-gap character class deliberately does NOT exclude `|` (unlike
+# almost every other bounded gap in this file, which excludes it to avoid
+# crossing a real shell-pipe boundary into an unrelated next command): jq's
+# own `|=` operator is itself built from a literal `|`, sitting textually
+# BETWEEN the key and the dangerous value in `.runOptions.runOn |=
+# "folderOpen"` — a `|`-excluding gap can never scan past that operator to
+# reach the value on its far side, a self-inflicted bypass caught while
+# fixing this exact `|=` gap and confirmed non-obvious (it only manifests
+# when the target token sits textually AFTER the `|=`, not before). Cost:
+# these three lookaheads can now also see across a GENUINE shell pipe into
+# an unrelated next command in the same compound line — a narrower version
+# of the same whole-command trade-off already accepted throughout this
+# file, still bounded, still fails toward ASK not ALLOW.
+#
+# QA finding (independent adversarial review, round E, verifying round D's
+# own fix): the "no structural relationship required" breadth isn't limited
+# to crossing a real pipe — it also fires within a SINGLE, non-piped jq
+# script when the operator/key/value all happen to be present but
+# unrelated to each other, e.g. a fully benign edit that sets
+# `task.allowAutomaticTasks` to the SAFE `"off"` value while separately
+# toggling the common, unrelated `files.autoSave` setting to `"on"` in the
+# same one-liner (`.["task.allowAutomaticTasks"] = "off" |
+# .["files.autoSave"] = "on"`). Confirmed non-exploitable (fails toward
+# ASK, never ALLOW; human-escapable) and kept deliberately — the same
+# accepted trade-off as the pipe-crossing case above and
+# `_vscode_mcp_bareword_kv_hit`'s own MCP-side equivalent — but disclosed
+# explicitly since it needs no pipe at all to manifest.
+_VSCODE_JQ_ASSIGN_OP = r"(?:\|=|\+=|(?<![!<>=])=(?!=))"
+VSCODE_TASKS_JQ_RE = re.compile(
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _VSCODE_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}\brunOn\b)"
+    r"(?=[^;&\n]{0,400}folderOpen)",
+    re.IGNORECASE,
+)
+VSCODE_SETTINGS_JQ_RE = re.compile(
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _VSCODE_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}task\.allowAutomaticTasks)"
+    r"(?=[^;&\n]{0,400}\bon\b)",
+    re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
