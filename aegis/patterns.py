@@ -1556,6 +1556,75 @@ DEVCONTAINER_EXEC_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# VS Code auto-run task config: `.vscode/tasks.json` (workspace-folder scope
+# only — a multi-root `*.code-workspace` file can embed the same `"tasks"`
+# object directly and is a disclosed, not-covered gap; see
+# `rule_vscode_tasks_protect`'s own docstring). This is the file VS Code
+# reads, on ordinary folder-open, for tasks carrying `"runOptions":
+# {"runOn": "folderOpen"}` — the editor-level auto-run surface
+# `rule_devcontainer_exec_protect`'s own docstring flagged as a disclosed,
+# not-covered candidate for a follow-up guard.
+VSCODE_TASKS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.vscode" + _WIN_TRIM + _SEP + r"tasks\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The companion workspace-settings file: `.vscode/settings.json`. Carries no
+# lifecycle command of its own, but a `"task.allowAutomaticTasks": "on"`
+# entry silences VS Code's one-time "Allow Automatic Tasks in Folder..."
+# confirmation prompt — the only human-in-the-loop friction standing between
+# a planted `runOn: folderOpen` task and it actually auto-executing. Gating
+# only the tasks.json half and leaving this one unguarded would still let an
+# agent quietly clear the human's own last checkpoint.
+VSCODE_SETTINGS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.vscode" + _WIN_TRIM + _SEP + r"settings\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The auto-run marker itself: a `"runOn"` key set specifically to
+# `"folderOpen"` (the only value that arms unattended execution — VS Code's
+# other documented value, `"default"`, means "manual trigger only" and is
+# deliberately NOT matched, the same "gate the specific dangerous value, not
+# the key alone" shape `GIT_CONFIG_BANG_VALUE_RE` uses for git-config keys
+# that have a safe, ordinary value too). Requires the key/value PAIR, not
+# just the bareword "folderOpen", so an unrelated string literal containing
+# that word doesn't false-positive.
+VSCODE_TASKS_RUNON_RE = re.compile(
+    r"[\"']runOn[\"']\s*:\s*[\"']folderOpen[\"']",
+    re.IGNORECASE,
+)
+
+# The prompt-silencing marker: `"task.allowAutomaticTasks"` set to `"on"`
+# (VS Code's other value, `"off"`, is the safe default and is deliberately
+# NOT matched — same key-plus-dangerous-value shape as
+# ``VSCODE_TASKS_RUNON_RE`` above).
+VSCODE_ALLOW_AUTOTASKS_RE = re.compile(
+    r"[\"']task\.allowAutomaticTasks[\"']\s*:\s*[\"']on[\"']",
+    re.IGNORECASE,
+)
+
+# `jq`-scripted edits reach both files the same way `DEVCONTAINER_EXEC_JQ_RE`
+# documents for devcontainer.json: a bare dot-path ASSIGNMENT
+# (`.tasks[0].runOptions.runOn="folderOpen"`, `.["task.allowAutomaticTasks"]
+# ="on"`), never adjacent to a quote+colon the way the two key/value
+# patterns above require, usually piped through `sponge` (jq has no `-i`
+# flag, so it's on no write-verb list at all). Requires the assignment shape
+# specifically — a bare, non-mutating `.runOptions.runOn` reference with no
+# trailing `=` does not match — and is ANDed with a whole-command path check
+# at the rule's call site, the same two-part design
+# `DEVCONTAINER_EXEC_JQ_RE`'s own QA history (round B) converged on to avoid
+# false-positiving on a plain read or an unrelated comment.
+VSCODE_TASKS_JQ_RE = re.compile(
+    r"\bjq\b(?=[^|;&\n]{0,300}\.(?:runOptions\.)?runOn\s*=)",
+    re.IGNORECASE,
+)
+VSCODE_SETTINGS_JQ_RE = re.compile(
+    r"\bjq\b(?=[^|;&\n]{0,300}"
+    r"(?:\.[\"']?task\.allowAutomaticTasks[\"']?|\[[\"']task\.allowAutomaticTasks[\"']\])"
+    r"\s*=)",
+    re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this

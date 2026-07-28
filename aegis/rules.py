@@ -2078,6 +2078,223 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+def _vscode_tasks_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _vscode_struct_kv_hit(v, key_name: str, value: str, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for a specific
+    KEY (case/whitespace-insensitive) mapped to a specific string VALUE
+    (case/whitespace-insensitive) — the same structural-arg fallback shape
+    `_devcontainer_struct_key_hit` uses, but keyed on the value too, since
+    (unlike a devcontainer lifecycle-command key) `runOn` and
+    `task.allowAutomaticTasks` both have an ordinary, safe value
+    (``"default"``, ``"off"``) as well as the dangerous one gated here. Same
+    depth cap (12) as `_flatten_strings`/`_devcontainer_struct_key_hit` for
+    the identical cyclic/pathological-payload protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if (isinstance(k, str) and k.strip().lower() == key_name
+                    and isinstance(val, str) and val.strip().lower() == value):
+                return True
+            if _vscode_struct_kv_hit(val, key_name, value, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_vscode_struct_kv_hit(x, key_name, value, _depth + 1) for x in v)
+    return False
+
+
+def _vscode_struct_sibling_kv_hit(v, key_name: str, value: str, _depth: int = 0) -> bool:
+    """Walk raw MCP args for a dict whose VALUES include both the target key
+    name and the target value as separate sibling string leaves — the
+    ``{"key": "runOn", "value": "folderOpen"}``-style "set a config value"
+    MCP-tool shape, where the key name is itself a bare VALUE (never a dict
+    KEY, never adjacent to a colon), so neither ``VSCODE_TASKS_RUNON_RE``
+    nor `_vscode_struct_kv_hit` (which only matches a dict KEY) sees it.
+    Same class of gap `rule_devcontainer_exec_protect`'s own QA (round A)
+    found and fixed for its lifecycle-command keys; same depth cap (12)."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        strs = {x.strip().lower() for x in v.values() if isinstance(x, str)}
+        if key_name in strs and value in strs:
+            return True
+        for val in v.values():
+            if _vscode_struct_sibling_kv_hit(val, key_name, value, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_vscode_struct_sibling_kv_hit(x, key_name, value, _depth + 1) for x in v)
+    return False
+
+
+def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a VS Code auto-run task (``.vscode/tasks.json``
+    with ``"runOptions": {"runOn": "folderOpen"}``) or silencing the one
+    human checkpoint that gates it (``.vscode/settings.json`` with
+    ``"task.allowAutomaticTasks": "on"``).
+
+    THREAT MODEL: no existing guard reaches this surface —
+    `rule_devcontainer_exec_protect`'s own docstring explicitly disclosed it
+    as a "related but distinct" auto-run primitive and a candidate for a
+    follow-up guard, since an IDE, not a devcontainer runtime, does the
+    auto-running here. A task with ``runOn: folderOpen`` runs automatically
+    the next time this workspace folder is opened in VS Code — no git
+    operation, no CI run, no boot/login, no container (re)build required,
+    just the editor opening the folder, which (like a devcontainer
+    (re)build) is often the very moment an agentic coding session's own
+    environment comes up. Unlike `rule_devcontainer_exec_protect`'s surface,
+    VS Code does interpose one piece of friction: the first time a folder
+    with an automatic task is opened, it shows an "Allow Automatic Tasks in
+    Folder..." prompt, and a human must accept it once. But that friction is
+    itself a single config value away from being silently removed —
+    ``.vscode/settings.json``'s ``task.allowAutomaticTasks: "on"`` disables
+    the prompt entirely, so an agent that plants both files in the same
+    session removes the human's last checkpoint before it ever fires. Both
+    files are normally TRACKED and reviewed as routine editor/workspace
+    configuration (recommended extensions, format-on-save, build tasks), so
+    a one-line addition reads as ordinary tooling in a diff, not as a
+    planted detonator — the same "hidden in plain sight" property
+    `rule_devcontainer_exec_protect`'s own docstring describes for
+    ``devcontainer.json``.
+
+    Distinct from a path-only guard for the same reason
+    `rule_devcontainer_exec_protect`/`rule_package_manifest_protect` are:
+    ``tasks.json`` legitimately carries build/test/watch tasks with
+    ``runOn: "default"`` (manual trigger only) in a large fraction of real
+    repos, and ``settings.json`` is edited constantly for benign reasons —
+    gating on path alone would ask on nearly every ``.vscode/`` edit. Gated
+    on PATH *and* the specific DANGEROUS VALUE: ``tasks.json`` must carry
+    ``runOn`` set to ``folderOpen`` specifically (not ``default``), and
+    ``settings.json`` must carry ``task.allowAutomaticTasks`` set to ``on``
+    specifically (not ``off``) — the same "gate the key AND its dangerous
+    value, not the key alone" shape `rule_git_config_exec_protect` applies
+    to `credential.helper` versus an ordinary alias value.
+
+    Config (``policy.vscode_tasks_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted, reviewed automatic task, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard in this
+    file does: a real automatic task can be legitimate, sanctioned
+    workspace setup — it just needs a human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_VSCODE_TASKS_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a multi-root ``*.code-workspace`` file can embed the same
+    ``"tasks"`` object (and the same ``task.allowAutomaticTasks`` setting)
+    directly inside itself, with no ``.vscode/`` path segment at all — not
+    covered by this first pass, the same "one config surface first, siblings
+    disclosed as a follow-up" approach `rule_devcontainer_exec_protect` took
+    for its own ``.devcontainer/<name>/`` nesting; a JetBrains ``.idea/``
+    run-configuration's "Before launch" step is a related but distinct
+    IDE-auto-run primitive, also not covered; a ``runOn``/
+    ``allowAutomaticTasks`` value assembled indirectly (a templating step, a
+    build script that writes the JSON) rather than appearing as a literal is
+    not caught; and, like `rule_devcontainer_exec_protect`, a direct
+    fetch-to-file write (``curl -o .vscode/tasks.json ...``) is caught by
+    none of the shell branch's write-verb checks, the same inherited gap
+    every sibling ``*_protect`` guard in this file already discloses."""
+    cfg = getattr(policy, "vscode_tasks_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "vscode-tasks-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        is_tasks = bool(patterns.VSCODE_TASKS_PATH_RE.search(p))
+        is_settings = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(p))
+        if not (is_tasks or is_settings):
+            return None
+        if is_tasks:
+            hit = bool(patterns.VSCODE_TASKS_RUNON_RE.search(content))
+            if not hit and ev.action == ActionClass.MCP:
+                hit = bool(_vscode_struct_kv_hit(a, "runon", "folderopen")
+                           or _vscode_struct_sibling_kv_hit(a, "runon", "folderopen"))
+            reason = ("'{p}' is being written with an automatic task "
+                      '(`"runOptions": {{"runOn": "folderOpen"}}`) — it runs '
+                      "automatically, unattended, the next time this "
+                      "workspace folder is opened in VS Code.")
+        else:
+            hit = bool(patterns.VSCODE_ALLOW_AUTOTASKS_RE.search(content))
+            if not hit and ev.action == ActionClass.MCP:
+                hit = bool(_vscode_struct_kv_hit(a, "task.allowautomatictasks", "on")
+                           or _vscode_struct_sibling_kv_hit(a, "task.allowautomatictasks", "on"))
+            reason = ("'{p}' is being written with "
+                      '`"task.allowAutomaticTasks": "on"` — it silences the '
+                      "one human confirmation prompt that otherwise gates "
+                      "an automatic task from running unattended.")
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_VSCODE_TASKS_EXEC")
+                or _vscode_tasks_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "vscode-tasks-protect",
+                         reason.format(p=p) + " Review the change, then confirm "
+                         "with AEGIS_ALLOW_VSCODE_TASKS_EXEC=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        tasks_path_hit = bool(patterns.VSCODE_TASKS_PATH_RE.search(cmd))
+        settings_path_hit = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(cmd))
+        tasks_jq_hit = bool(patterns.VSCODE_TASKS_JQ_RE.search(cmd) and tasks_path_hit)
+        settings_jq_hit = bool(patterns.VSCODE_SETTINGS_JQ_RE.search(cmd) and settings_path_hit)
+        tasks_write_hit = bool(write_verb and tasks_path_hit
+                                and patterns.VSCODE_TASKS_RUNON_RE.search(cmd))
+        settings_write_hit = bool(write_verb and settings_path_hit
+                                   and patterns.VSCODE_ALLOW_AUTOTASKS_RE.search(cmd))
+        if not (tasks_jq_hit or settings_jq_hit or tasks_write_hit or settings_write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_VSCODE_TASKS_EXEC")
+                or _vscode_tasks_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        is_settings_hit = settings_jq_hit or settings_write_hit
+        reason = ('`"task.allowAutomaticTasks": "on"` is being planted in '
+                   ".vscode/settings.json from a shell — it silences the "
+                   "one human confirmation prompt that otherwise gates an "
+                   "automatic task from running unattended" if is_settings_hit
+                   else "An automatic task (`runOn: \"folderOpen\"`) is being "
+                   "planted in .vscode/tasks.json from a shell — it runs "
+                   "automatically, unattended, the next time this workspace "
+                   "folder is opened in VS Code")
+        return _finish(Decision(action, "vscode-tasks-protect",
+                         f"{reason}. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_VSCODE_TASKS_EXEC=1; a spawned "
+                         "agent cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -2483,6 +2700,7 @@ _CORE_RULES = (
     rule_git_attributes_exec_protect,
     rule_service_persist_protect,
     rule_devcontainer_exec_protect,
+    rule_vscode_tasks_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
