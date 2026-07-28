@@ -226,6 +226,33 @@ def test_jsonc_comment_mentioning_key_not_gated_for_literal_edit():
     assert not _gated(d)
 
 
+def test_mcp_list_wrapped_value_gated():
+    """QA finding (independent adversarial review, round A): a value wrapped
+    in a one-element list (`{"key": "runOn", "value": ["folderOpen"]}`) —
+    plausible for an MCP tool that always wraps values in a list — bypassed
+    the original sibling-only structural fallback. `_vscode_mcp_bareword_kv_
+    hit` (flatten-based) closes this because `_flatten_strings` already
+    recurses through the list."""
+    d = evaluate(_mcp_key_value(".vscode/tasks.json", "runOn", ["folderOpen"]), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_mcp_cousin_shape_split_across_sibling_list_items_gated():
+    """QA finding (round A): the key and value split across two DIFFERENT
+    sibling list items (`{"edits": [{"key": "runOn"}, {"value":
+    "folderOpen"}]}`) — never siblings of the same dict — bypassed the
+    original dict-siblings-only structural fallback. The flatten-based
+    `_vscode_mcp_bareword_kv_hit` requires no structural relationship
+    between the two tokens at all, closing this and the list-wrapped case
+    uniformly."""
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__edit_file",
+                     action=ActionClass.MCP,
+                     args={"path": ".vscode/tasks.json",
+                           "edits": [{"key": "runOn"}, {"value": "folderOpen"}]})
+    d = evaluate(ev, EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
 # ---- shell forms ----------------------------------------------------------------------
 
 def test_shell_redirect_tasks_json_gated():
@@ -267,6 +294,101 @@ def test_shell_jq_sponge_settings_gated():
         'jq \'.["task.allowAutomaticTasks"]="on"\' .vscode/settings.json '
         '| sponge .vscode/settings.json'), EMPTY)
     assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_merge_form_unquoted_key_gated():
+    """QA finding (independent adversarial review, round A): jq's object-
+    MERGE idiom (`+=`, operator BEFORE the key) with the key left UNQUOTED
+    (`runOn` is a legal bare jq object-construction identifier) evaded the
+    original assignment-only, quote-agnostic-but-`=`-after-key pattern
+    entirely — a confirmed, silent bypass on a realistic, idiomatic
+    one-liner."""
+    d = evaluate(_shell(
+        'jq \'.tasks[0].runOptions += {runOn:"folderOpen"}\' .vscode/tasks.json '
+        '> /tmp/x.json && mv /tmp/x.json .vscode/tasks.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_merge_form_quoted_key_gated():
+    d = evaluate(_shell(
+        'jq \'.tasks[0].runOptions += {"runOn": "folderOpen"}\' .vscode/tasks.json '
+        '> /tmp/x.json && mv /tmp/x.json .vscode/tasks.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_settings_merge_form_gated():
+    d = evaluate(_shell(
+        'jq \'. += {"task.allowAutomaticTasks": "on"}\' .vscode/settings.json '
+        '> /tmp/s.json && mv /tmp/s.json .vscode/settings.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_jq_assignment_to_safe_value_not_gated():
+    """QA finding (independent adversarial review, round B): the jq
+    assignment-shape check originally matched ANY assignment to the key,
+    regardless of value — contradicting the guard's own stated design
+    ("gate the key AND its dangerous value, not the key alone") and asking
+    on a jq script that resets the task to its safe, manual-trigger value.
+    Both jq patterns now require the specific dangerous value."""
+    d = evaluate(_shell(
+        'jq \'.tasks[0].runOptions.runOn="default"\' .vscode/tasks.json '
+        '| sponge .vscode/tasks.json'), EMPTY)
+    assert not _gated(d)
+
+
+def test_jq_settings_assignment_to_safe_value_not_gated():
+    d = evaluate(_shell(
+        'jq \'.["task.allowAutomaticTasks"]="off"\' .vscode/settings.json '
+        '| sponge .vscode/settings.json'), EMPTY)
+    assert not _gated(d)
+
+
+def test_shell_cd_into_vscode_dir_then_jq_bare_filename_gated():
+    """QA finding (independent adversarial review, rounds A and B, run in
+    parallel — each independently found and confirmed this same bypass): a
+    prior `cd .vscode` in the same command lets a later bare `tasks.json`
+    reference drop the `.vscode/` prefix entirely — an ordinary,
+    zero-obfuscation two-command shell idiom that
+    `VSCODE_TASKS_PATH_RE`'s single-contiguous-match requirement missed
+    completely (confirmed silent ALLOW on all four detection paths before
+    the fix)."""
+    d = evaluate(_shell(
+        'cd .vscode && jq \'.tasks[0].runOptions.runOn = "folderOpen"\' '
+        'tasks.json | sponge tasks.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_shell_pushd_into_vscode_dir_then_redirect_bare_filename_gated():
+    d = evaluate(_shell(
+        'pushd .vscode && echo \'{"runOptions": {"runOn": "folderOpen"}}\' '
+        '> tasks.json && popd'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_shell_cd_into_vscode_dir_then_settings_bare_filename_gated():
+    d = evaluate(_shell(
+        'cd .vscode && sed -i \'s/.*/{"task.allowAutomaticTasks":"on"}/\' '
+        'settings.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_shell_set_location_into_vscode_dir_then_bare_filename_gated():
+    """QA finding (round A): `Set-Location` (PowerShell's `cd`) is not
+    covered by `cd`/`pushd` alone — a live, confirmed bypass using an
+    entirely ordinary PowerShell idiom."""
+    d = evaluate(_shell(
+        'Set-Location .vscode; Set-Content tasks.json \'{"runOn":"folderOpen"}\''
+        ), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
+def test_shell_cd_elsewhere_then_bare_tasks_json_not_gated():
+    """The cd+bare-filename pair requires BOTH signals — cd-ing into an
+    unrelated directory that merely happens to also mention a bare
+    'tasks.json' filename (e.g. in an unrelated echo) must not be gated on
+    the cd alone."""
+    assert not _gated(evaluate(_shell(
+        'cd /tmp && echo "see tasks.json for the build task"'), EMPTY))
 
 
 def test_jq_plain_read_not_gated():

@@ -2113,28 +2113,28 @@ def _vscode_struct_kv_hit(v, key_name: str, value: str, _depth: int = 0) -> bool
     return False
 
 
-def _vscode_struct_sibling_kv_hit(v, key_name: str, value: str, _depth: int = 0) -> bool:
-    """Walk raw MCP args for a dict whose VALUES include both the target key
-    name and the target value as separate sibling string leaves — the
-    ``{"key": "runOn", "value": "folderOpen"}``-style "set a config value"
-    MCP-tool shape, where the key name is itself a bare VALUE (never a dict
-    KEY, never adjacent to a colon), so neither ``VSCODE_TASKS_RUNON_RE``
-    nor `_vscode_struct_kv_hit` (which only matches a dict KEY) sees it.
-    Same class of gap `rule_devcontainer_exec_protect`'s own QA (round A)
-    found and fixed for its lifecycle-command keys; same depth cap (12)."""
-    if _depth > 12:
-        return False
-    if isinstance(v, dict):
-        strs = {x.strip().lower() for x in v.values() if isinstance(x, str)}
-        if key_name in strs and value in strs:
-            return True
-        for val in v.values():
-            if _vscode_struct_sibling_kv_hit(val, key_name, value, _depth + 1):
-                return True
-        return False
-    if isinstance(v, (list, tuple)):
-        return any(_vscode_struct_sibling_kv_hit(x, key_name, value, _depth + 1) for x in v)
-    return False
+def _vscode_mcp_bareword_kv_hit(a: dict, key_name: str, value: str) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: both the key name and
+    the dangerous value appear, ANYWHERE, as string leaves in the full
+    (recursively) flattened raw MCP args — closes every "key and value both
+    present but not adjacent, not a dict key, split across sibling
+    structures" shape QA (round A) found, including the
+    ``{"key": "runOn", "value": "folderOpen"}`` "set a config value" shape
+    (the key name is a bare sibling VALUE, never a dict key or adjacent to a
+    colon), a value wrapped in a one-element list
+    (``{"key": "runOn", "value": ["folderOpen"]}``), and a "cousin" shape
+    splitting the key and value across two different sibling list items
+    (``{"edits": [{"key": "runOn"}, {"value": "folderOpen"}]}``) —
+    `_flatten_strings` already recurses through every list/dict nesting
+    shape uniformly, so no structural relationship between the two tokens is
+    required, the same low-structure, high-recall signal
+    `DEVCONTAINER_EXEC_KEY_BAREWORD_RE`'s own single-token bareword fallback
+    already relies on. Deliberately scoped to MCP only: an Edit/Write's
+    literal file content legitimately contains both words separately (a
+    comment, an unrelated field) far more often than an MCP tool's own args
+    would by coincidence."""
+    strs = {s.strip().lower() for s in _flatten_strings(a) if isinstance(s, str)}
+    return key_name in strs and value in strs
 
 
 def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -2207,7 +2207,44 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     not caught; and, like `rule_devcontainer_exec_protect`, a direct
     fetch-to-file write (``curl -o .vscode/tasks.json ...``) is caught by
     none of the shell branch's write-verb checks, the same inherited gap
-    every sibling ``*_protect`` guard in this file already discloses."""
+    every sibling ``*_protect`` guard in this file already discloses.
+
+    QA history (two independent adversarial reviews, run in parallel —
+    round A bypass-hunting, round B design/consistency — matching this
+    codebase's established process): both rounds independently found and
+    confirmed the SAME critical bug — the shell branch had no `cd`/`pushd`-
+    into-`.vscode`-then-bare-filename fallback at all (unlike
+    `rule_devcontainer_exec_protect`, which added exactly this fallback
+    after its own QA round C), a silent, total bypass of every shell-branch
+    check (`cd .vscode && jq '.runOptions.runOn="folderOpen"' tasks.json |
+    sponge tasks.json`). Fixed with `VSCODE_CD_RE` + `VSCODE_TASKS_BARE_
+    FILENAME_RE`/`VSCODE_SETTINGS_BARE_FILENAME_RE`, additionally covering
+    `Set-Location`/`sl`/`chdir` (not just `cd`/`pushd`) after round A
+    demonstrated a live PowerShell bypass (`Set-Location .vscode; Set-
+    Content tasks.json ...`) neither `DEVCONTAINER_CD_RE` nor its own first
+    draft covered. Round A separately found jq's object-MERGE idiom (`+=`,
+    operator BEFORE the key, e.g. `.runOptions += {runOn:"folderOpen"}`
+    with the key left unquoted — a legal, idiomatic bare jq identifier)
+    evaded the original assignment-only (`.runOn =`, operator AFTER the
+    key) jq pattern entirely; round B, independently, found that same
+    pattern's fix-target was itself over-broad in the other direction — it
+    matched ANY assignment to `runOn` regardless of value, asking even on a
+    jq script resetting the task to its safe `"default"` value, contradicting
+    the guard's own stated "gate the key AND its dangerous value" design.
+    Both fixed together: `VSCODE_TASKS_JQ_RE`/`VSCODE_SETTINGS_JQ_RE` now
+    match BOTH the direct-assignment and merge-object forms, and BOTH
+    require the specific dangerous value adjacent to the key in either
+    form — closing the false-ALLOW without reopening the false-ASK. Round A
+    also found two lower-confidence MCP structural-argument bypasses (a
+    value wrapped in a one-element list, and the key/value split across two
+    different sibling list items rather than one shared dict) past the
+    original dict-siblings-only fallback; replaced with
+    `_vscode_mcp_bareword_kv_hit`, a flatten-based check requiring no
+    structural relationship between the two tokens at all (mirroring
+    `DEVCONTAINER_EXEC_KEY_BAREWORD_RE`'s own single-token bareword
+    fallback), which closes both uniformly. Full suite green throughout
+    (1201 passed) and a fresh perf/ReDoS pass clean on every new/widened
+    pattern."""
     cfg = getattr(policy, "vscode_tasks_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -2236,7 +2273,7 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
             hit = bool(patterns.VSCODE_TASKS_RUNON_RE.search(content))
             if not hit and ev.action == ActionClass.MCP:
                 hit = bool(_vscode_struct_kv_hit(a, "runon", "folderopen")
-                           or _vscode_struct_sibling_kv_hit(a, "runon", "folderopen"))
+                           or _vscode_mcp_bareword_kv_hit(a, "runon", "folderopen"))
             reason = ("'{p}' is being written with an automatic task "
                       '(`"runOptions": {{"runOn": "folderOpen"}}`) — it runs '
                       "automatically, unattended, the next time this "
@@ -2245,7 +2282,7 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
             hit = bool(patterns.VSCODE_ALLOW_AUTOTASKS_RE.search(content))
             if not hit and ev.action == ActionClass.MCP:
                 hit = bool(_vscode_struct_kv_hit(a, "task.allowautomatictasks", "on")
-                           or _vscode_struct_sibling_kv_hit(a, "task.allowautomatictasks", "on"))
+                           or _vscode_mcp_bareword_kv_hit(a, "task.allowautomatictasks", "on"))
             reason = ("'{p}' is being written with "
                       '`"task.allowAutomaticTasks": "on"` — it silences the '
                       "one human confirmation prompt that otherwise gates "
@@ -2266,8 +2303,27 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                            or patterns.INPLACE_WRITE_RE.search(cmd)
                            or patterns.FORCED_LINK_WRITE_RE.search(cmd))
-        tasks_path_hit = bool(patterns.VSCODE_TASKS_PATH_RE.search(cmd))
-        settings_path_hit = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(cmd))
+        # QA finding (independent adversarial review, rounds A and B, run in
+        # parallel, each independently confirming the other): a prior `cd`/
+        # `pushd`/`Set-Location` into `.vscode` in the SAME command lets
+        # every later reference drop the `.vscode/` prefix entirely (`cd
+        # .vscode && jq '.runOptions.runOn="folderOpen"' tasks.json | sponge
+        # tasks.json`) — `VSCODE_TASKS_PATH_RE`/`VSCODE_SETTINGS_PATH_RE`'s
+        # single-contiguous-match requirement never sees this, and it was a
+        # SILENT, TOTAL bypass (every one of `tasks_jq_hit`/`settings_jq_hit`/
+        # `tasks_write_hit`/`settings_write_hit` depends on one of these two
+        # flags). `*_path_hit` now accepts either the direct match OR the
+        # cd-into-dir + bare-filename pair, mirroring
+        # `rule_devcontainer_exec_protect`'s own `DEVCONTAINER_CD_RE`/
+        # `DEVCONTAINER_BARE_FILENAME_RE` fix for the identical gap (see
+        # `VSCODE_CD_RE`'s own comment in patterns.py).
+        vscode_cd_hit = bool(patterns.VSCODE_CD_RE.search(cmd))
+        tasks_path_hit = bool(patterns.VSCODE_TASKS_PATH_RE.search(cmd)
+                               or (vscode_cd_hit
+                                   and patterns.VSCODE_TASKS_BARE_FILENAME_RE.search(cmd)))
+        settings_path_hit = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(cmd)
+                                  or (vscode_cd_hit
+                                      and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd)))
         tasks_jq_hit = bool(patterns.VSCODE_TASKS_JQ_RE.search(cmd) and tasks_path_hit)
         settings_jq_hit = bool(patterns.VSCODE_SETTINGS_JQ_RE.search(cmd) and settings_path_hit)
         tasks_write_hit = bool(write_verb and tasks_path_hit

@@ -1569,6 +1569,41 @@ VSCODE_TASKS_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# QA finding (independent adversarial review, rounds A and B, run in
+# parallel): `VSCODE_TASKS_PATH_RE`/`VSCODE_SETTINGS_PATH_RE` (below) require
+# `.vscode` and the filename in one CONTIGUOUS match — an entirely ordinary
+# `cd .vscode && jq '.runOptions.runOn="folderOpen"' tasks.json | sponge
+# tasks.json` (or `pushd`, or PowerShell's `Set-Location`) never produces
+# that adjacency, even with zero obfuscation, and was confirmed by BOTH
+# independent reviewers as a silent full bypass of every check in the shell
+# branch. Same companion-pair shape `DEVCONTAINER_CD_RE`/
+# `DEVCONTAINER_BARE_FILENAME_RE` uses for the identical gap in
+# `rule_devcontainer_exec_protect` (used together, both required, at the
+# shell branch's call site in `rule_vscode_tasks_protect`): `VSCODE_CD_RE`
+# flags a `cd`/`pushd`/`Set-Location` into `.vscode` (or a subdirectory)
+# anywhere in the command, and the two bare-filename patterns below flag a
+# bare `tasks.json`/`settings.json` reference with no `.vscode/` prefix
+# required. Neither alone is high-signal; both co-occurring in the same
+# whole command is (same whole-command, not clause-scoped, trade-off
+# `gitattrs_wiring_hit`/`DEVCONTAINER_CD_RE` already document).
+#
+# Additionally accepts `Set-Location`/`sl`/`chdir` (PowerShell/cmd aliases),
+# not just `cd`/`pushd` — round A demonstrated `Set-Location .vscode;
+# Set-Content tasks.json ...` as a live bypass using this exact form.
+VSCODE_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.vscode\b",
+    re.IGNORECASE,
+)
+VSCODE_TASKS_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])tasks\.json" + _CI_END,
+    re.IGNORECASE,
+)
+VSCODE_SETTINGS_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])settings\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
 # The companion workspace-settings file: `.vscode/settings.json`. Carries no
 # lifecycle command of its own, but a `"task.allowAutomaticTasks": "on"`
 # entry silences VS Code's one-time "Allow Automatic Tasks in Folder..."
@@ -1608,20 +1643,43 @@ VSCODE_ALLOW_AUTOTASKS_RE = re.compile(
 # (`.tasks[0].runOptions.runOn="folderOpen"`, `.["task.allowAutomaticTasks"]
 # ="on"`), never adjacent to a quote+colon the way the two key/value
 # patterns above require, usually piped through `sponge` (jq has no `-i`
-# flag, so it's on no write-verb list at all). Requires the assignment shape
-# specifically — a bare, non-mutating `.runOptions.runOn` reference with no
-# trailing `=` does not match — and is ANDed with a whole-command path check
-# at the rule's call site, the same two-part design
-# `DEVCONTAINER_EXEC_JQ_RE`'s own QA history (round B) converged on to avoid
-# false-positiving on a plain read or an unrelated comment.
+# flag, so it's on no write-verb list at all). Unlike
+# `DEVCONTAINER_EXEC_JQ_RE` (whose six keys have no safe value — any
+# assignment is dangerous), `runOn`/`task.allowAutomaticTasks` each have an
+# everyday SAFE value too (`"default"`, `"off"`), so — matching this guard's
+# own "gate the key AND its dangerous value, not the key alone" design
+# principle (see the rule's docstring) — both patterns below require the
+# assigned VALUE itself, not just the assignment shape.
+#
+# Two independent forms are covered: (1) direct dot-path assignment
+# (`.runOn = "folderOpen"`, operator AFTER the key), and (2) jq's object
+# MERGE idiom (`.runOptions += {runOn: "folderOpen"}`, operator BEFORE the
+# key, key/value pair nested inside the merged `{...}` object). QA finding
+# (independent adversarial review, round A): the original version of this
+# pattern only covered form (1) — a realistic, idiomatic merge one-liner
+# using form (2), with the key left UNQUOTED (a valid, ordinary jq object-
+# construction key — `runOn` is a legal bare identifier, unlike
+# `task.allowAutomaticTasks`, whose literal `.` forces it to stay quoted
+# even in merge form) sailed through as a silent, confirmed bypass. Form
+# (2)'s key match (`\brunOn\b`) is deliberately quote-agnostic for this
+# reason; form (1)'s key is a jq PATH expression, which is never quoted in
+# real jq syntax either way.
+#
+# ANDed with a whole-command path check at the rule's call site, the same
+# two-part design `DEVCONTAINER_EXEC_JQ_RE`'s own QA history (round B)
+# converged on to avoid false-positiving on a plain read or an unrelated
+# comment.
 VSCODE_TASKS_JQ_RE = re.compile(
-    r"\bjq\b(?=[^|;&\n]{0,300}\.(?:runOptions\.)?runOn\s*=)",
+    r"\bjq\b(?=[^|;&\n]{0,400}\.(?:runOptions\s*\.\s*)?runOn\s*=\s*[\"']folderOpen[\"'])"
+    r"|\bjq\b(?=[^|;&\n]{0,400}\+=\s*\{[^|;&\n]{0,150}\brunOn\b\s*:\s*[\"']folderOpen[\"'])",
     re.IGNORECASE,
 )
 VSCODE_SETTINGS_JQ_RE = re.compile(
-    r"\bjq\b(?=[^|;&\n]{0,300}"
+    r"\bjq\b(?=[^|;&\n]{0,400}"
     r"(?:\.[\"']?task\.allowAutomaticTasks[\"']?|\[[\"']task\.allowAutomaticTasks[\"']\])"
-    r"\s*=)",
+    r"\s*=\s*[\"']on[\"'])"
+    r"|\bjq\b(?=[^|;&\n]{0,400}\+=\s*\{[^|;&\n]{0,150}"
+    r"[\"']task\.allowAutomaticTasks[\"']\s*:\s*[\"']on[\"'])",
     re.IGNORECASE,
 )
 
