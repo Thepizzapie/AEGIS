@@ -422,6 +422,26 @@ def test_jq_equality_comparison_not_gated():
     assert not _gated(d)
 
 
+def test_jq_unrelated_coincidental_tokens_in_single_script_false_ask_is_accepted_tradeoff():
+    """QA finding (independent adversarial review, round E, verifying round
+    D's own fix): the three-lookahead jq design's "no structural
+    relationship required" breadth isn't limited to crossing a real shell
+    pipe (round D's own disclosed cost) — it also fires within a SINGLE,
+    non-piped jq script when the operator/key/value all happen to be
+    present but unrelated to each other. Here, a fully benign edit sets
+    `task.allowAutomaticTasks` to the SAFE `"off"` value while separately
+    toggling the common, unrelated `files.autoSave` setting to `"on"` in
+    the same one-liner. This is a documented, accepted trade-off (fails
+    toward ASK, never ALLOW, human-escapable), not a bug — this test pins
+    the current (imperfect but deliberate) behavior, the same role
+    `test_mcp_unrelated_tokens_anywhere_in_args_false_ask_is_accepted_
+    tradeoff` plays for the MCP-side equivalent."""
+    d = evaluate(_shell(
+        'jq \'.["task.allowAutomaticTasks"] = "off" | .["files.autoSave"] = "on"\' '
+        '.vscode/settings.json > /tmp/s.json && mv /tmp/s.json .vscode/settings.json'), EMPTY)
+    assert _gated(d) and d.rule == "vscode-tasks-protect"
+
+
 def test_shell_cd_into_vscode_dir_then_jq_bare_filename_gated():
     """QA finding (independent adversarial review, rounds A and B, run in
     parallel — each independently found and confirmed this same bypass): a

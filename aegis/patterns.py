@@ -1707,6 +1707,20 @@ VSCODE_ALLOW_AUTOTASKS_RE = re.compile(
 # an unrelated next command in the same compound line — a narrower version
 # of the same whole-command trade-off already accepted throughout this
 # file, still bounded, still fails toward ASK not ALLOW.
+#
+# QA finding (independent adversarial review, round E, verifying round D's
+# own fix): the "no structural relationship required" breadth isn't limited
+# to crossing a real pipe — it also fires within a SINGLE, non-piped jq
+# script when the operator/key/value all happen to be present but
+# unrelated to each other, e.g. a fully benign edit that sets
+# `task.allowAutomaticTasks` to the SAFE `"off"` value while separately
+# toggling the common, unrelated `files.autoSave` setting to `"on"` in the
+# same one-liner (`.["task.allowAutomaticTasks"] = "off" |
+# .["files.autoSave"] = "on"`). Confirmed non-exploitable (fails toward
+# ASK, never ALLOW; human-escapable) and kept deliberately — the same
+# accepted trade-off as the pipe-crossing case above and
+# `_vscode_mcp_bareword_kv_hit`'s own MCP-side equivalent — but disclosed
+# explicitly since it needs no pipe at all to manifest.
 _VSCODE_JQ_ASSIGN_OP = r"(?:\|=|\+=|(?<![!<>=])=(?!=))"
 VSCODE_TASKS_JQ_RE = re.compile(
     r"\bjq\b"

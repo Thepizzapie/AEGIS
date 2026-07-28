@@ -2289,8 +2289,24 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     from these three lookaheads specifically, accepting the narrower cost
     of now also being able to see across a genuine shell pipe into an
     unrelated next command (bounded, same accepted-trade-off direction).
-    Full suite green throughout (1203 passed) and a fresh perf/ReDoS pass
-    clean on every new/widened pattern."""
+    Round E (follow-up verification of round D's fixes) confirmed no new
+    false-ALLOW anywhere (independent lookaheads only strengthen, never
+    suppress, detection — verified, not assumed), confirmed the
+    `&&`/`;`/newline command-boundary handling and settings-side parity
+    hold, confirmed a multi-line jq script (heredoc / `-f script.jq`) goes
+    undetected but traced this to a pre-existing gap (newlines were already
+    excluded from the scan gap before round D) rather than a regression,
+    and found the round-D pipe-crossing trade-off has a sharper, more
+    concrete instance than originally disclosed: it also fires within a
+    SINGLE, non-piped jq script on coincidental unrelated substrings (e.g.
+    setting `task.allowAutomaticTasks` to its SAFE `"off"` value while
+    separately toggling the common, unrelated `files.autoSave` setting to
+    `"on"` in the same one-liner) — same accepted direction, now disclosed
+    explicitly (see `VSCODE_TASKS_JQ_RE`'s own comment) and pinned with a
+    regression test. Recommended PASS, no round F needed. Full suite green
+    throughout (1209 passed) and a fresh perf/ReDoS pass (including a
+    50,000-repetition adversarial probe, ~756ms, linear scaling) clean on
+    every new/widened pattern."""
     cfg = getattr(policy, "vscode_tasks_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
