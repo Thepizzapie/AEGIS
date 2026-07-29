@@ -961,11 +961,12 @@ def _direnv_allowed_by_policy(cfg: dict, text: str) -> bool:
 
 
 def rule_direnv_protect(ev: Event, policy=None) -> Optional[Decision]:
-    """Block planting/altering a direnv-managed shell script (a project
-    ``.envrc``, or the GLOBAL ``direnvrc`` — ``~/.config/direnv/direnvrc`` /
-    the legacy ``~/.direnvrc``) and block the activation commands
-    (``direnv allow``/``direnv permit``/``direnv edit``) that trust an
-    untrusted/changed ``.envrc`` with no file write of their own.
+    """Block planting/altering a direnv-managed file (a project ``.envrc``;
+    the GLOBAL ``direnvrc`` — ``~/.config/direnv/direnvrc`` / the legacy
+    ``~/.direnvrc``; or ``direnv.toml``'s ``[whitelist]``, which pre-trusts
+    matching ``.envrc`` paths unconditionally) and block the activation
+    commands (``direnv allow``/``direnv permit``/``direnv edit``) that trust
+    an untrusted/changed ``.envrc`` with no file write of their own.
 
     THREAT MODEL: reached by no existing guard at all — direnv (bundled or
     one ``apt``/``brew install`` away, routine in Python/Node/Go dev setups
@@ -1040,7 +1041,47 @@ def rule_direnv_protect(ev: Event, policy=None) -> Optional[Decision]:
     the project root, too generic a bare-directory signal to gate on without
     flagging nearly every project checkout, the same "too generic" trade-off
     ``SHELL_PERSIST_FIND_RE`` already accepts for the bare words
-    "config"/"profile"."""
+    "config"/"profile".
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention ``rule_service_persist_protect``/``rule_git_config_exec_protect``
+    used): round A (bypass hunting) found the original draft's file-write
+    half covered only the two exec-capable files (``.envrc``/``direnvrc``),
+    missing ``direnv.toml``'s ``[whitelist]`` — not itself executable, but
+    its ``prefix``/``exact`` entries pre-trust matching ``.envrc`` paths
+    UNCONDITIONALLY (direnv's own docs: honored "regardless of contents or
+    past usage of `direnv allow`/`direnv deny`"), a strictly MORE dangerous
+    primitive than trusting one ``.envrc`` — every future ``.envrc`` under
+    the whitelisted prefix auto-runs too, forever, with no further
+    per-content check; fixed by adding it to ``DIRENV_PATH_RE`` and the
+    ``find``-indirection fragment list (see ``patterns.py``'s own comment on
+    this fix). Round A also surfaced three gaps confirmed to be pre-existing
+    and SHARED across every literal-substring guard in this file, not new or
+    unique to this one (verified against ``rule_service_persist_protect``
+    with the equivalent input, same result both times) — disclosed here
+    rather than fixed, since a real fix belongs in the shared
+    ``normalize.scan_surface``/activation-regex layer every ``*_protect``
+    guard builds on, not in one guard's patterns: (1) a bare backslash
+    before an ordinary character is removed by bash at parse time (``di\\
+    renv`` IS ``direnv``) but ``scan_surface`` only strips quote characters
+    and ANSI-C (``$'...'``) escapes, never a bare mid-token backslash, so
+    ``echo x >> .e\\nvrc``/``di\\renv allow`` both evade detection the same
+    way ``echo x >> ~/.ba\\shrc`` already evades ``rule_shell_persist_protect``
+    today; (2) a one-line shell function wrapper (``d() { direnv "$@"; }; d
+    allow``) breaks ``DIRENV_ACTIVATE_RE``'s word-adjacency assumption while
+    bash still executes the real command — the same gap
+    ``SERVICE_ACTIVATE_CMD_RE`` already has for ``s() { systemctl "$@"; }; s
+    enable evil.service``; (3) the 200-char non-greedy gap
+    ``DIRENV_ACTIVATE_RE`` inherited from ``SERVICE_ACTIVATE_CMD_RE`` is a
+    wider fixed bound, not a structural fix, so a single ~220-char padding
+    argument still pushes the verb outside it, the exact bug class that
+    guard's own docstring already discloses widening (not eliminating) at
+    round A of its own QA. Round B (design/consistency) confirmed the
+    guard's structure, escape hatches, and registration (``_CORE_RULES``,
+    ``Policy``, ``loader.py``, ``skills.py``, README) all match sibling-guard
+    convention with no gaps, verified the ``loader.py`` YAML knob wiring
+    end-to-end (not just by reading), and confirmed no ReDoS risk on
+    adversarial input for any of this guard's new patterns."""
     cfg = getattr(policy, "direnv", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

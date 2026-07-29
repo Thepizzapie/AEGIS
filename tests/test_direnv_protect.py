@@ -84,6 +84,30 @@ def test_custom_xdg_config_home_direnvrc_gated():
     assert _gated(d) and d.rule == "direnv-protect"
 
 
+def test_direnv_toml_whitelist_gated():
+    """QA finding (independent adversarial review, round A): direnv.toml's
+    [whitelist] prefix/exact entries pre-trust matching .envrc paths
+    UNCONDITIONALLY (direnv's own docs), regardless of direnv allow/deny or
+    content — strictly more dangerous than trusting a single .envrc, since
+    every FUTURE .envrc under the whitelisted prefix auto-runs too with no
+    further check. Missing from the original draft, which covered only the
+    two exec-capable files."""
+    d = evaluate(_write("~/.config/direnv/direnv.toml"), EMPTY)
+    assert _gated(d) and d.rule == "direnv-protect"
+
+
+def test_direnv_toml_shell_write_gated():
+    d = evaluate(_shell(
+        "printf '[whitelist]\\nprefix = [\"/home\"]\\n' >> ~/.config/direnv/direnv.toml"),
+        EMPTY)
+    assert _gated(d) and d.rule == "direnv-protect"
+
+
+def test_direnv_toml_find_indirection_gated():
+    assert _gated(evaluate(
+        _shell("cp evil.toml $(find . -name direnv.toml)"), EMPTY))
+
+
 # ---- MCP-tool writes -------------------------------------------------------
 
 def test_mcp_tool_write_to_envrc_gated():

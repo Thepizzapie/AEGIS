@@ -1347,6 +1347,15 @@ def shell_persist_find_hit(cmd: str) -> bool:
 #     at all. This is the direnv analog of `~/.bashrc`
 #     (`rule_shell_persist_protect`'s own target) but fires on every `cd` into
 #     ANY direnv-managed project, not just on opening a new shell.
+#   - `direnv.toml`'s `[whitelist]` (`$XDG_CONFIG_HOME/direnv/direnv.toml`) —
+#     not itself executable, but its `prefix`/`exact` entries pre-trust
+#     matching `.envrc` paths UNCONDITIONALLY, honored (per direnv's own
+#     docs) "regardless of contents or past usage of `direnv allow`/`direnv
+#     deny`". A single write here is more dangerous than trusting one
+#     `.envrc`: every FUTURE `.envrc` under the whitelisted prefix auto-runs
+#     too, forever, with no further per-content check — QA finding
+#     (independent adversarial review): missing from the original draft,
+#     which covered only the two exec-capable files above.
 #
 # The one thing that makes this surface distinct from shell-persist's .bashrc
 # half: direnv ships its own defense — an untrusted/changed `.envrc` is
@@ -1360,10 +1369,21 @@ def shell_persist_find_hit(cmd: str) -> bool:
 # this guard, like `rule_service_persist_protect`, has a file-write half AND
 # an activation-command half.
 _DIRENV_END = _CI_END
+# `direnv.toml`'s `[whitelist]` `prefix`/`exact` entries pre-trust matching
+# `.envrc` paths UNCONDITIONALLY — direnv's own docs: honored "regardless of
+# contents or past usage of `direnv allow`/`direnv deny`". That's strictly
+# more dangerous than planting a payload in `.envrc` itself: a single write
+# here means every FUTURE `.envrc` under the whitelisted prefix auto-runs
+# too, with no further per-content trust check ever again — QA finding
+# (independent adversarial review): the original draft covered only the two
+# exec-capable files (`.envrc`/`direnvrc`), missing this config-only file
+# that nonetheless controls whether the exec-capable one needs any
+# confirmation at all.
 DIRENV_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.envrc" + _DIRENV_END
     + r"|(?:^|[\s'\"/\\=])\.direnvrc" + _DIRENV_END
-    + r"|(?:^|[\s'\"/\\=])direnv" + _WIN_TRIM + _SEP + r"direnvrc" + _DIRENV_END,
+    + r"|(?:^|[\s'\"/\\=])direnv" + _WIN_TRIM + _SEP + r"direnvrc" + _DIRENV_END
+    + r"|(?:^|[\s'\"/\\=])direnv" + _WIN_TRIM + _SEP + r"direnv\.toml" + _DIRENV_END,
     re.IGNORECASE,
 )
 
@@ -1380,7 +1400,7 @@ DIRENV_ACTIVATE_RE = re.compile(
 
 # `find -path/-name/-wholename/-regex` indirection, same reason
 # SHELL_PERSIST_FIND_RE exists for its own surface.
-_DIRENV_FIND_FRAGMENTS = r"envrc|direnvrc"
+_DIRENV_FIND_FRAGMENTS = r"envrc|direnvrc|direnv\.toml"
 DIRENV_FIND_RE = _find_predicate_re(r"(?:" + _DIRENV_FIND_FRAGMENTS + r")")
 
 
