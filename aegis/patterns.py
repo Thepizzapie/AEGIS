@@ -1329,6 +1329,65 @@ def shell_persist_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, SHELL_PERSIST_FIND_RE)
 
 
+# ---- direnv .envrc / direnvrc auto-exec-on-cd protection ---------------------
+# direnv (https://direnv.net, bundled or one `apt`/`brew install direnv` away,
+# routine in Python/Node/Go dev setups for per-project env vars and
+# venv/nvm/asdf activation) auto-SOURCES two kinds of shell script no existing
+# guard reaches:
+#   - A project `.envrc` — arbitrary bash, run automatically the next time
+#     ANYONE (this agent, a teammate, CI via `direnv exec`) `cd`s into that
+#     directory or a descendant of it, once the current content hash has been
+#     trusted via `direnv allow`/`direnv permit`. direnv nests: a `.envrc` in
+#     a subdirectory is sourced in addition to (not instead of) its parents',
+#     so planting one several levels deep from the project root still fires.
+#   - The GLOBAL `direnvrc` (`$XDG_CONFIG_HOME/direnv/direnvrc`, i.e.
+#     `~/.config/direnv/direnvrc` on a default XDG setup, or the legacy
+#     `~/.direnvrc`) — bash functions sourced for EVERY `.envrc` on the whole
+#     machine, for every project, with NO per-file `direnv allow` hash-check
+#     at all. This is the direnv analog of `~/.bashrc`
+#     (`rule_shell_persist_protect`'s own target) but fires on every `cd` into
+#     ANY direnv-managed project, not just on opening a new shell.
+#
+# The one thing that makes this surface distinct from shell-persist's .bashrc
+# half: direnv ships its own defense — an untrusted/changed `.envrc` is
+# blocked with a loud warning until a human runs `direnv allow`. But that
+# defense is just a CLI subcommand, not an OS dialog a human alone can click
+# — an agent that plants a payload and then runs `direnv allow`/`direnv
+# permit` (or `direnv edit`, which opens $EDITOR and auto-allows on save)
+# itself defeats direnv's own human-in-the-loop check exactly the way
+# `rule_vscode_tasks_protect`'s `task.allowAutomaticTasks: "on"` guard exists
+# to catch a config value that silences VS Code's own one-time prompt. So
+# this guard, like `rule_service_persist_protect`, has a file-write half AND
+# an activation-command half.
+_DIRENV_END = _CI_END
+DIRENV_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.envrc" + _DIRENV_END
+    + r"|(?:^|[\s'\"/\\=])\.direnvrc" + _DIRENV_END
+    + r"|(?:^|[\s'\"/\\=])direnv" + _WIN_TRIM + _SEP + r"direnvrc" + _DIRENV_END,
+    re.IGNORECASE,
+)
+
+# `direnv allow`/`direnv permit` (synonyms) trust the CURRENT content hash of
+# an `.envrc`, silencing direnv's own "blocked" warning on the next `cd`;
+# `direnv edit` opens $EDITOR then auto-allows on save. 200-char non-greedy
+# gap between the command and its verb, same bound `SERVICE_ACTIVATE_CMD_RE`
+# uses after that guard's own QA found a narrower gap defeated by nothing
+# more exotic than an ordinary intervening flag.
+DIRENV_ACTIVATE_RE = re.compile(
+    r"\bdirenv\b[^|;&\n]{0,200}?\b(?:allow|permit|edit)\b",
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# SHELL_PERSIST_FIND_RE exists for its own surface.
+_DIRENV_FIND_FRAGMENTS = r"envrc|direnvrc"
+DIRENV_FIND_RE = _find_predicate_re(r"(?:" + _DIRENV_FIND_FRAGMENTS + r")")
+
+
+def direnv_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, DIRENV_FIND_RE)
+
+
 # ---- systemd unit / launchd persistence protection --------------------------
 # The Linux/macOS analog of Windows' scheduled-tasks/services (already caught,
 # non-escapably, by PERSIST_RE inside rule_containment) and of the same
