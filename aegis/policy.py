@@ -142,6 +142,14 @@ class Policy:
     # /etc/profile.d/*.sh/a PowerShell $PROFILE and ~/.ssh/authorized_keys/
     # ~/.ssh/config/sshd_config/ssh_config. See rules.rule_shell_persist_protect.
     shell_persist: dict = field(default_factory=dict)
+    # direnv .envrc / global direnvrc auto-exec-on-cd protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a project .envrc (any nesting depth)
+    # and the global direnvrc (~/.config/direnv/direnvrc, ~/.direnvrc), plus
+    # the direnv allow/permit/edit activation commands that trust an
+    # untrusted/changed .envrc with no file write of their own. See
+    # rules.rule_direnv_protect.
+    direnv: dict = field(default_factory=dict)
     # Package-manifest lifecycle-script / registry-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers package.json/composer.json lifecycle

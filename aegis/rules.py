@@ -949,6 +949,197 @@ def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- direnv .envrc / direnvrc auto-exec-on-cd protection: escapable with human confirm --
+def _direnv_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_direnv_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a direnv-managed file (a project ``.envrc``;
+    the GLOBAL ``direnvrc`` — ``~/.config/direnv/direnvrc`` / the legacy
+    ``~/.direnvrc``; or ``direnv.toml``'s ``[whitelist]``, which pre-trusts
+    matching ``.envrc`` paths unconditionally) and block the activation
+    commands (``direnv allow``/``direnv permit``/``direnv edit``) that trust
+    an untrusted/changed ``.envrc`` with no file write of their own.
+
+    THREAT MODEL: reached by no existing guard at all — direnv (bundled or
+    one ``apt``/``brew install`` away, routine in Python/Node/Go dev setups
+    for per-project env vars and venv/nvm/asdf activation) auto-SOURCES a
+    project's ``.envrc`` as arbitrary bash the next time ANYONE (this agent,
+    a teammate, CI via ``direnv exec``) ``cd``s into that directory or a
+    descendant of it — no git operation, CI run, or agent-session restart
+    needed, the same "fires on the single most common action there is"
+    shape ``rule_shell_persist_protect``'s own ``.bashrc`` half already
+    covers, but for `cd` rather than opening a new shell, and direnv nests:
+    a ``.envrc`` several directories below the project root still fires,
+    sourced in addition to its parents'. The GLOBAL ``direnvrc`` is worse:
+    it is sourced for EVERY ``.envrc`` on the whole machine, for every
+    project, with NO per-file trust check at all — the direnv analog of
+    ``~/.bashrc`` itself, but firing on every ``cd`` into ANY direnv-managed
+    project rather than only on a new shell.
+
+    What makes this surface distinct from ``rule_shell_persist_protect``'s:
+    direnv ships its own defense — an untrusted or changed ``.envrc`` is
+    blocked with a loud warning until a human runs ``direnv allow``. But
+    that defense is a CLI subcommand an agent can invoke itself, not an OS
+    dialog only a human can click — unlike VS Code's one-time "Allow
+    Automatic Tasks" prompt, nothing stops a spawned agent from running
+    ``direnv allow`` right after planting the payload and defeating direnv's
+    own human-in-the-loop check in the same tool call. ``direnv edit`` is the
+    same risk under a different name: it opens ``$EDITOR`` and then
+    auto-allows on save, so a non-interactive ``$EDITOR`` (a script that
+    just exits 0, say) makes it equivalent to an unconditional ``allow``.
+    This is why the guard has a file-write half AND an activation-command
+    half, the same three-way split ``rule_service_persist_protect`` uses for
+    ``systemctl enable``/``launchctl load``.
+
+    Config (``policy.direnv``): ``mode`` (deny|ask|monitor|off, default ask),
+    ``allow`` (regexes on the path/command that skip the gate — a repo's own
+    trusted ``.envrc`` bootstrap script, say). Defaults to ``ask`` for the
+    same reason every sibling ``*_protect`` guard does: editing a project's
+    ``.envrc`` to add a `PATH` tweak or a venv activation line is routine,
+    sanctioned dev work, unlike planting an MCP server — it just needs a
+    human to have actually looked at it before it runs unattended.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_DIRENV=1`` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot
+    set its own env for a hook invocation it doesn't control, so neither
+    path is agent-self-escapable — the same invariant every escapable guard
+    in this file holds. Note this means ``direnv allow``/``direnv permit``
+    run BY A HUMAN, after they've reviewed the diff, is exactly the
+    confirmation this guard exists to require — the guard does not fire
+    twice; it just makes the review actually happen before the trust is
+    granted instead of after.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path assembled indirectly (shell variable concatenation
+    across separate assignments, a ``for``/``xargs`` loop, ``basename``/
+    ``dirname`` reconstruction) rather than appearing as one contiguous
+    literal is not caught; a direct fetch-to-file write (``curl -o .envrc
+    ...``, ``wget -O ~/.config/direnv/direnvrc ...``) is caught by none of
+    the shell branch's five write-verb checks — the same inherited gap
+    ``rule_ci_workflow_protect``/``rule_git_hooks_protect``/
+    ``rule_agent_def_protect``/``rule_shell_persist_protect``/
+    ``rule_service_persist_protect`` already disclose, not new or worse
+    here; an ``$XDG_CONFIG_HOME`` relocation of where the global ``direnvrc``
+    lives is not covered when set to a directory this guard's patterns don't
+    otherwise recognize — the same "computed indirectly, not a literal path"
+    class of gap ``rule_shell_persist_protect``'s own docstring already
+    accepts for fish's ``$XDG_CONFIG_HOME``/zsh's ``$ZDOTDIR``; and, unlike
+    ``rule_shell_persist_protect``/``rule_service_persist_protect``, this
+    guard has no bare-directory ``find_hit``/``DIR_RE`` fallback for an
+    archive/sync tool that restores a whole project directory containing an
+    ``.envrc`` without ever naming it discretely — deliberately: unlike
+    ``.ssh`` or a systemd unit dir, an ``.envrc``'s own parent directory IS
+    the project root, too generic a bare-directory signal to gate on without
+    flagging nearly every project checkout, the same "too generic" trade-off
+    ``SHELL_PERSIST_FIND_RE`` already accepts for the bare words
+    "config"/"profile".
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention ``rule_service_persist_protect``/``rule_git_config_exec_protect``
+    used): round A (bypass hunting) found the original draft's file-write
+    half covered only the two exec-capable files (``.envrc``/``direnvrc``),
+    missing ``direnv.toml``'s ``[whitelist]`` — not itself executable, but
+    its ``prefix``/``exact`` entries pre-trust matching ``.envrc`` paths
+    UNCONDITIONALLY (direnv's own docs: honored "regardless of contents or
+    past usage of `direnv allow`/`direnv deny`"), a strictly MORE dangerous
+    primitive than trusting one ``.envrc`` — every future ``.envrc`` under
+    the whitelisted prefix auto-runs too, forever, with no further
+    per-content check; fixed by adding it to ``DIRENV_PATH_RE`` and the
+    ``find``-indirection fragment list (see ``patterns.py``'s own comment on
+    this fix). Round A also surfaced three gaps confirmed to be pre-existing
+    and SHARED across every literal-substring guard in this file, not new or
+    unique to this one (verified against ``rule_service_persist_protect``
+    with the equivalent input, same result both times) — disclosed here
+    rather than fixed, since a real fix belongs in the shared
+    ``normalize.scan_surface``/activation-regex layer every ``*_protect``
+    guard builds on, not in one guard's patterns: (1) a bare backslash
+    before an ordinary character is removed by bash at parse time (``di\\
+    renv`` IS ``direnv``) but ``scan_surface`` only strips quote characters
+    and ANSI-C (``$'...'``) escapes, never a bare mid-token backslash, so
+    ``echo x >> .e\\nvrc``/``di\\renv allow`` both evade detection the same
+    way ``echo x >> ~/.ba\\shrc`` already evades ``rule_shell_persist_protect``
+    today; (2) a one-line shell function wrapper (``d() { direnv "$@"; }; d
+    allow``) breaks ``DIRENV_ACTIVATE_RE``'s word-adjacency assumption while
+    bash still executes the real command — the same gap
+    ``SERVICE_ACTIVATE_CMD_RE`` already has for ``s() { systemctl "$@"; }; s
+    enable evil.service``; (3) the 200-char non-greedy gap
+    ``DIRENV_ACTIVATE_RE`` inherited from ``SERVICE_ACTIVATE_CMD_RE`` is a
+    wider fixed bound, not a structural fix, so a single ~220-char padding
+    argument still pushes the verb outside it, the exact bug class that
+    guard's own docstring already discloses widening (not eliminating) at
+    round A of its own QA. Round B (design/consistency) confirmed the
+    guard's structure, escape hatches, and registration (``_CORE_RULES``,
+    ``Policy``, ``loader.py``, ``skills.py``, README) all match sibling-guard
+    convention with no gaps, verified the ``loader.py`` YAML knob wiring
+    end-to-end (not just by reading), and confirmed no ReDoS risk on
+    adversarial input for any of this guard's new patterns."""
+    cfg = getattr(policy, "direnv", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "direnv-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.DIRENV_PATH_RE.search(p)):
+            return None
+        if os.environ.get("AEGIS_ALLOW_DIRENV") or _direnv_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"direnv-managed file '{p}' is being written — it runs as "
+                   "arbitrary shell, automatically and unattended, the next "
+                   "time anyone `cd`s into this project (or, for the global "
+                   "direnvrc, into ANY direnv-managed project on this "
+                   "machine)")
+        return _finish(Decision(action, "direnv-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_DIRENV=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.DIRENV_PATH_RE.search(cmd)
+                             or patterns.direnv_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        activates = bool(patterns.DIRENV_ACTIVATE_RE.search(cmd))
+        if not (touches_target or activates):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DIRENV")
+                or _direnv_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A direnv-managed file is being modified from a shell"
+                   if touches_target else
+                   "direnv is being told to trust/edit an .envrc, silencing "
+                   "its own untrusted-content warning")
+        return _finish(Decision(action, "direnv-protect",
+                         f"{reason} — it runs automatically, unattended, the "
+                         "next time anyone `cd`s into this (or any "
+                         "direnv-managed) project. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_DIRENV=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
 # ---- package-manifest lifecycle-script / registry-hijack protection ----------
 def _package_manifest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -2813,6 +3004,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_agent_def_protect,
     rule_shell_persist_protect,
+    rule_direnv_protect,
     rule_package_manifest_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,

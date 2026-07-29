@@ -39,6 +39,7 @@ _REMEDIES = """\
 | git-hooks-protect | wrote a git hook / redirected core.hooksPath (runs later, untracked by git) | ask the human; they can set AEGIS_ALLOW_GIT_HOOKS=1 after review |
 | agent-def-protect | wrote CLAUDE.md/AGENTS.md or a .claude/agents or .claude/commands definition (auto-loaded/auto-invoked next session) | ask the human; they can set AEGIS_ALLOW_AGENT_DEF=1 after review |
 | shell-persist-protect | wrote a shell startup/profile file or an SSH persistence target (runs on the next shell open / ssh connection) | ask the human; they can set AEGIS_ALLOW_SHELL_PERSIST=1 after review |
+| direnv-protect | wrote a project .envrc or the global direnvrc, or ran direnv allow/permit/edit (runs on the next `cd` into the project) | ask the human; they can set AEGIS_ALLOW_DIRENV=1 after review |
 | service-persist-protect | wrote a systemd unit/timer or launchd plist, or ran systemctl enable / launchctl load (runs on the next boot / login) | ask the human; they can set AEGIS_ALLOW_SERVICE_PERSIST=1 after review |
 | devcontainer-exec-protect | wrote a devcontainer.json lifecycle command (initializeCommand/onCreateCommand/postCreateCommand/postStartCommand/postAttachCommand/updateContentCommand) | ask the human; they can set AEGIS_ALLOW_DEVCONTAINER_EXEC=1 after review |
 | vscode-tasks-protect | wrote a VS Code automatic task (tasks.json runOn: "folderOpen") or silenced its confirmation prompt (settings.json task.allowAutomaticTasks: "on") | ask the human; they can set AEGIS_ALLOW_VSCODE_TASKS_EXEC=1 after review |
@@ -100,7 +101,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `shell_persist`, `package_manifest`, `service_persist`, `devcontainer_exec`, `vscode_tasks_exec`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `shell_persist`, `direnv`, `package_manifest`, `service_persist`, `devcontainer_exec`, `vscode_tasks_exec`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -144,7 +145,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
    - declarative rule: `rules: [{{name, action: allow|deny|ask, tools/actions/
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
-     `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `shell_persist`,
+     `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `shell_persist`, `direnv`,
      `package_manifest`, `service_persist`, `devcontainer_exec`, `vscode_tasks_exec`, `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
