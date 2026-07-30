@@ -197,6 +197,15 @@ class Policy:
     # silences VS Code's one-time confirmation prompt for the former). See
     # rules.rule_vscode_tasks_protect.
     vscode_tasks_exec: dict = field(default_factory=dict)
+    # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted
+    # command name (git, ssh, sudo, curl, python, pip, npm, docker, aws,
+    # aegis, ...) inside a directory that already sits ahead of the system
+    # directories on $PATH (~/.local/bin, ~/.cargo/bin, pyenv/rbenv/asdf
+    # shims, ~/go/bin, /usr/local/bin, /opt/homebrew/bin, ...). See
+    # rules.rule_path_hijack_protect.
+    path_hijack: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.

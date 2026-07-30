@@ -2604,6 +2604,161 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
+def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_path_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting, symlinking, or `chmod +x`-ing an executable over a
+    trusted command name (git, ssh, sudo, curl, python, pip, npm, docker,
+    aws, aegis, ...) inside a directory that already sits ahead of the
+    system directories on $PATH.
+
+    THREAT MODEL: reached by no existing guard. Every other `*_protect` guard
+    in this file protects a config/definition file consulted by a specific
+    subsystem on a specific FUTURE trigger — a git operation, a CI push, a
+    new shell, a `cd`. PATH resolution has no such trigger: the very next
+    time this agent, a teammate, or CI runs a shadowed command BY ITS BARE
+    NAME — the overwhelmingly common way any of them is invoked — the shell
+    resolves it to the planted file instead of the real tool. No git
+    operation, CI run, reboot, new shell, or `cd` needed; the victim's own
+    routine use of the tool IS the trigger, and it can fire within the same
+    session that planted it.
+
+    User-local bin directories (`~/.local/bin`, `~/.cargo/bin`, pyenv/
+    rbenv/asdf shims, `~/go/bin`) are ROUTINELY ahead of `/usr/bin` on a
+    modern dev machine — that's the point of `pip install --user`/`cargo
+    install`/pyenv, not a misconfiguration — and `/usr/local/bin` outranks
+    `/usr/bin` on nearly every Linux/macOS default PATH. A planted `git`,
+    `ssh`, `sudo`, `curl`, `pip`, or `aegis` there is a durable backdoor
+    invisible to `git diff`/`git status`/code review (it isn't a tracked
+    project file at all) that needs no external trigger — unlike a git hook
+    (next matching git op) or a CI workflow (next push), the human's or
+    CI's own ordinary use of the shadowed command is what runs it. A
+    shadowed `aegis` is also a self-protection gap none of
+    AEGIS_SOURCE_RE/ENFORCEMENT_PATH_RE reach, since those cover Aegis's
+    source TREE, not the installed executable resolved off PATH.
+
+    Config (``policy.path_hijack``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a
+    repo's own sanctioned `~/.local/bin` tool-install script, say). Default
+    ``ask``: installing a CLI tool into one of these directories via the
+    NORMAL path (`pip install --user`, `cargo install`, `go install`, a
+    package manager) is routine, sanctioned dev work that never literally
+    names the target file in the invoking command line, so it doesn't match
+    this guard at all — only a direct Edit/Write/MCP write, shell
+    redirect/copy/move/symlink/archive-extract, or `chmod +x`, onto ONE OF A
+    CURATED LIST of security-relevant command names inside one of these
+    directories gates.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_PATH_HIJACK=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control (``_is_agent()``), so neither path is agent-self-escapable — the
+    same invariant every escapable guard in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: gated on a CURATED command-name list, not "any file written
+    into a PATH directory" — an unlisted, unusual command name shadowed
+    there is not caught, the deliberate precision-over-recall trade-off
+    ``rule_package_manifest_protect``'s own docstring makes for the same
+    reason (gating on the directory alone would ask on every routine
+    user-scoped package install). A path assembled indirectly (shell
+    variable concatenation, a `for`/`xargs` loop, `basename`/`dirname`
+    reconstruction) rather than appearing as one contiguous literal is not
+    caught, the same class every sibling guard accepts. Deliberately NO
+    `find -path/-name` indirection fallback (unlike most siblings): the
+    command names this guard watches for (`go`, `sh`, `cc`, `su`, `make`,
+    `node`, ...) are common substrings of entirely unrelated, legitimate
+    `find` targets (`node_modules`, `Makefile.am`, `google-cloud-sdk`), and
+    the false-positive rate from wiring them into the shared
+    `_find_predicate_re` helper was judged worse than the disclosed gap — a
+    deliberate scope choice, not an oversight, the same trade-off
+    ``rule_package_manifest_protect``'s own docstring makes for its own
+    directory-indirection gap. A direct fetch-to-file write (`curl -o
+    ~/.local/bin/git ...`) is caught by none of the shell branch's write-verb
+    checks, the same inherited gap eight sibling guards already disclose.
+    `chmod` is matched only in its symbolic `+x` form, not a numeric mode
+    (`chmod 755 ...`) — disclosed above at the pattern definition
+    (``PATH_HIJACK_CHMOD_RE``). And this guard only recognizes a CURATED set
+    of bin directories; an unusual custom PATH entry (a project-local
+    `./scripts/bin` a developer prepends in their own shell config, a
+    corporate-wrapped toolchain install location) carries no signal this
+    guard's patterns recognize at all — PATH itself is not introspected
+    (Aegis has no reliable, static way to know what a FUTURE shell's
+    resolved PATH will actually be), so coverage is necessarily a curated
+    guess at the common cases, not a PATH-aware guarantee. Deny-by-default
+    egress and workspace confinement are unrelated backstops that do not
+    cover this surface at all — found a bypass? That's a bug worth
+    reporting."""
+    cfg = getattr(policy, "path_hijack", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "path-hijack-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.PATH_BIN_TARGET_RE.search(p)):
+            return None
+        if os.environ.get("AEGIS_ALLOW_PATH_HIJACK") or _path_hijack_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"'{p}' shadows a trusted command on $PATH — the next bare "
+                   "invocation of that command name, by this agent, a "
+                   "teammate, or CI, silently runs this file instead of the "
+                   "real tool, with no reboot/new-shell/git-op needed")
+        return _finish(Decision(action, "path-hijack-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_PATH_HIJACK=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        target_named = bool(patterns.PATH_BIN_TARGET_RE.search(cmd))
+        touches_target = target_named and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+            or patterns.PATH_HIJACK_CHMOD_RE.search(cmd))
+        dir_only = bool(patterns.PATH_BIN_DIR_RE.search(cmd)
+                         and patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not (touches_target or dir_only):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PATH_HIJACK")
+                or _path_hijack_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A trusted command name on $PATH is being shadowed"
+                   if touches_target else
+                   "An archive/sync tool is extracting into a $PATH bin "
+                   "directory, which can plant a shadowed command without "
+                   "ever naming it discretely")
+        return _finish(Decision(action, "path-hijack-protect",
+                         f"{reason} — the next bare invocation of that "
+                         "command name, by anyone, silently runs the "
+                         "planted file instead of the real tool. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_PATH_HIJACK=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -3011,6 +3166,7 @@ _CORE_RULES = (
     rule_service_persist_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
+    rule_path_hijack_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

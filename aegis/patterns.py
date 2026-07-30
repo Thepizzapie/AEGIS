@@ -441,7 +441,26 @@ EXFIL_RE = re.compile(
     r"|Invoke-(?:RestMethod|WebRequest)\b[^|;&\n]*?-InFile\b"
     # scp/rsync to a user@host: remote. The '@' anchor avoids matching a LOCAL copy
     # of a file whose name contains a dot+colon (e.g. a timestamp 'log.12:30.txt').
-    r"|\b(?:scp|rsync)\b[^|;&\n]*\s[^\s|;&]*@[^\s|;&]*:"
+    #
+    # QA finding (independent adversarial review of an unrelated new guard,
+    # path-hijack-protect — discovered incidentally while stress-testing that
+    # guard's own perf test, not by exercising containment/EXFIL_RE directly,
+    # the same way FIND_PROTECTED_RE's round-8 catastrophic-backtracking bug
+    # was found): the ORIGINAL unbounded `[^|;&\n]*` between the verb and the
+    # required `\s` overlaps that class's own allowed characters (space is
+    # NOT excluded from `[^|;&\n]`), so on an input with no `@` anywhere
+    # after a real `scp`/`rsync` match (e.g. `"rsync -a x/ y/ " * 8000`, an
+    # ordinary-shaped long argument list, not a contrived string), the engine
+    # backtracks through every possible split point between the two
+    # overlapping classes before concluding failure — 13+ seconds measured on
+    # a ~120KB input reaching this NEVER-escapable guard through the real
+    # evaluate() pipeline, a fail-open bypass of containment itself (README:
+    # "Fail-open by default"). Bounded to `{0,200}?` (lazy, matching
+    # DIRENV_ACTIVATE_RE/SERVICE_ACTIVATE_CMD_RE's own verb-to-target gap
+    # convention) — an scp/rsync invocation's remote-target argument
+    # realistically sits within 200 chars of the verb; see
+    # `test_no_catastrophic_backtracking_on_exfil_re` for the regression.
+    r"|\b(?:scp|rsync)\b[^|;&\n]{0,200}?\s[^\s|;&]*@[^\s|;&]*:"
     r"|\b(?:nc|ncat|netcat)\b[^|;&\n]*<\s*\S"
     # httpie invoked as a command, piping/attaching a local file (http POST u < f,
     # http -f POST u field@file). Anchored to a command position so an https:// URL
@@ -1408,6 +1427,128 @@ def direnv_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, DIRENV_FIND_RE)
 
 
+# ---- PATH binary-shadow (hijack) protection -----------------------------------
+# Every guard above this point protects a FILE that runs later, on some future
+# trigger (a git operation, a CI push, a new shell, a `cd`). This surface is
+# different in kind, not degree: dropping (or symlinking, or `chmod +x`-ing) an
+# executable over a TRUSTED COMMAND NAME inside a directory that already sits
+# ahead of the system directories on $PATH shadows that command for every BARE
+# invocation of its name from that point on — no git operation, CI run, reboot,
+# new shell, or `cd` required. The very next time this agent, a teammate, or CI
+# runs `git`/`pip`/`npm`/`curl`/... by its bare name (the overwhelmingly common
+# way any of them is invoked), the shell's own PATH search resolves it to the
+# planted file instead of the real tool. User-local bin directories
+# (`~/.local/bin`, `~/.cargo/bin`, pyenv/rbenv/asdf shims, `~/go/bin`) are
+# ROUTINELY ahead of `/usr/bin` on a modern dev machine — that's the whole
+# point of `pip install --user`/`cargo install`/pyenv, not a misconfiguration —
+# and `/usr/local/bin` outranks `/usr/bin` on nearly every Linux/macOS default
+# PATH. A single planted `git`, `ssh`, `sudo`, `curl`, `pip`, or `aegis` there
+# is a durable, invisible-to-`git diff` backdoor: it isn't a tracked project
+# file, survives no code review, and (unlike a git hook or CI workflow) needs
+# no external trigger at all — the human's or CI's own routine use of the tool
+# it shadows IS the trigger.
+#
+# THREAT MODEL: reached by no existing guard. containment's persistence check
+# (cron/registry-autorun/scheduled-tasks/services) and every `*_protect` guard
+# above target a config/definition file consulted by a specific subsystem on a
+# specific future event; none of them recognize an ordinary bin directory or
+# gate on a command name being shadowed. self-protect only covers Aegis's own
+# source tree, not `aegis` the installed executable on PATH.
+#
+# Scope, precision over recall like every sibling `*_protect` guard: gated on
+# BOTH a known PATH bin-directory segment AND the target basename matching a
+# curated list of security-relevant command names (VCS, shells, interpreters,
+# package managers, cloud/infra CLIs, privilege-escalation tools, and Aegis
+# itself) — an arbitrary new filename dropped in `~/.local/bin` (the routine,
+# sanctioned result of `pip install --user some-cli`) is NOT itself dangerous
+# until it collides with a name someone will actually type; gating on the
+# directory alone would ask on every ordinary user-scoped package install.
+_PATH_BIN_DIRS = (
+    r"\.local" + _SEP + r"bin"
+    r"|\.cargo" + _SEP + r"bin"
+    r"|go" + _SEP + r"bin"
+    r"|\.npm-global" + _SEP + r"bin"
+    r"|\.npm-packages" + _SEP + r"bin"
+    r"|\.pyenv" + _SEP + r"shims"
+    r"|\.rbenv" + _SEP + r"shims"
+    r"|\.asdf" + _SEP + r"shims"
+    r"|usr" + _SEP + r"local" + _SEP + r"bin"
+    r"|usr" + _SEP + r"local" + _SEP + r"sbin"
+    r"|opt" + _SEP + r"homebrew" + _SEP + r"bin"
+    r"|opt" + _SEP + r"homebrew" + _SEP + r"sbin"
+)
+# Curated, not exhaustive: VCS/remote-access, privilege escalation, network
+# fetch, language runtimes/package managers, build toolchains, cloud/infra
+# CLIs, DB clients, editors/agent CLIs (a shadowed `code`/`claude` is a path
+# straight back into this same agent's own tooling), and `aegis` itself — a
+# shadowed `aegis` on PATH is a self-protection gap none of the source-tree
+# checks above reach, since the installed executable isn't under `aegis/`.
+_PATH_HIJACK_CMD_NAMES = (
+    r"git|ssh|ssh-agent|ssh-add|scp|sftp|sudo|su|doas"
+    r"|curl|wget|nc|ncat|netcat|socat"
+    r"|python|python3|pip|pip3|pipx"
+    r"|node|npm|npx|yarn|pnpm"
+    r"|ruby|gem|bundle|rake"
+    r"|perl|php"
+    r"|bash|sh|zsh|dash|ksh"
+    r"|make|cc|gcc|clang|g\+\+|ld"
+    r"|go|cargo|rustc"
+    r"|docker|docker-compose|kubectl|helm|terraform|ansible|ansible-playbook"
+    r"|aws|gcloud|az"
+    r"|psql|mysql|sqlite3|redis-cli"
+    r"|brew|apt|apt-get|yum|dnf|pacman"
+    r"|code|claude|codex|cursor|gemini"
+    r"|aegis"
+    r"|java|javac|mvn|gradle"
+)
+_PATH_HIJACK_LEAD = r"(?:^|[\s'\"/\\=])"
+# Windows executable-resolution suffixes (PATHEXT) — a `.exe`/`.bat`/`.cmd`
+# sibling in the same directories is resolved ahead of a same-named
+# extensionless script there too.
+_PATH_HIJACK_EXT = r"(?:\.exe|\.bat|\.cmd)?"
+PATH_BIN_TARGET_RE = re.compile(
+    _PATH_HIJACK_LEAD + r"(?:" + _PATH_BIN_DIRS + r")" + _SEP
+    + r"(?:" + _PATH_HIJACK_CMD_NAMES + r")" + _PATH_HIJACK_EXT + _CI_END
+    # `~/bin` and `$HOME/bin` — "bin" alone is too generic (an ordinary
+    # project build-output directory), so unlike the dirs above this
+    # alternative requires the literal `~`/`$HOME` anchor immediately before
+    # it, the same narrowing SSH_PERSIST_PATH_RE's own comment explains for
+    # the bare word "config".
+    + r"|" + _PATH_HIJACK_LEAD + r"~" + _SEP + r"bin" + _SEP
+    + r"(?:" + _PATH_HIJACK_CMD_NAMES + r")" + _PATH_HIJACK_EXT + _CI_END
+    + r"|" + _PATH_HIJACK_LEAD + r"\$HOME" + _SEP + r"bin" + _SEP
+    + r"(?:" + _PATH_HIJACK_CMD_NAMES + r")" + _PATH_HIJACK_EXT + _CI_END,
+    re.IGNORECASE,
+)
+# Bare PATH bin-directory reference (no filename) — the same gap
+# SHELL_PERSIST_DIR_RE/GIT_HOOKS_DIR_RE/AGENT_DEF_DIR_RE exist to close: an
+# archive/sync tool (`rsync -a evil_bins/ /usr/local/bin/`, `tar xf
+# payload.tar -C ~/.local/bin/`) can drop several maliciously-named files at
+# once without ever naming any single one of them as a discrete argument,
+# evading PATH_BIN_TARGET_RE entirely. Paired ONLY with ARCHIVE_SYNC_VERB_RE
+# in the rule below, never with the general write-verb set — a bare
+# directory mention is too weak a signal on its own (unlike a git-hooks/SSH
+# directory, an ordinary bin directory is routinely referenced by legitimate
+# tooling with no write at all, e.g. `ls ~/.local/bin`).
+PATH_BIN_DIR_RE = re.compile(
+    _PATH_HIJACK_LEAD + r"(?:" + _PATH_BIN_DIRS + r")" + _CI_END
+    + r"|" + _PATH_HIJACK_LEAD + r"~" + _SEP + r"bin" + _CI_END
+    + r"|" + _PATH_HIJACK_LEAD + r"\$HOME" + _SEP + r"bin" + _CI_END,
+    re.IGNORECASE,
+)
+# `chmod ... +x <target>` — flips an already-planted, inert (non-executable)
+# file live. Deliberately narrow: only the symbolic `+x` form (`chmod +x`,
+# `chmod a+x`, `chmod ug+x`, ...), the form an agent actually types. A numeric
+# mode (`chmod 755 ...`) is NOT matched — disambiguating "this specific octal
+# grants execute" from "this is any ordinary permission change" by regex
+# alone is unreliable enough (755/644/700/... all differ by one digit with no
+# fixed position) that the honest choice is to disclose the gap rather than
+# risk a wide false-positive surface on routine `chmod` use. 200-char
+# non-greedy gap, the same bound SERVICE_ACTIVATE_CMD_RE/DIRENV_ACTIVATE_RE
+# use, so an intervening flag doesn't push `+x` out of range.
+PATH_HIJACK_CHMOD_RE = re.compile(r"\bchmod\b[^|;&\n]{0,200}?\+x\b", re.IGNORECASE)
+
+
 # ---- systemd unit / launchd persistence protection --------------------------
 # The Linux/macOS analog of Windows' scheduled-tasks/services (already caught,
 # non-escapably, by PERSIST_RE inside rule_containment) and of the same
@@ -2009,9 +2150,30 @@ _SUB_INNER = (
 _SCRIPT_ENV = r"(?:os\.environ|process\.env)\b"
 _SCRIPT_NET = r"(?:requests\.(?:post|put|get|patch)|urlopen|fetch|axios\.\w+|http\.client)\s*\("
 
+# QA finding (independent adversarial review of an unrelated new guard,
+# path-hijack-protect — discovered incidentally while stress-testing that
+# guard's own perf test with a plain, non-contrived long command, not by
+# exercising this guard directly, the same way FIND_PROTECTED_RE's round-8
+# catastrophic-backtracking bug was found): the second alternative's
+# ORIGINAL unbounded `[^;&\n$`<]*` between `_NET_SINK` and the required
+# `(?:\$\(|`|<\()` overlaps that class's own allowed characters, so on an
+# input where `_NET_SINK` matches (or partially matches at a `\b`-adjacent
+# position) but no `$(`/backtick/`<(` ever follows — e.g. `"rsync -a x/ y/
+# " * 8000`, an ordinary-shaped long argument list — the engine backtracks
+# through every possible split point before concluding failure: 12+ seconds
+# measured on a ~120KB input reaching this guard through the real
+# evaluate() pipeline (containment's own env-dump check runs later in
+# BUILTIN_RULES, so a hang here fail-opens every rule after it too, the
+# same class of bug already documented on FIND_PROTECTED_RE/CI_WORKFLOW_
+# PATH_RE elsewhere in this file). Bounded to `{0,200}?` (lazy, matching
+# DIRENV_ACTIVATE_RE/SERVICE_ACTIVATE_CMD_RE's own verb-to-substitution gap
+# convention) — see `test_no_catastrophic_backtracking_on_adversarial_input`
+# for the regression (the existing adversarial cases there all anchor at a
+# SINGLE match position; this one repeats the anchor thousands of times,
+# which is what turns per-position backtracking into a quadratic total).
 ENV_DUMP_EXFIL_RE = re.compile(
     _ENV_DUMP_ALT + r"[^;&\n]*" + _SINK_OR_DEVNET
-    + r"|" + _NET_SINK + r"\b[^;&\n$`<]*(?:<\s+)?(?:\$\(|`|<\()\s*" + _SUB_INNER + r"\s*[)`]"
+    + r"|" + _NET_SINK + r"\b[^;&\n$`<]{0,200}?(?:<\s+)?(?:\$\(|`|<\()\s*" + _SUB_INNER + r"\s*[)`]"
     + r"|" + _SCRIPT_ENV + r"[^;&\n]*" + _SCRIPT_NET
     + r"|" + _SCRIPT_NET + r"[^;&\n]*" + _SCRIPT_ENV,
     re.IGNORECASE,

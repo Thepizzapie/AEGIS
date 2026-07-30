@@ -331,3 +331,27 @@ def test_no_catastrophic_backtracking_on_adversarial_input():
         patterns.ENV_DUMP_EXFIL_RE.search(cmd)
         elapsed = time.monotonic() - start
         assert elapsed < 1.0, f"regex took {elapsed:.2f}s on adversarial input ({len(cmd)} chars)"
+
+
+def test_no_catastrophic_backtracking_on_repeated_net_sink_anchor():
+    """QA finding (independent adversarial review of an unrelated new guard,
+    path-hijack-protect — discovered incidentally, not by exercising this
+    guard directly): the cases above all anchor `_NET_SINK` (curl/wget/ssh/
+    ...) at a SINGLE match position, so the original unbounded
+    `[^;&\\n$`<]*` gap only ever backtracked once. An input that repeats a
+    real `_NET_SINK` match MANY times, with no `$(`/backtick/`<(` ever
+    following any occurrence (an ordinary-shaped long rsync argument list,
+    not a contrived string — `nc` is one of `_NET_SINK`'s own alternatives
+    and is a literal substring of "rsync"), turned that single-position
+    backtrack into a per-occurrence one: 12+ seconds measured on a ~120KB
+    input reaching this guard through the real evaluate() pipeline before
+    the `{0,200}?` bound was added. See ENV_DUMP_EXFIL_RE's own comment."""
+    import time
+
+    from aegis import patterns
+
+    cmd = "rsync -a x/ y/ " * 8000
+    start = time.monotonic()
+    patterns.ENV_DUMP_EXFIL_RE.search(cmd)
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"regex took {elapsed:.2f}s on adversarial input ({len(cmd)} chars)"
