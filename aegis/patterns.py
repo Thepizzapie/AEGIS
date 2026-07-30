@@ -1591,9 +1591,16 @@ PATH_BIN_DIR_RE = re.compile(
 # than risk a wide false-positive surface on routine `chmod` use. 200-char
 # non-greedy verb gap, the same bound SERVICE_ACTIVATE_CMD_RE/
 # DIRENV_ACTIVATE_RE use, so an intervening flag doesn't push the mode
-# clause out of range.
+# clause out of range. QA finding (round C, final pre-merge verification):
+# the bare `=` alternative also matched GNU chmod's `--reference=<file>`
+# long option whenever the reference filename happened to end in `x`
+# (`chmod --reference=backup_unix ...` — "backup_unix" ends in `x`, no
+# execute bit involved at all) — a negative lookbehind excludes the `=`
+# immediately after that specific 9-character flag name, the one chmod
+# long option whose value is an arbitrary, attacker-adjacent filename
+# rather than a fixed permission vocabulary.
 PATH_HIJACK_CHMOD_RE = re.compile(
-    r"\bchmod\b[^|;&\n]{0,200}?[+=][^\s,+-]*x\b", re.IGNORECASE)
+    r"\bchmod\b[^|;&\n]{0,200}?(?<!reference)[+=][^\s,+-]*x\b", re.IGNORECASE)
 # `ln -s`/`ln --symbolic`, WITHOUT requiring `-f`/`--force` (unlike the
 # shared FORCED_LINK_WRITE_RE, still checked separately below for its
 # PowerShell New-Item coverage). QA finding (independent adversarial

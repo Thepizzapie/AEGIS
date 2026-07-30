@@ -256,6 +256,19 @@ def test_chmod_numeric_mode_disclosed_gap():
     assert d.rule != "path-hijack-protect"
 
 
+def test_chmod_reference_flag_not_falsely_gated():
+    """QA finding (round C, final pre-merge verification): the widened
+    symbolic-chmod check's bare `=` alternative also matched GNU chmod's
+    `--reference=<file>` long option whenever the reference filename
+    happened to end in `x` (no execute bit involved at all) — an arbitrary,
+    attacker-adjacent filename, unlike every other chmod flag's fixed
+    permission vocabulary."""
+    for cmd in ("chmod --reference=backup_unix ~/.local/bin/git",
+                "chmod -v --reference=matrix.txt ~/.local/bin/pip"):
+        d = evaluate(_shell(cmd), EMPTY)
+        assert d.rule != "path-hijack-protect", cmd
+
+
 # ---- version-suffixed interpreters in shim dirs (QA round A) ----------------
 
 def test_version_suffixed_interpreters_in_shims_gated():

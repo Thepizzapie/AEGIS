@@ -2757,7 +2757,28 @@ def rule_path_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
     own patterns (both instead found — and fixed — two PRE-EXISTING
     catastrophic-backtracking bugs in unrelated containment patterns,
     ``EXFIL_RE``/``ENV_DUMP_EXFIL_RE``, incidentally while stress-testing
-    this guard's own perf test; see those patterns' own comments)."""
+    this guard's own perf test; see those patterns' own comments). Round C
+    (final pre-merge verification, independent) confirmed all five round-A
+    fixes and round-B's finding actually close under ``evaluate()``, ran a
+    fresh adversarial pass over the fixes themselves, and confirmed no
+    ReDoS regression on the widened patterns (linear scaling verified up to
+    a 1.2MB adversarial input) — but found one further real, narrow false
+    positive the widened ``PATH_HIJACK_CHMOD_RE`` introduced: GNU chmod's
+    ``--reference=<file>`` long option also matched whenever the reference
+    filename happened to end in `x` (`chmod --reference=backup_unix ...` —
+    an arbitrary, attacker-adjacent filename, unlike every other chmod
+    flag's fixed permission vocabulary), fixed with a negative lookbehind
+    excluding that one flag name (see ``PATH_HIJACK_CHMOD_RE``'s own
+    comment). Round C separately confirmed, as accepted/non-blocking
+    (default mode is ``ask``, so both cause an extra confirmation, never a
+    silent bypass): ``PATH_HIJACK_INSTALL_RE`` is whole-command like every
+    other verb check `touches_target` already uses (`pip install --user X
+    && echo ~/.local/bin/aws` also asks, the same pre-existing convention
+    ``DELETE_OR_MOVE_VERB_RE``/`WRITE_REDIRECT_RE` already have, not a
+    fix-introduced deviation); and the inherited 200-char verb-to-target gap
+    is paddable past (`chmod ` + 250 junk chars + ` +x <target>` evades),
+    the same disclosed trade-off ``SERVICE_ACTIVATE_CMD_RE``/
+    ``DIRENV_ACTIVATE_RE`` already accept for their own callers."""
     cfg = getattr(policy, "path_hijack", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
