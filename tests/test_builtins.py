@@ -35,6 +35,37 @@ def test_containment_not_escapable():
     assert evaluate(_shell("cat ~/.ssh/id_rsa  # aegis-allow"), EMPTY).blocked
 
 
+def test_exfil_re_no_catastrophic_backtracking():
+    """QA finding (independent adversarial review of an unrelated new guard,
+    path-hijack-protect — discovered incidentally while stress-testing that
+    guard's own perf test, not by exercising containment directly, the same
+    way FIND_PROTECTED_RE's own round-8 backtracking bug was found):
+    EXFIL_RE's scp/rsync clause originally had an unbounded
+    `[^|;&\\n]*` between the verb and the required `\\s...@...:` remote-host
+    shape. On an input where `scp`/`rsync` matches repeatedly with no `@`
+    ever following any occurrence — an ordinary-shaped long argument list,
+    e.g. `"rsync -a x/ y/ " * 8000`, not a contrived string — the engine
+    backtracked through every possible split point at EVERY occurrence
+    before concluding failure: 13+ seconds measured on a ~120KB input
+    reaching this NEVER-escapable guard through the real evaluate()
+    pipeline, itself a fail-open bypass of containment (README: "Fail-open
+    by default"). Fixed with a `{0,200}?` bound (see EXFIL_RE's own
+    comment)."""
+    import time
+    from aegis import patterns
+
+    cmd = "rsync -a x/ y/ " * 8000
+    start = time.time()
+    patterns.EXFIL_RE.search(cmd)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"EXFIL_RE took {elapsed:.2f}s on adversarial input"
+
+    start = time.time()
+    evaluate(_shell(cmd), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"rule_containment took {elapsed:.2f}s on adversarial input"
+
+
 def test_destructive_git_blocked_and_escapable():
     assert evaluate(_shell("git push --force origin main"), EMPTY).blocked
     assert evaluate(_shell("git reset --hard HEAD~3"), EMPTY).blocked
