@@ -459,7 +459,7 @@ EXFIL_RE = re.compile(
     # DIRENV_ACTIVATE_RE/SERVICE_ACTIVATE_CMD_RE's own verb-to-target gap
     # convention) — an scp/rsync invocation's remote-target argument
     # realistically sits within 200 chars of the verb; see
-    # `test_no_catastrophic_backtracking_on_exfil_re` for the regression.
+    # `test_exfil_re_no_catastrophic_backtracking` for the regression.
     r"|\b(?:scp|rsync)\b[^|;&\n]{0,200}?\s[^\s|;&]*@[^\s|;&]*:"
     r"|\b(?:nc|ncat|netcat)\b[^|;&\n]*<\s*\S"
     # httpie invoked as a command, piping/attaching a local file (http POST u < f,
@@ -1472,10 +1472,27 @@ _PATH_BIN_DIRS = (
     r"|\.pyenv" + _SEP + r"shims"
     r"|\.rbenv" + _SEP + r"shims"
     r"|\.asdf" + _SEP + r"shims"
+    # QA finding (independent adversarial review, round A): several more
+    # user-scope bin directories in routine, common use for modern
+    # toolchains were missing entirely — Bun's/Deno's own installers default
+    # to these, pnpm's standalone installer sets PNPM_HOME to this, and
+    # Ubuntu's snap packaging puts /snap/bin very early on the default PATH.
+    r"|\.bun" + _SEP + r"bin"
+    r"|\.deno" + _SEP + r"bin"
+    r"|\.local" + _SEP + r"share" + _SEP + r"pnpm"
+    r"|snap" + _SEP + r"bin"
     r"|usr" + _SEP + r"local" + _SEP + r"bin"
     r"|usr" + _SEP + r"local" + _SEP + r"sbin"
     r"|opt" + _SEP + r"homebrew" + _SEP + r"bin"
     r"|opt" + _SEP + r"homebrew" + _SEP + r"sbin"
+    # Windows user-scope bin dirs — Scoop's shim dir, Chocolatey's install
+    # dir, and WindowsApps (frequently FIRST on a default Windows user
+    # PATH). QA finding (independent adversarial review, round A): the
+    # guard already handles PATHEXT (.exe/.bat/.cmd) but covered none of
+    # the actual common Windows bin directories those extensions matter for.
+    r"|scoop" + _SEP + r"shims"
+    r"|chocolatey" + _SEP + r"bin"
+    r"|Microsoft" + _SEP + r"WindowsApps"
 )
 # Curated, not exhaustive: VCS/remote-access, privilege escalation, network
 # fetch, language runtimes/package managers, build toolchains, cloud/infra
@@ -1483,40 +1500,55 @@ _PATH_BIN_DIRS = (
 # straight back into this same agent's own tooling), and `aegis` itself — a
 # shadowed `aegis` on PATH is a self-protection gap none of the source-tree
 # checks above reach, since the installed executable isn't under `aegis/`.
+# `python`/`pip`/`ruby` carry an optional version suffix (`python3.11`,
+# `pip3.12`, `ruby3.2`) — QA finding (independent adversarial review, round
+# A): pyenv/rbenv shims (this guard's own motivating example directories)
+# are routinely invoked BY exact version, and the original bare
+# `python|python3`/`pip|pip3`/`ruby` alternatives never matched those forms
+# at all, missing the exact shim files this guard's own comments call out.
 _PATH_HIJACK_CMD_NAMES = (
     r"git|ssh|ssh-agent|ssh-add|scp|sftp|sudo|su|doas"
     r"|curl|wget|nc|ncat|netcat|socat"
-    r"|python|python3|pip|pip3|pipx"
-    r"|node|npm|npx|yarn|pnpm"
-    r"|ruby|gem|bundle|rake"
+    r"|python\d*(?:\.\d+)?|pip\d*(?:\.\d+)?|pipx|uv|uvx|poetry|pipenv|conda|mamba"
+    r"|node|npm|npx|yarn|pnpm|bun|deno"
+    r"|ruby\d*(?:\.\d+)?|gem|bundle|rake"
     r"|perl|php"
     r"|bash|sh|zsh|dash|ksh"
     r"|make|cc|gcc|clang|g\+\+|ld"
     r"|go|cargo|rustc"
-    r"|docker|docker-compose|kubectl|helm|terraform|ansible|ansible-playbook"
+    r"|docker|docker-compose|podman|kubectl|helm|terraform|ansible|ansible-playbook"
     r"|aws|gcloud|az"
     r"|psql|mysql|sqlite3|redis-cli"
     r"|brew|apt|apt-get|yum|dnf|pacman"
     r"|code|claude|codex|cursor|gemini"
     r"|aegis"
     r"|java|javac|mvn|gradle"
+    r"|gpg|gpg2"
 )
 _PATH_HIJACK_LEAD = r"(?:^|[\s'\"/\\=])"
 # Windows executable-resolution suffixes (PATHEXT) — a `.exe`/`.bat`/`.cmd`
 # sibling in the same directories is resolved ahead of a same-named
 # extensionless script there too.
 _PATH_HIJACK_EXT = r"(?:\.exe|\.bat|\.cmd)?"
+# `~/bin`/`$HOME/bin`/`${HOME}/bin` — "bin" alone is too generic (an ordinary
+# project build-output directory), so unlike the dirs above these
+# alternatives require a literal `~`/`$HOME`/`${HOME}` anchor immediately
+# before them, the same narrowing SSH_PERSIST_PATH_RE's own comment explains
+# for the bare word "config". The braced `${HOME}` form is a separate
+# alternative from bare `$HOME` — QA finding (independent adversarial
+# review, round A): shell parameter-expansion braces (`${HOME}/bin/git`,
+# an ordinary, common way to write the same expansion, e.g. when
+# immediately followed by more path text) sailed through undetected when
+# only the unbraced literal was matched.
+_PATH_HIJACK_HOME_BIN = (
+    r"~" + _SEP + r"bin"
+    r"|\$HOME" + _SEP + r"bin"
+    r"|\$\{HOME\}" + _SEP + r"bin"
+)
 PATH_BIN_TARGET_RE = re.compile(
     _PATH_HIJACK_LEAD + r"(?:" + _PATH_BIN_DIRS + r")" + _SEP
     + r"(?:" + _PATH_HIJACK_CMD_NAMES + r")" + _PATH_HIJACK_EXT + _CI_END
-    # `~/bin` and `$HOME/bin` — "bin" alone is too generic (an ordinary
-    # project build-output directory), so unlike the dirs above this
-    # alternative requires the literal `~`/`$HOME` anchor immediately before
-    # it, the same narrowing SSH_PERSIST_PATH_RE's own comment explains for
-    # the bare word "config".
-    + r"|" + _PATH_HIJACK_LEAD + r"~" + _SEP + r"bin" + _SEP
-    + r"(?:" + _PATH_HIJACK_CMD_NAMES + r")" + _PATH_HIJACK_EXT + _CI_END
-    + r"|" + _PATH_HIJACK_LEAD + r"\$HOME" + _SEP + r"bin" + _SEP
+    + r"|" + _PATH_HIJACK_LEAD + r"(?:" + _PATH_HIJACK_HOME_BIN + r")" + _SEP
     + r"(?:" + _PATH_HIJACK_CMD_NAMES + r")" + _PATH_HIJACK_EXT + _CI_END,
     re.IGNORECASE,
 )
@@ -1529,24 +1561,72 @@ PATH_BIN_TARGET_RE = re.compile(
 # in the rule below, never with the general write-verb set — a bare
 # directory mention is too weak a signal on its own (unlike a git-hooks/SSH
 # directory, an ordinary bin directory is routinely referenced by legitimate
-# tooling with no write at all, e.g. `ls ~/.local/bin`).
+# tooling with no write at all, e.g. `ls ~/.local/bin`). Disclosed false
+# positive (not fixed — see rule_path_hijack_protect's own docstring for
+# why): this pairing has no source/destination awareness, so a legitimate
+# BACKUP command reading FROM a bin directory (`rsync -a ~/.local/bin/
+# ~/backups/...`) also gates, indistinguishable by regex alone from writing
+# INTO one — an accepted "ask" false positive, not a false allow.
 PATH_BIN_DIR_RE = re.compile(
     _PATH_HIJACK_LEAD + r"(?:" + _PATH_BIN_DIRS + r")" + _CI_END
-    + r"|" + _PATH_HIJACK_LEAD + r"~" + _SEP + r"bin" + _CI_END
-    + r"|" + _PATH_HIJACK_LEAD + r"\$HOME" + _SEP + r"bin" + _CI_END,
+    + r"|" + _PATH_HIJACK_LEAD + r"(?:" + _PATH_HIJACK_HOME_BIN + r")" + _CI_END,
     re.IGNORECASE,
 )
-# `chmod ... +x <target>` — flips an already-planted, inert (non-executable)
-# file live. Deliberately narrow: only the symbolic `+x` form (`chmod +x`,
-# `chmod a+x`, `chmod ug+x`, ...), the form an agent actually types. A numeric
-# mode (`chmod 755 ...`) is NOT matched — disambiguating "this specific octal
+# `chmod` granting execute, symbolic form: a bare `+x`/`a+x`/`ug+x`, an
+# absolute assignment that includes it (`=rwx`, `u=rwx`), or any other
+# `+`/`=` clause that includes the `x` bit (`+rwx`, `u+rwx`). QA finding
+# (independent adversarial review, round A): the original pattern required
+# the literal two-character substring `+x` immediately adjacent, so
+# idiomatic (arguably more commonly typed, e.g. tutorial-boilerplate)
+# forms like `chmod u+rwx`/`chmod +rwx`/`chmod a=rwx` — which all grant
+# execute exactly like `+x` does — sailed through with zero detection. The
+# fragment requires `x` appear within the SAME `+`/`=` clause with no
+# intervening `-`/`,`/whitespace, so a mixed clause that only REMOVES
+# execute for this match (`chmod go-x,u+rw`) correctly does not match (no
+# `+`/`=` clause in that command contains an `x`). A numeric mode (`chmod
+# 755 ...`) is still NOT matched — disambiguating "this specific octal
 # grants execute" from "this is any ordinary permission change" by regex
-# alone is unreliable enough (755/644/700/... all differ by one digit with no
-# fixed position) that the honest choice is to disclose the gap rather than
-# risk a wide false-positive surface on routine `chmod` use. 200-char
-# non-greedy gap, the same bound SERVICE_ACTIVATE_CMD_RE/DIRENV_ACTIVATE_RE
-# use, so an intervening flag doesn't push `+x` out of range.
-PATH_HIJACK_CHMOD_RE = re.compile(r"\bchmod\b[^|;&\n]{0,200}?\+x\b", re.IGNORECASE)
+# alone is unreliable enough (755/644/700/... all differ by one digit with
+# no fixed position) that the honest choice is to disclose the gap rather
+# than risk a wide false-positive surface on routine `chmod` use. 200-char
+# non-greedy verb gap, the same bound SERVICE_ACTIVATE_CMD_RE/
+# DIRENV_ACTIVATE_RE use, so an intervening flag doesn't push the mode
+# clause out of range.
+PATH_HIJACK_CHMOD_RE = re.compile(
+    r"\bchmod\b[^|;&\n]{0,200}?[+=][^\s,+-]*x\b", re.IGNORECASE)
+# `ln -s`/`ln --symbolic`, WITHOUT requiring `-f`/`--force` (unlike the
+# shared FORCED_LINK_WRITE_RE, still checked separately below for its
+# PowerShell New-Item coverage). QA finding (independent adversarial
+# review, round A): the whole point of shadowing a command is that the
+# target name does NOT already exist there, so the natural, common form of
+# this attack (`ln -s /tmp/evil.sh ~/.local/bin/git`) never needs `-f` at
+# all — FORCED_LINK_WRITE_RE's force-only gate, correct for its OTHER
+# callers (overwriting an EXISTING tracked file), missed the common case
+# here entirely. Safe to widen for this guard specifically: `target_named`
+# already requires the exact PATH_BIN_TARGET_RE match before this check is
+# ever consulted, so an unrelated, benign `ln -s` elsewhere in a command
+# that also happens to mention a shadowed-looking path is not a realistic
+# false positive.
+PATH_HIJACK_SYMLINK_RE = re.compile(
+    r"\bln\b(?=[^|;&\n]{0,200}?(?:-s\b|--symbolic\b))", re.IGNORECASE)
+# Coreutils `install` defaults to mode 0755 (executable) with NO `-m`/
+# `--mode` flag at all — GNU install's own documented default — so
+# ARCHIVE_SYNC_VERB_RE's `install` alternative, which REQUIRES that flag
+# (added for GIT_HOOKS_ARCHIVE_VERB_RE's own siblings to disambiguate
+# coreutils `install` from `npm install`/`pip install` when the only other
+# signal is a bare path mention elsewhere in a longer command), misses the
+# MORE common, MORE dangerous bare form entirely — QA finding (independent
+# adversarial review, round B): `install evil.sh /usr/local/bin/git` planted
+# a live, executable backdoor with zero detection. Safe to widen for THIS
+# guard specifically, unlike ARCHIVE_SYNC_VERB_RE's other callers: the
+# ambiguity that pattern's `-m`/`--mode` requirement exists to avoid doesn't
+# apply here, because this guard's `target_named` gate already requires the
+# literal PATH_BIN_TARGET_RE match (a specific bin directory + curated
+# command name as the exact final path component) before this check is ever
+# consulted — an `npm install`/`pip install` invocation that also happens to
+# name a literal target ending in exactly `/usr/local/bin/git` is not a
+# realistic false positive.
+PATH_HIJACK_INSTALL_RE = re.compile(r"\binstall\b", re.IGNORECASE)
 
 
 # ---- systemd unit / launchd persistence protection --------------------------

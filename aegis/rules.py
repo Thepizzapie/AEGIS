@@ -2686,19 +2686,78 @@ def rule_path_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
     directory-indirection gap. A direct fetch-to-file write (`curl -o
     ~/.local/bin/git ...`) is caught by none of the shell branch's write-verb
     checks, the same inherited gap eight sibling guards already disclose.
-    `chmod` is matched only in its symbolic `+x` form, not a numeric mode
-    (`chmod 755 ...`) — disclosed above at the pattern definition
-    (``PATH_HIJACK_CHMOD_RE``). And this guard only recognizes a CURATED set
-    of bin directories; an unusual custom PATH entry (a project-local
-    `./scripts/bin` a developer prepends in their own shell config, a
-    corporate-wrapped toolchain install location) carries no signal this
-    guard's patterns recognize at all — PATH itself is not introspected
-    (Aegis has no reliable, static way to know what a FUTURE shell's
-    resolved PATH will actually be), so coverage is necessarily a curated
-    guess at the common cases, not a PATH-aware guarantee. Deny-by-default
-    egress and workspace confinement are unrelated backstops that do not
-    cover this surface at all — found a bypass? That's a bug worth
-    reporting."""
+    `chmod`'s numeric-mode form (`chmod 755 ...`) is still not matched —
+    disambiguating "this specific octal grants execute" from "this is any
+    ordinary permission change" by regex alone is unreliable enough that the
+    honest choice is to disclose the gap rather than risk a wide
+    false-positive surface on routine `chmod` use (see
+    ``PATH_HIJACK_CHMOD_RE``'s own comment for the symbolic forms it DOES
+    catch). And this guard only recognizes a CURATED set of bin directories;
+    an unusual custom PATH entry (a project-local `./scripts/bin` a
+    developer prepends in their own shell config, a corporate-wrapped
+    toolchain install location) carries no signal this guard's patterns
+    recognize at all — PATH itself is not introspected (Aegis has no
+    reliable, static way to know what a FUTURE shell's resolved PATH will
+    actually be), so coverage is necessarily a curated guess at the common
+    cases, not a PATH-aware guarantee. The bare-directory fallback
+    (``dir_only``, paired with ``ARCHIVE_SYNC_VERB_RE`` for an archive/sync
+    tool that never names a single target discretely) still requires
+    coreutils ``install``'s ``-m``/``--mode`` flag be present — see
+    ``ARCHIVE_SYNC_VERB_RE``'s own comment for why (disambiguating from
+    `npm install`/`pip install` when the only other signal is a bare
+    directory mention) — and, since it has no source/destination
+    awareness, also gates a legitimate BACKUP command reading FROM a bin
+    directory (`rsync -a ~/.local/bin/ ~/backups/...`) the same as one
+    writing INTO one; a disclosed "ask" false positive, not a false allow,
+    the same "narrower false ask over a worse false negative" trade-off
+    ``rule_git_attributes_exec_protect``'s own docstring accepts for its
+    whole-command (not clause-scoped) check. Neither restriction applies to
+    the ``touches_target`` (named-file) branch, which uses the dedicated,
+    unrestricted ``PATH_HIJACK_INSTALL_RE`` instead of ``ARCHIVE_SYNC_VERB_RE``
+    for `install` — see its own comment for why the ambiguity concern
+    doesn't transfer once an exact ``PATH_BIN_TARGET_RE`` match is already
+    required. Deny-by-default egress and workspace confinement are
+    unrelated backstops that do not cover this surface at all — found a
+    bypass? That's a bug worth reporting.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention ``rule_direnv_protect``/``rule_service_persist_protect`` used).
+    Round A (bypass-hunting) confirmed five real, undisclosed bypasses in
+    the original draft, all fixed here: (1) an UNFORCED `ln -s
+    /tmp/evil.sh ~/.local/bin/git` (no `-f`) — the shared
+    ``FORCED_LINK_WRITE_RE`` requires a force flag, correct for its OTHER
+    callers (overwriting an already-tracked file) but wrong here, since the
+    whole point of shadowing is that the target does NOT already exist, so
+    `-f` is never needed; fixed with the dedicated, unforced
+    ``PATH_HIJACK_SYMLINK_RE``. (2) bare coreutils `install evil.sh
+    /usr/local/bin/git` (no `-m`/`--mode`) — GNU install's own documented
+    default mode is 0755 (executable); fixed with
+    ``PATH_HIJACK_INSTALL_RE`` (see above). (3) `chmod`'s idiomatic
+    symbolic forms beyond literal `+x` (`chmod u+rwx`, `chmod +rwx`, `chmod
+    a=rwx`) — arguably MORE commonly typed than bare `+x`; fixed by
+    widening ``PATH_HIJACK_CHMOD_RE`` to any `+`/`=` clause that includes
+    the `x` bit. (4) version-suffixed interpreters inside this guard's own
+    motivating example directories (`~/.pyenv/shims/python3.11`,
+    `~/.rbenv/shims/ruby3.2`) — pyenv/rbenv shims are routinely invoked BY
+    exact version; fixed by widening `python`/`pip`/`ruby` to an optional
+    version suffix. (5) the braced `${HOME}/bin/git` form of the home-bin
+    anchor — only the unbraced `$HOME` literal was matched; fixed by adding
+    it as a separate anchor alternative. Round A also flagged, as
+    non-blocking coverage gaps rather than regex bugs, several missing
+    curated bin directories (Bun/Deno installers, pnpm's `PNPM_HOME`,
+    `/snap/bin`, and the Windows Scoop/Chocolatey/WindowsApps user-scope
+    dirs) and command names (`uv`/`uvx`, `poetry`, `pipenv`, `conda`/
+    `mamba`, `podman`, `gpg`/`gpg2`, `bun`, `deno`) — added. Round B
+    (design/consistency, independent) confirmed registration
+    (``_CORE_RULES``, ``Policy``, ``loader.py``, ``skills.py``, README) and
+    the escape hatch/config-knob/test-coverage structure all match
+    sibling-guard convention end-to-end, and found one further undisclosed
+    bypass overlapping round A's install finding, confirming it
+    independently. Neither round found a ReDoS/perf issue in this guard's
+    own patterns (both instead found — and fixed — two PRE-EXISTING
+    catastrophic-backtracking bugs in unrelated containment patterns,
+    ``EXFIL_RE``/``ENV_DUMP_EXFIL_RE``, incidentally while stress-testing
+    this guard's own perf test; see those patterns' own comments)."""
     cfg = getattr(policy, "path_hijack", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -2736,7 +2795,9 @@ def rule_path_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
             or patterns.INPLACE_WRITE_RE.search(cmd)
             or patterns.FORCED_LINK_WRITE_RE.search(cmd)
             or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
-            or patterns.PATH_HIJACK_CHMOD_RE.search(cmd))
+            or patterns.PATH_HIJACK_CHMOD_RE.search(cmd)
+            or patterns.PATH_HIJACK_INSTALL_RE.search(cmd)
+            or patterns.PATH_HIJACK_SYMLINK_RE.search(cmd))
         dir_only = bool(patterns.PATH_BIN_DIR_RE.search(cmd)
                          and patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
         if not (touches_target or dir_only):

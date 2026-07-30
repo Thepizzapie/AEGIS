@@ -199,6 +199,121 @@ def test_archive_extract_into_unrelated_dir_not_gated():
     assert not _gated(evaluate(_shell("tar xf payload.tar -C /tmp/build/"), EMPTY))
 
 
+def test_rsync_backup_from_bin_dir_disclosed_false_positive():
+    """Disclosed, accepted false positive (see rule_path_hijack_protect's own
+    docstring): dir_only has no source/destination awareness, so a
+    legitimate backup command reading FROM a bin directory also gates, the
+    same as one writing INTO one. An accepted 'ask' false positive, not a
+    false allow — asserted explicitly so a future change doesn't silently
+    narrow or widen this without updating the docstring."""
+    d = evaluate(_shell("rsync -a ~/.local/bin/ ~/backups/local-bin-2026/"), EMPTY)
+    assert _gated(d) and d.rule == "path-hijack-protect"
+
+
+# ---- unforced symlink plant (QA round A) ------------------------------------
+
+def test_unforced_symlink_plant_gated():
+    """The natural, common form of this attack needs no -f/--force at all —
+    the whole point of shadowing is that the target does NOT already
+    exist. QA finding (independent adversarial review, round A): the
+    shared FORCED_LINK_WRITE_RE (force-only) missed this entirely."""
+    d = evaluate(_shell("ln -s /tmp/evil.sh ~/.local/bin/git"), EMPTY)
+    assert _gated(d) and d.rule == "path-hijack-protect"
+    d2 = evaluate(_shell("ln --symbolic /tmp/evil.sh /usr/local/bin/curl"), EMPTY)
+    assert _gated(d2) and d2.rule == "path-hijack-protect"
+
+
+def test_forced_symlink_still_gated():
+    d = evaluate(_shell("ln -sf /tmp/evil.sh ~/.local/bin/git"), EMPTY)
+    assert _gated(d) and d.rule == "path-hijack-protect"
+
+
+# ---- chmod symbolic forms beyond bare +x (QA round A) -----------------------
+
+def test_chmod_symbolic_forms_gated():
+    for cmd in (
+        "chmod u+rwx ~/.local/bin/git",
+        "chmod +rwx /usr/local/bin/curl",
+        "chmod a=rwx ~/.local/bin/pip",
+        "chmod ug+rwx /usr/local/bin/git",
+        "chmod =rwx ~/.local/bin/git",
+    ):
+        d = evaluate(_shell(cmd), EMPTY)
+        assert _gated(d) and d.rule == "path-hijack-protect", cmd
+
+
+def test_chmod_remove_only_not_falsely_gated_via_symbolic_check():
+    """A clause that only REMOVES execute must not itself trigger the
+    symbolic-grant check (no +/= clause in the command contains x)."""
+    d = evaluate(_shell("chmod go-x ~/.local/bin/git"), EMPTY)
+    assert d.rule != "path-hijack-protect"
+
+
+def test_chmod_numeric_mode_disclosed_gap():
+    """Disclosed, accepted gap: a numeric mode is not matched (see
+    PATH_HIJACK_CHMOD_RE's own comment)."""
+    d = evaluate(_shell("chmod 755 ~/.local/bin/git"), EMPTY)
+    assert d.rule != "path-hijack-protect"
+
+
+# ---- version-suffixed interpreters in shim dirs (QA round A) ----------------
+
+def test_version_suffixed_interpreters_in_shims_gated():
+    for path in ("~/.pyenv/shims/python3.11", "~/.pyenv/shims/python3.12",
+                 "~/.pyenv/shims/pip3.11", "~/.rbenv/shims/ruby3.2"):
+        d = evaluate(_write(path), EMPTY)
+        assert _gated(d) and d.rule == "path-hijack-protect", path
+
+
+# ---- braced ${HOME}/bin form (QA round A) -----------------------------------
+
+def test_braced_dollar_home_bin_gated():
+    d = evaluate(_write("${HOME}/bin/git"), EMPTY)
+    assert _gated(d) and d.rule == "path-hijack-protect"
+    d2 = evaluate(_shell('cp evil.sh "${HOME}/bin/git"'), EMPTY)
+    assert _gated(d2) and d2.rule == "path-hijack-protect"
+
+
+# ---- bare install without -m (QA round A + B) -------------------------------
+
+def test_bare_install_without_mode_flag_gated():
+    """GNU install's own documented default mode is 0755 (executable) with
+    NO -m/--mode flag at all — QA finding (independent adversarial review,
+    rounds A and B, confirmed independently): the original touches_target
+    check relied solely on ARCHIVE_SYNC_VERB_RE, whose install alternative
+    requires that flag, missing this more common, more dangerous form."""
+    d = evaluate(_shell("install evil.sh /usr/local/bin/git"), EMPTY)
+    assert _gated(d) and d.rule == "path-hijack-protect"
+    d2 = evaluate(_shell("install -o root evil.sh /usr/local/bin/curl"), EMPTY)
+    assert _gated(d2) and d2.rule == "path-hijack-protect"
+
+
+# ---- newly curated bin directories (QA round A) -----------------------------
+
+def test_newly_curated_bin_dirs_gated():
+    for path in ("~/.bun/bin/git", "~/.deno/bin/curl",
+                 "~/.local/share/pnpm/npm", "/snap/bin/aws"):
+        d = evaluate(_write(path), EMPTY)
+        assert _gated(d) and d.rule == "path-hijack-protect", path
+
+
+def test_windows_user_bin_dirs_gated():
+    for path in (r"~\scoop\shims\git.exe",
+                 r"C:\ProgramData\chocolatey\bin\curl.exe",
+                 r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\python.exe"):
+        d = evaluate(_write(path), EMPTY)
+        assert _gated(d) and d.rule == "path-hijack-protect", path
+
+
+# ---- newly curated command names (QA round A) -------------------------------
+
+def test_newly_curated_command_names_gated():
+    for name in ("uv", "uvx", "poetry", "pipenv", "conda", "mamba",
+                 "podman", "gpg", "gpg2", "bun", "deno"):
+        d = evaluate(_write(f"~/.local/bin/{name}"), EMPTY)
+        assert _gated(d) and d.rule == "path-hijack-protect", name
+
+
 # ---- false-positive guards --------------------------------------------------
 
 def test_unrelated_edit_allowed():
