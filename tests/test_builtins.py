@@ -19,6 +19,10 @@ def _edit(path):
     return Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={"file_path": path})
 
 
+def _write(path):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Write", args={"file_path": path})
+
+
 def test_containment_credentials():
     assert evaluate(_shell("cat ~/.ssh/id_rsa"), EMPTY).blocked
     assert evaluate(_shell("type C:\\Users\\me\\.aws\\credentials"), EMPTY).blocked
@@ -86,6 +90,99 @@ def test_self_protect_not_escapable():
     assert evaluate(_shell("rm -rf .claude"), EMPTY).blocked
     assert evaluate(_edit("project/.claude/settings.json"), EMPTY).blocked
     assert evaluate(_shell("aegis uninstall --project ."), EMPTY).blocked
+
+
+def test_self_protect_blocks_settings_local_json():
+    """`.claude/settings.local.json` (Claude Code's PERSONAL, project-local
+    settings override — auto-added to .gitignore, takes precedence over the
+    shared `.claude/settings.json`) carries the identical `hooks` +
+    `permissions.allow` power self-protect already denies on the shared
+    file. Before this fix ENFORCEMENT_PATH_RE matched only the literal
+    `settings.json`, so an Edit/Write (as opposed to a shell redirect/
+    in-place-edit — CONFIG_DIR_RE already caught those generically for the
+    whole `.claude` dir, see test_self_protect_blocks_shell_redirect_to_config
+    below) landed here unguarded: an agent could plant a SessionStart/
+    PreToolUse hook or a `permissions.allow: ["Bash(*)"]` self-approval in a
+    file that, being untracked by convention, is invisible to `git diff`/
+    `git status`/code review — the same "invisible to review" property that
+    justifies git-hooks-protect elsewhere."""
+    assert evaluate(_edit(".claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_write(".claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_edit("project/.claude/settings.local.json"), EMPTY).blocked
+    d = evaluate(_edit(".claude/settings.local.json"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_settings_local_json_not_escapable():
+    """Never-escapable, same as every other self-protect surface: the shell
+    form must still deny even with a trailing `# aegis-allow`."""
+    d = evaluate(_shell("echo '{}' > .claude/settings.local.json  # aegis-allow"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_settings_local_json_shell_forms_blocked():
+    """Shell write forms against the local settings file — already covered
+    generically by CONFIG_DIR_RE (matches the whole `.claude` dir), verified
+    explicitly here as a regression guard now that the file has a dedicated
+    Edit/Write path too."""
+    assert evaluate(_shell("echo '{}' > .claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/x/y/' .claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_shell("cp evil.json .claude/settings.local.json"), EMPTY).blocked
+
+
+def test_self_protect_blocks_mcp_write_to_enforcement_files():
+    """Round-A/B QA (independent, parallel adversarial review): rule_self_protect's
+    EDIT/WRITE branch checked only ActionClass.EDIT/WRITE, never MCP — unlike
+    every other *_protect guard in this file. An MCP filesystem-server tool
+    (a different tool name than 'Edit'/'Write', e.g. mcp__filesystem__write_file)
+    writing to Aegis's own policy dir, either settings file, or its engine
+    source sailed through completely unguarded. Fixed by adding ActionClass.MCP
+    alongside EDIT/WRITE, matching every sibling guard."""
+    def _mcp(path):
+        return Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file",
+                           args={"path": path})
+
+    assert evaluate(_mcp(".claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_mcp(".claude/settings.json"), EMPTY).blocked
+    assert evaluate(_mcp(".aegis/policies/default.yaml"), EMPTY).blocked
+    assert evaluate(_mcp("aegis/rules.py"), EMPTY).blocked
+    d = evaluate(_mcp(".claude/settings.local.json"), EMPTY)
+    assert d.rule == "self-protect"
+
+
+def test_self_protect_settings_files_windows_trailing_dot():
+    """Round-A/B QA: unlike `.aegis` in the same regex, the `.claude/settings...`
+    branch had no _WIN_TRIM before its separator — Windows silently strips
+    trailing dots/spaces off a path component, so `.claude./settings.json`
+    resolves to the real file but bypassed the Edit/Write check. Verified
+    pre-existing on plain settings.json before this fix, not introduced by
+    the settings.local.json coverage above; closed for both here."""
+    assert evaluate(_edit(".claude./settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude ./settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude./settings.local.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude ./settings.local.json"), EMPTY).blocked
+
+
+def test_self_protect_settings_files_doubled_separator():
+    """Round-A QA: a bare `[/\\\\]` between `.claude` and `settings` missed
+    doubled slashes and `./` no-op segments the OS treats as identical to the
+    plain path — `_SEP` (already used by AEGIS_SOURCE_RE for the exact same
+    reason) closes it. A `../`-backtracking segment remains a known,
+    disclosed gap (true path normalization is out of scope for a regex
+    denylist — same accepted limitation AEGIS_SOURCE_RE already carries)."""
+    assert evaluate(_edit(".claude//settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude/./settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude//settings.local.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude/./settings.local.json"), EMPTY).blocked
+
+
+def test_self_protect_settings_local_json_doesnt_false_positive():
+    """Similarly-named but unrelated files stay allowed — the guard is
+    anchored on the `.claude/` path segment, not a bare filename match."""
+    assert not evaluate(_edit("my-settings.local.json"), EMPTY).blocked
+    assert not evaluate(_edit(".claude/settings-local.json"), EMPTY).blocked
+    assert not evaluate(_edit(".claude/local.json"), EMPTY).blocked
+    assert not evaluate(_edit("docs/settings.local.json.md"), EMPTY).blocked
 
 
 def test_self_protect_blocks_aegis_pull():

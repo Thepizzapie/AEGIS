@@ -251,7 +251,16 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
                             "Writing/deleting/moving Aegis's own config, policy, or engine "
                             "source is blocked.")
         return None
-    if ev.action in (ActionClass.EDIT, ActionClass.WRITE):
+    # ActionClass.MCP alongside EDIT/WRITE: every other *_protect guard in this
+    # file already includes it (an MCP filesystem-server tool writes a file
+    # just as durably as the native Edit/Write tools, via a different tool
+    # name — `_path()` already recognizes its common arg-name variants). This
+    # branch had been EDIT/WRITE-only since self-protect was first written,
+    # silently exempting Aegis's own config/policy/engine source — the single
+    # highest-value target in the whole file — from the one write path every
+    # sibling guard already covers. Found by independent, parallel QA review
+    # while this same guard was being extended for settings.local.json.
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         if patterns.ENFORCEMENT_PATH_RE.search(p) or patterns.AEGIS_SOURCE_RE.search(p):
             return Decision(Action.DENY, "self-protect",

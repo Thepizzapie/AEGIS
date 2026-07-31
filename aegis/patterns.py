@@ -117,9 +117,47 @@ DNS_C2_RE = re.compile(
 # no backtracking blowup (see _SEP below for what that failure mode looks
 # like when a quantifier IS nested inside another).
 _WIN_TRIM = r"[ .]*"
+# Moved up from just above AEGIS_SOURCE_RE (full rationale is documented there,
+# including the catastrophic-backtracking history) so ENFORCEMENT_PATH_RE below
+# can reuse it too: one-or-more slashes, optionally followed by more
+# `.`-then-slashes segments — makes a path match survive `settings//json`
+# doubled separators and `settings/./json` no-op segments, the same tricks
+# AEGIS_SOURCE_RE already had to defend against.
+_SEP = r"[/\\]+(?:\.[/\\]+)*"
 # Aegis's own enforcement surface — deleting/editing this disables Aegis.
+# Covers BOTH Claude Code settings files, not just the shared/committed one:
+# `.claude/settings.json` (project, normally tracked in git) AND
+# `.claude/settings.local.json` (project, personal — Claude Code auto-adds it
+# to .gitignore and it takes precedence over the shared file). Both carry the
+# identical `hooks` + `permissions.allow` power Aegis's own install lives in,
+# so a write to either can plant a durable auto-exec hook or silently
+# self-approve future tool calls past Claude Code's own permission prompt —
+# and the `.local` variant is *more* dangerous to miss, not less: being
+# untracked by convention, a planted change there is invisible to `git
+# diff`/`git status`/code review, the same "invisible to review" property
+# that justifies git-hooks-protect elsewhere in this file. Previously only
+# the exact literal `settings.json` was matched, so an Edit/Write tool call
+# (as opposed to a shell redirect/in-place-edit, already caught generically
+# by CONFIG_DIR_RE below) targeting `settings.local.json` sailed through
+# self-protect's EDIT/WRITE branch entirely unguarded.
+#
+# Round-A/B QA (independent, parallel adversarial review) on the first cut of
+# this guard found two more issues, both closed here:
+#  - `.claude` before the separator had no `_WIN_TRIM`, unlike `.aegis` right
+#    above it — `.claude./settings.json` (Windows silently strips the
+#    trailing dot) bypassed self-protect on Edit/Write for BOTH settings
+#    files, a pre-existing gap this fix inherited rather than introduced.
+#    `_WIN_TRIM` between `.claude` and the separator closes it for both.
+#  - a bare `[/\\]` between `.claude` and `settings` missed doubled slashes
+#    and `./` segments (`.claude//settings.json`, `.claude/./settings.json`)
+#    the OS treats as identical to the plain form — `_SEP` (see above) closes
+#    it, reusing the exact fix AEGIS_SOURCE_RE already applies below. A
+#    `../`-segment path (`.claude/x/../settings.local.json`) is NOT covered —
+#    same accepted limitation AEGIS_SOURCE_RE already carries; true path
+#    normalization is out of scope for a regex denylist.
 ENFORCEMENT_PATH_RE = re.compile(
-    r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)|\.claude[/\\]settings\.json\b",
+    r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)"
+    r"|\.claude" + _WIN_TRIM + _SEP + r"settings(?:\.local)?\.json\b",
     re.IGNORECASE)
 # broader: shell delete/move of the whole config dirs (.aegis / .claude). Anchored
 # so it matches the DIR (followed by a separator / end / quote), not any filename
@@ -157,7 +195,8 @@ CONFIG_DIR_RE = re.compile(
 # _WIN_TRIM (defined above CONFIG_DIR_RE) sits before EVERY _SEP for the same
 # Windows trailing-dot/space reason: 'aegis./rules.py' and 'aegis ./rules.py'
 # resolve to Aegis's real engine source on Windows.
-_SEP = r"[/\\]+(?:\.[/\\]+)*"
+# (`_SEP` itself is now defined up near `_WIN_TRIM`, above ENFORCEMENT_PATH_RE,
+# which needed it too — this comment block stays here as its rationale.)
 AEGIS_SOURCE_RE = re.compile(
     r"\baegis" + _WIN_TRIM + _SEP + r"(?:__init__|rules|patterns|engine|policy|gate|attest|"
     r"identity|reaper|normalize|plugins|mcp|loader|cli|config|events|audit|"
