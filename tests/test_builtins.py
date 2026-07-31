@@ -130,6 +130,52 @@ def test_self_protect_settings_local_json_shell_forms_blocked():
     assert evaluate(_shell("cp evil.json .claude/settings.local.json"), EMPTY).blocked
 
 
+def test_self_protect_blocks_mcp_write_to_enforcement_files():
+    """Round-A/B QA (independent, parallel adversarial review): rule_self_protect's
+    EDIT/WRITE branch checked only ActionClass.EDIT/WRITE, never MCP — unlike
+    every other *_protect guard in this file. An MCP filesystem-server tool
+    (a different tool name than 'Edit'/'Write', e.g. mcp__filesystem__write_file)
+    writing to Aegis's own policy dir, either settings file, or its engine
+    source sailed through completely unguarded. Fixed by adding ActionClass.MCP
+    alongside EDIT/WRITE, matching every sibling guard."""
+    def _mcp(path):
+        return Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file",
+                           args={"path": path})
+
+    assert evaluate(_mcp(".claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_mcp(".claude/settings.json"), EMPTY).blocked
+    assert evaluate(_mcp(".aegis/policies/default.yaml"), EMPTY).blocked
+    assert evaluate(_mcp("aegis/rules.py"), EMPTY).blocked
+    d = evaluate(_mcp(".claude/settings.local.json"), EMPTY)
+    assert d.rule == "self-protect"
+
+
+def test_self_protect_settings_files_windows_trailing_dot():
+    """Round-A/B QA: unlike `.aegis` in the same regex, the `.claude/settings...`
+    branch had no _WIN_TRIM before its separator — Windows silently strips
+    trailing dots/spaces off a path component, so `.claude./settings.json`
+    resolves to the real file but bypassed the Edit/Write check. Verified
+    pre-existing on plain settings.json before this fix, not introduced by
+    the settings.local.json coverage above; closed for both here."""
+    assert evaluate(_edit(".claude./settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude ./settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude./settings.local.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude ./settings.local.json"), EMPTY).blocked
+
+
+def test_self_protect_settings_files_doubled_separator():
+    """Round-A QA: a bare `[/\\\\]` between `.claude` and `settings` missed
+    doubled slashes and `./` no-op segments the OS treats as identical to the
+    plain path — `_SEP` (already used by AEGIS_SOURCE_RE for the exact same
+    reason) closes it. A `../`-backtracking segment remains a known,
+    disclosed gap (true path normalization is out of scope for a regex
+    denylist — same accepted limitation AEGIS_SOURCE_RE already carries)."""
+    assert evaluate(_edit(".claude//settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude/./settings.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude//settings.local.json"), EMPTY).blocked
+    assert evaluate(_edit(".claude/./settings.local.json"), EMPTY).blocked
+
+
 def test_self_protect_settings_local_json_doesnt_false_positive():
     """Similarly-named but unrelated files stay allowed — the guard is
     anchored on the `.claude/` path segment, not a bare filename match."""
