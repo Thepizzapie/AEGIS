@@ -118,8 +118,24 @@ DNS_C2_RE = re.compile(
 # like when a quantifier IS nested inside another).
 _WIN_TRIM = r"[ .]*"
 # Aegis's own enforcement surface — deleting/editing this disables Aegis.
+# Covers BOTH Claude Code settings files, not just the shared/committed one:
+# `.claude/settings.json` (project, normally tracked in git) AND
+# `.claude/settings.local.json` (project, personal — Claude Code auto-adds it
+# to .gitignore and it takes precedence over the shared file). Both carry the
+# identical `hooks` + `permissions.allow` power Aegis's own install lives in,
+# so a write to either can plant a durable auto-exec hook or silently
+# self-approve future tool calls past Claude Code's own permission prompt —
+# and the `.local` variant is *more* dangerous to miss, not less: being
+# untracked by convention, a planted change there is invisible to `git
+# diff`/`git status`/code review, the same "invisible to review" property
+# that justifies git-hooks-protect elsewhere in this file. Previously only
+# the exact literal `settings.json` was matched, so an Edit/Write tool call
+# (as opposed to a shell redirect/in-place-edit, already caught generically
+# by CONFIG_DIR_RE below) targeting `settings.local.json` sailed through
+# self-protect's EDIT/WRITE branch entirely unguarded.
 ENFORCEMENT_PATH_RE = re.compile(
-    r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)|\.claude[/\\]settings\.json\b",
+    r"\.aegis" + _WIN_TRIM + r"(?=[/\\]|\s|['\"]|$)"
+    r"|\.claude[/\\]settings(?:\.local)?\.json\b",
     re.IGNORECASE)
 # broader: shell delete/move of the whole config dirs (.aegis / .claude). Anchored
 # so it matches the DIR (followed by a separator / end / quote), not any filename

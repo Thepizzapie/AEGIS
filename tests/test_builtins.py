@@ -19,6 +19,10 @@ def _edit(path):
     return Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={"file_path": path})
 
 
+def _write(path):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Write", args={"file_path": path})
+
+
 def test_containment_credentials():
     assert evaluate(_shell("cat ~/.ssh/id_rsa"), EMPTY).blocked
     assert evaluate(_shell("type C:\\Users\\me\\.aws\\credentials"), EMPTY).blocked
@@ -86,6 +90,53 @@ def test_self_protect_not_escapable():
     assert evaluate(_shell("rm -rf .claude"), EMPTY).blocked
     assert evaluate(_edit("project/.claude/settings.json"), EMPTY).blocked
     assert evaluate(_shell("aegis uninstall --project ."), EMPTY).blocked
+
+
+def test_self_protect_blocks_settings_local_json():
+    """`.claude/settings.local.json` (Claude Code's PERSONAL, project-local
+    settings override — auto-added to .gitignore, takes precedence over the
+    shared `.claude/settings.json`) carries the identical `hooks` +
+    `permissions.allow` power self-protect already denies on the shared
+    file. Before this fix ENFORCEMENT_PATH_RE matched only the literal
+    `settings.json`, so an Edit/Write (as opposed to a shell redirect/
+    in-place-edit — CONFIG_DIR_RE already caught those generically for the
+    whole `.claude` dir, see test_self_protect_blocks_shell_redirect_to_config
+    below) landed here unguarded: an agent could plant a SessionStart/
+    PreToolUse hook or a `permissions.allow: ["Bash(*)"]` self-approval in a
+    file that, being untracked by convention, is invisible to `git diff`/
+    `git status`/code review — the same "invisible to review" property that
+    justifies git-hooks-protect elsewhere."""
+    assert evaluate(_edit(".claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_write(".claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_edit("project/.claude/settings.local.json"), EMPTY).blocked
+    d = evaluate(_edit(".claude/settings.local.json"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_settings_local_json_not_escapable():
+    """Never-escapable, same as every other self-protect surface: the shell
+    form must still deny even with a trailing `# aegis-allow`."""
+    d = evaluate(_shell("echo '{}' > .claude/settings.local.json  # aegis-allow"), EMPTY)
+    assert d.blocked and d.rule == "self-protect"
+
+
+def test_self_protect_settings_local_json_shell_forms_blocked():
+    """Shell write forms against the local settings file — already covered
+    generically by CONFIG_DIR_RE (matches the whole `.claude` dir), verified
+    explicitly here as a regression guard now that the file has a dedicated
+    Edit/Write path too."""
+    assert evaluate(_shell("echo '{}' > .claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_shell("sed -i 's/x/y/' .claude/settings.local.json"), EMPTY).blocked
+    assert evaluate(_shell("cp evil.json .claude/settings.local.json"), EMPTY).blocked
+
+
+def test_self_protect_settings_local_json_doesnt_false_positive():
+    """Similarly-named but unrelated files stay allowed — the guard is
+    anchored on the `.claude/` path segment, not a bare filename match."""
+    assert not evaluate(_edit("my-settings.local.json"), EMPTY).blocked
+    assert not evaluate(_edit(".claude/settings-local.json"), EMPTY).blocked
+    assert not evaluate(_edit(".claude/local.json"), EMPTY).blocked
+    assert not evaluate(_edit("docs/settings.local.json.md"), EMPTY).blocked
 
 
 def test_self_protect_blocks_aegis_pull():
