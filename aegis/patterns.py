@@ -2281,6 +2281,113 @@ TEST_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code hook-config protection (.claude/settings.local.json) ---------
+# self_protect (ENFORCEMENT_PATH_RE) blocks any touch to `.claude/settings.json`
+# outright — the file `aegis install` writes its own hooks into. Claude Code
+# reads a SIBLING file with equal authority and merges its `hooks` array with
+# settings.json's own, `.claude/settings.local.json` — the project-local,
+# personal-override file Claude Code itself auto-adds to `.gitignore` on
+# first use — that self_protect's own path check never mentions and no other
+# guard reaches. A "hooks" entry planted there runs exactly like one in
+# settings.json: a shell command the RUNTIME executes directly on
+# PreToolUse/PostToolUse/Stop/etc, outside the tool-call loop Aegis's own
+# PreToolUse hook evaluates — Aegis sees and gates tool calls the model
+# makes, not another hook's own subprocess. Worse than every other
+# next-trigger-auto-exec surface this file already guards (a git hook, an
+# MCP server, a CI workflow, a devcontainer): the trigger here can be the
+# very NEXT tool call, often in this SAME session, not a future git
+# operation/CI run/shell restart/`cd` — and, being gitignored by design, a
+# change here produces no diff, shows in no `git status`, and survives no
+# code review, the same "most invisible durable backdoor" property
+# `rule_git_hooks_protect`'s own docstring claims for `.git/hooks/`, but
+# reachable here with an ordinary Edit/Write, no git internals required.
+CLAUDE_LOCAL_SETTINGS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.claude" + _WIN_TRIM + _SEP + r"settings\.local\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Content-only check for a CONFIRMED settings.local.json path: a "hooks" key
+# being introduced, in its ordinary JSON-object form (`"hooks": {...}`, the
+# Edit/Write shape). Content-gated, not path-only, because settings.local.json
+# legitimately carries plenty of other personal config (permissions, env,
+# model, statusLine, outputStyle, ...) edited for entirely benign reasons —
+# the same "gate the file AND the specific dangerous key" trade-off
+# `PACKAGE_SCRIPTS_PATH_RE`/`LIFECYCLE_SCRIPT_KEY_RE` already make for
+# package.json.
+#
+# QA finding (independent adversarial review, round A): an earlier draft
+# also matched a bareword dot/bracket-indirection form (`\bhooks\s*[.\[]`)
+# unconditionally, intended for a jq-style path expression — but applied to
+# ordinary Edit/Write literal content (not just shell/jq text) that form is
+# a false-positive magnet: a completely benign string value merely
+# containing `hooks.json`, `hooks.md`, or a `hooks[0]` array reference (a
+# webhook-URL note, a doc reference) matched and asked on routine,
+# unrelated settings.local.json edits. Real settings.local.json content is
+# always proper JSON, where a live `hooks` key is ALWAYS quote-delimited —
+# the dot/bracket form has no legitimate literal-JSON shape to catch here at
+# all. Dropped for Edit/Write/MCP content; the jq-specific dot/bracket case
+# is still covered, more safely, by `CLAUDE_HOOKS_JQ_RE` below, which
+# requires an assignment-shaped operator adjacent to the bareword (not mere
+# co-occurrence) before it fires.
+CLAUDE_HOOKS_KEY_RE = re.compile(
+    r"[\"']hooks[\"']\s*(?::|\])",
+    re.IGNORECASE,
+)
+
+# `cd`/`pushd`/`Set-Location` into `.claude` followed by a bare
+# `settings.local.json` reference — the same contiguous-match-adjacency
+# bypass QA repeatedly found (and closed) in `VSCODE_CD_RE`/
+# `DEVCONTAINER_CD_RE`: `CLAUDE_LOCAL_SETTINGS_PATH_RE` requires `.claude`
+# and the filename in one contiguous match, which an ordinary `cd .claude &&
+# jq '.hooks...' settings.local.json | sponge settings.local.json` never
+# produces even with zero obfuscation. `_CI_END` (not a bare `\b`)
+# terminates the directory name so a lookalike `.claude-old`/`.claude.bak`
+# backup directory doesn't false-positive, the same fix `VSCODE_CD_RE`
+# needed after its own round-C QA finding.
+#
+# QA finding (independent adversarial review, round A): the alias list here
+# was copied verbatim from `VSCODE_CD_RE`, which is missing PowerShell's
+# `Push-Location` (as common as `Set-Location`/`Push-Location`'s own `pushd`
+# alias, and neither self-protect's `CONFIG_DIR_RE` — no write-verb match on
+# a jq/sponge pipeline — nor this guard's own list caught it) — confirmed,
+# reproduced live bypass (`Push-Location .claude; jq '...' settings.local.json
+# | sponge settings.local.json`). Added `push-location`/`pop-location` here;
+# the identical gap is inherited, pre-existing, and still open in
+# `VSCODE_CD_RE`/`DEVCONTAINER_CD_RE` (out of scope for this guard alone —
+# a shared-normalization-layer fix, the same class of note this file's other
+# guards already disclose rather than patch guard-by-guard).
+CLAUDE_SETTINGS_CD_RE = re.compile(
+    r"\b(?:cd|pushd|popd|chdir|sl|set-location|push-location|pop-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.claude" + _CI_END,
+    re.IGNORECASE,
+)
+CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])settings\.local\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# jq has no `-i` flag, so a scripted edit is either a temp-file-then-`mv`
+# (already caught by the shared write-verb check at the rule's call site) or
+# piped through `sponge` (moreutils) — on no write-verb list at all, the
+# same gap `JQ_SCRIPTS_LIFECYCLE_RE`/`VSCODE_TASKS_JQ_RE` already close for
+# their own targets. Three independent, order-agnostic signals (matching
+# `VSCODE_TASKS_JQ_RE`'s own design, for the identical "don't keep
+# enumerating jq's path-expression grammar one shape at a time" reason): jq
+# itself, an assignment-shaped operator (`=`/`+=`/`|=` — explicitly not
+# `==`/`!=`/`<=`/`>=`), and the `hooks` key as a bare substring so any dot/
+# bracket/quoted path syntax reaching it is covered without being
+# individually named. Unlike `VSCODE_TASKS_JQ_RE`'s `runOn`, `hooks` has no
+# everyday safe value to also gate on (matching `DEVCONTAINER_EXEC_JQ_RE`'s
+# own six keys) — any assignment under it plants at least one auto-run
+# command.
+_CLAUDE_HOOKS_JQ_ASSIGN_OP = r"(?:\|=|\+=|(?<![!<>=])=(?!=))"
+CLAUDE_HOOKS_JQ_RE = re.compile(
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}\.?hooks\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

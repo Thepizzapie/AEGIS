@@ -11,6 +11,7 @@ destructive git/delete are escapable with an explicit '# aegis-allow'.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import subprocess
@@ -2841,6 +2842,266 @@ def rule_path_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- Claude Code hook-config protection: escapable with human confirm --------
+def _claude_hooks_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _claude_hooks_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for
+    ``hooks`` as an actual DICT KEY, not a string value — closes the bypass
+    where a structural MCP arg shape (a filesystem server's own ``{"json":
+    {"hooks": {...}}}`` edit-tool convention, say) never puts the key name
+    anywhere `_flatten_strings` (which only walks dict VALUES) would see it.
+    Same shape and same depth cap (12) as `_devcontainer_struct_key_hit` for
+    the identical cyclic/pathological-payload protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() == "hooks":
+                return True
+            if _claude_hooks_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_hooks_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_hooks_mcp_bareword_hit(a: dict) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: ``hooks`` appears,
+    exact-match (not substring), as a plain string LEAF anywhere in the
+    (recursively) flattened raw MCP args — closes a "set config value"-style
+    MCP tool's ``{"key": "hooks", "value": {...}}`` shape, where the key
+    name is a bare sibling VALUE, never a dict key or adjacent to a quote+
+    colon, the same shape `_vscode_mcp_bareword_kv_hit`'s own docstring
+    describes for `rule_vscode_tasks_protect`. Exact-match, not `in`/substr,
+    to keep this MCP-only fallback narrow — an unrelated multi-word string
+    leaf that merely mentions "hooks" in passing (a description field, say)
+    does not match."""
+    return any(isinstance(s, str) and s.strip().lower() == "hooks"
+               for s in _flatten_strings(a))
+
+
+def _claude_hooks_json_key_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result SEMANTICALLY for a ``hooks`` dict key, reusing
+    `_claude_hooks_struct_key_hit`'s own walk — an additional signal
+    alongside `CLAUDE_HOOKS_KEY_RE`'s textual check, not a replacement for
+    it (an ordinary Edit's ``new_string`` is usually a partial fragment with
+    no enclosing braces, which never parses standalone, so the textual
+    check still carries most of the real-world load).
+
+    QA finding (independent adversarial review, round A): JSON's own
+    ``\\uXXXX`` escape lets the key ``"hooks"`` be spelled byte-for-byte
+    differently in the raw text (``"\\u0068ooks"``, or any other character
+    escaped) while still decoding to the exact same key — a confirmed,
+    reproduced silent-ALLOW bypass against the purely textual
+    `CLAUDE_HOOKS_KEY_RE` on a whole-file ``Write`` call, since no substring
+    match can see through a decode step it never performs. `json.loads`
+    performs that decode for free; walking its *result* rather than its raw
+    text closes this whole escaping class at once (not just ``\\u0068``)
+    for any content that stands alone as valid JSON."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _claude_hooks_struct_key_hit(obj)
+
+
+def rule_claude_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a ``hooks`` entry in ``.claude/settings.local.json``
+    — the project-local, gitignored-by-default sibling of ``.claude/settings.json``
+    that Claude Code reads with equal authority and merges hooks from, and that
+    ``rule_self_protect``'s own ``ENFORCEMENT_PATH_RE`` never mentions.
+
+    THREAT MODEL: Aegis's own defense rests on being the thing every tool call
+    is checked against, from a process the model can't reach. That defense has
+    a blind spot: Aegis's PreToolUse hook gates TOOL CALLS the model makes, not
+    OTHER hooks the runtime itself invokes as its own subprocess — a
+    ``PreToolUse``/``PostToolUse``/``Stop``/... entry in a settings file is
+    executed directly by Claude Code, outside the tool-call loop entirely, so
+    nothing in this file's rule pipeline ever sees or gates it. ``rule_self_
+    protect`` already treats ``.claude/settings.json`` as fully off-limits for
+    exactly this reason — but Claude Code reads a SECOND file with identical
+    authority and merges its own ``hooks`` array with the first's:
+    ``.claude/settings.local.json``, the project-local override file Claude
+    Code itself auto-adds to ``.gitignore`` the first time it's used (a
+    personal home for permissions/env/model tweaks a developer doesn't want
+    checked in). Self-protect's path check has no mention of it, and no other
+    guard in this file reaches it either — an agent (hijacked, prompt-injected,
+    or just told to "add a debug hook") can plant an arbitrary shell command
+    there and it runs automatically, with no further action from the agent,
+    the next time any hook event it's registered for fires.
+
+    That "next trigger" is a materially worse bar than every sibling
+    next-trigger-auto-exec guard in this file clears: a git hook needs a
+    future commit/push/checkout, an MCP server needs a future session start, a
+    CI workflow needs a future push, a devcontainer command needs a future
+    (re)build — this needs only the very next matching tool call, which can
+    land in THIS SAME SESSION, moments after the plant. And because the file
+    is gitignored by design, the plant produces no diff, shows in no `git
+    status`, and survives no code review — the same "most invisible durable
+    backdoor" property `rule_git_hooks_protect`'s own docstring claims for
+    `.git/hooks/` (untracked, no diff), but reachable here with one ordinary
+    Edit/Write call, no git internals required, and armed sooner.
+
+    Distinct from a path-only guard for the same reason `rule_package_
+    manifest_protect`/`rule_devcontainer_exec_protect` are: settings.local.json
+    legitimately carries plenty of other personal config (permissions, env,
+    model, statusLine, outputStyle, ...) edited for entirely benign reasons —
+    gating on path alone would ask on nearly every legitimate local-settings
+    tweak. Gated on PATH *and* the specific ``hooks`` key, the same "gate the
+    file AND the dangerous key, not the whole file" shape those two guards use
+    for their own manifests. Unlike a guard that also gates a specific
+    dangerous VALUE (`rule_vscode_tasks_protect`'s `runOn`/
+    `allowAutomaticTasks`), ``hooks`` has no safe value once present — any
+    non-empty entry under it is at least one auto-run command, matching
+    `rule_devcontainer_exec_protect`'s own six lifecycle keys in that respect.
+
+    Config (``policy.claude_hooks``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a repo's
+    own trusted, reviewed local hook, say). Defaults to ``ask`` for the same
+    reason every sibling ``*_protect`` guard does: a locally-installed
+    formatter-on-save or notification hook can be legitimate, sanctioned
+    personal tooling — it just needs a human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_CLAUDE_HOOKS=1`` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form. A spawned agent
+    cannot set its own env for a hook invocation it doesn't control, so
+    neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: the user-level ``~/.claude/settings.json``/``~/.claude/
+    settings.local.json`` are reached the same way `rule_self_protect`'s own
+    suffix-only match reaches the user-level settings.json (no anchoring to
+    project root), but this is incidental, not a design goal, and a
+    relocated ``CLAUDE_CONFIG_DIR`` is not specially covered; a `hooks` value
+    assembled indirectly (a templating step, a build script) rather than
+    appearing as a literal is not caught; and, like every sibling guard here,
+    a direct fetch-to-file write (``curl -o .claude/settings.local.json
+    ...``) is caught by none of the shell branch's write-verb checks, the
+    same inherited gap every other guard in this file already discloses.
+    `_claude_hooks_struct_key_hit`'s recursion depth cap (12, matching
+    `_flatten_strings`/`_devcontainer_struct_key_hit`) means an MCP tool's
+    raw JSON args nesting the real ``hooks`` dict key beyond that depth
+    evades the structural fallback — the same disclosed, deliberately
+    unchanged precedent those two share, not a defect unique to this guard.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows): design/consistency review (round B) found no confirmed
+    defects — verified the ``claude_hooks`` knob is wired everywhere its
+    siblings are (``Policy``, all three ``loader.py`` spots, both
+    ``skills.py`` knob lists, the remedy table, README), verified the
+    self-protect-precedence claim above by actually running it through
+    ``evaluate()`` rather than trusting the docstring, and confirmed the
+    escape-hatch/mode/monitor conventions match every sibling guard exactly.
+    Bypass-hunting (round A) found and closed two real, reproduced gaps:
+    (1) a silent full-ALLOW bypass — JSON's own ``\\uXXXX`` escape lets the
+    key ``"hooks"`` be spelled byte-for-byte differently in the raw text
+    (``"\\u0068ooks"``) while a purely textual check can't see through the
+    decode step it never performs; closed by `_claude_hooks_json_key_hit`,
+    which parses whole-file-valid JSON content and walks the DECODED
+    structure semantically, as an additional signal alongside the textual
+    check rather than a replacement for it (most real edits are partial
+    fragments that never parse standalone). (2) `CLAUDE_SETTINGS_CD_RE`'s
+    alias list, copied from `VSCODE_CD_RE`, was missing PowerShell's
+    `Push-Location` — a confirmed, reproduced live bypass; fixed locally,
+    though the identical gap is inherited and still open in
+    `VSCODE_CD_RE`/`DEVCONTAINER_CD_RE` (out of scope here — a
+    shared-normalization-layer fix, not a per-guard one). Round A also found
+    and closed a false-positive/ask-fatigue source: an earlier draft's
+    `CLAUDE_HOOKS_KEY_RE` also matched a bareword dot/bracket form
+    (`hooks.`/`hooks[`) on ordinary Edit/Write literal content, intended for
+    jq path-expression text but with no legitimate literal-JSON shape to
+    catch there — a benign string merely mentioning `hooks.json`/`hooks.md`/
+    `hooks[0]` (a webhook-URL note, a doc reference) asked unnecessarily;
+    dropped for Edit/Write/MCP content, with the jq-specific case still
+    covered, more safely, by `CLAUDE_HOOKS_JQ_RE`'s own assignment-adjacency
+    requirement. Recommended PASS after these fixes; no round C needed. Full
+    suite green throughout, and a fresh ReDoS pass (adversarial inputs up to
+    500,000 characters) clean on every new pattern."""
+    cfg = getattr(policy, "claude_hooks", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-hooks-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.CLAUDE_HOOKS_KEY_RE.search(content)
+                   or _claude_hooks_json_key_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = bool(_claude_hooks_struct_key_hit(a) or _claude_hooks_mcp_bareword_hit(a))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_HOOKS")
+                or _claude_hooks_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-hooks-protect",
+                         f"'{p}' is being written with a `hooks` entry — Claude "
+                         "Code executes it directly as its own subprocess on "
+                         "the next matching tool call, often in this same "
+                         "session, OUTSIDE the tool-call loop Aegis evaluates, "
+                         "and (being gitignored by default) with no diff and "
+                         "no code review. Review the change, then confirm "
+                         "with AEGIS_ALLOW_CLAUDE_HOOKS=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        jq_hit = bool(patterns.CLAUDE_HOOKS_JQ_RE.search(cmd))
+        write_hit = bool(write_verb and patterns.CLAUDE_HOOKS_KEY_RE.search(cmd))
+        if not (jq_hit or write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_HOOKS")
+                or _claude_hooks_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-hooks-protect",
+                         "A `hooks` entry is being planted in "
+                         ".claude/settings.local.json from a shell — Claude "
+                         "Code executes it directly as its own subprocess on "
+                         "the next matching tool call, often in this same "
+                         "session, OUTSIDE the tool-call loop Aegis "
+                         "evaluates, and (being gitignored by default) with "
+                         "no diff and no code review. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_CLAUDE_HOOKS=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -3249,6 +3510,7 @@ _CORE_RULES = (
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,
+    rule_claude_hooks_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

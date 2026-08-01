@@ -206,6 +206,14 @@ class Policy:
     # shims, ~/go/bin, /usr/local/bin, /opt/homebrew/bin, ...). See
     # rules.rule_path_hijack_protect.
     path_hijack: dict = field(default_factory=dict)
+    # Claude Code hook-config protection: {mode: deny|ask|monitor|off, allow:
+    # [regex on path/command]}. Empty -> defaults (mode=ask) apply. Covers a
+    # `hooks` entry planted in `.claude/settings.local.json` — the
+    # project-local, gitignored-by-default sibling of `.claude/settings.json`
+    # (already fully blocked by self-protect) that Claude Code reads and
+    # merges hooks from with equal authority, and that no other guard
+    # reaches. See rules.rule_claude_hooks_protect.
+    claude_hooks: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.

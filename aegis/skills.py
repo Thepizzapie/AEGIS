@@ -44,6 +44,7 @@ _REMEDIES = """\
 | devcontainer-exec-protect | wrote a devcontainer.json lifecycle command (initializeCommand/onCreateCommand/postCreateCommand/postStartCommand/postAttachCommand/updateContentCommand) | ask the human; they can set AEGIS_ALLOW_DEVCONTAINER_EXEC=1 after review |
 | vscode-tasks-protect | wrote a VS Code automatic task (tasks.json runOn: "folderOpen") or silenced its confirmation prompt (settings.json task.allowAutomaticTasks: "on") | ask the human; they can set AEGIS_ALLOW_VSCODE_TASKS_EXEC=1 after review |
 | path-hijack-protect | planted/symlinked/chmod +x'd an executable over a trusted command name in a $PATH bin directory (shadows the next bare invocation of that command, by anyone) | ask the human; they can set AEGIS_ALLOW_PATH_HIJACK=1 after review |
+| claude-hooks-protect | planted a `hooks` entry in .claude/settings.local.json (runs as Claude Code's own subprocess on the next matching tool call, outside the tool-call loop Aegis evaluates) | ask the human; they can set AEGIS_ALLOW_CLAUDE_HOOKS=1 after review |
 | workspace-confine | wrote outside the project root the identity is bound to | stay in the project; ask for workspace.allow if a path is legitimate |
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |
 | subagent-spawn | a spawned agent tried to spawn sub-agents | do the work in this session, or run with AEGIS_ALLOW_SUBAGENTS=1 |
@@ -102,7 +103,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `shell_persist`, `direnv`, `package_manifest`, `service_persist`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `shell_persist`, `direnv`, `package_manifest`, `service_persist`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -148,6 +149,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
      `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `shell_persist`, `direnv`,
      `package_manifest`, `service_persist`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
+     `claude_hooks`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
