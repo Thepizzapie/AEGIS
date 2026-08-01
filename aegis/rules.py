@@ -11,6 +11,7 @@ destructive git/delete are escapable with an explicit '# aegis-allow'.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import subprocess
@@ -2889,6 +2890,32 @@ def _claude_hooks_mcp_bareword_hit(a: dict) -> bool:
                for s in _flatten_strings(a))
 
 
+def _claude_hooks_json_key_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result SEMANTICALLY for a ``hooks`` dict key, reusing
+    `_claude_hooks_struct_key_hit`'s own walk — an additional signal
+    alongside `CLAUDE_HOOKS_KEY_RE`'s textual check, not a replacement for
+    it (an ordinary Edit's ``new_string`` is usually a partial fragment with
+    no enclosing braces, which never parses standalone, so the textual
+    check still carries most of the real-world load).
+
+    QA finding (independent adversarial review, round A): JSON's own
+    ``\\uXXXX`` escape lets the key ``"hooks"`` be spelled byte-for-byte
+    differently in the raw text (``"\\u0068ooks"``, or any other character
+    escaped) while still decoding to the exact same key — a confirmed,
+    reproduced silent-ALLOW bypass against the purely textual
+    `CLAUDE_HOOKS_KEY_RE` on a whole-file ``Write`` call, since no substring
+    match can see through a decode step it never performs. `json.loads`
+    performs that decode for free; walking its *result* rather than its raw
+    text closes this whole escaping class at once (not just ``\\u0068``)
+    for any content that stands alone as valid JSON."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _claude_hooks_struct_key_hit(obj)
+
+
 def rule_claude_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting/altering a ``hooks`` entry in ``.claude/settings.local.json``
     — the project-local, gitignored-by-default sibling of ``.claude/settings.json``
@@ -2962,7 +2989,47 @@ def rule_claude_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     appearing as a literal is not caught; and, like every sibling guard here,
     a direct fetch-to-file write (``curl -o .claude/settings.local.json
     ...``) is caught by none of the shell branch's write-verb checks, the
-    same inherited gap every other guard in this file already discloses."""
+    same inherited gap every other guard in this file already discloses.
+    `_claude_hooks_struct_key_hit`'s recursion depth cap (12, matching
+    `_flatten_strings`/`_devcontainer_struct_key_hit`) means an MCP tool's
+    raw JSON args nesting the real ``hooks`` dict key beyond that depth
+    evades the structural fallback — the same disclosed, deliberately
+    unchanged precedent those two share, not a defect unique to this guard.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows): design/consistency review (round B) found no confirmed
+    defects — verified the ``claude_hooks`` knob is wired everywhere its
+    siblings are (``Policy``, all three ``loader.py`` spots, both
+    ``skills.py`` knob lists, the remedy table, README), verified the
+    self-protect-precedence claim above by actually running it through
+    ``evaluate()`` rather than trusting the docstring, and confirmed the
+    escape-hatch/mode/monitor conventions match every sibling guard exactly.
+    Bypass-hunting (round A) found and closed two real, reproduced gaps:
+    (1) a silent full-ALLOW bypass — JSON's own ``\\uXXXX`` escape lets the
+    key ``"hooks"`` be spelled byte-for-byte differently in the raw text
+    (``"\\u0068ooks"``) while a purely textual check can't see through the
+    decode step it never performs; closed by `_claude_hooks_json_key_hit`,
+    which parses whole-file-valid JSON content and walks the DECODED
+    structure semantically, as an additional signal alongside the textual
+    check rather than a replacement for it (most real edits are partial
+    fragments that never parse standalone). (2) `CLAUDE_SETTINGS_CD_RE`'s
+    alias list, copied from `VSCODE_CD_RE`, was missing PowerShell's
+    `Push-Location` — a confirmed, reproduced live bypass; fixed locally,
+    though the identical gap is inherited and still open in
+    `VSCODE_CD_RE`/`DEVCONTAINER_CD_RE` (out of scope here — a
+    shared-normalization-layer fix, not a per-guard one). Round A also found
+    and closed a false-positive/ask-fatigue source: an earlier draft's
+    `CLAUDE_HOOKS_KEY_RE` also matched a bareword dot/bracket form
+    (`hooks.`/`hooks[`) on ordinary Edit/Write literal content, intended for
+    jq path-expression text but with no legitimate literal-JSON shape to
+    catch there — a benign string merely mentioning `hooks.json`/`hooks.md`/
+    `hooks[0]` (a webhook-URL note, a doc reference) asked unnecessarily;
+    dropped for Edit/Write/MCP content, with the jq-specific case still
+    covered, more safely, by `CLAUDE_HOOKS_JQ_RE`'s own assignment-adjacency
+    requirement. Recommended PASS after these fixes; no round C needed. Full
+    suite green throughout, and a fresh ReDoS pass (adversarial inputs up to
+    500,000 characters) clean on every new pattern."""
     cfg = getattr(policy, "claude_hooks", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -2985,7 +3052,8 @@ def rule_claude_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
-        hit = bool(patterns.CLAUDE_HOOKS_KEY_RE.search(content))
+        hit = bool(patterns.CLAUDE_HOOKS_KEY_RE.search(content)
+                   or _claude_hooks_json_key_hit(content))
         if not hit and ev.action == ActionClass.MCP:
             hit = bool(_claude_hooks_struct_key_hit(a) or _claude_hooks_mcp_bareword_hit(a))
         if not hit:

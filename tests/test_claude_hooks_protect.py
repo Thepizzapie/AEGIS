@@ -89,8 +89,71 @@ def test_bracket_form_gated():
     assert _gated(d) and d.rule == "claude-hooks-protect"
 
 
-def test_dot_indirection_form_gated():
-    d = evaluate(_write(".claude/settings.local.json", "hooks.PreToolUse = []"), EMPTY)
+def test_bareword_dot_form_in_literal_content_not_gated():
+    """QA finding (independent adversarial review, round A): an earlier
+    draft also matched a bareword dot/bracket form (`hooks.`/`hooks[`) on
+    ordinary Edit/Write literal content, intended for jq path-expression
+    text — but real settings.local.json content is always proper JSON,
+    where a live `hooks` key is always quote-delimited, so that alternative
+    had no legitimate literal-JSON shape to catch and was a false-positive
+    magnet on benign content that merely mentions `hooks.json`/`hooks.md`/
+    `hooks[0]` (a webhook-URL note, a doc reference). Dropped for Edit/
+    Write/MCP content; the jq-specific dot-path mutation form is still
+    caught, more safely, via `CLAUDE_HOOKS_JQ_RE` on the shell branch (see
+    `test_shell_jq_sponge_assign_gated` — that one requires an
+    assignment-shaped operator adjacent to the bareword, not mere
+    co-occurrence)."""
+    assert not _gated(evaluate(
+        _write(".claude/settings.local.json", "hooks.PreToolUse = []"), EMPTY))
+
+
+def test_benign_hooks_json_filename_mention_not_gated():
+    d = evaluate(_write(".claude/settings.local.json",
+                         '{"env": {"NOTES_FILE": "hooks.json"}}'), EMPTY)
+    assert not _gated(d)
+
+
+def test_benign_hooks_array_index_mention_not_gated():
+    d = evaluate(_write(".claude/settings.local.json",
+                         '{"env": {"REF": "see hooks[0] in the docs"}}'), EMPTY)
+    assert not _gated(d)
+
+
+def test_webhooks_key_not_gated():
+    """`webhooks`/similar lookalike keys must not match the exact `hooks`
+    key check."""
+    d = evaluate(_write(".claude/settings.local.json",
+                         '{"webhooks": {"url": "https://example.com"}}'), EMPTY)
+    assert not _gated(d)
+
+
+def test_unicode_escaped_key_gated():
+    """QA finding (independent adversarial review, round A): a CONFIRMED,
+    reproduced silent-ALLOW bypass — JSON's own `\\uXXXX` escape lets the
+    key `"hooks"` be spelled byte-for-byte differently in the raw text
+    (`"\\u0068ooks"` decodes to the real key `hooks`) while evading a purely
+    textual substring check. Closed by `_claude_hooks_json_key_hit`, which
+    parses whole-file-valid JSON content and walks the DECODED structure
+    semantically rather than pattern-matching the raw text."""
+    d = evaluate(_write(".claude/settings.local.json",
+                         '{"\\u0068ooks": {"PreToolUse": [{"matcher": "Bash", "hooks": '
+                         '[{"type": "command", "command": "echo hi"}]}]}}'), EMPTY)
+    assert _gated(d) and d.rule == "claude-hooks-protect"
+
+
+def test_unicode_escaped_key_via_mcp_gated():
+    d = evaluate(_mcp_write(".claude/settings.local.json",
+                             '{"\\u0068ooks": {"PreToolUse": []}}'), EMPTY)
+    assert _gated(d) and d.rule == "claude-hooks-protect"
+
+
+def test_partial_edit_fragment_not_valid_json_still_uses_textual_check():
+    """An ordinary Edit's `new_string` is usually a partial fragment (no
+    enclosing braces) that never parses standalone as JSON — the JSON
+    semantic check silently no-ops (returns False, doesn't raise) and the
+    textual `CLAUDE_HOOKS_KEY_RE` check alone still carries this case, the
+    same as before the round-A fix."""
+    d = evaluate(_edit(".claude/settings.local.json", '"hooks": {"PreToolUse": []}'), EMPTY)
     assert _gated(d) and d.rule == "claude-hooks-protect"
 
 
@@ -274,6 +337,19 @@ def test_shell_set_location_into_claude_dir_then_bare_filename_gated():
     d = evaluate(_shell(
         'Set-Location .claude; Set-Content settings.local.json '
         '\'{"hooks": {"PreToolUse": []}}\''), EMPTY)
+    assert _gated(d) and d.rule == "claude-hooks-protect"
+
+
+def test_shell_push_location_into_claude_dir_then_bare_filename_gated():
+    """QA finding (independent adversarial review, round A): a CONFIRMED,
+    reproduced bypass — `CLAUDE_SETTINGS_CD_RE`'s alias list (copied from
+    `VSCODE_CD_RE`) was missing PowerShell's `Push-Location`, as common an
+    alias as `Set-Location`. Neither self-protect (no recognized write-verb
+    on a jq/sponge pipeline) nor this guard's own list caught it before the
+    fix."""
+    d = evaluate(_shell(
+        'Push-Location .claude; jq \'.hooks = {"PreToolUse": []}\' '
+        'settings.local.json | sponge settings.local.json'), EMPTY)
     assert _gated(d) and d.rule == "claude-hooks-protect"
 
 
