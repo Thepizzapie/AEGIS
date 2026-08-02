@@ -220,7 +220,7 @@ def test_shell_echo_redirect_gated():
     assert _gated(d) and d.rule == "conftest-protect"
 
 
-def test_shell_cp_from_payload_gated():
+def test_shell_cp_from_payload_not_gated():
     d = evaluate(_shell('cp payload.py conftest.py'), EMPTY)
     # cp alone carries no dangerous-call signal until content is inspected;
     # the shell branch only sees the command text, not payload.py's
