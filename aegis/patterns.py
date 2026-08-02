@@ -2982,16 +2982,25 @@ CONFTEST_MODULE_LEVEL_RE = re.compile(
 # run; `pytest_unconfigure` fires at teardown, unconditionally, even on a
 # run that collected zero tests.
 #
-# Lookahead window (600 chars, DOTALL so it spans lines) for a dangerous
+# Lookahead window (4000 chars, DOTALL so it spans lines) for a dangerous
 # call following the `def` -- the same bounded co-occurrence convention
 # `CLAUDE_HOOKS_JQ_RE`/`DIRENV_ACTIVATE_RE` already use for "somewhere in
 # the same statement/block" rather than a true parse of the function body.
 # Disclosed trade-off, the same shape as those: the window isn't scoped to
-# THIS function's body specifically, so a hook def followed (within 600
-# chars) by an unrelated dangerous call in a DIFFERENT, later function can
+# THIS function's body specifically, so a hook def followed (within the
+# window) by an unrelated dangerous call in a DIFFERENT, later function can
 # still match -- accepted here for the same reason it's accepted there
 # (real Python source has the same "adjacent enough to almost always mean
-# what it looks like" property those shell one-liners do).
+# what it looks like" property those shell one-liners do). QA (bypass-
+# hunting round) found the original 600-char width too NARROW in the other
+# direction first: an ordinary, plausible docstring (a one-line summary plus
+# a handful of wrapped detail lines -- nothing adversarial, no padding
+# attack) ahead of the actual dangerous call already exceeds 600 chars and
+# pushed the call outside the window, a false ALLOW on a realistic fixture
+# body, not just a contrived one. Widened to 4000 to cover that common case;
+# still a fixed bound, not a real parse, so an unusually long function could
+# in principle still exceed it -- the same class of residual gap, just
+# further out.
 _CONFTEST_AUTOEXEC_HOOKS = (
     r"pytest_configure|pytest_sessionstart|pytest_collection_modifyitems"
     r"|pytest_collectstart|pytest_runtestloop|pytest_load_initial_conftests"
@@ -2999,7 +3008,7 @@ _CONFTEST_AUTOEXEC_HOOKS = (
 )
 CONFTEST_AUTOEXEC_HOOK_RE = re.compile(
     r"def\s+(?:" + _CONFTEST_AUTOEXEC_HOOKS + r")\s*\("
-    r"(?=.{0,600}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
+    r"(?=.{0,4000}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -3012,12 +3021,12 @@ CONFTEST_AUTOEXEC_HOOK_RE = re.compile(
 # match, same direction as the hook check above.
 CONFTEST_AUTOUSE_RE = re.compile(
     r"autouse\s*=\s*True"
-    r"(?=.{0,600}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
+    r"(?=.{0,4000}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
     re.IGNORECASE | re.DOTALL,
 )
 
 
-def conftest_dangerous_hit(content: str, *, shell: bool = False) -> bool:
+def conftest_dangerous_hit(content: str, *, shell: bool = False, raw: str = None) -> bool:
     """True if `content` carries a conftest.py auto-exec-on-collection
     shape: a module-level dangerous call, an auto-invoked pytest hook
     function wrapping one, or an `autouse=True` fixture wrapping one. Used
@@ -3025,24 +3034,47 @@ def conftest_dangerous_hit(content: str, *, shell: bool = False) -> bool:
     or a fragment) and the shell branch (``shell=True``, the de-obfuscated
     command text) of `rules.rule_conftest_protect`.
 
-    ``shell=True`` with NO embedded newline in `content` is a single
-    physical line -- a one-line `echo '<code>' > conftest.py`/`printf
-    '<code>' >> conftest.py` plant, where the ENTIRE quoted argument
-    becomes the whole resulting file (or the whole appended line): there is
-    no possibility of real indentation surviving a shell argument with no
-    line breaks, so any dangerous call anywhere in it -- however many
-    `;`-joined statements precede it -- is unconditionally module-level
-    once written. `CONFTEST_DANGEROUS_CALL_RE` (position-agnostic) is used
-    for that case instead of the strict `^`-anchored check, which would
-    otherwise miss the common `echo 'import os; os.system(...)' >
-    conftest.py` shape entirely (the call sits after a `; `, never at
-    column 0 of the raw COMMAND text). A heredoc body (or any other
-    embedded-newline shell payload) reproduces the target file's own line
-    structure verbatim, so it still gets the precise, position-aware
-    `CONFTEST_MODULE_LEVEL_RE` check -- an indented line inside an ordinary,
-    by-name fixture written via `cat <<EOF` is not flagged just because the
-    heredoc happens to travel through a shell tool call instead of Write."""
-    if shell and "\n" not in content:
+    ``shell=True`` with NO embedded newline is a single physical line -- a
+    one-line `echo '<code>' > conftest.py`/`printf '<code>' >> conftest.py`
+    plant, where the ENTIRE quoted argument becomes the whole resulting
+    file (or the whole appended line): there is no possibility of real
+    indentation surviving a shell argument with no line breaks, so any
+    dangerous call anywhere in it -- however many `;`-joined statements
+    precede it -- is unconditionally module-level once written.
+    `CONFTEST_DANGEROUS_CALL_RE` (position-agnostic) is used for that case
+    instead of the strict `^`-anchored check, which would otherwise miss
+    the common `echo 'import os; os.system(...)' > conftest.py` shape
+    entirely (the call sits after a `; `, never at column 0 of the raw
+    COMMAND text). A heredoc body (or any other embedded-newline shell
+    payload) reproduces the target file's own line structure verbatim, so
+    it still gets the precise, position-aware `CONFTEST_MODULE_LEVEL_RE`
+    check -- an indented line inside an ordinary, by-name fixture written
+    via `cat <<EOF` is not flagged just because the heredoc happens to
+    travel through a shell tool call instead of Write.
+
+    ``raw``, when given, is the un-de-obfuscated original command text, and
+    is what decides single-line-vs-heredoc instead of `content` itself.
+    Callers pass `content` = `normalize.scan_surface(command)`: the
+    de-obfuscated scan surface, which appends decoded/inner-interpreter
+    text as EXTRA, SPACE-joined segments after the raw command. QA (bypass-
+    hunting round) found that when a genuinely single-line command (no
+    heredoc, e.g. `echo <base64> | base64 -d > conftest.py`) decodes to
+    payload text that itself ends in (or contains) a newline byte, that
+    newline makes it into `content` and flips the decision to the strict
+    `^`-anchored check -- but the decoded segment is joined onto the
+    preceding text with a plain SPACE, not a real line break, so a dangerous
+    call sitting at the very start of that decoded segment is never
+    preceded by an actual `\\n` and the strict check silently never matches
+    it: a live false ALLOW for a one-line, non-heredoc plant whose payload
+    just happens to decode to more than one line. Deciding on `raw` (which
+    has no newline for a genuinely one-line command, decoded content
+    notwithstanding) restores the correct, more-permissive position-
+    agnostic check for that case, while a real heredoc's `raw` command
+    still carries its own literal embedded newlines and is unaffected.
+    Defaults to `content` when omitted, for backward compatibility with
+    direct callers that already only pass one string."""
+    newline_probe = raw if raw is not None else content
+    if shell and "\n" not in newline_probe:
         module_level = CONFTEST_DANGEROUS_CALL_RE
     else:
         module_level = CONFTEST_MODULE_LEVEL_RE

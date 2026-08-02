@@ -3186,11 +3186,16 @@ def rule_conftest_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     Honest scope, the same denylist trade-offs every guard in this file
     discloses: the auto-invoked-hook and autouse-fixture checks use a
-    bounded (600-char) forward lookahead for co-occurrence, not a real
+    bounded (4000-char) forward lookahead for co-occurrence, not a real
     parse of the function's body -- a hook/fixture def followed, within
     that window, by an unrelated dangerous call in a DIFFERENT, later
     function can still match, the same disclosed trade-off ``CLAUDE_HOOKS_
-    JQ_RE``'s own assignment-adjacency window already accepts; a dangerous
+    JQ_RE``'s own assignment-adjacency window already accepts (QA's bypass-
+    hunting round widened this from an original 600 chars after finding
+    that width too NARROW for an ordinary, undoctored docstring ahead of the
+    real call -- a false ALLOW on a realistic fixture body, not merely a
+    contrived one; 4000 is still a fixed bound, not a real parse, so an
+    unusually long function could in principle still exceed it); a dangerous
     call assembled indirectly (string concatenation, a wrapper the file
     then calls) rather than appearing as a literal defeats every check
     here; the module-level check's "unindented" signal is column-0-in-the-
@@ -3220,7 +3225,49 @@ def rule_conftest_protect(ev: Event, policy=None) -> Optional[Decision]:
     here (the bare-filename path match already reaches every depth on its
     own) -- and, for the same reason, no bare-directory archive/sync
     fallback either, the same absence ``rule_direnv_protect``'s own
-    docstring discloses for ``.envrc``."""
+    docstring discloses for ``.envrc``.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review found the wiring correct
+    everywhere its siblings are (``Policy``, all three ``loader.py`` spots,
+    both ``skills.py`` knob lists, the remedy table, README), verified an
+    actual YAML ``conftest:`` block round-trips through ``load_policy()``
+    into a live ``evaluate()`` decision rather than trusting the wiring by
+    inspection alone, and found one test misnamed for what it actually
+    asserted (fixed). Bypass-hunting found and closed three real, reproduced
+    gaps: (1) the shell branch's single-line-vs-heredoc decision was made on
+    ``normalize.scan_surface``'s OWN output, which appends a decoded/inner-
+    interpreter segment with a plain space join -- a genuinely one-line
+    ``echo <base64> | base64 -d > conftest.py`` plant whose DECODED payload
+    happened to contain a newline byte flipped the check to the stricter,
+    position-aware one, which then never found the call at a real line
+    start (it sat after the join space) -- a confirmed, reproduced live
+    bypass; closed by deciding the single-line-vs-heredoc branch on the
+    PRE-decode raw command text instead (`conftest_dangerous_hit`'s own
+    ``raw`` parameter), which has no such synthetic newline for a genuinely
+    single-line command. (2) the MCP fallback's ``" ".join(_flatten_
+    strings(a))`` meant a bare, single-line dangerous call that was the
+    ENTIRE value of a nested string leaf (a filesystem-server edit tool's
+    own ``{"edits": [{"newText": ...}]}`` shape, say) was preceded by that
+    join space rather than a real line break, so the module-level check's
+    ``^`` anchor never saw it as column-0 -- a confirmed, reproduced live
+    bypass (the existing test for this MCP shape happened to still pass
+    only because its own payload had an unrelated ``import`` line ahead of
+    the call, incidentally supplying the newline the join itself didn't);
+    closed by joining flattened MCP string leaves with ``\\n`` instead of a
+    space, guard-local (the shared `_flatten_strings` helper itself, and
+    every other guard that calls it, is unchanged). (3) the auto-invoked-
+    hook/autouse-fixture lookahead window, originally 600 chars, was found
+    too NARROW in the opposite direction from every other guard's own
+    disclosed "window too wide" trade-off: an ordinary, undoctored docstring
+    (a one-line summary plus a handful of wrapped detail lines, no padding
+    attack) ahead of the real call already exceeds 600 chars on realistic
+    fixture code -- a confirmed, reproduced live false-ALLOW on a plausible,
+    non-adversarial input; widened to 4000 chars, which is still a fixed
+    bound, not a real parse, and is disclosed as such above. Recommended
+    PASS after these fixes; no further round needed. Full suite green
+    throughout (1423 passed after the fixes' own regression tests)."""
     cfg = getattr(policy, "conftest", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -3238,7 +3285,20 @@ def rule_conftest_protect(ev: Event, policy=None) -> Optional[Decision]:
         p = _path(ev)
         a = ev.args or {}
         literal = a.get("content") or a.get("new_string")
-        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        # Fallback for MCP tool shapes that don't use Claude Code's own
+        # "content"/"new_string" keys (e.g. a filesystem-server edit tool's
+        # nested {"edits": [{"oldText": ..., "newText": ...}]}) -- flatten
+        # every string leaf in the args. QA (bypass-hunting round) found a
+        # SPACE join here was a live bypass: a module-level dangerous call
+        # sitting at the very start of a nested string leaf (e.g. "newText")
+        # is preceded by that join space, not a real line break, so the
+        # `^`-anchored module-level check never sees it as column-0 — only
+        # a payload with an unrelated line (an `import`) ahead of the call
+        # inside the SAME leaf happened to still match, by accident of that
+        # leaf's own internal newline. Joining with "\n" instead makes each
+        # flattened leaf start its own logical line, the same property a
+        # real file's/fragment's own text already has.
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
         if not p or not content:
             return None
         if not patterns.CONFTEST_PATH_RE.search(p):
@@ -3269,7 +3329,7 @@ def rule_conftest_protect(ev: Event, policy=None) -> Optional[Decision]:
                            or patterns.COPY_WRITE_VERB_RE.search(cmd))
         if not (write_verb and patterns.CONFTEST_PATH_RE.search(cmd)):
             return None
-        if not patterns.conftest_dangerous_hit(cmd, shell=True):
+        if not patterns.conftest_dangerous_hit(cmd, shell=True, raw=_cmd(ev)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CONFTEST")
                 or _conftest_allowed_by_policy(cfg, _cmd(ev))):
