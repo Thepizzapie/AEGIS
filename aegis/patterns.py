@@ -2909,3 +2909,143 @@ def gitattrs_wiring_hit(cmd: str) -> bool:
     already accepts the equivalent trade-off for."""
     names = bool(GIT_ATTRS_PATH_RE.search(cmd) or git_attrs_find_hit(cmd))
     return names and bool(GIT_ATTRS_DRIVER_ASSIGN_RE.search(cmd))
+
+
+# ---- pytest conftest.py auto-exec-on-collection protection --------------------
+# pytest auto-discovers and imports EVERY `conftest.py` from the invocation's
+# rootdir down to each collected test's own directory -- no explicit `import`,
+# no opt-in, no wiring in pytest.ini/pyproject.toml/tox.ini needed. It is
+# pytest's single most fundamental plugin-loading mechanism, on by default in
+# every pytest project -- this repo's own `tests/` included (see
+# `[tool.pytest.ini_options]` in pyproject.toml, and `TEST_CMD_RE` above,
+# which already recognizes `pytest` as a test-runner invocation). Nothing
+# else in this file reaches it: `PACKAGE_SCRIPTS_PATH_RE`/
+# `LIFECYCLE_SCRIPT_KEY_RE` gate JS/PHP install-lifecycle keys, not Python
+# test collection; `CI_WORKFLOW_PATH_RE`/`GIT_HOOKS_*`/`DEVCONTAINER_*`/
+# `VSCODE_TASKS_*`/`CLAUDE_HOOKS_*` all gate OTHER auto-exec surfaces.
+#
+# Bare-filename match, no fixed parent directory needed -- unlike `.vscode`/
+# `.devcontainer`/`.claude`, a conftest.py has no single canonical parent
+# (repo root, `tests/`, and every package subdirectory are all equally
+# legitimate places for one), so unlike those siblings there is no
+# directory-name `cd`-fallback to add here: the bare-filename match already
+# reaches every depth on its own.
+CONFTEST_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])conftest\.py" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Process/dynamic-code-exec primitives a planted conftest.py would actually
+# use to DO something once pytest auto-imports/auto-invokes it -- the same
+# network-call vocabulary `_SCRIPT_NET` uses (already shared with
+# `ENV_DUMP_EXFIL_RE` above), spelled out here WITHOUT its own trailing
+# `\s*\(` (every use site below appends that once, uniformly, after the
+# whole alternation -- reusing `_SCRIPT_NET` verbatim would require TWO
+# consecutive open-parens for its branches specifically), plus the
+# os/subprocess/dynamic-exec primitives it doesn't name.
+_CONFTEST_NET_CALL = r"requests\.(?:post|put|get|patch)|urlopen|fetch|axios\.\w+|http\.client"
+_CONFTEST_EXEC_CALL = (
+    r"(?:os\.system|os\.popen|subprocess\.(?:Popen|call|run|check_output|check_call)"
+    r"|pty\.spawn|commands\.getoutput|eval|exec|__import__|importlib\.import_module"
+    r"|socket\.socket|" + _CONFTEST_NET_CALL + r")"
+)
+CONFTEST_DANGEROUS_CALL_RE = re.compile(_CONFTEST_EXEC_CALL + r"\s*\(", re.IGNORECASE)
+
+# Module-level (unindented) statement: pytest imports a conftest.py top to
+# bottom at COLLECTION time -- before a single test is selected, run, or
+# even named -- so a bare top-level call executes unconditionally on plain
+# `pytest`, `pytest --collect-only`, `pytest -k nonexistent_name`, `pytest
+# --fixtures`, whatever. `^` (MULTILINE) with no leading `\s*` requires the
+# call to start the line with zero indentation; an ordinary call nested
+# inside a function/class body never matches this alone -- deliberate, the
+# same "gate the dangerous SHAPE, not any use of these APIs" trade-off
+# `LIFECYCLE_SCRIPT_KEY_RE` makes for package.json, since a normal
+# integration-test fixture legitimately shells out to run the CLI under
+# test (a `subprocess.run` INSIDE an ordinary, by-name-requested fixture is
+# ubiquitous and NOT gated by this pattern alone). Used for the Edit/Write/
+# MCP branch, where `content`/`new_string` is real Python source with real
+# indentation.
+CONFTEST_MODULE_LEVEL_RE = re.compile(
+    r"^" + _CONFTEST_EXEC_CALL + r"\s*\(",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# pytest calls these hook functions unconditionally, early in every session,
+# with NO per-test opt-in at all -- unlike an ordinary fixture (which only
+# runs if some selected test actually requests it, directly or
+# transitively), every one of these runs on every bare `pytest` invocation
+# regardless of `-k`/`--collect-only`/which tests get selected.
+# `pytest_cmdline_main`/`pytest_load_initial_conftests` run before option
+# parsing even finishes; `pytest_configure`/`pytest_sessionstart` run once
+# collection starts; `pytest_collectstart`/`pytest_collection_modifyitems`
+# fire during collection itself; `pytest_runtestloop` wraps the whole test
+# run; `pytest_unconfigure` fires at teardown, unconditionally, even on a
+# run that collected zero tests.
+#
+# Lookahead window (600 chars, DOTALL so it spans lines) for a dangerous
+# call following the `def` -- the same bounded co-occurrence convention
+# `CLAUDE_HOOKS_JQ_RE`/`DIRENV_ACTIVATE_RE` already use for "somewhere in
+# the same statement/block" rather than a true parse of the function body.
+# Disclosed trade-off, the same shape as those: the window isn't scoped to
+# THIS function's body specifically, so a hook def followed (within 600
+# chars) by an unrelated dangerous call in a DIFFERENT, later function can
+# still match -- accepted here for the same reason it's accepted there
+# (real Python source has the same "adjacent enough to almost always mean
+# what it looks like" property those shell one-liners do).
+_CONFTEST_AUTOEXEC_HOOKS = (
+    r"pytest_configure|pytest_sessionstart|pytest_collection_modifyitems"
+    r"|pytest_collectstart|pytest_runtestloop|pytest_load_initial_conftests"
+    r"|pytest_cmdline_main|pytest_unconfigure"
+)
+CONFTEST_AUTOEXEC_HOOK_RE = re.compile(
+    r"def\s+(?:" + _CONFTEST_AUTOEXEC_HOOKS + r")\s*\("
+    r"(?=.{0,600}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# `autouse=True` fixtures run for EVERY test in their scope automatically --
+# without being requested by name in any test signature -- the fixture
+# analog of the hook functions above (as opposed to an ordinary, by-name
+# fixture, which is NOT gated by this pattern). Same bounded lookahead-
+# window convention: `autouse=True` in the decorator precedes the `def` and
+# its body textually, so the dangerous call is still found FORWARD of the
+# match, same direction as the hook check above.
+CONFTEST_AUTOUSE_RE = re.compile(
+    r"autouse\s*=\s*True"
+    r"(?=.{0,600}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def conftest_dangerous_hit(content: str, *, shell: bool = False) -> bool:
+    """True if `content` carries a conftest.py auto-exec-on-collection
+    shape: a module-level dangerous call, an auto-invoked pytest hook
+    function wrapping one, or an `autouse=True` fixture wrapping one. Used
+    by both the Edit/Write/MCP branch (``shell=False``, full file content
+    or a fragment) and the shell branch (``shell=True``, the de-obfuscated
+    command text) of `rules.rule_conftest_protect`.
+
+    ``shell=True`` with NO embedded newline in `content` is a single
+    physical line -- a one-line `echo '<code>' > conftest.py`/`printf
+    '<code>' >> conftest.py` plant, where the ENTIRE quoted argument
+    becomes the whole resulting file (or the whole appended line): there is
+    no possibility of real indentation surviving a shell argument with no
+    line breaks, so any dangerous call anywhere in it -- however many
+    `;`-joined statements precede it -- is unconditionally module-level
+    once written. `CONFTEST_DANGEROUS_CALL_RE` (position-agnostic) is used
+    for that case instead of the strict `^`-anchored check, which would
+    otherwise miss the common `echo 'import os; os.system(...)' >
+    conftest.py` shape entirely (the call sits after a `; `, never at
+    column 0 of the raw COMMAND text). A heredoc body (or any other
+    embedded-newline shell payload) reproduces the target file's own line
+    structure verbatim, so it still gets the precise, position-aware
+    `CONFTEST_MODULE_LEVEL_RE` check -- an indented line inside an ordinary,
+    by-name fixture written via `cat <<EOF` is not flagged just because the
+    heredoc happens to travel through a shell tool call instead of Write."""
+    if shell and "\n" not in content:
+        module_level = CONFTEST_DANGEROUS_CALL_RE
+    else:
+        module_level = CONFTEST_MODULE_LEVEL_RE
+    return bool(module_level.search(content)
+                or CONFTEST_AUTOEXEC_HOOK_RE.search(content)
+                or CONFTEST_AUTOUSE_RE.search(content))

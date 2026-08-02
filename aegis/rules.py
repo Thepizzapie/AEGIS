@@ -3102,6 +3102,189 @@ def rule_claude_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_conftest_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a pytest ``conftest.py`` with an auto-exec-
+    on-collection shape: a module-level process/code-exec call, an
+    auto-invoked pytest hook function (``pytest_configure``,
+    ``pytest_sessionstart``, ...) wrapping one, or an ``autouse=True``
+    fixture wrapping one.
+
+    THREAT MODEL: pytest auto-discovers and imports EVERY ``conftest.py``
+    from the invocation's rootdir down to each collected test's own
+    directory -- no explicit ``import`` statement, no opt-in flag, no
+    wiring in ``pytest.ini``/``pyproject.toml``/``tox.ini`` required. It is
+    pytest's single most fundamental plugin-loading mechanism, on by
+    default in every pytest project, this repo's own ``tests/`` included.
+    Module-level code in a ``conftest.py`` runs at IMPORT time, during
+    collection, before a single test is selected or run -- ``pytest -k
+    nonexistent_name``, ``pytest --collect-only``, and ``pytest
+    --fixtures`` all trigger it just as surely as a full run does.
+    ``pytest_configure``/``pytest_sessionstart``/``pytest_collection_
+    modifyitems``/etc. are hook functions pytest calls unconditionally,
+    with no per-test opt-in, and an ``autouse=True`` fixture runs for every
+    test in its scope without being requested by name anywhere.
+
+    Nothing else in this file reaches this surface: ``rule_package_
+    manifest_protect`` gates JS/PHP install-lifecycle keys, not Python test
+    collection; the CI-workflow/git-hooks/devcontainer/vscode-tasks/
+    claude-hooks guards all gate OTHER auto-exec surfaces. The shape here
+    is the same "innocuous-looking, plausible-purpose tracked file that
+    becomes remote code execution on a routine, expected future action,
+    with no further attacker action needed" every sibling ``*_protect``
+    guard in this file targets -- but reachable via an even more mundane
+    trigger than most of them (running the project's own test suite --
+    something a teammate or CI does constantly, often within minutes of
+    the plant) and requiring zero additional configuration or opt-in step
+    at all (no ``pre-commit install``, no CI wiring, no ``direnv allow``) --
+    pytest's ``conftest.py`` auto-load is unconditional, on-by-default
+    behavior. This is a documented, real-world supply-chain vector: a
+    malicious ``conftest.py`` landed in an otherwise ordinary-looking PR
+    has been used to get RCE on CI runners and on any contributor's/
+    reviewer's machine that runs the suite locally.
+
+    Deliberately NOT gated on any ``conftest.py`` write, nor on "any
+    dangerous call anywhere in it" -- unlike ``.envrc`` (whose entire
+    content is inherently auto-run shell with no benign non-executable
+    form), a ``conftest.py``'s NORMAL content is fixtures/hooks, and a
+    fixture requested by name from an ordinary test -- including one that
+    legitimately shells out via ``subprocess.run`` to exercise a CLI under
+    test, a common and entirely benign integration-test pattern -- only
+    runs when that test actually asks for it. Gating on any dangerous call
+    anywhere in the file would flag that routine pattern on nearly every
+    edit; gating on "no conftest.py edit is safe" would be the single
+    noisiest guard in this file. Instead this narrows to the three shapes
+    above, which share the property every one of them runs UNCONDITIONALLY
+    on any pytest invocation, matching the "gate the dangerous SHAPE, not
+    the whole file" trade-off ``rule_package_manifest_protect``/``rule_
+    devcontainer_exec_protect``/``rule_claude_hooks_protect`` already make
+    for their own manifests.
+
+    Config (``policy.conftest``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate -- a
+    repo's own trusted, reviewed conftest.py helper, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard does: an
+    ``autouse`` fixture or a ``pytest_configure`` hook that shells out can
+    be legitimate, sanctioned test-infrastructure work (a linter check, an
+    environment sanity check) -- it just needs a human to have actually
+    looked at it once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_CONFTEST=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: the auto-invoked-hook and autouse-fixture checks use a
+    bounded (600-char) forward lookahead for co-occurrence, not a real
+    parse of the function's body -- a hook/fixture def followed, within
+    that window, by an unrelated dangerous call in a DIFFERENT, later
+    function can still match, the same disclosed trade-off ``CLAUDE_HOOKS_
+    JQ_RE``'s own assignment-adjacency window already accepts; a dangerous
+    call assembled indirectly (string concatenation, a wrapper the file
+    then calls) rather than appearing as a literal defeats every check
+    here; the module-level check's "unindented" signal is column-0-in-the-
+    SCANNED-TEXT, not column-0-in-the-real-file -- an ``Edit`` call's
+    ``new_string`` is often a partial fragment, and a genuinely indented
+    statement that happens to start a fragment can misread as module-level
+    the same way a partial-fragment JSON check can misread `_claude_hooks_
+    json_key_hit`'s own textual sibling; the shell branch's "no embedded
+    newline means the whole quoted argument is inherently module-level"
+    heuristic (`patterns.conftest_dangerous_hit`'s own docstring) means a
+    single dangerous call inside a MULTI-line shell payload that is NOT a
+    real heredoc/file write -- e.g. a `python -c $'line1\\nline2'` argument
+    containing an actual embedded newline byte but never touching the
+    filesystem as a multi-line file -- still gets the stricter, position-
+    aware check rather than the looser one, an accepted, narrower-than-
+    ideal trade-off for a shape this guard does not expect to see in
+    practice (planting a conftest.py normally means an actual file write,
+    not an in-place interpreter invocation); ``find``-path indirection around
+    ``conftest.py`` isn't covered (no ``*_find_hit``-style fallback, the
+    same gap ``rule_package_manifest_protect``/``rule_direnv_protect``
+    already disclose for their own targets); and, like every sibling guard
+    here, a direct fetch-to-file write (``curl -o conftest.py ...``) is
+    caught by none of the shell branch's write-verb checks, the same
+    inherited gap every other guard in this file already discloses. Unlike
+    ``.vscode``/``.devcontainer``/``.claude``, ``conftest.py`` has no fixed
+    parent directory, so there is no directory-name ``cd``-fallback to add
+    here (the bare-filename path match already reaches every depth on its
+    own) -- and, for the same reason, no bare-directory archive/sync
+    fallback either, the same absence ``rule_direnv_protect``'s own
+    docstring discloses for ``.envrc``."""
+    cfg = getattr(policy, "conftest", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "conftest-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CONFTEST_PATH_RE.search(p):
+            return None
+        if not patterns.conftest_dangerous_hit(content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CONFTEST")
+                or _conftest_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "conftest-protect",
+                         f"'{p}' is being written with a pytest auto-exec "
+                         "shape (module-level code, an auto-invoked hook "
+                         "like pytest_configure, or an autouse=True "
+                         "fixture) wrapping a process/code-exec call -- "
+                         "pytest imports and runs it on the very next "
+                         "`pytest` invocation, by this agent, a teammate, "
+                         "or CI, with no further action and no per-test "
+                         "opt-in needed. Review the change, then confirm "
+                         "with AEGIS_ALLOW_CONFTEST=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not (write_verb and patterns.CONFTEST_PATH_RE.search(cmd)):
+            return None
+        if not patterns.conftest_dangerous_hit(cmd, shell=True):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CONFTEST")
+                or _conftest_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "conftest-protect",
+                         "A pytest auto-exec shape is being planted in a "
+                         "conftest.py from a shell -- pytest imports and "
+                         "runs it on the very next `pytest` invocation, by "
+                         "this agent, a teammate, or CI, with no further "
+                         "action and no per-test opt-in needed. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CONFTEST=1; a spawned agent cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -3511,6 +3694,7 @@ _CORE_RULES = (
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
+    rule_conftest_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

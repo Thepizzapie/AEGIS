@@ -214,6 +214,15 @@ class Policy:
     # merges hooks from with equal authority, and that no other guard
     # reaches. See rules.rule_claude_hooks_protect.
     claude_hooks: dict = field(default_factory=dict)
+    # pytest conftest.py auto-exec-on-collection protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a conftest.py carrying a
+    # module-level process/code-exec call, an auto-invoked pytest hook
+    # (pytest_configure, pytest_sessionstart, ...) wrapping one, or an
+    # autouse=True fixture wrapping one -- pytest auto-imports every
+    # conftest.py on the very next `pytest` invocation, no opt-in needed.
+    # See rules.rule_conftest_protect.
+    conftest: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.
