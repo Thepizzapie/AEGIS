@@ -181,6 +181,17 @@ class Policy:
     # load/bootstrap/enable activation commands. See
     # rules.rule_service_persist_protect.
     service_persist: dict = field(default_factory=dict)
+    # Environment-variable persistence protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply. Covers /etc/environment, ~/.pam_environment,
+    # /etc/security/pam_env.conf, and systemd's environment.d drop-ins
+    # (~/.config/environment.d/*.conf, /etc/environment.d/*.conf) -- KEY=VALUE
+    # files exported into every future process by PAM's pam_env module or the
+    # systemd user/system manager, with no interactive-shell trigger required
+    # -- plus the launchctl setenv / systemctl set-environment activation
+    # commands that inject a variable straight into a running session/service
+    # manager with no file write of their own. See rules.rule_env_persist_protect.
+    env_persist: dict = field(default_factory=dict)
     # Dev-container lifecycle-command protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers .devcontainer/devcontainer.json (+ .devcontainer/<name>/

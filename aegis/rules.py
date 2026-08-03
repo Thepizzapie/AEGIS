@@ -1944,6 +1944,199 @@ def rule_service_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _env_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_env_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering an environment-variable persistence file
+    (``/etc/environment``, ``~/.pam_environment``,
+    ``/etc/security/pam_env.conf``, or a systemd ``environment.d`` drop-in —
+    ``~/.config/environment.d/*.conf``/``/etc/environment.d/*.conf``), and
+    block the two activation commands that inject a variable straight into a
+    running session manager with no file write of their own at all
+    (``launchctl setenv``, ``systemctl set-environment``/``systemctl --user
+    set-environment``).
+
+    THREAT MODEL: reached by no existing guard at all. These five files
+    share ``rule_shell_persist_protect``'s ``.bashrc`` half's exact shape —
+    the whole point of the file is to export KEY=VALUE pairs into every
+    process that starts afterward — but ``SHELL_RC_PATH_RE`` has zero
+    alternatives naming any of them, and ``PERSIST_RE``'s cron/scheduled-
+    task/service alternatives don't reach them either. What makes this a
+    DISTINCT surface, not a duplicate of shell-persist's: a shell startup
+    file only fires when the human opens a new INTERACTIVE shell.
+    ``/etc/environment`` is read by PAM's ``pam_env`` module for any
+    PAM-authenticated session — on many stock distro configurations that
+    includes a non-interactive ``ssh host command`` where no shell is ever
+    opened, and, where ``pam_env`` is wired into the ``cron``/``sshd``
+    service stack, a cron job too. ``environment.d`` is read by the systemd
+    user/system manager at login and exported into every unit it
+    subsequently starts — again no shell or interactive session required.
+    Setting an interpreter/loader hijack variable through any of these
+    (``LD_PRELOAD``/``LD_LIBRARY_PATH``, macOS's
+    ``DYLD_INSERT_LIBRARIES``/``DYLD_LIBRARY_PATH``, ``BASH_ENV``/``ENV``
+    — sourced by bash/sh on every NON-interactive invocation, e.g. a CI
+    step or cron job that shells out — ``PROMPT_COMMAND``, ``PYTHONSTARTUP``,
+    ``NODE_OPTIONS``, ``PERL5OPT``, ``RUBYOPT``, ``GIT_SSH_COMMAND``) turns
+    the next invocation of the matching interpreter/tool, by anyone on the
+    machine, into arbitrary code execution, with no further write needed —
+    and unlike a git hook or CI workflow, none of these files are normally
+    tracked by the project's own repo, so the change is invisible to ``git
+    status``/``git diff``/code review the same way a shell rc file already
+    is.
+
+    The activation-command half exists for the same reason
+    ``rule_direnv_protect``/``rule_service_persist_protect`` each have one:
+    ``launchctl setenv KEY VALUE`` writes no plist at all — it injects
+    straight into the per-user launchd, persisting for every future GUI app
+    and shell launched from Finder/Dock/Terminal until the next reboot or an
+    explicit ``launchctl unsetenv`` — a BROADER blast radius than any single
+    shell rc file, and with no file for this guard's write-verb checks to
+    ever see. ``systemctl set-environment``/``systemctl --user
+    set-environment`` is the identical primitive for the systemd manager:
+    persists for the rest of the boot, exported into every unit
+    subsequently started. ``systemctl unset-environment`` is the harmless
+    inverse and is deliberately not matched (see ``ENV_PERSIST_ACTIVATE_RE``'s
+    own comment in ``patterns.py`` for why the word-boundary requirement
+    already excludes it, with no special-casing needed). Windows carries the
+    identical primitive under different names, added after QA (independent
+    adversarial review, round A) found the original draft covered only the
+    macOS/Linux forms despite the guard otherwise being Windows-aware:
+    ``setx`` always writes the user/machine registry environment store
+    (unlike ``set``, it has no in-process-only mode at all — every
+    invocation is persistent); ``reg add`` targeting the same
+    ``...\\Environment`` registry key directly, with no ``setx`` verb
+    needed; and PowerShell's ``[Environment]::SetEnvironmentVariable(name,
+    value, "User"/"Machine")`` — its "Process" scope is the harmless,
+    non-persistent inverse and is deliberately not matched, the same
+    "in-memory only, not a persistence primitive" line ``systemctl
+    unset-environment`` already sits on.
+
+    Config (``policy.env_persist``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a
+    repo's own trusted environment-provisioning script, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard does:
+    adding a `JAVA_HOME=`/proxy variable to ``/etc/environment`` is routine,
+    sanctioned sysadmin work, unlike planting an MCP server — it just needs
+    a human to have actually looked at it before it runs unattended.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_ENV_PERSIST=1`` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form. A spawned agent
+    cannot set its own env for a hook invocation it doesn't control, so
+    neither path is agent-self-escapable — the same invariant every
+    escapable guard in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path assembled indirectly (shell variable concatenation
+    across separate assignments, a ``for``/``xargs`` loop, ``basename``/
+    ``dirname`` reconstruction) rather than appearing as one contiguous
+    literal is not caught; a direct fetch-to-file write (``curl -o
+    /etc/environment ...``) is caught by none of the shell branch's five
+    write-verb checks — the same inherited gap every sibling ``*_protect``
+    guard already discloses, not new or worse here; the bare word
+    "environment" alone is deliberately excluded from the ``find``-
+    indirection fallback (too generic — an ordinary project's own
+    ``environment.py``/``environment.rb``), the same "too generic"
+    exclusion ``SHELL_PERSIST_FIND_RE`` already makes for "config"/
+    "profile"; and a one-line shell function wrapper (``s() { systemctl
+    "$@"; }; s set-environment X=Y``) breaks
+    ``ENV_PERSIST_ACTIVATE_RE``'s word-adjacency assumption while the shell
+    still executes the real command — the same disclosed gap
+    ``rule_direnv_protect``'s own docstring already accepts for
+    ``DIRENV_ACTIVATE_RE``.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention ``rule_service_persist_protect``/``rule_direnv_protect``
+    used): round A (bypass hunting) found the original draft's activation-
+    command half covered only the macOS/Linux forms, missing the Windows
+    analogs (``setx``, ``reg add ...\\Environment``, PowerShell
+    ``SetEnvironmentVariable(..., "User"/"Machine")``) entirely — fixed by
+    adding all three to ``ENV_PERSIST_ACTIVATE_RE`` (see its own comment in
+    ``patterns.py``). Round A separately confirmed a `..`-traversal literal
+    path (``/etc/environment.d/../environment.d/50-evil.conf``, which the OS
+    resolves to the real top-level drop-in) evades this guard's path
+    patterns, and a direct fetch-to-file write is caught by none of the
+    shell branch's five write-verb checks — both are pre-existing, codebase-
+    wide limitations of literal-substring path matching shared by every
+    sibling ``*_protect`` guard (verified against ``rule_service_persist_
+    protect`` with the equivalent input), not new or unique to this guard,
+    so left disclosed above rather than fixed here. Round B
+    (design/consistency) verified end-to-end (a real YAML policy loaded
+    through ``load_policy()``, not just read) that registration
+    (``_CORE_RULES``), ``Policy``/``loader.py`` threading, ``README``/
+    ``skills.py`` docs, mode handling (including the YAML-``off``-as-
+    Python-``False`` gotcha), and both escape hatches all match sibling-
+    guard convention with no gaps, and flagged two test-coverage gaps
+    (shell-form policy ``allow``-list, ReDoS regression tests) relative to
+    sibling test files — both closed, see
+    ``test_policy_allow_regex_exempts_trusted_shell_command``/
+    ``test_*_no_quadratic_blowup`` in this guard's test file."""
+    cfg = getattr(policy, "env_persist", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "env-persist-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.ENV_PERSIST_PATH_RE.search(p)):
+            return None
+        if os.environ.get("AEGIS_ALLOW_ENV_PERSIST") or _env_persist_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"Environment-persistence file '{p}' is being written — its "
+                   "KEY=VALUE pairs are exported into every process this "
+                   "machine starts afterward, with no interactive-shell or "
+                   "git/CI trigger required")
+        return _finish(Decision(action, "env-persist-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_ENV_PERSIST=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.ENV_PERSIST_PATH_RE.search(cmd)
+                             or patterns.ENV_PERSIST_DIR_RE.search(cmd)
+                             or patterns.env_persist_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        activates = bool(patterns.ENV_PERSIST_ACTIVATE_RE.search(cmd))
+        if not (touches_target or activates):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_ENV_PERSIST")
+                or _env_persist_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("An environment-persistence file is being modified from a "
+                   "shell" if touches_target else
+                   "A persistent environment variable is being injected "
+                   "straight into the session/service manager")
+        return _finish(Decision(action, "env-persist-protect",
+                         f"{reason} — it is exported into every process this "
+                         "machine starts afterward, with no interactive-shell "
+                         "or git/CI trigger required. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_ENV_PERSIST=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 def _devcontainer_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -3750,6 +3943,7 @@ _CORE_RULES = (
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_service_persist_protect,
+    rule_env_persist_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,

@@ -1748,6 +1748,125 @@ SERVICE_ACTIVATE_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Environment-variable persistence (env_persist) -------------------------
+# `/etc/environment`, `~/.pam_environment`, `/etc/security/pam_env.conf`, and
+# systemd's `environment.d` drop-ins (`~/.config/environment.d/*.conf`,
+# `/etc/environment.d/*.conf`) are plain KEY=VALUE files whose entire purpose
+# is to be exported into every future process on the machine — read by PAM's
+# pam_env module (the first three) or the systemd user/system manager (the
+# last two) — the same "the whole point of this file is to inject env vars
+# into everything that starts afterward" shape SHELL_RC_PATH_RE's `.bashrc`
+# half already covers, but reached by NEITHER that guard nor any other: none
+# of SHELL_RC_PATH_RE's alternatives name any of these five paths, and
+# PERSIST_RE's cron/scheduled-task/service alternatives don't either.
+#
+# What makes this a DISTINCT surface from `rule_shell_persist_protect`'s
+# rather than a duplicate of it: a shell startup file only runs when the
+# human opens a new INTERACTIVE shell. `/etc/environment` is not gated on
+# that at all — a stock `pam.d` stack applies pam_env to any PAM-
+# authenticated session, which on many distros includes a non-interactive
+# `ssh host command` (no shell ever opened) and, where `pam_env` is wired
+# into the `cron`/`sshd` service stack, a cron job too. `environment.d` is
+# read by the systemd --user manager at login and exported into every unit
+# it subsequently starts — a different trigger again, no shell or PAM
+# session required, and (per systemd's own docs) also consulted by common
+# graphical-login integrations. Setting an interpreter/loader hijack
+# variable through any of these — `LD_PRELOAD`/`LD_LIBRARY_PATH` (Linux),
+# `DYLD_INSERT_LIBRARIES`/`DYLD_LIBRARY_PATH` (macOS), `BASH_ENV`/`ENV`
+# (sourced by bash/sh on every NON-interactive invocation, e.g. every CI
+# step or cron job that shells out), `PROMPT_COMMAND` (bash), `PYTHONSTARTUP`,
+# `NODE_OPTIONS`, `PERL5OPT`, `RUBYOPT`, or `GIT_SSH_COMMAND` — turns the
+# next invocation of the matching interpreter/tool, by anyone on the
+# machine, into arbitrary code execution, with no further write needed.
+# Like every sibling `*_PATH_RE` in this file, this is a path-only match:
+# gating the FILE, not a specific dangerous key, the same trade-off
+# SHELL_RC_PATH_RE already accepts for `.bashrc` (nothing stops a legitimate
+# `JAVA_HOME=` edit from also asking for confirmation — the cost is one
+# extra human review, not a missed detection of the dangerous case).
+_ENV_PERSIST_END = _CI_END
+ENV_PERSIST_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"environment" + _ENV_PERSIST_END
+    + r"|(?:^|[\s'\"/\\=])\.pam_environment" + _ENV_PERSIST_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"security" + _ETC_SEP
+    + r"pam_env\.conf" + _ENV_PERSIST_END
+    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"environment\.d"
+    + _WIN_TRIM + _SEP + _CI_SEG + r"\.conf" + _ENV_PERSIST_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"environment\.d" + _ETC_SEP
+    + _CI_SEG + r"\.conf" + _ENV_PERSIST_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — the same archive/sync-tool gap
+# SHELL_PERSIST_DIR_RE / SERVICE_PERSIST_DIR_RE exist to close: `rsync -a
+# evil/ ~/.config/environment.d/` or `tar xf payload.tar -C
+# /etc/environment.d/` never names a discrete target file at all. `/etc/
+# environment` and the two `pam_environment`/`pam_env.conf` files are
+# deliberately excluded here — they are single files, not directories, so
+# there is no bare-directory form of "restore into them" to close.
+ENV_PERSIST_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"environment\.d" + _ENV_PERSIST_END
+    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"environment\.d"
+    + _ENV_PERSIST_END,
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason every other
+# `*_FIND_RE` in this file exists. The bare word "environment" alone is
+# deliberately excluded (too generic — an ordinary project's own
+# `environment.py`/`environment.rb`, the same "too generic" exclusion
+# SHELL_PERSIST_FIND_RE already makes for the bare words "config"/"profile").
+_ENV_PERSIST_FIND_FRAGMENTS = r"pam_environment|pam_env\.conf|environment\.d"
+ENV_PERSIST_FIND_RE = _find_predicate_re(r"(?:" + _ENV_PERSIST_FIND_FRAGMENTS + r")")
+
+
+def env_persist_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, ENV_PERSIST_FIND_RE)
+
+
+# Activation commands — the OTHER way this surface is reached, with no file
+# write of its own at all, the same shape DIRENV_ACTIVATE_RE/
+# SERVICE_ACTIVATE_CMD_RE already cover for their own surfaces:
+# `launchctl setenv KEY VALUE` injects a variable straight into the
+# per-user launchd on macOS — persists for every future GUI app and shell
+# launched from Finder/Dock/Terminal until the next reboot or `launchctl
+# unsetenv`, a BROADER blast radius than any single shell rc file, with no
+# plist ever written to catch. `systemctl set-environment KEY=VALUE` (and
+# `systemctl --user set-environment ...`) is the identical primitive for
+# the systemd manager: persists for the rest of the boot, exported into
+# every unit subsequently started by that manager. `unset-environment` is
+# the (harmless) inverse and is NOT matched — the required literal
+# `set-environment` has no word boundary immediately before its "s" when
+# preceded by "un", so `\bset-environment\b` does not match
+# `unset-environment` at all. Same 200-char bounded scan gap
+# SERVICE_ACTIVATE_CMD_RE/DIRENV_ACTIVATE_RE use, for the identical
+# "verb...target can be arbitrarily far apart within one clause" reason
+# (an intervening `--root=...`/`--user`/`-w` flag must not push the verb
+# outside the window).
+#
+# QA finding (independent adversarial review, round A): the original draft
+# covered only the macOS/Linux activation primitives, leaving their exact
+# Windows analog — `setx` (always writes the user/machine registry
+# environment store; unlike `set`, it has no in-process-only mode at all),
+# `reg add` targeting the `...\Environment` registry key directly (the same
+# store `setx` writes to, reachable without the `setx` verb ever appearing),
+# and PowerShell's `[Environment]::SetEnvironmentVariable(name, value,
+# "User"/"Machine")` (the "Process" scope is the harmless, non-persistent
+# inverse — same "in-memory only, not a persistence primitive" shape
+# `systemctl unset-environment` already sits on, and is deliberately NOT
+# matched here) — entirely unmatched, even though this guard is otherwise
+# Windows-aware (`ENV_PERSIST_PATH_RE`'s siblings across this file already
+# handle `$PROFILE`/registry `Run` keys). Fixed by adding all three; `reg
+# add` and `SetEnvironmentVariable` both use the same 200-char bounded gap
+# for the identical "verb...target can be arbitrarily far apart" reason.
+ENV_PERSIST_ACTIVATE_RE = re.compile(
+    r"\blaunchctl\b[^|;&\n]{0,200}?\bsetenv\b"
+    r"|\bsystemctl\b[^|;&\n]{0,200}?\bset-environment\b"
+    r"|\bsetx\b\s+\S"
+    r"|\breg(?:\.exe)?\s+add\b[^|;&\n]{0,200}?\\Environment\b"
+    r"|SetEnvironmentVariable\s*\([^)]{0,300}?[\"'](?:User|Machine)[\"']",
+    re.IGNORECASE,
+)
+
 # Dev-container lifecycle config: `.devcontainer/devcontainer.json` (or a
 # named sibling for a multi-config repo, `.devcontainer/<name>/
 # devcontainer.json`) and the root-level `.devcontainer.json` shorthand. This
