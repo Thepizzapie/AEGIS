@@ -57,7 +57,7 @@ def load_policy(path) -> Policy:
         "direnv": {},
         "package_manifest": {}, "git_config_exec": {}, "git_attributes_exec": {},
         "service_persist": {}, "devcontainer_exec": {}, "vscode_tasks_exec": {},
-        "path_hijack": {}, "claude_hooks": {}, "conftest": {},
+        "path_hijack": {}, "claude_hooks": {}, "conftest": {}, "pysite": {},
         "inject": {}, "failures": {},
         "completion": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
@@ -98,6 +98,7 @@ def load_policy(path) -> Policy:
                   path_hijack=st["path_hijack"],
                   claude_hooks=st["claude_hooks"],
                   conftest=st["conftest"],
+                  pysite=st["pysite"],
                   inject=st["inject"], failures=st["failures"],
                   completion=st["completion"],
                   team=lc["team"], compaction=lc["compaction"],
@@ -129,7 +130,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
     for key in ("install_review", "mcp_config", "ci_workflow", "git_hooks", "agent_def",
                 "shell_persist", "direnv", "package_manifest", "git_config_exec",
                 "git_attributes_exec", "service_persist", "devcontainer_exec",
-                "vscode_tasks_exec", "path_hijack", "claude_hooks", "conftest",
+                "vscode_tasks_exec", "path_hijack", "claude_hooks", "conftest", "pysite",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
             st[key] = dict(data[key])

@@ -223,6 +223,16 @@ class Policy:
     # conftest.py on the very next `pytest` invocation, no opt-in needed.
     # See rules.rule_conftest_protect.
     conftest: dict = field(default_factory=dict)
+    # Python interpreter-startup auto-exec protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a module-level process/code-exec
+    # call in sitecustomize.py/usercustomize.py (CPython's `site` module
+    # imports either unconditionally on every interpreter startup), or a
+    # `.pth` file in site-packages/dist-packages/__pypackages__ carrying an
+    # `import `-prefixed line CPython execs as code that itself invokes a
+    # process/code-exec call -- runs on the very next `python`/`pytest`
+    # invocation, no opt-in needed. See rules.rule_pysite_protect.
+    pysite: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.

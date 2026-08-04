@@ -3345,6 +3345,269 @@ def rule_conftest_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _pysite_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_pysite_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Python interpreter-startup auto-exec shape: a
+    module-level process/code-exec call in a ``sitecustomize.py``/
+    ``usercustomize.py``, or a ``.pth`` "path configuration file" line
+    (inside a ``site-packages``/``dist-packages``/``__pypackages__``
+    directory) that CPython execs as code and that itself invokes a
+    process/code-exec call.
+
+    THREAT MODEL: CPython's own ``site`` module runs unconditionally,
+    before any user code, on EVERY interpreter startup -- ``python``,
+    ``python -c``, ``pytest``, any script, any venv activation -- no
+    opt-in, no explicit import, no CLI flag, no git/CI/session-restart
+    trigger needed. Two distinct mechanisms both reach this:
+
+    1. ``site.py`` imports a module literally named ``sitecustomize``
+       (searched across the WHOLE of ``sys.path``, not just site-packages
+       -- the project root itself lands on ``sys.path`` for a bare
+       ``python script.py``, and any ``PYTHONPATH``-added directory does
+       too) and, for user installs, ``usercustomize`` from the user site
+       directory. Either module's top-level code runs in full, top to
+       bottom, the moment the interpreter starts.
+
+    2. A ``.pth`` file dropped into a recognized site directory is read
+       line by line by ``site.addpackage()``; a line starting with the
+       literal, case-sensitive text ``import `` or ``import\\t`` at column
+       zero is handed straight to ``exec()`` -- a real, documented
+       supply-chain RCE primitive (malicious ``.pth`` files shipped inside
+       typosquatted/compromised PyPI packages have used exactly this to
+       get code execution the moment ANY interpreter with that
+       site-packages on ``sys.path`` starts up, no ``import`` of the
+       package itself ever required). Unlike ``sitecustomize.py``, this
+       fires on literally the NEXT Python interpreter startup with that
+       site directory on ``sys.path`` -- for a project's own venv, that is
+       this agent's own following ``python``/``pytest`` invocation in the
+       same session, no future human/CI action needed at all -- the same
+       "no future trigger, the very next bare invocation" property
+       ``rule_path_hijack_protect``'s own docstring highlights as unique
+       among most of that guard's siblings; this guard shares it for the
+       analogous reason (an interpreter startup, like a bare command
+       invocation, needs no git op/CI push/new shell/``cd``).
+
+    Nothing else in this file reaches this surface: ``rule_conftest_
+    protect`` gates pytest's own auto-import mechanism, not the
+    interpreter's; ``rule_path_hijack_protect`` gates a shadowed ``$PATH``
+    *binary*, not an imported Python module; ``rule_package_manifest_
+    protect`` gates npm/composer install-lifecycle hooks, not Python's own
+    interpreter-startup hooks. Given this repo (and the venv any agent
+    working in a Python project runs inside) is itself a Python package,
+    this is a supply-chain vector with the same severity class as
+    ``rule_path_hijack_protect``'s own PATH-binary-shadow guard, just one
+    layer up the interpreter instead of the shell.
+
+    Deliberately NOT gated on any ``sitecustomize.py``/``usercustomize.py``
+    write, nor on any ``.pth`` write, nor on any import-prefixed ``.pth``
+    line: a ``sitecustomize.py`` CAN contain innocuous setup (warnings
+    filters, encoding fixups) with no process/code-exec call in sight, and
+    legitimate, widely-shipped packages (setuptools' own
+    ``distutils-precedence.pth``, virtualenv's ``_virtualenv.pth``) plant
+    ordinary, benign ``import``-prefixed ``.pth`` lines for ``sys.path``/
+    import-hook setup. Gating on the bare file alone would flag those on
+    sight; instead this narrows to the shape that actually DOES something
+    dangerous once auto-run, the same "gate the SHAPE, not the file"
+    trade-off ``rule_conftest_protect``/``rule_package_manifest_protect``/
+    ``rule_devcontainer_exec_protect`` already make for their own
+    manifests.
+
+    Config (``policy.pysite``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate).
+    Defaults to ``ask`` for the same reason every sibling ``*_protect``
+    guard does: a legitimate, sanctioned interpreter-startup hook (e.g. a
+    controlled coverage/profiling shim) can shell out deliberately -- it
+    just needs a human to have actually looked at it once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_PYSITE=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a dangerous call assembled indirectly (string concatenation,
+    a wrapper function/module the file then calls) rather than appearing as
+    a literal defeats every check here, the same class every sibling guard
+    already accepts; ``find``-path indirection around ``sitecustomize.py``/
+    ``usercustomize.py``/a ``.pth`` filename isn't covered (no
+    ``*_find_hit``-style fallback, the same gap ``rule_package_manifest_
+    protect``/``rule_direnv_protect``/``rule_conftest_protect`` already
+    disclose for their own targets); a direct fetch-to-file write
+    (``curl -o sitecustomize.py ...``) is caught by none of the shell
+    branch's write-verb checks, the same inherited gap every other guard
+    in this file already discloses; the ``.pth`` check requires a
+    ``site-packages``/``dist-packages``/``__pypackages__`` path segment to
+    actually appear in the scanned text -- a ``.pth`` file written via a
+    relative path from inside an already-``cd``'d-into site-packages
+    directory (no directory-name `cd`-fallback exists here, the same
+    absence ``rule_conftest_protect``'s own docstring discloses for
+    ``conftest.py``, and the same "no fixed parent, no bare-directory
+    archive/sync fallback either" reasoning ``rule_direnv_protect``'s own
+    docstring gives for ``.envrc``) is not covered; and a ``PYTHONPATH``/
+    ``sys.path`` relocation that lets a `.pth`-equivalent mechanism run
+    from an entirely unrecognized directory name is the same "computed
+    indirectly" class of gap ``rule_shell_persist_protect``'s own
+    ``$ZDOTDIR`` gap already accepts -- though note ``sitecustomize.py``/
+    ``usercustomize.py`` themselves are deliberately gated with NO
+    directory restriction at all, precisely because ``PYTHONPATH``
+    relocation is exactly the kind of thing that shape needs to stay
+    robust against. An aliased/renamed import (``import subprocess as sp;
+    sp.call(...)``, ``from os import system; system(...)``) evades the
+    literal qualified-name vocabulary both branches match on -- the same
+    "computed indirectly" class as the string-concatenation gap above, not
+    a distinct one, but confirmed via direct reproduction (bypass-hunting
+    QA round) rather than merely inferred. The shared ``_path()`` helper
+    every ``*_protect`` guard in this file reads MCP tool-call arguments
+    through only checks top-level argument keys (``file_path``/``path``/
+    ``target_file``/...) -- an MCP tool shape that nests its target one
+    level deeper (``{"target": {"path": ...}}``) evades path detection
+    entirely, confirmed as a PRE-EXISTING gap shared by every sibling guard
+    (``rule_conftest_protect`` included, verified directly), not unique to
+    ``pysite`` and not fixed here -- a real fix belongs in ``_path()``
+    itself, shared infrastructure out of scope for a single guard's own
+    change. Likewise, the shared shell de-obfuscation layer
+    (``normalize.scan_surface``) decodes base64 but not hex/``xxd``-style
+    encoding -- confirmed as a pre-existing gap shared by every shell-form
+    guard in this file, not unique here. Finally, the ``.pth`` branch's
+    single-line shell fallback (``PYSITE_PTH_DANGEROUS_ANY_RE``) requires
+    ``import`` be immediately preceded by a quote character to avoid a
+    confirmed false ASK on an ordinary shell comment (see that pattern's
+    own comment in ``patterns.py`` for the full reasoning and the false
+    positive it replaced) -- the accepted, narrower trade-off is that an
+    OBFUSCATED single-line ``.pth`` plant (base64/hex piped through a
+    decoder) whose decoded text starts with ``import `` is joined onto the
+    scanned surface by a plain space, not a quote, and so evades this
+    specific fallback; the ``sitecustomize.py``/``usercustomize.py``
+    branch has no equivalent gap, since it never required an
+    ``import``-prefix to begin with and already handles the
+    decoded-payload case correctly (reusing ``conftest_dangerous_hit``'s
+    own fixed single-line-vs-heredoc logic unchanged).
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review verified the wiring correct
+    everywhere its siblings are (``Policy``, all three ``loader.py`` spots,
+    both ``skills.py`` knob lists, the guard table, README), verified an
+    actual YAML ``pysite:`` block round-trips through ``load_policy()``
+    into a live ``evaluate()`` decision rather than trusting the wiring by
+    inspection alone, and flagged that this docstring's own QA-history
+    claim in README had been written before the QA history it referenced
+    actually existed -- a real documentation-integrity defect, fixed by
+    writing this section once both rounds had genuinely concluded rather
+    than in advance of them. Bypass-hunting found and closed two real,
+    reproduced false ASKs and confirmed (without fixing, as pre-existing
+    shared infrastructure) three further gaps: (1) setuptools' own,
+    shipped-in-nearly-every-venv ``distutils-precedence.pth`` was flagged
+    on sight -- a confirmed, guaranteed, high-volume false ASK this
+    docstring's own "must not gate" example had claimed, incorrectly,
+    would not happen; closed by dropping bare ``__import__(`` from the
+    ``.pth``-specific exec vocabulary (`_PYSITE_PTH_EXEC_CALL`), since a
+    bare ``__import__('x')`` call with nothing chained onto it cannot
+    itself invoke a process, and the actually-dangerous chained form
+    (``__import__('os').system(...)``) was never caught by the literal
+    ``os\\.system\\(`` vocabulary either way -- see
+    `_PYSITE_PTH_EXEC_CALL`'s own comment in ``patterns.py``. (2) the
+    original position-agnostic single-line ``.pth`` fallback matched
+    ``import`` anywhere on the line via a bare word-boundary, including
+    inside an ordinary shell comment that real CPython ``site.addpackage()``
+    skips entirely before ever checking the ``import`` prefix -- a
+    confirmed, reproduced false ASK; closed by requiring ``import`` be
+    immediately preceded by a quote character instead, the trade-off
+    disclosed above. (3) import-aliasing, the shared ``_path()`` MCP
+    nesting gap, and hex/xxd non-decoding were all confirmed via direct
+    reproduction but are the same "computed indirectly"/shared-
+    infrastructure classes every sibling guard already accepts, and are
+    disclosed above rather than fixed per-guard. Recommended PASS after
+    the two fixes; no further round needed. Full suite green throughout
+    (1469 passed after the fixes' own regression tests)."""
+    cfg = getattr(policy, "pysite", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "pysite-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+
+        is_customize = bool(patterns.PYSITE_CUSTOMIZE_PATH_RE.search(p))
+        is_pth = bool(patterns.PYSITE_PTH_PATH_RE.search(p) and patterns.PYSITE_DIR_RE.search(p))
+        if not (is_customize or is_pth):
+            return None
+        if is_customize:
+            dangerous = patterns.pysite_customize_dangerous_hit(content)
+        else:
+            dangerous = patterns.pysite_pth_dangerous_hit(content)
+        if not dangerous:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PYSITE")
+                or _pysite_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "pysite-protect",
+                         f"'{p}' is being written with a Python "
+                         "interpreter-startup auto-exec shape wrapping a "
+                         "process/code-exec call -- CPython's own `site` "
+                         "module runs it on the very next `python`/`pytest` "
+                         "invocation, by this agent, a teammate, or CI, "
+                         "with no further action needed. Review the "
+                         "change, then confirm with AEGIS_ALLOW_PYSITE=1; "
+                         "a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+
+        is_customize = bool(patterns.PYSITE_CUSTOMIZE_PATH_RE.search(cmd))
+        is_pth = bool(patterns.PYSITE_PTH_PATH_RE.search(cmd) and patterns.PYSITE_DIR_RE.search(cmd))
+        if not (is_customize or is_pth):
+            return None
+        if is_customize:
+            dangerous = patterns.pysite_customize_dangerous_hit(cmd, shell=True, raw=_cmd(ev))
+        else:
+            dangerous = patterns.pysite_pth_dangerous_hit(cmd, shell=True, raw=_cmd(ev))
+        if not dangerous:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PYSITE")
+                or _pysite_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "pysite-protect",
+                         "A Python interpreter-startup auto-exec shape is "
+                         "being planted from a shell -- CPython's own "
+                         "`site` module runs it on the very next "
+                         "`python`/`pytest` invocation, by this agent, a "
+                         "teammate, or CI, with no further action needed. "
+                         "A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_PYSITE=1; a spawned agent cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -3755,6 +4018,7 @@ _CORE_RULES = (
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_conftest_protect,
+    rule_pysite_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
