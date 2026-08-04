@@ -3081,3 +3081,153 @@ def conftest_dangerous_hit(content: str, *, shell: bool = False, raw: str = None
     return bool(module_level.search(content)
                 or CONFTEST_AUTOEXEC_HOOK_RE.search(content)
                 or CONFTEST_AUTOUSE_RE.search(content))
+
+
+# ---- Python interpreter-startup auto-exec protection (sitecustomize.py/
+#      usercustomize.py / .pth import-line injection) --------------------------
+# CPython's own `site` module runs unconditionally, before any user code, on
+# EVERY interpreter startup -- `python`, `python -c`, `pytest`, any script,
+# any venv activation -- no opt-in, no explicit import, no CLI flag, no git/
+# CI/session-restart trigger. Two distinct mechanisms both reach this, and
+# neither is covered by any other guard in this file:
+#
+# 1. `site.py` imports a module literally named `sitecustomize` (searched
+#    across the WHOLE of `sys.path`, not just site-packages -- the project
+#    root itself lands on `sys.path` for a bare `python script.py`, and any
+#    `PYTHONPATH`-added directory does too, so this is deliberately gated as
+#    a bare filename with no fixed parent directory, the same "no single
+#    canonical parent, so no directory restriction" reasoning `CONFTEST_
+#    PATH_RE`'s own docstring already gives for conftest.py) and, for user
+#    installs, a second module named `usercustomize` from the user site
+#    directory. Either module's top-level code runs in full, top to bottom,
+#    the moment the interpreter starts -- the exact "module executes
+#    unconditionally at import time" shape `CONFTEST_MODULE_LEVEL_RE`
+#    already gates for conftest.py, just triggered by `python` itself
+#    starting up instead of `pytest` collecting.
+#
+# 2. A `.pth` ("path configuration") file dropped into a recognized site
+#    directory (`site-packages`, `dist-packages`, PEP 582's `__pypackages__`)
+#    is read line by line by `site.addpackage()`; a line that starts with
+#    the literal, case-sensitive text `import ` or `import\t` at column zero
+#    (CPython's own `Lib/site.py`: `line.startswith(("import ", "import\t"))`
+#    -- NOT `.strip()`'d first, so a genuinely indented line is inert) is
+#    handed straight to `exec()`. This is a real, documented supply-chain RCE
+#    primitive -- malicious `.pth` files shipped inside typosquatted/
+#    compromised PyPI packages have used exactly this to get code execution
+#    the moment ANY interpreter with that site-packages on `sys.path` starts
+#    up, no `import` of the package itself ever required. Unlike
+#    `sitecustomize.py`, this fires on literally the NEXT Python interpreter
+#    startup with that site directory on `sys.path` -- for a project's own
+#    venv, that is this agent's own following `python`/`pytest` invocation in
+#    the same session.
+#
+# Nothing else in this file reaches this surface: `CONFTEST_PATH_RE` gates
+# pytest's own auto-import mechanism, not the interpreter's; `PATH_HIJACK_*`
+# gates a shadowed $PATH *binary*, not an imported Python module; the
+# package-manifest guard gates npm/composer install-lifecycle hooks, not
+# Python's own interpreter-startup hooks.
+PYSITE_CUSTOMIZE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])(?:site|user)customize\.py" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `.pth` files are only ever read by `site.addpackage()` when they sit inside
+# a directory `site.py` actually scans -- an unrelated `.pth` file elsewhere
+# on disk (a different tool's own unrelated use of the extension) is never
+# scanned and does nothing. Gated on a curated site-directory segment, the
+# same "gate the SHAPE where it's actually dangerous, not the bare extension
+# everywhere" trade-off `PATH_HIJACK_*`'s own curated `$PATH`-directory list
+# already makes.
+PYSITE_DIR_RE = re.compile(
+    r"(?:site-packages|dist-packages|__pypackages__)",
+    re.IGNORECASE,
+)
+PYSITE_PTH_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])[\w.\-]+\.pth" + _CI_END,
+    re.IGNORECASE,
+)
+
+# A `.pth` line CPython execs as code, restricted to one that ALSO invokes a
+# process/code-exec primitive -- deliberately NOT "any import-prefixed line
+# at column zero" alone: legitimate, widely-shipped packages (setuptools' own
+# `distutils-precedence.pth`, virtualenv's `_virtualenv.pth`) use this exact
+# `.pth`-exec mechanism for benign `sys.path`/import-hook setup with no
+# process/code-exec call anywhere in the line, the same "gate the SHAPE, not
+# the mechanism" trade-off `conftest_dangerous_hit`'s own module-level check
+# already makes for conftest.py and `LIFECYCLE_SCRIPT_KEY_RE` makes for
+# package.json. The `import[ \t]` prefix is intentionally case-SENSITIVE (no
+# `re.IGNORECASE` on that piece, via the scoped `(?i:...)` group below covering
+# only the call vocabulary) to mirror CPython's own exact-case prefix check --
+# a line CPython itself would never treat as an exec directive shouldn't gate
+# here either. `[^\n]*?` (not `.*?` with DOTALL) deliberately stays on one
+# physical line: `site.addpackage()` execs each qualifying line independently,
+# so a dangerous call on a LATER, unrelated line never taints this one.
+PYSITE_PTH_DANGEROUS_LINE_RE = re.compile(
+    r"^import[ \t][^\n]*?(?i:" + _CONFTEST_EXEC_CALL + r")\s*\(",
+    re.MULTILINE,
+)
+
+# Position-agnostic sibling of the check above, for a genuinely single-line
+# shell plant (`echo 'import os; os.system(...)' > .../evil.pth`, no
+# heredoc): the ENTIRE quoted argument becomes the whole one-line .pth file,
+# so its "import" prefix sits at the start of the real file even though it is
+# NOT at column 0 of the scanned shell command text (it is preceded by
+# `echo `/`printf `/the quote character itself) -- the identical "single
+# line == the whole target file, so the strict `^`-anchored check silently
+# never fires" gap `conftest_dangerous_hit`'s own docstring already
+# documents and fixes for conftest.py's module-level check, applied here to
+# the same failure mode. `\b` (not `^`) is still real signal, not "any call
+# anywhere": it requires the literal word `import` immediately followed by a
+# space/tab, still case-sensitive, still on the same physical line as the
+# dangerous call -- stricter than `CONFTEST_DANGEROUS_CALL_RE`'s own
+# single-line fallback, which drops the `import`-prefix requirement
+# entirely, because a `.pth` line's danger is conditioned on that prefix in
+# a way conftest.py's module-level statements are not.
+PYSITE_PTH_DANGEROUS_ANY_RE = re.compile(
+    r"\bimport[ \t][^\n]*?(?i:" + _CONFTEST_EXEC_CALL + r")\s*\(",
+)
+
+
+def pysite_customize_dangerous_hit(content: str, *, shell: bool = False, raw: str = None) -> bool:
+    """True if `content` carries a module-level process/code-exec call --
+    the identical "unconditionally executes at import time" shape
+    `conftest_dangerous_hit`'s own module-level check gates for
+    conftest.py, just applied to a `sitecustomize.py`/`usercustomize.py`:
+    CPython's `site` module imports either module in full, top to bottom,
+    on every interpreter startup -- no pytest-specific hook/autouse concept
+    applies here, so (unlike `conftest_dangerous_hit`) there is no second or
+    third shape to check for.
+
+    Deliberately reuses `CONFTEST_MODULE_LEVEL_RE`/`CONFTEST_DANGEROUS_
+    CALL_RE` and the identical single-line-vs-heredoc `raw`-newline decision
+    `conftest_dangerous_hit` already documents in full -- the trigger
+    differs (`python` starting up vs. `pytest` collecting), but the SHAPE
+    being detected (an unconditional, top-level process/code-exec call in a
+    module Python imports for you with zero opt-in) and the ambiguity that
+    shape creates when it arrives via a single-line shell echo vs. a real
+    multi-line heredoc are exactly the same; see `conftest_dangerous_hit`'s
+    own docstring for the full reasoning and QA history behind that
+    decision."""
+    newline_probe = raw if raw is not None else content
+    if shell and "\n" not in newline_probe:
+        return bool(CONFTEST_DANGEROUS_CALL_RE.search(content))
+    return bool(CONFTEST_MODULE_LEVEL_RE.search(content))
+
+
+def pysite_pth_dangerous_hit(content: str, *, shell: bool = False, raw: str = None) -> bool:
+    """True if `content` carries a `.pth` line CPython execs as code (see
+    `PYSITE_PTH_DANGEROUS_LINE_RE`'s own comment for the full reasoning).
+
+    ``shell``/``raw`` select the same single-line-vs-heredoc branch
+    `pysite_customize_dangerous_hit`/`conftest_dangerous_hit` already use:
+    a genuinely single-line shell plant (no embedded newline in the RAW
+    command) uses the position-agnostic `PYSITE_PTH_DANGEROUS_ANY_RE`
+    (the quoted argument IS the whole one-line file, so its `import`
+    prefix is never at column 0 of the scanned command text); real
+    multi-line content -- a full file via Edit/Write/MCP, or a real shell
+    heredoc -- uses the strict, position-aware `PYSITE_PTH_DANGEROUS_
+    LINE_RE`."""
+    newline_probe = raw if raw is not None else content
+    if shell and "\n" not in newline_probe:
+        return bool(PYSITE_PTH_DANGEROUS_ANY_RE.search(content))
+    return bool(PYSITE_PTH_DANGEROUS_LINE_RE.search(content))
