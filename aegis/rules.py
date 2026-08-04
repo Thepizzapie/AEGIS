@@ -3389,11 +3389,11 @@ def rule_pysite_protect(ev: Event, policy=None) -> Optional[Decision]:
        fires on literally the NEXT Python interpreter startup with that
        site directory on ``sys.path`` -- for a project's own venv, that is
        this agent's own following ``python``/``pytest`` invocation in the
-       same session, no future human/CI action needed at all, the same
+       same session, no future human/CI action needed at all -- the same
        "no future trigger, the very next bare invocation" property
        ``rule_path_hijack_protect``'s own docstring highlights as unique
-       among that guard's siblings -- this guard shares it for the exact
-       same reason (an interpreter startup, like a bare command
+       among most of that guard's siblings; this guard shares it for the
+       analogous reason (an interpreter startup, like a bare command
        invocation, needs no git op/CI push/new shell/``cd``).
 
     Nothing else in this file reaches this surface: ``rule_conftest_
@@ -3461,7 +3461,75 @@ def rule_pysite_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``usercustomize.py`` themselves are deliberately gated with NO
     directory restriction at all, precisely because ``PYTHONPATH``
     relocation is exactly the kind of thing that shape needs to stay
-    robust against."""
+    robust against. An aliased/renamed import (``import subprocess as sp;
+    sp.call(...)``, ``from os import system; system(...)``) evades the
+    literal qualified-name vocabulary both branches match on -- the same
+    "computed indirectly" class as the string-concatenation gap above, not
+    a distinct one, but confirmed via direct reproduction (bypass-hunting
+    QA round) rather than merely inferred. The shared ``_path()`` helper
+    every ``*_protect`` guard in this file reads MCP tool-call arguments
+    through only checks top-level argument keys (``file_path``/``path``/
+    ``target_file``/...) -- an MCP tool shape that nests its target one
+    level deeper (``{"target": {"path": ...}}``) evades path detection
+    entirely, confirmed as a PRE-EXISTING gap shared by every sibling guard
+    (``rule_conftest_protect`` included, verified directly), not unique to
+    ``pysite`` and not fixed here -- a real fix belongs in ``_path()``
+    itself, shared infrastructure out of scope for a single guard's own
+    change. Likewise, the shared shell de-obfuscation layer
+    (``normalize.scan_surface``) decodes base64 but not hex/``xxd``-style
+    encoding -- confirmed as a pre-existing gap shared by every shell-form
+    guard in this file, not unique here. Finally, the ``.pth`` branch's
+    single-line shell fallback (``PYSITE_PTH_DANGEROUS_ANY_RE``) requires
+    ``import`` be immediately preceded by a quote character to avoid a
+    confirmed false ASK on an ordinary shell comment (see that pattern's
+    own comment in ``patterns.py`` for the full reasoning and the false
+    positive it replaced) -- the accepted, narrower trade-off is that an
+    OBFUSCATED single-line ``.pth`` plant (base64/hex piped through a
+    decoder) whose decoded text starts with ``import `` is joined onto the
+    scanned surface by a plain space, not a quote, and so evades this
+    specific fallback; the ``sitecustomize.py``/``usercustomize.py``
+    branch has no equivalent gap, since it never required an
+    ``import``-prefix to begin with and already handles the
+    decoded-payload case correctly (reusing ``conftest_dangerous_hit``'s
+    own fixed single-line-vs-heredoc logic unchanged).
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review verified the wiring correct
+    everywhere its siblings are (``Policy``, all three ``loader.py`` spots,
+    both ``skills.py`` knob lists, the guard table, README), verified an
+    actual YAML ``pysite:`` block round-trips through ``load_policy()``
+    into a live ``evaluate()`` decision rather than trusting the wiring by
+    inspection alone, and flagged that this docstring's own QA-history
+    claim in README had been written before the QA history it referenced
+    actually existed -- a real documentation-integrity defect, fixed by
+    writing this section once both rounds had genuinely concluded rather
+    than in advance of them. Bypass-hunting found and closed two real,
+    reproduced false ASKs and confirmed (without fixing, as pre-existing
+    shared infrastructure) three further gaps: (1) setuptools' own,
+    shipped-in-nearly-every-venv ``distutils-precedence.pth`` was flagged
+    on sight -- a confirmed, guaranteed, high-volume false ASK this
+    docstring's own "must not gate" example had claimed, incorrectly,
+    would not happen; closed by dropping bare ``__import__(`` from the
+    ``.pth``-specific exec vocabulary (`_PYSITE_PTH_EXEC_CALL`), since a
+    bare ``__import__('x')`` call with nothing chained onto it cannot
+    itself invoke a process, and the actually-dangerous chained form
+    (``__import__('os').system(...)``) was never caught by the literal
+    ``os\\.system\\(`` vocabulary either way -- see
+    `_PYSITE_PTH_EXEC_CALL`'s own comment in ``patterns.py``. (2) the
+    original position-agnostic single-line ``.pth`` fallback matched
+    ``import`` anywhere on the line via a bare word-boundary, including
+    inside an ordinary shell comment that real CPython ``site.addpackage()``
+    skips entirely before ever checking the ``import`` prefix -- a
+    confirmed, reproduced false ASK; closed by requiring ``import`` be
+    immediately preceded by a quote character instead, the trade-off
+    disclosed above. (3) import-aliasing, the shared ``_path()`` MCP
+    nesting gap, and hex/xxd non-decoding were all confirmed via direct
+    reproduction but are the same "computed indirectly"/shared-
+    infrastructure classes every sibling guard already accepts, and are
+    disclosed above rather than fixed per-guard. Recommended PASS after
+    the two fixes; no further round needed. Full suite green throughout
+    (1469 passed after the fixes' own regression tests)."""
     cfg = getattr(policy, "pysite", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

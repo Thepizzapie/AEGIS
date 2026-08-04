@@ -3147,6 +3147,29 @@ PYSITE_PTH_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The `.pth`-specific exec vocabulary is `_CONFTEST_EXEC_CALL` MINUS
+# `__import__` -- QA (independent bypass-hunting round) found bare
+# `__import__(` alone flags setuptools' own, real, shipped-in-nearly-every-
+# venv `distutils-precedence.pth` (`import os; var = 'SETUPTOOLS_USE_
+# DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and
+# __import__('_distutils_hack').add_shim();`), a confirmed, guaranteed,
+# high-volume false ASK the module comment above already claimed (incorrectly)
+# would not happen. A bare `__import__('x')` call with nothing chained onto
+# it cannot itself invoke a process/network call -- the actual danger needs a
+# SECOND, chained call (`__import__('os').system(...)`), whose literal text
+# still doesn't match `os\.system\(` (no qualifying `os.` prefix precedes
+# `system(` there) and was never caught by this vocabulary either way, the
+# same "computed indirectly" class of gap every sibling guard in this file
+# already accepts. Dropping `__import__` here only removes a confirmed FP; it
+# does not create a new true-negative this vocabulary was ever actually
+# covering. `os.system`/`subprocess.*`/`eval`/`exec`/the network-call
+# vocabulary are unchanged and still gate the direct, undisguised forms.
+_PYSITE_PTH_EXEC_CALL = (
+    r"(?:os\.system|os\.popen|subprocess\.(?:Popen|call|run|check_output|check_call)"
+    r"|pty\.spawn|commands\.getoutput|eval|exec|importlib\.import_module"
+    r"|socket\.socket|" + _CONFTEST_NET_CALL + r")"
+)
+
 # A `.pth` line CPython execs as code, restricted to one that ALSO invokes a
 # process/code-exec primitive -- deliberately NOT "any import-prefixed line
 # at column zero" alone: legitimate, widely-shipped packages (setuptools' own
@@ -3163,7 +3186,7 @@ PYSITE_PTH_PATH_RE = re.compile(
 # physical line: `site.addpackage()` execs each qualifying line independently,
 # so a dangerous call on a LATER, unrelated line never taints this one.
 PYSITE_PTH_DANGEROUS_LINE_RE = re.compile(
-    r"^import[ \t][^\n]*?(?i:" + _CONFTEST_EXEC_CALL + r")\s*\(",
+    r"^import[ \t][^\n]*?(?i:" + _PYSITE_PTH_EXEC_CALL + r")\s*\(",
     re.MULTILINE,
 )
 
@@ -3176,15 +3199,30 @@ PYSITE_PTH_DANGEROUS_LINE_RE = re.compile(
 # line == the whole target file, so the strict `^`-anchored check silently
 # never fires" gap `conftest_dangerous_hit`'s own docstring already
 # documents and fixes for conftest.py's module-level check, applied here to
-# the same failure mode. `\b` (not `^`) is still real signal, not "any call
-# anywhere": it requires the literal word `import` immediately followed by a
-# space/tab, still case-sensitive, still on the same physical line as the
-# dangerous call -- stricter than `CONFTEST_DANGEROUS_CALL_RE`'s own
-# single-line fallback, which drops the `import`-prefix requirement
-# entirely, because a `.pth` line's danger is conditioned on that prefix in
-# a way conftest.py's module-level statements are not.
+# the same failure mode.
+#
+# Requires `import` be immediately preceded by a quote character (`'`/`"`),
+# NOT just a word boundary -- QA (independent bypass-hunting round) found an
+# earlier `\b`-based version matched `import` ANYWHERE on the line, including
+# inside an ordinary shell COMMENT (`echo '# see also import os;
+# os.system("id") for details' > evil.pth`): real CPython `site.addpackage()`
+# checks `line.startswith("#")` and skips the line entirely BEFORE it would
+# ever check the `import` prefix, so that comment line is genuinely inert and
+# must not gate -- a confirmed, reproduced false ASK. The overwhelmingly
+# common real-world single-line plant shape is `echo '<content>' > x.pth` /
+# `printf '<content>' > x.pth`, where the quoted argument (and therefore the
+# resulting file's one line) begins exactly at the opening quote -- so
+# requiring that adjacency is real signal, not a weakened check, for that
+# shape. Disclosed, narrower trade-off: an OBFUSCATED single-line plant (a
+# base64/hex payload piped through a decoder) whose decoded text starts with
+# `import ` is joined onto the scanned surface by a plain SPACE, not a quote,
+# by `normalize.scan_surface` -- so it is not caught by this specific
+# fallback (the customize/sitecustomize branch has no such gap, since it
+# never required an `import`-prefix in the first place; only the `.pth`
+# branch's prefix requirement creates this asymmetry). Still case-sensitive,
+# still bounded to one physical line, same as the strict check above.
 PYSITE_PTH_DANGEROUS_ANY_RE = re.compile(
-    r"\bimport[ \t][^\n]*?(?i:" + _CONFTEST_EXEC_CALL + r")\s*\(",
+    r"['\"]import[ \t][^\n]*?(?i:" + _PYSITE_PTH_EXEC_CALL + r")\s*\(",
 )
 
 
