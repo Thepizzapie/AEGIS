@@ -1815,7 +1815,31 @@ LD_PRELOAD_DIR_RE = re.compile(
 # distinctive filenames (unlike the generic "config"/"profile" words this
 # file's other guards deliberately exclude) -- no ordinary, unrelated project
 # has a file literally named either, so both are safe to include outright.
-_LD_PRELOAD_FIND_FRAGMENTS = r"ld\.so\.preload|ld\.so\.conf(?:\.d)?"
+#
+# QA finding (independent adversarial review, bypass-hunting round): a
+# `find -regex`/`-iregex` VALUE is itself an ERE, and escaping its interior
+# literal dots (`'.*ld\.so\.preload.*'`) -- the textbook-correct, and this
+# very file's own AGENT_DEF_FIND_PREDICATE_RE-comment-demonstrated, way to
+# write one -- inserts a literal backslash between "ld"/"so"/"preload" in
+# the SCANNED TEXT, breaking the plain substring-adjacency match a naive
+# `ld\.so\.preload` fragment (Python-regex-escaped, but expecting the target
+# text to contain a bare dot, not a backslash-dot pair) requires. Unlike
+# `.claude`/`aegis` (this file's other find-fragments, which have at most
+# one LEADING dot), "ld.so.preload"/"ld.so.conf.d" have TWO/THREE INTERIOR
+# dots, so escaping them is uniquely disruptive here. Fixed with an optional
+# literal backslash (`\\?`) before each dot in the fragment itself, so it
+# matches the target text whether or not each dot arrived pre-escaped for
+# ERE use -- reproduced and closed via `-regex`/`-iregex` with both `find
+# ... -exec` and `$(find ...)` substitution forms. Accepted residual gap,
+# same "computed indirectly" class every guard's find-fallback already
+# carries: a `-regex` value built from bracket-class dot-avoidance
+# (`ld[.]so[.]preload`) or any other ERE construct beyond a single optional
+# backslash is not covered -- chasing every possible ERE spelling of a
+# literal dot is unbounded, the same trade-off this file's other
+# find-indirection fallbacks already accept for their own targets.
+_LD_PRELOAD_FIND_FRAGMENTS = (
+    r"ld\\?\.so\\?\.preload|ld\\?\.so\\?\.conf(?:\\?\.d)?"
+)
 LD_PRELOAD_FIND_RE = _find_predicate_re(
     r"(?:" + _LD_PRELOAD_FIND_FRAGMENTS + r")")
 

@@ -2033,7 +2033,55 @@ def rule_ld_preload_protect(ev: Event, policy=None) -> Optional[Decision]:
     via an environment variable for ordinary (non-setuid) processes the
     way ``$ZDOTDIR``/``$XDG_CONFIG_HOME`` relocate ``rule_shell_persist_
     protect``/``rule_service_persist_protect``'s own targets -- so this
-    guard has no equivalent env-var-relocation gap to disclose."""
+    guard has no equivalent env-var-relocation gap to disclose.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): design/consistency review
+    verified the wiring correct everywhere its siblings are (``_CORE_RULES``,
+    ``Policy``, all three ``loader.py`` spots -- round-tripped an actual YAML
+    ``ld_preload:`` block through ``load_policy()`` into a live ``evaluate()``
+    decision rather than trusting the wiring by inspection alone -- both
+    ``skills.py`` knob lists, the README guard table), confirmed the full
+    suite green throughout, and flagged two gaps: this docstring's own
+    disclosed trade-offs (the bare-``/etc`` exclusion, the ``curl -o``
+    inherited gap, the ``_path()`` MCP-arg-key limitation) had no matching
+    README Limits-section paragraph the way every sibling guard from CI/CD
+    workflow through ``pysite`` gets one -- added; and this guard's test file
+    was missing the Windows-trailing-dot regression coverage its closest
+    sibling (``rule_service_persist_protect``) carries for the identical
+    ``_WIN_TRIM``/``_SEP`` mechanism -- added. Bypass-hunting found and
+    closed one real, reproduced bypass: a ``find -regex``/``-iregex`` value
+    with its interior literal dots escaped (``'.*ld\\.so\\.preload.*'`` --
+    the textbook-correct, ERE-idiomatic way to write one, the same style
+    this file's own ``AGENT_DEF_FIND_PREDICATE_RE`` comment demonstrates)
+    inserted a literal backslash between "ld"/"so"/"preload" in the scanned
+    text, breaking the plain substring-adjacency match the find-fragment
+    pattern originally required -- unlike this file's other find-fragments
+    (at most one leading dot), "ld.so.preload"/"ld.so.conf.d" have two/three
+    INTERIOR dots, uniquely exposing this guard to the escaping trick; fixed
+    by tolerating an optional literal backslash before each dot in the
+    fragment itself -- see ``LD_PRELOAD_FIND_RE``'s own comment in
+    ``patterns.py`` for the fix and its own accepted residual gap (a
+    bracket-class or other non-backslash ERE dot-spelling is still not
+    covered, the same "computed indirectly, unbounded to fully chase" class
+    every find-fallback in this file already accepts). Bypass-hunting also
+    confirmed, without fixing (pre-existing, shared-infrastructure, not new
+    or worse here): the ``curl -o``/``wget -O`` gap; a bare ``install`` verb
+    with no mode flag; MCP alternate-arg-key misses outside ``_path()``'s
+    list; a heredoc-form interpreter write with no ``-c``/``-e`` flag; and a
+    same-clause false ASK when an unrelated write verb and an incidental
+    path mention share a clause -- reproduced identically against
+    ``rule_service_persist_protect``/``rule_shell_persist_protect`` on
+    analogous inputs, confirming it is an inherited trait of the shared
+    ``touches_target = names_target and (verb...)`` shape, not unique to
+    this guard. Traced line-by-line against ``rule_service_persist_
+    protect``/``rule_shell_persist_protect`` and found no structural
+    inconsistency in mode/monitor/off handling (including the YAML-boolean
+    ``False`` case), the allow-regex escape hatch, ``_finish``/
+    ``_record_monitor`` wiring, the five-verb ``touches_target`` set, or the
+    agent-proof ``_override_allowed``/env-toggle escape hatches. Recommended
+    PASS after the two fixes; no further round needed. Full suite green
+    throughout (1516 passed after the fixes' own regression tests)."""
     cfg = getattr(policy, "ld_preload", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

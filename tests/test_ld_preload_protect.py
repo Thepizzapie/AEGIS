@@ -133,6 +133,20 @@ def test_find_path_indirection_gated():
         _shell("mv evil.conf $(find / -path '*ld.so.conf.d*')"), EMPTY))
 
 
+def test_find_regex_escaped_dots_does_not_bypass():
+    """QA finding (independent adversarial review, bypass-hunting round): a
+    `find -regex`/`-iregex` value is itself an ERE, and escaping its interior
+    literal dots (the textbook-correct way to write one) inserted a literal
+    backslash between "ld"/"so"/"preload" in the scanned text, breaking a
+    naive substring-adjacency fragment match — reproduced and closed by
+    tolerating an optional backslash before each dot in the find-fragment
+    pattern itself. See LD_PRELOAD_FIND_RE's own comment in patterns.py."""
+    assert _gated(evaluate(
+        _shell(r"find / -regex '.*ld\.so\.preload.*' -exec cp evil.so {} \;"), EMPTY))
+    assert _gated(evaluate(
+        _shell(r"find / -iregex '.*etc/ld\.so\.conf\.d/.*' -exec cp evil.conf {} \;"), EMPTY))
+
+
 def test_forced_symlink_swap_gated():
     d = evaluate(_shell("ln -sf evil.preload /etc/ld.so.preload"), EMPTY)
     assert _gated(d) and d.rule == "ld-preload-protect"
@@ -170,6 +184,11 @@ def test_doubled_separator_does_not_bypass():
 
 def test_etc_doubled_slash_shell_form_does_not_bypass():
     d = evaluate(_shell("echo /tmp/evil.so >> /etc//ld.so.preload"), EMPTY)
+    assert _gated(d) and d.rule == "ld-preload-protect"
+
+
+def test_windows_trailing_dot_does_not_bypass():
+    d = evaluate(_write("etc./ld.so.preload"), EMPTY)
     assert _gated(d) and d.rule == "ld-preload-protect"
 
 
