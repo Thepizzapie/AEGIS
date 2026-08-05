@@ -1748,6 +1748,106 @@ SERVICE_ACTIVATE_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- dynamic-linker preload / search-path hijack protection ------------------
+# `/etc/ld.so.preload` is glibc's dynamic-linker preload list: every shared
+# object path listed in it is dlopen()'d into EVERY dynamically-linked ELF
+# binary the system execs from that point on -- any user, any binary
+# (including setuid ones, sudo, ssh, package managers, cron jobs, other
+# users' sessions), with NO per-process opt-in and no reboot/new-shell/CI
+# trigger needed at all: the very next `exec()` anywhere on the machine picks
+# it up. This is the actual mechanism real Linux userland rootkits (Jynx,
+# Azazel, and the wider "LD_PRELOAD rootkit" family) use to wrap libc calls
+# (readdir/getdents, accept, ...) process-wide to hide files/PIDs/backdoor
+# connections -- a well-documented, high-severity persistence primitive with
+# a blast radius that meets or exceeds SERVICE_PERSIST's own (every future
+# process on the machine, not just units systemd/launchd itself launches at
+# boot/login).
+#
+# `/etc/ld.so.conf` and its `/etc/ld.so.conf.d/*.conf` drop-ins (the same
+# top-level-file-plus-drop-in-directory shape SSH_PERSIST_PATH_RE/
+# SYSTEMD_UNIT_PATH_RE already cover for their own surfaces) are the softer
+# sibling: they extend the shared-LIBRARY SEARCH PATH `ldconfig`/`ld.so`
+# consult, so a directory added there ahead of a legitimate one lets a
+# same-named malicious `.so` shadow it for every subsequent dynamic link --
+# the ELF/shared-library analog of PATH_HIJACK_PROTECT's own $PATH-binary
+# shadow guard, one layer down (the loader's search path, not the shell's).
+#
+# Nothing else in this file reaches this surface: `rule_containment`'s
+# PERSIST_RE covers Windows scheduled tasks/services/registry Run keys, not a
+# Linux linker config path; `rule_service_persist_protect` covers systemd/
+# launchd process-supervision units, a different auto-run mechanism entirely
+# (a service manager launching a program, not the ELF loader injecting a
+# library into one already running); `rule_path_hijack_protect` covers
+# shadowing a $PATH *binary*, not a *shared library* reached via the loader's
+# own search path; `rule_pysite_protect` covers the analogous Python
+# interpreter-startup auto-exec mechanism but never touches the OS-level ELF
+# loader underneath it.
+#
+# Unlike most sibling guards' targets, there is no environment-variable
+# relocation of `/etc/ld.so.preload` itself for ordinary (non-setuid)
+# processes to disclose as a gap -- the path is fixed inside glibc, not
+# configurable via an env var the way `$ZDOTDIR`/`$XDG_CONFIG_HOME` relocate
+# their own guards' targets.
+_LD_PRELOAD_END = _CI_END
+LD_PRELOAD_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ld\.so\.preload" + _LD_PRELOAD_END,
+    re.IGNORECASE,
+)
+LD_SO_CONF_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ld\.so\.conf" + _LD_PRELOAD_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ld\.so\.conf\.d" + _ETC_SEP
+    + _CI_SEG + r"\.conf" + _LD_PRELOAD_END,
+    re.IGNORECASE,
+)
+# Bare directory reference (no filename) -- the same archive/sync-tool gap
+# SHELL_PERSIST_DIR_RE/SERVICE_PERSIST_DIR_RE exist to close: `rsync -a
+# evil/ /etc/ld.so.conf.d/` never names a discrete target file at all.
+# `/etc` itself is deliberately excluded (too generic, the same "too generic"
+# trade-off SHELL_PERSIST_FIND_RE's own docstring makes for the bare words
+# "config"/"profile" -- almost every project's build touches SOME `/etc`
+# path) -- only the distinctive `ld.so.conf.d` drop-in directory qualifies.
+LD_PRELOAD_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"ld\.so\.conf\.d" + _LD_PRELOAD_END,
+    re.IGNORECASE,
+)
+# `find -path/-name/-wholename/-regex` indirection, same reason every other
+# `*_FIND_RE` in this file exists. "ld.so.preload"/"ld.so.conf" are fully
+# distinctive filenames (unlike the generic "config"/"profile" words this
+# file's other guards deliberately exclude) -- no ordinary, unrelated project
+# has a file literally named either, so both are safe to include outright.
+#
+# QA finding (independent adversarial review, bypass-hunting round): a
+# `find -regex`/`-iregex` VALUE is itself an ERE, and escaping its interior
+# literal dots (`'.*ld\.so\.preload.*'`) -- the textbook-correct, and this
+# very file's own AGENT_DEF_FIND_PREDICATE_RE-comment-demonstrated, way to
+# write one -- inserts a literal backslash between "ld"/"so"/"preload" in
+# the SCANNED TEXT, breaking the plain substring-adjacency match a naive
+# `ld\.so\.preload` fragment (Python-regex-escaped, but expecting the target
+# text to contain a bare dot, not a backslash-dot pair) requires. Unlike
+# `.claude`/`aegis` (this file's other find-fragments, which have at most
+# one LEADING dot), "ld.so.preload"/"ld.so.conf.d" have TWO/THREE INTERIOR
+# dots, so escaping them is uniquely disruptive here. Fixed with an optional
+# literal backslash (`\\?`) before each dot in the fragment itself, so it
+# matches the target text whether or not each dot arrived pre-escaped for
+# ERE use -- reproduced and closed via `-regex`/`-iregex` with both `find
+# ... -exec` and `$(find ...)` substitution forms. Accepted residual gap,
+# same "computed indirectly" class every guard's find-fallback already
+# carries: a `-regex` value built from bracket-class dot-avoidance
+# (`ld[.]so[.]preload`) or any other ERE construct beyond a single optional
+# backslash is not covered -- chasing every possible ERE spelling of a
+# literal dot is unbounded, the same trade-off this file's other
+# find-indirection fallbacks already accept for their own targets.
+_LD_PRELOAD_FIND_FRAGMENTS = (
+    r"ld\\?\.so\\?\.preload|ld\\?\.so\\?\.conf(?:\\?\.d)?"
+)
+LD_PRELOAD_FIND_RE = _find_predicate_re(
+    r"(?:" + _LD_PRELOAD_FIND_FRAGMENTS + r")")
+
+
+def ld_preload_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, LD_PRELOAD_FIND_RE)
+
+
 # Dev-container lifecycle config: `.devcontainer/devcontainer.json` (or a
 # named sibling for a multi-config repo, `.devcontainer/<name>/
 # devcontainer.json`) and the root-level `.devcontainer.json` shorthand. This

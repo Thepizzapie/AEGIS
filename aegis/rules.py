@@ -1944,6 +1944,204 @@ def rule_service_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _ld_preload_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_ld_preload_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering the dynamic linker's preload list
+    (``/etc/ld.so.preload``) or its shared-library search-path config
+    (``/etc/ld.so.conf``, ``/etc/ld.so.conf.d/*.conf`` drop-ins).
+
+    THREAT MODEL: ``/etc/ld.so.preload`` is glibc's dynamic-linker preload
+    list -- every shared-object path listed in it is ``dlopen()``'d into
+    EVERY dynamically-linked ELF binary the system execs from that point
+    forward: any user, any binary (including setuid ones, ``sudo``, ``ssh``,
+    package managers, cron jobs, other users' sessions), with no
+    per-process opt-in and no reboot/new-shell/CI/git trigger needed at
+    all -- the very next ``exec()`` anywhere on the machine picks it up.
+    This is the actual mechanism real Linux userland rootkits (Jynx,
+    Azazel, and the wider "LD_PRELOAD rootkit" family) use to wrap libc
+    calls (``readdir``/``getdents``, ``accept``, ...) process-wide to hide
+    files/PIDs/backdoor connections from every subsequently-run tool,
+    including the very ones an operator would use to look for them. Its
+    blast radius meets or exceeds ``rule_service_persist_protect``'s own:
+    every future process on the machine, not just units systemd/launchd
+    itself launches at boot/login.
+
+    ``/etc/ld.so.conf``/``/etc/ld.so.conf.d/*.conf`` are the softer
+    sibling: they extend the shared-LIBRARY search path ``ldconfig``/
+    ``ld.so`` consult, so a directory added there ahead of a legitimate one
+    lets a same-named malicious ``.so`` shadow it for every subsequent
+    dynamic link -- the ELF/shared-library analog of
+    ``rule_path_hijack_protect``'s own ``$PATH``-binary-shadow guard, one
+    layer down (the loader's search path, not the shell's).
+
+    Nothing else in this file reaches this surface: ``rule_containment``'s
+    ``PERSIST_RE`` covers Windows scheduled tasks/services/registry Run
+    keys, not a Linux linker config path; ``rule_service_persist_protect``
+    covers systemd/launchd process-supervision units, a different auto-run
+    mechanism (a service manager launching a program, not the ELF loader
+    injecting a library into one already running); ``rule_path_hijack_
+    protect`` covers shadowing a ``$PATH`` *binary*, not a *shared library*
+    reached via the loader's own search path; ``rule_pysite_protect``
+    covers the analogous Python interpreter-startup auto-exec mechanism but
+    never touches the OS-level ELF loader underneath it.
+
+    Config (``policy.ld_preload``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate --
+    e.g. a repo's own trusted deploy script that provisions an EDR/
+    observability agent this way). Defaults to ``ask`` for the same reason
+    every sibling ``*_protect`` guard does: legitimate uses of this exact
+    mechanism exist (security/EDR agents, APM/observability instrumentation,
+    malloc-debugging libraries deliberately preloaded process-wide) -- it
+    just needs a human to have actually looked at the change once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_LD_PRELOAD=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable -- the same "an agent
+    can't wave itself past its own guard" invariant every escapable guard
+    in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path assembled indirectly (shell variable concatenation
+    across separate assignments, a ``for``/``xargs`` loop, ``basename``/
+    ``dirname`` reconstruction) rather than appearing as one contiguous
+    literal is not caught, the same class every sibling guard already
+    accepts; a direct fetch-to-file write (``curl -o /etc/ld.so.preload
+    ...``, ``wget -O ...``) is caught by none of the shell branch's five
+    write-verb checks, the same inherited gap every other guard in this
+    file already discloses; the bare parent directory ``/etc`` is
+    deliberately excluded from both the archive/sync bare-directory
+    fallback and the ``find``-indirection fragment list (too generic --
+    almost every project's build touches some ``/etc`` path), the same
+    "too generic" trade-off ``SHELL_PERSIST_FIND_RE``'s own docstring
+    already makes for the bare words "config"/"profile"; an MCP tool
+    naming its target argument outside ``_path()``'s recognized key list
+    is missed the same way it is for every other ``_path()``-based guard
+    in this file (a shared limitation of the helper itself, out of this
+    guard's scope to fix); and, unlike most sibling guards' targets,
+    ``/etc/ld.so.preload``'s path is fixed inside glibc, not relocatable
+    via an environment variable for ordinary (non-setuid) processes the
+    way ``$ZDOTDIR``/``$XDG_CONFIG_HOME`` relocate ``rule_shell_persist_
+    protect``/``rule_service_persist_protect``'s own targets -- so this
+    guard has no equivalent env-var-relocation gap to disclose.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): design/consistency review
+    verified the wiring correct everywhere its siblings are (``_CORE_RULES``,
+    ``Policy``, all three ``loader.py`` spots -- round-tripped an actual YAML
+    ``ld_preload:`` block through ``load_policy()`` into a live ``evaluate()``
+    decision rather than trusting the wiring by inspection alone -- both
+    ``skills.py`` knob lists, the README guard table), confirmed the full
+    suite green throughout, and flagged two gaps: this docstring's own
+    disclosed trade-offs (the bare-``/etc`` exclusion, the ``curl -o``
+    inherited gap, the ``_path()`` MCP-arg-key limitation) had no matching
+    README Limits-section paragraph the way every sibling guard from CI/CD
+    workflow through ``pysite`` gets one -- added; and this guard's test file
+    was missing the Windows-trailing-dot regression coverage its closest
+    sibling (``rule_service_persist_protect``) carries for the identical
+    ``_WIN_TRIM``/``_SEP`` mechanism -- added. Bypass-hunting found and
+    closed one real, reproduced bypass: a ``find -regex``/``-iregex`` value
+    with its interior literal dots escaped (``'.*ld\\.so\\.preload.*'`` --
+    the textbook-correct, ERE-idiomatic way to write one, the same style
+    this file's own ``AGENT_DEF_FIND_PREDICATE_RE`` comment demonstrates)
+    inserted a literal backslash between "ld"/"so"/"preload" in the scanned
+    text, breaking the plain substring-adjacency match the find-fragment
+    pattern originally required -- unlike this file's other find-fragments
+    (at most one leading dot), "ld.so.preload"/"ld.so.conf.d" have two/three
+    INTERIOR dots, uniquely exposing this guard to the escaping trick; fixed
+    by tolerating an optional literal backslash before each dot in the
+    fragment itself -- see ``LD_PRELOAD_FIND_RE``'s own comment in
+    ``patterns.py`` for the fix and its own accepted residual gap (a
+    bracket-class or other non-backslash ERE dot-spelling is still not
+    covered, the same "computed indirectly, unbounded to fully chase" class
+    every find-fallback in this file already accepts). Bypass-hunting also
+    confirmed, without fixing (pre-existing, shared-infrastructure, not new
+    or worse here): the ``curl -o``/``wget -O`` gap; a bare ``install`` verb
+    with no mode flag; MCP alternate-arg-key misses outside ``_path()``'s
+    list; a heredoc-form interpreter write with no ``-c``/``-e`` flag; and a
+    same-clause false ASK when an unrelated write verb and an incidental
+    path mention share a clause -- reproduced identically against
+    ``rule_service_persist_protect``/``rule_shell_persist_protect`` on
+    analogous inputs, confirming it is an inherited trait of the shared
+    ``touches_target = names_target and (verb...)`` shape, not unique to
+    this guard. Traced line-by-line against ``rule_service_persist_
+    protect``/``rule_shell_persist_protect`` and found no structural
+    inconsistency in mode/monitor/off handling (including the YAML-boolean
+    ``False`` case), the allow-regex escape hatch, ``_finish``/
+    ``_record_monitor`` wiring, the five-verb ``touches_target`` set, or the
+    agent-proof ``_override_allowed``/env-toggle escape hatches. Recommended
+    PASS after the two fixes; no further round needed. Full suite green
+    throughout (1516 passed after the fixes' own regression tests)."""
+    cfg = getattr(policy, "ld_preload", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "ld-preload-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        preload_hit = bool(p and patterns.LD_PRELOAD_PATH_RE.search(p))
+        conf_hit = bool(p and patterns.LD_SO_CONF_PATH_RE.search(p))
+        if not (preload_hit or conf_hit):
+            return None
+        if os.environ.get("AEGIS_ALLOW_LD_PRELOAD") or _ld_preload_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"Dynamic-linker preload list '{p}' is being written — every "
+                   "shared object it names is loaded into EVERY dynamically-"
+                   "linked program run on this machine from now on, by any "
+                   "user, with no reboot or new shell needed" if preload_hit else
+                   f"Dynamic-linker search-path config '{p}' is being written — "
+                   "a directory added here can shadow a legitimate shared "
+                   "library for every subsequent dynamic link")
+        return _finish(Decision(action, "ld-preload-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_LD_PRELOAD=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.LD_PRELOAD_PATH_RE.search(cmd)
+                             or patterns.LD_SO_CONF_PATH_RE.search(cmd)
+                             or patterns.LD_PRELOAD_DIR_RE.search(cmd)
+                             or patterns.ld_preload_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_LD_PRELOAD")
+                or _ld_preload_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "ld-preload-protect",
+                         "The dynamic linker's preload list or search-path "
+                         "config is being modified from a shell — it affects "
+                         "every dynamically-linked program run on this "
+                         "machine from now on, with no reboot or new shell "
+                         "needed. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_LD_PRELOAD=1; a spawned agent cannot."))
+    return None
+
+
 def _devcontainer_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -4013,6 +4211,7 @@ _CORE_RULES = (
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_service_persist_protect,
+    rule_ld_preload_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,

@@ -56,7 +56,7 @@ def load_policy(path) -> Policy:
         "ci_workflow": {}, "git_hooks": {}, "agent_def": {}, "shell_persist": {},
         "direnv": {},
         "package_manifest": {}, "git_config_exec": {}, "git_attributes_exec": {},
-        "service_persist": {}, "devcontainer_exec": {}, "vscode_tasks_exec": {},
+        "service_persist": {}, "ld_preload": {}, "devcontainer_exec": {}, "vscode_tasks_exec": {},
         "path_hijack": {}, "claude_hooks": {}, "conftest": {}, "pysite": {},
         "inject": {}, "failures": {},
         "completion": {},
@@ -93,6 +93,7 @@ def load_policy(path) -> Policy:
                   git_config_exec=st["git_config_exec"],
                   git_attributes_exec=st["git_attributes_exec"],
                   service_persist=st["service_persist"],
+                  ld_preload=st["ld_preload"],
                   devcontainer_exec=st["devcontainer_exec"],
                   vscode_tasks_exec=st["vscode_tasks_exec"],
                   path_hijack=st["path_hijack"],
@@ -129,7 +130,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
     # injection, failure-loop, completion verification) — small dicts.
     for key in ("install_review", "mcp_config", "ci_workflow", "git_hooks", "agent_def",
                 "shell_persist", "direnv", "package_manifest", "git_config_exec",
-                "git_attributes_exec", "service_persist", "devcontainer_exec",
+                "git_attributes_exec", "service_persist", "ld_preload", "devcontainer_exec",
                 "vscode_tasks_exec", "path_hijack", "claude_hooks", "conftest", "pysite",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
