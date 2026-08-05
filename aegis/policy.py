@@ -181,6 +181,14 @@ class Policy:
     # load/bootstrap/enable activation commands. See
     # rules.rule_service_persist_protect.
     service_persist: dict = field(default_factory=dict)
+    # Dynamic-linker preload / search-path hijack protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers /etc/ld.so.preload (glibc dlopen()s
+    # every listed .so into EVERY dynamically-linked program run on the
+    # machine from that point on, no reboot/new-shell/CI trigger needed) and
+    # /etc/ld.so.conf + /etc/ld.so.conf.d/*.conf (shared-library search-path
+    # hijack). See rules.rule_ld_preload_protect.
+    ld_preload: dict = field(default_factory=dict)
     # Dev-container lifecycle-command protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers .devcontainer/devcontainer.json (+ .devcontainer/<name>/
