@@ -3806,6 +3806,146 @@ def rule_pysite_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _ipython_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a module-level process/code-exec call in an IPython
+    profile's ``startup/*.py`` script, or in a Jupyter/IPython ``*_config.py``
+    loader file (``jupyter_notebook_config.py``, ``jupyter_server_config.py``,
+    ``jupyter_lab_config.py``, ``ipython_config.py``, ...).
+
+    THREAT MODEL: see ``patterns.IPYTHON_STARTUP_PATH_RE``/``patterns.
+    JUPYTER_CONFIG_PATH_RE``'s own module comment for the full mechanism.
+    Short version: IPython execs every ``*.py`` file in a profile's
+    ``startup/`` directory, in order, on every IPython/Jupyter-kernel
+    startup, no opt-in needed; traitlets execs a Jupyter/IPython
+    ``*_config.py`` as a real Python module (not just data) the next time
+    the matching application starts. Both fire on the very next
+    ``ipython``/``jupyter notebook``/``jupyter lab``/`jupyter server``
+    invocation, by this agent, a teammate, or CI -- no git/CI/session-
+    restart trigger needed, the direct IPython/Jupyter analog of
+    ``rule_pysite_protect``'s own ``sitecustomize.py`` guard for the bare
+    interpreter.
+
+    Deliberately reuses ``patterns.pysite_customize_dangerous_hit`` unchanged
+    rather than duplicating it: the underlying shape (an unconditional,
+    top-level process/code-exec call in a module something else execs for
+    you with zero opt-in) is identical to ``sitecustomize.py``'s; only the
+    trigger differs. NOT gated on the bare file/write alone -- an IPython
+    startup script or Jupyter config file routinely carries wholly
+    innocuous setup (``c.NotebookApp.ip = '0.0.0.0'``, ``import pandas as
+    pd``, a registered IPython magic) with no process/code-exec call in
+    sight; gating on the bare file would flag those on sight, the same
+    false-positive trade-off ``rule_pysite_protect``'s own docstring already
+    rejects for ``sitecustomize.py``.
+
+    Config (``policy.ipython_startup``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the
+    gate). Defaults to ``ask`` for the same reason every sibling
+    ``*_protect`` guard does: a legitimate, sanctioned startup hook (a
+    controlled autoreload/logging shim) can shell out deliberately -- it
+    just needs a human to have actually looked at it once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_IPYTHON_STARTUP=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a dangerous call assembled indirectly (string concatenation,
+    a wrapper function/module, an aliased import) rather than appearing as
+    a literal defeats every check here, the same class every sibling guard
+    already accepts; neither branch has a ``find``-path-indirection
+    fallback, nor a bare-directory/``cd``-into-``startup``-or-``~/.jupyter``
+    fallback (the same absence ``rule_pysite_protect``'s own docstring
+    discloses for its ``.pth`` branch); a direct fetch-to-file write
+    (``curl -o ~/.ipython/profile_default/startup/x.py ...``) is caught by
+    none of the shell branch's write-verb checks, the same inherited gap
+    every other guard in this file discloses; an ``IPYTHONDIR``/
+    ``JUPYTER_CONFIG_DIR``/``JUPYTER_PATH`` relocation of where these files
+    are read from is not specially covered -- the same "computed
+    indirectly" class ``rule_shell_persist_protect``'s own ``$ZDOTDIR`` gap
+    already accepts; and the shared ``_path()`` helper every ``*_protect``
+    guard in this file reads MCP arguments through only checks top-level
+    keys, the same pre-existing, shared gap ``rule_pysite_protect``'s own
+    docstring already discloses (not unique to this guard, not fixed
+    here)."""
+    cfg = getattr(policy, "ipython_startup", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "ipython-startup-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not (patterns.IPYTHON_STARTUP_PATH_RE.search(p) or patterns.JUPYTER_CONFIG_PATH_RE.search(p)):
+            return None
+        if not patterns.pysite_customize_dangerous_hit(content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_IPYTHON_STARTUP")
+                or _ipython_startup_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "ipython-startup-protect",
+                         f"'{p}' is being written with an IPython/Jupyter "
+                         "startup auto-exec shape wrapping a process/"
+                         "code-exec call -- IPython execs it on the very "
+                         "next `ipython`/`jupyter notebook`/`jupyter lab`/"
+                         "`jupyter server` invocation, by this agent, a "
+                         "teammate, or CI, with no further action needed. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_IPYTHON_STARTUP=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+        if not (patterns.IPYTHON_STARTUP_PATH_RE.search(cmd) or patterns.JUPYTER_CONFIG_PATH_RE.search(cmd)):
+            return None
+        if not patterns.pysite_customize_dangerous_hit(cmd, shell=True, raw=_cmd(ev)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_IPYTHON_STARTUP")
+                or _ipython_startup_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "ipython-startup-protect",
+                         "An IPython/Jupyter startup auto-exec shape is "
+                         "being planted from a shell -- IPython execs it "
+                         "on the very next `ipython`/`jupyter notebook`/"
+                         "`jupyter lab`/`jupyter server` invocation, by "
+                         "this agent, a teammate, or CI, with no further "
+                         "action needed. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_IPYTHON_STARTUP=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -4218,6 +4358,7 @@ _CORE_RULES = (
     rule_claude_hooks_protect,
     rule_conftest_protect,
     rule_pysite_protect,
+    rule_ipython_startup_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

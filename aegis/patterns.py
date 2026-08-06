@@ -3369,3 +3369,82 @@ def pysite_pth_dangerous_hit(content: str, *, shell: bool = False, raw: str = No
     if shell and "\n" not in newline_probe:
         return bool(PYSITE_PTH_DANGEROUS_ANY_RE.search(content))
     return bool(PYSITE_PTH_DANGEROUS_LINE_RE.search(content))
+
+
+# ---- IPython/Jupyter startup auto-exec ---------------------------------------
+#
+# THREAT MODEL: two distinct IPython/Jupyter mechanisms auto-run arbitrary
+# top-level Python on startup, no opt-in, no explicit import, no CLI flag, no
+# git/CI/session-restart trigger -- the same "no future trigger, the very next
+# bare invocation" property `PYSITE_CUSTOMIZE_PATH_RE`'s own docstring gives
+# `sitecustomize.py`/`usercustomize.py`, applied one layer up from the bare
+# interpreter to the (overwhelmingly common, in an agentic coding context)
+# IPython/Jupyter one:
+#
+# 1. Every `*.py` file inside an IPython profile's `startup/` directory
+#    (`~/.ipython/profile_default/startup/`, or any other named profile) is
+#    exec'd, in lexicographic filename order, top to bottom, on EVERY IPython
+#    startup -- and, since `ipykernel` (the kernel every Jupyter notebook/lab/
+#    console session actually runs) is itself built on IPython, on every
+#    Jupyter kernel startup too. This is a dedicated-purpose directory: IPython
+#    invented it FOR this exact "run this on every startup" use case, so unlike
+#    `conftest.py`/`sitecustomize.py` there's no adjacent legitimate-but-inert
+#    file shape sharing the same name to stay compatible with -- anything
+#    dropped there runs.
+#
+# 2. `jupyter_notebook_config.py`/`jupyter_server_config.py`/`jupyter_lab_
+#    config.py`/`jupyter_console_config.py`/`jupyter_qtconsole_config.py`/
+#    `jupyter_nbconvert_config.py`/`jupyter_kernel_gateway_config.py` (any
+#    Jupyter application's own `<app>_config.py`) and IPython's own
+#    `ipython_config.py`/`ipython_kernel_config.py` are not static data --
+#    traitlets' `PyFileConfigLoader` loads each by executing it as a real
+#    Python module with a `c` (the app's `Config` object) bound in its
+#    namespace, so any top-level statement in the file runs, not just `c.foo =
+#    bar` assignments. `jupyter --paths`/`ipython profile locate` resolve these
+#    from `~/.jupyter`/`~/.ipython/profile_default`, `<sys.prefix>/etc/jupyter`,
+#    and (on Linux) `/etc/jupyter` -- runs the next time `jupyter notebook`/
+#    `jupyter lab`/`jupyter server`/`jupyter console`/`jupyter qtconsole`/
+#    `jupyter nbconvert`/`ipython` starts, again by this agent, a teammate, or
+#    CI, with no further action needed.
+#
+# Nothing else in this file reaches this surface: `PYSITE_CUSTOMIZE_PATH_RE`
+# gates CPython's OWN interpreter-startup hook (`sitecustomize.py`), not
+# IPython's separate, IPython-specific startup-directory/config-loader
+# mechanisms -- a bare `python` invocation never reads either of these files;
+# `CONFTEST_PATH_RE` gates pytest's own auto-collection hook, an unrelated
+# trigger. Given how much agentic coding work runs inside a Jupyter kernel
+# (notebook-driven data science, MCP Jupyter servers), this is the same
+# severity class as `PYSITE_CUSTOMIZE_PATH_RE`'s own guard, just scoped to
+# IPython/Jupyter's own startup surface instead of the bare interpreter's.
+#
+# Deliberately gated on the SAME shape `pysite_customize_dangerous_hit`
+# already gates for `sitecustomize.py` (a module-level process/code-exec
+# call), not on the bare file/write alone -- reused directly rather than
+# duplicated, since the underlying danger (an unconditional, top-level exec
+# call in a module something else imports/execs for you with zero opt-in) is
+# identical; only the trigger (`python starting up` vs. `ipython`/`jupyter`
+# starting up) differs. An IPython startup script or Jupyter config file CAN
+# contain wholly innocuous setup (`c.NotebookApp.ip = '0.0.0.0'`, `import
+# pandas as pd`, a `%matplotlib inline` magic) with no process/code-exec call
+# in sight -- gating on the bare file alone would flag those on sight, the
+# same false-positive `pysite_customize_dangerous_hit`'s own docstring already
+# rejects for `sitecustomize.py`.
+IPYTHON_STARTUP_PATH_RE = re.compile(
+    r"\.ipython[/\\]profile_[^/\\'\"]*[/\\]startup[/\\][^/\\'\"]*\.py" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `(?:_\w+)?` makes the middle segment optional so a bare `jupyter_config.py`
+# still matches, while `jupyter_notebook_config.py`/`jupyter_server_config.py`/
+# `jupyter_lab_config.py`/`jupyter_console_config.py`/`jupyter_qtconsole_
+# config.py`/`jupyter_nbconvert_config.py`/`jupyter_kernel_gateway_config.py`
+# all match through the same `\w+` capture -- no per-application enumeration
+# needed. `ipython(?:_kernel)?` covers IPython's own two config files the same
+# way. No directory restriction (like `PYSITE_CUSTOMIZE_PATH_RE`): these
+# filenames are resolved from several possible directories (`~/.jupyter`,
+# `<sys.prefix>/etc/jupyter`, `/etc/jupyter`, a `--config-dir` override), so
+# the filename alone is the only reliable signal.
+JUPYTER_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])(?:jupyter(?:_\w+)?|ipython(?:_kernel)?)_config\.py" + _CI_END,
+    re.IGNORECASE,
+)
