@@ -84,6 +84,37 @@ def test_startup_script_windows_path_separator_gated():
     assert _gated(d) and d.rule == "ipython-startup-protect"
 
 
+def test_startup_script_windows_trailing_dot_after_ipython_dir_gated():
+    """QA regression (bypass-hunting round): Windows strips a trailing dot/
+    space from each path component before resolving it, so
+    '.ipython.\\profile_default\\startup\\x.py' resolves to the exact same
+    real IPython startup directory as the unpadded path — a bare `[/\\]`
+    separator (rather than `_WIN_TRIM + _SEP`) let this padded form evade
+    the guard entirely (confirmed, reproduced false ALLOW). Fixed by
+    adopting the same `_WIN_TRIM + _SEP` idiom AEGIS_SOURCE_RE/
+    AEGIS_SKILL_PATH_RE already use for this exact OS-level quirk."""
+    d = evaluate(_write(r"C:\Users\dev\.ipython.\profile_default\startup\init.py"), EMPTY)
+    assert _gated(d) and d.rule == "ipython-startup-protect"
+
+
+def test_startup_script_windows_trailing_dot_after_startup_dir_gated():
+    """Same QA regression, the second padded component the bypass-hunting
+    round found: 'startup.\\x.py' resolves to the same real startup/
+    directory as 'startup\\x.py' on Windows."""
+    d = evaluate(_write(r"C:\Users\dev\.ipython\profile_default\startup.\init.py"), EMPTY)
+    assert _gated(d) and d.rule == "ipython-startup-protect"
+
+
+def test_shell_startup_script_windows_trailing_dot_gated():
+    """Shell branch is equally affected by the same Windows trailing-dot
+    padding bypass — confirmed and closed the same way as the Edit/Write/
+    MCP branch above."""
+    d = evaluate(_shell(
+        'echo \'import os; os.system("id")\' > '
+        r'C:\Users\dev\.ipython.\profile_default\startup\init.py'), EMPTY)
+    assert _gated(d) and d.rule == "ipython-startup-protect"
+
+
 def test_startup_script_indented_call_not_module_level_not_gated():
     content = (
         "def _setup():\n"

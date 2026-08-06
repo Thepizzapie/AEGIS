@@ -3429,8 +3429,22 @@ def pysite_pth_dangerous_hit(content: str, *, shell: bool = False, raw: str = No
 # in sight -- gating on the bare file alone would flag those on sight, the
 # same false-positive `pysite_customize_dangerous_hit`'s own docstring already
 # rejects for `sitecustomize.py`.
+# `_WIN_TRIM + _SEP` (not a bare `[/\\]`) sits between every fixed-literal
+# segment, the same idiom `AEGIS_SOURCE_RE`/`AEGIS_SKILL_PATH_RE` already use
+# and `_SEP`'s own comment documents: Windows strips a trailing dot/space from
+# EACH path component before resolving it, so `.ipython.\profile_default\
+# startup\x.py` and `.ipython\profile_default\startup.\x.py` both resolve, on
+# disk, to the exact same real IPython startup directory as the unpadded path
+# — a bare `[/\\]` between "\.ipython"/"startup" and the next separator would
+# silently fail to match either padded form despite both being genuinely
+# dangerous (QA bypass-hunting round: confirmed, reproduced false ALLOW,
+# closed here). The `profile_...` segment's own wildcard (`[^/\\'\"]*`)
+# already absorbs a trailing dot/space as ordinary wildcard content, so it
+# needs no separate fix, but gets the same `_WIN_TRIM + _SEP` treatment on
+# its trailing edge for consistency with its siblings.
 IPYTHON_STARTUP_PATH_RE = re.compile(
-    r"\.ipython[/\\]profile_[^/\\'\"]*[/\\]startup[/\\][^/\\'\"]*\.py" + _CI_END,
+    r"\.ipython" + _WIN_TRIM + _SEP + r"profile_[^/\\'\"]*" + _WIN_TRIM + _SEP
+    + r"startup" + _WIN_TRIM + _SEP + r"[^/\\'\"]*\.py" + _CI_END,
     re.IGNORECASE,
 )
 

@@ -3878,7 +3878,34 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     guard in this file reads MCP arguments through only checks top-level
     keys, the same pre-existing, shared gap ``rule_pysite_protect``'s own
     docstring already discloses (not unique to this guard, not fixed
-    here)."""
+    here).
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review verified the wiring correct
+    everywhere its siblings are (``Policy``, all three ``loader.py`` spots,
+    both ``skills.py`` knob lists, ``_CORE_RULES``, README), and proved an
+    actual YAML ``ipython_startup:`` block round-trips through
+    ``load_policy()`` into a live ``evaluate()`` decision rather than
+    trusting the wiring by inspection alone -- no defects found. Bypass-
+    hunting found and closed one real, reproduced false ALLOW before merge:
+    ``patterns.IPYTHON_STARTUP_PATH_RE`` joined its fixed-literal path
+    segments (``\\.ipython``, ``startup``) with a bare ``[/\\]`` separator
+    instead of the ``_WIN_TRIM + _SEP`` idiom ``AEGIS_SOURCE_RE``/
+    ``AEGIS_SKILL_PATH_RE`` already use for the identical, documented
+    Windows quirk (a trailing dot/space on a path component is stripped
+    before the OS resolves it) -- a padded path like
+    ``.ipython.\\profile_default\\startup\\x.py`` or
+    ``.ipython\\profile_default\\startup.\\x.py`` resolves, on disk, to the
+    exact same real IPython startup directory as the unpadded path, but the
+    unpadded-only regex let both forms sail through undetected carrying a
+    literal, undisguised ``os.system(...)`` call -- confirmed via direct
+    reproduction through ``evaluate()`` on both the Edit/Write/MCP and shell
+    branches. Closed by adopting the same ``_WIN_TRIM + _SEP`` idiom
+    between every fixed-literal segment; ``JUPYTER_CONFIG_PATH_RE`` was
+    unaffected (filename-only, no internal directory separator to pad).
+    Recommended PASS after the fix; no further round needed. Full suite
+    green throughout (1565 passed after the fix's own regression tests)."""
     cfg = getattr(policy, "ipython_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
