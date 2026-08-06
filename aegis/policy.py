@@ -241,6 +241,17 @@ class Policy:
     # process/code-exec call -- runs on the very next `python`/`pytest`
     # invocation, no opt-in needed. See rules.rule_pysite_protect.
     pysite: dict = field(default_factory=dict)
+    # IPython/Jupyter startup auto-exec protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers a module-level process/code-exec call in an IPython profile's
+    # startup/*.py script (IPython execs every file there on every IPython/
+    # Jupyter-kernel startup) or a Jupyter/IPython *_config.py loader file
+    # (jupyter_notebook_config.py, jupyter_server_config.py, jupyter_lab_
+    # config.py, ipython_config.py, ...) that traitlets execs as real Python --
+    # runs on the very next `ipython`/`jupyter notebook`/`jupyter lab`/
+    # `jupyter server` invocation, no opt-in needed. See
+    # rules.rule_ipython_startup_protect.
+    ipython_startup: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.
