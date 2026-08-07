@@ -199,6 +199,124 @@ def test_output_style_def_gated():
     assert _gated(d) and d.rule == "agent-def-protect"
 
 
+# ---- skill definitions (.claude/skills/<name>/SKILL.md) -------------------------
+# The sharpest instance of this whole guard's risk: a skill is auto-invoked
+# whenever a FUTURE session's task is judged to match its frontmatter
+# `description` — no typed slash-command name, no explicit output-style
+# selection, not even "use PROACTIVELY" framing a human might notice. Before
+# this coverage, a non-aegis-named `.claude/skills/*/SKILL.md` had ZERO
+# guard coverage via Edit/Write/MCP: self-protect's EDIT/WRITE branch checks
+# only `AEGIS_SKILL_PATH_RE` (`.claude/skills/aegis-*` — Aegis's own shipped
+# skills only), never the broader `CONFIG_DIR_RE`.
+
+def test_custom_skill_def_gated():
+    d = evaluate(_write(".claude/skills/data-exfil/SKILL.md"), EMPTY)
+    assert _gated(d) and d.rule == "agent-def-protect"
+
+
+def test_skill_def_case_insensitive_filename_gated():
+    """Real Claude Code convention is all-caps `SKILL.md`, but the guard must
+    not depend on exact case."""
+    assert _gated(evaluate(_write(".claude/skills/evil/skill.md"), EMPTY))
+    assert _gated(evaluate(_write(".claude/skills/evil/Skill.MD"), EMPTY))
+
+
+def test_user_scoped_skill_def_gated():
+    """Same risk at the user (global, cross-repo) scope, not just project."""
+    assert _gated(evaluate(_write("/home/dev/.claude/skills/evil/SKILL.md"), EMPTY))
+    assert _gated(evaluate(_write("~/.claude/skills/evil/SKILL.md"), EMPTY))
+
+
+def test_nested_repo_path_skill_gated():
+    assert _gated(evaluate(_write("repo/.claude/skills/evil/SKILL.md"), EMPTY))
+
+
+def test_mcp_tool_write_to_skill_gated():
+    d = evaluate(_mcp_write(".claude/skills/evil/SKILL.md"), EMPTY)
+    assert _gated(d) and d.rule == "agent-def-protect"
+
+
+def test_skill_non_skill_md_resource_file_not_gated():
+    """Deliberately narrower than agents/commands/output-styles: those gate ANY
+    `.md` dropped in the directory (filename is arbitrary), but a skill's
+    auto-loaded surface is specifically the file literally named `SKILL.md` —
+    an ordinary reference doc bundled alongside it (a real, common skill-
+    authoring pattern) is not itself auto-invoked and must not false-positive."""
+    assert not _gated(evaluate(_write(".claude/skills/data-viz/reference.md"), EMPTY))
+    assert not _gated(evaluate(_write(".claude/skills/data-viz/palette.md"), EMPTY))
+
+
+def test_aegis_shipped_skill_not_claimed_by_new_skill_pattern():
+    """`.claude/skills/aegis-*` stays self-protect's exclusive, stricter
+    (non-escapable deny) territory — the new skill branch's `(?!aegis-)`
+    exclusion must keep it disjoint, the same way the pre-existing
+    `test_shipped_skill_not_claimed_by_this_guard` already verifies for the
+    full engine path; this asserts the PATTERN itself excludes it directly."""
+    from aegis import patterns
+    assert not patterns.AGENT_DEF_PATH_RE.search(".claude/skills/aegis-status/SKILL.md")
+    assert not patterns.AGENT_DEF_PATH_RE.search(".claude/skills/aegis-explain-block/SKILL.md")
+    # a NON-aegis skill still matches
+    assert patterns.AGENT_DEF_PATH_RE.search(".claude/skills/my-skill/SKILL.md")
+
+
+def test_shell_redirect_to_skill_gated():
+    """Overlaps self-protect's own (stricter, non-escapable) `.claude/`
+    coverage for the shell form — call the rule directly to verify THIS
+    guard's own logic, not self-protect's (see module docstring)."""
+    assert _gated(_agent_def_only("echo 'malicious' > .claude/skills/evil/SKILL.md"))
+
+
+def test_skill_archive_and_sync_tools_gated():
+    """Real, NON-redundant coverage (unlike the shell-redirect case above):
+    self-protect's `CONFIG_DIR_RE` shell branch has no `ARCHIVE_SYNC_VERB_RE`
+    check at all, so an archive/sync-tool plant into `.claude/skills/`
+    evades self-protect entirely regardless of an aegis-* name — this
+    guard's `AGENT_DEF_DIR_RE`/`ARCHIVE_SYNC_VERB_RE` pairing is the only
+    guard that catches it."""
+    assert _gated(_agent_def_only("rsync -a evil_skill/ .claude/skills/"))
+    assert _gated(_agent_def_only("tar xf payload.tar -C .claude/skills/"))
+    assert _gated(_agent_def_only("unzip payload.zip -d .claude/skills/"))
+
+
+def test_skill_bare_directory_reference_gated():
+    from aegis import patterns
+    assert patterns.AGENT_DEF_DIR_RE.search(".claude/skills/")
+    assert patterns.AGENT_DEF_DIR_RE.search(".claude/skills")
+    assert not patterns.AGENT_DEF_DIR_RE.search("src/skills/README.md")
+
+
+def test_skill_find_path_indirection_gated():
+    assert _gated(_agent_def_only(
+        "cp evil.md $(find . -path '*/.claude/skills*' -name SKILL.md)"))
+    assert _gated(_agent_def_only(
+        "mv evil.md $(find . -regex '.*\\.claude.*skills.*SKILL\\.md')"))
+
+
+def test_skill_env_toggle_allows(monkeypatch):
+    monkeypatch.setenv("AEGIS_ALLOW_AGENT_DEF", "1")
+    assert not _gated(evaluate(_write(".claude/skills/evil/SKILL.md"), EMPTY))
+
+
+def test_skill_policy_allow_regex_exempts_trusted_path():
+    pol = Policy(agent_def={"allow": [r"^\.claude/skills/trusted-"]})
+    assert not _gated(evaluate(_write(".claude/skills/trusted-tool/SKILL.md"), pol))
+    assert _gated(evaluate(_write(".claude/skills/untrusted-tool/SKILL.md"), pol))
+
+
+def test_skill_deny_mode_hard_blocks():
+    d = evaluate(_write(".claude/skills/evil/SKILL.md"), DENY)
+    assert d.blocked and d.action == Action.DENY and d.rule == "agent-def-protect"
+
+
+def test_skill_no_quadratic_blowup_on_adversarial_path_input():
+    from aegis import patterns
+    adversarial = ".claude/skills/" * 8000
+    start = time.time()
+    patterns.AGENT_DEF_PATH_RE.search(adversarial)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"AGENT_DEF_PATH_RE (skills) took {elapsed:.2f}s on adversarial input"
+
+
 def test_shell_redirect_to_agent_def_gated():
     """`.claude/agents`/`.claude/commands` overlaps self-protect's own
     (stricter, non-escapable) `.claude/` coverage for the shell form — call

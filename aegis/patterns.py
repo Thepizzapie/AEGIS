@@ -1139,13 +1139,31 @@ AGENT_INSTRUCTIONS_PATH_RE = re.compile(
 # argument is concerned.
 _AGENT_DEF_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
 _AGENT_DEF_ROOT = r"(?:^|[\s'\"/\\=])\.claude" + _WIN_TRIM + _SEP
+# `.claude/skills/<name>/SKILL.md` — a project/user Claude Code skill. Unlike
+# agents/commands/output-styles above (any `.md` dropped in the dir is
+# dangerous, filename is arbitrary), a skill's auto-loaded, auto-triggered
+# content lives specifically in the file literally named `SKILL.md` inside
+# the named subdirectory — the frontmatter `description` is what gets a
+# skill silently selected and invoked in a FUTURE session with no explicit,
+# per-invocation human choice at all (not even a typed `/name`, unlike a
+# slash command, and not an explicit selection, unlike an output-style) — so
+# the filename is pinned narrowly here rather than widened to `_CI_SEG`.
+# `(?!aegis-)` excludes Aegis's own shipped skills — already covered, more
+# strictly (non-escapable deny, not ask), by self-protect's own
+# `AEGIS_SKILL_PATH_RE`; this pattern must stay disjoint from that guard's
+# territory the same way `AGENT_DEF_PATH_RE` already stays disjoint from
+# `ENFORCEMENT_PATH_RE`/`AEGIS_SOURCE_RE` for `.claude/settings.json`/
+# Aegis's own source.
+_AGENT_DEF_SKILL_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP + r"(?!aegis-)"
 AGENT_DEF_PATH_RE = re.compile(
     _AGENT_DEF_ROOT + r"agents" + _WIN_TRIM + _SEP
     + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
     + r"|" + _AGENT_DEF_ROOT + r"commands" + _WIN_TRIM + _SEP
     + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
     + r"|" + _AGENT_DEF_ROOT + r"output-styles" + _WIN_TRIM + _SEP
-    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END,
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
+    + r"|" + _AGENT_DEF_SKILL_ROOT
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,3}" + r"SKILL" + _WIN_TRIM + r"\.md" + _CI_END,
     re.IGNORECASE,
 )
 
@@ -1155,10 +1173,22 @@ AGENT_DEF_PATH_RE = re.compile(
 # .claude/agents/`, `tar xf payload.tar -C .claude/commands/`) never matches
 # AGENT_DEF_PATH_RE at all, the identical gap GIT_HOOKS_DIR_RE exists to
 # close for `.git/hooks/`. Mirrors GIT_HOOKS_DIR_RE's shape exactly.
+# The `.claude/skills` alternative deliberately has NO `(?!aegis-)` exclusion
+# (unlike AGENT_DEF_PATH_RE/`_AGENT_DEF_SKILL_ROOT` above): an archive/sync
+# tool's own destination argument is routinely just the bare parent
+# directory with no subdirectory name in it at all (see
+# `test_archive_and_sync_tools_gated`'s own `.claude/agents/` examples), so
+# there is no name text here to test the exclusion against in the first
+# place — and self-protect's shell branch has no archive/sync-verb check of
+# its own (`ARCHIVE_SYNC_VERB_RE` is not among the verbs its `CONFIG_DIR_RE`
+# branch pairs with), so this is real, non-overlapping defense-in-depth for
+# an `aegis-*` skill dropped via `rsync`/`tar`/`unzip`/`install -m`, not
+# redundant coverage.
 AGENT_DEF_DIR_RE = re.compile(
     _AGENT_DEF_ROOT + r"agents" + _CI_END
     + r"|" + _AGENT_DEF_ROOT + r"commands" + _CI_END
-    + r"|" + _AGENT_DEF_ROOT + r"output-styles" + _CI_END,
+    + r"|" + _AGENT_DEF_ROOT + r"output-styles" + _CI_END
+    + r"|" + _AGENT_DEF_ROOT + r"skills" + _CI_END,
     re.IGNORECASE,
 )
 
@@ -1201,7 +1231,7 @@ ARCHIVE_SYNC_VERB_RE = re.compile(
 # coverage than `AGENT_DEF_DIR_RE` above already accepts.
 AGENT_DEF_FIND_PREDICATE_RE = _find_predicate_re(
     r"(?:CLAUDE\.md\b|AGENTS\.md\b|\.claude[/\\]agents\b|\.claude[/\\]commands\b"
-    r"|\.claude[/\\]output-styles\b|\.claude\b)")
+    r"|\.claude[/\\]output-styles\b|\.claude[/\\]skills\b|\.claude\b)")
 
 
 def agent_def_find_hit(cmd: str) -> bool:

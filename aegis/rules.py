@@ -604,8 +604,33 @@ def _agent_def_allowed_by_policy(cfg: dict, text: str) -> bool:
 def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting/altering project instructions (``CLAUDE.md``/``AGENTS.md``,
     including the ``.local`` supplement variants) or a custom agent/command/
-    output-style definition (``.claude/agents/*.md``, ``.claude/commands/*.md``,
-    ``.claude/output-styles/*.md``, project- or user-scoped).
+    output-style/skill definition (``.claude/agents/*.md``,
+    ``.claude/commands/*.md``, ``.claude/output-styles/*.md``,
+    ``.claude/skills/*/SKILL.md``, project- or user-scoped).
+
+    A skill is the sharpest instance of this whole family's risk, not just
+    another entry in the list: a custom sub-agent needs "use PROACTIVELY"
+    framing to get auto-selected, a slash command needs a human to type its
+    name, an output-style needs explicit selection — a skill is invoked
+    automatically whenever a FUTURE session's own task description is judged
+    to match its frontmatter ``description``, with no typed name and no
+    explicit selection step at all. ``(?!aegis-)`` in
+    ``_AGENT_DEF_SKILL_ROOT`` keeps this guard's own skill coverage disjoint
+    from Aegis's shipped skills, which self-protect's stricter, non-escapable
+    ``AEGIS_SKILL_PATH_RE`` already owns — this guard's skill branch is new
+    coverage only for a project's OWN, non-``aegis-*`` skills, which had zero
+    coverage from any existing rule before this: self-protect's own EDIT/
+    WRITE branch checks only ``ENFORCEMENT_PATH_RE``/``AEGIS_SOURCE_RE``/
+    ``AEGIS_SKILL_PATH_RE`` (never the broader ``CONFIG_DIR_RE``, same gap
+    already disclosed below for agents/commands/output-styles), and the
+    shell form, while already caught by self-protect's broad ``.claude``
+    substring match for a plain redirect/delete/in-place-edit, had no
+    archive/sync-tool coverage at all — ``ARCHIVE_SYNC_VERB_RE`` is not among
+    the verbs self-protect's ``CONFIG_DIR_RE`` branch pairs with, so
+    ``rsync -a evil_skill/ .claude/skills/`` sailed through self-protect
+    undetected. This guard's own ``AGENT_DEF_DIR_RE``/``ARCHIVE_SYNC_VERB_RE``
+    pairing closes that specific gap for skills the same way it already does
+    for agents/commands/output-styles.
 
     ``CLAUDE.md``/``AGENTS.md`` is folded directly into the model's OWN context
     on every FUTURE session start — the same "runs later, unattended" shape as
@@ -642,7 +667,12 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     fires on it; (2) a plain ``Edit``/``Write``/MCP-tool call (no shell) to
     ANY of these paths — self-protect's own EDIT/WRITE branch checks only
     ``ENFORCEMENT_PATH_RE``/``AEGIS_SOURCE_RE``/``AEGIS_SKILL_PATH_RE``, never
-    the broader ``CONFIG_DIR_RE``.
+    the broader ``CONFIG_DIR_RE``; (3) for ``.claude/skills/*/SKILL.md``
+    specifically, the shell form's archive/sync-tool bypass too —
+    self-protect's ``CONFIG_DIR_RE`` branch has no ``ARCHIVE_SYNC_VERB_RE``
+    check at all, so `rsync -a evil_skill/ .claude/skills/` is new coverage
+    from THIS guard, not a redundant second layer over self-protect the way
+    a plain redirect/delete/in-place-edit already is.
 
     Config (``policy.agent_def``): ``mode`` (deny|ask|monitor|off, default
     ask), ``allow`` (regexes on the path/command that skip the gate — a
@@ -672,10 +702,12 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     `rule_git_hooks_protect` share too, not new or worse here; a project-
     instructions filename outside the recognized set; an MCP filesystem tool
     naming its target argument outside ``_path()``'s recognized key list;
-    nesting past 4 levels under `.claude/agents|commands|output-styles`
-    evading the filename form of `AGENT_DEF_PATH_RE` (the bare-directory
-    backstop above still catches an archive/sync tool's own target argument
-    regardless of nesting); and a shell command that computes the target path
+    nesting past 4 levels under `.claude/agents|commands|output-styles` (3 for
+    `.claude/skills`, since a real skill is never nested deeper than its own
+    named directory) evading the filename form of `AGENT_DEF_PATH_RE` (the
+    bare-directory backstop above still catches an archive/sync tool's own
+    target argument regardless of nesting); and a shell command that computes
+    the target path
     indirectly across separate variable assignments (the ``find``-indirection
     case is covered; a `for`/`xargs` loop or `basename`/`dirname`
     reconstruction is not, the same disclosed gap
@@ -699,8 +731,8 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
         reason = (f"Project instructions file '{p}' is being written — its content is "
                    "folded directly into every future session's context, unattended"
                    if instr_hit else
-                   f"Agent/command/output-style definition '{p}' is being written — it "
-                   "can be auto-selected or invoked in a future session, carrying its "
+                   f"Agent/command/output-style/skill definition '{p}' is being written — "
+                   "it can be auto-selected or invoked in a future session, carrying its "
                    "own tool allowlist")
         would = Decision(action, "agent-def-protect",
                          f"{reason}. Review the change, then confirm with "
@@ -735,7 +767,7 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
                 or _agent_def_allowed_by_policy(cfg, _cmd(ev))):
             return None
         would = Decision(action, "agent-def-protect",
-                         "Project instructions or an agent/command/output-style "
+                         "Project instructions or an agent/command/output-style/skill "
                          "definition is being modified from a shell — its content is "
                          "auto-loaded or auto-invoked in a future session with no "
                          "further review. A human may append '# aegis-allow', or set "
