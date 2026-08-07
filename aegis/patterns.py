@@ -1137,8 +1137,36 @@ AGENT_INSTRUCTIONS_PATH_RE = re.compile(
 # ARCHIVE_SYNC_VERB_RE, since a deeply-nested write is still a write INTO
 # the top-level directory as far as an archive/sync tool's own target
 # argument is concerned.
-_AGENT_DEF_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
-_AGENT_DEF_ROOT = r"(?:^|[\s'\"/\\=])\.claude" + _WIN_TRIM + _SEP
+# `(?!\.)` blocks a segment that starts with a bare `.`/`..` — QA finding
+# (independent adversarial review, design/consistency round): `_SEP`'s own
+# `(?:\.[/\\]+)*` component is a backtrackable star-quantifier, so for input
+# like `skills/./aegis-status/`, the engine can under-consume `_SEP` (0
+# iterations of that group instead of 1), landing `_AGENT_DEF_SKILL_ROOT`'s
+# `(?!aegis-[\w-])` lookahead at the leading `.` instead of at `aegis-` —
+# the lookahead sees "." and passes, and without this fix `_AGENT_DEF_SEG`'s
+# permissive char class would then happily swallow that bogus `.` as an
+# ordinary path "segment", letting the match continue straight into
+# `aegis-status/SKILL.md` — a real, unmodified path
+# (`.claude/skills/./aegis-status/SKILL.md`) any shell/tool can address,
+# fully evading the aegis-exclusion invariant `_AGENT_DEF_SKILL_ROOT`'s own
+# comment documents. No legitimate agent/command/output-style/skill
+# namespace segment is ever a bare `.`/`..` — `_SEP` itself already treats
+# dot-components as separator noise everywhere else in this file (see
+# `AEGIS_SOURCE_RE`'s own comment) — so this only closes the backtracking
+# gap, it does not narrow any real match.
+_AGENT_DEF_SEG = r"(?!\.{1,2}(?:[/\\]|$))[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+# Leading-context class widened with `-o` (same as `_GIT_HOOKS_LEAD` below) —
+# QA finding (independent adversarial review, bypass-hunt round): 7-Zip's
+# canonical output-directory flag attaches its argument with NO separator at
+# all (`7z x payload.7z -o.claude/skills/evil`), so the plain
+# start/whitespace/quote/separator/`=` class this pattern originally used
+# never recognized the path began right there even though
+# `ARCHIVE_SYNC_VERB_RE` correctly recognized `7z`/`7za` as an archive verb —
+# the identical gap `_GIT_HOOKS_LEAD`'s own comment already documents fixing
+# for git-hooks, never carried over here. Fixes the glued-flag bypass for
+# agents/commands/output-styles too, not just the new skills coverage below —
+# they share this one root.
+_AGENT_DEF_ROOT = r"(?:^|[\s'\"/\\=]|-o)\.claude" + _WIN_TRIM + _SEP
 # `.claude/skills/<name>/SKILL.md` — a project/user Claude Code skill. Unlike
 # agents/commands/output-styles above (any `.md` dropped in the dir is
 # dangerous, filename is arbitrary), a skill's auto-loaded, auto-triggered
@@ -1148,13 +1176,22 @@ _AGENT_DEF_ROOT = r"(?:^|[\s'\"/\\=])\.claude" + _WIN_TRIM + _SEP
 # per-invocation human choice at all (not even a typed `/name`, unlike a
 # slash command, and not an explicit selection, unlike an output-style) — so
 # the filename is pinned narrowly here rather than widened to `_CI_SEG`.
-# `(?!aegis-)` excludes Aegis's own shipped skills — already covered, more
-# strictly (non-escapable deny, not ask), by self-protect's own
-# `AEGIS_SKILL_PATH_RE`; this pattern must stay disjoint from that guard's
-# territory the same way `AGENT_DEF_PATH_RE` already stays disjoint from
-# `ENFORCEMENT_PATH_RE`/`AEGIS_SOURCE_RE` for `.claude/settings.json`/
-# Aegis's own source.
-_AGENT_DEF_SKILL_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP + r"(?!aegis-)"
+# `(?!aegis-[\w-])` excludes Aegis's own shipped skills — already covered,
+# more strictly (non-escapable deny, not ask), by self-protect's own
+# `AEGIS_SKILL_PATH_RE = r"...aegis-[\w-]+"`; this pattern must stay disjoint
+# from that guard's territory the same way `AGENT_DEF_PATH_RE` already stays
+# disjoint from `ENFORCEMENT_PATH_RE`/`AEGIS_SOURCE_RE` for
+# `.claude/settings.json`/Aegis's own source. The lookahead requires one
+# MORE `[\w-]` character after "aegis-", mirroring `AEGIS_SKILL_PATH_RE`'s
+# own `+` (one-or-more) exactly, not a bare `(?!aegis-)` — QA finding
+# (independent adversarial review, bypass-hunt round): a bare `(?!aegis-)`
+# excludes a directory literally named `aegis-` (dash, nothing after it) from
+# THIS pattern, but `AEGIS_SKILL_PATH_RE`'s `[\w-]+` never matches it either
+# (nothing after the dash to satisfy "one or more") — a one-directory-name
+# gap between the two guards' definitions of "starts with aegis-" that let
+# `.claude/skills/aegis-/SKILL.md` sail through both, undetected, via
+# Edit/Write/MCP. Requiring the same trailing character here closes it.
+_AGENT_DEF_SKILL_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP + r"(?!aegis-[\w-])"
 AGENT_DEF_PATH_RE = re.compile(
     _AGENT_DEF_ROOT + r"agents" + _WIN_TRIM + _SEP
     + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END

@@ -703,11 +703,17 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     instructions filename outside the recognized set; an MCP filesystem tool
     naming its target argument outside ``_path()``'s recognized key list;
     nesting past 4 levels under `.claude/agents|commands|output-styles` (3 for
-    `.claude/skills`, since a real skill is never nested deeper than its own
-    named directory) evading the filename form of `AGENT_DEF_PATH_RE` (the
-    bare-directory backstop above still catches an archive/sync tool's own
-    target argument regardless of nesting); and a shell command that computes
-    the target path
+    `.claude/skills` — QA correction, independent adversarial review, design/
+    consistency round: a real skill in this repo's own convention
+    (``aegis/skills.py``'s ``<claude_dir>/skills/<name>/SKILL.md``) is never
+    nested past its own single named directory, so the bound could be
+    tighter than 3, but it deliberately stays as generous as its
+    agents/commands/output-styles siblings' own bound rather than assume no
+    future/plugin-qualified skill layout ever nests one level deeper — the
+    slack costs nothing, the safe direction for an ``ask`` guard) evading the
+    filename form of `AGENT_DEF_PATH_RE` (the bare-directory backstop above
+    still catches an archive/sync tool's own target argument regardless of
+    nesting); and a shell command that computes the target path
     indirectly across separate variable assignments (the ``find``-indirection
     case is covered; a `for`/`xargs` loop or `basename`/`dirname`
     reconstruction is not, the same disclosed gap

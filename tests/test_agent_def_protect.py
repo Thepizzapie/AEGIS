@@ -248,8 +248,8 @@ def test_skill_non_skill_md_resource_file_not_gated():
 
 def test_aegis_shipped_skill_not_claimed_by_new_skill_pattern():
     """`.claude/skills/aegis-*` stays self-protect's exclusive, stricter
-    (non-escapable deny) territory — the new skill branch's `(?!aegis-)`
-    exclusion must keep it disjoint, the same way the pre-existing
+    (non-escapable deny) territory — the new skill branch's exclusion must
+    keep it disjoint, the same way the pre-existing
     `test_shipped_skill_not_claimed_by_this_guard` already verifies for the
     full engine path; this asserts the PATTERN itself excludes it directly."""
     from aegis import patterns
@@ -257,6 +257,98 @@ def test_aegis_shipped_skill_not_claimed_by_new_skill_pattern():
     assert not patterns.AGENT_DEF_PATH_RE.search(".claude/skills/aegis-explain-block/SKILL.md")
     # a NON-aegis skill still matches
     assert patterns.AGENT_DEF_PATH_RE.search(".claude/skills/my-skill/SKILL.md")
+
+
+def test_skill_doubled_slash_and_dot_component_does_not_bypass():
+    """Same path-separator bypass family `test_doubled_slash_does_not_bypass`/
+    `test_dot_component_does_not_bypass` already cover for agents — must hold
+    for skills too."""
+    assert _gated(evaluate(_write(".claude//skills/evil/SKILL.md"), EMPTY))
+    assert _gated(evaluate(_write(".claude/./skills/evil/SKILL.md"), EMPTY))
+
+
+def test_skill_windows_trailing_dot_does_not_bypass():
+    assert _gated(evaluate(_write(".claude./skills/evil/SKILL.md"), EMPTY))
+    assert _gated(evaluate(_write(".claude/skills./evil/SKILL.md"), EMPTY))
+
+
+def test_mcp_tool_alternate_path_arg_keys_gated_for_skill():
+    for key in ("target_file", "targetFile", "filename", "file", "uri"):
+        d = evaluate(_mcp_write_arg(key, ".claude/skills/evil/SKILL.md"), EMPTY)
+        assert _gated(d) and d.rule == "agent-def-protect", key
+
+
+# ---- QA regression tests (independent adversarial review, bypass-hunt round --
+# and design/consistency round — 3 real, reproduced bypasses found and closed
+# before merge) --------------------------------------------------------------
+
+def test_exact_aegis_dash_directory_name_gated():
+    """QA finding (bypass-hunt round): a skill directory named EXACTLY
+    `aegis-` (dash, nothing after it) satisfied neither this guard's
+    exclusion (any text starting with the literal "aegis-" was excluded,
+    regardless of what followed) nor self-protect's own
+    `AEGIS_SKILL_PATH_RE` (which requires `[\\w-]+` — one or more characters
+    — after the dash), leaving a one-directory-name gap where the path was
+    claimed by NEITHER guard: a full, silent ALLOW. The exclusion now
+    requires the same trailing character `AEGIS_SKILL_PATH_RE` does, closing
+    the gap symmetrically."""
+    d = evaluate(_write(".claude/skills/aegis-/SKILL.md"), EMPTY)
+    assert _gated(d) and d.rule == "agent-def-protect"
+    d2 = evaluate(_mcp_write(".claude/skills/aegis-/SKILL.md"), EMPTY)
+    assert _gated(d2) and d2.rule == "agent-def-protect"
+    # a real aegis-owned name is still self-protect's stricter territory
+    from aegis import patterns
+    assert not patterns.AGENT_DEF_PATH_RE.search(".claude/skills/aegis-status/SKILL.md")
+
+
+def test_glued_dash_o_flag_archive_bypass_gated():
+    """QA finding (bypass-hunt round): 7-Zip's canonical output-directory
+    flag attaches its argument with NO separator (`-o<path>`), which the
+    path-anchor's original start/whitespace/quote/separator/`=` boundary
+    class never recognized as the start of a path — even though
+    `ARCHIVE_SYNC_VERB_RE` correctly recognized `7z`/`7za` as an archive
+    verb, the anchor was the piece that missed it. The identical gap was
+    already found and fixed for git-hooks (`_GIT_HOOKS_LEAD`); `_AGENT_DEF_ROOT`
+    now shares the same `-o` boundary alternative, closing it for
+    agents/commands/output-styles/skills alike, not just skills."""
+    assert _gated(_agent_def_only("7z x payload.7z -o.claude/skills/evil"))
+    assert _gated(_agent_def_only("7za x payload.7z -o.claude/agents/evil.md"))
+
+
+def test_dot_component_lookahead_backtrack_bypass_gated():
+    """QA finding (design/consistency round): `_SEP`'s own `(?:\\.[/\\\\]+)*`
+    component is a backtrackable star-quantifier — for
+    `.claude/skills/./aegis-status/SKILL.md`, the engine could under-consume
+    `_SEP` (0 iterations instead of 1), landing the `aegis-` exclusion's
+    lookahead at the leading `.` instead of at `aegis-` (where it passes,
+    since `.` isn't `aegis-`), after which the permissive segment class
+    would swallow the bogus `.` as an ordinary path "segment" and match
+    straight into `aegis-status/SKILL.md` — a real, unmodified path any
+    shell/tool can address, fully evading the guard's own disjointness
+    invariant with self-protect. `_AGENT_DEF_SEG` now refuses to match a
+    bare `.`/`..` segment, closing the backtracking path."""
+    from aegis import patterns
+    assert not patterns.AGENT_DEF_PATH_RE.search(
+        ".claude/skills/./aegis-status/SKILL.md")
+    assert not patterns.AGENT_DEF_PATH_RE.search(
+        ".claude/skills/././aegis-status/SKILL.md")
+    assert not patterns.AGENT_DEF_PATH_RE.search(
+        ".claude/skills/../aegis-status/SKILL.md")
+    # a genuinely non-aegis skill nested past a bogus dot component still matches
+    assert patterns.AGENT_DEF_PATH_RE.search(
+        ".claude/skills/./my-skill/SKILL.md")
+
+
+def test_archive_sync_into_aegis_named_skill_dir_gated_by_this_guard_only():
+    """Defense-in-depth claim from the docstring/README: self-protect's shell
+    branch has NO `ARCHIVE_SYNC_VERB_RE` check at all, so an archive/sync
+    plant into an aegis-NAMED skill directory evades self-protect entirely
+    (aegis-owned or not makes no difference to that gap) — this guard's
+    `AGENT_DEF_DIR_RE` (which deliberately does NOT exclude `aegis-`, since
+    an archive/sync destination is usually just the bare parent directory
+    with no name argument at all) is the only guard that catches it."""
+    assert _gated(_agent_def_only("rsync -a evil/ .claude/skills/aegis-status/"))
+    assert _gated(_agent_def_only("tar xf payload.tar -C .claude/skills/aegis-status/"))
 
 
 def test_shell_redirect_to_skill_gated():
