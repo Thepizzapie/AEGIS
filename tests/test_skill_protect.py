@@ -14,6 +14,19 @@ Default mode is ``ask`` (not ``deny``) — authoring a project's own skill is
 routine, sanctioned dev work, the same reasoning ``agent_def``/``ci_workflow``/
 ``git_hooks`` apply. A dedicated ``mode: deny`` policy is used below to test
 the stricter posture explicitly.
+
+NOT new coverage for most of the SHELL form (design/consistency QA, round 1):
+a shell-based delete/redirect/copy/in-place-edit anywhere under ``.claude/`` —
+which includes every ``.claude/skills/*`` path, not just Aegis's own — was
+ALREADY denied, non-escapably, by self-protect's broad ``CONFIG_DIR_RE``
+match, which runs BEFORE this guard in ``_CORE_RULES`` and wins first. Tests
+below that exercise the SHELL form of ``.claude/skills/...`` therefore call
+``rule_skill_protect`` DIRECTLY (bypassing self-protect and the rest of the
+engine) so they verify this guard's own logic in isolation, not merely that
+self-protect got there first — see ``_skill_def_only`` below. Real, non-
+overlapping new coverage from the shell form specifically: an archive/sync
+tool (``rsync``/``tar``/``unzip``/``install -m``) placing a skill file with no
+verb self-protect's own (narrower) shell check recognizes.
 """
 import time
 
@@ -281,6 +294,29 @@ def test_shipped_aegis_skill_not_claimed_by_this_guard():
     d = evaluate(_write(".claude/skills/aegis-status/SKILL.md"), EMPTY)
     assert d.rule != "skill-protect"
     assert d.rule == "self-protect" and d.blocked
+
+
+def test_bare_and_punctuated_aegis_prefix_gated_not_dropped_between_guards():
+    """QA finding (independent adversarial review, round 1): AEGIS_SKILL_PATH_RE
+    (self-protect) requires at least one further [\\w-] char after "aegis-"
+    (`aegis-[\\w-]+`) — a bare `aegis-` directory name, or `aegis-` immediately
+    followed by a non-word/non-hyphen char, satisfied an earlier, looser
+    `(?!aegis-)` exclusion here while failing self-protect's own match: neither
+    guard fired, a silent ALLOW even under mode=deny. The exclusion is now
+    `(?!aegis-[\\w-])`, partitioning the exact same name-space as
+    AEGIS_SKILL_PATH_RE instead of leaving this sliver to neither guard."""
+    DENY = Policy(skill_def={"mode": "deny"})
+    for path in (".claude/skills/aegis-/SKILL.md", ".claude/skills/aegis-!x/SKILL.md"):
+        d = evaluate(_write(path), DENY)
+        assert d.blocked and d.rule == "skill-protect", path
+        from aegis import patterns
+        assert not patterns.AEGIS_SKILL_PATH_RE.search(path), (
+            "self-protect must genuinely NOT claim this path — otherwise this "
+            "test would pass for the wrong reason (self-protect winning first) "
+            "rather than proving skill-protect's own exclusion boundary is correct")
+
+    d_mcp = evaluate(_mcp_write(".claude/skills/aegis-/SKILL.md"), DENY)
+    assert d_mcp.blocked and d_mcp.rule == "skill-protect"
 
 
 def test_aegis_prefix_case_variant_not_claimed_by_this_guard():

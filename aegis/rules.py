@@ -785,10 +785,47 @@ def rule_skill_protect(ev: Event, policy=None) -> Optional[Decision]:
     a project's own skill is routine, sanctioned dev work, not inherently
     malicious.
 
+    NOT new coverage for most of the shell form (QA note, design/consistency
+    review, round 1 — the same correction ``rule_agent_def_protect``'s own
+    docstring already makes for its own shell branch): a shell-based delete/
+    redirect/copy/in-place-edit anywhere under ``.claude/`` — which includes
+    every ``.claude/skills/*`` path, not just Aegis's own — is ALREADY denied,
+    non-escapably, by ``rule_self_protect``'s broad ``CONFIG_DIR_RE`` match,
+    which runs BEFORE this guard in ``_CORE_RULES`` and wins first. This
+    guard's shell branch is a redundant, weaker (``ask``, escapable) second
+    layer there for those verb shapes specifically — NOT dead weight, though:
+    ``CONFIG_DIR_RE``'s own shell check has no archive/sync-tool verb
+    recognition, so ``rsync``/``tar``/``unzip``/``install -m`` placing a skill
+    file bypasses self-protect entirely and correctly falls through to reach
+    THIS guard's own ``ARCHIVE_SYNC_VERB_RE`` check. What is unambiguously new
+    from this guard, with no self-protect overlap at all: (1) the plain
+    ``Edit``/``Write``/MCP-tool form (no shell) for any non-``aegis-*`` skill
+    name — self-protect's own EDIT/WRITE branch checks only
+    ``ENFORCEMENT_PATH_RE``/``AEGIS_SOURCE_RE``/``AEGIS_SKILL_PATH_RE``, never
+    the broader ``CONFIG_DIR_RE``; (2) the archive/sync-tool shell forms noted
+    above.
+
     Escapable only by a human: a trailing '# aegis-allow' on the shell form,
     or the env toggle ``AEGIS_ALLOW_SKILL_DEF=1`` for the Edit/Write/MCP-tool
     form. A spawned agent cannot set its own env for a hook invocation it
     doesn't control, so neither path is agent-self-escapable.
+
+    QA history: two independent adversarial-review rounds (bypass-hunting and
+    design/consistency, run in parallel, the same convention every guard in
+    this file follows) found and closed one real, reproduced bypass before
+    merge — ``SKILL_DEF_PATH_RE``'s exclusion lookahead originally read
+    ``(?!aegis-)``, a looser check than ``AEGIS_SKILL_PATH_RE``'s own
+    ``aegis-[\\w-]+`` match (which requires at least one further ``[\\w-]``
+    character after the hyphen); a bare ``aegis-`` directory name, or
+    ``aegis-`` immediately followed by a non-word/non-hyphen character,
+    satisfied this guard's old exclusion while failing self-protect's actual
+    match — neither guard fired, a silent ALLOW even under ``mode: deny``, for
+    the Edit/Write/MCP-tool forms that have no shell-only ``CONFIG_DIR_RE``
+    backstop to catch it a second way. Closed by tightening the lookahead to
+    ``(?!aegis-[\\w-])`` so the two patterns partition the exact same name-
+    space. See ``patterns.SKILL_DEF_PATH_RE``'s own comment and
+    ``tests/test_skill_protect.py::test_bare_and_punctuated_aegis_prefix_gated_not_dropped_between_guards``
+    for the reproduction.
 
     Honest scope, same denylist trade-offs every guard in this file discloses:
     a bundled script/resource written with no corresponding SKILL.md write in

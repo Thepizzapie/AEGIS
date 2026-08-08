@@ -1245,8 +1245,22 @@ def agent_def_find_hit(cmd: str) -> bool:
 # not itself gated by this pattern — same disclosed-gap shape as every other
 # guard's "computed/staged indirectly" limitation.
 _SKILL_DEF_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP
+# The exclusion lookahead below is `(?!aegis-[\w-])`, NOT the simpler-looking
+# `(?!aegis-)` an earlier draft used — QA finding (independent adversarial
+# review, round 1): `AEGIS_SKILL_PATH_RE` (self-protect's non-escapable
+# surface, which this guard's own docstring assumes owns everything the
+# exclusion carves out) requires at least one further `[\w-]` character after
+# the hyphen (`aegis-[\w-]+`), so a bare `aegis-` directory name (hyphen, then
+# nothing) or `aegis-` followed immediately by a non-word/non-hyphen character
+# (`aegis-!x`) satisfied the bare `(?!aegis-)` lookahead's exclusion while
+# failing `AEGIS_SKILL_PATH_RE`'s own match — a real, reproduced silent-ALLOW
+# gap between the two guards (neither fired, even under `mode: deny`) for the
+# Edit/Write/MCP-tool forms, which have no shell-only `CONFIG_DIR_RE` backstop
+# to catch it a second way. `(?!aegis-[\w-])` makes the two patterns partition
+# the exact same name-space instead of leaving that hyphen-boundary sliver
+# uncovered by either.
 SKILL_DEF_PATH_RE = re.compile(
-    _SKILL_DEF_ROOT + r"(?!aegis-)" + _AGENT_DEF_SEG
+    _SKILL_DEF_ROOT + r"(?!aegis-[\w-])" + _AGENT_DEF_SEG
     + r"(?:" + _AGENT_DEF_SEG + r"){0,3}" + r"SKILL" + _WIN_TRIM + r"\.md" + _CI_END,
     re.IGNORECASE,
 )
