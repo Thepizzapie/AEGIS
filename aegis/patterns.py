@@ -1208,6 +1208,71 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Skill-definition file protection --------------------------------------------
+# `.claude/skills/<name>/SKILL.md` — a FOURTH auto-loaded, no-per-use-trust-check
+# surface in the same family AGENT_DEF_PATH_RE/AGENT_INSTRUCTIONS_PATH_RE already
+# cover (CLAUDE.md/AGENTS.md, .claude/agents/*.md, .claude/commands/*.md,
+# .claude/output-styles/*.md) — but reached by NEITHER that guard nor self-protect
+# for any skill name other than Aegis's own shipped ones (AEGIS_SKILL_PATH_RE
+# claims only `.claude/skills/aegis-*`, by design — see its own comment). Every
+# OTHER skill directory — a repo's own custom skills, or any third-party/
+# marketplace skill installed alongside them, the overwhelming majority on a real
+# machine — has NO guard at all today.
+#
+# A SKILL.md's `description` frontmatter is folded into the model's own listing of
+# "available skills" on every session start, the same unattended-refresh surface
+# AGENT_DEF_PATH_RE's own docstring already documents the risk shape for: a
+# `.claude/agents/*.md` sub-agent whose description reads like "use PROACTIVELY" is
+# auto-selected by the orchestrator with no explicit per-invocation human choice.
+# A skill's description does the identical job for the Skill tool — the MODEL
+# itself, not a human, decides whether a turn's task matches a planted or altered
+# description closely enough to invoke it, then loads and follows that skill's full
+# body the moment it does — the same "trusted name, unread body" trap
+# CI_WORKFLOW_PATH_RE/GIT_HOOKS_PATH_RE/AGENT_DEF_PATH_RE already exist for, except
+# the auto-selection step here has no human review checkpoint at all, unlike a
+# slash command a human has to explicitly type. A skill directory can also bundle
+# its OWN scripts/resources (`scripts/*.py`, `references/*.md`) alongside SKILL.md,
+# which the body then instructs the agent to read or run — a supply-chain shape
+# none of CLAUDE.md/AGENTS.md/agents/commands/output-styles has, since each of
+# those is a single self-contained file. This guard's own scope, matching every
+# sibling guard's narrow-and-disclosed convention rather than trying to solve that
+# whole shape at once: it gates the SKILL.md definition file itself (the auto-
+# loaded description + the auto-followed body), the same "gate the definition, not
+# every byte a definition might reference" trade-off AGENT_DEF_PATH_RE already
+# makes for a sub-agent definition's own referenced tools. A bundled script/
+# resource file written or altered with NO corresponding SKILL.md write in the same
+# call (e.g. only `scripts/run.py` touched, the skill already planted earlier) is
+# not itself gated by this pattern — same disclosed-gap shape as every other
+# guard's "computed/staged indirectly" limitation.
+_SKILL_DEF_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP
+SKILL_DEF_PATH_RE = re.compile(
+    _SKILL_DEF_ROOT + r"(?!aegis-)" + _AGENT_DEF_SEG
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,3}" + r"SKILL" + _WIN_TRIM + r"\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — same archive/sync-tool bypass
+# AGENT_DEF_DIR_RE/GIT_HOOKS_DIR_RE close for their own surfaces: `rsync -a
+# evil_skill/ .claude/skills/` places a whole new skill directory with no
+# filename ever named as one contiguous string, and no `aegis-` name to exclude
+# yet either — the same "err toward asking" trade-off AGENT_DEF_DIR_RE already
+# accepts for its own bare-directory match.
+SKILL_DEF_DIR_RE = re.compile(_AGENT_DEF_ROOT + r"skills" + _CI_END, re.IGNORECASE)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# AGENT_DEF_FIND_PREDICATE_RE exists for its own surface — including the bare
+# `\.claude\b` fallback alternative that guard's own round-2 QA added, since a
+# `-regex` VALUE can insert its own wildcard between ".claude" and "skills"
+# (`-regex '.*\.claude.*skills.*SKILL\.md'`) and defeat tight adjacency the same
+# way it did there.
+SKILL_DEF_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:SKILL\.md\b|\.claude[/\\]skills\b|\.claude\b)")
+
+
+def skill_def_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, SKILL_DEF_FIND_PREDICATE_RE)
+
+
 # ---- Shell-startup / SSH persistence protection --------------------------------
 # Two more "runs later, unattended, with the human's full privileges" triggers
 # that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,

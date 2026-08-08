@@ -38,6 +38,7 @@ _REMEDIES = """\
 | ci-workflow-protect | wrote a CI/CD pipeline definition (runs later, on the CI runner) | ask the human; they can set AEGIS_ALLOW_CI_WORKFLOW=1 after review |
 | git-hooks-protect | wrote a git hook / redirected core.hooksPath (runs later, untracked by git) | ask the human; they can set AEGIS_ALLOW_GIT_HOOKS=1 after review |
 | agent-def-protect | wrote CLAUDE.md/AGENTS.md or a .claude/agents or .claude/commands definition (auto-loaded/auto-invoked next session) | ask the human; they can set AEGIS_ALLOW_AGENT_DEF=1 after review |
+| skill-protect | wrote a .claude/skills/<name>/SKILL.md definition (description auto-loaded into every future session's skill listing; can be auto-selected by the model itself) | ask the human; they can set AEGIS_ALLOW_SKILL_DEF=1 after review |
 | shell-persist-protect | wrote a shell startup/profile file or an SSH persistence target (runs on the next shell open / ssh connection) | ask the human; they can set AEGIS_ALLOW_SHELL_PERSIST=1 after review |
 | direnv-protect | wrote a project .envrc or the global direnvrc, or ran direnv allow/permit/edit (runs on the next `cd` into the project) | ask the human; they can set AEGIS_ALLOW_DIRENV=1 after review |
 | service-persist-protect | wrote a systemd unit/timer or launchd plist, or ran systemctl enable / launchctl load (runs on the next boot / login) | ask the human; they can set AEGIS_ALLOW_SERVICE_PERSIST=1 after review |
@@ -105,7 +106,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `shell_persist`, `direnv`, `package_manifest`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `conftest`, `pysite`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `skill_def`, `shell_persist`, `direnv`, `package_manifest`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `conftest`, `pysite`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -149,7 +150,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
    - declarative rule: `rules: [{{name, action: allow|deny|ask, tools/actions/
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
-     `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `shell_persist`, `direnv`,
+     `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `skill_def`, `shell_persist`, `direnv`,
      `package_manifest`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
      `claude_hooks`, `conftest`, `pysite`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.

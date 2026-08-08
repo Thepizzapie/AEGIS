@@ -136,6 +136,14 @@ class Policy:
     # (mode=ask) apply. Covers CLAUDE.md/AGENTS.md and .claude/agents/*.md,
     # .claude/commands/*.md. See rules.rule_agent_def_protect.
     agent_def: dict = field(default_factory=dict)
+    # Skill-definition protection: {mode: deny|ask|monitor|off, allow: [regex
+    # on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # .claude/skills/<name>/SKILL.md (project- or user-scoped, any name other
+    # than Aegis's own aegis-* shipped skills, which self-protect already
+    # covers non-escapably) — a skill's description is auto-loaded into every
+    # future session's skill listing and can be auto-selected by the model
+    # itself with no explicit human invocation. See rules.rule_skill_protect.
+    skill_def: dict = field(default_factory=dict)
     # Shell-startup / SSH persistence protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers ~/.bashrc/~/.zshrc/~/.profile/fish's config.fish/
