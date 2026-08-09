@@ -58,6 +58,7 @@ def load_policy(path) -> Policy:
         "package_manifest": {}, "git_config_exec": {}, "git_attributes_exec": {},
         "service_persist": {}, "ld_preload": {}, "devcontainer_exec": {}, "vscode_tasks_exec": {},
         "path_hijack": {}, "claude_hooks": {}, "conftest": {}, "pysite": {},
+        "ipython_startup": {},
         "inject": {}, "failures": {},
         "completion": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
@@ -100,6 +101,7 @@ def load_policy(path) -> Policy:
                   claude_hooks=st["claude_hooks"],
                   conftest=st["conftest"],
                   pysite=st["pysite"],
+                  ipython_startup=st["ipython_startup"],
                   inject=st["inject"], failures=st["failures"],
                   completion=st["completion"],
                   team=lc["team"], compaction=lc["compaction"],
@@ -132,6 +134,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
                 "shell_persist", "direnv", "package_manifest", "git_config_exec",
                 "git_attributes_exec", "service_persist", "ld_preload", "devcontainer_exec",
                 "vscode_tasks_exec", "path_hijack", "claude_hooks", "conftest", "pysite",
+                "ipython_startup",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
             st[key] = dict(data[key])
