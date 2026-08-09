@@ -189,6 +189,36 @@ def test_lookalike_dir_not_gated():
     assert not _gated(d)
 
 
+def test_word_suffixed_lookalike_dir_not_gated():
+    """QA regression (bypass-hunting round): an earlier, unanchored version
+    of IPYTHON_STARTUP_PATH_RE matched any path segment merely ENDING in
+    `.ipython` (course.ipython/...), not just the real `.ipython` directory
+    -- closed by adding the same `(?:^|[\\s'\"/\\\\=])` left-anchor every
+    sibling path pattern in this file already requires."""
+    d = evaluate(_write("exports/course.ipython/profile_default/startup/00-notes.py",
+                         PY_PAYLOAD), EMPTY)
+    assert not _gated(d)
+
+
+def test_system_config_dir_etc_gated():
+    """IPython globs its system-wide config dirs (<sys.prefix>/etc/ipython/
+    startup/, ...) alongside the profile directory, no `profile_*` segment
+    at all -- an earlier version of this guard covered only the per-user
+    profile form."""
+    d = evaluate(_write("/etc/ipython/startup/00-evil.py", PY_PAYLOAD), EMPTY)
+    assert _gated(d) and d.rule == "ipython-startup-protect"
+
+
+def test_system_config_dir_usr_local_etc_gated():
+    d = evaluate(_write("/usr/local/etc/ipython/startup/00-evil.py", PY_PAYLOAD), EMPTY)
+    assert _gated(d) and d.rule == "ipython-startup-protect"
+
+
+def test_system_config_dir_usr_etc_gated():
+    d = evaluate(_write("/usr/etc/ipython/startup/00-evil.py", PY_PAYLOAD), EMPTY)
+    assert _gated(d) and d.rule == "ipython-startup-protect"
+
+
 def test_empty_startup_file_not_gated():
     assert not _gated(evaluate(_write(STARTUP_PY, "# nothing here yet\n"), EMPTY))
 
@@ -238,6 +268,22 @@ def test_shell_base64_decoded_single_line_plant_gated():
     payload = "os.system('id > /tmp/pwned_marker')\n"
     b64 = base64.b64encode(payload.encode()).decode()
     d = evaluate(_shell(f"echo {b64} | base64 -d > {STARTUP_PY}"), EMPTY)
+    assert _gated(d) and d.rule == "ipython-startup-protect"
+
+
+def test_shell_base64_decoded_single_line_bang_plant_gated():
+    """QA regression (bypass-hunting round): a base64-decoded single-line
+    .ipy plant whose DECODED payload contains a real embedded newline lands
+    its `!` line at a genuine post-newline line-start position in the
+    de-obfuscated scan surface, but the decoded segment is joined onto the
+    preceding text with a plain SPACE (not a quote) -- so the quote-
+    adjacent IPYTHON_BANG_ANY_RE alone never matched it, a confirmed,
+    reproduced, complete bypass. Fixed by always trying the position-aware
+    IPYTHON_BANG_LINE_RE first, regardless of branch."""
+    import base64
+    payload = "!id > /tmp/pwned_marker\n"
+    b64 = base64.b64encode(payload.encode()).decode()
+    d = evaluate(_shell(f"echo {b64} | base64 -d > {STARTUP_IPY}"), EMPTY)
     assert _gated(d) and d.rule == "ipython-startup-protect"
 
 

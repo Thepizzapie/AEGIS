@@ -3417,8 +3417,29 @@ def pysite_pth_dangerous_hit(content: str, *, shell: bool = False, raw: str = No
 # for any name a user chooses) -- not hardcoded to `profile_default`, the
 # same "don't over-narrow to the common case" reasoning `PYSITE_DIR_RE`'s own
 # curated-but-not-single-value site-directory list already applies.
+#
+# Two distinct root locations both feed `InteractiveShellApp._run_startup_
+# files()`, and both are gated here: the per-user profile's own `startup/`
+# (`_IPYTHON_USER_STARTUP`, the common case), and IPython's system-wide
+# config directories -- `<sys.prefix>/etc/ipython/startup/`, and on some
+# installs `<sys.prefix>/usr/etc/ipython/startup/` -- which IPython globs
+# unconditionally alongside the profile directory, no `profile_*` segment
+# involved at all (`_IPYTHON_SYSTEM_STARTUP`). QA (bypass-hunting round)
+# found the system-config-dir form was a real, silent scope gap in an
+# earlier version of this pattern that covered only the profile form.
+_IPYTHON_USER_STARTUP = r"\.ipython" + _SEP + r"profile_[\w.\-]+" + _SEP + r"startup"
+_IPYTHON_SYSTEM_STARTUP = (
+    r"(?:usr" + _SEP + r"(?:local" + _SEP + r")?)?etc" + _SEP + r"ipython" + _SEP + r"startup"
+)
+# Left-anchored with the same `(?:^|[\s'\"/\\=])` boundary `CONFTEST_PATH_RE`/
+# `PYSITE_CUSTOMIZE_PATH_RE` already use before their own literal target --
+# QA (bypass-hunting round) found an earlier, unanchored version of this
+# pattern matched any path segment merely ENDING in `.ipython`
+# (`course.ipython/profile_default/startup/x.py`), not just the real
+# `.ipython` directory; closed by requiring the same boundary every sibling
+# path pattern in this file already requires.
 IPYTHON_STARTUP_PATH_RE = re.compile(
-    r"\.ipython" + _SEP + r"profile_[\w.\-]+" + _SEP + r"startup"
+    r"(?:^|[\s'\"/\\=])(?:" + _IPYTHON_USER_STARTUP + r"|" + _IPYTHON_SYSTEM_STARTUP + r")"
     + _SEP + r"[\w.\-]+\.(?:py|ipy)" + _CI_END,
     re.IGNORECASE,
 )
@@ -3453,6 +3474,17 @@ IPYTHON_DANGEROUS_CALL_RE = re.compile(_IPYTHON_EXEC_CALL + r"\s*\(", re.IGNOREC
 # `.ipy`-only: a bare `!<command>` shell-escape line, real IPython-magic
 # syntax with no Python call/import needed at all. `[ \t]*` (not `\s*`)
 # keeps this to real leading whitespace on the line, not a blank-line match.
+#
+# Disclosed false-ASK trade-off (QA, bypass-hunting round): this is a pure
+# physical-line-start regex, not a real tokenizer -- an ordinary multi-line
+# triple-quoted docstring/banner whose TEXT happens to contain a physical
+# line starting with `!` (e.g. a "!! IMPORTANT !!" warning line) gates, even
+# though real IPython's tokenize-based input transformer correctly leaves
+# string-literal content untouched. No clean fix without a real parse of
+# the file (the same "gate the SHAPE via a bounded/line-based check, not a
+# full parse" trade-off `CONFTEST_AUTOEXEC_HOOK_RE`'s own bounded-lookahead
+# window already accepts) -- accepted here rather than fixed, and disclosed
+# in `rule_ipython_startup_protect`'s own docstring.
 IPYTHON_BANG_LINE_RE = re.compile(r"^[ \t]*![ \t]*\S", re.MULTILINE)
 # Position-agnostic sibling for a single-line shell plant: the bang sits
 # right after the opening quote of the echoed/printf'd argument, not at
@@ -3478,7 +3510,25 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     all; callers pass it based on `IPYTHON_STARTUP_PATH_RE`'s own matched
     path extension. ``shell``/``raw`` select the same single-line-vs-heredoc
     branch `pysite_customize_dangerous_hit`/`conftest_dangerous_hit` already
-    use and document in full."""
+    use and document in full.
+
+    The bang check always tries the position-aware `IPYTHON_BANG_LINE_RE`
+    FIRST, regardless of the single-line/heredoc branch -- not just as the
+    heredoc-branch choice. QA (bypass-hunting round) found a real,
+    reproduced bypass in an earlier version that used ONLY the
+    quote-adjacent `IPYTHON_BANG_ANY_RE` for the single-line case: a
+    base64-decoded single-line shell plant (`echo <b64> | base64 -d > x.ipy`)
+    whose DECODED payload contains a real embedded newline lands its `!`
+    line at a genuine post-newline line-start position in the de-obfuscated
+    scan surface -- `IPYTHON_BANG_LINE_RE` matches that position correctly,
+    but the decoded segment is joined onto the preceding text by a plain
+    SPACE (`normalize.scan_surface`'s own convention), never a quote, so
+    `IPYTHON_BANG_ANY_RE` alone silently never matches it -- a live, complete
+    bypass of a self-contained shell-escape payload. Trying
+    `IPYTHON_BANG_LINE_RE` unconditionally first closes it: it only matches
+    a REAL line-start position, so unlike widening `IPYTHON_BANG_ANY_RE`
+    itself, this can't introduce a new false positive beyond one a genuine
+    embedded newline already creates."""
     newline_probe = raw if raw is not None else content
     single_line = shell and "\n" not in newline_probe
     module_level = IPYTHON_DANGEROUS_CALL_RE if single_line else IPYTHON_MODULE_LEVEL_RE
@@ -3486,5 +3536,6 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
         return True
     if not is_ipy:
         return False
-    bang = IPYTHON_BANG_ANY_RE if single_line else IPYTHON_BANG_LINE_RE
-    return bool(bang.search(content))
+    if IPYTHON_BANG_LINE_RE.search(content):
+        return True
+    return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))

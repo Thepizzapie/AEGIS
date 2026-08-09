@@ -3913,11 +3913,63 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     upper bound on plausible false matches from an unrelated project that
     happens to nest a `profile_x/startup/` directory structure elsewhere
     for its own reasons -- not observed in practice, disclosed as a
-    theoretical trade-off; and the shared `_path()` helper every
-    `*_protect` guard in this file reads MCP tool-call arguments through
-    only checks top-level argument keys, the same pre-existing,
-    shared-infrastructure gap `rule_pysite_protect`'s own docstring already
-    discloses and does not fix per-guard."""
+    theoretical trade-off; the shared `_path()` helper every `*_protect`
+    guard in this file reads MCP tool-call arguments through only checks
+    top-level argument keys, the same pre-existing, shared-infrastructure
+    gap `rule_pysite_protect`'s own docstring already discloses and does
+    not fix per-guard; and the `.ipy`-only bang-line check
+    (`IPYTHON_BANG_LINE_RE`) is a pure physical-line-start regex, not a real
+    tokenizer -- an ordinary multi-line triple-quoted docstring/banner whose
+    TEXT happens to contain a physical line starting with `!` (e.g. a
+    "!! IMPORTANT !!" warning line) gates, even though real IPython's own
+    tokenize-based input transformer correctly leaves string-literal content
+    untouched; no clean fix without a real parse of the file, the same
+    "gate the SHAPE via a bounded/line-based check, not a full parse"
+    trade-off `CONFTEST_AUTOEXEC_HOOK_RE`'s own bounded-lookahead window
+    already accepts.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review verified the wiring correct
+    everywhere its siblings are (`Policy`, all three `loader.py` spots, both
+    `skills.py` knob lists, the guard table, `_CORE_RULES`, README) via a
+    live YAML round-trip through `load_policy()` and the full test suite
+    (1560 passed at that point), and flagged that this docstring's own
+    QA-history section -- which README's own Limits-section clause already
+    promised existed -- had not actually been written yet; a real
+    documentation-integrity defect, the same class `rule_ld_preload_
+    protect`'s own QA history discloses having caught for itself, fixed by
+    writing this section once both rounds had genuinely concluded. Bypass-
+    hunting (which additionally installed real IPython to verify actual
+    `InteractiveShellApp._run_startup_files()` semantics rather than assume
+    them) found and closed two real, reproduced bugs before merge: (1) a
+    complete, reproduced BYPASS -- a base64-decoded single-line `.ipy` plant
+    (`echo <b64> | base64 -d > x.ipy`) whose decoded payload contained a
+    real embedded newline placed its `!<command>` line at a genuine
+    post-newline line-start position in the de-obfuscated scan surface, but
+    the single-line branch used only the quote-adjacent `IPYTHON_BANG_
+    ANY_RE`, which the decoded segment's plain-SPACE join (not a quote)
+    never satisfies -- closed by always trying the position-aware
+    `IPYTHON_BANG_LINE_RE` first, regardless of branch, which cannot
+    introduce a new false positive since it only matches a REAL line-start
+    position; (2) an unanchored `IPYTHON_STARTUP_PATH_RE` matched any path
+    segment merely ENDING in `.ipython` (`course.ipython/profile_default/
+    startup/x.py`), not just the real `.ipython` directory -- closed by
+    adding the same `(?:^|[\\s'\"/\\\\=])` left-anchor every sibling path
+    pattern in this file already requires. Bypass-hunting also found and
+    closed one real, silent scope gap (not a bug in existing logic, a
+    missing one): IPython globs its system-wide config directories
+    (`<sys.prefix>/etc/ipython/startup/`, and on some installs `<sys.prefix>/
+    usr/etc/ipython/startup/`) alongside the profile directory, no
+    `profile_*` segment at all -- confirmed by reading real IPython source
+    (`shellapp.py`) rather than assumed, and closed by extending
+    `IPYTHON_STARTUP_PATH_RE` to also match that form. The multi-line
+    triple-quoted-string false-ASK class above was confirmed via direct
+    reproduction but disclosed rather than fixed, the "no clean fix without
+    a real tokenizer" class every sibling line-based guard in this file
+    already accepts for its own analogous gaps. Recommended PASS after the
+    three fixes; no further round needed. Full suite green throughout (1565
+    passed after the fixes' own regression tests)."""
     cfg = getattr(policy, "ipython_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
