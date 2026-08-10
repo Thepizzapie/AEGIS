@@ -3539,3 +3539,76 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     if IPYTHON_BANG_LINE_RE.search(content):
         return True
     return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))
+
+
+# ---- pre-commit `repo: local` hook injection protection --------------------------
+# `.pre-commit-config.yaml` is the framework config the `pre-commit` tool reads
+# to decide what actually runs on `pre-commit run` / `git commit` (once
+# `pre-commit install` has wired the tiny, generic `.git/hooks/pre-commit`
+# wrapper -- itself already covered by `GIT_HOOKS_*`, but that wrapper just
+# shells out to `pre-commit`, which then reads THIS file to learn what to
+# execute). A `repos:` entry pinned to a public repo+rev is at least a public,
+# diffable, pinned dependency; a `repo: local` entry has none of that -- its
+# `entry:` value IS the payload, a raw command `pre-commit` runs directly
+# (`language: system`/`script`) or via a language runtime it manages
+# (`language: python`/`node`/...), with no upstream repo, no rev to pin, and
+# nothing to fetch or review beyond the YAML sitting right here. Nothing else
+# in this file reaches this surface: `GIT_HOOKS_*` gates the generated
+# `.git/hooks/*` wrapper files themselves (untracked, invisible to `git diff`),
+# not the tracked, reviewable-looking config that actually drives what those
+# wrappers run; `CI_WORKFLOW_PATH_RE`/`DEVCONTAINER_*`/`VSCODE_TASKS_*` all
+# gate OTHER auto-exec surfaces.
+PRECOMMIT_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.pre-commit-config\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# A `repos:` list item selecting the local pseudo-repo. Block-style
+# (`- repo: local`) is the overwhelmingly common form; the leading `-` is
+# made OPTIONAL so a flow-style item (`- {repo: local, hooks: [...]}`, valid
+# YAML) still matches on its own `repo: local` substring even though the
+# dash sits before the `{`, not immediately before `repo:`. Quotes around
+# `local` are optional (`repo: 'local'`/`repo: "local"` are both valid
+# YAML); the lookahead after `local` accepts whitespace, a flow-style `,`/
+# `}`, a comment, or end-of-string, so it doesn't also match an unrelated
+# word merely starting with "local" (`localhost`, `localdev-hooks`).
+PRECOMMIT_LOCAL_REPO_RE = re.compile(
+    r"-?\s*repo:\s*['\"]?local['\"]?(?=[\s,}#]|$)",
+    re.MULTILINE,
+)
+# The very next `repos:` list item (block- or flow-style), used to bound how
+# far past a `repo: local` match this guard looks for a hook `entry:` --
+# without this, an `entry:` belonging to a LATER, unrelated remote-repo hook
+# override could be misattributed to an earlier local block that never
+# defined one itself.
+PRECOMMIT_NEXT_REPO_RE = re.compile(r"-\s*\{?\s*repo:\s*", re.MULTILINE)
+# A non-empty `entry:` value -- under `repo: local` this is the whole
+# payload, the same "no safe value once the key is present" shape
+# `CLAUDE_HOOKS_KEY_RE`'s own docstring already accepts for `hooks`: there is
+# no reliable way to tell a benign local lint wrapper's command from a
+# malicious one by pattern alone, so (like that guard) this gates on the KEY
+# being present in this block, not a specific dangerous-command vocabulary.
+PRECOMMIT_ENTRY_KEY_RE = re.compile(r"entry:\s*['\"]?\S")
+
+
+def precommit_local_entry_hit(content: str) -> bool:
+    """True if `content` carries a `repo: local` pre-commit hook block with a
+    non-empty `entry:` (the arbitrary-command payload) somewhere inside that
+    SAME block -- bounded by either a fixed 4000-char lookahead window (the
+    same bounded-co-occurrence convention `CONFTEST_AUTOEXEC_HOOK_RE`/
+    `CLAUDE_HOOKS_JQ_RE` already use) or the next `repos:` list item,
+    whichever comes first. Deliberately NOT a full YAML parse -- most
+    Edit/Write calls carry a partial fragment that won't parse standalone
+    (the same reason `_claude_hooks_json_key_hit` treats its own structural
+    JSON parse as an ADDITIONAL signal, not a replacement, for its textual
+    check); `rules._precommit_yaml_local_entry_hit` provides that structural
+    signal separately for the (less common) case where the scanned text
+    happens to be whole, valid YAML on its own."""
+    for m in PRECOMMIT_LOCAL_REPO_RE.finditer(content):
+        window = content[m.end():m.end() + 4000]
+        boundary = PRECOMMIT_NEXT_REPO_RE.search(window)
+        if boundary:
+            window = window[:boundary.start()]
+        if PRECOMMIT_ENTRY_KEY_RE.search(window):
+            return True
+    return False
