@@ -250,6 +250,14 @@ class Policy:
     # `ipython`/Jupyter-kernel launch, no opt-in needed. See
     # rules.rule_ipython_startup_protect.
     ipython_startup: dict = field(default_factory=dict)
+    # pre-commit `repo: local` hook injection protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a `.pre-commit-config.yaml` `repos:`
+    # entry pinned to `repo: local` carrying a hook with a non-empty
+    # `entry:` -- pre-commit runs that command directly, with no upstream
+    # repo/pinned rev to review, on the very next `pre-commit run` /
+    # `git commit`. See rules.rule_precommit_config_protect.
+    precommit_config: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.

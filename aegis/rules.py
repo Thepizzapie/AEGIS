@@ -4039,6 +4039,268 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _precommit_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _precommit_yaml_local_entry_hit(content: str) -> bool:
+    """Structural sibling to `patterns.precommit_local_entry_hit`'s textual
+    check -- parses `content` as YAML (only succeeds when the whole scanned
+    text is itself valid, standalone YAML; most Edit/Write calls carry a
+    partial fragment that won't parse on its own, so this is an ADDITIONAL
+    signal, not a replacement, the same precedent `_claude_hooks_json_key_hit`
+    already sets for its own JSON parse) and walks the decoded `repos` list
+    for a `repo: local` entry with any hook carrying a non-empty `entry`.
+    Closes the class of textual-only bypass `_claude_hooks_json_key_hit` was
+    added to close for `claude_hooks` (an encoding/escaping trick that reads
+    differently in raw text than in the parsed structure it produces) before
+    it could ever be found here as a live bug."""
+    import yaml  # lazy: only needed when this structural check actually runs
+
+    try:
+        data = yaml.safe_load(content)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    repos = data.get("repos")
+    if not isinstance(repos, list):
+        return False
+    for repo in repos:
+        if not isinstance(repo, dict):
+            continue
+        if str(repo.get("repo", "")).strip().lower() != "local":
+            continue
+        for hook in (repo.get("hooks") or []):
+            if isinstance(hook, dict) and str(hook.get("entry") or "").strip():
+                return True
+    return False
+
+
+def rule_precommit_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a `repo: local` hook in `.pre-commit-config.yaml`
+    whose `entry:` is an arbitrary command -- the pre-commit framework's own
+    "escape hatch" for running an ad-hoc command with no upstream repo, no
+    pinned rev, and nothing to fetch or diff beyond the YAML sitting right
+    here in the tree.
+
+    THREAT MODEL: `rule_git_hooks_protect` already gates `.git/hooks/pre-commit`
+    and friends -- but for a repo managed by the `pre-commit` framework, that
+    generated hook is a tiny, generic wrapper (`pre-commit run ... hook-impl
+    ...`) that does nothing dangerous on its own; it just reads THIS file,
+    `.pre-commit-config.yaml`, to learn what to actually execute.
+    `rule_git_hooks_protect`'s own docstring explicitly treats a `pre-commit
+    install` setup as routine, sanctioned dev work and offers an `allow`
+    regex for exactly that pattern -- meaning the wrapper file itself is
+    expected to be uninteresting, and nothing in this file's rule pipeline
+    ever inspects the config that actually drives it. A `repos:` entry
+    pinned to a public `repo:`+`rev:` is at least a publicly diffable,
+    pinned, third-party dependency (a real supply-chain surface in its own
+    right, but a different, broader problem than this guard's scope); a
+    `repo: local` entry has none of that -- pre-commit runs its `entry:`
+    value directly, as a raw command (`language: system`/`script`) or via a
+    language runtime IT manages (`language: python`/`node`/...), with no
+    external fetch step at all. The entire attack is one YAML block, in a
+    file that reads as routine tooling config in a diff (recommended
+    formatter/linter hooks are exactly this shape too) -- the same "hidden
+    in plain sight" property `rule_devcontainer_exec_protect`'s/
+    `rule_vscode_tasks_protect`'s own docstrings describe for their own
+    tracked, reviewed-as-routine config files.
+
+    The trigger is as mundane as they come: `pre-commit run` (directly, or
+    via the installed git hook on the next `git commit`), often wired into
+    CI as `pre-commit run --all-files` on every PR -- a teammate's next
+    commit, or the very next CI run, executes it with no further attacker
+    action, the same "no further action, no per-invocation opt-in" property
+    `rule_conftest_protect`'s/`rule_pysite_protect`'s own THREAT MODEL
+    sections already establish for their own auto-exec surfaces, just
+    reached through a build-tooling config file instead of an interpreter
+    startup mechanism.
+
+    Distinct from a path-only guard for the same reason `rule_package_
+    manifest_protect`/`rule_devcontainer_exec_protect`/`rule_claude_hooks_
+    protect` are: `.pre-commit-config.yaml` legitimately carries any number
+    of ordinary, pinned remote-repo hooks (the vast majority of real-world
+    usage) edited for entirely benign reasons (bumping a `rev:`, adding a
+    linter) -- gating on path alone would ask on nearly every routine edit.
+    Gated on PATH *and* the specific dangerous SHAPE: a `repo: local` block
+    that also carries a non-empty `entry:` inside it. Like `rule_claude_
+    hooks_protect`'s own `hooks` key, there is no reliable way to tell a
+    benign local lint wrapper's command from a malicious one by pattern
+    alone, so (the same trade-off that guard's docstring makes explicit)
+    this gates on the KEY being present in the local-repo block, not a
+    curated dangerous-command vocabulary -- an ordinary local hook that
+    legitimately shells out (running the project's own lint/format script)
+    stays gated too, the same way an ordinary local Claude Code hook does;
+    it just needs a human to have actually looked at it once.
+
+    Config (`policy.precommit_config`): `mode` (deny|ask|monitor|off,
+    default ask), `allow` (regexes on the path/command that skip the gate --
+    a repo's own trusted, reviewed local hook, say). Defaults to `ask` for
+    the same reason every sibling `*_protect` guard does.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle `AEGIS_ALLOW_PRECOMMIT_CONFIG=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: `patterns.precommit_local_entry_hit`'s bounded 4000-char
+    lookahead window (mirroring `CONFTEST_AUTOEXEC_HOOK_RE`'s own) is not a
+    real YAML parse -- an unusually long hook block (many keys/comments
+    between `repo: local` and its `entry:`) could in principle exceed it,
+    and `_precommit_yaml_local_entry_hit`'s structural parse only helps when
+    the scanned text happens to be whole, standalone-parseable YAML (most
+    Edit fragments are not); a fully flow-style `repos:` entry whose `-`
+    list marker is separated from `repo:` by other keys in an unusual key
+    order is only caught if `repo: local` itself still appears as a
+    contiguous substring (it is not order-dependent on which YAML key comes
+    first inside the flow mapping, since the regex only anchors on
+    `repo:`+`local` themselves, but a `repo` key spelled via a YAML anchor/
+    alias (`<<: *local_repo`) or merge key evades both checks entirely, the
+    same "computed/aliased indirectly" class of gap every sibling guard
+    already accepts for its own dangerous keys); `find`-path indirection
+    around `.pre-commit-config.yaml` isn't covered (no `*_find_hit`-style
+    fallback, the same gap `rule_package_manifest_protect`/`rule_direnv_
+    protect`/`rule_conftest_protect` already disclose for their own
+    targets); and, like every sibling guard here, a direct fetch-to-file
+    write (`curl -o .pre-commit-config.yaml ...`) is caught by none of the
+    shell branch's write-verb checks, the same inherited gap every other
+    guard in this file already discloses. A remote `repo:`+`rev:` hook
+    (including one whose upstream target itself later turns malicious, or
+    whose `rev:` is a mutable branch name rather than a pinned SHA) is
+    deliberately out of scope -- a different, broader supply-chain problem
+    (auditing third-party pinned dependencies) than the self-contained
+    "the payload IS this file" shape this guard targets.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review found no defects -- verified
+    the `precommit_config` knob wired everywhere its siblings are (`Policy`,
+    all three `loader.py` spots, both `skills.py` knob lists, the remedy
+    table, README), verified a live `precommit_config:` YAML block
+    round-trips through `load_policy()` into a real `evaluate()` DENY rather
+    than trusting the wiring by inspection alone, confirmed the content-
+    extraction convention uses `"\\n".join(_flatten_strings(a))` (the
+    corrected join `rule_conftest_protect`/`rule_ipython_startup_protect`
+    use, not the older buggy `" ".join` `rule_claude_hooks_protect` still
+    carries), and ran the full suite green (1606 passed) with no regressions.
+    Bypass-hunting found and closed two real, reproduced silent-ALLOW
+    bypasses before merge, both root-caused to the bounded-window helper
+    `patterns.precommit_local_entry_hit`: (1) the original `PRECOMMIT_NEXT_
+    REPO_RE`, `-\\s*\\{?\\s*repo:\\s*` with no line anchor, matched ANY
+    `-repo:`-shaped SUBSTRING anywhere in the lookahead window, not just a
+    genuine YAML list-item boundary -- an ordinary field value before the
+    real `entry:` (a hook's own `name:`/`id:` mentioning something shaped
+    like `internal-repo:`, or a directly adversarial `name: -repo:`)
+    truncated the window early and the check never reached the real
+    `entry:` line at all; worse for the shell branch specifically, which has
+    no structural YAML fallback to catch what the textual check misses, this
+    was a TOTAL bypass there -- even a whole, valid heredoc-written file
+    sailed through as ALLOW. Fixed by anchoring the boundary check to a
+    genuine list-item line start (`^[ \\t]*-`, MULTILINE); an ordinary
+    mid-line field value can no longer be mistaken for one, and the fix can
+    only widen the window on a false-boundary case (still capped at the
+    fixed 4000-char bound), never narrow it. (2) `repo: # trusted local
+    override\\n  local` is real, legal YAML (`yaml.safe_load` parses it as
+    `{"repo": "local", ...}` -- a comment after a mapping key's `:` pushing
+    the scalar value to the next line), but the original `PRECOMMIT_LOCAL_
+    REPO_RE`'s plain `\\s*` between `repo:` and `local` never skips over
+    `#`-comment text, so the textual check missed it outright on an Edit
+    fragment or a shell heredoc (a Write of a whole file was incidentally
+    saved by the structural `_precommit_yaml_local_entry_hit` fallback, but
+    neither of those other two paths has one) -- a second confirmed,
+    reproduced bypass. Fixed by tolerating one optional `# comment` line
+    between the key and its value. Both fixes verified directly against the
+    bypass-hunting round's own repro cases (all now `ASK`) plus the full
+    existing suite, with two new regression tests
+    (`test_decoy_dash_repo_substring_in_field_value_gated`,
+    `test_repo_local_with_intervening_comment_gated`) pinning them. Bypass-
+    hunting separately confirmed (empirically, not by inspection) that the
+    `cd`/bare-filename shell-indirection gap several sibling guards' own QA
+    histories disclose for their own targets does NOT apply here:
+    `PRECOMMIT_CONFIG_PATH_RE`'s `(?:^|[\\s'\"/\\\\=])` alternation already
+    matches a bare filename with no directory prefix, so `cd subproject &&
+    cat > .pre-commit-config.yaml <<EOF ...` still gates correctly with no
+    extra `*_CD_RE` fallback needed. Recommended PASS after these fixes; no
+    further round needed. Full suite green throughout (1609 passed after the
+    fixes' own regression tests)."""
+    cfg = getattr(policy, "precommit_config", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "precommit-config-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.PRECOMMIT_CONFIG_PATH_RE.search(p):
+            return None
+        if not (patterns.precommit_local_entry_hit(content)
+                or _precommit_yaml_local_entry_hit(content)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PRECOMMIT_CONFIG")
+                or _precommit_config_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "precommit-config-protect",
+                         f"'{p}' is being written with a `repo: local` "
+                         "pre-commit hook carrying an `entry:` command -- "
+                         "pre-commit runs it directly, with no upstream "
+                         "repo, no pinned rev, and nothing to fetch or "
+                         "review beyond this file, on the very next "
+                         "`pre-commit run` / `git commit`, by this agent, "
+                         "a teammate, or CI. Review the change, then "
+                         "confirm with AEGIS_ALLOW_PRECOMMIT_CONFIG=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+        if not patterns.PRECOMMIT_CONFIG_PATH_RE.search(cmd):
+            return None
+        if not patterns.precommit_local_entry_hit(cmd):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PRECOMMIT_CONFIG")
+                or _precommit_config_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "precommit-config-protect",
+                         "A `repo: local` pre-commit hook carrying an "
+                         "`entry:` command is being planted in "
+                         ".pre-commit-config.yaml from a shell -- pre-commit "
+                         "runs it directly, with no upstream repo, no "
+                         "pinned rev, and nothing to fetch or review beyond "
+                         "this file, on the very next `pre-commit run` / "
+                         "`git commit`, by this agent, a teammate, or CI. "
+                         "A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_PRECOMMIT_CONFIG=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -4452,6 +4714,7 @@ _CORE_RULES = (
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
+    rule_precommit_config_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
