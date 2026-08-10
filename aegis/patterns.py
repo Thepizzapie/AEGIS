@@ -3569,11 +3569,17 @@ PRECOMMIT_CONFIG_PATH_RE = re.compile(
 # YAML) still matches on its own `repo: local` substring even though the
 # dash sits before the `{`, not immediately before `repo:`. Quotes around
 # `local` are optional (`repo: 'local'`/`repo: "local"` are both valid
-# YAML); the lookahead after `local` accepts whitespace, a flow-style `,`/
-# `}`, a comment, or end-of-string, so it doesn't also match an unrelated
-# word merely starting with "local" (`localhost`, `localdev-hooks`).
+# YAML); an optional `# comment` (real, legal YAML between a mapping key's
+# `:` and a value pushed to the next line) between `repo:` and `local` is
+# tolerated too -- QA (bypass-hunting round) found the original pattern had
+# no allowance for that at all, so `repo: # trusted override\n  local`
+# (valid YAML `yaml.safe_load` itself parses as `{"repo": "local", ...}`)
+# never matched the textual check, a confirmed, reproduced silent bypass.
+# The lookahead after `local` accepts whitespace, a flow-style `,`/`}`, a
+# comment, or end-of-string, so it doesn't also match an unrelated word
+# merely starting with "local" (`localhost`, `localdev-hooks`).
 PRECOMMIT_LOCAL_REPO_RE = re.compile(
-    r"-?\s*repo:\s*['\"]?local['\"]?(?=[\s,}#]|$)",
+    r"-?\s*repo:\s*(?:#[^\n]*\n\s*)?['\"]?local['\"]?(?=[\s,}#]|$)",
     re.MULTILINE,
 )
 # The very next `repos:` list item (block- or flow-style), used to bound how
@@ -3581,7 +3587,24 @@ PRECOMMIT_LOCAL_REPO_RE = re.compile(
 # without this, an `entry:` belonging to a LATER, unrelated remote-repo hook
 # override could be misattributed to an earlier local block that never
 # defined one itself.
-PRECOMMIT_NEXT_REPO_RE = re.compile(r"-\s*\{?\s*repo:\s*", re.MULTILINE)
+#
+# Anchored to an actual line START (`^[ \t]*-`, MULTILINE) -- QA (bypass-
+# hunting round) found the original, unanchored `-\s*\{?\s*repo:\s*` matched
+# ANY `-repo:`-shaped substring anywhere in the window, not just a genuine
+# YAML list-item boundary: an ordinary-looking field VALUE placed before the
+# real `entry:` (a hook's own `name:`/`id:`/`args:` mentioning something
+# like `internal-repo: latest`, or a directly adversarial `name: -repo:`)
+# truncated the lookahead window early, so the check never reached the real
+# `entry:` line at all -- a confirmed, reproduced silent bypass, and (since
+# the shell branch has no structural YAML fallback to fall back on) a total
+# bypass for a shell-written plant. Anchoring to a genuine list-item line
+# start closes it: an ordinary field value can appear anywhere mid-line
+# without ever being mistaken for a boundary. This can only make the window
+# LARGER than before on a false-boundary case that no longer stops it early
+# (still capped by the fixed 4000-char bound below) -- a safe direction,
+# same as every bounded-lookahead guard in this file already accepts for its
+# own window-width trade-offs.
+PRECOMMIT_NEXT_REPO_RE = re.compile(r"^[ \t]*-\s*\{?\s*repo:\s*", re.MULTILINE)
 # A non-empty `entry:` value -- under `repo: local` this is the whole
 # payload, the same "no safe value once the key is present" shape
 # `CLAUDE_HOOKS_KEY_RE`'s own docstring already accepts for `hooks`: there is

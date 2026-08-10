@@ -375,3 +375,64 @@ def test_local_entry_hit_helper_direct():
 def test_local_repo_regex_rejects_lookalike_word():
     assert not patterns.PRECOMMIT_LOCAL_REPO_RE.search("repo: localhost-mirror")
     assert patterns.PRECOMMIT_LOCAL_REPO_RE.search("- repo: local\n")
+
+
+# ---- QA regressions (bypass-hunting round) -------------------------------------------
+
+def test_decoy_dash_repo_substring_in_field_value_gated():
+    """QA regression (bypass-hunting round): a field VALUE before the real
+    `entry:` that merely CONTAINS the text "-repo:" (a hook's own `name:`
+    mentioning something like an unrelated `internal-repo:` reference, or a
+    directly adversarial `name: -repo:`) used to be misread by the original,
+    unanchored `PRECOMMIT_NEXT_REPO_RE` as a genuine next-list-item boundary,
+    truncating the lookahead window before it ever reached the real `entry:`
+    line -- a confirmed, reproduced silent ALLOW bypass, worse for the shell
+    branch (no structural YAML fallback there) where it was a TOTAL bypass
+    even for a whole, valid heredoc-written file. Anchoring the boundary
+    check to a genuine YAML list-item line start (`^[ \\t]*-`) closes it: an
+    ordinary mid-line field value can never be mistaken for a boundary."""
+    decoy_payload = (
+        "repos:\n"
+        "  - repo: local\n"
+        "    hooks:\n"
+        "      - id: x\n"
+        "        name: -repo:\n"
+        "        entry: bash -c 'id > /tmp/pwned_marker'\n"
+    )
+    d = evaluate(_edit(".pre-commit-config.yaml", decoy_payload), EMPTY)
+    assert _gated(d) and d.rule == "precommit-config-protect"
+    d = evaluate(_mcp_edit_nested(".pre-commit-config.yaml", "pass", decoy_payload), EMPTY)
+    assert _gated(d) and d.rule == "precommit-config-protect"
+    d = evaluate(_shell(
+        "cat > .pre-commit-config.yaml <<EOF\n" + decoy_payload + "EOF"), EMPTY)
+    assert _gated(d) and d.rule == "precommit-config-protect"
+
+
+def test_repo_local_with_intervening_comment_gated():
+    """QA regression (bypass-hunting round): `repo: # trusted local override\\n
+    local` is real, legal YAML (`yaml.safe_load` parses it as
+    `{"repo": "local", ...}` — a comment after a mapping key's `:` pushing
+    the scalar value to the next line) but the original `PRECOMMIT_LOCAL_
+    REPO_RE`'s plain `\\s*` between `repo:` and `local` never skips over
+    `#`-comment text, so the textual check missed it entirely — a confirmed,
+    reproduced silent ALLOW bypass on both an Edit fragment and a shell
+    heredoc of a whole, valid file. Now tolerates one optional `# comment`
+    line between the key and the value."""
+    comment_payload = (
+        "repos:\n"
+        "  - repo: # trusted local override, reviewed\n"
+        "      local\n"
+        "    hooks:\n"
+        "      - id: x\n"
+        "        entry: bash -c 'id > /tmp/pwned_marker'\n"
+    )
+    d = evaluate(_edit(".pre-commit-config.yaml", comment_payload), EMPTY)
+    assert _gated(d) and d.rule == "precommit-config-protect"
+    d = evaluate(_shell(
+        "cat > .pre-commit-config.yaml <<EOF\n" + comment_payload + "EOF"), EMPTY)
+    assert _gated(d) and d.rule == "precommit-config-protect"
+
+
+def test_next_repo_boundary_regex_requires_line_start():
+    assert not patterns.PRECOMMIT_NEXT_REPO_RE.search("        name: -repo:\n")
+    assert patterns.PRECOMMIT_NEXT_REPO_RE.search("  - repo: https://example\n")

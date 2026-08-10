@@ -4178,7 +4178,60 @@ def rule_precommit_config_protect(ev: Event, policy=None) -> Optional[Decision]:
     whose `rev:` is a mutable branch name rather than a pinned SHA) is
     deliberately out of scope -- a different, broader supply-chain problem
     (auditing third-party pinned dependencies) than the self-contained
-    "the payload IS this file" shape this guard targets."""
+    "the payload IS this file" shape this guard targets.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review found no defects -- verified
+    the `precommit_config` knob wired everywhere its siblings are (`Policy`,
+    all three `loader.py` spots, both `skills.py` knob lists, the remedy
+    table, README), verified a live `precommit_config:` YAML block
+    round-trips through `load_policy()` into a real `evaluate()` DENY rather
+    than trusting the wiring by inspection alone, confirmed the content-
+    extraction convention uses `"\\n".join(_flatten_strings(a))` (the
+    corrected join `rule_conftest_protect`/`rule_ipython_startup_protect`
+    use, not the older buggy `" ".join` `rule_claude_hooks_protect` still
+    carries), and ran the full suite green (1606 passed) with no regressions.
+    Bypass-hunting found and closed two real, reproduced silent-ALLOW
+    bypasses before merge, both root-caused to the bounded-window helper
+    `patterns.precommit_local_entry_hit`: (1) the original `PRECOMMIT_NEXT_
+    REPO_RE`, `-\\s*\\{?\\s*repo:\\s*` with no line anchor, matched ANY
+    `-repo:`-shaped SUBSTRING anywhere in the lookahead window, not just a
+    genuine YAML list-item boundary -- an ordinary field value before the
+    real `entry:` (a hook's own `name:`/`id:` mentioning something shaped
+    like `internal-repo:`, or a directly adversarial `name: -repo:`)
+    truncated the window early and the check never reached the real
+    `entry:` line at all; worse for the shell branch specifically, which has
+    no structural YAML fallback to catch what the textual check misses, this
+    was a TOTAL bypass there -- even a whole, valid heredoc-written file
+    sailed through as ALLOW. Fixed by anchoring the boundary check to a
+    genuine list-item line start (`^[ \\t]*-`, MULTILINE); an ordinary
+    mid-line field value can no longer be mistaken for one, and the fix can
+    only widen the window on a false-boundary case (still capped at the
+    fixed 4000-char bound), never narrow it. (2) `repo: # trusted local
+    override\\n  local` is real, legal YAML (`yaml.safe_load` parses it as
+    `{"repo": "local", ...}` -- a comment after a mapping key's `:` pushing
+    the scalar value to the next line), but the original `PRECOMMIT_LOCAL_
+    REPO_RE`'s plain `\\s*` between `repo:` and `local` never skips over
+    `#`-comment text, so the textual check missed it outright on an Edit
+    fragment or a shell heredoc (a Write of a whole file was incidentally
+    saved by the structural `_precommit_yaml_local_entry_hit` fallback, but
+    neither of those other two paths has one) -- a second confirmed,
+    reproduced bypass. Fixed by tolerating one optional `# comment` line
+    between the key and its value. Both fixes verified directly against the
+    bypass-hunting round's own repro cases (all now `ASK`) plus the full
+    existing suite, with two new regression tests
+    (`test_decoy_dash_repo_substring_in_field_value_gated`,
+    `test_repo_local_with_intervening_comment_gated`) pinning them. Bypass-
+    hunting separately confirmed (empirically, not by inspection) that the
+    `cd`/bare-filename shell-indirection gap several sibling guards' own QA
+    histories disclose for their own targets does NOT apply here:
+    `PRECOMMIT_CONFIG_PATH_RE`'s `(?:^|[\\s'\"/\\\\=])` alternation already
+    matches a bare filename with no directory prefix, so `cd subproject &&
+    cat > .pre-commit-config.yaml <<EOF ...` still gates correctly with no
+    extra `*_CD_RE` fallback needed. Recommended PASS after these fixes; no
+    further round needed. Full suite green throughout (1609 passed after the
+    fixes' own regression tests)."""
     cfg = getattr(policy, "precommit_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
