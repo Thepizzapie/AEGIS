@@ -250,6 +250,17 @@ class Policy:
     # `ipython`/Jupyter-kernel launch, no opt-in needed. See
     # rules.rule_ipython_startup_protect.
     ipython_startup: dict = field(default_factory=dict)
+    # Anti-forensics protection: {mode: deny|ask|monitor|off, allow: [regex
+    # on command]}. Empty -> defaults (mode=ask) apply. Covers clearing/
+    # disabling interactive-shell command history (`history -c`, unsetting/
+    # nulling $HISTFILE, deleting/overwriting a `.bash_history`/`.zsh_history`/
+    # etc. file) and clearing/disabling the OS-level audit trail (wtmp/btmp/
+    # utmp/lastlog, auth.log/secure, the Linux audit log/auditd,
+    # `journalctl --vacuum-*`, Windows event-log clear verbs) -- the "cover
+    # your tracks after the fact" step Aegis's own self-protection (which
+    # only reaches `.aegis/audit.jsonl`) doesn't. See
+    # rules.rule_history_tamper_protect.
+    history_tamper: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.

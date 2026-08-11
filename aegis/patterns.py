@@ -3539,3 +3539,85 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     if IPYTHON_BANG_LINE_RE.search(content):
         return True
     return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))
+
+
+# ---- Anti-forensics: shell-history & audit-log tampering ---------------------
+# After a harmful action, a rogue/prompt-injected agent's next move is often to
+# cover its tracks rather than repeat the action: clear the interactive
+# shell's command history, or clear/disable the OS-level audit trail (auth
+# log, login accounting, the kernel audit framework). Self-protection above
+# already denies tampering with Aegis's OWN audit.jsonl -- it lives under
+# `.aegis/`, which CONFIG_DIR_RE/ENFORCEMENT_PATH_RE already cover -- but that
+# leaves the OS-level forensic record a human incident-responder reaches for
+# independent of (and even to cross-check) Aegis's own log completely open:
+# nothing above this point in the file names a shell-history or system-log
+# path at all. MITRE ATT&CK's "Indicator Removal" family names this exact
+# technique set: T1070.003 (clear command history), T1070.002 (clear Linux/
+# Mac system logs), T1070.001 (clear Windows event logs).
+
+# Interactive-shell history files, by well-known name -- bash/zsh/ksh/fish/
+# PowerShell. Matched as a bare filename or nested under a path (mirrors
+# CRED_RE's own boundary style) so `~/.bash_history`, `/root/.bash_history`,
+# and a bare `.bash_history` (cwd already $HOME) all hit alike.
+SHELL_HISTORY_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\])\.(?:bash|zsh|z|sh|ksh|ash)_history\b"
+    r"|(?:^|[\s'\"/\\])\.local[/\\]share[/\\]fish[/\\]fish_history\b"
+    r"|(?:^|[\s'\"/\\])fish_history\b"
+    r"|(?:^|[\s'\"/\\])ConsoleHost_history\.txt\b",
+    re.IGNORECASE,
+)
+
+# Clearing/disabling the history mechanism itself, no file path needed at
+# all: `history -c` (bash/zsh in-memory clear), unsetting/nulling $HISTFILE
+# so nothing is ever written back out, zeroing $HISTSIZE/$HISTFILESIZE,
+# `set +o history` (bash), `unsetopt ...hist...` (zsh), and PowerShell's
+# `Clear-History` / disabling PSReadLine's own save-to-disk.
+HISTORY_CLEAR_CMD_RE = re.compile(
+    r"\bhistory\b[^|;&\n]*(?:-c\b|--clear\b|-cw\b)"
+    r"|\bunset\s+HISTFILE\b"
+    r"|\bHISTFILE\s*=\s*(?:/dev/null\b|\"\"|''|(?=\s|[;&|]|$))"
+    r"|\bHIST(?:SIZE|FILESIZE)\s*=\s*0\b"
+    r"|\bset\s+\+o\s+history\b"
+    r"|\bunsetopt\b[^|;&\n]*\bhist\w*\b"
+    r"|\bClear-History\b"
+    r"|\bSet-PSReadLineOption\b[^|;&\n]*-HistorySaveStyle\s+SaveNothing\b",
+    re.IGNORECASE,
+)
+
+# System-level audit/auth trail -- login/logout accounting (wtmp/btmp/utmp/
+# lastlog), the common distro auth logs sshd/sudo/su etc. write every
+# authentication event to, and the Linux audit framework's own log.
+AUDIT_LOG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\])var[/\\]log[/\\](?:wtmp|btmp|lastlog|auth\.log|secure)\b"
+    r"|(?:^|[\s'\"/\\])var[/\\](?:run|log)[/\\]utmp\b"
+    r"|(?:^|[\s'\"/\\])var[/\\]log[/\\]audit(?:[/\\]audit\.log)?\b"
+    # Bare-filename fallback for wtmp/btmp/utmp/lastlog only -- distinctive
+    # enough (no ordinary project has a file literally named "wtmp"/"btmp"/
+    # "lastlog") to safely match with no "var/log/"-prefixed path in the same
+    # token, closing the `cd /var/log && rm wtmp` gap a literal-path-only
+    # match would otherwise leave (QA bypass-hunting, round 1). "auth.log"/
+    # "secure"/"audit.log" are deliberately excluded from this fallback --
+    # each is a plausible name for a project's OWN log/config file (an app's
+    # own "auth.log", a secrets file named "secure"), too generic to safely
+    # match without the "var/log/" path context that disambiguates them, the
+    # same "too generic" trade-off SHELL_PERSIST_FIND_RE's own docstring
+    # already makes for the bare words "config"/"profile".
+    r"|(?:^|[\s'\"/\\])(?:wtmp|btmp|utmp|lastlog)\b",
+    re.IGNORECASE,
+)
+
+# Disabling/rotating-out the audit trail via its own tooling, no file path
+# needed: `auditctl -e 0` (turns the kernel audit framework off), stopping/
+# disabling/masking the auditd service (either verb/target order --
+# `systemctl stop auditd` and `service auditd stop` are both idiomatic,
+# depending on the tool), `journalctl --vacuum-*` (erases retained
+# systemd-journal entries), and Windows' own event-log clear verbs.
+AUDIT_LOG_DISABLE_CMD_RE = re.compile(
+    r"\bauditctl\b[^|;&\n]*-e\s*0\b"
+    r"|\b(?:systemctl|service)\b[^|;&\n]*\b(?:stop|disable|mask)\b[^|;&\n]*\bauditd\b"
+    r"|\b(?:systemctl|service)\b[^|;&\n]*\bauditd\b[^|;&\n]*\b(?:stop|disable|mask)\b"
+    r"|\bjournalctl\b[^|;&\n]*--vacuum-(?:time|size)\b"
+    r"|\bwevtutil\b[^|;&\n]*\b(?:cl|clear-log)\b"
+    r"|\bClear-EventLog\b",
+    re.IGNORECASE,
+)

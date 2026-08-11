@@ -4039,6 +4039,171 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- anti-forensics: shell-history / audit-log tampering protection ----------
+def _history_tamper_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_history_tamper_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block clearing/disabling interactive-shell command history or the
+    OS-level audit/auth trail (login accounting, the kernel audit framework,
+    system event logs).
+
+    THREAT MODEL: after a harmful action, a rogue or prompt-injected agent's
+    next move is often not to repeat it but to cover its tracks -- clear the
+    shell's own command history, or clear/disable the OS-level log a human
+    incident-responder would reach for during a post-hoc review. Aegis's
+    self-protection guard already denies tampering with Aegis's OWN
+    ``~/.aegis/audit.jsonl`` (it lives under ``.aegis/``, which
+    ``CONFIG_DIR_RE``/``ENFORCEMENT_PATH_RE`` already cover) -- but nothing
+    else in this file names a shell-history or system-log path at all, so the
+    OS-level forensic record a human would use INDEPENDENT of (or to
+    cross-check) Aegis's own log was left completely open. This is MITRE
+    ATT&CK's "Indicator Removal" technique family: T1070.003 (clear command
+    history), T1070.002 (clear Linux/Mac system logs), T1070.001 (clear
+    Windows event logs) -- a real, named post-exploitation step, not a
+    hypothetical one.
+
+    Covers two shapes, from a shell:
+      1. Shell command history: clearing it in-memory (``history -c``),
+         disabling the file it's saved to (``unset HISTFILE``, ``HISTFILE=``/
+         ``=/dev/null``, ``HISTSIZE=0``, ``set +o history``, zsh's
+         ``unsetopt ...hist...``, PowerShell's ``Clear-History``/disabling
+         PSReadLine's save), or deleting/overwriting/in-place-editing the
+         history FILE itself (``.bash_history``, ``.zsh_history``,
+         ``fish_history``, PowerShell's ``ConsoleHost_history.txt``, ...).
+      2. System audit/auth trail: deleting/overwriting/in-place-editing
+         login-accounting files (``wtmp``/``btmp``/``utmp``/``lastlog``) or
+         auth logs (``auth.log``/``secure``)/the Linux audit log, or using
+         the trail's own tooling to disable/erase it (``auditctl -e 0``,
+         stopping/disabling/masking ``auditd``, ``journalctl --vacuum-*``,
+         Windows' ``wevtutil cl``/``Clear-EventLog``).
+
+    Config (``policy.history_tamper``): ``mode`` (deny|ask|monitor|off,
+    default ``ask``), ``allow`` (regexes on the command that skip the gate --
+    e.g. a repo's own trusted log-rotation/CI-cleanup script). Escapable only
+    by a human: a trailing ``# aegis-allow``, or ``AEGIS_ALLOW_HISTORY_TAMPER=1``
+    set by the orchestrator/human. A spawned agent cannot set its own env for
+    a hook invocation it doesn't control and ``_override_allowed`` already
+    refuses the comment escape when ``AEGIS_AGENT_NAME`` is set, so neither
+    path is agent-self-escapable -- the same invariant every escapable guard
+    in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: only the shell-command surface is covered (Edit/Write/MCP
+    writes to a history/log path are not, unlike most sibling ``*_protect``
+    guards -- a coding agent overwriting its OWN shell-history file through a
+    file-edit tool rather than a shell redirect is an unusual enough shape
+    that it's deliberately left out of scope for this first version rather
+    than guessed at); a path assembled indirectly (variable concatenation, a
+    `find`-path indirection the way self-protect/ld-preload-protect
+    specifically harden against) is not caught, the class every guard in
+    this file already accepts; a bare, no-``-f``/``--force`` ``ln -s`` onto a
+    matched path is not caught (only the forced form is, via
+    ``FORCED_LINK_WRITE_RE``, matching every sibling guard that checks it) --
+    accepted because ``ln`` without ``-f`` refuses to overwrite a target that
+    already exists, which the shell-history and most audit-log files do by
+    the time an agent would want to swap them for ``/dev/null``; a benign
+    backup read of a history/log file (``cp ~/.bash_history /tmp/backup``)
+    still ASKs even though the source is untouched, the same
+    ``INPLACE_WRITE_RE``-reuses-``cp``-unconditionally trade-off
+    ``rule_self_protect`` already accepts for its own targets; only the
+    Linux/POSIX + PowerShell audit-log paths/tools named above are covered,
+    not every distro's/platform's own log location or clearing utility;
+    ``auth.log``/``secure``/``audit.log`` require the ``var/log/`` path
+    prefix in-token to match (unlike ``wtmp``/``btmp``/``utmp``/``lastlog``,
+    each is a plausible name for a project's OWN log/config file, too
+    generic to safely bare-match) -- so, unlike the four distinctive
+    accounting files, a `cd /var/log && rm auth.log` shape is not caught;
+    and disabling logging BEFORE the harmful action (rather than clearing
+    evidence of it after) reads identically to this guard and is denied the
+    same way, which is a feature, not a gap, of a denylist keyed on the
+    mechanism rather than intent.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): design/consistency review
+    round-tripped a YAML ``history_tamper:`` block through ``load_policy()``
+    into a live ``evaluate()`` decision, confirmed wiring correct everywhere
+    its siblings' is (``_CORE_RULES``, ``Policy``, all three ``loader.py``
+    spots, both ``skills.py`` knob lists, README's guard table and
+    "Identity and accountability" section), and confirmed the full suite
+    green throughout -- and flagged that this guard's own disclosed gaps had
+    no matching README Limits-section clause the way every sibling guard
+    gets one; added. Bypass-hunting found and closed two real, reproduced
+    bypasses: ``ln -sf /dev/null ~/.bash_history`` (and the equivalent
+    against an audit-log path) swapped the target for a symlink into the
+    void with no delete/redirect/in-place-edit verb ever appearing --
+    ``FORCED_LINK_WRITE_RE`` (already used by ``rule_ld_preload_protect`` and
+    others for the identical shape) was missing from this guard's own
+    touches-target checks; added. And ``cd /var/log && rm wtmp`` slipped
+    through because ``AUDIT_LOG_PATH_RE``, unlike ``SHELL_HISTORY_PATH_RE``,
+    had no bare-filename fallback at all; added one for the four names
+    distinctive enough to bare-match safely (see the pattern's own comment in
+    ``patterns.py`` for why ``auth.log``/``secure``/``audit.log`` are
+    deliberately excluded from it). Recommended PASS after the two fixes; no
+    further round needed. Full suite green throughout (1611 passed before
+    the fixes, unaffected by them; new regression tests added for both)."""
+    cfg = getattr(policy, "history_tamper", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "history-tamper-protect-monitor")
+            return None
+        return would
+
+    if not _is_shell(ev):
+        return None
+    cmd = _shell_scan(ev)
+
+    clear_hit = bool(patterns.HISTORY_CLEAR_CMD_RE.search(cmd))
+    history_file_hit = bool(patterns.SHELL_HISTORY_PATH_RE.search(cmd) and (
+        patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+        or patterns.WRITE_REDIRECT_RE.search(cmd)
+        or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+        or patterns.INPLACE_WRITE_RE.search(cmd)
+        or patterns.FORCED_LINK_WRITE_RE.search(cmd)))
+    audit_disable_hit = bool(patterns.AUDIT_LOG_DISABLE_CMD_RE.search(cmd))
+    audit_file_hit = bool(patterns.AUDIT_LOG_PATH_RE.search(cmd) and (
+        patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+        or patterns.WRITE_REDIRECT_RE.search(cmd)
+        or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+        or patterns.INPLACE_WRITE_RE.search(cmd)
+        or patterns.FORCED_LINK_WRITE_RE.search(cmd)))
+
+    if not (clear_hit or history_file_hit or audit_disable_hit or audit_file_hit):
+        return None
+    if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_HISTORY_TAMPER")
+            or _history_tamper_allowed_by_policy(cfg, cmd)):
+        return None
+
+    if clear_hit:
+        reason = "Shell command history is being cleared or disabled"
+    elif history_file_hit:
+        reason = "A shell-history file is being deleted, moved, or overwritten"
+    elif audit_disable_hit:
+        reason = "The system audit/auth trail is being cleared or the audit service disabled"
+    else:
+        reason = "A system audit/auth log file is being deleted, moved, or overwritten"
+
+    return _finish(Decision(action, "history-tamper-protect",
+                     f"{reason} — this erases the forensic trail of what ran "
+                     "in this session, independent of Aegis's own "
+                     "audit.jsonl. A human may append '# aegis-allow', or "
+                     "set AEGIS_ALLOW_HISTORY_TAMPER=1; a spawned agent "
+                     "cannot."))
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -4452,6 +4617,7 @@ _CORE_RULES = (
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
+    rule_history_tamper_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
