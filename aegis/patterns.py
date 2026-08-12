@@ -3539,3 +3539,44 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     if IPYTHON_BANG_LINE_RE.search(content):
         return True
     return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))
+
+
+# ---------------------------------------------------------------------------
+# Fetch-to-file write verb: curl/wget/PowerShell/certutil writing a remote
+# response DIRECTLY to a target path. Every `*_protect` guard above gates its
+# shell branch on a fixed write-verb set (`WRITE_REDIRECT_RE` /
+# `DELETE_OR_MOVE_VERB_RE` / `COPY_WRITE_VERB_RE` / `INPLACE_WRITE_RE` /
+# `FORCED_LINK_WRITE_RE` / `ARCHIVE_SYNC_VERB_RE`) -- disclosed, repeatedly,
+# as never including a fetch tool's own destination flag: `curl -o <target>
+# <url>` and `wget -O <target> <url>` write a file exactly the way `cp`/a
+# shell redirect do, but neither verb was ever on any sibling guard's list.
+# `rules.rule_fetch_to_file_protect` is the shared backstop this pattern
+# feeds: rather than re-deriving "does this write-verb set include a fetch
+# form" once per sibling guard (and risk yet another guard shipping without
+# it), it re-checks EVERY already-protected surface in this file -- self-
+# protect's own never-escapable one included -- against this one additional
+# verb shape in a single new rule.
+#
+# Deliberately excludes curl's bare `-O`/`--remote-name` (writes to the
+# CURRENT DIRECTORY under a name taken from the URL itself, not a literal
+# destination argument in the command text) and wget's bare `-P <dir>`
+# (directory-only, filename still taken from the URL) -- neither puts a
+# literal destination PATH string in the scanned command for the
+# target-path check below to match against, so gating the bare verb alone
+# would either miss the real cases (no path text present to match) or
+# false-positive on an ordinary, unrelated download with no protected path
+# anywhere in the command. `-O`/`-P` combined with an explicit `cd`/
+# `--output-dir` INTO a protected directory is the same "computed
+# indirectly" class of gap several sibling guards' own `cd`-into-directory
+# fallback (or documented lack of one) already discloses -- not fixed here.
+# `curl -o -`/`--output -` (stdout, not a file) is not specially excluded --
+# an accepted, vanishingly-unlikely false-ASK trade-off, since a hit still
+# requires a literal protected path elsewhere in the same command.
+FETCH_TO_FILE_VERB_RE = re.compile(
+    r"\bcurl(?:\.exe)?\b[^|;&\n]*?(?:-o\s+\S|--output(?:=|\s+)\S)"
+    r"|\bwget\b[^|;&\n]*?(?:-O\s+\S|--output-document(?:=|\s+)\S)"
+    r"|\b(?:Invoke-WebRequest|iwr|curl|wget)\b[^|;&\n]*?-OutFile\b"
+    r"|\bStart-BitsTransfer\b[^|;&\n]*?-Destination\b"
+    r"|\bcertutil(?:\.exe)?\b[^|;&\n]*?-urlcache\b",
+    re.IGNORECASE,
+)

