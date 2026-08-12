@@ -3539,3 +3539,111 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     if IPYTHON_BANG_LINE_RE.search(content):
         return True
     return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))
+
+
+# ---------------------------------------------------------------------------
+# Fetch-to-file write verb: curl/wget/PowerShell/certutil writing a remote
+# response DIRECTLY to a target path. Every `*_protect` guard above gates its
+# shell branch on a fixed write-verb set (`WRITE_REDIRECT_RE` /
+# `DELETE_OR_MOVE_VERB_RE` / `COPY_WRITE_VERB_RE` / `INPLACE_WRITE_RE` /
+# `FORCED_LINK_WRITE_RE` / `ARCHIVE_SYNC_VERB_RE`) -- disclosed, repeatedly,
+# as never including a fetch tool's own destination flag: `curl -o <target>
+# <url>` and `wget -O <target> <url>` write a file exactly the way `cp`/a
+# shell redirect do, but neither verb was ever on any sibling guard's list.
+# `rules.rule_fetch_to_file_protect` is the shared backstop this pattern
+# feeds: rather than re-deriving "does this write-verb set include a fetch
+# form" once per sibling guard (and risk yet another guard shipping without
+# it), it re-checks EVERY already-protected surface in this file -- self-
+# protect's own never-escapable one included -- against this one additional
+# verb shape in a single new rule.
+#
+# Deliberately excludes curl's bare `-O`/`--remote-name` (writes to the
+# CURRENT DIRECTORY under a name taken from the URL itself, not a literal
+# destination argument in the command text) and wget's bare `-P <dir>`
+# (directory-only, filename still taken from the URL) -- neither puts a
+# literal destination PATH string in the scanned command for the
+# target-path check below to match against, so gating the bare verb alone
+# would either miss the real cases (no path text present to match) or
+# false-positive on an ordinary, unrelated download with no protected path
+# anywhere in the command. `-O`/`-P` combined with an explicit `cd`/
+# `--output-dir` INTO a protected directory is the same "computed
+# indirectly" class of gap several sibling guards' own `cd`-into-directory
+# fallback (or documented lack of one) already discloses -- not fixed here.
+# `curl -o -`/`--output -` (stdout, not a file) is not specially excluded --
+# an accepted, vanishingly-unlikely false-ASK trade-off, since a hit still
+# requires a literal protected path elsewhere in the same command.
+#
+# QA history (two independent adversarial reviews, run in parallel, same
+# convention every guard in this file follows): bypass-hunting found and
+# closed three real, reproduced bugs in the FIRST version of this pattern
+# before merge:
+#
+# (1) it required a literal SPACE between `-o`/`-O` and the destination
+# (`-o\s+\S`) -- curl and wget both accept the destination GLUED directly
+# onto the short option with no space at all (`-o.aegis/policy.yaml` is
+# valid, documented syntax, identical to `-o .aegis/policy.yaml`), a full,
+# silent bypass of even the never-escapable tier. Fixed by requiring the
+# destination be either a run of whitespace-then-non-whitespace OR a
+# non-whitespace character immediately adjacent (`(?:\s+\S|\S)`) -- but a
+# looser `\s*\S` (any amount of whitespace, including none, then
+# anything) was tried FIRST and rejected: it also matched `-o` as a bare
+# two-character substring inside an unrelated hyphenated word anywhere in
+# the command (e.g. the "-o" inside "re-open" in a completely ordinary
+# URL path segment `.../re-open-file`), a new false-positive worse than
+# the bug it fixed. The actual fix instead anchors `-o`/`-O` to the START
+# of a shell token -- `(?:^|\s)-o` / `(?:^|\s)-O` -- which the "re-open"
+# case can never satisfy (its `-o` is preceded by the letter "e", not
+# whitespace or the start of the command), while a real flag always IS
+# preceded by whitespace (or is the very first characters after the
+# command name). Residual, accepted gap: curl's CLUSTERED short-option
+# form (`-sSLo <target>`, several boolean flags glued onto one leading
+# dash with `-o` as the LAST, value-taking one) is not matched -- its `-o`
+# is preceded by another letter, not whitespace, the same "no real
+# argument parsing" trade-off `rule_path_hijack_protect`'s own
+# curated-command-name list and un-parsed `chmod` numeric-mode gap already
+# accept.
+#
+# (2) the whole pattern was compiled with a single blanket `re.IGNORECASE`
+# -- but curl's `-o`/`--output` (destination) and `-O`/`--remote-name`
+# (writes under the URL's OWN filename, deliberately excluded above) are
+# case-DISTINCT real flags, as are wget's `-o` (a LOG file, unrelated) and
+# `-O` (the actual destination, `--output-document`'s short form).
+# Case-blind matching let `curl -O <url>` (the bare, deliberately-excluded
+# form) satisfy the `-o` check anyway, gating on protected-looking text
+# that happened to sit inside the URL itself with nothing local ever
+# written -- and, the mirror bug, let wget's unrelated `-o <logfile>`
+# satisfy the destination check meant for `-O` alone. Fixed with a scoped
+# `(?-i: ... )` group around just the single case-significant letter in
+# each short flag, so `curl`/`wget`/`Invoke-WebRequest`/... themselves stay
+# matched case-insensitively (obfuscation resistance every sibling guard's
+# own verb/path matching already relies on) while `-o` only ever matches
+# literal lowercase and `-O` only ever matches literal uppercase.
+#
+# (3) all five alternatives originally joined the tool name to its flag
+# check with an UNBOUNDED lazy gap (`[^|;&\n]*?`) -- this file has fixed
+# the identical shape's catastrophic-backtracking blowup before (see
+# `EXFIL_RE`'s own comment, the `scp`/`rsync` remote-target gap) but this
+# new pattern was not given the same treatment. Measured directly against
+# an 82KB adversarial input (`("curl " * 16000) + "x" * 2000`, an ordinary-
+# SHAPED long argument list, not a contrived string): 18.6s to conclude no
+# match, reachable through the real `evaluate()` pipeline with no per-rule
+# timeout in `engine._run()` -- a fail-open bypass of a guard that includes
+# a never-escapable tier, the identical class of bug `EXFIL_RE`'s own
+# history already discloses. Fixed the same way: bounded to `{0,200}?`
+# (matching `EXFIL_RE`/`DIRENV_ACTIVATE_RE`/`SERVICE_ACTIVATE_CMD_RE`'s own
+# verb-to-target gap convention) -- a real destination flag realistically
+# sits within 200 chars of the tool name; the same 82KB input now resolves
+# in ~0.2s. Also added `Invoke-RestMethod`/`irm` (both support `-OutFile`,
+# common in real PowerShell scripts, and were simply missing from the
+# original verb list alongside `Invoke-WebRequest`/`iwr`).
+FETCH_TO_FILE_VERB_RE = re.compile(
+    r"\bcurl(?:\.exe)?\b[^|;&\n]{0,200}?"
+    r"(?:(?:^|\s)-(?-i:o)(?:\s+\S|\S)|--output(?:=|\s+)\S)"
+    r"|\bwget\b[^|;&\n]{0,200}?"
+    r"(?:(?:^|\s)-(?-i:O)(?:\s+\S|\S)|--output-document(?:=|\s+)\S)"
+    r"|\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|irm|curl|wget)\b"
+    r"[^|;&\n]{0,200}?-OutFile\b"
+    r"|\bStart-BitsTransfer\b[^|;&\n]{0,200}?-Destination\b"
+    r"|\bcertutil(?:\.exe)?\b[^|;&\n]{0,200}?-urlcache\b",
+    re.IGNORECASE,
+)

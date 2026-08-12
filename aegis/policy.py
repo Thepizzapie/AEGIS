@@ -250,6 +250,19 @@ class Policy:
     # `ipython`/Jupyter-kernel launch, no opt-in needed. See
     # rules.rule_ipython_startup_protect.
     ipython_startup: dict = field(default_factory=dict)
+    # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
+    # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
+    # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing
+    # its response directly to a path one of the OTHER *_protect guards
+    # above already protects (git hooks, CI workflows, shell-persist,
+    # package manifests, systemd/launchd, ld.so.preload, devcontainer,
+    # VS Code tasks, Claude Code hooks, conftest.py, pysite, IPython
+    # startup, ...). The never-escapable tier (Aegis's own
+    # config/policy/source/skills, the same surface rule_self_protect
+    # itself hard-blocks) has no config knob here at all -- it is checked
+    # unconditionally, the same way rule_self_protect takes no policy
+    # config. See rules.rule_fetch_to_file_protect.
+    fetch_to_file: dict = field(default_factory=dict)
     # Context injection: {mode: on|off} — emit a policy-posture digest as
     # additionalContext on SessionStart and PostCompact so the rules the agent
     # runs under survive context compaction. Empty -> on. See aegis.context.
