@@ -4125,19 +4125,58 @@ def _fetch_to_file_allowed_by_policy(cfg: dict, text: str) -> bool:
 # regexes (each one also relied on unchanged by its own sibling guard) to
 # accept a boundary they were never designed to need, this normalizes just
 # the SCAN TEXT fed to the target-path loops below: insert a synthetic
-# space after a genuine glued `-o`/`-O` (the same case-sensitive,
-# token-anchored shape `FETCH_TO_FILE_VERB_RE`'s own `-o`/`-O` alternative
-# uses, so it fires on exactly the same occurrences and no others) so every
-# reused regex sees the identical boundary the spaced form already
-# supplies. A no-op on an already-spaced command (the lookahead only fires
-# when the very next character is non-whitespace).
-_FETCH_GLUED_O_RE = re.compile(r"(?:^|(?<=\s))-(?-i:o)(?=\S)")
-_FETCH_GLUED_CAP_O_RE = re.compile(r"(?:^|(?<=\s))-(?-i:O)(?=\S)")
+# space after a genuine glued `-o`/`-O`.
+#
+# QA finding (independent adversarial follow-up review, verifying this exact
+# fix): a FIRST version here matched `-o`/`-O` context-free, with no
+# requirement that it actually sit right after ITS OWN tool's name -- so
+# once `FETCH_TO_FILE_VERB_RE` matched anywhere (e.g. one genuine, already-
+# spaced `curl -o /tmp/out.bin ...`), the WHOLE command was rescanned, and
+# an unrelated `-o`/`-O`-shaped substring sitting inert inside a quoted
+# `--data` argument or a shell comment elsewhere in the same command -- not
+# a real flag at all -- got a synthetic space inserted too, newly
+# satisfying a majority-class target regex's boundary requirement it did
+# NOT satisfy before this fix existed (verified: reproduced a fresh false
+# ASK against `AGENT_INSTRUCTIONS_PATH_RE`/`CLAUDE.md` that did NOT occur
+# on the pre-normalization code). Fixed by anchoring each candidate glued
+# occurrence to its OWN tool mention the same way `FETCH_TO_FILE_VERB_RE`
+# itself does (`\bcurl\b[^|;&\n]{0,200}?...`) -- but merely reusing that
+# same `-o(?=\S)`-only shape here still leaked the identical bug: its lazy
+# gap happily backtracks PAST a real, already-spaced `-o` (which never
+# satisfies a bare `(?=\S)` lookahead) to reach a LATER, incidental
+# glued-shaped substring within the same 200-char budget instead. The
+# alternative here captures the actual destination-
+# start token for BOTH the spaced (`\s+\S`) and glued (`\S`) shapes, so the
+# engine commits to and consumes the FIRST real destination token after
+# each tool mention (spaced ones are then a no-op), instead of skipping
+# past it hunting for one that also happens to satisfy a bare `(?=\S)`
+# lookahead. `finditer` then only reaches a SECOND occurrence when a
+# SECOND, genuine tool mention exists later in the command (a real chained
+# `curl ... && curl -o<dest2> ...`), never an incidental one with no tool
+# mention of its own nearby.
+_FETCH_DEST_TOKEN_RE = re.compile(
+    r"\bcurl(?:\.exe)?\b[^|;&\n]{0,200}?(?:^|\s)-(?-i:o)(\s+\S|\S)"
+    r"|\bwget\b[^|;&\n]{0,200}?(?:^|\s)-(?-i:O)(\s+\S|\S)",
+    re.IGNORECASE,
+)
 
 
 def _fetch_normalize_glued_dest(cmd: str) -> str:
-    cmd = _FETCH_GLUED_O_RE.sub("-o ", cmd)
-    return _FETCH_GLUED_CAP_O_RE.sub("-O ", cmd)
+    out = []
+    last = 0
+    for m in _FETCH_DEST_TOKEN_RE.finditer(cmd):
+        group_index = 1 if m.group(1) is not None else 2
+        token = m.group(group_index)
+        if token[0].isspace():
+            continue  # already spaced -- no-op, a real boundary exists
+        start = m.start(group_index)
+        out.append(cmd[last:start])
+        out.append(" ")
+        last = start
+    if not out:
+        return cmd
+    out.append(cmd[last:])
+    return "".join(out)
 
 
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -4255,11 +4294,42 @@ def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     boundary the glued flag's own trailing letter never supplies -- so the
     glued form stayed silently uncaught for the MAJORITY of targets,
     ``AEGIS_SOURCE_RE`` (never-escapable tier) included, even after the
-    verb-regex fix. Closed with ``_fetch_normalize_glued_dest`` (below):
-    rather than touching 20 shared, already-tested target regexes, it
-    inserts the same synthetic space a spaced `-o <dest>` already has, on
-    exactly the occurrences the verb check itself recognizes as glued and
-    no others."""
+    verb-regex fix. Closed with a first version of ``_fetch_normalize_
+    glued_dest`` (below): rather than touching 20 shared, already-tested
+    target regexes, it inserted the same synthetic space a spaced
+    `-o <dest>` already has, on the occurrences a bare, context-free
+    `-o`/`-O` regex found.
+
+    A follow-up, independent adversarial round targeting THAT fix
+    specifically (not re-litigating the earlier findings, verifying them
+    instead) found and closed a fifth real, reproduced bug: the
+    context-free `-o`/`-O` scan had no requirement that the match actually
+    be a real flag of the invocation at all -- so once one genuine,
+    already-spaced `-o /tmp/out.bin` satisfied the initial verb check, the
+    WHOLE command got rescanned, and an unrelated `-o`/`-O`-shaped
+    substring sitting inert inside a quoted `--data` argument or a shell
+    comment elsewhere in the SAME command -- never a real flag -- also got
+    a synthetic space inserted, newly satisfying a majority-class target
+    regex's boundary requirement it did not satisfy before normalization
+    existed at all (reproduced: a fresh false ASK against
+    ``AGENT_INSTRUCTIONS_PATH_RE``/``CLAUDE.md`` with nothing ever written
+    there, confirmed absent on the pre-normalization code by checking out
+    the prior commit directly). A same-shaped repro against a
+    never-escapable-tier target (``CONFIG_DIR_RE``/`.aegis`) turned out to
+    be a RED HERRING on inspection -- that specific regex has no preceding-
+    boundary requirement at all, so it already gated identically before any
+    glued-destination fix existed; only the majority, boundary-requiring
+    class was actually made worse. Closed by anchoring each candidate glued
+    occurrence to its own tool mention, capturing the real destination-
+    start token (spaced or glued) so the matcher commits to and consumes
+    the FIRST genuine destination after each tool mention instead of
+    backtracking past it to reach a later, incidental one -- a naive
+    tool-anchored version using only a bare `(?=\\S)` lookahead (no spaced
+    alternative to consume) was tried first and still leaked the identical
+    bug, since its lazy gap happily skips past a real, already-spaced `-o`
+    (which never satisfies a bare `(?=\\S)`) to reach the incidental one
+    instead. See ``_fetch_normalize_glued_dest``'s own comment for the
+    fix in full."""
     if not _is_shell(ev):
         return None
     cmd = _shell_scan(ev)

