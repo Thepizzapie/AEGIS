@@ -34,6 +34,15 @@ def _edit_content(path, new_string):
                        args={"file_path": path, "new_string": new_string})
 
 
+def _edit_content_replace(path, old_string, new_string):
+    """A value-only diff — old_string/new_string cover just the CHANGED
+    VALUE text, not the surrounding `key = ` line, the real shape Claude
+    Code's own Edit tool produces for a targeted substring replace."""
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                       args={"file_path": path, "old_string": old_string,
+                             "new_string": new_string})
+
+
 def _write(path, content=None):
     args = {"file_path": path}
     if content is not None:
@@ -135,6 +144,28 @@ def test_mcp_edits_shape_gated():
     assert _gated(d) and d.rule == "gitmodules-protect"
 
 
+def test_multiedit_gated():
+    """`MultiEdit` is ActionClass.EDIT (see events.py), not MCP, and puts its
+    text under `edits: [{new_string}, ...]` rather than a top-level
+    `new_string` — a plain `content`/`new_string` lookup misses it entirely,
+    and gating the `_flatten_strings` fallback on `ev.action == MCP` (an
+    earlier draft's bug, found by independent adversarial QA) left it
+    completely unchecked. Must fall through to the flatten walker for every
+    action class."""
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+                  args={"file_path": ".gitmodules",
+                        "edits": [{"old_string": "x", "new_string": "url = ext::sh -c id\n"}]}),
+                  EMPTY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_notebookedit_new_source_gated():
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="NotebookEdit",
+                  args={"notebook_path": ".gitmodules", "new_source": "url = ext::sh -c id\n"}),
+                  EMPTY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
 def test_heredoc_write_gitmodules_ext_url_gated():
     d = evaluate(_shell(
         'cat > .gitmodules <<EOF\n[submodule "evil"]\n\turl = ext::sh -c id\nEOF'), EMPTY)
@@ -176,6 +207,30 @@ def test_shell_redirect_gitmodules_path_traversal_gated():
 def test_windows_backslash_traversal_gated():
     d = evaluate(_write(".gitmodules", "\tpath = ..\\..\\.git\\hooks\\pre-commit\n"), EMPTY)
     assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_section_traversal_only_message_says_traversal_not_url():
+    """`GITMODULES_SECTION_INI_RE` has two alternatives (url-scheme OR
+    traversal) — an earlier draft only OR'd its combined result into
+    `url_hit`, so a section matching PURELY via the traversal alternative
+    (no `url = ext::`/`file://` anywhere) still reported the URL-scheme
+    wording, a factually wrong human-facing message (QA finding,
+    independent adversarial review). The gate itself was never wrong, only
+    the explanation."""
+    d = evaluate(_write("staging/tmp2.txt",
+        '[submodule "evil"]\n\tpath = ../../../../outside_tree\n'), EMPTY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+    assert "traversal" in d.message
+    assert "ext::" not in d.message and "file://" not in d.message
+
+
+def test_shell_section_traversal_only_message_says_traversal_not_url():
+    d = evaluate(_shell(
+        'cat > staging/tmp3.txt <<EOF\n[submodule "evil"]\n\tpath = ../../outside_tree\nEOF'),
+        EMPTY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+    assert "traversal" in d.message
+    assert "ext::" not in d.message and "file://" not in d.message
 
 
 # ---- protocol.ext.allow / protocol.file.allow override ------------------------
@@ -344,3 +399,127 @@ def test_gitmodules_patterns_no_quadratic_blowup():
         for rx in rxs:
             rx.search(s)
     assert time.time() - t0 < 2.0
+
+
+# ---- QA round 2 (independent adversarial bypass-hunting) regressions ---------
+#
+# Five real, end-to-end-verified bypasses were found and closed after the
+# first round of QA above: a value-only Edit diff to `.gitmodules` itself
+# (the single most severe finding — silent ALLOW under `mode: deny`), the
+# same value-only-diff shape against `.git/config`'s own
+# `submodule.<name>.url` override, a value-only diff enabling
+# `protocol.ext.allow`/`protocol.file.allow`, a `patch`/`git apply` write
+# with no shell redirect/in-place-edit verb, and padding
+# `GITMODULES_CONFIG_URL_CLI_RE`'s bounded flag-skip past its cap. See
+# `rule_gitmodules_protect`'s own docstring for the full QA history.
+
+def test_value_only_edit_to_gitmodules_ext_scheme_gated():
+    """The single most severe QA-round-2 finding: a targeted Edit that
+    replaces just the URL VALUE (no `url =` key in either old_string or
+    new_string) previously returned a silent ALLOW even under `mode:
+    deny`."""
+    d = evaluate(_edit_content_replace(".gitmodules",
+        "https://example.com/foo.git", "ext::sh -c id"), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_value_only_edit_to_gitmodules_traversal_gated():
+    d = evaluate(_edit_content_replace(".gitmodules", "libs/foo",
+        "../../.git/hooks/post-checkout"), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_value_only_edit_to_git_config_submodule_url_gated():
+    """`.git/config`'s own `submodule.<name>.url` override has the
+    identical live effect for an already-initialized submodule — confirmed
+    end-to-end against real git: `git config submodule.x.url 'ext::touch
+    PWNED'` followed by `git -c protocol.ext.allow=always submodule update
+    --init` actually ran the payload."""
+    d = evaluate(_edit_content_replace(".git/config",
+        "url = https://example.com/foo.git", "url = ext::sh -c id"), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_bare_value_only_edit_to_git_config_gated():
+    """Even with NO `url =` prefix at all in either old_string or
+    new_string, a bare `ext::` in a confirmed git-config file is
+    high-signal — there is no legitimate reason for that literal text to
+    appear in an edit to it."""
+    d = evaluate(_edit_content_replace(".git/config",
+        "https://example.com/foo.git", "ext::sh -c id"), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_value_only_edit_protocol_allow_gated():
+    d = evaluate(_edit_content_replace(".gitconfig", "allow = never",
+        "allow = always"), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_patch_heredoc_writes_gitmodules_ext_url_gated():
+    """`patch`/`git apply` write via their own internal file write, not a
+    shell redirect/in-place-editor invocation — neither
+    `WRITE_REDIRECT_RE` nor `INPLACE_WRITE_RE` recognized either verb."""
+    patch_cmd = (
+        "patch -p1 <<'EOF'\n"
+        "--- a/.gitmodules\n"
+        "+++ b/.gitmodules\n"
+        "@@ -3 +3 @@\n"
+        "-\turl = https://example.com/foo.git\n"
+        "+\turl = ext::sh -c id\n"
+        "EOF")
+    d = evaluate(_shell(patch_cmd), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_git_apply_writes_gitmodules_ext_url_gated():
+    apply_cmd = (
+        "git apply --unidiff-zero <<'EOF'\n"
+        "--- a/.gitmodules\n"
+        "+++ b/.gitmodules\n"
+        "@@ -3 +3 @@\n"
+        "-\turl = https://example.com/foo.git\n"
+        "+\turl = ext::sh -c id\n"
+        "EOF")
+    d = evaluate(_shell(apply_cmd), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_git_config_argskip_padding_bypass_gated():
+    """`_GIT_ARGSKIP`'s bounded `{0,8}` token cap is, by construction,
+    beatable by padding past it with enough real, valid, idempotent flags
+    — this exact command genuinely runs and writes the payload."""
+    d = evaluate(_shell(
+        "git config --includes --no-includes --includes --no-includes "
+        "--includes --no-includes --includes --no-includes --file "
+        ".gitmodules submodule.evil.url ext::true"), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_git_submodule_add_argskip_padding_bypass_gated():
+    d = evaluate(_shell(
+        "git submodule add --reference x --reference x --reference x "
+        "--reference x --reference x --reference x --reference x "
+        "--reference x ext::sh -c id evil"), DENY)
+    assert _gated(d) and d.rule == "gitmodules-protect"
+
+
+def test_legit_file_remote_in_git_config_not_gated():
+    """`file://` bare-matches only on `.gitmodules`, not a generic
+    git-config file — an ordinary, benign `git remote add origin
+    file:///path` local-mirror workflow must stay allowed."""
+    d = evaluate(_edit_content_replace(".git/config",
+        "url = https://old.example.com/x.git",
+        "url = file:///home/user/local-mirror.git"), EMPTY)
+    assert not _gated(d)
+
+
+def test_legit_relative_submodule_url_disclosed_false_positive():
+    """Accepted, disclosed trade-off (see `rule_gitmodules_protect`'s own
+    docstring): the bare traversal check can't tell a malicious `path =`
+    traversal apart from git's own legitimate relative-URL convention
+    (`url = ../sibling-repo.git`) once the key context is gone — both are
+    the identical bare string shape. A false ask, not a false allow."""
+    d = evaluate(_write(".gitmodules",
+        '[submodule "x"]\n\tpath = libs/x\n\turl = ../sibling-repo.git\n'), EMPTY)
+    assert _gated(d) and d.rule == "gitmodules-protect"

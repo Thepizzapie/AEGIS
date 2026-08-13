@@ -89,6 +89,25 @@ def test_lifecycle_knobs_absent_by_default(tmp_path):
     assert pol.permission == {} and pol.mcp == {}
 
 
+def test_gitmodules_knob_wired_through_loader(tmp_path):
+    """The `gitmodules` guard-config knob must round-trip from YAML onto the
+    Policy through all three loader.py spots (the `st` defaults dict, the
+    `_merge_file` knob-key tuple, and the final `Policy(...)` constructor
+    call) — regression for a new guard's knob being silently dropped by
+    real YAML-based policy loading despite `Policy(gitmodules=...)` working
+    fine when constructed directly in Python (QA finding, independent
+    adversarial review: the guard was permanently pinned to its hardcoded
+    `ask` default through `aegis validate`/`aegis hook`/the CLI, with no
+    warning, because this exact wiring was missing)."""
+    pol = load_policy(_write(tmp_path, "gitmodules:\n  mode: deny\n  allow: ['trusted-mirror']\n"))
+    assert pol.gitmodules == {"mode": "deny", "allow": ["trusted-mirror"]}
+
+
+def test_gitmodules_knob_absent_by_default(tmp_path):
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.gitmodules == {}
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
     assert validate_policy(_write(tmp_path, LIFECYCLE)) == []

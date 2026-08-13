@@ -1829,7 +1829,76 @@ def rule_gitmodules_protect(ev: Event, policy=None) -> Optional[Decision]:
     confirmed to pair with a `submodule.*.url` key, the same
     `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` split-across-calls limitation
     `rule_git_hooks_protect`/`rule_git_config_exec_protect` already
-    disclose for their own env-injection forms."""
+    disclose for their own env-injection forms; and `GITMODULES_TRAVERSAL_
+    BARE_RE` (the value-only-diff traversal check, see its own docstring)
+    has no way to tell a malicious `path =` traversal apart from git's own
+    LEGITIMATE relative submodule `url = ../sibling-repo.git` convention
+    once the key context a value-only diff lacks by definition is gone —
+    both are the identical bare string shape. Accepted, the same "false
+    positives are the safe direction" trade-off this docstring already
+    takes for `protocol.ext.allow`/`protocol.file.allow` above: an editor
+    changing an existing relative submodule URL costs one false ask.
+
+    Two independent adversarial-review rounds on this guard (run in
+    parallel — bypass-hunting and design/consistency, the same convention
+    every guard in this file follows) found and closed three real,
+    reproduced bugs before merge, round 1: (1) the ``gitmodules`` policy
+    knob was never wired into ``aegis.loader``'s three merge spots, so
+    `mode`/`allow` set in real YAML policy were silently dropped and the
+    guard was permanently pinned to its hardcoded ``ask`` default through
+    `aegis validate`/`aegis hook`/the CLI, with no warning — the same
+    "works via `Policy(...)` in tests, dead via YAML in production" class
+    of bug; (2) `MultiEdit`/`NotebookEdit` are `ActionClass.EDIT`, not MCP,
+    and carry their text under `edits: [{new_string}, ...]`/`new_source`
+    — gating the `_flatten_strings` fallback on `ev.action == MCP` (this
+    guard's first draft) left both mainstream builtin tools completely
+    unchecked, a silent total bypass, the identical bug class
+    `rule_git_attributes_exec_protect`'s own docstring already discloses
+    fixing once; (3) `GITMODULES_SECTION_INI_RE` is a single regex with
+    two alternatives (url-scheme OR traversal) that the rule function only
+    OR'd into `url_hit`, so a section matching purely via the traversal
+    alternative reported the URL-scheme wording in the human-facing
+    message — the gate/block decision was unaffected, only the
+    explanation was factually wrong.
+
+    A follow-up bypass-hunting-only round (round 2, against the round-1-
+    fixed code) found and closed five further real, end-to-end-verified
+    bypasses — all gave a silent ALLOW on a working `ext::` RCE or
+    traversal payload, several under an explicit `mode: deny`: (1) a
+    VALUE-ONLY Edit diff to `.gitmodules` itself (`old_string`/`new_string`
+    covering just the changed value, no `url =`/`path =` key in either) —
+    the single most severe finding of that round, closed by
+    `GITMODULES_EXT_SCHEME_BARE_RE`/`GITMODULES_FILE_SCHEME_BARE_RE`/
+    `GITMODULES_TRAVERSAL_BARE_RE`; (2) the identical value-only-diff shape
+    against `.git/config`'s own `submodule.<name>.url` override, verified
+    to actually run via real git (`git config submodule.x.url 'ext::touch
+    PWNED'` + `git -c protocol.ext.allow=always submodule update --init`
+    created the file), closed by scoping the `ext::` bare check to any
+    confirmed git-config file, not just `.gitmodules`; (3) the same
+    value-only-diff gap for `protocol.ext.allow`/`protocol.file.allow`,
+    closed by `GITMODULES_PROTOCOL_ALLOW_CONTENT_RE`; (4) `patch`/`git
+    apply` write `.gitmodules` via their own internal file write, which
+    neither `WRITE_REDIRECT_RE` nor `INPLACE_WRITE_RE` recognized as a
+    write verb, verified against real `patch -p1`/`git apply
+    --unidiff-zero` in a scratch repo, closed by
+    `GITMODULES_PATCH_APPLY_RE`; (5) `_GIT_ARGSKIP`'s bounded `{0,8}`
+    flag-skip cap is, by construction, beatable by padding past it with
+    enough real, valid, idempotent flags (confirmed as a genuinely valid,
+    working command), closed by the same-clause
+    `gitmodules_config_url_loose_hit`/`gitmodules_add_loose_hit` helpers.
+    An earlier fix attempt for (5) used four chained `(?=...)` lookaheads
+    in one regex and measured ~0.9-1.6s against a 20K-char adversarial
+    input — a fail-open-on-hook-timeout risk caught and fixed (bounded
+    same-clause helpers instead) before it ever reached this docstring's
+    disclosed-gaps list. Round 2 also confirmed one genuine, accepted
+    trade-off rather than a bug — see the relative-submodule-URL note in
+    "Honest scope" above — and two source-level self-matches (this guard's
+    own test fixtures/pattern source containing the literal dangerous INI
+    shapes they test for) that are not bugs: every path-independent INI
+    check in this file (`GIT_HOOKS_CONFIG_INI_RE`,
+    `GIT_CONFIG_BANG_VALUE_INI_RE`, ...) has applied to file content
+    regardless of destination extension since it was introduced, the same
+    accepted trade-off, not new here."""
     cfg = getattr(policy, "gitmodules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1846,21 +1915,87 @@ def rule_gitmodules_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
+        # `MultiEdit`/`NotebookEdit` are ActionClass.EDIT (see events.py),
+        # not MCP, but put their text under `edits: [{new_string}, ...]`/
+        # `new_source` — neither key a bare `content`/`new_string` lookup
+        # checks, so gating the flatten fallback on `ev.action == MCP` (as
+        # this guard's first draft did) left both mainstream builtin tools
+        # completely unchecked, a silent total bypass (QA finding,
+        # independent adversarial review). Falls through to the
+        # depth-capped `_flatten_strings` walker for EVERY action class
+        # whenever direct extraction doesn't yield a non-empty plain
+        # string, the same fix `rule_git_attributes_exec_protect` already
+        # applies for the identical bug class.
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
         path_confirmed = bool(p and patterns.GITMODULES_PATH_RE.search(p))
-        url_hit = bool(
-            (path_confirmed and patterns.GITMODULES_URL_CONTENT_RE.search(content))
-            or patterns.GITMODULES_SECTION_INI_RE.search(content))
-        traversal_hit = bool(
+        # `.git/config`'s own `submodule.<name>.url` override has the
+        # identical live effect for an already-initialized submodule as a
+        # `.gitmodules` edit — confirmed end-to-end against real git (QA
+        # finding, independent adversarial review): `git config
+        # submodule.subdir.url 'ext::touch PWNED'` followed by `git -c
+        # protocol.ext.allow=always submodule update --init` actually ran
+        # the payload. `GIT_CONFIG_FILE_PATH_RE` also matches a submodule's
+        # own real `.git/modules/<name>/config`.
+        path_confirmed_config = bool(p and patterns.GIT_CONFIG_FILE_PATH_RE.search(p))
+        direct_url_hit = bool(
+            path_confirmed and patterns.GITMODULES_URL_CONTENT_RE.search(content))
+        direct_traversal_hit = bool(
             path_confirmed and patterns.GITMODULES_PATH_TRAVERSAL_RE.search(content))
+        # `GITMODULES_SECTION_INI_RE` is a single regex with two
+        # alternatives (dangerous URL scheme OR '..' traversal) — checking
+        # it once and only ORing the result into `url_hit` misattributed
+        # the reported reason to "URL scheme" even when the match came
+        # purely from the traversal alternative with no url=ext::/file://
+        # anywhere in the content (QA finding, independent adversarial
+        # review: the gate/block decision was unaffected, only the
+        # human-facing explanation was factually wrong). Disambiguated by
+        # checking each alternative's own standalone regex against the
+        # SAME path-independent content instead of relying on the combined
+        # pattern's result for messaging.
+        section_url_hit = bool(patterns.GITMODULES_URL_CONTENT_RE.search(content)
+                                and patterns.GITMODULES_SECTION_INI_RE.search(content))
+        section_traversal_hit = bool(patterns.GITMODULES_PATH_TRAVERSAL_RE.search(content)
+                                      and patterns.GITMODULES_SECTION_INI_RE.search(content)
+                                      and not section_url_hit)
+        # Value-only diff (`old_string`/`new_string` covering just the
+        # CHANGED VALUE, no `url =`/`path =` key in either) — see
+        # `GITMODULES_EXT_SCHEME_BARE_RE`'s/`GITMODULES_TRAVERSAL_BARE_RE`'s
+        # own docstrings in patterns.py for the full QA history; this was
+        # the single most severe finding of that round (a silent ALLOW,
+        # under `mode: deny` too, on a direct edit to `.gitmodules`
+        # itself). `ext::` bare-matches on any confirmed git-config file
+        # (no legitimate use anywhere); `file://` bare-matches on
+        # `.gitmodules` only, NOT a generic git-config file, to avoid
+        # false-positiving on an ordinary `git remote add origin
+        # file:///path` local-mirror workflow — see that pattern's own
+        # comment.
+        bare_scheme_hit = bool(
+            ((path_confirmed or path_confirmed_config)
+             and patterns.GITMODULES_EXT_SCHEME_BARE_RE.search(content))
+            or (path_confirmed and patterns.GITMODULES_FILE_SCHEME_BARE_RE.search(content)))
+        bare_traversal_hit = bool(path_confirmed
+                                   and patterns.GITMODULES_TRAVERSAL_BARE_RE.search(content))
+        url_hit = direct_url_hit or section_url_hit or bare_scheme_hit
+        traversal_hit = direct_traversal_hit or section_traversal_hit or bare_traversal_hit
         # Path-independent, same reasoning `GIT_HOOKS_CONFIG_INI_RE` uses: a
         # full "[protocol "ext"] ... allow =" block is high-signal on its own
-        # regardless of destination filename.
-        protocol_hit = bool(patterns.GITMODULES_PROTOCOL_ALLOW_INI_RE.search(content))
+        # regardless of destination filename. `GITMODULES_PROTOCOL_ALLOW_
+        # CONTENT_RE` (bare `allow = <value>`, gated on a CONFIRMED
+        # git-config path) closes the same value-only-diff class the scheme/
+        # traversal bare checks above close — an Edit's new_string is
+        # typically just the changed line, not the `[protocol "ext"]`
+        # header (QA finding, independent adversarial review).
+        protocol_hit = bool(patterns.GITMODULES_PROTOCOL_ALLOW_INI_RE.search(content)
+                             or (path_confirmed_config
+                                 and patterns.GITMODULES_PROTOCOL_ALLOW_CONTENT_RE.search(content)))
         if not (url_hit or traversal_hit or protocol_hit):
             return None
         if (os.environ.get("AEGIS_ALLOW_GITMODULES")
@@ -1884,17 +2019,44 @@ def rule_gitmodules_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         names_gitmodules = bool(patterns.GITMODULES_PATH_RE.search(cmd))
-        url_hit = bool(
-            (names_gitmodules and patterns.GITMODULES_URL_CONTENT_RE.search(cmd)
-             and (patterns.WRITE_REDIRECT_RE.search(cmd)
-                  or patterns.INPLACE_WRITE_RE.search(cmd)))
-            or patterns.GITMODULES_SECTION_INI_RE.search(cmd)
-            or patterns.GITMODULES_ADD_CLI_RE.search(cmd)
-            or patterns.GITMODULES_CONFIG_URL_CLI_RE.search(cmd))
-        traversal_hit = bool(
+        # `patch`/`git apply` write `.gitmodules` via their OWN internal
+        # file write — neither is a `>`-redirect nor an in-place-editor
+        # invocation `WRITE_REDIRECT_RE`/`INPLACE_WRITE_RE` recognize (QA
+        # finding, independent adversarial review, confirmed end-to-end
+        # against real `patch`/`git apply`: a minimal unified-diff hunk
+        # silently rewrote `.gitmodules` with zero detection). See
+        # `GITMODULES_PATCH_APPLY_RE`'s own docstring in patterns.py.
+        write_verb_hit = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                               or patterns.INPLACE_WRITE_RE.search(cmd)
+                               or patterns.GITMODULES_PATCH_APPLY_RE.search(cmd))
+        direct_url_hit = bool(
+            names_gitmodules and patterns.GITMODULES_URL_CONTENT_RE.search(cmd)
+            and write_verb_hit)
+        direct_traversal_hit = bool(
             names_gitmodules and patterns.GITMODULES_PATH_TRAVERSAL_RE.search(cmd)
-            and (patterns.WRITE_REDIRECT_RE.search(cmd)
-                 or patterns.INPLACE_WRITE_RE.search(cmd)))
+            and write_verb_hit)
+        # Same section-INI disambiguation as the Edit/Write/MCP branch above
+        # — see that branch's own comment for why the combined
+        # `GITMODULES_SECTION_INI_RE` result alone can't tell url-scheme
+        # from traversal-only for messaging purposes.
+        section_url_hit = bool(patterns.GITMODULES_URL_CONTENT_RE.search(cmd)
+                                and patterns.GITMODULES_SECTION_INI_RE.search(cmd))
+        section_traversal_hit = bool(patterns.GITMODULES_PATH_TRAVERSAL_RE.search(cmd)
+                                      and patterns.GITMODULES_SECTION_INI_RE.search(cmd)
+                                      and not section_url_hit)
+        # `GITMODULES_ADD_CLI_RE`/`GITMODULES_CONFIG_URL_CLI_RE`'s
+        # fixed-position adjacency (`_GIT_ARGSKIP`'s bounded `{0,8}` token
+        # cap) is beatable by padding past it with enough real, valid,
+        # idempotent flags (QA finding, independent adversarial review,
+        # confirmed as a genuinely valid, working command). The same-clause
+        # loose-hit helpers close that class — see their own docstrings in
+        # patterns.py.
+        cli_url_hit = bool(patterns.GITMODULES_ADD_CLI_RE.search(cmd)
+                            or patterns.GITMODULES_CONFIG_URL_CLI_RE.search(cmd)
+                            or patterns.gitmodules_add_loose_hit(cmd)
+                            or patterns.gitmodules_config_url_loose_hit(cmd))
+        url_hit = direct_url_hit or section_url_hit or cli_url_hit
+        traversal_hit = direct_traversal_hit or section_traversal_hit
         protocol_hit = bool(patterns.GITMODULES_PROTOCOL_ALLOW_RE.search(cmd)
                              or patterns.GITMODULES_PROTOCOL_ALLOW_INI_RE.search(cmd))
         if not (url_hit or traversal_hit or protocol_hit):
