@@ -1754,6 +1754,170 @@ def rule_git_attributes_exec_protect(ev: Event, policy=None) -> Optional[Decisio
     return None
 
 
+def _gitmodules_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_gitmodules_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a `.gitmodules` submodule-hijack: an `ext::`/`file://` URL scheme
+    (git-remote-ext RCE / CVE-2022-39253-class local disclosure) or a `path =`
+    parent-traversal segment (CVE-2018-11235/CVE-2024-32002-class hooks-
+    directory collision), plus setting `protocol.ext.allow`/
+    `protocol.file.allow` to an allowing value — the override git's own
+    2.38.1+ default requires before either scheme is allowed to run at all.
+
+    THREAT MODEL: `.gitmodules` (superproject root, or nested inside a
+    submodule's own working tree) declares each submodule's `url`/`path`
+    under a `[submodule "<name>"]` section. Unlike `.git/hooks/*` or
+    `.git/config`, it is an ORDINARY TRACKED file — pushed, diffed, and
+    reviewed like any other change — which is exactly what makes it a
+    comfortable place to smuggle a detonator wired to arm on a FUTURE,
+    different git operation (`git clone --recurse-submodules`, `git
+    submodule update --init [--recursive]`, or a plain `pull`/`fetch` with
+    `submodule.recurse=true` configured), by a teammate or CI, not
+    necessarily this session — the same "runs later, unattended, possibly
+    higher-privileged" shape every sibling `*_protect` guard in this file
+    exists for. `url = ext::<command>` invokes git's `git-remote-ext`
+    transport, which runs `<command>` as a literal shell invocation to
+    satisfy the "fetch" — a real, documented RCE primitive (git-remote-
+    ext(1)), not an obscure trick. A `path = ` traversal segment lets git
+    materialize a submodule's working tree (and, on vulnerable/older git,
+    its `.git/modules/<name>` metadata) OUTSIDE the intended directory —
+    historically enabling an overwrite straight into `.git/hooks/*`, the
+    exact payload `rule_git_hooks_protect` exists to stop, arriving through
+    a file that guard never inspects at all.
+
+    Config (``policy.gitmodules``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a
+    repo's own trusted vendored-submodule bootstrap, say). Defaults to
+    ``ask`` for the same reason every sibling git-config-family guard does:
+    adding an ordinary (https://-scheme) submodule is routine, sanctioned
+    dev work — it just needs a human to have actually looked at the two
+    specific schemes/traversal shape that are never legitimate.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_GITMODULES=1`` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form. A spawned agent
+    cannot set its own env for a hook invocation it doesn't control, so
+    neither path is agent-self-escapable.
+
+    Honest scope, same denylist trade-offs as every guard in this file: a
+    `url`/`path` value assembled indirectly (shell variable concatenation,
+    a wrapper script) rather than one contiguous literal defeats every
+    check; there is no `find`-path-indirection fallback (the same absence
+    `rule_package_manifest_protect`/`rule_direnv_protect`/
+    `rule_ipython_startup_protect` already disclose for their own targets);
+    a direct fetch-to-file write (`curl -o .gitmodules ...`) is closed by
+    `rule_fetch_to_file_protect` reusing `GITMODULES_PATH_RE`, not by this
+    guard's own write-verb checks (which, like `git_config_exec`'s CLI
+    forms, deliberately has none — the `git submodule add`/`git config`
+    subcommand IS the write, not a verb applied to an already-named path);
+    the `protocol.ext.allow`/`protocol.file.allow` override check is
+    gated on the KEY alone (any allowing value) and so costs a false ask
+    on an operator legitimately re-enabling the scheme for a trusted,
+    already-audited internal mirror — accepted, the same "false positives
+    are the safe direction" trade-off `core.fsmonitor`/`core.sshCommand`
+    already take in `rule_git_attributes_exec_protect`; and the
+    `GIT_CONFIG_VALUE_n=ext::...`/`file://...` env-injection alternative on
+    `GITMODULES_CONFIG_URL_CLI_RE` is matched on the value alone, not
+    confirmed to pair with a `submodule.*.url` key, the same
+    `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` split-across-calls limitation
+    `rule_git_hooks_protect`/`rule_git_config_exec_protect` already
+    disclose for their own env-injection forms."""
+    cfg = getattr(policy, "gitmodules", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "gitmodules-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        path_confirmed = bool(p and patterns.GITMODULES_PATH_RE.search(p))
+        url_hit = bool(
+            (path_confirmed and patterns.GITMODULES_URL_CONTENT_RE.search(content))
+            or patterns.GITMODULES_SECTION_INI_RE.search(content))
+        traversal_hit = bool(
+            path_confirmed and patterns.GITMODULES_PATH_TRAVERSAL_RE.search(content))
+        # Path-independent, same reasoning `GIT_HOOKS_CONFIG_INI_RE` uses: a
+        # full "[protocol "ext"] ... allow =" block is high-signal on its own
+        # regardless of destination filename.
+        protocol_hit = bool(patterns.GITMODULES_PROTOCOL_ALLOW_INI_RE.search(content))
+        if not (url_hit or traversal_hit or protocol_hit):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_GITMODULES")
+                or _gitmodules_allowed_by_policy(cfg, p)):
+            return None
+        target = f"'{p}'" if p else "A file"
+        reason = (f"{target} is being written with a submodule URL using the "
+                   "ext:: or file:// scheme" if url_hit else
+                   f"{target} is being written with a submodule path "
+                   "containing a '..' traversal segment" if traversal_hit else
+                   f"{target} is being written enabling protocol.ext.allow/"
+                   "protocol.file.allow")
+        return _finish(Decision(action, "gitmodules-protect",
+                         f"{reason} — it runs automatically, with the "
+                         "invoking user's or CI's full privileges, on the "
+                         "next `git clone --recurse-submodules`/`git "
+                         "submodule update`. Review the change, then "
+                         "confirm with AEGIS_ALLOW_GITMODULES=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_gitmodules = bool(patterns.GITMODULES_PATH_RE.search(cmd))
+        url_hit = bool(
+            (names_gitmodules and patterns.GITMODULES_URL_CONTENT_RE.search(cmd)
+             and (patterns.WRITE_REDIRECT_RE.search(cmd)
+                  or patterns.INPLACE_WRITE_RE.search(cmd)))
+            or patterns.GITMODULES_SECTION_INI_RE.search(cmd)
+            or patterns.GITMODULES_ADD_CLI_RE.search(cmd)
+            or patterns.GITMODULES_CONFIG_URL_CLI_RE.search(cmd))
+        traversal_hit = bool(
+            names_gitmodules and patterns.GITMODULES_PATH_TRAVERSAL_RE.search(cmd)
+            and (patterns.WRITE_REDIRECT_RE.search(cmd)
+                 or patterns.INPLACE_WRITE_RE.search(cmd)))
+        protocol_hit = bool(patterns.GITMODULES_PROTOCOL_ALLOW_RE.search(cmd)
+                             or patterns.GITMODULES_PROTOCOL_ALLOW_INI_RE.search(cmd))
+        if not (url_hit or traversal_hit or protocol_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GITMODULES")
+                or _gitmodules_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A submodule URL using the ext:: or file:// scheme is "
+                   "being set from a shell" if url_hit else
+                   "A submodule path containing a '..' traversal segment is "
+                   "being set from a shell" if traversal_hit else
+                   "protocol.ext.allow/protocol.file.allow is being enabled "
+                   "from a shell")
+        return _finish(Decision(action, "gitmodules-protect",
+                         f"{reason} — it runs automatically, with the "
+                         "invoking user's or CI's full privileges, on the "
+                         "next `git clone --recurse-submodules`/`git "
+                         "submodule update`. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_GITMODULES=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 def _service_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -4080,6 +4244,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.REGISTRY_CONFIG_PATH_RE, "a package-registry config"),
     (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
     (patterns.GIT_ATTRS_PATH_RE, "a .gitattributes file"),
+    (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),
     (patterns.SYSTEMD_UNIT_PATH_RE, "a systemd unit"),
     (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
     (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
@@ -4780,6 +4945,7 @@ _CORE_RULES = (
     rule_package_manifest_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
+    rule_gitmodules_protect,
     rule_service_persist_protect,
     rule_ld_preload_protect,
     rule_devcontainer_exec_protect,

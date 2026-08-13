@@ -172,6 +172,15 @@ class Policy:
     # git_config_exec's bang-only value check can't reach (no `!` required).
     # See rules.rule_git_attributes_exec_protect.
     git_attributes_exec: dict = field(default_factory=dict)
+    # .gitmodules submodule-hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers a submodule `url` using the `ext::`/`file://` scheme
+    # (git-remote-ext RCE), a submodule `path` with a `..` traversal segment
+    # (hooks-directory collision / write outside the intended directory),
+    # and setting `protocol.ext.allow`/`protocol.file.allow` to an allowing
+    # value (the override git's own 2.38.1+ default requires before either
+    # scheme runs at all). See rules.rule_gitmodules_protect.
+    gitmodules: dict = field(default_factory=dict)
     # Systemd unit / launchd persistence protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers /etc/systemd/{system,user}/*.service (+ .timer/.socket/
