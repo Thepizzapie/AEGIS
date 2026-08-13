@@ -3647,3 +3647,304 @@ FETCH_TO_FILE_VERB_RE = re.compile(
     r"|\bcertutil(?:\.exe)?\b[^|;&\n]{0,200}?-urlcache\b",
     re.IGNORECASE,
 )
+
+# ---- .gitmodules submodule hijack: ext:: transport RCE + path-traversal ----
+# hooks-directory collision --------------------------------------------------
+#
+# `.gitmodules` (superproject root, or nested inside a submodule's own
+# working tree) declares each submodule's `url` and `path` under a
+# `[submodule "<name>"]` section. Unlike `.git/hooks/*` or `.git/config`, it
+# is an ORDINARY TRACKED file — pushed, diffed, and reviewed like any other —
+# which is exactly what makes it a comfortable place to smuggle a detonator
+# wired to arm on a FUTURE, different git operation, by a teammate or CI, not
+# necessarily this session:
+#
+#   - `url = ext::<command>` invokes git's `git-remote-ext` transport, which
+#     runs <command> as a literal SHELL invocation to satisfy the "fetch" —
+#     a real, documented RCE primitive (git-remote-ext(1)), not an obscure
+#     trick. `url = file://<path>` is the second flagged scheme: a lower-
+#     severity but still-real local-disclosure/traversal primitive
+#     (CVE-2022-39253). Both fire on `git clone --recurse-submodules`, `git
+#     submodule update --init [--recursive]`, or a plain `git pull`/`fetch`
+#     when `submodule.recurse=true` is configured — none of which need to
+#     happen in THIS session for the payload to detonate.
+#   - `path = ` containing a `..` traversal segment lets git materialize a
+#     submodule's working tree (and, on vulnerable/older git, its
+#     `.git/modules/<name>` metadata) OUTSIDE the intended directory —
+#     historically enabling an overwrite into `.git/hooks/*` on `git clone
+#     --recurse-submodules` (CVE-2018-11235) or a case-insensitive-
+#     filesystem hooks-directory collision (CVE-2024-32002). This plants
+#     exactly the payload `rule_git_hooks_protect` exists to stop, arriving
+#     through a file that guard never inspects at all.
+#
+# Since git 2.38.1 (the CVE-2022-39253 fix), a plain `git submodule update`/
+# `clone --recurse-submodules` refuses `ext::`/`file://` submodule URLs
+# UNLESS `protocol.ext.allow`/`protocol.file.allow` is explicitly set to
+# `always`/`user` — real, meaningful friction, but not a guarantee: an
+# older/unpatched git, an already-permissive global config, or the agent
+# simply passing `-c protocol.ext.allow=always` itself all still fire it. So
+# this guard ALSO gates setting either config key to an allowing value at
+# all — the same "gate on the key/value pair alone, it has no other
+# legitimate purpose" reasoning `core.fsmonitor`/`core.sshCommand` already
+# use in `rule_git_attributes_exec_protect`.
+GITMODULES_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.gitmodules" + _CI_END,
+    re.IGNORECASE,
+)
+
+_GITMODULES_DANGEROUS_SCHEME = r"(?:ext::|file://)"
+
+# `\bpath`/`\burl` alone misses a `printf '...\npath = ...'`-built payload:
+# `\n` in a shell single/double-quoted argument is a LITERAL two-character
+# backslash-n (printf itself interprets it at runtime, not the shell), which
+# merges into "npath"/"nurl" as one contiguous word run and breaks `\b`'s
+# boundary requirement — the identical class of bug
+# `GIT_CONFIG_CREDENTIAL_HELPER_INI_RE`'s own comment already documents and
+# fixes for "helper" the same way (QA finding, verified during this guard's
+# own build, not a post-merge round: an unpaired `\bpath`/`\burl` silently
+# missed a realistic, non-adversarial heredoc/printf-built payload entirely,
+# not merely a disclosed gap). Each key check below pairs the ordinary `\b`
+# form with a literal `\\n` form for this reason.
+_GITMODULES_URL_KEY = r"(?:\burl|\\nurl)"
+_GITMODULES_PATH_KEY = r"(?:\bpath|\\npath)"
+
+# `url = ext::<command>` / `url = file://<path>` — INI form, matched against
+# any Edit/Write content (path-confirmed by GITMODULES_PATH_RE at the call
+# site) or a shell command's de-obfuscated scan surface (a heredoc/printf
+# building the same INI text).
+GITMODULES_URL_CONTENT_RE = re.compile(
+    _GITMODULES_URL_KEY + r"\s*=\s*['\"]?" + _GITMODULES_DANGEROUS_SCHEME,
+    re.IGNORECASE)
+
+# Path-independent staged-elsewhere-then-renamed form — mirrors
+# `GIT_HOOKS_CONFIG_INI_RE`'s/`GIT_CONFIG_BANG_VALUE_INI_RE`'s own reasoning:
+# a full `[submodule "name"]` section header is high-signal on its own
+# regardless of the destination filename an Edit/Write call used.
+GITMODULES_SECTION_INI_RE = re.compile(
+    r"\[submodule\s+\"[^\"\n]{0,200}\"\][^\[]{0,2000}(?:"
+    + _GITMODULES_URL_KEY + r"\s*=\s*['\"]?" + _GITMODULES_DANGEROUS_SCHEME + r"|"
+    + _GITMODULES_PATH_KEY + r"\s*=\s*['\"]?[^\n'\"]{0,200}\.\.[/\\])",
+    re.IGNORECASE,
+)
+
+# `path = ` whose value contains a `..` parent-traversal segment anywhere —
+# CVE-2018-11235/CVE-2024-32002-class hooks-directory collision / write
+# outside the intended submodule directory. Bounded single span (`{0,200}`,
+# not lazy-adjacent to another unbounded quantifier) — the same "one bounded
+# quantifier before a fixed literal is linear, not quadratic" shape this
+# file's other single-span checks already rely on (see `_CI_SEG`'s comment
+# for the class of blowup that only bites with TWO adjacent overlapping
+# quantifiers, which this pattern does not have).
+GITMODULES_PATH_TRAVERSAL_RE = re.compile(
+    _GITMODULES_PATH_KEY + r"\s*=\s*['\"]?[^\n'\"]{0,200}\.\.[/\\]", re.IGNORECASE)
+
+# `git submodule add <url> [<path>]` — the URL is the first non-flag
+# positional argument after `add`; reuses `_GIT_CONFIG_FLAG_TOKEN` (already
+# defined above for `GIT_CONFIG_BANG_VALUE_RE`) for the bounded flag-token
+# span between the subcommand and its first positional argument.
+# `{0,8}` bounded whitespace-token skip, not `_GIT_CONFIG_FLAG_TOKEN` — unlike
+# the bang-value/credential-helper CLI checks this pattern is modeled on,
+# `git submodule add`'s own flags (`-b <branch>`, `--name <name>`,
+# `--reference <repo>`, `--depth <n>`) and `git config`'s own `-f <file>`
+# take their value as a SEPARATE, space-joined token, not a glued `--flag=
+# value` — a flag-token-only skip loop never matches past `-b`/`-f` to find
+# the real target that follows one token later.
+_GIT_ARGSKIP = r"(?:\s+\S{1,100}){0,8}"
+
+GITMODULES_ADD_CLI_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,60}\bsubmodule\b[^|;&\n]{0,60}\badd\b"
+    + _GIT_ARGSKIP + r"\s+['\"]?"
+    + _GITMODULES_DANGEROUS_SCHEME,
+    re.IGNORECASE,
+)
+
+# `git config [-f .gitmodules] submodule.<name>.url <value>` (also reaches
+# `.git/config`, where a URL override has the identical live effect for an
+# already-initialized submodule) plus the inline `-c`/`--config`/
+# `--config-env` and `GIT_CONFIG_VALUE_n` forms — mirrors
+# `GIT_CONFIG_BANG_VALUE_RE`'s own three-alternative shape and its "value is
+# the token immediately after the key, not a freeform later occurrence"
+# anchoring (see that pattern's own comment for why: a freeform gap let an
+# unrelated later `!`/scheme-shaped substring inside an ordinary quoted
+# argument false-match).
+GITMODULES_CONFIG_URL_CLI_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,60}\bconfig\b" + _GIT_ARGSKIP + r"\s+"
+    r"submodule\.[^\s'\"=]{1,100}\.url\s+['\"]?" + _GITMODULES_DANGEROUS_SCHEME
+    + r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+submodule\.[^\s'\"=]{1,100}\.url=['\"]?"
+    + _GITMODULES_DANGEROUS_SCHEME
+    + r"|\bGIT_CONFIG_VALUE_\d+\s*=\s*['\"]?" + _GITMODULES_DANGEROUS_SCHEME,
+    re.IGNORECASE,
+)
+
+_PROTOCOL_ALLOW_VALUE = r"(?:always|user|true|1)\b"
+
+# `protocol.ext.allow`/`protocol.file.allow` set to an allowing value — the
+# exact override git's own 2.38.1+ default requires before an `ext::`/
+# `file://` submodule URL is allowed to run at all. Gated on the KEY alone
+# (any allowing value), the same "no safe/dangerous split, the key's only
+# purpose is permitting exactly this" reasoning `core.fsmonitor`/
+# `core.sshCommand` already use — see `rule_git_attributes_exec_protect`'s
+# own docstring.
+GITMODULES_PROTOCOL_ALLOW_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,60}\bconfig\b" + _GIT_ARGSKIP + r"\s+"
+    r"protocol\.(?:ext|file)\.allow\s+['\"]?" + _PROTOCOL_ALLOW_VALUE
+    + r"|(?<!\S)(?:-c|--config(?:-env)?)[\s=]+protocol\.(?:ext|file)\.allow=['\"]?"
+    + _PROTOCOL_ALLOW_VALUE
+    + r"|\bGIT_CONFIG_KEY_\d+\s*=\s*['\"]?protocol\.(?:ext|file)\.allow\b",
+    re.IGNORECASE,
+)
+GITMODULES_PROTOCOL_ALLOW_INI_RE = re.compile(
+    r"\[protocol\s+\"(?:ext|file)\"\][^\[]{0,500}\ballow\s*=\s*['\"]?"
+    + _PROTOCOL_ALLOW_VALUE,
+    re.IGNORECASE,
+)
+# Content-only check for a CONFIRMED git-config path — same reasoning
+# `GIT_CONFIG_HELPER_CONTENT_RE`'s own comment documents: an Edit's
+# new_string is typically just the changed line, not the `[protocol "ext"]`
+# header, which is old_string context that never appears in new_string.
+GITMODULES_PROTOCOL_ALLOW_CONTENT_RE = re.compile(
+    r"\ballow\s*=\s*['\"]?" + _PROTOCOL_ALLOW_VALUE, re.IGNORECASE)
+
+# A VALUE-ONLY Edit diff (`old_string`/`new_string` covering just the
+# changed VALUE text, e.g. `old_string="https://example.com/foo.git",
+# new_string="ext::sh -c id"`) is a realistic, non-adversarial editing
+# shape — Claude Code's own Edit tool operates on an exact substring match,
+# not a whole-line replace — that every key-anchored check above (`url =`/
+# `path =`/`allow =`) misses entirely, since neither the key name nor the
+# `=` separator appears in a value-only diff at all (QA finding,
+# independent adversarial review: this was the single most severe finding
+# of that round — a silent ALLOW, under `mode: deny` too, on a direct edit
+# to `.gitmodules` itself, no shell, no obfuscation, no cleverness beyond
+# an ordinary "change the submodule URL" instruction). Once the
+# destination file is independently CONFIRMED (by `GITMODULES_PATH_RE`/
+# `GIT_CONFIG_FILE_PATH_RE` at the call site, not by this pattern), a bare
+# occurrence of the scheme needs no surrounding key context to be
+# high-signal: there is no legitimate reason literal `ext::`/`file://`
+# text appears in an edit to `.gitmodules` OR any real git-config file at
+# all (`.git/config`'s own `submodule.<name>.url` override has the
+# identical live effect for an already-initialized submodule — the second
+# critical finding of that same round).
+#
+# Split into two, NOT one combined bare-scheme pattern, and applied with
+# different path-scoping at the call site: `ext::` has NO legitimate use
+# ANYWHERE in a git-config file (it is git's own "run this as a shell
+# command" transport, full stop), so it is safe to bare-match across any
+# CONFIRMED git-config file, not just `.gitmodules`. `file://` is NOT the
+# same — `git remote add origin file:///path/to/repo` (a plain, non-
+# submodule remote pointing at a local mirror/testing checkout) is a real,
+# common, entirely benign workflow that would false-positive on every
+# ordinary `.git/config` edit if bare-matched there too. Scoping the bare
+# `file://` check to `.gitmodules` alone (where the CVE-2022-39253 risk
+# actually lives) keeps that ordinary workflow working while still closing
+# the value-only-diff gap for the primary target.
+GITMODULES_EXT_SCHEME_BARE_RE = re.compile(r"ext::", re.IGNORECASE)
+GITMODULES_FILE_SCHEME_BARE_RE = re.compile(r"file://", re.IGNORECASE)
+
+# Same value-only-diff reasoning, scoped to `.gitmodules` alone (NOT any
+# git-config file — see below for why): a bare `..` + separator needs no
+# `path =` key context once the destination is confirmed as `.gitmodules`
+# itself. Deliberately NOT applied when only `GIT_CONFIG_FILE_PATH_RE`
+# confirms the path (i.e. NOT for a bare `.git/config`/`.gitconfig` edit):
+# unlike the scheme check above, git documents a LEGITIMATE relative
+# submodule URL convention (`url = ../sibling-repo.git`, resolved relative
+# to the superproject's own remote) — a bare `..` scan applied to `url =`
+# values project-wide would false-positive on that real, sanctioned
+# pattern. `.gitmodules`'s `path =` field has no such legitimate use for
+# `..` at all (a submodule's checkout location is always inside the
+# repository), so scoping the bare check to that one file, not the
+# scheme-agnostic git-config surface, keeps the real relative-URL
+# convention working while still closing the value-only-diff gap for the
+# traversal primitive specifically.
+GITMODULES_TRAVERSAL_BARE_RE = re.compile(r"\.\.[/\\]", re.IGNORECASE)
+
+# `patch`/`git apply` write `.gitmodules`'s new content via their OWN
+# internal file write, not a shell redirect/in-place-editor invocation —
+# neither is recognized by `WRITE_REDIRECT_RE`/`INPLACE_WRITE_RE` (QA
+# finding, independent adversarial review, confirmed end-to-end against
+# real `patch`/`git apply` in a scratch repo: a minimal unified diff
+# hunk — no `[submodule "name"]` header needed in the hunk context at all
+# — silently rewrote `.gitmodules` with an `ext::` payload with zero
+# detection at any mode). A minimal `patch -p1 <<EOF ... EOF`/`git apply
+# --unidiff-zero` invocation has no `>`/`-i`-shaped write verb at all — the
+# `patch`/`apply` subcommand IS the write, the same "no separate verb
+# needed" reasoning `GITMODULES_ADD_CLI_RE`/`GITMODULES_CONFIG_URL_CLI_RE`
+# already apply for `git submodule add`/`git config`. Disclosed, not fixed,
+# for every OTHER sibling `*_protect` guard's own write-verb checks in this
+# file — the same class of gap, closed here first per this round's QA
+# scope, not yet backported.
+GITMODULES_PATCH_APPLY_RE = re.compile(
+    r"\bpatch\b|\bgit\b[^|;&\n]{0,60}\bapply\b", re.IGNORECASE)
+
+# `_GIT_ARGSKIP`'s bounded `{0,8}` token cap (needed to keep the pattern
+# ReDoS-safe — an UNBOUNDED skip loop is the exact catastrophic-
+# backtracking shape this file's own `_CI_SEG`/`_CI_MULTI` comments
+# describe) is, BY CONSTRUCTION, beatable by padding past it: any FIXED
+# cap can always be exceeded with enough real, valid, idempotent flags (QA
+# finding, independent adversarial review, confirmed as a genuinely valid,
+# real command: `git config --includes --no-includes --includes
+# --no-includes --includes --no-includes --includes --no-includes --file
+# .gitmodules submodule.evil.url ext::true` actually ran and actually
+# wrote the payload). A fixed-position adjacency requirement is the wrong
+# shape to defend this specific surface — a SAME-CLAUSE presence check
+# (git/config-or-submodule-add/the target key/the dangerous scheme all
+# appear SOMEWHERE in the same `;`/`&`/`|`/newline-delimited clause,
+# order-independent) closes the padding class entirely. Modeled directly
+# on `_find_word_and_predicate_hit`'s own clause-split technique (reusing
+# `_CLAUSE_SPLIT_RE`, already defined above) rather than one combined
+# lookahead-chained regex: an EARLIER version of this fix used four
+# `(?=[^\n]{0,4000}...)` lookaheads in one pattern and measured ~0.9-1.6s
+# against a 20K-char adversarial input (`re.search` retries all four
+# bounded lookaheads at EVERY starting position along the string, an
+# O(n × window) cost this file's own bounded-window patterns elsewhere
+# avoid by anchoring to a fixed prefix first) — a fail-open-on-hook-
+# timeout risk, the same class of bug this file's `EXFIL_RE`/
+# `FETCH_TO_FILE_VERB_RE` histories already document and fix. Splitting on
+# real shell separators and checking each independent, already-compiled
+# component regex against the SAME clause (four cheap, bounded `.search()`
+# calls per clause, no lookahead chaining at all) reproduces the identical
+# real-command reproduction from the QA finding above at sub-millisecond
+# cost. Used as an ADDITIONAL check alongside the existing
+# adjacency-anchored `GITMODULES_CONFIG_URL_CLI_RE`/`GITMODULES_ADD_CLI_RE`,
+# not a replacement — the precise form still drives the common-case reason
+# message, and same-clause scoping (unlike the whole-command scan
+# `gitattrs_wiring_hit` deliberately uses) keeps this narrower than that
+# guard's own disclosed cross-clause false-positive trade-off.
+_GITMODULES_GIT_WORD_RE = re.compile(r"\bgit\b", re.IGNORECASE)
+_GITMODULES_CONFIG_WORD_RE = re.compile(r"\bconfig\b", re.IGNORECASE)
+_GITMODULES_SUBMODULE_WORD_RE = re.compile(r"\bsubmodule\b", re.IGNORECASE)
+_GITMODULES_ADD_WORD_RE = re.compile(r"\badd\b", re.IGNORECASE)
+_GITMODULES_SUBMODULE_URL_KEY_RE = re.compile(
+    r"submodule\.[^\s'\"=]{1,100}\.url\b", re.IGNORECASE)
+# Both schemes, unlike the Edit/Write/MCP bare-content check's split
+# ext-only-vs-file-scoped-to-.gitmodules distinction above: these two
+# helpers already require "submodule"+"add"/"config"+the `.url` key to
+# co-occur in the SAME clause, so a `file://` scheme here is unambiguously
+# submodule-related, not an ordinary `git remote add ... file://...` — the
+# false-positive concern that motivated scoping `file://` narrowly there
+# does not apply here.
+_GITMODULES_ANY_SCHEME_RE = re.compile(_GITMODULES_DANGEROUS_SCHEME, re.IGNORECASE)
+
+
+def gitmodules_config_url_loose_hit(cmd: str) -> bool:
+    """True if the SAME clause invokes `git`+`config`, names a
+    `submodule.<name>.url` key, and carries the dangerous scheme —
+    order-independent, closing `_GIT_ARGSKIP`'s fixed-cap padding bypass."""
+    for clause in _CLAUSE_SPLIT_RE.split(cmd):
+        if (_GITMODULES_GIT_WORD_RE.search(clause)
+                and _GITMODULES_CONFIG_WORD_RE.search(clause)
+                and _GITMODULES_SUBMODULE_URL_KEY_RE.search(clause)
+                and _GITMODULES_ANY_SCHEME_RE.search(clause)):
+            return True
+    return False
+
+
+def gitmodules_add_loose_hit(cmd: str) -> bool:
+    """Same technique for `git submodule add` — see
+    `gitmodules_config_url_loose_hit`'s own docstring."""
+    for clause in _CLAUSE_SPLIT_RE.split(cmd):
+        if (_GITMODULES_GIT_WORD_RE.search(clause)
+                and _GITMODULES_SUBMODULE_WORD_RE.search(clause)
+                and _GITMODULES_ADD_WORD_RE.search(clause)
+                and _GITMODULES_ANY_SCHEME_RE.search(clause)):
+            return True
+    return False
