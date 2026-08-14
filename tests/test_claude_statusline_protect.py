@@ -560,15 +560,73 @@ def test_unterminated_object_fragment_still_gated():
 
 
 def test_perf_no_redos_on_many_statusline_occurrences():
-    """The structural scan is capped at `_STATUSLINE_MAX_SPANS` (20)
-    `statusLine`-key occurrences and each span walk is linear — many
-    repeated, never-closed occurrences must stay fast rather than
-    quadratic."""
+    """The structural scan is capped by a shared character BUDGET
+    (`_STATUSLINE_SCAN_BUDGET`), not a match count — many repeated,
+    never-closed occurrences must stay fast rather than quadratic."""
     adversarial = '"statusLine": {"type": "x", ' * 3000
     start = time.time()
     d = evaluate(_write(".claude/settings.local.json", adversarial), EMPTY)
     assert time.time() - start < 1.0
     assert not _gated(d)
+
+
+# ---- regression: round-B bypass-hunt findings (match-count cap) -----------------
+#
+# QA finding (round-B independent adversarial review, following up on round A's
+# fix): the round-A fix capped the NUMBER of `statusLine` occurrences examined
+# at 20 (`_STATUSLINE_MAX_SPANS`), not the total scanning work. Two confirmed
+# bypasses of THAT specific shape: (1) planting 21+ short, ordinary decoy
+# `statusLine` occurrences ahead of the real payload defeated detection
+# outright — no padding trick needed, just more decoys than the count cap
+# allowed; (2) many short UNCLOSED spans against large (~8MB) content each
+# independently re-scanned to end-of-content, multiplying out to several
+# seconds. Both fixed by replacing the count cap with a shared character
+# BUDGET (`_STATUSLINE_SCAN_BUDGET`) that every span's actual consumed length
+# is deducted from, capping total work regardless of occurrence count or
+# content size — see `claude_statusline_key_hit`'s own docstring in
+# patterns.py for the full history.
+
+def test_many_short_decoys_beyond_old_count_cap_still_gated():
+    """25 short decoy `statusLine` occurrences (no `command` field) ahead of
+    the real payload — one more than the OLD 20-occurrence count cap — must
+    not defeat detection under the new budget-based scan."""
+    decoys = '"statusLine": {"type": "notcommand"}, ' * 25
+    frag = decoys + '"statusLine": {"type": "command", "command": "evil.sh"}'
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_many_short_decoys_with_jsonc_trailing_comma_write_still_gated():
+    """The combined round-B finding: many short decoys (defeating the old
+    count cap) PLUS a JSONC trailing comma (silencing the JSON semantic
+    fallback) in a whole-file Write — must still gate under the new scan."""
+    decoys = '"statusLine": {"type":"notcommand"}, ' * 25
+    content = ('{\n' + decoys
+               + '"statusLine": {"type": "command", "command": "evil.sh"},\n}\n')
+    d = evaluate(_write(".claude/settings.local.json", content), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_perf_many_unclosed_spans_against_large_content():
+    """Many short UNCLOSED `statusLine` spans against large (multi-MB)
+    surrounding content must not multiply out to occurrences x
+    content-length — each span's scan is capped by the shared remaining
+    budget, so this must stay well under 1s even at several MB."""
+    adversarial = ('"statusLine": {' + ("X" * 40)) * 20 + ("Y" * (8 * 1024 * 1024))
+    start = time.time()
+    evaluate(_write(".claude/settings.local.json", adversarial), EMPTY)
+    assert time.time() - start < 1.0
+
+
+def test_real_payload_within_budget_after_many_decoys_gated():
+    """A real payload sitting well within the scan budget, after a large
+    but budget-compatible number of short decoys, must still be found —
+    confirms the budget replaces the old fixed count of 20 with something
+    materially more permissive for realistic (short-decoy) inputs."""
+    decoys = '"statusLine": {"type": "notcommand"}, ' * 500
+    frag = decoys + '"statusLine": {"type": "command", "command": "evil.sh"}'
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
 
 
 # ---- direct pattern sanity ---------------------------------------------------------

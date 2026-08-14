@@ -3770,35 +3770,47 @@ def rule_claude_statusline_protect(ev: Event, policy=None) -> Optional[Decision]
     shell branch's write-verb checks, the same inherited gap every other
     guard in this file already discloses.
 
-    QA history (two independent agents, bypass-hunting and design/
-    consistency, run in parallel — the same convention every guard in this
-    file follows): design/consistency review found no confirmed defects —
-    verified the ``claude_statusline`` knob is wired everywhere its
-    siblings are (``Policy``, all three ``loader.py`` spots, both
-    ``skills.py`` knob lists, the remedy table, README), verified this
-    guard's precedence relative to `rule_self_protect` by actually running
-    it through `evaluate()`, and confirmed the escape-hatch/mode/monitor
-    conventions match every sibling guard exactly. Bypass-hunting found and
-    closed the round's one real, severe finding: the original
-    `CLAUDE_STATUSLINE_KEY_RE` used a fixed-width lazy character-class
-    window (`[^{}]{0,300}?`) between the `statusLine` and `command` keys —
-    a single decoy field long enough to push `command` past the width bound
-    (no obfuscation needed, an ordinary-looking padded field) silently
-    missed a live payload, and, independently and more severely, the
-    class's blanket brace exclusion meant ANY nested sub-object placed
-    before `command` — zero padding required — broke the match
-    unconditionally; both landed the exact working `{"statusLine":
+    QA history (three independent adversarial-review rounds — round A
+    bypass-hunting paired with a parallel design/consistency pass, round B
+    a bypass-hunting follow-up specifically re-verifying round A's fix —
+    the same convention every guard in this file follows): design/
+    consistency (round A) found no confirmed defects — verified the
+    ``claude_statusline`` knob is wired everywhere its siblings are
+    (``Policy``, all three ``loader.py`` spots, both ``skills.py`` knob
+    lists, the remedy table, README), verified this guard's precedence
+    relative to `rule_self_protect` by actually running it through
+    `evaluate()`, and confirmed the escape-hatch/mode/monitor conventions
+    match every sibling guard exactly. Round A's bypass-hunting found and
+    closed one real, severe finding: the original `CLAUDE_STATUSLINE_KEY_RE`
+    used a fixed-width lazy character-class window (`[^{}]{0,300}?`)
+    between the `statusLine` and `command` keys — a single decoy field
+    long enough to push `command` past the width bound (no obfuscation
+    needed) silently missed a live payload, and, independently and more
+    severely, the class's blanket brace exclusion meant ANY nested
+    sub-object placed before `command` — zero padding required — broke the
+    match unconditionally; both landed the exact working `{"statusLine":
     {"type":"command","command":"..."}}` shape with a silent ALLOW instead
-    of ASK/DENY. See `_STATUSLINE_KEY_EXISTS_RE`'s docstring in patterns.py
-    for the full finding and the brace-depth-aware structural scan
-    (`claude_statusline_key_hit()`/`_json_object_span()`) that replaced the
-    bounded regex to close it. The round's remaining finding (the jq
-    computed-key-name gap above) was judged an accepted, inherited,
-    non-guard-specific limitation rather than fixed, matching how this
-    codebase treats the identical gap in `CLAUDE_HOOKS_JQ_RE`. Full suite
-    green throughout, with a dedicated perf test confirming the new
-    structural scan stays linear-time under adversarial input (long padding,
-    many repeated key occurrences, and deeply/never-closed nested objects)."""
+    of ASK/DENY. Fixed by replacing the bounded regex with a brace-depth-
+    aware structural scan (`claude_statusline_key_hit()`/
+    `_json_object_span()`). Round B, re-verifying that fix specifically,
+    confirmed both round-A payloads now correctly gate, then found the
+    FIX's own new cap was itself gameable: capping the NUMBER of
+    `statusLine` occurrences examined (20) rather than total scanning work
+    let 21+ short, ordinary-looking decoy occurrences push a real payload
+    out of range with no padding trick at all, and independently let many
+    short UNCLOSED decoy spans against large (~8 MB) content each re-scan
+    to end-of-content, multiplying out to several seconds. See
+    `_json_object_span`'s and `claude_statusline_key_hit`'s own docstrings
+    in patterns.py for the full round-B history and the shared character-
+    BUDGET replacement (`_STATUSLINE_SCAN_BUDGET`) that closed both by
+    capping total work instead of occurrence count. Both rounds' remaining
+    finding (the jq computed-key-name gap disclosed above) was judged an
+    accepted, inherited, non-guard-specific limitation rather than fixed,
+    matching how this codebase treats the identical gap in
+    `CLAUDE_HOOKS_JQ_RE`. Full suite green throughout every round, with
+    dedicated perf tests confirming the scan stays fast under adversarial
+    input at each stage (long padding, nested decoys, many repeated key
+    occurrences at multi-MB scale, deeply/never-closed nested objects)."""
     cfg = getattr(policy, "claude_statusline", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

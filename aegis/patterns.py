@@ -2563,27 +2563,49 @@ CLAUDE_HOOKS_JQ_RE = re.compile(
 # backtracking risk on its own either.
 _STATUSLINE_KEY_EXISTS_RE = re.compile(r'["\']statusLine["\']\s*:\s*\{', re.IGNORECASE)
 _STATUSLINE_COMMAND_KEY_RE = re.compile(r'["\']command["\']\s*:', re.IGNORECASE)
-_STATUSLINE_MAX_SPANS = 20
+# Shared scanning budget for one `claude_statusline_key_hit()` call — 256 KiB,
+# generous for any realistic hand-edited settings file (a real one is a few
+# KB at most). See that function's own docstring below for why this is a
+# character BUDGET shared across every `statusLine` occurrence, not a count
+# of occurrences examined (the round-A fix's original, flawed shape).
+_STATUSLINE_SCAN_BUDGET = 262144
 
 
-def _json_object_span(content: str, open_brace_idx: int) -> str:
+def _json_object_span(content: str, open_brace_idx: int, max_chars: int) -> str:
     """Return the substring of ``content`` starting at the opening ``{`` at
     ``open_brace_idx`` through its brace-depth-matched closing ``}`` — or
-    through end-of-string if the object is never closed within ``content``
-    (an ordinary Edit ``new_string`` fragment routinely ends mid-object,
-    since the surrounding context sits outside the diff). Tracks whether the
-    scan is inside a quoted JSON string (with ``\\``-escape awareness) so a
-    literal ``{``/``}`` character INSIDE a string value — a command whose
-    own text happens to contain a brace — doesn't desync the depth count.
-    Single forward pass, linear in the remaining content length; no
-    backtracking, so no padding-length or nesting-depth attack surface the
-    way a bounded regex span has (see `_STATUSLINE_KEY_EXISTS_RE`'s own
-    docstring above for the two confirmed bypasses this replaces)."""
+    through end-of-string / ``max_chars`` (whichever comes first) if the
+    object is never closed within that span (an ordinary Edit ``new_string``
+    fragment routinely ends mid-object, since the surrounding context sits
+    outside the diff). Tracks whether the scan is inside a quoted JSON
+    string (with ``\\``-escape awareness) so a literal ``{``/``}`` character
+    INSIDE a string value — a command whose own text happens to contain a
+    brace — doesn't desync the depth count. Single forward pass, and now
+    hard-capped at ``max_chars`` from ``open_brace_idx`` regardless of
+    whether/where the object actually closes.
+
+    QA finding (round B, independent adversarial review): the FIRST version
+    of this function had no cap at all — an unclosed object scanned all the
+    way to end-of-content unconditionally, relying entirely on the CALLER
+    capping the NUMBER of `statusLine` occurrences examined
+    (`_STATUSLINE_MAX_SPANS = 20`) to bound total work. Confirmed,
+    reproduced: many short UNCLOSED decoy occurrences against LARGE content
+    (~8 MB) each independently re-scanned to the same end-of-content, so
+    total work was occurrences × content-length, not O(content-length) — an
+    8 MB payload measured ~9s, well past this file's own established
+    ~1s red line for a hook that must not fail-open on timeout (the same
+    "a non-escapable/human-gated guard hanging IS a bypass" principle
+    `CI_WORKFLOW_PATH_RE`/`FIND_PROTECTED_RE`'s own comments document
+    elsewhere in this file). Passing the REMAINING budget in as `max_chars`
+    and decrementing it by each span's actual length (see
+    `claude_statusline_key_hit` below) means a single span can never itself
+    consume more than what's left of the shared budget, closing this
+    regardless of how many occurrences precede it."""
+    n = min(len(content), open_brace_idx + max(0, max_chars))
     depth = 0
     in_str = False
     esc = False
     i = open_brace_idx
-    n = len(content)
     while i < n:
         ch = content[i]
         if in_str:
@@ -2603,29 +2625,50 @@ def _json_object_span(content: str, open_brace_idx: int) -> str:
                 if depth == 0:
                     return content[open_brace_idx:i + 1]
         i += 1
-    return content[open_brace_idx:]
+    return content[open_brace_idx:n]
 
 
 def claude_statusline_key_hit(content: str) -> bool:
     """High-signal textual co-occurrence check: a `statusLine` object that
     structurally CONTAINS a `command` key anywhere within its own value
     (including inside a nested sub-object, which real Claude Code configs
-    never have but a decoy might) — robust against both the padding-length
-    and nested-decoy bypasses a fixed-width regex window has (see
-    `_STATUSLINE_KEY_EXISTS_RE`'s docstring above for the full QA history).
-    Bounded to the first `_STATUSLINE_MAX_SPANS` `statusLine`-key
-    occurrences in `content` — a real settings file has at most one; more
-    than a handful is itself a sign of adversarial/pathological input, and
-    examining a first several is sufficient for real-world detection while
-    keeping total work linear rather than quadratic in content length."""
+    never have but a decoy might) — robust against the padding-length and
+    nested-decoy bypasses a fixed-width regex window has (see
+    `_STATUSLINE_KEY_EXISTS_RE`'s docstring above for that round-A QA
+    history).
+
+    QA finding (round B, independent adversarial review): the round-A fix
+    capped the NUMBER of `statusLine` occurrences examined at 20
+    (`_STATUSLINE_MAX_SPANS`), not the total scanning work — two
+    confirmed, reproduced bypasses of THAT shape specifically: (1) planting
+    21+ short, ordinary-looking decoy `statusLine` occurrences (no
+    `command` field, no padding trick) ahead of the real payload pushed it
+    past the 20th and defeated detection outright, silently ALLOWing a
+    live, working payload; (2) the count cap didn't bound PER-SPAN cost
+    either — see `_json_object_span`'s own docstring for the resulting
+    occurrences × content-length blowup on large content. A shared
+    CHARACTER BUDGET (`_STATUSLINE_SCAN_BUDGET`, 256 KiB) replaces the
+    count cap and closes both at once: every span's actual consumed length
+    is deducted from one running budget for the whole call, so (a) many
+    SHORT decoys consume proportionally little budget — thousands are
+    tolerated before a same-budget real payload would be pushed out of
+    range, not just 20 — and (b) total work across every span in a call is
+    bounded by the budget regardless of occurrence count or content size,
+    since `_json_object_span` itself now refuses to scan past its
+    remaining share. Honest residual gap, the same "bounded window, not an
+    unbounded parse" trade-off every sibling guard in this file discloses
+    for its own scan width: a real `statusLine`+`command` pair positioned
+    entirely past the 256 KiB budget (behind that much OTHER content in a
+    single write) is not reached — judged acceptable given no real
+    `.claude/settings.local.json` is remotely this large."""
     if not content:
         return False
-    spans_checked = 0
+    budget = _STATUSLINE_SCAN_BUDGET
     for m in _STATUSLINE_KEY_EXISTS_RE.finditer(content):
-        spans_checked += 1
-        if spans_checked > _STATUSLINE_MAX_SPANS:
+        if budget <= 0:
             break
-        span = _json_object_span(content, m.end() - 1)
+        span = _json_object_span(content, m.end() - 1, budget)
+        budget -= len(span)
         if _STATUSLINE_COMMAND_KEY_RE.search(span):
             return True
     return False
