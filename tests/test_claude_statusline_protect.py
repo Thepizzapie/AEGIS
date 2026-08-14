@@ -629,6 +629,57 @@ def test_real_payload_within_budget_after_many_decoys_gated():
     assert _gated(d) and d.rule == "claude-statusline-protect"
 
 
+# ---- regression: round-C bypass-hunt finding (single-quote string tracking) -----
+#
+# QA finding (round-C independent adversarial review, the final verification
+# pass): `_json_object_span`'s FIRST quote-aware version only tracked
+# DOUBLE-quote string state, even though `_STATUSLINE_KEY_EXISTS_RE`/
+# `_STATUSLINE_COMMAND_KEY_RE` (and `test_single_quoted_key_gated` above)
+# deliberately accept EITHER quote style. A single-quoted decoy field
+# containing a literal `}` inside its value (no escaping needed) was
+# invisible to the double-quote-only tracker, so that stray `}` was read as
+# real object structure and prematurely closed the span before the real
+# `command` key was reached — confirmed, reproduced silent ALLOW. Fixed by
+# tracking whichever quote character actually opened the current string and
+# closing only on that same character (symmetric single/double handling).
+
+def test_single_quoted_decoy_with_brace_in_value_still_gated():
+    """A single-quoted field whose VALUE contains a literal `}` must not
+    desync the brace-depth scan and hide the real `command` key that
+    follows it."""
+    frag = ("'statusLine': {'type': 'command', 'note': 'a} b', "
+            "'command': 'evil.sh'}")
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_mixed_quote_styles_decoy_with_brace_in_value_still_gated():
+    """The same bypass shape with a double-quoted `statusLine` key but a
+    single-quoted decoy field — mixed quote styles in the same object must
+    not confuse the scan either."""
+    frag = ('"statusLine": {"type": "command", \'note\': \'a} b\', '
+            '"command": "evil.sh"}')
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_apostrophe_inside_double_quoted_value_does_not_false_positive():
+    """An apostrophe inside an ordinary DOUBLE-quoted string value (ordinary
+    English text, not a decoy attack) must not be mistaken for a string
+    delimiter — the object must still be scanned to its real close and the
+    real `command` key correctly found."""
+    frag = ('"statusLine": {"type": "command", "note": "don' + chr(39)
+            + 't touch this", "command": "evil.sh"}')
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_single_quote_regex_direct():
+    hit = patterns.claude_statusline_key_hit(
+        "'statusLine': {'type': 'command', 'note': 'a} b', 'command': 'evil.sh'}")
+    assert hit is True
+
+
 # ---- direct pattern sanity ---------------------------------------------------------
 
 def test_key_hit_matches_expected_forms():

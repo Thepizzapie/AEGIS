@@ -2600,24 +2600,48 @@ def _json_object_span(content: str, open_brace_idx: int, max_chars: int) -> str:
     and decrementing it by each span's actual length (see
     `claude_statusline_key_hit` below) means a single span can never itself
     consume more than what's left of the shared budget, closing this
-    regardless of how many occurrences precede it."""
+    regardless of how many occurrences precede it.
+
+    QA finding (round C, independent adversarial review): this function's
+    FIRST quote-aware version only tracked DOUBLE-quote (``"``) string
+    state — but `_STATUSLINE_KEY_EXISTS_RE`/`_STATUSLINE_COMMAND_KEY_RE`
+    (and the test suite's own `test_single_quoted_key_gated`) both
+    deliberately accept SINGLE-quoted keys too, the same "either quote
+    style" convention `CLAUDE_HOOKS_KEY_RE` uses. A confirmed, reproduced
+    bypass: a single decoy field with a SINGLE-quoted value containing a
+    literal ``}`` (e.g. ``'note': 'a} b'``) was invisible to a
+    double-quote-only string tracker, so that stray ``}`` was read as real
+    object structure and prematurely closed the span before the real
+    `command` key was reached — no escaping or obfuscation needed, just an
+    ordinary-looking decoy value. Fixed by tracking whichever quote
+    character actually opened the current string (``quote_char``, either
+    ``"`` or ``'``) and only closing on that SAME character — symmetric
+    handling for both, matching the dual-quote acceptance everywhere else
+    in this guard. Safe for genuine double-quoted-only JSON too: outside of
+    a string, real JSON syntax never contains a bare apostrophe (only
+    structural characters, literals, and numbers), so treating a stray
+    ``'`` as a potential string delimiter there cannot misfire on
+    legitimate double-quoted content — and a ``'`` appearing INSIDE an
+    already-open ``"..."`` string is simply ignored, same as any other
+    ordinary character, since only the character that opened a string can
+    close it."""
     n = min(len(content), open_brace_idx + max(0, max_chars))
     depth = 0
-    in_str = False
+    quote_char = None
     esc = False
     i = open_brace_idx
     while i < n:
         ch = content[i]
-        if in_str:
+        if quote_char is not None:
             if esc:
                 esc = False
             elif ch == "\\":
                 esc = True
-            elif ch == '"':
-                in_str = False
+            elif ch == quote_char:
+                quote_char = None
         else:
-            if ch == '"':
-                in_str = True
+            if ch == '"' or ch == "'":
+                quote_char = ch
             elif ch == "{":
                 depth += 1
             elif ch == "}":

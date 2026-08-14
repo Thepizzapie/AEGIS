@@ -3770,10 +3770,11 @@ def rule_claude_statusline_protect(ev: Event, policy=None) -> Optional[Decision]
     shell branch's write-verb checks, the same inherited gap every other
     guard in this file already discloses.
 
-    QA history (three independent adversarial-review rounds — round A
-    bypass-hunting paired with a parallel design/consistency pass, round B
-    a bypass-hunting follow-up specifically re-verifying round A's fix —
-    the same convention every guard in this file follows): design/
+    QA history (four independent adversarial-review rounds — round A
+    bypass-hunting paired with a parallel design/consistency pass, rounds B
+    and C each a bypass-hunting follow-up specifically re-verifying the
+    prior round's fix — the same convention every guard in this file
+    follows): design/
     consistency (round A) found no confirmed defects — verified the
     ``claude_statusline`` knob is wired everywhere its siblings are
     (``Policy``, all three ``loader.py`` spots, both ``skills.py`` knob
@@ -3803,14 +3804,29 @@ def rule_claude_statusline_protect(ev: Event, policy=None) -> Optional[Decision]
     `_json_object_span`'s and `claude_statusline_key_hit`'s own docstrings
     in patterns.py for the full round-B history and the shared character-
     BUDGET replacement (`_STATUSLINE_SCAN_BUDGET`) that closed both by
-    capping total work instead of occurrence count. Both rounds' remaining
-    finding (the jq computed-key-name gap disclosed above) was judged an
-    accepted, inherited, non-guard-specific limitation rather than fixed,
-    matching how this codebase treats the identical gap in
+    capping total work instead of occurrence count. Round C, the final
+    verification pass, confirmed the budget mechanism itself was solid (no
+    crashes, no negative/off-by-one budget bugs, correct behavior on a
+    giant-single-decoy edge case, no quadratic blowup on 140K+ tiny
+    occurrences) but found one fresh, unrelated bypass: `_json_object_span`
+    only tracked DOUBLE-quote string state even though this guard
+    deliberately accepts EITHER quote style for the keys themselves (see
+    `test_single_quoted_key_gated`) — a single-quoted decoy field whose
+    value contained a literal `}` (no escaping needed) was invisible to
+    that tracker, prematurely closing the span before the real `command`
+    key. Fixed by tracking whichever quote character opened the current
+    string and closing only on that same character, symmetric for both
+    styles — see `_json_object_span`'s own docstring for why this can't
+    misfire on genuine double-quoted-only JSON (a bare apostrophe never
+    appears outside a string in valid JSON syntax). All four rounds'
+    remaining finding (the jq computed-key-name gap disclosed above) was
+    judged an accepted, inherited, non-guard-specific limitation rather
+    than fixed, matching how this codebase treats the identical gap in
     `CLAUDE_HOOKS_JQ_RE`. Full suite green throughout every round, with
     dedicated perf tests confirming the scan stays fast under adversarial
     input at each stage (long padding, nested decoys, many repeated key
-    occurrences at multi-MB scale, deeply/never-closed nested objects)."""
+    occurrences at multi-MB scale, deeply/never-closed and mixed-quote
+    nested objects)."""
     cfg = getattr(policy, "claude_statusline", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
