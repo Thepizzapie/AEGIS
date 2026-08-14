@@ -2514,14 +2514,121 @@ CLAUDE_HOOKS_JQ_RE = re.compile(
 # dangerous SHAPE, not just the key" trade-off `CLAUDE_HOOKS_KEY_RE`'s own
 # docstring credits to `PACKAGE_SCRIPTS_PATH_RE`/`LIFECYCLE_SCRIPT_KEY_RE`,
 # applied one level deeper here since the bare key alone is ambiguous where
-# `hooks` was not. Bounded lazy `{0,300}?` span between the two keys (not
-# unbounded) for the same catastrophic-backtracking reason every bounded gap
-# in this file is bounded — see `FIND_PROTECTED_RE`'s own comment above for
-# the mechanism and the measured hang this shape avoids.
-CLAUDE_STATUSLINE_KEY_RE = re.compile(
-    r'["\']statusLine["\']\s*:\s*\{[^{}]{0,300}?["\']command["\']\s*:',
-    re.IGNORECASE,
-)
+# `hooks` was not.
+#
+# QA finding (independent adversarial review, round A): an earlier draft
+# bounded the span between the two keys with a fixed-width lazy window
+# (`[^{}]{0,300}?`) — the same shape `FIND_PROTECTED_RE`'s own comment
+# credits for avoiding catastrophic backtracking elsewhere in this file, but
+# WRONG for a co-occurring-key check specifically, for two independent,
+# both CONFIRMED-reproduced reasons a same-length window doesn't have when
+# checking for only ONE key: (1) a single decoy field long enough to push
+# `"command"` past the width bound (a plausible, cheap `"junk": "<300+
+# chars>"` sibling field) made the match silently miss a live payload —
+# unlike `FIND_PROTECTED_RE`'s target (a target PATH, which has no reason
+# to be arbitrarily long), a JSON object's own field values are exactly the
+# attacker-controlled padding this shape needed and never got; (2) far
+# worse, the character class `[^{}]` excludes braces ENTIRELY, so ANY
+# nested sub-object before `command` at all — `"decoy": {"x": 1}`, zero
+# padding needed — broke the match immediately regardless of width, since
+# nothing in that class can ever cross a `{`. Both landed the exact
+# malicious `{"statusLine":{"type":"command","command":"..."}}` shape
+# Claude Code executes as its own subprocess on the very next debounced UI
+# tick, silently ALLOWed instead of ASK/DENY. Combined with (2) also
+# incidentally silencing the JSON semantic fallback below whenever the
+# surrounding content used JSONC-style leniency (a trailing comma, a `//`
+# comment) that `json.loads` rejects but a hand-edited settings file
+# plausibly contains, this was the single most severe finding of the round.
+#
+# Fixed by dropping the fixed-width regex window entirely in favor of
+# `claude_statusline_key_hit()` below: a linear-time, brace-DEPTH-aware
+# structural scan (not a backtracking regex) that finds the `statusLine`
+# key, walks forward counting `{`/`}` depth (skipping over quoted-string
+# contents so a brace INSIDE a string value can't desync the count) to the
+# matching close — or to end-of-content if the object is never closed,
+# since an ordinary Edit `new_string` fragment often ends mid-object with
+# the surrounding context left out of the diff — then searches that exact,
+# unpadded, unbounded-but-STRUCTURALLY-scoped span for a `command` key.
+# Immune to both padding (the span is delimited by real brace structure,
+# not a character count) and nested decoys (nested objects are correctly
+# walked INTO, not treated as span terminators) by construction, with no
+# unbounded-regex-backtracking exposure either: the scan is a single
+# forward pass, O(content length) per `statusLine` occurrence, capped at 20
+# occurrences (`_STATUSLINE_MAX_SPANS` below) as a backstop against a
+# pathological input repeating the key thousands of times — see
+# `test_perf_no_redos_on_many_statusline_occurrences` for the measured
+# bound. `_STATUSLINE_KEY_EXISTS_RE` (the search entry point) and
+# `_STATUSLINE_COMMAND_KEY_RE` (the span-content check) are each a single
+# fixed-literal match with no nested quantifiers, so neither carries any
+# backtracking risk on its own either.
+_STATUSLINE_KEY_EXISTS_RE = re.compile(r'["\']statusLine["\']\s*:\s*\{', re.IGNORECASE)
+_STATUSLINE_COMMAND_KEY_RE = re.compile(r'["\']command["\']\s*:', re.IGNORECASE)
+_STATUSLINE_MAX_SPANS = 20
+
+
+def _json_object_span(content: str, open_brace_idx: int) -> str:
+    """Return the substring of ``content`` starting at the opening ``{`` at
+    ``open_brace_idx`` through its brace-depth-matched closing ``}`` — or
+    through end-of-string if the object is never closed within ``content``
+    (an ordinary Edit ``new_string`` fragment routinely ends mid-object,
+    since the surrounding context sits outside the diff). Tracks whether the
+    scan is inside a quoted JSON string (with ``\\``-escape awareness) so a
+    literal ``{``/``}`` character INSIDE a string value — a command whose
+    own text happens to contain a brace — doesn't desync the depth count.
+    Single forward pass, linear in the remaining content length; no
+    backtracking, so no padding-length or nesting-depth attack surface the
+    way a bounded regex span has (see `_STATUSLINE_KEY_EXISTS_RE`'s own
+    docstring above for the two confirmed bypasses this replaces)."""
+    depth = 0
+    in_str = False
+    esc = False
+    i = open_brace_idx
+    n = len(content)
+    while i < n:
+        ch = content[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return content[open_brace_idx:i + 1]
+        i += 1
+    return content[open_brace_idx:]
+
+
+def claude_statusline_key_hit(content: str) -> bool:
+    """High-signal textual co-occurrence check: a `statusLine` object that
+    structurally CONTAINS a `command` key anywhere within its own value
+    (including inside a nested sub-object, which real Claude Code configs
+    never have but a decoy might) — robust against both the padding-length
+    and nested-decoy bypasses a fixed-width regex window has (see
+    `_STATUSLINE_KEY_EXISTS_RE`'s docstring above for the full QA history).
+    Bounded to the first `_STATUSLINE_MAX_SPANS` `statusLine`-key
+    occurrences in `content` — a real settings file has at most one; more
+    than a handful is itself a sign of adversarial/pathological input, and
+    examining a first several is sufficient for real-world detection while
+    keeping total work linear rather than quadratic in content length."""
+    if not content:
+        return False
+    spans_checked = 0
+    for m in _STATUSLINE_KEY_EXISTS_RE.finditer(content):
+        spans_checked += 1
+        if spans_checked > _STATUSLINE_MAX_SPANS:
+            break
+        span = _json_object_span(content, m.end() - 1)
+        if _STATUSLINE_COMMAND_KEY_RE.search(span):
+            return True
+    return False
 
 # jq-scripted edit of an EXISTING statusLine's command — same three-signal
 # shape (verb `jq` + an assignment-shaped operator + the dangerous key, all
@@ -2535,9 +2642,21 @@ CLAUDE_STATUSLINE_KEY_RE = re.compile(
 # adjacency to each other) since a jq filter's own syntax routinely
 # separates a parent key from the child field it sets
 # (`.statusLine.command = "..."` puts them adjacent, but `.statusLine |=
-# (.command = "...")` does not) — unlike `CLAUDE_STATUSLINE_KEY_RE`'s literal-
-# JSON check, which only ever sees the two keys in their fixed nested-object
-# order.
+# (.command = "...")` does not) — unlike `claude_statusline_key_hit()`'s
+# literal-JSON check, which walks the actual nested object structure.
+#
+# Disclosed gap (independent adversarial review, round A): a bareword match
+# on the literal text `command` can't see a KEY NAME jq builds at runtime
+# from string concatenation (`jq --arg k "comm" --arg k2 "and"
+# '.statusLine[($k+$k2)] = "evil.sh"'`) — the literal substring "command"
+# never appears in the program text at all. The identical class of
+# limitation `CLAUDE_HOOKS_JQ_RE` already inherits and discloses for its own
+# bareword `hooks` match (computed field names generically evade any
+# fixed-string check); accepted here for the same reason: closing it
+# generically would require parsing jq's own expression grammar, out of
+# scope for a regex-based guard, and the narrow, awkward construction this
+# takes is far more conspicuous than the ordinary shapes this guard exists
+# to catch.
 CLAUDE_STATUSLINE_JQ_RE = re.compile(
     r"\bjq\b"
     r"(?=[^;&\n]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"

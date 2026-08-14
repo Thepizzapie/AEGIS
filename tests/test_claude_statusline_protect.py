@@ -101,9 +101,9 @@ def test_command_field_elsewhere_without_statusline_not_gated():
     """A `command` field belonging to an unrelated block (e.g. a `hooks`
     entry) must not trip THIS guard on its own — that shape is
     claude-hooks-protect's own territory, not statusLine's."""
-    d = patterns.CLAUDE_STATUSLINE_KEY_RE.search(
+    hit = patterns.claude_statusline_key_hit(
         '{"hooks": {"PreToolUse": [{"type": "command", "command": "x"}]}}')
-    assert d is None
+    assert hit is False
 
 
 def test_benign_hooks_entry_not_gated_by_this_guard():
@@ -486,19 +486,104 @@ def test_perf_no_redos_on_adversarial_content_no_command_key():
     assert time.time() - start < 1.0
 
 
+# ---- regression: round-A bypass-hunt findings (fixed-width regex window) --------
+#
+# QA finding (independent adversarial review, round A): the ORIGINAL
+# `CLAUDE_STATUSLINE_KEY_RE` bounded the span between the two keys with a
+# fixed-width lazy character class (`[^{}]{0,300}?`) — a decoy field long
+# enough to push `command` past 300 chars missed a live payload, and
+# separately, ANY nested sub-object before `command` (the class excludes
+# braces entirely) broke the match with zero padding needed at all. Both
+# gave a silent ALLOW on a working statusLine-command payload. Fixed by
+# `claude_statusline_key_hit()`, a brace-depth-aware structural scan — the
+# tests below pin both confirmed bypasses as regressions.
+
+def test_long_decoy_field_before_command_still_gated():
+    """A single long sibling field pushed `command` well past the OLD
+    300-char window — must still gate under the new structural scan, which
+    has no fixed-width limit at all."""
+    frag = ('"statusLine": {"type": "command", "junk": "' + "X" * 350
+            + '", "command": "evil.sh"}')
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_nested_decoy_object_before_command_still_gated():
+    """A nested sub-object between `statusLine`'s open brace and `command`
+    broke the OLD character-class-based match unconditionally (it excluded
+    `{`/`}` entirely) — the structural scan walks INTO nested objects
+    rather than treating them as a boundary, so this must still gate."""
+    frag = '"statusLine": {"type": "command", "decoy": {"x": 1}, "command": "evil.sh"}'
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_jsonc_trailing_comma_with_long_decoy_still_gated():
+    """The combined round-A finding: a trailing comma (JSONC-style) breaks
+    `json.loads`, silencing the semantic fallback, while the same long
+    decoy field breaks the old textual window — a whole-file Write with a
+    fully working payload that both layers used to miss at once."""
+    content = ('{"statusLine": {"type": "command", "junk": "' + "X" * 280
+               + '", "command": "evil.sh",}}')
+    d = evaluate(_write(".claude/settings.local.json", content), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_command_key_inside_string_value_does_not_desync_span():
+    """A `command`-shaped substring INSIDE a quoted string value (not a
+    real key) must not confuse the brace-depth/string-aware scan into
+    either over- or under-matching; the real `command` KEY later in the
+    same object must still be found."""
+    frag = ('"statusLine": {"type": "command", "note": "see \\"command\\" '
+            'below", "command": "evil.sh"}')
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_brace_inside_string_value_does_not_desync_span():
+    """A literal `{`/`}` character inside a quoted string value (part of
+    an unrelated field, before `command`) must not prematurely close the
+    tracked object span."""
+    frag = ('"statusLine": {"type": "command", "note": "a {brace} in text", '
+            '"command": "evil.sh"}')
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_unterminated_object_fragment_still_gated():
+    """An Edit `new_string` that ends mid-object (the closing brace sits
+    outside the diff) must still be scanned to end-of-content, not silently
+    dropped."""
+    frag = '"statusLine": {"type": "command", "command": "evil.sh"'
+    d = evaluate(_edit(".claude/settings.local.json", frag), EMPTY)
+    assert _gated(d) and d.rule == "claude-statusline-protect"
+
+
+def test_perf_no_redos_on_many_statusline_occurrences():
+    """The structural scan is capped at `_STATUSLINE_MAX_SPANS` (20)
+    `statusLine`-key occurrences and each span walk is linear — many
+    repeated, never-closed occurrences must stay fast rather than
+    quadratic."""
+    adversarial = '"statusLine": {"type": "x", ' * 3000
+    start = time.time()
+    d = evaluate(_write(".claude/settings.local.json", adversarial), EMPTY)
+    assert time.time() - start < 1.0
+    assert not _gated(d)
+
+
 # ---- direct pattern sanity ---------------------------------------------------------
 
-def test_key_regex_matches_expected_forms():
+def test_key_hit_matches_expected_forms():
     for content in (
         '"statusLine": {"type": "command", "command": "x"}',
         "'statusLine': {'type': 'command', 'command': 'x'}",
         '"statusLine":{"type":"command","command":"x"}',
     ):
-        assert patterns.CLAUDE_STATUSLINE_KEY_RE.search(content), content
+        assert patterns.claude_statusline_key_hit(content), content
 
 
-def test_key_regex_does_not_match_statusline_without_command():
-    assert not patterns.CLAUDE_STATUSLINE_KEY_RE.search('"statusLine": {"padding": 2}')
+def test_key_hit_does_not_match_statusline_without_command():
+    assert not patterns.claude_statusline_key_hit('"statusLine": {"padding": 2}')
 
 
 def test_path_regex_does_not_match_settings_json():

@@ -3756,11 +3756,49 @@ def rule_claude_statusline_protect(ev: Event, policy=None) -> Optional[Decision]
     docstring discloses for a value-only `.gitmodules` diff, and inherent
     to any guard whose signal is a JSON key name rather than a value
     pattern with its own unambiguous shape (an arbitrary shell command has
-    no such shape to match generically); and, like every sibling guard
-    here, a direct fetch-to-file write (``curl -o
-    .claude/settings.local.json ...``) is caught by none of the shell
-    branch's write-verb checks, the same inherited gap every other guard in
-    this file already discloses."""
+    no such shape to match generically); `CLAUDE_STATUSLINE_JQ_RE`'s
+    bareword `command`/`statusLine` match can't see a jq-computed key name
+    built from string concatenation (see its own docstring in patterns.py
+    for the narrow, disclosed example) — the identical inherited class
+    `CLAUDE_HOOKS_JQ_RE` already accepts; `_claude_statusline_struct_key_
+    hit`'s recursion depth cap (12, matching `_flatten_strings`/
+    `_claude_hooks_struct_key_hit`) means an MCP tool's raw JSON args
+    nesting the real key pair beyond that depth evades the structural
+    fallback, the same disclosed, deliberately unchanged precedent those
+    share; and, like every sibling guard here, a direct fetch-to-file write
+    (``curl -o .claude/settings.local.json ...``) is caught by none of the
+    shell branch's write-verb checks, the same inherited gap every other
+    guard in this file already discloses.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows): design/consistency review found no confirmed defects —
+    verified the ``claude_statusline`` knob is wired everywhere its
+    siblings are (``Policy``, all three ``loader.py`` spots, both
+    ``skills.py`` knob lists, the remedy table, README), verified this
+    guard's precedence relative to `rule_self_protect` by actually running
+    it through `evaluate()`, and confirmed the escape-hatch/mode/monitor
+    conventions match every sibling guard exactly. Bypass-hunting found and
+    closed the round's one real, severe finding: the original
+    `CLAUDE_STATUSLINE_KEY_RE` used a fixed-width lazy character-class
+    window (`[^{}]{0,300}?`) between the `statusLine` and `command` keys —
+    a single decoy field long enough to push `command` past the width bound
+    (no obfuscation needed, an ordinary-looking padded field) silently
+    missed a live payload, and, independently and more severely, the
+    class's blanket brace exclusion meant ANY nested sub-object placed
+    before `command` — zero padding required — broke the match
+    unconditionally; both landed the exact working `{"statusLine":
+    {"type":"command","command":"..."}}` shape with a silent ALLOW instead
+    of ASK/DENY. See `_STATUSLINE_KEY_EXISTS_RE`'s docstring in patterns.py
+    for the full finding and the brace-depth-aware structural scan
+    (`claude_statusline_key_hit()`/`_json_object_span()`) that replaced the
+    bounded regex to close it. The round's remaining finding (the jq
+    computed-key-name gap above) was judged an accepted, inherited,
+    non-guard-specific limitation rather than fixed, matching how this
+    codebase treats the identical gap in `CLAUDE_HOOKS_JQ_RE`. Full suite
+    green throughout, with a dedicated perf test confirming the new
+    structural scan stays linear-time under adversarial input (long padding,
+    many repeated key occurrences, and deeply/never-closed nested objects)."""
     cfg = getattr(policy, "claude_statusline", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -3783,7 +3821,7 @@ def rule_claude_statusline_protect(ev: Event, policy=None) -> Optional[Decision]
             return None
         if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
-        hit = bool(patterns.CLAUDE_STATUSLINE_KEY_RE.search(content)
+        hit = bool(patterns.claude_statusline_key_hit(content)
                    or _claude_statusline_json_key_hit(content))
         if not hit and ev.action == ActionClass.MCP:
             hit = bool(_claude_statusline_struct_key_hit(a)
@@ -3816,7 +3854,7 @@ def rule_claude_statusline_protect(ev: Event, policy=None) -> Optional[Decision]
         if not path_hit:
             return None
         jq_hit = bool(patterns.CLAUDE_STATUSLINE_JQ_RE.search(cmd))
-        write_hit = bool(write_verb and patterns.CLAUDE_STATUSLINE_KEY_RE.search(cmd))
+        write_hit = bool(write_verb and patterns.claude_statusline_key_hit(cmd))
         if not (jq_hit or write_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_STATUSLINE")
