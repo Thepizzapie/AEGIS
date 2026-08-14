@@ -3626,6 +3626,215 @@ def rule_claude_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _claude_statusline_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _claude_statusline_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for a dict
+    keyed ``statusLine`` whose OWN value is itself a dict carrying a
+    ``command`` key — mirrors `_claude_hooks_struct_key_hit`'s shape and
+    depth cap (12), but requires the parent/child relationship (not just
+    both key names present anywhere in the payload) since `statusLine`
+    alone, unlike `hooks`, has a safe shape (no `command` field yet)."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if (isinstance(k, str) and k.strip().lower() == "statusline"
+                    and isinstance(val, dict)
+                    and any(isinstance(ik, str) and ik.strip().lower() == "command"
+                            for ik in val)):
+                return True
+            if _claude_statusline_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_statusline_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_statusline_mcp_bareword_hit(a: dict) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: both ``statusline`` and
+    ``command`` appear, exact-match (not substring), as plain string LEAVES
+    anywhere in the (recursively) flattened raw MCP args — closes a "set
+    config value"-style MCP tool's ``{"key": "statusLine", "value":
+    {"type": "command", "command": "..."}}`` shape, the identical shape
+    `_claude_hooks_mcp_bareword_hit` closes for `hooks`. Claude Code's docs
+    describe only one `statusLine` shape, always carrying `"type":
+    "command"` — so the literal string "command" is guaranteed to appear as
+    a flattened leaf (from the `type` field's own value) whenever a real,
+    working `statusLine` command block is present, making the AND of both
+    bare leaves a reliable, non-coincidental signal rather than two
+    independently-common words that happen to co-occur."""
+    strs = {s.strip().lower() for s in _flatten_strings(a) if isinstance(s, str)}
+    return "statusline" in strs and "command" in strs
+
+
+def _claude_statusline_json_key_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result SEMANTICALLY via `_claude_statusline_struct_key_hit`, closing
+    the identical JSON `\\uXXXX`-escape bypass `_claude_hooks_json_key_hit`
+    closes for `hooks` (``"\\u0073tatusLine"`` decodes to the real key while
+    evading a purely textual check)."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _claude_statusline_struct_key_hit(obj)
+
+
+def rule_claude_statusline_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a ``statusLine`` command entry in
+    ``.claude/settings.local.json`` — the project-local, gitignored-by-default
+    sibling of ``.claude/settings.json`` (already fully blocked by
+    self-protect) that Claude Code reads with equal authority, and that
+    ``rule_claude_hooks_protect`` deliberately leaves alone (its own
+    docstring names ``statusLine`` as ordinary "personal config...edited for
+    entirely benign reasons", since gating the whole file would ask on
+    nearly every legitimate local-settings tweak).
+
+    THREAT MODEL: ``statusLine`` is not benign on its own. Per Claude Code's
+    documentation, a status line is "a customizable bar at the bottom of
+    Claude Code that runs any shell script you configure" — a
+    ``{"type": "command", "command": "<cmd>"}`` block is executed by Claude
+    Code itself, directly, as its own subprocess, the identical "runs
+    OUTSIDE the tool-call loop Aegis's own PreToolUse hook evaluates" blind
+    spot ``rule_claude_hooks_protect`` exists to close for a planted
+    ``hooks`` entry — except the re-fire cadence here is worse, not
+    equivalent: a hook needs a matching TOOL CALL to fire again, while a
+    statusLine command re-fires on its own, event-driven (debounced
+    ~300ms) on essentially every UI update throughout an otherwise-idle
+    session — including while the agent is blocked waiting on something
+    else entirely (e.g. a coordinator idling on background subagents) — and
+    optionally ALSO on a fixed ``refreshInterval`` timer, with zero further
+    agent or tool action needed after the initial plant. And, being
+    gitignored by design, the plant produces no diff, shows in no `git
+    status`, and survives no code review — the same invisibility property
+    ``rule_claude_hooks_protect``'s own docstring documents for `hooks`.
+
+    Distinct from a path-only guard for the same reason its `hooks` sibling
+    is: settings.local.json legitimately carries plenty of other personal
+    config (permissions, env, model, outputStyle, ...) edited for entirely
+    benign reasons. Gated on PATH *and* the `statusLine`+`command`
+    CO-OCCURRING shape (not `statusLine` alone — an object with no
+    `command` field yet can't run anything), the "gate the file and the
+    dangerous key/shape" convention every sibling `*_protect` guard in this
+    file uses for its own manifest.
+
+    Config (``policy.claude_statusline``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted, reviewed local status line, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard does: a
+    legitimate context/cost/git-status status line is common, sanctioned
+    personal tooling — it just needs a human to have actually looked at the
+    command it runs.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_CLAUDE_STATUSLINE=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: the user-level ``~/.claude/settings.local.json`` is reached
+    the same incidental (not anchored-to-project-root) way
+    ``rule_claude_hooks_protect`` reaches its own user-level equivalent; a
+    `statusLine`/`command` pair assembled indirectly (a templating step, a
+    build script) rather than appearing as a literal is not caught; a
+    later Edit that changes ONLY an already-planted statusLine's `command`
+    VALUE, scoped so narrowly (`old_string`/`new_string` covering just the
+    quoted command string) that neither the `statusLine` nor `command` KEY
+    text appears in that specific diff, is a disclosed residual gap — the
+    identical class of limitation `GITMODULES_TRAVERSAL_BARE_RE`'s own
+    docstring discloses for a value-only `.gitmodules` diff, and inherent
+    to any guard whose signal is a JSON key name rather than a value
+    pattern with its own unambiguous shape (an arbitrary shell command has
+    no such shape to match generically); and, like every sibling guard
+    here, a direct fetch-to-file write (``curl -o
+    .claude/settings.local.json ...``) is caught by none of the shell
+    branch's write-verb checks, the same inherited gap every other guard in
+    this file already discloses."""
+    cfg = getattr(policy, "claude_statusline", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-statusline-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.CLAUDE_STATUSLINE_KEY_RE.search(content)
+                   or _claude_statusline_json_key_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = bool(_claude_statusline_struct_key_hit(a)
+                       or _claude_statusline_mcp_bareword_hit(a))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_STATUSLINE")
+                or _claude_statusline_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-statusline-protect",
+                         f"'{p}' is being written with a `statusLine` command "
+                         "entry — Claude Code executes it directly as its own "
+                         "subprocess, event-driven throughout the session (and "
+                         "optionally on a refreshInterval timer), OUTSIDE the "
+                         "tool-call loop Aegis evaluates, and (being gitignored "
+                         "by default) with no diff and no code review. Review "
+                         "the change, then confirm with "
+                         "AEGIS_ALLOW_CLAUDE_STATUSLINE=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        jq_hit = bool(patterns.CLAUDE_STATUSLINE_JQ_RE.search(cmd))
+        write_hit = bool(write_verb and patterns.CLAUDE_STATUSLINE_KEY_RE.search(cmd))
+        if not (jq_hit or write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_STATUSLINE")
+                or _claude_statusline_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-statusline-protect",
+                         "A `statusLine` command entry is being planted in "
+                         ".claude/settings.local.json from a shell — Claude "
+                         "Code executes it directly as its own subprocess, "
+                         "event-driven throughout the session, OUTSIDE the "
+                         "tool-call loop Aegis evaluates, and (being "
+                         "gitignored by default) with no diff and no code "
+                         "review. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CLAUDE_STATUSLINE=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -5114,6 +5323,7 @@ _CORE_RULES = (
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
+    rule_claude_statusline_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,

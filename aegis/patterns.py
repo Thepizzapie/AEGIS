@@ -2488,6 +2488,64 @@ CLAUDE_HOOKS_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# `statusLine` is Claude Code's OTHER direct-exec key reachable in
+# settings.local.json — CLAUDE_HOOKS_KEY_RE only looks for `hooks`, and its
+# own docstring above explicitly names `statusLine` as one of the "plenty of
+# other personal config...edited for entirely benign reasons" that guard
+# deliberately leaves alone. It isn't benign on its own: per Claude Code's
+# docs, a `statusLine` block with `"type": "command"` "runs any shell script
+# you configure" — Claude Code execs `command` directly as its own
+# subprocess, event-driven (debounced ~300ms) on essentially every UI update
+# during an active session, optionally ALSO on a fixed `refreshInterval`
+# timer — the identical "runs as the runtime's own subprocess, entirely
+# outside the PreToolUse/PostToolUse tool-call loop Aegis's own hook
+# evaluates" blind spot `CLAUDE_HOOKS_KEY_RE`/`rule_claude_hooks_protect`
+# exist to close for `hooks`, except the re-fire cadence here is WORSE: a
+# hook needs a matching TOOL CALL to fire again; a statusLine command
+# re-fires on its own throughout an otherwise-idle session (and continues
+# even while the agent is waiting on something else, e.g. background
+# subagents) with zero further agent/tool action needed at all.
+#
+# Gated on `statusLine` AND `command` CO-OCCURRING within the same object
+# (the only shape Claude Code's docs describe — `{"type": "command",
+# "command": "..."}`), not `statusLine` alone: unlike `hooks` (which has no
+# safe value once present at all), a `statusLine` object with no `command`
+# field yet can't actually run anything — the same "gate the file and the
+# dangerous SHAPE, not just the key" trade-off `CLAUDE_HOOKS_KEY_RE`'s own
+# docstring credits to `PACKAGE_SCRIPTS_PATH_RE`/`LIFECYCLE_SCRIPT_KEY_RE`,
+# applied one level deeper here since the bare key alone is ambiguous where
+# `hooks` was not. Bounded lazy `{0,300}?` span between the two keys (not
+# unbounded) for the same catastrophic-backtracking reason every bounded gap
+# in this file is bounded — see `FIND_PROTECTED_RE`'s own comment above for
+# the mechanism and the measured hang this shape avoids.
+CLAUDE_STATUSLINE_KEY_RE = re.compile(
+    r'["\']statusLine["\']\s*:\s*\{[^{}]{0,300}?["\']command["\']\s*:',
+    re.IGNORECASE,
+)
+
+# jq-scripted edit of an EXISTING statusLine's command — same three-signal
+# shape (verb `jq` + an assignment-shaped operator + the dangerous key, all
+# within a bounded window, order-agnostic) `CLAUDE_HOOKS_JQ_RE`/
+# `VSCODE_TASKS_JQ_RE` already use for their own targets, for the identical
+# reason: jq has no `-i` flag, so a scripted edit is either a temp-file-
+# then-`mv` (already caught by the shared write-verb check at the rule's
+# call site) or piped through `sponge` (moreutils), neither of which any
+# write-verb pattern in this file recognizes on its own. Requires BOTH
+# `statusLine` and `command` appear somewhere in the jq program (not
+# adjacency to each other) since a jq filter's own syntax routinely
+# separates a parent key from the child field it sets
+# (`.statusLine.command = "..."` puts them adjacent, but `.statusLine |=
+# (.command = "...")` does not) — unlike `CLAUDE_STATUSLINE_KEY_RE`'s literal-
+# JSON check, which only ever sees the two keys in their fixed nested-object
+# order.
+CLAUDE_STATUSLINE_JQ_RE = re.compile(
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}\.?statusLine\b)"
+    r"(?=[^;&\n]{0,400}\.?command\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

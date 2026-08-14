@@ -231,6 +231,16 @@ class Policy:
     # merges hooks from with equal authority, and that no other guard
     # reaches. See rules.rule_claude_hooks_protect.
     claude_hooks: dict = field(default_factory=dict)
+    # Claude Code statusLine-config protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers a `statusLine` entry with a `command` field planted in
+    # `.claude/settings.local.json` — Claude Code runs it directly as its
+    # own subprocess, event-driven throughout the session (and optionally
+    # on a refreshInterval timer), the same "outside the tool-call loop"
+    # blind spot claude_hooks closes for `hooks`, left uncovered by that
+    # guard's own deliberately narrow `hooks`-only key gate. See
+    # rules.rule_claude_statusline_protect.
+    claude_statusline: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a
