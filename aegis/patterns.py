@@ -1208,6 +1208,103 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Cross-tool agent-instructions hijack ---------------------------------------
+# The equivalent of AGENT_INSTRUCTIONS_PATH_RE above (CLAUDE.md/AGENTS.md), one
+# layer OUTSIDE the runtime Aegis's own adapters execute inside of: every other
+# major AI coding-agent tool folds its own instructions file into ITS OWN
+# context on every future session, unattended, no opt-in, the identical
+# "runs later, unattended, natural-language payload" shape — but nothing in
+# this file recognized any of these paths before now, so a hijacked/
+# prompt-injected session could plant a payload in one of them with zero
+# detection, to be picked up not by this session at all but by a human (or a
+# different agent) opening the same repo in that OTHER tool later. Curated to
+# the current market's dominant tools, the same "curated, not exhaustive"
+# trade-off PATH_HIJACK's own command-name list and CI_WORKFLOW_PATH_RE's own
+# provider list already make:
+#   - Cursor: `.cursorrules` (legacy, still read) and `.cursor/rules/*.mdc`
+#     (current "Project Rules")
+#   - Windsurf: `.windsurfrules` (legacy) and `.windsurf/rules/*.md` (current
+#     "Workspace Rules")
+#   - GitHub Copilot: `.github/copilot-instructions.md` (repo-wide) and
+#     `.github/instructions/*.instructions.md` (path-scoped)
+#   - Cline: `.clinerules` — a single file OR a directory of `.md` files, both
+#     forms are real and auto-loaded
+#   - Amazon Q Developer: `.amazonq/rules/*.md`
+#   - Gemini CLI: `GEMINI.md` — read the same way, at any nesting depth, that
+#     Gemini CLI's own docs describe CLAUDE.md/AGENTS.md being read
+_CROSS_AGENT_ROOT = r"(?:^|[\s'\"/\\=])"
+CROSS_AGENT_INSTRUCTIONS_PATH_RE = re.compile(
+    _CROSS_AGENT_ROOT + r"\.cursorrules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.windsurfrules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.clinerules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"GEMINI" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP
+    + r"copilot-instructions" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.cursor" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.mdc" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"instructions" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.instructions\.md" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.clinerules" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.amazonq" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — same reason AGENT_DEF_DIR_RE exists:
+# an archive/sync tool that places a file without ever naming it as a discrete
+# argument (`rsync -a evil/ .cursor/rules/`, `tar xf payload.tar -C
+# .amazonq/rules/`) never matches the filename-form pattern above at all.
+# `.clinerules` itself is deliberately NOT repeated here — the root pattern
+# above already matches the bare token (its trailing-boundary check accepts a
+# following `/` or end-of-argument, so `rsync -a evil/ .clinerules/` is
+# already caught with no separate directory form needed).
+CROSS_AGENT_INSTRUCTIONS_DIR_RE = re.compile(
+    _CROSS_AGENT_ROOT + r"\.cursor" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"instructions" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT + r"\.amazonq" + _WIN_TRIM + _SEP + r"rules" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# AGENT_DEF_FIND_PREDICATE_RE exists for its own surface. A `-regex` VALUE is
+# itself a regex and routinely separates path components with its own
+# wildcard (`-regex '.*\.amazonq.*rules.*security\.md'`) — the identical
+# real-world pattern AGENT_DEF_FIND_PREDICATE_RE's own round-2 QA finding
+# documents for `.claude/commands` — so a strict `dir[/\\]rules\b`-adjacency
+# fragment alone misses it. Closed the same way: a bare directory-name
+# fallback for the four segments that are distinctive enough on their own
+# (no ordinary, unrelated project has a hidden directory or file literally
+# named `.cursor`/`.windsurf`/`.amazonq`/`.clinerules` for any other reason —
+# the same reasoning that earns `.claude` its own bare fallback there).
+# Deliberately EXCLUDES a bare `.github` fallback — unlike `.claude`/
+# `.cursor`/`.windsurf`/`.amazonq`, `.github/` is a near-universal directory
+# in any GitHub-hosted repo (workflows, issue templates, CODEOWNERS, ...)
+# carrying no signal on its own; a `find`-regex reconstruction of
+# `.github/copilot-instructions.md`/`.github/instructions/*` that never
+# contains the literal `copilot-instructions`/`.instructions.md` fragments
+# below is an accepted, disclosed residual gap, same as
+# `CI_WORKFLOW_FIND_RE`'s own identical `.github` exclusion for the CI
+# surface. Bare "rules" alone is also excluded — too generic (an ordinary
+# project can have an unrelated `rules/` directory), the same "too generic"
+# exclusion `SHELL_PERSIST_FIND_RE`'s own docstring makes for the bare words
+# "config"/"profile".
+_CROSS_AGENT_NAME_FRAGMENTS = (
+    r"\.cursorrules\b|\.windsurfrules\b|\.clinerules\b|GEMINI\.md\b"
+    r"|copilot-instructions\b|\.instructions\.md\b"
+    r"|\.cursor\b|\.windsurf\b|\.amazonq\b"
+)
+CROSS_AGENT_INSTRUCTIONS_FIND_RE = _find_predicate_re(
+    r"(?:" + _CROSS_AGENT_NAME_FRAGMENTS + r")")
+
+
+def cross_agent_instructions_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, CROSS_AGENT_INSTRUCTIONS_FIND_RE)
+
+
 # ---- Shell-startup / SSH persistence protection --------------------------------
 # Two more "runs later, unattended, with the human's full privileges" triggers
 # that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,
