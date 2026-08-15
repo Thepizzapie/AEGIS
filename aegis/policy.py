@@ -136,6 +136,15 @@ class Policy:
     # (mode=ask) apply. Covers CLAUDE.md/AGENTS.md and .claude/agents/*.md,
     # .claude/commands/*.md. See rules.rule_agent_def_protect.
     agent_def: dict = field(default_factory=dict)
+    # Cross-tool agent-instructions protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers other AI coding agents' own auto-loaded instructions files:
+    # Cursor (.cursorrules, .cursor/rules/*.mdc), Windsurf (.windsurfrules,
+    # .windsurf/rules/*.md), GitHub Copilot (.github/copilot-instructions.md,
+    # .github/instructions/*.instructions.md), Cline (.clinerules),
+    # Amazon Q Developer (.amazonq/rules/*.md), Gemini CLI (GEMINI.md). See
+    # rules.rule_cross_agent_instructions_protect.
+    cross_agent_instructions: dict = field(default_factory=dict)
     # Shell-startup / SSH persistence protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers ~/.bashrc/~/.zshrc/~/.profile/fish's config.fish/

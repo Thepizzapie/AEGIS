@@ -747,6 +747,187 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- cross-tool agent-instructions protection: escapable with human confirm ----
+def _cross_agent_instructions_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cross_agent_instructions_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering another AI coding agent's own auto-loaded
+    instructions file: Cursor's ``.cursorrules``/``.cursor/rules/*.mdc``,
+    Windsurf's ``.windsurfrules``/``.windsurf/rules/*.md``, GitHub Copilot's
+    ``.github/copilot-instructions.md``/``.github/instructions/*.instructions.md``,
+    Cline's ``.clinerules`` (file or directory of ``.md`` files), Amazon Q
+    Developer's ``.amazonq/rules/*.md``, and Gemini CLI's ``GEMINI.md``.
+
+    THREAT MODEL: the identical shape ``rule_agent_def_protect``'s own
+    ``AGENT_INSTRUCTIONS_PATH_RE`` half (CLAUDE.md/AGENTS.md) exists for —
+    each of these files is folded directly into ITS OWN runtime's context on
+    every future session, unattended, no opt-in, no "install a hook" step a
+    human reviewing a diff would flag as unusual. What differs is the
+    attacker's vantage point: a session running under Aegis today has no
+    reason to maliciously READ its own CLAUDE.md/AGENTS.md, since
+    ``rule_agent_def_protect`` already guards writes to it — but nothing
+    stopped that SAME session (hijacked, prompt-injected, or just following
+    a poisoned instruction it already trusted) from planting a payload in
+    one of these OTHER tools' instruction files instead, files a teammate,
+    or this same repo opened in Cursor/Windsurf/VS Code+Copilot/Cline/
+    Amazon Q/Gemini CLI later, will silently trust with zero further
+    review. A team standardizing on Claude Code today routinely has these
+    other tools' config sitting right next to ``CLAUDE.md`` in the same
+    repo (onboarding docs, a teammate's own editor preference) — until this
+    guard existed, every one of them was a completely open, zero-detection
+    cross-tool persistence surface, and the write doesn't even need to be
+    read back by an AGENT to matter: a human opening the repo in the other
+    tool is the trigger.
+
+    Config (``policy.cross_agent_instructions``): ``mode`` (deny|ask|
+    monitor|off, default ask), ``allow`` (regexes on the path/command that
+    skip the gate — a repo's own CI-authored sync of these files, say).
+    Defaults to ``ask`` for the same reason ``rule_agent_def_protect`` does:
+    editing a ``.cursorrules``/``copilot-instructions.md`` is routine,
+    sanctioned dev work for a team that actually uses that tool.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_CROSS_AGENT_INSTRUCTIONS=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path-string match, not content-aware, same as
+    ``rule_agent_def_protect``; a curated, not exhaustive, list of the
+    current market's dominant tools — an instructions filename outside the
+    six covered here (Roo Code's ``.roorules``, Aider's own conventions
+    file, ...) is not covered, the same "curated, not exhaustive" trade-off
+    ``rule_path_hijack_protect``'s own command-name list and
+    ``CI_WORKFLOW_PATH_RE``'s own CI-provider list already make; a direct
+    fetch-to-file write (``curl -o .cursorrules ...``) is caught by none of
+    this guard's own write-verb checks — closed the same way every sibling
+    guard's identical gap is, by ``rule_fetch_to_file_protect`` reusing this
+    guard's own path regex (see ``_FETCH_HUMAN_ESCAPABLE``); an MCP tool
+    naming its target argument outside ``_path()``'s recognized key list is
+    missed the same way it is for every other ``_path()``-based guard in
+    this file; and a shell command that computes the target path indirectly
+    across separate variable assignments (a ``for``/``xargs`` loop,
+    ``basename``/``dirname`` reconstruction) is not covered — ``find``'s
+    ``-path``/``-name``/``-regex`` indirection IS covered (with one
+    disclosed exception: a ``-regex`` value that wildcards between "GEMINI"
+    and ".md" evades ``CROSS_AGENT_INSTRUCTIONS_FIND_RE`` — see that
+    pattern's own comment in ``patterns.py`` for why a bare fallback wasn't
+    added), the same disclosed gap ``rule_self_protect``/
+    ``rule_ci_workflow_protect``/``rule_agent_def_protect`` already carry
+    for their own targets.
+
+    ``.clinerules``, ``.cursorrules``, and ``.windsurfrules`` each also have
+    a NESTED-directory form (``.clinerules/*.md``, ``.cursor/rules/*.mdc``,
+    ``.windsurf/rules/*.md``) requiring a real extension the same way
+    ``AGENT_DEF_PATH_RE`` requires ``.md`` for ``.claude/agents/*`` — but
+    unlike the other four, ``.clinerules`` ALSO has a bare-root-token
+    alternative (matching the literal directory name with no filename
+    requirement at all, the same way ``CLAUDE.md``/``AGENTS.md`` do), so a
+    non-``.md`` file anywhere under ``.clinerules/`` is still caught on
+    BOTH the Edit/Write/MCP branch and the shell branch (QA correction,
+    independent adversarial review, round 1 — an earlier draft of this
+    docstring overstated a coverage gap here that does not actually exist:
+    ``.clinerules/payload.txt`` gates the identical way ``.clinerules``
+    itself does). The genuine extension gap is narrower than that first
+    draft claimed: ``.cursor/rules/*``, ``.windsurf/rules/*``,
+    ``.github/instructions/*``, and ``.amazonq/rules/*`` have no bare-root
+    alternative of their own (``.cursor``/``.windsurf``/``.github``/
+    ``.amazonq`` are generic parent directories that also hold unrelated
+    files — an MCP config, CI workflows — so matching the bare parent alone
+    would be a much broader false-positive surface than ``.clinerules``'s
+    own, already-distinctive full name). For THOSE four, the Edit/Write/MCP
+    branch below additionally checks ``CROSS_AGENT_INSTRUCTIONS_DIR_RE``
+    (a plain "does the path start under this protected directory" prefix
+    check — safe here in a way it would not be for a whole shell command,
+    since an Edit/Write/MCP call's path argument has no unrelated
+    surrounding text to false-positive on), closing the extension gap for
+    them the same way it's already closed for ``.clinerules``. Trade-off,
+    disclosed: this directory check has no filename/extension awareness at
+    all, so a backup/disabled variant under one of these four directories
+    (``.cursor/rules/security.mdc.orig``) now gates too, unlike the
+    equivalent bare-root-file backup suffix (``.cursorrules.bak`` stays
+    excluded, since that form's OWN pattern does check the suffix) — the
+    false-ASK direction, the same trade-off this file's own module
+    docstring and several sibling guards' docstrings already accept
+    elsewhere for a directory-prefix check. Nesting past
+    4 levels under any of the directory forms still evades the FILENAME
+    check the same disclosed way it does for ``AGENT_DEF_PATH_RE`` (the
+    directory check above, and the shell branch's own bare-directory
+    fallback, both cover an arbitrarily deep write regardless of nesting)."""
+    cfg = getattr(policy, "cross_agent_instructions", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        # DIR_RE closes the extension-gated gap for the four directory-based
+        # targets that have no bare-root-token alternative of their own
+        # (.cursor/rules, .windsurf/rules, .github/instructions, .amazonq/
+        # rules) — see the module docstring above for why this is safe to do
+        # here (a single known path argument) but not for a whole shell
+        # command (see the shell branch below, which also needs a write-verb
+        # check DIR_RE alone can't provide).
+        if not (p and (patterns.CROSS_AGENT_INSTRUCTIONS_PATH_RE.search(p)
+                       or patterns.CROSS_AGENT_INSTRUCTIONS_DIR_RE.search(p))):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CROSS_AGENT_INSTRUCTIONS")
+                or _cross_agent_instructions_allowed_by_policy(cfg, p)):
+            return None
+        would = Decision(action, "cross-agent-instructions-protect",
+                         f"Another AI coding agent's instructions file '{p}' is being "
+                         "written — its content is folded directly into that tool's own "
+                         "context on every future session, unattended. Review the "
+                         "change, then confirm with "
+                         "AEGIS_ALLOW_CROSS_AGENT_INSTRUCTIONS=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "cross-agent-instructions-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.CROSS_AGENT_INSTRUCTIONS_PATH_RE.search(cmd)
+                             or patterns.CROSS_AGENT_INSTRUCTIONS_DIR_RE.search(cmd)
+                             or patterns.cross_agent_instructions_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev)
+                or os.environ.get("AEGIS_ALLOW_CROSS_AGENT_INSTRUCTIONS")
+                or _cross_agent_instructions_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "cross-agent-instructions-protect",
+                         "Another AI coding agent's instructions file is being "
+                         "modified from a shell — its content is auto-loaded by that "
+                         "tool in a future session with no further review. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CROSS_AGENT_INSTRUCTIONS=1; a spawned agent "
+                         "cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "cross-agent-instructions-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- shell-startup / SSH persistence protection: escapable with human confirm --
 def _shell_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -4399,6 +4580,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.CROSS_AGENT_INSTRUCTIONS_PATH_RE, "another AI coding agent's instructions file"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
@@ -5102,6 +5284,7 @@ _CORE_RULES = (
     rule_ci_workflow_protect,
     rule_git_hooks_protect,
     rule_agent_def_protect,
+    rule_cross_agent_instructions_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
     rule_package_manifest_protect,
