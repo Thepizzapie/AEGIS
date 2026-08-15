@@ -1232,7 +1232,25 @@ def agent_def_find_hit(cmd: str) -> bool:
 #   - Amazon Q Developer: `.amazonq/rules/*.md`
 #   - Gemini CLI: `GEMINI.md` — read the same way, at any nesting depth, that
 #     Gemini CLI's own docs describe CLAUDE.md/AGENTS.md being read
-_CROSS_AGENT_ROOT = r"(?:^|[\s'\"/\\=])"
+#
+# QA finding (independent adversarial review, round 1): the leading boundary
+# class below originally omitted shell redirect/pipe/subshell metacharacters
+# (`<`, `>`, `(`, `;`, `&`, `|`) — real, common, GLUED shell syntax with no
+# space before the path (`echo x >.cursorrules`, `cat evil.md|tee
+# .windsurfrules`) has no whitespace/quote/path-separator/`=` immediately
+# before the target, so it silently bypassed every alternative below despite
+# `WRITE_REDIRECT_RE` correctly recognizing the glued `>`/`>>` itself as a
+# write. The identical boundary-class shape is copy-pasted from the
+# pre-existing `AGENT_INSTRUCTIONS_PATH_RE`/`_AGENT_DEF_ROOT`/several other
+# sibling guards' own root patterns (same gap, unfixed there — a shared,
+# pre-existing issue, not introduced here, and deliberately left alone on
+# those older, already-shipped, widely-relied-upon patterns rather than
+# rushed in as a drive-by fix bundled into this unrelated guard, the same
+# judgment call GitHub issue #15 documents for the sibling ReDoS class of
+# bug); closed HERE, on this guard's own freshly-introduced `_CROSS_AGENT_
+# ROOT`, since it shares no symbol with any already-shipped pattern and a
+# fix carries zero risk to any of the fifteen-plus other guards.
+_CROSS_AGENT_ROOT = r"(?:^|[\s'\"/\\=<>();&|])"
 CROSS_AGENT_INSTRUCTIONS_PATH_RE = re.compile(
     _CROSS_AGENT_ROOT + r"\.cursorrules" + _CI_END
     + r"|" + _CROSS_AGENT_ROOT + r"\.windsurfrules" + _CI_END
@@ -1292,6 +1310,23 @@ CROSS_AGENT_INSTRUCTIONS_DIR_RE = re.compile(
 # project can have an unrelated `rules/` directory), the same "too generic"
 # exclusion `SHELL_PERSIST_FIND_RE`'s own docstring makes for the bare words
 # "config"/"profile".
+#
+# QA finding (independent adversarial review, round 1): unlike the four
+# directory names above, `GEMINI.md` has NO bare-token fallback here — a
+# `-regex` value with a wildcard between "GEMINI" and ".md"
+# (`-regex '.*GEMINI.*\.md'`) evades the literal `GEMINI\.md\b` fragment the
+# same way the unfixed `.amazonq` case would have. A bare `GEMINI` fallback
+# was deliberately NOT added, unlike the four dotted directory names: those
+# are inherently distinctive hidden-directory names with no legitimate
+# unrelated use, while a bare `GEMINI` (no leading dot) is a plausible
+# ordinary token in an unrelated file/directory name (a Gemini-API
+# integration's own `gemini_client.py`/`test_gemini.py`, a model-comparison
+# notebook) — trading this disclosed, narrow gap for that broader
+# false-positive/ask-fatigue class was judged the wrong direction, the same
+# call `.github` above already makes for the identical reason. Accepted as
+# a disclosed residual gap (the identical, unfixed gap already exists,
+# undisclosed, in the pre-existing `AGENT_DEF_FIND_PREDICATE_RE`'s own
+# `CLAUDE\.md\b`/`AGENTS\.md\b` fragments).
 _CROSS_AGENT_NAME_FRAGMENTS = (
     r"\.cursorrules\b|\.windsurfrules\b|\.clinerules\b|GEMINI\.md\b"
     r"|copilot-instructions\b|\.instructions\.md\b"

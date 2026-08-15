@@ -817,21 +817,52 @@ def rule_cross_agent_instructions_protect(ev: Event, policy=None) -> Optional[De
     this file; and a shell command that computes the target path indirectly
     across separate variable assignments (a ``for``/``xargs`` loop,
     ``basename``/``dirname`` reconstruction) is not covered — ``find``'s
-    ``-path``/``-name``/``-regex`` indirection IS covered, the same
-    disclosed gap ``rule_self_protect``/``rule_ci_workflow_protect``/
-    ``rule_agent_def_protect`` already carry for their own targets. The
-    nested-file forms (``.cursor/rules/*.mdc``, ``.windsurf/rules/*.md``,
-    ``.github/instructions/*.instructions.md``, ``.clinerules/*.md``,
-    ``.amazonq/rules/*.md``) require their real extension the same way
-    ``AGENT_DEF_PATH_RE`` requires ``.md`` for ``.claude/agents/*`` — Cline
-    in practice reads any file under ``.clinerules/`` regardless of
-    extension, so a non-``.md`` file dropped there evades the nested-file
-    check specifically (the bare-directory fallback below still catches an
-    archive/sync tool's own directory target regardless of the file's
-    extension); nesting past 4 levels under any of the directory forms
-    evades the filename check the same disclosed way it does for
-    ``AGENT_DEF_PATH_RE`` (the bare-directory fallback again covers an
-    archive/sync tool's own target regardless of nesting)."""
+    ``-path``/``-name``/``-regex`` indirection IS covered (with one
+    disclosed exception: a ``-regex`` value that wildcards between "GEMINI"
+    and ".md" evades ``CROSS_AGENT_INSTRUCTIONS_FIND_RE`` — see that
+    pattern's own comment in ``patterns.py`` for why a bare fallback wasn't
+    added), the same disclosed gap ``rule_self_protect``/
+    ``rule_ci_workflow_protect``/``rule_agent_def_protect`` already carry
+    for their own targets.
+
+    ``.clinerules``, ``.cursorrules``, and ``.windsurfrules`` each also have
+    a NESTED-directory form (``.clinerules/*.md``, ``.cursor/rules/*.mdc``,
+    ``.windsurf/rules/*.md``) requiring a real extension the same way
+    ``AGENT_DEF_PATH_RE`` requires ``.md`` for ``.claude/agents/*`` — but
+    unlike the other four, ``.clinerules`` ALSO has a bare-root-token
+    alternative (matching the literal directory name with no filename
+    requirement at all, the same way ``CLAUDE.md``/``AGENTS.md`` do), so a
+    non-``.md`` file anywhere under ``.clinerules/`` is still caught on
+    BOTH the Edit/Write/MCP branch and the shell branch (QA correction,
+    independent adversarial review, round 1 — an earlier draft of this
+    docstring overstated a coverage gap here that does not actually exist:
+    ``.clinerules/payload.txt`` gates the identical way ``.clinerules``
+    itself does). The genuine extension gap is narrower than that first
+    draft claimed: ``.cursor/rules/*``, ``.windsurf/rules/*``,
+    ``.github/instructions/*``, and ``.amazonq/rules/*`` have no bare-root
+    alternative of their own (``.cursor``/``.windsurf``/``.github``/
+    ``.amazonq`` are generic parent directories that also hold unrelated
+    files — an MCP config, CI workflows — so matching the bare parent alone
+    would be a much broader false-positive surface than ``.clinerules``'s
+    own, already-distinctive full name). For THOSE four, the Edit/Write/MCP
+    branch below additionally checks ``CROSS_AGENT_INSTRUCTIONS_DIR_RE``
+    (a plain "does the path start under this protected directory" prefix
+    check — safe here in a way it would not be for a whole shell command,
+    since an Edit/Write/MCP call's path argument has no unrelated
+    surrounding text to false-positive on), closing the extension gap for
+    them the same way it's already closed for ``.clinerules``. Trade-off,
+    disclosed: this directory check has no filename/extension awareness at
+    all, so a backup/disabled variant under one of these four directories
+    (``.cursor/rules/security.mdc.orig``) now gates too, unlike the
+    equivalent bare-root-file backup suffix (``.cursorrules.bak`` stays
+    excluded, since that form's OWN pattern does check the suffix) — the
+    false-ASK direction, the same trade-off this file's own module
+    docstring and several sibling guards' docstrings already accept
+    elsewhere for a directory-prefix check. Nesting past
+    4 levels under any of the directory forms still evades the FILENAME
+    check the same disclosed way it does for ``AGENT_DEF_PATH_RE`` (the
+    directory check above, and the shell branch's own bare-directory
+    fallback, both cover an arbitrarily deep write regardless of nesting)."""
     cfg = getattr(policy, "cross_agent_instructions", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -841,7 +872,15 @@ def rule_cross_agent_instructions_protect(ev: Event, policy=None) -> Optional[De
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
-        if not (p and patterns.CROSS_AGENT_INSTRUCTIONS_PATH_RE.search(p)):
+        # DIR_RE closes the extension-gated gap for the four directory-based
+        # targets that have no bare-root-token alternative of their own
+        # (.cursor/rules, .windsurf/rules, .github/instructions, .amazonq/
+        # rules) — see the module docstring above for why this is safe to do
+        # here (a single known path argument) but not for a whole shell
+        # command (see the shell branch below, which also needs a write-verb
+        # check DIR_RE alone can't provide).
+        if not (p and (patterns.CROSS_AGENT_INSTRUCTIONS_PATH_RE.search(p)
+                       or patterns.CROSS_AGENT_INSTRUCTIONS_DIR_RE.search(p))):
             return None
         if (os.environ.get("AEGIS_ALLOW_CROSS_AGENT_INSTRUCTIONS")
                 or _cross_agent_instructions_allowed_by_policy(cfg, p)):
