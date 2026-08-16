@@ -181,6 +181,14 @@ class Policy:
     # value (the override git's own 2.38.1+ default requires before either
     # scheme runs at all). See rules.rule_gitmodules_protect.
     gitmodules: dict = field(default_factory=dict)
+    # pre-commit / husky hook-manager auto-exec protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a `repo: local`/`repo: meta` hook's
+    # `entry:` command in .pre-commit-config.yaml, and any tracked hook
+    # script under .husky/ (husky v5+) — third-party hook-manager surfaces
+    # `git_hooks` doesn't reach (neither path shares a segment with
+    # .git/hooks/*). See rules.rule_precommit_hooks_protect.
+    precommit_hooks: dict = field(default_factory=dict)
     # Systemd unit / launchd persistence protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers /etc/systemd/{system,user}/*.service (+ .timer/.socket/

@@ -3948,3 +3948,52 @@ def gitmodules_add_loose_hit(cmd: str) -> bool:
                 and _GITMODULES_ANY_SCHEME_RE.search(clause)):
             return True
     return False
+
+
+# ---- pre-commit / husky hook-manager auto-exec protection ---------------------
+# Two third-party hook-MANAGER surfaces, distinct from git's own native
+# `.git/hooks/*` (already covered by GIT_HOOKS_PATH_RE): a tracked config
+# file that a hook shim reads fresh on every invocation (pre-commit), and a
+# tracked hook-script file that IS the hook body (husky v5+). Neither shares
+# a path segment with GIT_HOOKS_PATH_RE, so neither is reached by
+# rule_git_hooks_protect at all.
+_PRECOMMIT_LEAD = r"(?:^|[\s'\"/\\=])"
+
+PRECOMMIT_CONFIG_PATH_RE = re.compile(
+    _PRECOMMIT_LEAD + r"\.pre-commit-config\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `entry:` is a pre-commit-config-specific YAML key: pre-commit's own schema
+# only reads/uses it for a `repo: local`/`repo: meta` hook — a hosted
+# (`repo: <git-url>`) hook's entry point is fixed by that hook's OWN
+# `.pre-commit-hooks.yaml` and cannot be overridden from the consuming
+# repo's config at all, so this key carries the same "no legitimate other
+# reason to appear here" signal LIFECYCLE_SCRIPT_KEY_RE's key list already
+# relies on for package.json. Deliberately NOT required to co-occur with
+# `repo: local`/`repo: meta` in the same scanned text: an Edit that extends
+# an ALREADY-`repo: local` block with one more hook item carries only the
+# new `- id: ...\n  entry: ...` hunk in its new_string — the earlier
+# `repo: local` line lives outside that diff's own hunk boundary and would
+# never appear in the scanned text at all if this guard required it
+# alongside `entry:` in the same call.
+PRECOMMIT_ENTRY_KEY_RE = re.compile(
+    r"\bentry\s*:\s*\S",
+    re.IGNORECASE,
+)
+
+# husky (v5+) tracks its hook SCRIPTS directly in the repo under `.husky/`
+# (e.g. `.husky/pre-commit`, `.husky/pre-push`) — unlike `.git/hooks/*`,
+# these ARE ordinary tracked files with a real diff, but that is a sharper
+# camouflage problem, not a milder one: a malicious line added to a file
+# reviewers already expect to run shell commands doesn't stand out the way
+# it would in an ordinary config file. Path-only gate (no content check),
+# the same convention GIT_HOOKS_PATH_RE itself uses — editing a hook script
+# is a rare, deliberate act, not routine work like a package.json bump.
+# Includes husky's own `.husky/_/` bootstrap helper (sourced by EVERY hook
+# husky installs) — the single highest-leverage file in the directory, not
+# excluded as noise.
+HUSKY_HOOK_PATH_RE = re.compile(
+    _PRECOMMIT_LEAD + r"\.husky" + _WIN_TRIM + _SEP + r"[^\s'\"/\\]{1,100}",
+    re.IGNORECASE,
+)
