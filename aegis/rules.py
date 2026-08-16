@@ -2184,7 +2184,34 @@ def rule_precommit_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``rule_fetch_to_file_protect`` reusing this guard's own path regexes
     (``PRECOMMIT_CONFIG_PATH_RE``/``HUSKY_HOOK_PATH_RE``), not by this guard
     itself, the same division of labor every sibling guard already relies
-    on."""
+    on.
+
+    QA history (two independent adversarial reviews, run in parallel —
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file uses): both rounds confirmed real, since-fixed bugs — the
+    shell branch's write-verb set omitted ``COPY_WRITE_VERB_RE`` (bare
+    ``cp``/``install``/``ln``, no flag required — ``install -m755
+    payload.sh .husky/pre-commit``/``ln payload.sh .husky/pre-commit``
+    sailed through with zero detection, the same verb shape every sibling
+    guard's own write-verb set already includes) and ``HUSKY_HOOK_DIR_RE``,
+    the bare-``.husky``-directory fallback ``GIT_HOOKS_DIR_RE`` already has
+    for ``.git/hooks/`` (an archive/sync tool extracting multiple hook
+    scripts into the directory without ever naming one in the command —
+    ``rsync -a evil_hooks/ .husky/``/``tar xf payload.tar -C .husky/`` — is
+    a write-verb+path pairing this guard's named-file-only path regex could
+    never see, paired with ``ARCHIVE_SYNC_VERB_RE`` the same way
+    ``rule_agent_def_protect``'s shell branch already pairs the two); and
+    the Edit/Write/MCP branch's content-extraction fallback was gated on
+    ``ev.action == ActionClass.MCP`` alone, an earlier draft's copy of
+    ``rule_package_manifest_protect``'s own still-unfixed gap rather than
+    ``rule_gitmodules_protect``'s corrected version — ``MultiEdit``/
+    ``NotebookEdit`` are ``ActionClass.EDIT``, not MCP, and put their
+    changed text under ``edits: [{new_string}, ...]``/``new_source``, so a
+    ``MultiEdit`` planting an ``entry:`` line into ``.pre-commit-config.yaml``
+    sailed through completely unchecked; closed by falling through to
+    ``_flatten_strings`` for every action class whenever direct extraction
+    doesn't yield a non-empty plain string, matching
+    ``rule_gitmodules_protect``'s own fix for the identical bug class."""
     cfg = getattr(policy, "precommit_hooks", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -2201,8 +2228,22 @@ def rule_precommit_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
+        # `MultiEdit`/`NotebookEdit` are ActionClass.EDIT, not MCP, but put
+        # their changed text under `edits: [{new_string}, ...]`/`new_source`
+        # — neither key a bare `content`/`new_string` lookup checks, so
+        # gating the flatten fallback on `ev.action == MCP` alone (as this
+        # guard's first draft did, copying rule_package_manifest_protect's
+        # own still-unfixed gap) left both mainstream builtin tools
+        # completely unchecked for the `.pre-commit-config.yaml` content
+        # branch (QA finding, independent adversarial review — the same bug
+        # class rule_gitmodules_protect's own docstring already discloses
+        # having fixed by falling through for EVERY action class, not just
+        # MCP). husky_hit is unaffected (path-only, no content dependency).
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        content = raw_content if isinstance(raw_content, str) and raw_content else ""
+        if not content:
             content = " ".join(_flatten_strings(a))
         if not p:
             return None
@@ -2243,14 +2284,32 @@ def rule_precommit_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
         # regression here — caught by this file's own adversarial `find`
         # perf tests, not by design review).
         precommit_named = bool(patterns.PRECOMMIT_CONFIG_PATH_RE.search(cmd))
-        husky_named = bool(patterns.HUSKY_HOOK_PATH_RE.search(cmd))
+        # HUSKY_HOOK_DIR_RE catches the bare `.husky` directory (no filename
+        # ever named) — an archive/sync tool (rsync/tar/unzip) extracting
+        # MULTIPLE hook scripts into it never trips the named-file form
+        # alone, the identical evasion GIT_HOOKS_DIR_RE exists to close for
+        # `.git/hooks/` (QA finding, independent adversarial review:
+        # `rsync -a evil_hooks/ .husky/` sailed through with zero detection).
+        husky_named = bool(patterns.HUSKY_HOOK_PATH_RE.search(cmd)
+                            or patterns.HUSKY_HOOK_DIR_RE.search(cmd))
         if not (precommit_named or husky_named):
             return None
+        # COPY_WRITE_VERB_RE (bare cp/install/ln — QA finding, independent
+        # adversarial review: `install -m755 payload.sh .husky/pre-commit`
+        # and `ln payload.sh .husky/pre-commit` overwrite/plant a hook
+        # without tripping any of the five checks below) and
+        # ARCHIVE_SYNC_VERB_RE (rsync/tar/unzip/7z, paired with
+        # HUSKY_HOOK_DIR_RE above for the no-filename-named case) are the
+        # same two verb shapes rule_agent_def_protect's own shell branch
+        # already needed for the identical "bare directory, archive/copy
+        # tool" evasion class.
         write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                            or patterns.INPLACE_WRITE_RE.search(cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                           or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
         precommit_hit = bool(precommit_named and write_verb
                               and patterns.PRECOMMIT_ENTRY_KEY_RE.search(cmd))
         husky_hit = bool(husky_named and write_verb)

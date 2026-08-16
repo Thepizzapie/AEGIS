@@ -3997,3 +3997,16 @@ HUSKY_HOOK_PATH_RE = re.compile(
     _PRECOMMIT_LEAD + r"\.husky" + _WIN_TRIM + _SEP + r"[^\s'\"/\\]{1,100}",
     re.IGNORECASE,
 )
+
+# The bare `.husky` DIRECTORY, no specific hook filename required — an
+# archive/sync tool (rsync/tar/unzip) writes/extracts MULTIPLE names into a
+# target directory without ever naming a specific hook in the command
+# itself, the identical evasion `GIT_HOOKS_DIR_RE` exists to close for
+# `.git/hooks/` (QA finding, independent adversarial review: `rsync -a
+# evil_hooks/ .husky/`/`tar xf payload.tar -C .husky/` named no hook
+# filename at all, so HUSKY_HOOK_PATH_RE's name-required form never
+# matched).
+HUSKY_HOOK_DIR_RE = re.compile(
+    _PRECOMMIT_LEAD + r"\.husky" + _CI_END,
+    re.IGNORECASE,
+)
