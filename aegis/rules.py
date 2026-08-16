@@ -2080,6 +2080,257 @@ def rule_gitmodules_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _precommit_hooks_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_precommit_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an auto-run command in a third-party git-hook-MANAGER
+    surface — distinct from git's own native ``.git/hooks/*``, which
+    ``rule_git_hooks_protect`` already covers and this guard does not
+    duplicate: a ``repo: local``/``repo: meta`` hook's ``entry:`` command in
+    ``.pre-commit-config.yaml`` (the pre-commit framework, ubiquitous across
+    Python and increasingly polyglot repos), or a tracked hook-script file
+    under ``.husky/`` (husky v5+, the dominant npm-ecosystem git-hooks tool).
+
+    THREAT MODEL: once a repo's hook-manager shim is installed — a routine,
+    one-time, human-run setup step (``pre-commit install``, ``npx husky
+    install``/the ``prepare`` script that runs it) exactly as unremarkable as
+    wiring up CI or adding a submodule — a command planted in either surface
+    runs automatically, with the invoking human's (or CI's) full privileges,
+    on the very next ordinary ``git commit``/``push``, no further agent
+    action needed. Same "write now, auto-exec later, unattended" shape as
+    ``rule_git_hooks_protect``/``rule_git_config_exec_protect``/
+    ``rule_gitmodules_protect`` — reached through files none of them watch at
+    all: neither ``.pre-commit-config.yaml`` nor ``.husky/*`` shares a path
+    segment with ``GIT_HOOKS_PATH_RE``'s ``.git/hooks/*`` anchor, or with any
+    other existing guard's protected-path list.
+
+    The two targets sit at opposite ends of the "how obviously dangerous
+    does this look" spectrum, which is exactly why both need a guard: a
+    ``.git/hooks/*`` file is NEVER tracked by git, so ``rule_git_hooks_protect``
+    calls it "the most invisible durable backdoor" of that guard's own
+    targets — no diff, no code review, ever. ``.pre-commit-config.yaml`` and
+    ``.husky/*`` are the opposite failure mode: both ARE tracked, ordinary-
+    looking files, so a planted line reads as routine — a one-line hook-list
+    addition in a lint config, or one more command in a script reviewers
+    already expect to run shell commands. Camouflage-by-plausibility instead
+    of camouflage-by-invisibility, the same "ordinary tracked file that reads
+    as routine in review" shape ``rule_gitmodules_protect`` was built for.
+
+    Config (``policy.precommit_hooks``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted local-hook wiring, say). Defaults to ``ask`` for
+    the same reason every sibling ``*_protect`` guard does: a ``repo: local``
+    hook running a project's own linter, or a husky ``pre-commit`` running
+    tests, is routine, sanctioned dev work — it just needs a human to have
+    actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_PRECOMMIT_HOOKS=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Design note on the ``.pre-commit-config.yaml`` content check: gated on
+    the ``entry:`` key ALONE, not required to co-occur with ``repo: local``/
+    ``repo: meta`` in the same scanned text — pre-commit's schema only reads
+    ``entry:`` for a local/meta hook at all (a hosted hook's entry point is
+    fixed by that hook's OWN ``.pre-commit-hooks.yaml`` and cannot be
+    overridden from the consuming repo's config), so the key alone is
+    already high-signal, and an Edit that extends an ALREADY-``repo: local``
+    block with one more hook item carries only the new hook's own hunk in
+    its ``new_string`` — the earlier ``repo: local`` line lives outside that
+    diff's boundary and would never appear in the scanned text at all if
+    this guard required it alongside ``entry:`` in the same call, the same
+    "content check that survives a narrow real-world diff hunk" reasoning
+    ``rule_package_manifest_protect``'s own key-only gate uses.
+
+    ``.husky/*`` is gated on PATH alone, no content check — the same
+    convention ``rule_git_hooks_protect`` uses for ``.git/hooks/*`` itself:
+    editing a hook script is a rare, deliberate act, not routine work like a
+    manifest bump, so a path-only ask does not cause ask-fatigue. Includes
+    husky's own ``.husky/_/`` bootstrap helper, sourced by every hook husky
+    installs — the single highest-leverage file in the directory, not
+    excluded as noise.
+
+    Honest scope, same denylist trade-offs as every guard in this file: a
+    ``repo:``/``rev:`` swap pointing an EXISTING hosted hook at an
+    attacker-controlled fork or malicious commit (a supply-chain vector, not
+    a local-exec one) is NOT covered — there is no regex-distinguishable
+    signal between a legitimate mirror/pin and a malicious one, the same
+    "trusted name, poisoned source" class ``rule_package_manifest_protect``'s
+    own registry-hijack check can only catch because a REGISTRY URL has a
+    fixed key to gate on, not an arbitrary git remote; ``lefthook.yml``/
+    ``.lefthook.yml`` (a third, less common Go-based hook-manager config with
+    the identical ``run:``-a-local-command shape) is not covered, a disclosed
+    gap rather than an attempt at exhaustive hook-manager coverage in one
+    guard; an ``entry:``/hook-script value assembled indirectly (shell
+    variable concatenation, a wrapper script) rather than appearing as a
+    literal in the scanned text defeats every check here, the same
+    "computed indirectly" class every sibling guard already accepts; ``find``
+    -path/-name indirection around either target's path is not covered (no
+    ``*_find_hit``-style fallback, the same omission
+    ``rule_package_manifest_protect``/``rule_git_config_exec_protect`` also
+    accept for their own targets); and a direct fetch-to-file write (``curl
+    -o .pre-commit-config.yaml``/``curl -o .husky/pre-commit``) is caught by
+    none of the shell branch's write-verb checks — closed instead by
+    ``rule_fetch_to_file_protect`` reusing this guard's own path regexes
+    (``PRECOMMIT_CONFIG_PATH_RE``/``HUSKY_HOOK_PATH_RE``), not by this guard
+    itself, the same division of labor every sibling guard already relies
+    on.
+
+    QA history (two independent adversarial reviews, run in parallel —
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file uses): both rounds confirmed real, since-fixed bugs — the
+    shell branch's write-verb set omitted ``COPY_WRITE_VERB_RE`` (bare
+    ``cp``/``install``/``ln``, no flag required — ``install -m755
+    payload.sh .husky/pre-commit``/``ln payload.sh .husky/pre-commit``
+    sailed through with zero detection, the same verb shape every sibling
+    guard's own write-verb set already includes) and ``HUSKY_HOOK_DIR_RE``,
+    the bare-``.husky``-directory fallback ``GIT_HOOKS_DIR_RE`` already has
+    for ``.git/hooks/`` (an archive/sync tool extracting multiple hook
+    scripts into the directory without ever naming one in the command —
+    ``rsync -a evil_hooks/ .husky/``/``tar xf payload.tar -C .husky/`` — is
+    a write-verb+path pairing this guard's named-file-only path regex could
+    never see, paired with ``ARCHIVE_SYNC_VERB_RE`` the same way
+    ``rule_agent_def_protect``'s shell branch already pairs the two); and
+    the Edit/Write/MCP branch's content-extraction fallback was gated on
+    ``ev.action == ActionClass.MCP`` alone, an earlier draft's copy of
+    ``rule_package_manifest_protect``'s own still-unfixed gap rather than
+    ``rule_gitmodules_protect``'s corrected version — ``MultiEdit``/
+    ``NotebookEdit`` are ``ActionClass.EDIT``, not MCP, and put their
+    changed text under ``edits: [{new_string}, ...]``/``new_source``, so a
+    ``MultiEdit`` planting an ``entry:`` line into ``.pre-commit-config.yaml``
+    sailed through completely unchecked; closed by falling through to
+    ``_flatten_strings`` for every action class whenever direct extraction
+    doesn't yield a non-empty plain string, matching
+    ``rule_gitmodules_protect``'s own fix for the identical bug class."""
+    cfg = getattr(policy, "precommit_hooks", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "precommit-hooks-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        # `MultiEdit`/`NotebookEdit` are ActionClass.EDIT, not MCP, but put
+        # their changed text under `edits: [{new_string}, ...]`/`new_source`
+        # — neither key a bare `content`/`new_string` lookup checks, so
+        # gating the flatten fallback on `ev.action == MCP` alone (as this
+        # guard's first draft did, copying rule_package_manifest_protect's
+        # own still-unfixed gap) left both mainstream builtin tools
+        # completely unchecked for the `.pre-commit-config.yaml` content
+        # branch (QA finding, independent adversarial review — the same bug
+        # class rule_gitmodules_protect's own docstring already discloses
+        # having fixed by falling through for EVERY action class, not just
+        # MCP). husky_hit is unaffected (path-only, no content dependency).
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        content = raw_content if isinstance(raw_content, str) and raw_content else ""
+        if not content:
+            content = " ".join(_flatten_strings(a))
+        if not p:
+            return None
+        precommit_hit = bool(patterns.PRECOMMIT_CONFIG_PATH_RE.search(p)
+                              and content
+                              and patterns.PRECOMMIT_ENTRY_KEY_RE.search(content))
+        husky_hit = bool(patterns.HUSKY_HOOK_PATH_RE.search(p))
+        if not (precommit_hit or husky_hit):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PRECOMMIT_HOOKS")
+                or _precommit_hooks_allowed_by_policy(cfg, p)):
+            return None
+        reason = (f"Pre-commit hook config '{p}' is being written with a "
+                  "local `entry:` command — it runs automatically, with no "
+                  "explicit invocation, on the next `git commit`/`pre-commit "
+                  "run`" if precommit_hit else
+                  f"Husky hook script '{p}' is being written — it runs "
+                  "automatically, with the invoking user's or CI's full "
+                  "privileges, on the very next matching git operation")
+        return _finish(Decision(action, "precommit-hooks-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_PRECOMMIT_HOOKS=1; a spawned agent "
+                         "cannot set this."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        # Named-path checks first, write-verb checks (DESTRUCTIVE_DELETE_RE in
+        # particular measured at ~0.45s on an adversarial `"find . -name x "
+        # * 8000` scan surface — expensive on its own, not just in
+        # combination) gated behind them via `and` short-circuit — the same
+        # "cheap narrow check first, expensive checks only once it already
+        # hit" ordering rule_git_hooks_protect/rule_gitmodules_protect use,
+        # not the eager-unconditional ordering an earlier draft of this
+        # guard copied from rule_package_manifest_protect's own write_verb
+        # (whose verb set never includes DESTRUCTIVE_DELETE_RE, so eager
+        # computation there is cheap; copying the SHAPE without checking the
+        # COST of each verb regex reproduced a real, measured perf
+        # regression here — caught by this file's own adversarial `find`
+        # perf tests, not by design review).
+        precommit_named = bool(patterns.PRECOMMIT_CONFIG_PATH_RE.search(cmd))
+        # HUSKY_HOOK_DIR_RE catches the bare `.husky` directory (no filename
+        # ever named) — an archive/sync tool (rsync/tar/unzip) extracting
+        # MULTIPLE hook scripts into it never trips the named-file form
+        # alone, the identical evasion GIT_HOOKS_DIR_RE exists to close for
+        # `.git/hooks/` (QA finding, independent adversarial review:
+        # `rsync -a evil_hooks/ .husky/` sailed through with zero detection).
+        husky_named = bool(patterns.HUSKY_HOOK_PATH_RE.search(cmd)
+                            or patterns.HUSKY_HOOK_DIR_RE.search(cmd))
+        if not (precommit_named or husky_named):
+            return None
+        # COPY_WRITE_VERB_RE (bare cp/install/ln — QA finding, independent
+        # adversarial review: `install -m755 payload.sh .husky/pre-commit`
+        # and `ln payload.sh .husky/pre-commit` overwrite/plant a hook
+        # without tripping any of the five checks below) and
+        # ARCHIVE_SYNC_VERB_RE (rsync/tar/unzip/7z, paired with
+        # HUSKY_HOOK_DIR_RE above for the no-filename-named case) are the
+        # same two verb shapes rule_agent_def_protect's own shell branch
+        # already needed for the identical "bare directory, archive/copy
+        # tool" evasion class.
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                           or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        precommit_hit = bool(precommit_named and write_verb
+                              and patterns.PRECOMMIT_ENTRY_KEY_RE.search(cmd))
+        husky_hit = bool(husky_named and write_verb)
+        if not (precommit_hit or husky_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PRECOMMIT_HOOKS")
+                or _precommit_hooks_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A local `entry:` command is being planted in a pre-commit "
+                  "hook config from a shell — it runs automatically on the "
+                  "next `git commit`" if precommit_hit else
+                  "A husky hook script is being modified from a shell — it "
+                  "runs automatically on the very next matching git "
+                  "operation")
+        return _finish(Decision(action, "precommit-hooks-protect",
+                         f"{reason}. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_PRECOMMIT_HOOKS=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _service_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -4407,6 +4658,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
     (patterns.GIT_ATTRS_PATH_RE, "a .gitattributes file"),
     (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),
+    (patterns.PRECOMMIT_CONFIG_PATH_RE, "a pre-commit hook config"),
+    (patterns.HUSKY_HOOK_PATH_RE, "a husky hook script"),
     (patterns.SYSTEMD_UNIT_PATH_RE, "a systemd unit"),
     (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
     (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
@@ -5108,6 +5361,7 @@ _CORE_RULES = (
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_gitmodules_protect,
+    rule_precommit_hooks_protect,
     rule_service_persist_protect,
     rule_ld_preload_protect,
     rule_devcontainer_exec_protect,
