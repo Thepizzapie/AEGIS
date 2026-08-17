@@ -45,6 +45,7 @@ _REMEDIES = """\
 | vscode-tasks-protect | wrote a VS Code automatic task (tasks.json runOn: "folderOpen") or silenced its confirmation prompt (settings.json task.allowAutomaticTasks: "on") | ask the human; they can set AEGIS_ALLOW_VSCODE_TASKS_EXEC=1 after review |
 | path-hijack-protect | planted/symlinked/chmod +x'd an executable over a trusted command name in a $PATH bin directory (shadows the next bare invocation of that command, by anyone) | ask the human; they can set AEGIS_ALLOW_PATH_HIJACK=1 after review |
 | claude-hooks-protect | planted a `hooks` entry in .claude/settings.local.json (runs as Claude Code's own subprocess on the next matching tool call, outside the tool-call loop Aegis evaluates) | ask the human; they can set AEGIS_ALLOW_CLAUDE_HOOKS=1 after review |
+| claude-permissions-protect | self-granted a Claude Code permission-prompt bypass — `permissions.defaultMode: "bypassPermissions"` / an unscoped `permissions.allow` entry in .claude/settings.local.json, or a `claude --dangerously-skip-permissions` launch — removes the human approval prompt for future tool calls | ask the human; they can set AEGIS_ALLOW_CLAUDE_PERMISSIONS=1 after review |
 | conftest-protect | planted a pytest auto-exec shape (module-level code, an autouse fixture, or a hook like pytest_configure) in a conftest.py (runs on the next `pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_CONFTEST=1 after review |
 | pysite-protect | planted a module-level process/code-exec call in sitecustomize.py/usercustomize.py, or a dangerous `import`-prefixed line in a site-packages/dist-packages .pth file (runs on the next `python`/`pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_PYSITE=1 after review |
 | ipython-startup-protect | planted a module-level process/code-exec call (or, in a `.ipy` file, a bare `!<command>` shell-escape line) in `.ipython/profile_*/startup/` (runs on the next `ipython`/Jupyter-kernel launch, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_IPYTHON_STARTUP=1 after review |
@@ -107,7 +108,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `claude_permissions`, `conftest`, `pysite`, `ipython_startup`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -154,7 +155,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `shell_persist`, `direnv`,
      `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
-     `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `fetch_to_file`,
+     `claude_hooks`, `claude_permissions`, `conftest`, `pysite`, `ipython_startup`, `fetch_to_file`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
