@@ -231,6 +231,18 @@ class Policy:
     # merges hooks from with equal authority, and that no other guard
     # reaches. See rules.rule_claude_hooks_protect.
     claude_hooks: dict = field(default_factory=dict)
+    # Claude Code permission-escalation protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply. Covers `.claude/settings.local.json` self-granting a
+    # `permissions.defaultMode: "bypassPermissions"` (the settings-file
+    # equivalent of `--dangerously-skip-permissions`) or an unscoped/
+    # wildcard `permissions.allow` entry for a high-privilege tool (bare
+    # "Bash", "Bash(*)", "*") — both remove Claude Code's own approval
+    # prompt for future tool calls, silently, gitignored by default. Also
+    # gates the CLI-flag form (`claude --dangerously-skip-permissions` /
+    # `--permission-mode bypassPermissions`), which needs no file write at
+    # all. See rules.rule_claude_permissions_protect.
+    claude_permissions: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a

@@ -2488,6 +2488,112 @@ CLAUDE_HOOKS_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code permission-escalation protection (.claude/settings.local.json) --
+# `rule_claude_hooks_protect` above gates the ONE key it was built for --
+# `hooks` -- in this same gitignored-by-default, no-diff, no-review file.
+# `.claude/settings.local.json` carries a SECOND self-escalation surface that
+# guard was never scoped to catch: `permissions`. Setting
+# `permissions.defaultMode` to `"bypassPermissions"` is the documented,
+# supported equivalent of launching with `--dangerously-skip-permissions` --
+# it disables Claude Code's own interactive approval prompt for nearly every
+# tool call from that point forward (the same effect the CLI flag has, minus
+# a human ever typing it), and it works from a PROJECT-local settings file. A
+# blanket `"allow"` grant (a bare tool name with no argument scoping, e.g.
+# `"Bash"`, or its `"Bash(*)"`/`"*"` wildcard-argument spelling) has the same
+# practical effect for that one tool: every future invocation of it skips the
+# prompt a human would otherwise see. Aegis's own hooks still run underneath
+# either change (hooks are a separate mechanism from Claude Code's own
+# permission prompts, which is why self-protect's non-escapable tier can't be
+# waved off by a permission change at all) -- but everything this file's
+# guards do NOT already have an opinion on (an unremarkable `default_action:
+# allow` policy, or simply no rule matching a given call) currently reaches
+# the human via Claude Code's own prompt. Planting either shape removes that
+# checkpoint silently, in-session, for every action this file doesn't already
+# deny/ask on -- widening exactly the blind spot every `*_protect` guard's own
+# "Guards are a denylist" disclosure already admits exists.
+#
+# Deliberately narrow, the same "gate the file AND the specific dangerous
+# key/value, not the whole key" trade-off `CLAUDE_HOOKS_KEY_RE`/
+# `VSCODE_TASKS`'s own `runOn`/`allowAutomaticTasks` checks make:
+# settings.local.json's `permissions` block is edited constantly for entirely
+# benign reasons (scoping ONE more safe command into `allow`, e.g.
+# `"Bash(npm test)"`) -- gating on the key alone would ask on nearly every
+# ordinary permissions tweak. Only `defaultMode: "bypassPermissions"` and an
+# UNSCOPED (bare or `(*)`-wildcarded) grant for a curated set of
+# high-privilege tools are gated; a scoped grant like `"Bash(git diff:*)"`
+# stays allowed with no ask at all. `defaultMode` values that legitimately
+# narrow the default (`"plan"`, `"dontAsk"`) or that only auto-approve a
+# bounded, low-risk action set (`"acceptEdits"`, `"auto"`) are deliberately
+# NOT gated here -- disclosed as a known, accepted gap in
+# `rule_claude_permissions_protect`'s own docstring, not silently dropped.
+CLAUDE_PERMISSIONS_MODE_RE = re.compile(
+    r"[\"']defaultMode[\"']\s*:\s*[\"']bypassPermissions[\"']",
+    re.IGNORECASE,
+)
+
+# High-privilege Claude Code tool names: an UNSCOPED grant for any of these
+# (bare, or wildcarded with `(*)`) hands out the one thing that matters most
+# for each -- arbitrary shell (Bash), arbitrary local file writes (Write/
+# Edit/MultiEdit/NotebookEdit), arbitrary outbound network fetch (WebFetch/
+# WebSearch), or the ability to spawn a sub-agent with its own tool access
+# (Task) -- with no further per-call human confirmation. A scoped grant for
+# any of these (`"Bash(npm test)"`, `"Edit(*.md)"`) is ordinary, sanctioned
+# configuration and is NOT matched.
+_CLAUDE_PERMISSIONS_BROAD_TOOLS = (
+    r"Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|Task"
+    r"|KillShell|BashOutput"
+)
+CLAUDE_PERMISSIONS_BROAD_TOKEN_RE = re.compile(
+    r"^(?:\*|mcp__\*|(?:" + _CLAUDE_PERMISSIONS_BROAD_TOOLS + r")"
+    r"(?:\s*\(\s*\*\s*\))?)$",
+    re.IGNORECASE,
+)
+# A quoted string LEAF anywhere in scanned content -- used to pull candidate
+# array entries out of a bounded `"allow": [...]` window (see
+# `_claude_permissions_allow_broad_hit` in rules.py) without a full JSON
+# parse, the same "textual co-occurrence, not a real parser" trade-off
+# `CLAUDE_HOOKS_JQ_RE` above already makes.
+CLAUDE_PERMISSIONS_QUOTED_LEAF_RE = re.compile(r"[\"']([^\"'\n]{0,200})[\"']")
+
+# CLI-level equivalent of the file-write shape above, reachable with a single
+# shell command and no persistence at all: `claude --dangerously-skip-
+# permissions` (or its `--permission-mode bypassPermissions` spelling) spawns
+# a nested Claude Code process/session with its OWN permission prompts
+# disabled from the first tool call. Whether that nested session even shares
+# this project's Aegis hook config is a separate question (it does, for an
+# ordinary same-directory launch) -- the point this pattern exists to catch
+# is the human-in-the-loop checkpoint that flag removes, the same one the
+# `defaultMode` file-write shape above removes, reachable in one line with no
+# write, no diff, no future trigger. 200-char bounded window between `claude`
+# and the flag, matching the shared verb-adjacency convention
+# `DIRENV_ACTIVATE_RE`'s/`SERVICE_ACTIVATE_RE`'s own docstrings already use
+# for this file's shell-command guards.
+CLAUDE_PERMISSIONS_CLI_BYPASS_RE = re.compile(
+    r"\bclaude(?:-code)?\b(?:(?!;|&&|\|\||\n).){0,200}?"
+    r"(?:--dangerously-skip-permissions\b"
+    r"|--permission-mode(?:=|\s+)[\"']?bypassPermissions\b)",
+    re.IGNORECASE,
+)
+
+# jq-scripted edit of `defaultMode` -> `"bypassPermissions"` — the same
+# "no -i flag, so a temp-file-then-mv (already caught by the shared
+# write-verb check) or piped through `sponge`" shape `CLAUDE_HOOKS_JQ_RE`
+# above closes for `hooks`. Deliberately narrower than that guard's own jq
+# check: `hooks` has no safe value at all once present, but `permissions.
+# allow` has plenty (a scoped grant is ordinary config), so a jq-scripted
+# broadening of `allow` specifically is a disclosed, accepted gap in
+# `rule_claude_permissions_protect`'s own docstring rather than a
+# false-ask-prone blanket "jq + permissions co-occur" match — only the
+# unambiguous `defaultMode` -> `bypassPermissions` shape, which (like
+# `hooks`) has no legitimate reason to ever be scripted this way, is gated.
+CLAUDE_PERMISSIONS_JQ_RE = re.compile(
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}\.?defaultMode\b)"
+    r"(?=[^;&\n]{0,400}bypassPermissions\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

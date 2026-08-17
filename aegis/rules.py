@@ -3626,6 +3626,293 @@ def rule_claude_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _claude_permissions_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _claude_permissions_broad_grant(s) -> bool:
+    """True when a single ``permissions.allow``/``permissions.ask`` array
+    entry is an UNSCOPED grant — a bare high-privilege tool name (``Bash``)
+    or its ``(*)``-wildcarded spelling (``Bash(*)``), or the universal ``*``/
+    ``mcp__*`` forms. A SCOPED entry (``Bash(npm test)``, ``Edit(*.md)``) is
+    ordinary, sanctioned configuration and returns False — the regex's `$`
+    anchor requires nothing follow the tool name but an optional bare `(*)`,
+    so any other parenthesized content fails the full match."""
+    if not isinstance(s, str):
+        return False
+    return bool(patterns.CLAUDE_PERMISSIONS_BROAD_TOKEN_RE.match(s.strip()))
+
+
+def _claude_permissions_allow_broad_hit(content: str) -> bool:
+    """Bounded textual scan for a broad/wildcard grant inside a
+    ``permissions.allow`` array, for the common partial-fragment Edit/Write
+    case that never parses as standalone JSON (the same trade-off
+    `CLAUDE_HOOKS_KEY_RE`'s own textual check makes, documented in
+    `rule_claude_hooks_protect`'s docstring). Deliberately NOT a bare
+    "'allow' co-occurs with a dangerous-looking token somewhere in this
+    content" check: it locates each `"allow": [` occurrence and stops
+    scanning at the first sibling key boundary (`deny`/`ask`/`defaultMode`)
+    or closing bracket, so a genuinely SAFER `"deny": ["Bash"]` entry sharing
+    the same edit chunk as an unrelated, scoped `"allow": [...]` is never
+    misattributed to allow — a real, tested failure mode a naive
+    window-based co-occurrence check would have produced here.
+
+    Perf note (found stress-testing this helper directly, the same
+    discipline `rule_fetch_to_file_protect`'s own QA history used to catch
+    its regex's catastrophic-backtracking gap): an adversarial content
+    string repeating the literal ``"allow": [`` thousands of times drove
+    per-occurrence work (a 2000-char slice plus several bounded regex
+    searches) into multi-second aggregate latency in this synchronous,
+    every-tool-call hot path, despite no single regex here being
+    catastrophically backtracking on its own — capped to the first 64
+    occurrences, matching this file's existing "bounded window, not
+    unbounded scan" convention one level up (a real edit/write content
+    field has no legitimate reason to repeat this key anywhere near that
+    often)."""
+    for i, m in enumerate(re.finditer(r"[\"']allow[\"']\s*:\s*\[", content, re.IGNORECASE)):
+        if i >= 64:
+            break
+        window = content[m.end():m.end() + 2000]
+        stop = len(window)
+        for boundary in (r"[\"']deny[\"']\s*:", r"[\"']ask[\"']\s*:",
+                          r"[\"']defaultMode[\"']\s*:", r"\]"):
+            bm = re.search(boundary, window, re.IGNORECASE)
+            if bm and bm.start() < stop:
+                stop = bm.start()
+        body = window[:stop]
+        for leaf in patterns.CLAUDE_PERMISSIONS_QUOTED_LEAF_RE.findall(body):
+            if _claude_permissions_broad_grant(leaf):
+                return True
+    return False
+
+
+def _claude_permissions_struct_hit(v, _depth: int = 0) -> bool:
+    """Walk a (possibly nested) structure — parsed whole-file JSON, or an
+    MCP tool's raw args — for a ``permissions`` dict key whose value carries
+    either dangerous shape: ``defaultMode: "bypassPermissions"`` or an
+    ``allow`` array containing a broad/wildcard grant. Same depth cap (12)
+    and same "additional structural signal, not a replacement for the
+    textual check" role as `_claude_hooks_struct_key_hit`."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() == "permissions" and isinstance(val, dict):
+                mode = val.get("defaultMode")
+                if isinstance(mode, str) and mode.strip() == "bypassPermissions":
+                    return True
+                allow = val.get("allow")
+                if isinstance(allow, (list, tuple)) and any(
+                        _claude_permissions_broad_grant(x) for x in allow):
+                    return True
+            if _claude_permissions_struct_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_permissions_struct_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_permissions_json_hit(content: str) -> bool:
+    """`_claude_hooks_json_hit`'s own JSON-unicode-escape-evasion fix, reused
+    here: parse ``content`` as JSON (only when it validates standalone) and
+    walk the DECODED structure, closing the identical ``\\uXXXX``-escaped-key
+    bypass class for ``"permissions"``/``"defaultMode"``/``"allow"`` that a
+    purely textual regex can't see through."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _claude_permissions_struct_hit(obj)
+
+
+def rule_claude_permissions_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block self-granting a Claude Code permission-prompt bypass in
+    ``.claude/settings.local.json`` — the project-local, gitignored-by-default
+    settings file `rule_claude_hooks_protect` already reaches for its own
+    ``hooks`` key, extended here to the file's SECOND self-escalation
+    surface that guard was never scoped to catch: ``permissions``.
+
+    THREAT MODEL: Claude Code's own interactive permission prompt is the
+    human checkpoint standing in front of everything this file's guards
+    don't ALREADY have an opinion on — an unremarkable ``default_action:
+    allow`` policy, or simply no rule matching a given tool call, both fall
+    through to that prompt today. Two documented settings keys remove it:
+
+    1. ``permissions.defaultMode: "bypassPermissions"`` — the settings-file
+       equivalent of launching with ``--dangerously-skip-permissions``. It
+       disables Claude Code's own approval prompt for nearly every tool call
+       from that point forward, and (unlike the CLI flag) requires no human
+       to ever type it — an agent plants it once, in a file nobody reviews.
+    2. A bare/wildcarded ``permissions.allow`` entry (``"Bash"``,
+       ``"Bash(*)"``, the universal ``"*"``) — same effect, scoped to one
+       tool: every future invocation of it skips the prompt.
+
+    Aegis's own guards are unaffected either way — hooks are a separate
+    mechanism from Claude Code's permission system, which is exactly why
+    `rule_self_protect`'s non-escapable tier isn't itself waveable by a
+    permission change. What's lost is everything OUTSIDE this file's
+    denylist: the "Guards are a denylist" gap every sibling `*_protect`
+    guard's own disclosure already admits exists, silently widened the
+    moment either shape lands. Distinct from, and additive to,
+    `rule_claude_hooks_protect`'s own ``hooks``-key check — the two keys
+    reach different runtime mechanisms (a runtime-executed subprocess vs. a
+    removed confirmation prompt) and are checked independently so a change
+    touching only one is still caught.
+
+    A third, file-write-free path reaches the identical bypass in one shell
+    command: ``claude --dangerously-skip-permissions`` (or
+    ``--permission-mode bypassPermissions``) launches a nested session with
+    its own prompts disabled from the first tool call, no plant, no diff, no
+    future trigger required at all.
+
+    Distinct from a path-only guard for the same reason `rule_claude_hooks_
+    protect` is: settings.local.json's ``permissions`` block is edited
+    constantly for entirely benign reasons (scoping one more safe command
+    into ``allow``) — gated on PATH *and* the specific dangerous shape
+    (``defaultMode: bypassPermissions``, or an UNSCOPED grant for a curated
+    high-privilege tool list), not the ``permissions``/``allow`` keys alone,
+    so an ordinary scoped grant (``"Bash(npm test)"``) stays allowed with no
+    ask.
+
+    Config (``policy.claude_permissions``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the
+    gate). Defaults to ``ask`` for the same reason every sibling
+    ``*_protect`` guard does: a human deliberately choosing
+    ``bypassPermissions`` for a fully sandboxed, throwaway run is legitimate
+    — it just needs a human to have actually chosen it.
+
+    Escapable only by a human: a trailing ``# aegis-allow`` on the shell
+    form, or ``AEGIS_ALLOW_CLAUDE_PERMISSIONS=1`` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form — the identical
+    "a spawned agent cannot set its own env for a hook invocation it doesn't
+    control" invariant `rule_claude_hooks_protect` already holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: ``defaultMode`` values that legitimately narrow the default
+    (``"plan"``, ``"dontAsk"``) or that only auto-approve a bounded action
+    set (``"acceptEdits"``, ``"auto"``) are deliberately NOT gated — only
+    the one value that removes essentially every prompt is; the curated
+    high-privilege tool list for the broad-grant check is a judgment call
+    the same way `rule_path_hijack_protect`'s own curated command-name list
+    is — an unlisted tool name granted unscoped is not caught; a scripted
+    edit via ``jq`` is checked only for the unambiguous ``defaultMode`` ->
+    ``bypassPermissions`` shape (``CLAUDE_PERMISSIONS_JQ_RE``) — unlike
+    ``hooks``, ``allow`` has plenty of safe values, so (unlike
+    `CLAUDE_HOOKS_JQ_RE`) a jq-scripted broadening of the ``allow`` array
+    itself is a disclosed, accepted gap here rather than a false-ask-prone
+    blanket match; the CLI-bypass check requires the literal ``claude``/
+    ``claude-code`` command name within 200 chars of its flag (the same
+    bounded verb-adjacency window this file's shell guards already use) — a
+    wrapper script or shell alias that itself invokes the real binary
+    evades it; the broad-grant check matches only the literal bare or
+    ``(*)``-wildcarded spellings — a glob that is broad IN EFFECT but not
+    spelled that way (``Bash(* *)``, ``Bash(*:*)``) is not caught, the same
+    "matches the documented universal-wildcard spelling, not every
+    semantically-equivalent glob" trade-off; and, like every sibling guard
+    here, a direct fetch-to-file write (``curl -o
+    .claude/settings.local.json ...``) is caught by `rule_fetch_to_file_
+    protect` reusing this guard's own ``CLAUDE_LOCAL_SETTINGS_PATH_RE``, not
+    by this guard's own write-verb checks directly — the same
+    shared-backstop shape every sibling guard's docstring already
+    discloses. `_claude_permissions_allow_broad_hit` caps itself to the
+    first 64 ``"allow": [`` occurrences per scan (found stress-testing it
+    directly — see its own docstring for the multi-second-latency
+    adversarial input that drove the cap)."""
+    cfg = getattr(policy, "claude_permissions", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-permissions-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.CLAUDE_PERMISSIONS_MODE_RE.search(content)
+                   or _claude_permissions_allow_broad_hit(content)
+                   or _claude_permissions_json_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = _claude_permissions_struct_hit(a)
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_PERMISSIONS")
+                or _claude_permissions_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-permissions-protect",
+                         f"'{p}' is being written with a permission-prompt "
+                         "bypass — `defaultMode: \"bypassPermissions\"` or an "
+                         "unscoped `allow` grant removes Claude Code's own "
+                         "approval prompt for future tool calls this file's "
+                         "guards don't already deny/ask on, silently, with "
+                         "no diff and no code review (gitignored by "
+                         "default). Review the change, then confirm with "
+                         "AEGIS_ALLOW_CLAUDE_PERMISSIONS=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if patterns.CLAUDE_PERMISSIONS_CLI_BYPASS_RE.search(cmd):
+            if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PERMISSIONS")
+                    or _claude_permissions_allowed_by_policy(cfg, cmd)):
+                return None
+            return _finish(Decision(action, "claude-permissions-protect",
+                             "Launching Claude Code with "
+                             "--dangerously-skip-permissions/--permission-mode "
+                             "bypassPermissions disables its own approval "
+                             "prompt for the new session from the first tool "
+                             "call, no file write needed. A human may append "
+                             "'# aegis-allow', or set "
+                             "AEGIS_ALLOW_CLAUDE_PERMISSIONS=1; a spawned "
+                             "agent cannot."))
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        jq_hit = bool(patterns.CLAUDE_PERMISSIONS_JQ_RE.search(cmd))
+        write_hit = bool(write_verb and (patterns.CLAUDE_PERMISSIONS_MODE_RE.search(cmd)
+                                          or _claude_permissions_allow_broad_hit(cmd)))
+        if not (jq_hit or write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PERMISSIONS")
+                or _claude_permissions_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-permissions-protect",
+                         "A permission-prompt bypass is being planted in "
+                         ".claude/settings.local.json from a shell — "
+                         "`defaultMode: \"bypassPermissions\"` or an unscoped "
+                         "`allow` grant removes Claude Code's own approval "
+                         "prompt for future tool calls, silently, with no "
+                         "diff and no code review. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_CLAUDE_PERMISSIONS=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -5114,6 +5401,7 @@ _CORE_RULES = (
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
+    rule_claude_permissions_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
