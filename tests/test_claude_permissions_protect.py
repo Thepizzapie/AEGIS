@@ -14,9 +14,13 @@ tool. Aegis's own hooks are unaffected by either change — what's lost is
 the human checkpoint standing in front of everything this file's OTHER
 guards don't already deny/ask on.
 """
+import time
+
+from aegis import patterns
 from aegis.engine import evaluate
 from aegis.events import ActionClass, Event, HookEvent
 from aegis.policy import Action, Policy
+from aegis.rules import _claude_permissions_allow_broad_hit
 
 EMPTY = Policy()                                                   # default mode: ask
 DENY = Policy(claude_permissions={"mode": "deny"})                 # stricter, hard-block posture
@@ -497,3 +501,72 @@ def test_off_mode_disables_guard_entirely():
     pol = Policy(claude_permissions={"mode": "off"})
     assert not _gated(evaluate(_write(".claude/settings.local.json"), pol))
     assert not _gated(evaluate(_shell(_CLI_BYPASS_CMD), pol))
+
+
+# ---- perf / ReDoS regression -------------------------------------------------------
+#
+# `_claude_permissions_allow_broad_hit`'s own docstring (rules.py) documents
+# a stress-testing-discovered adversarial input — content repeating the
+# literal `"allow": [` thousands of times — that drove per-occurrence work
+# into multi-second aggregate latency in this synchronous, every-tool-call
+# hot path (measured ~3.5s before the fix) despite no single regex here
+# being catastrophically backtracking on its own. Closed by capping the
+# helper to the first 64 `"allow": [` occurrences per scan. These tests
+# lock that fix in place, mirroring `rule_claude_hooks_protect`'s own
+# `test_perf_no_redos_on_adversarial_shell_input`/
+# `test_perf_no_redos_on_long_path_content` convention.
+
+def test_perf_repeated_allow_key_content_bounded():
+    adversarial = '"allow": [' * 20000 + "x" * 100000
+    start = time.time()
+    assert _claude_permissions_allow_broad_hit(adversarial) is False
+    assert time.time() - start < 1.0
+
+
+def test_perf_repeated_allow_key_via_write_bounded():
+    adversarial = '"allow": [' * 5000
+    start = time.time()
+    d = evaluate(_write(".claude/settings.local.json", adversarial), EMPTY)
+    assert time.time() - start < 1.0
+    assert not _gated(d)
+
+
+def test_perf_no_redos_on_adversarial_shell_input():
+    adversarial = ("jq " + "a" * 5000 + " .claude/settings.local.json | sponge "
+                    ".claude/settings.local.json " + "b" * 5000)
+    start = time.time()
+    evaluate(_shell(adversarial), EMPTY)
+    assert time.time() - start < 1.0
+
+
+def test_perf_no_redos_on_cli_bypass_padding():
+    adversarial = "claude " + ("x" * 500000) + " --dangerously-skip-permissions"
+    start = time.time()
+    evaluate(_shell(adversarial), EMPTY)
+    assert time.time() - start < 1.0
+
+
+def test_perf_no_redos_on_long_path_content():
+    long_content = '"x": "' + ("y" * 20000) + '", ' + BYPASS_MODE_JSON
+    start = time.time()
+    d = evaluate(_write(".claude/settings.local.json", long_content), EMPTY)
+    assert time.time() - start < 1.0
+    assert _gated(d)
+
+
+# ---- direct pattern sanity ---------------------------------------------------------
+
+def test_path_regex_matches_expected_forms():
+    for p in (".claude/settings.local.json", ".claude\\settings.local.json",
+              "a/b/.claude/settings.local.json", "/home/dev/.claude/settings.local.json"):
+        assert patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p), p
+
+
+def test_broad_token_regex_matches_expected_forms():
+    for tok in ("Bash", "bash", "Bash(*)", "Bash( * )", "*", "mcp__*", "WebFetch(*)"):
+        assert patterns.CLAUDE_PERMISSIONS_BROAD_TOKEN_RE.match(tok), tok
+
+
+def test_broad_token_regex_rejects_scoped_forms():
+    for tok in ("Bash(npm test)", "Edit(*.md)", "Bash(git *)", "", "notatool"):
+        assert not patterns.CLAUDE_PERMISSIONS_BROAD_TOKEN_RE.match(tok), tok
