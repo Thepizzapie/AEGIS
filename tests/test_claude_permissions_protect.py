@@ -262,6 +262,140 @@ def test_mcp_struct_depth_capped():
     assert _gated(d) and d.rule == "claude-permissions-protect"
 
 
+# ---- QA round 1 findings: MCP flat key/value shape + \uXXXX fragment escape ------
+#
+# Independent adversarial review confirmed two real, reproduced silent-ALLOW
+# bypasses before merge (see `_claude_permissions_mcp_kv_hit`'s and
+# `_claude_permissions_decode_unicode_escapes`'s own docstrings in rules.py
+# for the full reasoning). These tests lock both fixes in place.
+
+def _mcp_key_value(path, key, value):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__json_editor__set_key",
+                       action=ActionClass.MCP,
+                       args={"path": path, "key": key, "value": value})
+
+
+def test_mcp_flat_kv_permissions_dict_bypass_mode_gated():
+    """QA finding: a "set config value"-style MCP tool shape
+    ({"key": "permissions", "value": {...}}) — the key name is a bare
+    sibling STRING VALUE, never a dict key, so neither the structural walk
+    (which requires `permissions` as an actual dict key) nor the
+    flattened-string textual check (which loses key/value pairing) saw it
+    before this fix. Confirmed live: silent ALLOW pre-fix."""
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions",
+                                 {"defaultMode": "bypassPermissions"}), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_mcp_flat_kv_permissions_dict_broad_allow_gated():
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions",
+                                 {"allow": ["Bash"]}), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_mcp_flat_kv_dotted_default_mode_gated():
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions.defaultMode",
+                                 "bypassPermissions"), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_mcp_flat_kv_dotted_allow_gated():
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions.allow",
+                                 ["Bash(*)"]), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_mcp_flat_kv_case_insensitive_key_gated():
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "PERMISSIONS",
+                                 {"defaultMode": "bypassPermissions"}), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_mcp_flat_kv_scoped_allow_not_gated():
+    """The flat key/value fix must stay just as narrow as the structural
+    walk it mirrors — a SCOPED grant reached this way is still ordinary,
+    sanctioned configuration."""
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions",
+                                 {"allow": ["Bash(npm test)"]}), EMPTY)
+    assert not _gated(d)
+
+
+def test_mcp_flat_kv_dotted_default_mode_safe_value_not_gated():
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions.defaultMode",
+                                 "plan"), EMPTY)
+    assert not _gated(d)
+
+
+def test_mcp_flat_kv_unrelated_key_not_gated():
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "model", "opus"), EMPTY)
+    assert not _gated(d)
+
+
+def test_mcp_flat_kv_bare_word_permissions_alone_not_gated():
+    """Deliberately narrower than a bareword "permissions"-appears-anywhere
+    check (the shape `_claude_hooks_mcp_bareword_hit` uses for `hooks`) —
+    unlike `hooks`, a bare mention of the word "permissions" is common and
+    often benign, so the real key/value PAIRING is required, not mere
+    co-occurrence."""
+    d = evaluate(_mcp_write(".claude/settings.local.json",
+                             '{"note": "see permissions docs"}'), EMPTY)
+    assert not _gated(d)
+
+
+def test_mcp_flat_kv_depth_capped():
+    nested = {"key": "permissions", "value": {"defaultMode": "bypassPermissions"}}
+    for _ in range(8):
+        nested = {"wrapper": nested}
+    d = evaluate(_mcp_nested_json(".claude/settings.local.json", nested), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_unicode_escaped_bypass_mode_fragment_gated():
+    """QA finding: a partial Edit `new_string` almost never parses
+    standalone as JSON (no enclosing braces), so `_claude_permissions_
+    json_hit`'s `json.loads` path — the guard's only prior defense against
+    `\\uXXXX`-escaped keys/values — was unreachable for the DOMINANT
+    real-world Edit shape. Confirmed live: silent ALLOW pre-fix for
+    `"defaultMode": "\\u0062ypassPermissions"` (decodes to the real value,
+    byte-for-byte, once merged into the real file)."""
+    d = evaluate(_edit(".claude/settings.local.json",
+                        '"permissions": {"defaultMode": "\\u0062ypassPermissions"}'), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_unicode_escaped_broad_allow_fragment_gated():
+    d = evaluate(_edit(".claude/settings.local.json",
+                        '"permissions": {"allow": ["\\u0042ash(*)"]}'), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_unicode_escaped_allow_key_fragment_gated():
+    d = evaluate(_edit(".claude/settings.local.json",
+                        '"\\u0061llow": ["Bash"]'), EMPTY)
+    assert _gated(d) and d.rule == "claude-permissions-protect"
+
+
+def test_unicode_escaped_scoped_allow_fragment_not_gated():
+    """The unicode-decode retry must stay just as narrow as the plain-text
+    check it mirrors — a SCOPED grant spelled with an escape is still
+    ordinary configuration, not a broad grant."""
+    d = evaluate(_edit(".claude/settings.local.json",
+                        '"permissions": {"allow": ["\\u0042ash(npm test)"]}'), EMPTY)
+    assert not _gated(d)
+
+
+def test_unicode_escape_decode_helper_leaves_unrelated_text_unchanged():
+    from aegis.rules import _claude_permissions_decode_unicode_escapes
+    assert _claude_permissions_decode_unicode_escapes("plain text, no escapes") == (
+        "plain text, no escapes")
+
+
+def test_unicode_escape_decode_helper_decodes_expected_value():
+    from aegis.rules import _claude_permissions_decode_unicode_escapes
+    assert _claude_permissions_decode_unicode_escapes(
+        "\\u0062ypassPermissions") == "bypassPermissions"
+
+
 # ---- shell forms --------------------------------------------------------------
 #
 # Exactly like `rule_claude_hooks_protect`'s own module note: `rule_self_

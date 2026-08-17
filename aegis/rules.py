@@ -3732,6 +3732,100 @@ def _claude_permissions_json_hit(content: str) -> bool:
     return _claude_permissions_struct_hit(obj)
 
 
+_CLAUDE_PERMISSIONS_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _claude_permissions_decode_unicode_escapes(s: str) -> str:
+    """Decode JSON ``\\uXXXX`` escapes in RAW text, without requiring the
+    surrounding text to parse as standalone JSON — the fragment-level analog
+    of `_claude_permissions_json_hit`'s own whole-file-JSON fix.
+
+    QA finding (independent adversarial review): a partial Edit
+    ``new_string`` — the dominant real-world shape, since it almost never
+    parses standalone as JSON (no enclosing braces for the whole file) —
+    left `_claude_permissions_json_hit`'s ``json.loads`` path unreachable,
+    so a fragment like ``'"defaultMode": "\\u0062ypassPermissions"'``
+    evaded BOTH the textual regex (which requires the literal ASCII
+    spelling) and the JSON-walk fallback (which never runs), a confirmed,
+    reproduced silent-ALLOW bypass. Once landed in the real file via Edit,
+    the RESULTING full file is ordinary valid JSON that Claude Code decodes
+    identically — Aegis just never validated the merged result, only the
+    fragment it was shown. Closed by decoding ``\\uXXXX`` escapes in a COPY
+    of the scanned text (bounded, single-pass substitution, no parsing
+    required) and running the same textual checks against that decoded copy
+    too, not only the raw one — see the two extra `.search()`/broad-hit
+    calls in `rule_claude_permissions_protect`'s Edit/Write/MCP branch."""
+    try:
+        return _CLAUDE_PERMISSIONS_UNICODE_ESCAPE_RE.sub(
+            lambda m: chr(int(m.group(1), 16)), s)
+    except (ValueError, OverflowError):
+        return s
+
+
+def _claude_permissions_mode_value_dangerous(mode) -> bool:
+    return isinstance(mode, str) and mode.strip() == "bypassPermissions"
+
+
+def _claude_permissions_allow_value_dangerous(allow) -> bool:
+    return isinstance(allow, (list, tuple)) and any(
+        _claude_permissions_broad_grant(x) for x in allow)
+
+
+def _claude_permissions_mcp_kv_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args for a "set config
+    value"-style shape — ``{"key": "permissions", "value": {...}}`` or its
+    dotted-path spelling, ``{"key": "permissions.defaultMode", "value":
+    "bypassPermissions"}`` / ``{"key": "permissions.allow", "value":
+    [...]}`` — that neither `_claude_permissions_struct_hit` (which
+    requires ``permissions`` as an actual DICT KEY mapping straight to the
+    dangerous dict) nor the textual/flattened-string checks (which lose the
+    key/value PAIRING structure entirely — `_flatten_strings` collects bare
+    leaf strings with no memory of which key each came from) can see: the
+    key name is a bare SIBLING string value, and the dangerous payload sits
+    one level away under a differently-named sibling key.
+
+    QA finding (independent adversarial review): a CONFIRMED, reproduced
+    silent-ALLOW bypass via exactly this shape, live through ``evaluate()``
+    — the identical, already-disclosed gap `rule_claude_hooks_protect`'s
+    own docstring names for the same MCP convention, but for a NEWLY
+    self-escalating guard where the consequence is a fully disabled
+    approval prompt rather than a runtime-executed hook, so closed here
+    rather than only disclosed. Deliberately narrower than a bareword
+    "'permissions' appears as a leaf string anywhere" check (the shape
+    `_claude_hooks_mcp_bareword_hit` uses for ``hooks``) — unlike ``hooks``,
+    a bare mention of the WORD "permissions" is common and often benign
+    (an MCP tool merely referencing "permissions" in an unrelated field),
+    so this walk requires the real key/value PAIRING (a dict literally
+    carrying both a ``key`` and a ``value`` entry) before evaluating the
+    paired value with the same dangerous-value checks the structural walk
+    above uses, keeping the same low-false-positive bar as the rest of this
+    guard. Same depth cap (12) as its siblings."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        key_val = v.get("key")
+        if isinstance(key_val, str) and "value" in v:
+            k = key_val.strip().lower()
+            value = v["value"]
+            if k == "permissions" and isinstance(value, dict):
+                if (_claude_permissions_mode_value_dangerous(value.get("defaultMode"))
+                        or _claude_permissions_allow_value_dangerous(value.get("allow"))):
+                    return True
+            elif k in ("permissions.defaultmode", "defaultmode"):
+                if _claude_permissions_mode_value_dangerous(value):
+                    return True
+            elif k in ("permissions.allow", "allow"):
+                if _claude_permissions_allow_value_dangerous(value):
+                    return True
+        for val in v.values():
+            if _claude_permissions_mcp_kv_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_permissions_mcp_kv_hit(x, _depth + 1) for x in v)
+    return False
+
+
 def rule_claude_permissions_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block self-granting a Claude Code permission-prompt bypass in
     ``.claude/settings.local.json`` — the project-local, gitignored-by-default
@@ -3824,7 +3918,49 @@ def rule_claude_permissions_protect(ev: Event, policy=None) -> Optional[Decision
     discloses. `_claude_permissions_allow_broad_hit` caps itself to the
     first 64 ``"allow": [`` occurrences per scan (found stress-testing it
     directly — see its own docstring for the multi-second-latency
-    adversarial input that drove the cap)."""
+    adversarial input that drove the cap).
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows): design/consistency review found the wiring correct
+    everywhere its siblings are (``Policy``, all three ``loader.py`` spots,
+    ``_CORE_RULES``, both ``skills.py`` knob lists + the remedy table, the
+    README guard table and Known-gaps paragraph), round-tripped a real YAML
+    ``claude_permissions:`` block through ``load_policy()`` into a live
+    ``evaluate()`` decision, confirmed ``rule_self_protect`` really does
+    take precedence for ordinary shell writes exactly as documented, and
+    flagged one gap — no perf/ReDoS regression test locked in the
+    ``_claude_permissions_allow_broad_hit`` 64-occurrence-cap fix, unlike
+    every other perf-motivated fix in this file's convention — closed by
+    adding that coverage (mirroring `rule_claude_hooks_protect`'s own
+    ``test_perf_no_redos_*`` pair) before the bypass round below ran.
+
+    Bypass-hunting found and closed two real, reproduced silent-ALLOW
+    bypasses before merge: (1) the MCP "set config value" flat key/value
+    shape (``{"key": "permissions", "value": {...}}``, or its dotted-path
+    spelling) — the identical, already-disclosed gap class
+    `rule_claude_hooks_protect`'s own docstring names for ``hooks``, but
+    left neither closed nor even disclosed here at first; closed by
+    `_claude_permissions_mcp_kv_hit`, a depth-capped walk requiring the real
+    key/value PAIRING (deliberately narrower than a bareword
+    "'permissions' appears anywhere" check — that word is common and often
+    benign, unlike ``hooks``). (2) a ``\\uXXXX``-escaped Edit **fragment**
+    — ``_claude_permissions_json_hit``'s ``json.loads`` path only ever
+    fires on content that parses standalone, but an ordinary Edit
+    ``new_string`` almost never does (no enclosing braces), so the
+    fragment-level analog of the whole-file escape-decode fix was
+    completely unreachable for the DOMINANT real-world Edit shape; closed
+    by `_claude_permissions_decode_unicode_escapes`, which decodes
+    ``\\uXXXX`` sequences in a copy of the raw text (no standalone-JSON
+    requirement) and re-runs the same textual checks against that decoded
+    copy. Both fixes verified live through ``evaluate()``, not just against
+    the regex/helper in isolation, and both re-verified to stay as narrow
+    as the checks they extend (a scoped grant reached either new path still
+    stays allowed). Full suite green throughout (1767 passed after both
+    rounds); a fresh perf/ReDoS pass on both new code paths (adversarial
+    inputs up to 2,000,000 characters / 200,000 repeated tokens) measured
+    well under 250ms end to end. Recommended PASS after these fixes; no
+    round 3 needed."""
     cfg = getattr(policy, "claude_permissions", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -3847,11 +3983,14 @@ def rule_claude_permissions_protect(ev: Event, policy=None) -> Optional[Decision
             return None
         if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
+        decoded = _claude_permissions_decode_unicode_escapes(content)
         hit = bool(patterns.CLAUDE_PERMISSIONS_MODE_RE.search(content)
+                   or patterns.CLAUDE_PERMISSIONS_MODE_RE.search(decoded)
                    or _claude_permissions_allow_broad_hit(content)
+                   or _claude_permissions_allow_broad_hit(decoded)
                    or _claude_permissions_json_hit(content))
         if not hit and ev.action == ActionClass.MCP:
-            hit = _claude_permissions_struct_hit(a)
+            hit = bool(_claude_permissions_struct_hit(a) or _claude_permissions_mcp_kv_hit(a))
         if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_CLAUDE_PERMISSIONS")
