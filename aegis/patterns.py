@@ -1173,13 +1173,23 @@ AGENT_DEF_DIR_RE = re.compile(
 # see `GIT_HOOKS_ARCHIVE_VERB_RE`'s own comment for why a new, less
 # battle-tested pattern stays scoped to the guard it was written for rather
 # than becoming a second, silent dependency of an already-hardened one.
+# QA finding (independent adversarial bypass-hunting review, skills-protect round):
+# `unrar`, `cpio`, PowerShell `Expand-Archive`, and Windows `xcopy`/`robocopy` were
+# entirely absent — real, ordinary archive/copy tools this shared pattern (reused
+# verbatim by rule_agent_def_protect and rule_skills_protect, not a per-guard copy
+# like GIT_HOOKS_ARCHIVE_VERB_RE) simply never learned, confirmed as a live,
+# reproduced bypass (`unrar x payload.rar .claude/skills/evil/SKILL.md` sailed
+# through with zero detection). Added bare (no argument-shape lookahead needed,
+# same low-collision-risk reasoning `rsync`/`unzip` above already accept): none of
+# the five are common words or generic filenames likely to appear unrelated.
 ARCHIVE_SYNC_VERB_RE = re.compile(
     r"\brsync\b"
     r"|\btar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+-{0,2}[a-zA-Z]{0,5}x[a-zA-Z]{0,5}\b)"
     r"|\btar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+--extract\b)"
     r"|\bunzip\b"
     r"|\b7z[az]?\b(?=[^|;&\n]{0,50}\b[xe]\b)"
-    r"|\binstall\b(?=[^|;&\n]{0,50}(?:-m\b|--mode\b))",
+    r"|\binstall\b(?=[^|;&\n]{0,50}(?:-m\b|--mode\b))"
+    r"|\bunrar\b|\bcpio\b|\bExpand-Archive\b|\bxcopy\b|\brobocopy\b",
     re.IGNORECASE,
 )
 
@@ -1227,19 +1237,33 @@ def agent_def_find_hit(cmd: str) -> bool:
 #
 # Deliberately NOT scoped to exclude Aegis's own `.claude/skills/aegis-*` — unlike
 # AGENT_DEF_PATH_RE (which has zero overlap with AEGIS_SKILL_PATH_RE at all), this
-# pattern's surface is a superset of it. That overlap is safe by rule ORDER, not by
-# a carve-out here: `rule_self_protect` (never-escapable) runs before
-# `rule_skills_protect` in `_CORE_RULES` and returns first for every Edit/Write and
-# shell-write-verb case it already claims, so this guard's own (weaker, escapable)
-# opinion on those same paths is simply never reached. The one case self-protect's
-# own EDIT/WRITE branch does NOT check — an MCP-filesystem-tool write (`ActionClass.
-# MCP`, not EDIT/WRITE) to an `aegis-*` skill — falls through to this guard instead,
-# which is a small, honestly-disclosed net GAIN in coverage there, not a conflict.
+# guard's surface (SKILL_PATH_RE OR SKILL_DIR_RE — rule_skills_protect's Edit/
+# Write/MCP branch checks both, not SKILL_PATH_RE alone) is a genuine superset of
+# it: SKILL_DIR_RE matches the bare `.claude/skills` directory regardless of
+# filename, reaching every file under an `aegis-*` skill's own directory, not just
+# the one literally named SKILL.md. (QA correction, independent design review: an
+# earlier draft checked only SKILL_PATH_RE in that branch, so the "superset" claim
+# was true only for the literal SKILL.md filename — an MCP-tool write to e.g.
+# `.claude/skills/aegis-status/scripts/helper.py` fell through both self-protect's
+# EDIT/WRITE-only check and this guard's SKILL_PATH_RE-only check, unguarded.)
+# That overlap is safe by rule ORDER, not by a carve-out here: `rule_self_protect`
+# (never-escapable) runs before `rule_skills_protect` in `_CORE_RULES` and returns
+# first for every Edit/Write and shell-write-verb case it already claims, so this
+# guard's own (weaker, escapable) opinion on those same paths is simply never
+# reached. The cases self-protect's own EDIT/WRITE branch does NOT check at all —
+# an MCP-filesystem-tool write (`ActionClass.MCP`, not EDIT/WRITE) to anything
+# under an `aegis-*` skill directory — now fall through to and ARE fully caught by
+# this guard instead, a disclosed net GAIN in coverage there, not a conflict.
 #
 # `.claude/skills/<name>/SKILL.md` names the skill's own directory before the fixed
 # `SKILL.md` filename (unlike AGENT_DEF_PATH_RE's arbitrary-name-then-`.md`), so the
 # bounded repeated-segment allowance below exists for occasional deeper resource
-# nesting under a skill's own directory, not for alternate top-level names.
+# nesting under a skill's own directory, not for alternate top-level names. A write
+# that nests past that bound, or that targets a same-directory resource file never
+# named SKILL.md at all (a bundled script, a `reference/*.md`), still isn't missed
+# in practice: SKILL_DIR_RE below is checked in EVERY branch of rule_skills_protect
+# (Edit/Write/MCP and shell alike), not just the shell one, precisely so a bundled
+# resource file gets the same coverage SKILL.md itself does.
 _SKILL_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP
 SKILL_PATH_RE = re.compile(
     _SKILL_ROOT + r"(?:" + _AGENT_DEF_SEG + r"){0,4}SKILL" + _WIN_TRIM + r"\.md" + _CI_END,

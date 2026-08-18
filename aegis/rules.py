@@ -783,15 +783,33 @@ def rule_skills_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     Deliberately NOT scoped to exclude Aegis's own ``.claude/skills/aegis-*`` at
     the pattern level — unlike ``AGENT_DEF_PATH_RE`` (zero overlap with
-    ``AEGIS_SKILL_PATH_RE``), ``SKILL_PATH_RE``'s surface is a superset of it.
-    That overlap is safe by RULE ORDER, not a carve-out: ``rule_self_protect``
-    (never-escapable) runs before this guard in ``_CORE_RULES`` and returns
-    first for every Edit/Write and shell write-verb case it already claims for
-    ``aegis-*``, so this guard's own weaker, escapable opinion on those same
-    paths is never reached. The one case self-protect's own EDIT/WRITE branch
-    does NOT check — an MCP-filesystem-tool write (``ActionClass.MCP``, not
-    EDIT/WRITE) to an ``aegis-*`` skill — falls through to this guard instead,
-    a small, honestly-disclosed net GAIN in coverage there, not a conflict.
+    ``AEGIS_SKILL_PATH_RE``), this guard's surface (``SKILL_PATH_RE`` OR
+    ``SKILL_DIR_RE`` — see the Edit/Write/MCP branch below, which checks both,
+    not ``SKILL_PATH_RE`` alone) is a genuine superset of it: ``SKILL_DIR_RE``
+    matches the bare ``.claude/skills`` directory regardless of the filename
+    that follows, so it reaches every file under an ``aegis-*`` skill's own
+    directory, not just the one literally named ``SKILL.md``. (QA correction,
+    independent design review: an earlier draft checked only ``SKILL_PATH_RE``
+    in this branch, so the "superset" claim was true only for the literal
+    ``SKILL.md`` filename — an MCP-tool write to e.g. `.claude/skills/aegis-
+    status/scripts/helper.py` fell through BOTH self-protect's EDIT/WRITE-only
+    check and this guard's SKILL_PATH_RE-only check, unguarded. Folding
+    ``SKILL_DIR_RE`` into this branch too — the same regex the shell branch
+    already used — closes it, and doubles as the fix for a second, independently
+    found gap: a bundled resource file authored via a plain Edit/Write, not a
+    shell heredoc, previously had zero coverage even for a THIRD-PARTY skill,
+    despite the module docstring's threat model explicitly citing bundled
+    scripts.) That broadened overlap with ``aegis-*`` is still safe by RULE
+    ORDER, not a carve-out: ``rule_self_protect`` (never-escapable) runs before
+    this guard in ``_CORE_RULES`` and returns first for every Edit/Write and
+    shell write-verb case it already claims for ``aegis-*``, so this guard's
+    own weaker, escapable opinion on those same paths is never reached; the
+    cases self-protect's own EDIT/WRITE branch does NOT check at all — an
+    MCP-filesystem-tool write (``ActionClass.MCP``, not EDIT/WRITE) to
+    anything under an ``aegis-*`` skill directory — now fall through to and
+    ARE fully caught by this guard instead, a disclosed net GAIN in coverage
+    there, not a conflict.
+
     Same reasoning applies to the shell branch below: self-protect's broad
     ``CONFIG_DIR_RE`` match already denies, non-escapably, any shell
     delete/redirect/copy/in-place-edit anywhere under ``.claude/`` (including
@@ -817,22 +835,47 @@ def rule_skills_protect(ev: Event, policy=None) -> Optional[Decision]:
     agent-self-escapable.
 
     Honest scope, the same denylist trade-offs every guard in this file
-    discloses: a path-string match on the fixed ``SKILL.md`` filename plus
-    ``SKILL_DIR_RE``/``ARCHIVE_SYNC_VERB_RE`` for the archive/sync bypass and
+    discloses: a path-string match on the fixed ``SKILL.md`` filename OR a bare
+    ``.claude/skills`` directory reference (``SKILL_PATH_RE``/``SKILL_DIR_RE``,
+    both checked in every branch below, not just the shell one) plus
+    ``ARCHIVE_SYNC_VERB_RE`` for the archive/sync bypass and
     ``skill_find_hit``/``SKILL_FIND_PREDICATE_RE`` for the ``find``-indirection
     bypass (mirroring ``AGENT_DEF_DIR_RE``/``AGENT_DEF_FIND_PREDICATE_RE``
-    exactly); a resource file bundled alongside ``SKILL.md`` (a referenced
-    script, a ``reference/*.md``) is covered only by the directory-bare-match/
-    archive-sync backstop, not by ``SKILL_PATH_RE`` itself, since it isn't
-    named ``SKILL.md``; nesting past 4 levels under a skill's own directory
-    evading ``SKILL_PATH_RE``'s filename form (the directory backstop still
-    catches an archive/sync tool's own target argument regardless of nesting);
-    a direct fetch-to-file write (closed instead by
-    ``rule_fetch_to_file_protect``, which reuses ``SKILL_PATH_RE`` the same way
-    it reuses every other sibling guard's own path regex); and a shell command
-    that computes the target path indirectly across separate variable
-    assignments — the same disclosed gap ``rule_self_protect``/
-    ``rule_agent_def_protect`` already carry."""
+    exactly); nesting past 4 levels under a skill's own directory evading
+    ``SKILL_PATH_RE``'s filename form still gets caught by ``SKILL_DIR_RE``'s
+    bare-directory match regardless of nesting depth or filename; a direct
+    fetch-to-file write (closed instead by ``rule_fetch_to_file_protect``,
+    which reuses ``SKILL_PATH_RE`` the same way it reuses every other sibling
+    guard's own path regex — ``SKILL_DIR_RE`` is deliberately NOT added there,
+    matching every sibling guard's identical choice not to reuse its own
+    *_DIR_RE backstop for that guard, since a bare directory match with no
+    verb requirement at all would make an ordinary, unrelated fetch that
+    merely happens to write somewhere near a `.claude/skills` mention false-ASK
+    far too easily); and a shell command that computes the target path
+    indirectly across separate variable assignments — the same disclosed gap
+    ``rule_self_protect``/``rule_agent_def_protect`` already carry.
+
+    Two further gaps, independent adversarial bypass-hunting review, confirmed
+    real and reproduced against actual `tar`/`unzip` binaries, but INHERITED
+    from patterns this guard reuses unchanged rather than introduced by it, so
+    left disclosed here rather than fixed in this guard alone (a real fix
+    needs to touch the shared `_AGENT_DEF_ROOT` boundary class and
+    `ARCHIVE_SYNC_VERB_RE` themselves, which `rule_agent_def_protect` also
+    relies on — a cross-cutting change out of scope for a single new guard):
+    (1) an archive/sync tool's destination flag GLUED directly to the path
+    with no space (`tar xf payload.tar -C.claude/skills/`, `unzip payload.zip
+    -d.claude/skills/`, `7z x payload.7z -o.claude/skills/` — 7z's own docs
+    show `-oDIR` as the canonical, not merely alternate, form) defeats both
+    `SKILL_DIR_RE` and `SKILL_PATH_RE`: the boundary group both patterns
+    inherit from `_AGENT_DEF_ROOT` requires a real separator immediately
+    before `.claude`, and a glued flag's own trailing letter never supplies
+    one — the identical "majority of targets need a preceding boundary"
+    shape `rule_fetch_to_file_protect`'s own `_fetch_normalize_glued_dest`
+    exists to fix for curl/wget, never extended to archive-tool destination
+    flags for this or any sibling guard's directory backstop; (2)
+    ``ARCHIVE_SYNC_VERB_RE`` itself has no alternative for `unrar`, `cpio`,
+    PowerShell `Expand-Archive`, or Windows `xcopy`/`robocopy` — real,
+    ordinary archive/copy tools it simply never learned."""
     cfg = getattr(policy, "skills_protect", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -842,16 +885,17 @@ def rule_skills_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
-        if not p or not patterns.SKILL_PATH_RE.search(p):
+        if not p or not (patterns.SKILL_PATH_RE.search(p) or patterns.SKILL_DIR_RE.search(p)):
             return None
         if os.environ.get("AEGIS_ALLOW_SKILLS") or _skills_allowed_by_policy(cfg, p):
             return None
         would = Decision(action, "skills-protect",
-                         f"Claude Code Skill definition '{p}' is being written — its "
-                         "description is folded into every future session's context, "
-                         "unattended, and the model can select and run its body with "
-                         "no explicit per-invocation approval. Review the change, then "
-                         "confirm with AEGIS_ALLOW_SKILLS=1; a spawned agent cannot.")
+                         f"Claude Code Skill file '{p}' is being written — its "
+                         "SKILL.md description is folded into every future session's "
+                         "context, unattended, and the model can select and run the "
+                         "skill's body (or a bundled script/resource file this touches) "
+                         "with no explicit per-invocation approval. Review the change, "
+                         "then confirm with AEGIS_ALLOW_SKILLS=1; a spawned agent cannot.")
         if mode == "monitor":
             _record_monitor(ev, would, "skills-protect-monitor")
             return None

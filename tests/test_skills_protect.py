@@ -115,11 +115,23 @@ def test_windows_trailing_dot_does_not_bypass():
     assert _gated(evaluate(_write(".claude./skills/evil/SKILL.md"), EMPTY))
 
 
-# ---- suffix false-positive guard -------------------------------------------------
+# ---- suffix behavior: SKILL_PATH_RE alone excludes it, SKILL_DIR_RE still gates it -
 
-def test_backup_and_disabled_variants_not_gated():
-    assert not _gated(evaluate(_write(".claude/skills/data-export/SKILL.md.bak"), EMPTY))
-    assert not _gated(evaluate(_write(".claude/skills/data-export/SKILL.md.orig"), EMPTY))
+def test_backup_and_disabled_variants_not_matched_by_skill_path_re_alone():
+    """`SKILL.md.bak`/`SKILL.md.orig` don't satisfy SKILL_PATH_RE's own filename
+    form (no false match on a backup/disabled variant of the exact auto-loaded
+    filename) — but they're still a write INSIDE the skill's own directory, so
+    SKILL_DIR_RE (checked alongside SKILL_PATH_RE in every branch, intentionally,
+    per the bundled-resource-file fix above) still gates the write as a whole.
+    Unlike CLAUDE.md/AGENTS.md (which can sit anywhere), a skill file has no
+    legitimate reason to exist outside `.claude/skills/<name>/` at all, so
+    gating everything under that directory — backup files included — is the
+    intended, broadened posture here, not a false positive."""
+    from aegis import patterns
+    assert not patterns.SKILL_PATH_RE.search(".claude/skills/data-export/SKILL.md.bak")
+    assert not patterns.SKILL_PATH_RE.search(".claude/skills/data-export/SKILL.md.orig")
+    assert _gated(evaluate(_write(".claude/skills/data-export/SKILL.md.bak"), EMPTY))
+    assert _gated(evaluate(_write(".claude/skills/data-export/SKILL.md.orig"), EMPTY))
 
 
 # ---- MCP-tool writes (no Edit/Write, no shell) ----------------------------------
@@ -133,6 +145,30 @@ def test_mcp_tool_alternate_path_arg_keys_gated():
     for key in ("target_file", "targetFile", "filename", "file", "uri"):
         d = evaluate(_mcp_write_arg(key, ".claude/skills/data-export/SKILL.md"), EMPTY)
         assert _gated(d) and d.rule == "skills-protect", key
+
+
+# ---- bundled resource files (SKILL_DIR_RE, not just the SKILL.md filename) ------
+# QA finding (independent adversarial bypass-hunting review): a plain Edit/Write/
+# MCP-tool write to a bundled script/resource file (not literally named SKILL.md)
+# had ZERO coverage before this — only SKILL_PATH_RE was checked in this branch,
+# and it requires the exact filename. Since the threat model explicitly cites
+# bundled scripts a skill instructs the model to run, this is now closed by also
+# checking SKILL_DIR_RE (the bare-directory backstop) in the Edit/Write/MCP
+# branch, not just the shell one.
+
+def test_bundled_script_write_gated():
+    d = evaluate(_write(".claude/skills/data-export/scripts/run.sh"), EMPTY)
+    assert _gated(d) and d.rule == "skills-protect"
+
+
+def test_bundled_reference_doc_write_gated():
+    d = evaluate(_edit(".claude/skills/data-export/reference/schema.md"), EMPTY)
+    assert _gated(d) and d.rule == "skills-protect"
+
+
+def test_mcp_tool_write_to_bundled_script_gated():
+    d = evaluate(_mcp_write(".claude/skills/data-export/scripts/run.py"), EMPTY)
+    assert _gated(d) and d.rule == "skills-protect"
 
 
 # ---- shell-based mutation --------------------------------------------------------
@@ -171,6 +207,20 @@ def test_archive_and_sync_tools_gated():
     assert _gated(_skills_only("rsync evil.md .claude/skills/data-export/SKILL.md"))
 
 
+def test_additional_archive_and_copy_tools_gated():
+    """QA finding (independent adversarial bypass-hunting review): unrar, cpio,
+    PowerShell Expand-Archive, and Windows xcopy/robocopy were absent from
+    ARCHIVE_SYNC_VERB_RE entirely — a real, reproduced bypass, now fixed there
+    (a shared pattern also used by rule_agent_def_protect, so the fix benefits
+    both guards, not just this one)."""
+    assert _gated(_skills_only("unrar x payload.rar .claude/skills/evil/SKILL.md"))
+    assert _gated(_skills_only("cpio -idv .claude/skills/evil/SKILL.md"))
+    assert _gated(_skills_only(
+        "Expand-Archive payload.zip -DestinationPath .claude/skills/"))
+    assert _gated(_skills_only(r"xcopy evil.md .claude\skills\x\SKILL.md"))
+    assert _gated(_skills_only(r"robocopy src .claude\skills\x SKILL.md"))
+
+
 def test_bare_directory_reference_gated():
     """No filename is EVER named as one contiguous string — `SKILL_PATH_RE`
     alone can't see it; `SKILL_DIR_RE` is the backstop."""
@@ -178,6 +228,24 @@ def test_bare_directory_reference_gated():
     assert patterns.SKILL_DIR_RE.search(".claude/skills/")
     assert patterns.SKILL_DIR_RE.search(".claude/skills")
     assert not patterns.SKILL_DIR_RE.search("src/skills/README.md")
+
+
+def test_known_gap_glued_archive_destination_flag_not_gated():
+    """KNOWN, DISCLOSED gap (independent adversarial bypass-hunting review),
+    reproduced against real `tar`/`unzip` binaries extracting an actual
+    archive: an archive tool's destination flag GLUED directly to the path
+    with no space (`-C.claude/skills/`, not `-C .claude/skills/`) defeats both
+    SKILL_DIR_RE and SKILL_PATH_RE, since the boundary group both inherit from
+    `_AGENT_DEF_ROOT` requires a real separator immediately before `.claude`
+    and a glued flag's own trailing letter never supplies one. The identical
+    gap reproduces in `rule_agent_def_protect` (inherited from the same shared
+    `_AGENT_DEF_ROOT`, not introduced here) — a real fix needs to touch that
+    shared boundary class itself (the same kind of glued-destination fix
+    `rule_fetch_to_file_protect`'s `_fetch_normalize_glued_dest` applies for
+    curl/wget), a cross-cutting change out of scope for this guard alone. This
+    test documents the gap as currently accepted, not silently missing."""
+    assert not _gated(_skills_only("tar xf payload.tar -C.claude/skills/"))
+    assert not _gated(_skills_only("unzip payload.zip -d.claude/skills/"))
 
 
 def test_install_dash_m_gated():
@@ -303,13 +371,16 @@ def test_commit_message_mention_not_gated():
     assert not _gated(evaluate(_shell('git commit -m "update SKILL.md docs"'), EMPTY))
 
 
-def test_resource_file_alongside_skill_md_not_gated_by_path_re():
+def test_resource_file_alongside_skill_md_not_matched_by_path_re_alone():
     """A bundled resource file (a referenced script, a reference/*.md) isn't
-    named `SKILL.md` — `SKILL_PATH_RE` itself has no opinion on it (honest,
-    disclosed scope; the directory-bare-match/archive-sync backstop is what
-    covers a resource file placed via an archive/sync tool)."""
+    named `SKILL.md` — `SKILL_PATH_RE` itself has no opinion on it in
+    isolation. `rule_skills_protect` as a whole still gates it (see
+    test_bundled_script_write_gated/test_bundled_reference_doc_write_gated
+    above) via `SKILL_DIR_RE`, checked alongside `SKILL_PATH_RE` in every
+    branch, not this pattern alone."""
     from aegis import patterns
     assert not patterns.SKILL_PATH_RE.search(".claude/skills/data-export/reference/schema.md")
+    assert patterns.SKILL_DIR_RE.search(".claude/skills/data-export/reference/schema.md")
 
 
 # ---- aegis-* overlap: rule order, not a pattern-level carve-out -----------------
@@ -332,6 +403,18 @@ def test_aegis_skill_mcp_write_falls_through_to_this_guard():
     an MCP-tool write to an aegis-* skill falls through to this guard instead
     — a small, disclosed net coverage GAIN, not a conflict."""
     d = evaluate(_mcp_write(".claude/skills/aegis-status/SKILL.md"), EMPTY)
+    assert _gated(d) and d.rule == "skills-protect"
+
+
+def test_aegis_skill_mcp_write_to_non_skill_md_file_also_gated():
+    """QA finding (independent design review): an earlier draft checked only
+    SKILL_PATH_RE in the Edit/Write/MCP branch, so an MCP-tool write to a file
+    under an aegis-* skill directory that ISN'T literally named SKILL.md (a
+    bundled script) fell through both self-protect's EDIT/WRITE-only check
+    and this guard's SKILL_PATH_RE-only check, entirely unguarded. Checking
+    SKILL_DIR_RE too closes it — this guard's surface is a genuine superset
+    of AEGIS_SKILL_PATH_RE, not just for the SKILL.md filename."""
+    d = evaluate(_mcp_write(".claude/skills/aegis-status/scripts/helper.py"), EMPTY)
     assert _gated(d) and d.rule == "skills-protect"
 
 
