@@ -136,6 +136,14 @@ class Policy:
     # (mode=ask) apply. Covers CLAUDE.md/AGENTS.md and .claude/agents/*.md,
     # .claude/commands/*.md. See rules.rule_agent_def_protect.
     agent_def: dict = field(default_factory=dict)
+    # Claude Code Skill-definition protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers .claude/skills/<name>/SKILL.md, project- or user-scoped — a
+    # skill's description is read into every future session's context
+    # unattended, and the model can select and run its body with no
+    # explicit per-invocation approval, a surface rule_agent_def_protect
+    # was never extended to reach. See rules.rule_skills_protect.
+    skills_protect: dict = field(default_factory=dict)
     # Shell-startup / SSH persistence protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers ~/.bashrc/~/.zshrc/~/.profile/fish's config.fish/
