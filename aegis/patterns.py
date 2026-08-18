@@ -1208,6 +1208,66 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Claude Code Skill-definition protection -----------------------------------
+# A sibling of the agent_def family above, on a surface that family never reaches:
+# `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
+# frontmatter `description` is read into the model's OWN context at the start of
+# EVERY session — the exact mechanism this very file's Aegis session lists its own
+# available skills by, with no per-invocation human approval — and the model can
+# then select and run the skill's body as trusted instructions the instant its own
+# description matches something in the conversation, no explicit human invocation
+# required at all (unlike a slash command, which always needs one). A planted or
+# edited SKILL.md whose description reads like "use this whenever the user mentions
+# X" is a strictly more automatic trigger than `.claude/agents/*.md`'s "use
+# PROACTIVELY" sub-agent case AGENT_DEF_PATH_RE already covers, on a directory
+# AGENT_DEF_PATH_RE's own alternation never lists (only agents/commands/
+# output-styles) — confirmed by this file's own agent_def-protect test suite, which
+# asserts a `.claude/skills/*` write is explicitly NOT claimed by that guard
+# (`test_shipped_skill_not_claimed_by_this_guard`).
+#
+# Deliberately NOT scoped to exclude Aegis's own `.claude/skills/aegis-*` — unlike
+# AGENT_DEF_PATH_RE (which has zero overlap with AEGIS_SKILL_PATH_RE at all), this
+# pattern's surface is a superset of it. That overlap is safe by rule ORDER, not by
+# a carve-out here: `rule_self_protect` (never-escapable) runs before
+# `rule_skills_protect` in `_CORE_RULES` and returns first for every Edit/Write and
+# shell-write-verb case it already claims, so this guard's own (weaker, escapable)
+# opinion on those same paths is simply never reached. The one case self-protect's
+# own EDIT/WRITE branch does NOT check — an MCP-filesystem-tool write (`ActionClass.
+# MCP`, not EDIT/WRITE) to an `aegis-*` skill — falls through to this guard instead,
+# which is a small, honestly-disclosed net GAIN in coverage there, not a conflict.
+#
+# `.claude/skills/<name>/SKILL.md` names the skill's own directory before the fixed
+# `SKILL.md` filename (unlike AGENT_DEF_PATH_RE's arbitrary-name-then-`.md`), so the
+# bounded repeated-segment allowance below exists for occasional deeper resource
+# nesting under a skill's own directory, not for alternate top-level names.
+_SKILL_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP
+SKILL_PATH_RE = re.compile(
+    _SKILL_ROOT + r"(?:" + _AGENT_DEF_SEG + r"){0,4}SKILL" + _WIN_TRIM + r"\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — the same archive/sync-tool bypass
+# AGENT_DEF_DIR_RE/GIT_HOOKS_DIR_RE close for their own surfaces: `rsync -a
+# evil_skills/ .claude/skills/` or `tar xf payload.tar -C .claude/skills/` never
+# names `SKILL.md` as one contiguous string, so SKILL_PATH_RE alone can't see it.
+SKILL_DIR_RE = re.compile(_AGENT_DEF_ROOT + r"skills" + _CI_END, re.IGNORECASE)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# AGENT_DEF_FIND_PREDICATE_RE exists for its own surface. Includes the same bare
+# `\.claude\b` fallback alternative AGENT_DEF_FIND_PREDICATE_RE does and for the
+# identical reason (QA finding, independent adversarial review, round 2 there): a
+# `-regex` VALUE is itself a regex and routinely separates path components with
+# its own wildcard (`-regex '.*\.claude.*skills.*SKILL\.md'`), so the tight
+# `\.claude[/\\]skills\b`/`SKILL\.md\b` alternatives — which require their two
+# halves to sit directly adjacent — never fire on it without this fallback.
+SKILL_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:SKILL\.md\b|\.claude[/\\]skills\b|\.claude\b)")
+
+
+def skill_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, SKILL_FIND_PREDICATE_RE)
+
+
 # ---- Shell-startup / SSH persistence protection --------------------------------
 # Two more "runs later, unattended, with the human's full privileges" triggers
 # that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,

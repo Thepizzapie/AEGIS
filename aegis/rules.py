@@ -747,6 +747,146 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- Claude Code Skill-definition protection: escapable with human confirm -----
+def _skills_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_skills_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a Claude Code Skill definition
+    (``.claude/skills/<name>/SKILL.md``, project- or user-scoped).
+
+    THREAT MODEL: a Skill's YAML frontmatter ``description`` is read into the
+    model's OWN context at the start of EVERY session, unattended — the exact
+    mechanism this very session's own available-skills listing comes from — and
+    the model can then select and run the skill's body (routinely a set of
+    imperative instructions, often directing it to run bundled scripts) the
+    moment its own description matches something in conversation, with no
+    explicit per-invocation human approval at all. That is a STRICTER
+    auto-trigger than ``rule_agent_def_protect``'s ``.claude/agents/*.md``
+    "use PROACTIVELY" sub-agent case — a sub-agent still needs the
+    orchestrator to spawn it; a skill can be selected by the same model
+    that a prompt injection just steered — on a directory
+    ``rule_agent_def_protect`` was never extended to reach: `AGENT_DEF_PATH_RE`'s
+    own alternation lists only ``agents``/``commands``/``output-styles``, and
+    this file's own agent-def test suite asserts as much
+    (``test_shipped_skill_not_claimed_by_this_guard``). A planted skill reads,
+    to a reviewer skimming a diff, like ordinary onboarding documentation — the
+    same "trusted name, unread body" blind spot ``rule_ci_workflow_protect``/
+    ``rule_git_hooks_protect``/``rule_agent_def_protect`` already exist for.
+
+    Deliberately NOT scoped to exclude Aegis's own ``.claude/skills/aegis-*`` at
+    the pattern level — unlike ``AGENT_DEF_PATH_RE`` (zero overlap with
+    ``AEGIS_SKILL_PATH_RE``), ``SKILL_PATH_RE``'s surface is a superset of it.
+    That overlap is safe by RULE ORDER, not a carve-out: ``rule_self_protect``
+    (never-escapable) runs before this guard in ``_CORE_RULES`` and returns
+    first for every Edit/Write and shell write-verb case it already claims for
+    ``aegis-*``, so this guard's own weaker, escapable opinion on those same
+    paths is never reached. The one case self-protect's own EDIT/WRITE branch
+    does NOT check — an MCP-filesystem-tool write (``ActionClass.MCP``, not
+    EDIT/WRITE) to an ``aegis-*`` skill — falls through to this guard instead,
+    a small, honestly-disclosed net GAIN in coverage there, not a conflict.
+    Same reasoning applies to the shell branch below: self-protect's broad
+    ``CONFIG_DIR_RE`` match already denies, non-escapably, any shell
+    delete/redirect/copy/in-place-edit anywhere under ``.claude/`` (including
+    ``.claude/skills/aegis-*``) — but NOT an archive/sync-tool placement
+    (``rsync``/``tar``/``unzip``/``install -m``), a write shape self-protect's
+    own shell branch has never checked for ANY of its ``.claude`` surface. This
+    guard's ``ARCHIVE_SYNC_VERB_RE`` check closes that gap incidentally for the
+    ``.claude/skills`` subtree specifically (both third-party and ``aegis-*``),
+    though self-protect's own identical gap for the rest of ``.claude`` is a
+    separate, undisclosed-here issue, not this guard's to fix.
+
+    Config (``policy.skills_protect``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a repo's
+    own CI-authored skill sync, say). Defaults to ``ask`` for the same reason
+    ``rule_agent_def_protect``/``rule_ci_workflow_protect``/
+    ``rule_git_hooks_protect`` do: authoring or editing a skill is routine,
+    sanctioned dev work, unlike e.g. planting an MCP server.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form, or
+    the env toggle ``AEGIS_ALLOW_SKILLS=1`` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot set
+    its own env for a hook invocation it doesn't control, so neither path is
+    agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path-string match on the fixed ``SKILL.md`` filename plus
+    ``SKILL_DIR_RE``/``ARCHIVE_SYNC_VERB_RE`` for the archive/sync bypass and
+    ``skill_find_hit``/``SKILL_FIND_PREDICATE_RE`` for the ``find``-indirection
+    bypass (mirroring ``AGENT_DEF_DIR_RE``/``AGENT_DEF_FIND_PREDICATE_RE``
+    exactly); a resource file bundled alongside ``SKILL.md`` (a referenced
+    script, a ``reference/*.md``) is covered only by the directory-bare-match/
+    archive-sync backstop, not by ``SKILL_PATH_RE`` itself, since it isn't
+    named ``SKILL.md``; nesting past 4 levels under a skill's own directory
+    evading ``SKILL_PATH_RE``'s filename form (the directory backstop still
+    catches an archive/sync tool's own target argument regardless of nesting);
+    a direct fetch-to-file write (closed instead by
+    ``rule_fetch_to_file_protect``, which reuses ``SKILL_PATH_RE`` the same way
+    it reuses every other sibling guard's own path regex); and a shell command
+    that computes the target path indirectly across separate variable
+    assignments — the same disclosed gap ``rule_self_protect``/
+    ``rule_agent_def_protect`` already carry."""
+    cfg = getattr(policy, "skills_protect", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.SKILL_PATH_RE.search(p):
+            return None
+        if os.environ.get("AEGIS_ALLOW_SKILLS") or _skills_allowed_by_policy(cfg, p):
+            return None
+        would = Decision(action, "skills-protect",
+                         f"Claude Code Skill definition '{p}' is being written — its "
+                         "description is folded into every future session's context, "
+                         "unattended, and the model can select and run its body with "
+                         "no explicit per-invocation approval. Review the change, then "
+                         "confirm with AEGIS_ALLOW_SKILLS=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "skills-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.SKILL_PATH_RE.search(cmd)
+                             or patterns.SKILL_DIR_RE.search(cmd)
+                             or patterns.skill_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_SKILLS")
+                or _skills_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "skills-protect",
+                         "A Claude Code Skill definition is being modified from a "
+                         "shell — its description is folded into every future "
+                         "session's context, unattended. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_SKILLS=1; a spawned "
+                         "agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "skills-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- shell-startup / SSH persistence protection: escapable with human confirm --
 def _shell_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -4399,6 +4539,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
@@ -5102,6 +5243,7 @@ _CORE_RULES = (
     rule_ci_workflow_protect,
     rule_git_hooks_protect,
     rule_agent_def_protect,
+    rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
     rule_package_manifest_protect,
