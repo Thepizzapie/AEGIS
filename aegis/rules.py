@@ -4625,11 +4625,24 @@ def rule_dir_locals_protect(ev: Event, policy=None) -> Optional[Decision]:
     control, so neither path is agent-self-escapable.
 
     Honest scope, the same denylist trade-offs every guard in this file
-    discloses: a dangerous call assembled indirectly (a `funcall`/`apply` on
-    a dynamically-built symbol, string concatenation, a wrapper function
-    defined earlier in the same or a `load`ed file) rather than appearing as
-    a literal call defeats every check here, the same class every sibling
-    guard already accepts; `find`-path indirection around the
+    discloses: a dangerous call assembled indirectly (a `funcall`/`apply`/
+    `mapc`/`mapcar`/`cl-mapc` indirection on a DYNAMICALLY-built symbol --
+    `intern`, string concatenation -- rather than a statically-written
+    `#'name`/`'name`/`(function name)` reference, which
+    `DIR_LOCALS_INDIRECT_CALL_RE` now covers; see its own QA-history comment
+    in patterns.py, and this docstring's own QA-history paragraph below, for
+    the real bypass that vocabulary closes -- or a wrapper function defined
+    earlier in the same or a `load`ed file) rather than appearing as a
+    literal call defeats every check here, the same class every sibling
+    guard already accepts; a comment or string value that merely MENTIONS
+    the dangerous shape in prose, with no real `(eval . ...)` cons cell
+    present, can still gate (detection is purely textual, with no
+    adjacency/context requirement tying the `eval` trigger to a specific,
+    nearby exec-call token rather than "anywhere in the file") -- a narrow,
+    low-severity false ASK (default `ask`, a human simply approves) rather
+    than a false allow, the same "no clean fix without a real parser" class
+    `IPYTHON_BANG_LINE_RE`'s own docstring already accepts for its own
+    line-based check; `find`-path indirection around the
     `.dir-locals.el`/`.dir-locals-2.el` filename isn't covered (no
     `*_find_hit`-style fallback, the same gap
     `rule_package_manifest_protect`/`rule_direnv_protect`/
@@ -4653,7 +4666,38 @@ def rule_dir_locals_protect(ev: Event, policy=None) -> Optional[Decision]:
     helper every `*_protect` guard in this file reads MCP tool-call
     arguments through only checks top-level argument keys, the same
     pre-existing, shared-infrastructure gap `rule_pysite_protect`'s own
-    docstring already discloses and does not fix per-guard."""
+    docstring already discloses and does not fix per-guard.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review verified the wiring correct
+    everywhere its siblings are (`Policy`, all three `loader.py` spots, both
+    `skills.py` knob lists, the `_REMEDIES` table, `_CORE_RULES`,
+    `_FETCH_HUMAN_ESCAPABLE`, README) via a live YAML round-trip through
+    `load_policy()`, a live `curl -o .dir-locals.el <url>` fetch-to-file
+    check, three live re-verifications of this docstring's own "Honest
+    scope" claims against `patterns.dir_locals_dangerous_hit()` directly,
+    and the full test suite (1775 passed, 0 regressions) -- no defects
+    found. Bypass-hunting found and closed one real, reproduced, COMPLETE
+    bypass before merge: `(funcall #'shell-command ...)`/`(funcall
+    (function shell-command) ...)`/the `apply`/`mapc`/`mapcar`/`cl-mapc`
+    siblings -- Elisp's single most idiomatic indirect-call form, not an
+    exotic obfuscation -- put the exec-call name after the indirection
+    head's own static-reference syntax rather than immediately after `(`,
+    so `DIR_LOCALS_DANGEROUS_CALL_RE` alone never fired; confirmed to
+    evaluate to a bare ALLOW with no rule at all on every event surface
+    (Write/Edit/MCP/shell) for the exact threat this guard exists to stop.
+    Closed by adding `DIR_LOCALS_INDIRECT_CALL_RE` (see its own comment in
+    patterns.py for the full reasoning) as an additive OR alongside the
+    direct-call check in `dir_locals_dangerous_hit`, which only widens
+    detection. Bypass-hunting also flagged one low-severity, disclosed-not-
+    fixed false ASK (a comment merely mentioning the dangerous shape in
+    prose, no real cons cell present) -- accepted as the same "no clean fix
+    without a real parser" trade-off `IPYTHON_BANG_LINE_RE`'s own docstring
+    already makes, and now disclosed in this docstring's own "Honest scope"
+    paragraph above. Recommended PASS after the one fix; no further round
+    needed. Full suite green throughout (1783 passed after the fix's own
+    regression tests)."""
     cfg = getattr(policy, "dir_locals", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
