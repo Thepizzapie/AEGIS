@@ -4549,6 +4549,174 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _dir_locals_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+# ---- Emacs directory-local-variables `eval` auto-exec protection -------------
+def rule_dir_locals_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an Emacs dir-locals `eval` auto-exec shape: a literal
+    `(eval . FORM)` alist entry in a `.dir-locals.el`/`.dir-locals-2.el` file
+    whose FORM also invokes a process/code-exec primitive.
+
+    THREAT MODEL: Emacs's own `hack-dir-local-variables` reads
+    `.dir-locals.el` (and, Emacs 27+, its second-priority sibling
+    `.dir-locals-2.el`) from a directory and applies its alist to EVERY file
+    opened anywhere in that directory's subtree -- no opt-in, no explicit
+    `load`, no git/CI/session-restart trigger needed. The very next time
+    this agent, a teammate, or a CI elisp/batch-mode job (byte-compiling,
+    `flycheck`/`flymake` linting, a Magit/Projectile visit) opens any file
+    under that directory, Emacs reads and applies it -- the same "no future
+    trigger, the very next bare interaction" property
+    `rule_ipython_startup_protect`'s own docstring highlights for an
+    interpreter startup, one editor layer up: opening a file in Emacs is at
+    least as routine and frequent as starting a new Python/IPython process.
+
+    Ordinary directory-local variables (`indent-tabs-mode`, `tab-width`,
+    `fill-column`, `compile-command`) are common, benign, and only ever SET
+    a variable. The alist also supports one special pseudo-variable key,
+    `eval`, whose value is a Lisp FORM Emacs actually EVALUATES (not merely
+    assigns) on every matching file visit -- a real, documented, still-
+    current local-code-execution primitive. Emacs's own
+    `enable-local-eval`/`safe-local-variable-values` machinery gates it, but
+    that gate is opt-out, not opt-in: `enable-local-eval` set to `t` (a
+    common "stop nagging me" fix copied from a dotfile or a Stack Overflow
+    answer) or a single earlier "yes, and don't ask again" for a
+    similarly-shaped form silently trusts it forever after, with no further
+    per-visit confirmation -- the same "trusted, common, mostly-benign
+    filename hides one dangerous key among routine ones" shape
+    `rule_conftest_protect`/`rule_pysite_protect`/
+    `rule_package_manifest_protect` already gate for their own auto-exec
+    surfaces.
+
+    Nothing else in this file reaches this surface: `.dir-locals.el`/
+    `.dir-locals-2.el` are Emacs-specific, read by Emacs itself, not by git,
+    pytest, or CPython -- no sibling guard's path pattern recognizes them.
+
+    Deliberately gated on BOTH the `eval` trigger AND an Elisp process/
+    code-exec vocabulary (`patterns.DIR_LOCALS_DANGEROUS_CALL_RE`) being
+    present, the same "gate the SHAPE, not the bare mechanism" trade-off
+    every sibling content-gated guard in this file already makes: an `eval`
+    entry with no process/code-exec call in sight (e.g. one that only calls
+    an already-defined, project-local elisp function with no obvious
+    shell-out) stays allowed, so an ordinary, legitimately-eval-using
+    project is not flagged on sight. See `patterns.dir_locals_dangerous_hit`
+    for why this check, unlike its Python-source siblings, does not need a
+    position-anchored/single-line-vs-heredoc split: a dir-locals.el file is
+    a short, flat alist, not procedural source where a call's exact
+    line/column determines whether it is genuinely unconditional.
+
+    Config (`policy.dir_locals`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate). Defaults
+    to `ask` for the same reason every sibling `*_protect` guard does: a
+    legitimate, sanctioned eval hook can exist -- it just needs a human to
+    have actually looked at it once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle `AEGIS_ALLOW_DIR_LOCALS=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a dangerous call assembled indirectly (a `funcall`/`apply` on
+    a dynamically-built symbol, string concatenation, a wrapper function
+    defined earlier in the same or a `load`ed file) rather than appearing as
+    a literal call defeats every check here, the same class every sibling
+    guard already accepts; `find`-path indirection around the
+    `.dir-locals.el`/`.dir-locals-2.el` filename isn't covered (no
+    `*_find_hit`-style fallback, the same gap
+    `rule_package_manifest_protect`/`rule_direnv_protect`/
+    `rule_conftest_protect`/`rule_ipython_startup_protect` already disclose
+    for their own targets); a direct fetch-to-file write (`curl -o
+    .dir-locals.el ...`) is closed separately by
+    `rule_fetch_to_file_protect` (this guard's path pattern is registered in
+    its `_FETCH_HUMAN_ESCAPABLE` list), the same shared backstop every
+    sibling guard in this file relies on rather than adding a sixth
+    write-verb check per guard; the old, deprecated dir-locals FORMAT (a
+    bare top-level alist with no leading `MODE .` cons, e.g. `((eval .
+    FORM))` at the very top level rather than nested under `(nil . (...))`)
+    is still matched, since the detection here is purely textual (looking
+    for the literal `(eval . ` shape, not a real s-expression parse) and
+    does not care which level it is nested at -- but a form spanning
+    multiple, oddly-broken lines with the `eval`/`.`/exec-call tokens split
+    by an unusual comment or reader-macro construct between them could, in
+    principle, still evade the purely textual match, the same "no clean fix
+    without a real parser" class `IPYTHON_BANG_LINE_RE`'s own docstring
+    already accepts for its own line-based check; and the shared `_path()`
+    helper every `*_protect` guard in this file reads MCP tool-call
+    arguments through only checks top-level argument keys, the same
+    pre-existing, shared-infrastructure gap `rule_pysite_protect`'s own
+    docstring already discloses and does not fix per-guard."""
+    cfg = getattr(policy, "dir_locals", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "dir-locals-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.DIR_LOCALS_PATH_RE.search(p):
+            return None
+        if not patterns.dir_locals_dangerous_hit(content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_DIR_LOCALS")
+                or _dir_locals_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "dir-locals-protect",
+                         f"'{p}' is being written with an Emacs dir-locals "
+                         "`eval` auto-exec shape -- Emacs applies it to "
+                         "every file opened anywhere in this directory's "
+                         "subtree, by this agent, a teammate, or CI, with "
+                         "no further action needed. Review the change, "
+                         "then confirm with AEGIS_ALLOW_DIR_LOCALS=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+        if not patterns.DIR_LOCALS_PATH_RE.search(cmd):
+            return None
+        if not patterns.dir_locals_dangerous_hit(cmd):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DIR_LOCALS")
+                or _dir_locals_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "dir-locals-protect",
+                         "An Emacs dir-locals `eval` auto-exec shape is "
+                         "being planted from a shell -- Emacs applies it to "
+                         "every file opened anywhere in this directory's "
+                         "subtree, by this agent, a teammate, or CI, with "
+                         "no further action needed. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_DIR_LOCALS=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 # ---- fetch-to-file backstop: closes the "curl -o"/"wget -O" gap every ----------
 # ---- *_protect guard above discloses ------------------------------------------
 
@@ -4604,6 +4772,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
     (patterns.PYSITE_PTH_PATH_RE, "a site-packages .pth file"),
     (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
+    (patterns.DIR_LOCALS_PATH_RE, "an Emacs directory-local-variables file"),
 )
 
 
@@ -5303,6 +5472,7 @@ _CORE_RULES = (
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
+    rule_dir_locals_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,

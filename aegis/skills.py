@@ -48,6 +48,7 @@ _REMEDIES = """\
 | conftest-protect | planted a pytest auto-exec shape (module-level code, an autouse fixture, or a hook like pytest_configure) in a conftest.py (runs on the next `pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_CONFTEST=1 after review |
 | pysite-protect | planted a module-level process/code-exec call in sitecustomize.py/usercustomize.py, or a dangerous `import`-prefixed line in a site-packages/dist-packages .pth file (runs on the next `python`/`pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_PYSITE=1 after review |
 | ipython-startup-protect | planted a module-level process/code-exec call (or, in a `.ipy` file, a bare `!<command>` shell-escape line) in `.ipython/profile_*/startup/` (runs on the next `ipython`/Jupyter-kernel launch, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_IPYTHON_STARTUP=1 after review |
+| dir-locals-protect | planted an `(eval . FORM)` auto-exec entry (calling a process/code-exec primitive) in `.dir-locals.el`/`.dir-locals-2.el` (Emacs applies it to every file opened anywhere in that directory's subtree, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_DIR_LOCALS=1 after review |
 | fetch-to-file-protect | a curl/wget/PowerShell/certutil fetch wrote its response directly to a path another guard protects — bypasses that guard's own redirect/copy/move/in-place-edit checks | download to an unprotected scratch path, read it, then let the guard for that surface evaluate the real write; ask the human, who can set AEGIS_ALLOW_FETCH_TO_FILE=1 after review (never escapable for Aegis's own config/policy/source) |
 | workspace-confine | wrote outside the project root the identity is bound to | stay in the project; ask for workspace.allow if a path is legitimate |
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |
@@ -107,7 +108,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `dir_locals`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -154,7 +155,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
-     `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `fetch_to_file`,
+     `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `dir_locals`, `fetch_to_file`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
