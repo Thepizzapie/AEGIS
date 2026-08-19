@@ -267,6 +267,14 @@ class Policy:
     # `ipython`/Jupyter-kernel launch, no opt-in needed. See
     # rules.rule_ipython_startup_protect.
     ipython_startup: dict = field(default_factory=dict)
+    # Emacs directory-local-variables `eval` auto-exec protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a literal `(eval . FORM)` alist
+    # entry in `.dir-locals.el`/`.dir-locals-2.el` whose FORM also invokes a
+    # process/code-exec primitive -- Emacs applies it to every file opened
+    # anywhere in that directory's subtree, no opt-in needed. See
+    # rules.rule_dir_locals_protect.
+    dir_locals: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing

