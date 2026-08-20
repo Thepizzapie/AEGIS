@@ -655,6 +655,35 @@ def rule_hook_manager_protect(ev: Event, policy=None) -> Optional[Decision]:
     spawned agent cannot set its own env for a hook invocation it doesn't
     control, so neither path is agent-self-escapable.
 
+    QA history (independent adversarial bypass-hunting review): three real,
+    reproduced bypasses closed before merge — Husky v4's config resolves via
+    cosmiconfig, whose documented search list includes ``.huskyrc.js``/
+    ``.huskyrc.cjs``/``husky.config.js``/``husky.config.cjs`` alongside the
+    ``.json``/``.yaml``/``.yml`` forms; the original ``HUSKYRC_PATH_RE``
+    covered only the latter, so a real, working ``.huskyrc.js`` config
+    carrying the identical ``hooks`` block sailed through undetected
+    (closed by widening the pattern); ``repo: 'local'``/``repo: "local"``
+    parses to the identical YAML string pre-commit treats the same as the
+    bare form, but ``PRECOMMIT_LOCAL_REPO_RE`` required it unquoted — a
+    total bypass of that surface's only gate, since ``.pre-commit-
+    config.yaml`` has no path-only fallback (closed by tolerating optional
+    quotes); and the shell branch's archive-verb check reused ``GIT_HOOKS_
+    ARCHIVE_VERB_RE`` unchanged, missing the ``unrar``/``cpio``/
+    ``Expand-Archive``/``xcopy``/``robocopy`` alternatives an earlier QA
+    round already added to the newer, shared ``ARCHIVE_SYNC_VERB_RE`` for
+    ``rule_agent_def_protect``/``rule_skills_protect`` — all five real tools
+    sailed through onto ``.husky/``/Lefthook's config with zero detection
+    (closed by switching to ``ARCHIVE_SYNC_VERB_RE``). The same review
+    confirmed no bypass on: doubled-slash/dot-component/Windows-trailing-
+    dot path tricks, a nested repo path, ``rsync``/``tar -x``/``unzip``/
+    ``install -m``/glued ``7z -o``, the ``curl -o``/``wget -O`` backstop via
+    ``rule_fetch_to_file_protect``, an MCP filesystem server's ``{path,
+    edits: [{oldText, newText}]}`` shape, single-quoted JS-object-literal
+    keys or a nested-brace-interrupted ``husky:{...}`` block in
+    ``HUSKY_PKG_HOOKS_RE``, ReDoS on adversarial input, or false positives
+    on an unrelated ``hooks/`` directory, prose mentioning these tool
+    names, an ordinary pinned config, or an ordinary ``package.json``.
+
     Known residual gaps, same spirit as every guard in this file, disclosed
     rather than fixed: no ``find``-path-indirection fallback (unlike
     self-protect/CI-workflow/git-hooks/agent-def/shell-persist); a direct
@@ -726,7 +755,7 @@ def rule_hook_manager_protect(ev: Event, policy=None) -> Optional[Decision]:
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                            or patterns.INPLACE_WRITE_RE.search(cmd)
                            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                           or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd))
+                           or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
         path_hit = bool(write_verb and (
             patterns.HUSKY_HOOK_PATH_RE.search(cmd)
             or patterns.HUSKY_DIR_RE.search(cmd)

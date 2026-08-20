@@ -4072,10 +4072,19 @@ HUSKY_DIR_RE = re.compile(
     re.IGNORECASE,
 )
 # Legacy Husky v4 (pre-npm-`prepare`-script era): a dedicated `.huskyrc`/
-# `.huskyrc.json`/`.huskyrc.yaml`/`.huskyrc.yml` file whose sole purpose is to
-# carry a `hooks` block -- same "dedicated file, no other use" path-only gate.
+# `.huskyrc.json`/`.huskyrc.yaml`/`.huskyrc.yml`/`.huskyrc.js`/`.huskyrc.cjs`, or
+# `husky.config.js`/`husky.config.cjs`, file whose sole purpose is to carry a
+# `hooks` block -- same "dedicated file, no other use" path-only gate. Husky v4
+# resolves this config via cosmiconfig, whose documented search list includes
+# the `.js`/`.cjs` extensions and the `husky.config.*` filename alongside the
+# `.json`/`.yaml`/`.yml` forms already covered -- QA finding (independent
+# adversarial bypass-hunting review): the original pattern covered only the
+# non-executable extensions, so `.huskyrc.js`/`husky.config.js` (a real,
+# working, cosmiconfig-resolved config carrying the identical `hooks` block)
+# sailed through with zero detection.
 HUSKYRC_PATH_RE = re.compile(
-    _GIT_HOOKS_LEAD + r"\.huskyrc(?:\.(?:json|ya?ml))?" + _CI_END,
+    _GIT_HOOKS_LEAD + r"\.huskyrc(?:\.(?:json|ya?ml|c?js))?" + _CI_END
+    + r"|" + _GIT_HOOKS_LEAD + r"husky\.config\.c?js" + _CI_END,
     re.IGNORECASE,
 )
 # Lefthook (Go): `lefthook.yml`/`.lefthook.yml` (repo config) and
@@ -4108,7 +4117,14 @@ PRECOMMIT_CONFIG_PATH_RE = re.compile(
     _GIT_HOOKS_LEAD + r"\.pre-commit-config\.ya?ml" + _CI_END,
     re.IGNORECASE,
 )
-PRECOMMIT_LOCAL_REPO_RE = re.compile(r"\brepo\s*:\s*local\b", re.IGNORECASE)
+# A quoted value (`repo: 'local'`/`repo: "local"`) parses to the identical
+# YAML string and pre-commit treats it identically to the bare form -- QA
+# finding (independent adversarial bypass-hunting review): the original
+# pattern required `local` unquoted, so a real, working, quoted-equivalent
+# config sailed through with zero detection since this is the surface's
+# ONLY gate (no path-only fallback exists for `.pre-commit-config.yaml`,
+# unlike `.husky/`/Lefthook's config above).
+PRECOMMIT_LOCAL_REPO_RE = re.compile(r"\brepo\s*:\s*[\"']?local[\"']?\b", re.IGNORECASE)
 PRECOMMIT_ENTRY_KEY_RE = re.compile(r"\bentry\s*:", re.IGNORECASE)
 
 

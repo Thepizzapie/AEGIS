@@ -128,6 +128,23 @@ def test_huskyrc_gated():
     assert _gated(evaluate(_write(".huskyrc.yaml"), EMPTY))
 
 
+def test_huskyrc_js_gated():
+    """QA finding (independent adversarial bypass-hunting review): Husky v4
+    resolves its config via cosmiconfig, whose documented search list
+    includes the executable `.js`/`.cjs` forms alongside `.json`/`.yaml` —
+    the original pattern missed them entirely."""
+    d = evaluate(_write(".huskyrc.js", content="module.exports={hooks:{'pre-commit':'evil.sh'}}"),
+                 EMPTY)
+    assert _gated(d) and d.rule == "hook-manager-protect"
+    assert _gated(evaluate(_write(".huskyrc.cjs"), EMPTY))
+
+
+def test_husky_config_js_gated():
+    d = evaluate(_write("husky.config.js"), EMPTY)
+    assert _gated(d) and d.rule == "hook-manager-protect"
+    assert _gated(evaluate(_write("husky.config.cjs"), EMPTY))
+
+
 # ---- Lefthook config — path-only -----------------------------------------------
 
 def test_lefthook_yml_gated():
@@ -161,6 +178,20 @@ def test_precommit_ordinary_pinned_hook_not_gated():
     false-positive — no `repo: local` block at all."""
     d = evaluate(_write(".pre-commit-config.yaml", content=PRECOMMIT_ORDINARY), EMPTY)
     assert not _gated(d)
+
+
+def test_precommit_local_quoted_gated():
+    """QA finding (independent adversarial bypass-hunting review): a quoted
+    `repo: 'local'`/`repo: "local"` parses to the identical YAML string and
+    pre-commit treats it identically to the bare form — the original
+    pattern required it unquoted, a total bypass since this file has no
+    path-only fallback."""
+    content = ("repos:\n  - repo: 'local'\n    hooks:\n      - id: evil\n"
+               "        entry: evil.sh\n        language: system\n")
+    d = evaluate(_write(".pre-commit-config.yaml", content=content), EMPTY)
+    assert _gated(d) and d.rule == "hook-manager-protect"
+    content2 = content.replace("'local'", '"local"')
+    assert _gated(evaluate(_write(".pre-commit-config.yaml", content=content2), EMPTY))
 
 
 def test_precommit_local_without_entry_not_gated():
@@ -225,6 +256,19 @@ def test_shell_forced_symlink_swap_gated():
 
 def test_shell_rsync_bare_husky_dir_gated():
     assert _gated(evaluate(_shell("rsync -a evil_hooks/ .husky/"), EMPTY))
+
+
+def test_shell_archive_tools_beyond_tar_rsync_gated():
+    """QA finding (independent adversarial bypass-hunting review): the shell
+    branch originally reused `GIT_HOOKS_ARCHIVE_VERB_RE`, which never
+    received the unrar/cpio/Expand-Archive/xcopy/robocopy fix an earlier QA
+    round already made to the newer, shared `ARCHIVE_SYNC_VERB_RE` — all
+    five sailed through onto `.husky/`/Lefthook's config undetected."""
+    assert _gated(evaluate(_shell("unrar x payload.rar .husky/"), EMPTY))
+    assert _gated(evaluate(_shell("xcopy payload.sh .husky\\pre-commit /Y"), EMPTY))
+    assert _gated(evaluate(_shell("robocopy src .husky pre-commit"), EMPTY))
+    assert _gated(evaluate(_shell("Expand-Archive payload.zip -DestinationPath .husky"), EMPTY))
+    assert _gated(evaluate(_shell("cd .husky && cpio -idv < payload.cpio"), EMPTY))
 
 
 def test_shell_read_only_of_husky_hook_not_gated():
