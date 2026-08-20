@@ -4032,3 +4032,110 @@ def gitmodules_add_loose_hit(cmd: str) -> bool:
                 and _GITMODULES_ANY_SCHEME_RE.search(clause)):
             return True
     return False
+
+
+# ---- hook-manager config: third-party git-hooks-manager auto-exec, beyond -----
+# `.git/hooks/*`/`core.hooksPath` themselves -------------------------------------
+# GIT_HOOKS_PATH_RE/GIT_HOOKS_CONFIG_RE above cover the raw git-hooks mechanism.
+# Three widely-adopted THIRD-PARTY hook-manager tools sit one layer above it and
+# are reached by none of that guard's checks: Husky (JS/npm -- the dominant
+# git-hooks manager in the JS ecosystem), the Python `pre-commit` framework
+# (equally dominant outside JS, and routinely re-run in CI via `pre-commit run
+# --all-files` or the pre-commit.ci service -- so a planted hook can run with CI
+# secrets, not just a human's next local commit), and Lefthook (Go, growing).
+# Each installs only a THIN SHIM into `.git/hooks/<name>` that sources/execs a
+# separate, ordinary-looking tracked config/script file living OUTSIDE
+# `.git/hooks/` -- the actual command payload lives there, invisible to every
+# check GIT_HOOKS_PATH_RE/GIT_HOOKS_DIR_RE performs. Same "write now, auto-exec
+# later, unattended, on the very next matching git operation" shape
+# rule_git_hooks_protect's own docstring describes, one file over.
+
+# Husky v7+: the shim IS `.git/hooks/<name>` (already gated by GIT_HOOKS_PATH_RE),
+# but the payload is `.husky/<hookname>` -- an ordinary TRACKED shell script that
+# runs with the invoking user's full privileges on the very next matching git
+# operation for as long as husky stays installed (routine, via `npm install`
+# running the `prepare` lifecycle script). `.husky/` has no legitimate use beyond
+# defining hook commands, so -- like `.git/hooks/` itself -- this is a path-only
+# gate, reusing the same standard hook-name vocabulary (`_GIT_HOOK_NAMES`) and
+# leading-context class (`_GIT_HOOKS_LEAD`) GIT_HOOKS_PATH_RE already uses.
+HUSKY_HOOK_PATH_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.husky" + _WIN_TRIM + _SEP
+    + r"(?:" + _GIT_HOOK_NAMES + r")" + _CI_END,
+    re.IGNORECASE,
+)
+# The bare `.husky/` directory, no specific hook filename required -- an
+# archive/sync tool can write/extract multiple hook scripts into it without ever
+# naming one in the command, the same gap GIT_HOOKS_DIR_RE exists to close for
+# `.git/hooks/` itself.
+HUSKY_DIR_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.husky" + _CI_END,
+    re.IGNORECASE,
+)
+# Legacy Husky v4 (pre-npm-`prepare`-script era): a dedicated `.huskyrc`/
+# `.huskyrc.json`/`.huskyrc.yaml`/`.huskyrc.yml` file whose sole purpose is to
+# carry a `hooks` block -- same "dedicated file, no other use" path-only gate.
+HUSKYRC_PATH_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.huskyrc(?:\.(?:json|ya?ml))?" + _CI_END,
+    re.IGNORECASE,
+)
+# Lefthook (Go): `lefthook.yml`/`.lefthook.yml` (repo config) and
+# `lefthook-local.yml`/`.lefthook-local.yml` (an untracked, personal override
+# with EQUAL authority -- the same "gitignored sibling with equal authority"
+# shape `.claude/settings.local.json` has for `rule_claude_hooks_protect`), plus
+# a split-config `.lefthook/<name>.yml` directory form. Each hook entry's `run:`
+# value is the executed command -- the entire file's purpose is defining hook
+# commands, so, like `.husky/`, this is a path-only gate.
+LEFTHOOK_CONFIG_PATH_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.?lefthook(?:-local)?\.ya?ml" + _CI_END
+    + r"|" + _GIT_HOOKS_LEAD + r"\.lefthook" + _WIN_TRIM + _SEP
+    + r"[^\s'\"/\\]{1,100}\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `pre-commit` (Python framework, dominant outside the JS ecosystem):
+# `.pre-commit-config.yaml`/`.pre-commit-config.yml` is edited far too often for
+# entirely benign reasons (bumping a pinned `rev:` on a well-known, publicly
+# vetted hook, adding a hook by `id:`) to gate on path alone the way `.husky/`/
+# Lefthook's config can -- same "content, not path alone" design
+# `rule_package_manifest_protect` uses for `package.json`'s lifecycle-script
+# keys. The dangerous shape is a `repo: local` hook entry: unlike a normal entry
+# (a pinned `repo:`/`rev:` pair resolving to a vetted, hash-pinned EXTERNAL
+# hook), `repo: local` runs its `entry:` command directly on THIS machine, no
+# external repo, no pin, no review trail beyond the diff itself -- the exact
+# "agent plants the payload itself" shape package-manifest's own docstring
+# describes for a lifecycle-script key, one layer up.
+PRECOMMIT_CONFIG_PATH_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.pre-commit-config\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+PRECOMMIT_LOCAL_REPO_RE = re.compile(r"\brepo\s*:\s*local\b", re.IGNORECASE)
+PRECOMMIT_ENTRY_KEY_RE = re.compile(r"\bentry\s*:", re.IGNORECASE)
+
+
+def hook_manager_precommit_local_hit(content: str) -> bool:
+    """True if ``content`` carries BOTH a `repo: local` hook block and an
+    `entry:` command -- a `.pre-commit-config.yaml` naming only a normal, pinned
+    external hook (the overwhelming majority of routine edits -- bumping a
+    `rev:`, adding a well-known hook by `id:`) never has `repo: local` at all
+    and stays allowed. Whole-content co-occurrence, not adjacency-anchored: a
+    single `- repo: local` block can list several `hooks:` entries (id/name/
+    language/...) before its `entry:` key appears, the same "whole-command
+    boolean-AND, not per-clause adjacency" trade-off several sibling guards in
+    this file already accept (see e.g. `REGISTRY_HIJACK_RE`'s own poetry-source
+    alternative, gated the identical way)."""
+    return bool(PRECOMMIT_LOCAL_REPO_RE.search(content)
+                and PRECOMMIT_ENTRY_KEY_RE.search(content))
+
+
+# Legacy Husky v4's OTHER config surface: a `"husky": {"hooks": {...}}` block
+# inside `package.json` itself -- content-gated the same way
+# `rule_package_manifest_protect` already gates THAT file's disjoint
+# lifecycle-script-key surface, on the `husky`+`hooks` object header, or a real
+# git-hook-name key nested under a `hooks` object, co-occurring. `package.json`'s
+# own path is already covered by `PACKAGE_SCRIPTS_PATH_RE` -- reused directly
+# rather than duplicated.
+HUSKY_PKG_HOOKS_RE = re.compile(
+    r"[\"']husky[\"']\s*:\s*\{[^{}]{0,500}[\"']hooks[\"']\s*:"
+    r"|[\"']hooks[\"']\s*:\s*\{[^{}]{0,2000}[\"'](?:" + _GIT_HOOK_NAMES + r")[\"']\s*:",
+    re.IGNORECASE,
+)
