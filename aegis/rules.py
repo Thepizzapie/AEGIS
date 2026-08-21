@@ -4710,26 +4710,28 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     credential-plugin block.
 
     THREAT MODEL: unlike a git alias or a shell startup file, the command
-    planted here isn't just "auto-exec on the next matching operation" --
-    it is handed a LIVE, freshly-minted credential every single time it
-    runs. AWS's ``credential_process`` key tells the SDK/CLI to execute
-    the named command and parse its stdout as a set of temporary AWS
-    credentials, on every API call resolved through that profile --
-    trivially inverted into "run the real credential helper, THEN also
-    exfiltrate the credentials it just returned," with no visible error
-    and no separate network call for a security tool to catch (the
-    exfiltration IS the credential helper). Kubernetes' analogous ``exec:``
-    credential-plugin block in a kubeconfig (client-go's own documented
-    mechanism -- the same one ``aws-iam-authenticator``/
-    ``gke-gcloud-auth-plugin`` legitimately use) does the same for a
-    cluster bearer token or client certificate, on every ``kubectl``
-    invocation or API request any client-go-based tool makes through that
-    context. Same "write now, auto-exec later, on someone else's future
-    invocation, reads as a routine one-line config addition" shape
-    ``rule_git_config_exec_protect``'s own ``credential.helper`` half
-    already covers for git -- here the payoff is live cloud/cluster
-    credentials instead of a git host's, and the blast radius is every
-    future AWS API call or ``kubectl``/client-go request from that
+    planted here is handed a LIVE, freshly-minted credential every time it
+    actually runs. AWS's ``credential_process`` key tells the SDK/CLI to
+    execute the named command and parse its stdout as a set of temporary
+    AWS credentials -- the SDK caches that result and only re-invokes the
+    command on a cache miss/near-expiry (not literally every single API
+    call), but every re-invocation is still an unattended, unconfirmed
+    execution of an attacker-chosen binary that gets handed real
+    credentials in return, trivially inverted into "run the real
+    credential helper, THEN also exfiltrate the credentials it just
+    returned," with no visible error and no separate network call for a
+    security tool to catch (the exfiltration IS the credential helper).
+    Kubernetes' analogous ``exec:`` credential-plugin block in a
+    kubeconfig (client-go's own documented mechanism -- the same one
+    ``aws-iam-authenticator``/``gke-gcloud-auth-plugin`` legitimately use)
+    does the same for a cluster bearer token or client certificate, on
+    each token refresh any ``kubectl`` invocation or client-go-based tool
+    triggers through that context. Same "write now, auto-exec later, on
+    someone else's future invocation, reads as a routine one-line config
+    addition" shape ``rule_git_config_exec_protect``'s own ``credential.
+    helper`` half already covers for git -- here the payoff is live
+    cloud/cluster credentials instead of a git host's, and the blast
+    radius is every future credential refresh resolved through that
     profile/context, by this agent, a teammate, or CI, not just this
     session.
 
@@ -4807,7 +4809,43 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``external_account`` executable-sourced-credential JSON
     (``credential_source.executable.command``) is a related but DISTINCT
     mechanism this guard does not cover at all -- a known, disclosed gap,
-    not silently missed."""
+    not silently missed.
+
+    QA history (two independent adversarial reviews, run in parallel --
+    bypass-hunting and design/consistency, the same convention every
+    guard in this file follows): design/consistency review round-tripped
+    a real ``cloud_cred_exec:`` YAML policy block through ``load_policy()``
+    into a live ``evaluate()`` decision for both ``mode`` and ``allow``
+    (confirmed via ``aegis validate`` too), confirmed ``_CORE_RULES``/the
+    ``_FETCH_HUMAN_ESCAPABLE`` backstop wiring, both ``skills.py`` knob
+    lists, and the README table row, and independently reproduced every
+    claim in the containment-overlap paragraph above by calling
+    ``rule_containment`` directly -- and flagged one wording overstatement
+    since fixed (this docstring originally said "every API call" where
+    AWS's SDK-level caching means "every credential refresh" is accurate).
+    Bypass-hunting found and closed three real, reproduced issues before
+    merge: an MCP-tool write whose path argument used a key name outside
+    ``_path()``'s fixed allowlist (``location``/``dest``/...) left path
+    confirmation completely unreachable even though ``_flatten_strings()``
+    already saw that same value fine on the content side, silently
+    ALLOWing a bare/weak-content MCP write with no path confirmation at
+    all -- closed by widening path confirmation to the same flattened-
+    string sweep already used for MCP content, for the MCP branch only
+    (native Edit/Write always populate ``file_path`` reliably); the CLI-
+    form regexes' original 30/60/120-char inter-token gaps were too tight
+    for entirely realistic, non-adversarial invocations -- an ordinary
+    long AWS SSO-style ``--profile`` name, or routine global flags
+    (``--region``/``--namespace``/``--request-timeout``) ahead of the
+    subcommand, silently evaded both ``AWS_CRED_PROCESS_CLI_RE`` and
+    ``KUBE_EXEC_CRED_CLI_RE`` -- widened to 200 chars each, matching
+    ``GIT_CONFIG_CREDENTIAL_HELPER_RE``'s own verb-adjacency convention;
+    and ``AWS_CRED_PROCESS_INI_RE`` had no comment-awareness at all, so a
+    documentation/template line merely MENTIONING the directive inside a
+    ``#``-prefixed comment (never actually setting it) false-positived --
+    closed by stripping full-line ``#`` comments (via ``patterns.strip_
+    comment_lines``) from both branches' scanned text before every
+    content-shape check, which also, as a side effect, correctly stops
+    treating an entirely commented-out shell line as a real invocation."""
     cfg = getattr(policy, "cloud_cred_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -4829,14 +4867,31 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
-        aws_path_confirmed = bool(p and patterns.AWS_CONFIG_PATH_RE.search(p))
+        # `_path()` only recognizes a fixed key-name allowlist (file_path/
+        # path/target_file/...) -- an MCP tool naming its path argument
+        # something else entirely (`location`, `dest`, `target`, ...) left
+        # path confirmation completely unreachable even though
+        # `_flatten_strings()` already sees that same value fine on the
+        # CONTENT side (QA finding, bypass-hunting round: a bare MCP write
+        # with a non-allowlisted path key and weak/bare content sailed
+        # through as a silent ALLOW). Widen path confirmation to the same
+        # flattened-string sweep for MCP calls specifically -- native Edit/
+        # Write always populate `file_path` so `p` alone is already
+        # reliable there.
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            path_text = p + " " + " ".join(_flatten_strings(a))
+        scan_content = patterns.strip_comment_lines(content)
+        aws_path_confirmed = bool(path_text and patterns.AWS_CONFIG_PATH_RE.search(path_text))
         aws_hit = bool(
-            patterns.AWS_CRED_PROCESS_INI_RE.search(content)
-            or (aws_path_confirmed and patterns.AWS_CRED_PROCESS_CONTENT_RE.search(content)))
-        kube_path_confirmed = bool(p and patterns.KUBE_CONFIG_PATH_RE.search(p))
+            patterns.AWS_CRED_PROCESS_INI_RE.search(scan_content)
+            or (aws_path_confirmed
+                and patterns.AWS_CRED_PROCESS_CONTENT_RE.search(scan_content)))
+        kube_path_confirmed = bool(path_text and patterns.KUBE_CONFIG_PATH_RE.search(path_text))
         kube_hit = bool(
-            patterns.KUBE_EXEC_CRED_STRONG_RE.search(content)
-            or (kube_path_confirmed and patterns.KUBE_EXEC_CRED_CONTENT_RE.search(content)))
+            patterns.KUBE_EXEC_CRED_STRONG_RE.search(scan_content)
+            or (kube_path_confirmed
+                and patterns.KUBE_EXEC_CRED_CONTENT_RE.search(scan_content)))
         if not (aws_hit or kube_hit):
             return None
         if (os.environ.get("AEGIS_ALLOW_CLOUD_CRED_EXEC")
@@ -4859,16 +4914,17 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        aws_path_hit = bool(patterns.AWS_CONFIG_PATH_RE.search(cmd))
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        aws_path_hit = bool(patterns.AWS_CONFIG_PATH_RE.search(scan_cmd))
         aws_hit = bool(
-            patterns.AWS_CRED_PROCESS_CLI_RE.search(cmd)
-            or patterns.AWS_CRED_PROCESS_INI_RE.search(cmd)
-            or (aws_path_hit and patterns.AWS_CRED_PROCESS_CONTENT_RE.search(cmd)))
-        kube_path_hit = bool(patterns.KUBE_CONFIG_PATH_RE.search(cmd))
+            patterns.AWS_CRED_PROCESS_CLI_RE.search(scan_cmd)
+            or patterns.AWS_CRED_PROCESS_INI_RE.search(scan_cmd)
+            or (aws_path_hit and patterns.AWS_CRED_PROCESS_CONTENT_RE.search(scan_cmd)))
+        kube_path_hit = bool(patterns.KUBE_CONFIG_PATH_RE.search(scan_cmd))
         kube_hit = bool(
-            patterns.KUBE_EXEC_CRED_CLI_RE.search(cmd)
-            or patterns.KUBE_EXEC_CRED_STRONG_RE.search(cmd)
-            or (kube_path_hit and patterns.KUBE_EXEC_CRED_CONTENT_RE.search(cmd)))
+            patterns.KUBE_EXEC_CRED_CLI_RE.search(scan_cmd)
+            or patterns.KUBE_EXEC_CRED_STRONG_RE.search(scan_cmd)
+            or (kube_path_hit and patterns.KUBE_EXEC_CRED_CONTENT_RE.search(scan_cmd)))
         if not (aws_hit or kube_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLOUD_CRED_EXEC")

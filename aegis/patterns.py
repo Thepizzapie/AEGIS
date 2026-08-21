@@ -4116,9 +4116,17 @@ AWS_CRED_PROCESS_INI_RE = re.compile(
 )
 # `aws configure set credential_process <cmd> [--profile NAME]` (also the
 # dotted `profile.<name>.credential_process` key form -- both put the
-# literal word `credential_process` after `configure`/`set`).
+# literal word `credential_process` after `configure`/`set`). Gaps bounded
+# at 200 chars each (matching `GIT_CONFIG_CREDENTIAL_HELPER_RE`'s own
+# verb-adjacency convention elsewhere in this file) -- QA (bypass-hunting
+# round) found the original, much tighter 60/30/60-char gaps silently
+# missed entirely realistic invocations: a single `--profile <name>` with
+# an ordinary long AWS SSO-style profile name, or a couple of routine
+# global flags (`--region`/`--output`/`--no-cli-pager`) ahead of the
+# `configure` subcommand, routinely exceed 30-60 chars with no obfuscation
+# involved at all.
 AWS_CRED_PROCESS_CLI_RE = re.compile(
-    r"\baws\b[^|;&\n]{0,60}\bconfigure\b[^|;&\n]{0,30}\bset\b[^|;&\n]{0,60}"
+    r"\baws\b[^|;&\n]{0,200}\bconfigure\b[^|;&\n]{0,200}\bset\b[^|;&\n]{0,200}"
     r"\bcredential_process\b",
     re.IGNORECASE,
 )
@@ -4142,9 +4150,31 @@ KUBE_EXEC_CRED_STRONG_RE = re.compile(
     r"client\.authentication\.k8s\.io",
     re.IGNORECASE | re.DOTALL,
 )
-# `kubectl config set-credentials <name> --exec-command=<cmd> ...`.
+# `kubectl config set-credentials <name> --exec-command=<cmd> ...`. Gaps
+# widened to 200 chars each, the same fix and reasoning as
+# `AWS_CRED_PROCESS_CLI_RE` above -- QA (bypass-hunting round) found
+# ordinary `--context`/`--namespace`/`--request-timeout` global flags
+# ahead of `config`, or a single realistic `--kubeconfig-context=<name>`
+# flag between `config` and `set-credentials`, exceeded the original
+# 120/30-char gaps with no obfuscation involved.
 KUBE_EXEC_CRED_CLI_RE = re.compile(
-    r"\bkubectl\b[^|;&\n]{0,120}\bconfig\b[^|;&\n]{0,30}\bset-credentials\b"
+    r"\bkubectl\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,200}\bset-credentials\b"
     r"[^|;&\n]{0,300}--exec-command\b",
     re.IGNORECASE,
 )
+
+# Full-line `#` comments -- both AWS's own config-file format and YAML treat
+# a line whose first non-whitespace character is `#` as inert. QA (bypass-
+# hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
+# KUBE_EXEC_CRED_STRONG_RE false-positived on a documentation/template line
+# merely MENTIONING the directive inside a comment (`# TODO: consider
+# credential_process = for SSO later`), never actually setting it. Stripped
+# before every content-shape check below (both branches, both ecosystems) --
+# harmless for a real payload (never itself commented out) and, as a side
+# effect, correctly stops treating an entirely commented-out shell line as a
+# real invocation either.
+_COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
+
+
+def strip_comment_lines(text: str) -> str:
+    return _COMMENT_LINE_RE.sub("", text)

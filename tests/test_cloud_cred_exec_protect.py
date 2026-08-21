@@ -243,6 +243,92 @@ def test_kube_mcp_write_to_ordinary_path_gated():
     assert _gated(d) and d.rule == RULE
 
 
+# ---- QA round (bypass-hunting, independent adversarial review): closed bypasses --
+
+def test_mcp_unlisted_path_key_name_gated():
+    """`_path()` only recognizes a fixed key-name allowlist (file_path/path/
+    target_file/...) — QA (bypass-hunting round) found an MCP tool naming
+    its path argument something else entirely (`location`, `dest`,
+    `target`, ...) left path confirmation completely unreachable, silently
+    ALLOWing a bare/weak-content write even though `_flatten_strings()`
+    already saw that same path value fine on the content side."""
+    d = evaluate(Event.make(
+        HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file", action=ActionClass.MCP,
+        args={"location": ".aws/config", "content": "credential_process = /tmp/evil\n"}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+    d2 = evaluate(Event.make(
+        HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file", action=ActionClass.MCP,
+        args={"dest": "/home/user/.kube/config",
+              "content": "    exec:\n      command: /tmp/evil\n"}), EMPTY)
+    assert _gated(d2) and d2.rule == RULE
+
+
+def test_aws_cli_long_profile_name_gated():
+    """QA (bypass-hunting round): the original 30/60-char inter-token gaps
+    in `AWS_CRED_PROCESS_CLI_RE` silently missed an entirely realistic,
+    non-adversarial AWS SSO-style long `--profile` name."""
+    d = evaluate(_shell(
+        "aws --profile my-really-long-organization-profile-name-for-prod-account "
+        "configure set credential_process /tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_aws_cli_global_flags_before_configure_gated():
+    d = evaluate(_shell(
+        "aws --region us-east-1 --output json --no-cli-pager --color off "
+        "configure set credential_process /tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_kubectl_cli_long_context_and_flags_gated():
+    """Same fix, `KUBE_EXEC_CRED_CLI_RE`'s own original 120/30-char gaps —
+    ordinary `--context`/`--namespace`/`--request-timeout` global flags are
+    real kubectl flags, not obfuscation."""
+    d = evaluate(_shell(
+        "kubectl --context=my-really-long-organization-cluster-context-name-for-prod-east-1 "
+        "--namespace=kube-system --request-timeout=30s config set-credentials evil "
+        "--exec-command=/tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_kubectl_cli_flag_between_config_and_set_credentials_gated():
+    d = evaluate(_shell(
+        "kubectl config --kubeconfig-context=my-really-long-name-here "
+        "set-credentials evil --exec-command=/tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_comment_only_mention_of_credential_process_not_gated():
+    """QA (bypass-hunting round): `AWS_CRED_PROCESS_INI_RE` had no comment-
+    awareness at all, so a documentation/template line merely MENTIONING
+    the directive inside a `#`-prefixed comment (never actually setting
+    it) false-positived — closed by stripping full-line `#` comments
+    before every content-shape check."""
+    d = evaluate(_write(
+        "staging/aws-notes.ini",
+        content="[profile prod]\n# TODO: consider credential_process = for SSO later\n"
+                "region = us-east-1\n"), EMPTY)
+    assert not _gated(d)
+
+
+def test_commented_out_shell_line_not_gated():
+    """A side effect of the same fix: an entire shell command that is
+    itself a comment (never executed) should not gate."""
+    d = evaluate(_shell("# aws configure set credential_process /tmp/evil"), EMPTY)
+    assert not _gated(d)
+
+
+def test_real_credential_process_still_gated_alongside_unrelated_comment():
+    """The comment-stripping fix must not blind the checks to a REAL
+    directive that merely happens to share a file with an unrelated
+    comment line."""
+    d = evaluate(_write(
+        ".aws/config",
+        content="# managed by bootstrap.sh, do not edit by hand\n"
+                "[profile evil]\ncredential_process = /tmp/evil\n"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 # ---- Kubernetes exec-credential-plugin: shell CLI form -------------------------
 
 def test_kubectl_set_credentials_exec_command_cli_gated():
@@ -499,3 +585,53 @@ def test_engine_no_quadratic_blowup():
     evaluate(_shell(cmd), EMPTY)
     elapsed = time.time() - start
     assert elapsed < 1.0, f"rule_cloud_cred_exec_protect took {elapsed:.2f}s on adversarial input"
+
+
+def test_widened_cli_regex_bounds_still_no_quadratic_blowup():
+    """The 200-char widened gaps (QA fix) must not reopen a ReDoS hole."""
+    from aegis import patterns
+    checks = [
+        "aws " + "x " * 5000 + "configure " + "y " * 5000 + "set " + "z " * 5000,
+        "kubectl " + "x " * 5000 + "config " + "y " * 5000 + "set-credentials",
+    ]
+    for adv in checks:
+        start = time.time()
+        patterns.AWS_CRED_PROCESS_CLI_RE.search(adv)
+        patterns.KUBE_EXEC_CRED_CLI_RE.search(adv)
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"took {elapsed:.2f}s on {adv[:30]!r}..."
+
+
+def test_strip_comment_lines_no_quadratic_blowup():
+    from aegis import patterns
+    adv = "\n".join(["# " + "x" * 500] * 5000)
+    start = time.time()
+    patterns.strip_comment_lines(adv)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"took {elapsed:.2f}s"
+
+
+# ---- strip_comment_lines: unit-level ----------------------------------------------
+
+def test_strip_comment_lines_removes_full_comment_lines():
+    from aegis import patterns
+    out = patterns.strip_comment_lines(
+        "[profile prod]\n# TODO: consider credential_process = for SSO later\n"
+        "region = us-east-1\n")
+    assert "credential_process" not in out
+    assert "region = us-east-1" in out
+
+
+def test_strip_comment_lines_preserves_indented_comments():
+    from aegis import patterns
+    out = patterns.strip_comment_lines("    # a leading-whitespace comment\nreal = line\n")
+    assert "a leading-whitespace comment" not in out
+    assert "real = line" in out
+
+
+def test_strip_comment_lines_preserves_non_comment_lines_with_hash_mid_line():
+    """Only a line whose FIRST non-whitespace character is '#' is a
+    comment — a '#' appearing mid-line (e.g. inside a value) must survive."""
+    from aegis import patterns
+    out = patterns.strip_comment_lines("credential_process = /tmp/x#not-a-comment\n")
+    assert "credential_process" in out and "#not-a-comment" in out
