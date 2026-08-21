@@ -4032,3 +4032,149 @@ def gitmodules_add_loose_hit(cmd: str) -> bool:
                 and _GITMODULES_ANY_SCHEME_RE.search(clause)):
             return True
     return False
+
+
+# ---- Cloud-credential-provider exec hijack: AWS credential_process / --------
+# Kubernetes exec-credential-plugin -------------------------------------------
+#
+# Two credential-BROKERING primitives that name an arbitrary EXTERNAL COMMAND
+# in a config file, which the AWS SDK/CLI or a Kubernetes client (kubectl,
+# client-go, any tool built on it) then EXECUTES to mint credentials -- not
+# once, but on EVERY future call resolved through that profile/context,
+# unattended, by this agent, a teammate, or CI. The same "write now, auto-
+# exec later, on someone else's future invocation, reads as a routine
+# one-line config addition" shape `GIT_CONFIG_CREDENTIAL_HELPER_RE`'s own
+# `credential.helper` half already covers for git -- here the credential
+# handed to the planted command is a live AWS temporary-credential set or a
+# Kubernetes bearer token/client cert, minted fresh and handed over every
+# single time, not captured once.
+#
+# AWS: `credential_process` is honored in EITHER the config file
+# (`~/.aws/config`, `AWS_CONFIG_FILE`) or the credentials file
+# (`~/.aws/credentials`, `AWS_SHARED_CREDENTIALS_FILE`) -- documented AWS
+# CLI/SDK behavior. Gated on the KEY alone (any value) -- the identical
+# `credential.helper` reasoning: every value names a program the SDK will
+# execute and hand real, live AWS credentials to, so there is no safe/
+# dangerous split by value the way there is for e.g. a bare git alias.
+#
+# Kubernetes: an `exec:` credential-plugin block under `users[].user` --
+# client-go's own documented shape requires (at minimum) sibling `command:`
+# and `apiVersion: client.authentication.k8s.io/...` keys. The strong,
+# path-independent form requires that whole triad co-occurring within a
+# bounded window -- the same "confirmed shape without a real YAML parse"
+# trade-off `CONFTEST_AUTOEXEC_HOOK_RE`'s own bounded lookahead already
+# makes. A weaker `exec:` .. `command:` pair (no `apiVersion` requirement)
+# is used only once the path is already confirmed as a real kubeconfig
+# file -- an Edit's `new_string` may only be inserting/changing the
+# `command:` line of an ALREADY-EXISTING `exec:` block, the same
+# "new_string is just the inserted lines, the header is old_string
+# context" reasoning `GIT_CONFIG_HELPER_CONTENT_RE`'s own comment
+# documents.
+#
+# Both also have a CLI form that plants the identical key/block with no
+# literal INI/YAML text ever appearing in the tool call at all:
+# `aws configure set credential_process <cmd> [--profile NAME]` and
+# `kubectl config set-credentials <name> --exec-command=<cmd> ...`.
+#
+# Honest, disclosed scope: `AWS_CONFIG_FILE`/`AWS_SHARED_CREDENTIALS_FILE`/
+# `KUBECONFIG` relocating either file to a path with no `.aws`/`.kube`
+# segment at all is not covered -- the same "computed indirectly"/env-var-
+# relocation class `rule_shell_persist_protect`'s own `$ZDOTDIR` gap and
+# `rule_direnv_protect`'s own `$XDG_CONFIG_HOME` gap already accept. A
+# `--kubeconfig <path>` flag value IS matched when it appears literally in
+# the same shell command (unlike a bare `KUBECONFIG=` env-var prefix, which
+# is not specially parsed). A `credential_process`/`command:` value
+# assembled indirectly (shell variable concatenation, a wrapper script)
+# defeats every check here, the same class every sibling guard already
+# accepts. No `find`-path-indirection fallback (same disclosed absence
+# `rule_git_config_exec_protect`'s own docstring accepts, since the CLI/
+# inline forms are the dominant, expected way this surface is reached). A
+# GCP Application Default Credentials `external_account` executable-
+# sourced-credential JSON (`credential_source.executable.command`) is a
+# related but DISTINCT mechanism this guard does not cover at all.
+
+AWS_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.aws" + _WIN_TRIM + _SEP + r"(?:config|credentials)" + _CI_END,
+    re.IGNORECASE,
+)
+# Weak, path-CONFIRMED-only key check -- mirrors GIT_CONFIG_HELPER_CONTENT_RE.
+AWS_CRED_PROCESS_CONTENT_RE = re.compile(r"\bcredential_process\s*=", re.IGNORECASE)
+# Strong, path-INDEPENDENT form: a real AWS profile section header
+# (`[default]`, `[profile <name>]`, or the credentials file's own bare
+# `[<name>]`) followed, anywhere in its body, by `credential_process =` --
+# mirrors GIT_CONFIG_CREDENTIAL_HELPER_INI_RE's own `[credential]`-scoped
+# shape. `credential_process` itself is distinctive, AWS-specific
+# vocabulary (unlike a bare `= !` value prefix, shared across many INI-like
+# formats) so no cross-format false-positive risk drove the section
+# scoping here -- it is kept anyway for the same "looks like a real INI
+# section, not just a coincidental substring" precision every sibling
+# strong form applies.
+AWS_CRED_PROCESS_INI_RE = re.compile(
+    r"\[(?:profile\s+[^\]\n]{1,200}|default|[^\]\n]{1,200})\]"
+    r".{0,2000}?\bcredential_process\s*=",
+    re.IGNORECASE | re.DOTALL,
+)
+# `aws configure set credential_process <cmd> [--profile NAME]` (also the
+# dotted `profile.<name>.credential_process` key form -- both put the
+# literal word `credential_process` after `configure`/`set`). Gaps bounded
+# at 200 chars each (matching `GIT_CONFIG_CREDENTIAL_HELPER_RE`'s own
+# verb-adjacency convention elsewhere in this file) -- QA (bypass-hunting
+# round) found the original, much tighter 60/30/60-char gaps silently
+# missed entirely realistic invocations: a single `--profile <name>` with
+# an ordinary long AWS SSO-style profile name, or a couple of routine
+# global flags (`--region`/`--output`/`--no-cli-pager`) ahead of the
+# `configure` subcommand, routinely exceed 30-60 chars with no obfuscation
+# involved at all.
+AWS_CRED_PROCESS_CLI_RE = re.compile(
+    r"\baws\b[^|;&\n]{0,200}\bconfigure\b[^|;&\n]{0,200}\bset\b[^|;&\n]{0,200}"
+    r"\bcredential_process\b",
+    re.IGNORECASE,
+)
+
+KUBE_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.kube" + _WIN_TRIM + _SEP + r"config" + _CI_END
+    + r"|--kubeconfig(?:\s+|=)['\"]?[^\s'\"|;&\n]+",
+    re.IGNORECASE,
+)
+# Weak, path-CONFIRMED-only pair check.
+KUBE_EXEC_CRED_CONTENT_RE = re.compile(
+    r"\bexec\s*:.{0,400}?\bcommand\s*:",
+    re.IGNORECASE | re.DOTALL,
+)
+# Strong, path-INDEPENDENT triad check (either key order -- a template or
+# generator may emit `command:` before `apiVersion:`).
+KUBE_EXEC_CRED_STRONG_RE = re.compile(
+    r"\bexec\s*:.{0,300}?\bapiVersion\s*:\s*['\"]?client\.authentication\.k8s\.io"
+    r".{0,300}?\bcommand\s*:"
+    r"|\bexec\s*:.{0,300}?\bcommand\s*:.{0,300}?\bapiVersion\s*:\s*['\"]?"
+    r"client\.authentication\.k8s\.io",
+    re.IGNORECASE | re.DOTALL,
+)
+# `kubectl config set-credentials <name> --exec-command=<cmd> ...`. Gaps
+# widened to 200 chars each, the same fix and reasoning as
+# `AWS_CRED_PROCESS_CLI_RE` above -- QA (bypass-hunting round) found
+# ordinary `--context`/`--namespace`/`--request-timeout` global flags
+# ahead of `config`, or a single realistic `--kubeconfig-context=<name>`
+# flag between `config` and `set-credentials`, exceeded the original
+# 120/30-char gaps with no obfuscation involved.
+KUBE_EXEC_CRED_CLI_RE = re.compile(
+    r"\bkubectl\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,200}\bset-credentials\b"
+    r"[^|;&\n]{0,300}--exec-command\b",
+    re.IGNORECASE,
+)
+
+# Full-line `#` comments -- both AWS's own config-file format and YAML treat
+# a line whose first non-whitespace character is `#` as inert. QA (bypass-
+# hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
+# KUBE_EXEC_CRED_STRONG_RE false-positived on a documentation/template line
+# merely MENTIONING the directive inside a comment (`# TODO: consider
+# credential_process = for SSO later`), never actually setting it. Stripped
+# before every content-shape check below (both branches, both ecosystems) --
+# harmless for a real payload (never itself commented out) and, as a side
+# effect, correctly stops treating an entirely commented-out shell line as a
+# real invocation either.
+_COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
+
+
+def strip_comment_lines(text: str) -> str:
+    return _COMMENT_LINE_RE.sub("", text)

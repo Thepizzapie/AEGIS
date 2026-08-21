@@ -267,6 +267,17 @@ class Policy:
     # `ipython`/Jupyter-kernel launch, no opt-in needed. See
     # rules.rule_ipython_startup_protect.
     ipython_startup: dict = field(default_factory=dict)
+    # Cloud-credential-provider exec hijack protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers an AWS CLI/SDK `credential_process`
+    # directive (~/.aws/config, ~/.aws/credentials, or the `aws configure
+    # set` CLI form) and a Kubernetes kubeconfig `exec:` credential-plugin
+    # block (~/.kube/config, or the `kubectl config set-credentials
+    # --exec-command` CLI form) -- both name an external command the
+    # SDK/CLI executes and hands a live, freshly-minted credential to on
+    # every future credential resolution through that profile/context. See
+    # rules.rule_cloud_cred_exec_protect.
+    cloud_cred_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing
