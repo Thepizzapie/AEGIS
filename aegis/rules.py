@@ -4944,6 +4944,205 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _container_escape_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_container_escape_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block the handful of container-runtime primitives that hand a
+    container the means to reach or CONTROL the host it runs on, not just
+    the container's own filesystem: `docker`/`podman`/`nerdctl`/`ctr run`/
+    `create`/`exec` with `--privileged`, a bind-mount of the container
+    runtime's own control socket (`/var/run/docker.sock`, Docker Desktop's
+    named pipe, podman's rootless socket -- "Docker outside of Docker"),
+    `--cap-add=SYS_ADMIN`/`ALL` (the one capability `--privileged` itself
+    relies on), or a bind-mount of the host's root filesystem (`-v /:/host`)
+    -- plus, independent of any container runtime at all, `nsenter --target
+    1 --mount` (or its `-t 1 -m` short form), the direct host-namespace-entry
+    command a process already holding CAP_SYS_ADMIN uses to step onto the
+    host.
+
+    THREAT MODEL: every guard in this file -- containment's own CRED_RE/
+    PERSIST_RE/EXFIL_RE, self-protection, every `*_protect` sibling --
+    implicitly assumes the boundary Aegis evaluates each tool call inside
+    (this session, this container, this host) is the boundary the agent is
+    actually confined to. This guard closes the one class of primitive that
+    breaks that assumption outright: run any of the four shapes above and
+    everything that happens next runs inside a FRESH namespace/container
+    with no further Aegis oversight at all -- not "harder to catch," but
+    structurally invisible, since Aegis only sees one tool call at a time
+    and nothing inside a spawned container's own process tree is a tool call
+    it is ever asked to gate. The sandbox posture this project ships
+    (`sandbox/README.md`) names exactly these properties -- `--cap-drop ALL`
+    + `--security-opt no-new-privileges`, no docker-socket mount, non-root
+    user -- as what keeps the *sandboxed* agent's own container from
+    escaping; that hardening lives in the container Aegis happens to be
+    running inside on that path, not in Aegis's own rule set, so it protects
+    nothing on Aegis's much more common deployment path: hooked directly
+    into a developer's host machine (every host-persistence guard in this
+    file -- shell-persist, systemd/launchd, PATH hijack, ld.so.preload --
+    exists because that IS the primary posture), where Docker is routinely
+    already installed and `docker run --privileged -v /:/host ... chroot
+    /host` is full, immediate root on the real machine, not a throwaway
+    container. A container-escape primitive an agent runs from INSIDE an
+    already-hardened sandbox is caught the same way -- the shell command
+    reaching this guard is identical either way; only whether it actually
+    succeeds once allowed differs, and this guard exists precisely so it
+    is never allowed to try.
+
+    Config (`policy.container_escape`): `mode` (deny|ask|monitor|off,
+    default ask), `allow` (regexes on the command that skip the gate -- a
+    repo's own trusted, reviewed Docker-in-Docker CI runner invocation,
+    say). Defaults to `ask` for the same reason every sibling `*_protect`
+    guard does: `--privileged`/a docker-socket mount is routine, sanctioned
+    infrastructure for some workflows (DinD CI runners, systemd-in-container
+    integration tests, GPU/device passthrough) -- it just needs a human to
+    have actually looked at the specific invocation.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the command, or
+    the env toggle `AEGIS_ALLOW_CONTAINER_ESCAPE=1` set by the orchestrator/
+    human before launch. A spawned agent cannot set its own env for a hook
+    invocation it doesn't control, so neither path is agent-self-escapable
+    -- the same "an agent can't wave itself past its own guard" invariant
+    every escapable guard in this file holds.
+
+    Each of the four container-runtime-flag checks requires BOTH a
+    `docker`/`podman`/`nerdctl`/`ctr run|create|exec` verb AND the
+    escape-granting flag to be present in the command, checked as two
+    INDEPENDENT regex searches ANDed together in Python rather than one
+    combined regex requiring the flag to appear within a bounded distance
+    of the verb -- QA (bypass-hunting round) found a fixed verb-to-flag
+    gap bound, even a generous one, is silently exceeded by an entirely
+    ORDINARY invocation once past roughly a dozen routine flags (`-e
+    KEY=val`, `-p`, labels, ...), no obfuscation involved. Splitting the
+    two checks removes that ceiling entirely, at the cost of a narrower
+    false-ASK trade-off disclosed below.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a flag value assembled indirectly (shell variable
+    concatenation, a wrapper script that itself invokes `docker run`)
+    defeats every check here, the same "computed indirectly" class every
+    sibling guard already accepts; because the runtime-verb check and each
+    escape-flag check are independent regex searches over the WHOLE scanned
+    command rather than one clause-scoped match, an escape flag appearing
+    anywhere in a long compound/multi-command shell line that ALSO
+    separately mentions a container-runtime run/create/exec verb gates even
+    when the two aren't really the same invocation -- a narrower false-ASK,
+    not a false-negative bypass, the same "whole command, not clause-scoped"
+    trade-off `rule_git_attributes_exec_protect`'s own shell-form check
+    discloses and defends, after finding every clause-scoping attempt opened
+    a worse bypass instead; `--pid=host` alone (without `--privileged` or
+    `--cap-add`) is deliberately NOT gated -- it has real, ordinary uses
+    (process-monitoring containers, some log/metrics agents) and, alone,
+    grants visibility into host PIDs but not the CAP_SYS_ADMIN an `nsenter
+    --mount`/`--all` actually needs to complete an escape, so gating it bare
+    would be a much noisier false-positive trade than the disclosed gap is
+    worth; `nsenter` targeting a host-visible PID other than 1 (reachable
+    once `--pid=host` already put one in view) is not covered, only the
+    canonical, universal PID-1/host-init target is; docker-compose/Kubernetes
+    manifest YAML expressing the identical `privileged: true`/
+    `hostPath: /var/run/docker.sock`/`capabilities: add: [SYS_ADMIN]` shapes
+    declaratively, rather than as `docker run` CLI flags, is a related but
+    DISTINCT surface this guard does not cover at all; and curl's/wget's own
+    fetch-to-file write verb reaching a `docker run`/`compose.yaml` this
+    guard would otherwise flag is not specially covered either -- this
+    guard's target isn't a fixed path `rule_fetch_to_file_protect`'s reused
+    regexes could backstop, it's a live command invocation.
+
+    QA history (two independent adversarial reviews, run in parallel --
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file follows): design/consistency review confirmed every
+    registration point a sibling guard needs (`_CORE_RULES`, the `Policy`
+    dataclass field, all three `loader.py` spots -- the initial `st` dict,
+    the `Policy(...)` constructor call, AND `_merge_file`'s known-keys tuple,
+    easy to miss one of the three -- both `skills.py` knob lists, the README
+    table row and Limits paragraph) was present with none missing, and found
+    and closed two real, reproduced false ASKs: `CONTAINER_SOCKET_MOUNT_RE`
+    had no trailing boundary after the socket-path literal, so it matched
+    any path merely STARTING WITH the socket string (a
+    `docker.sock.bak`/`docker.sock-old` lookalike backup file) and, for the
+    `-v`/`--volume` form, matched on either side of the `:` SRC:DST
+    separator, contradicting this guard's own "the bind SOURCE is the
+    signal" design (already true for the `--mount source=` form, which
+    names the key explicitly, but not carried over to its sibling) --
+    `-v /home/user/fake.sock:/var/run/docker.sock:ro` false-positived on an
+    arbitrary bind whose real SOURCE was nowhere near the actual socket;
+    and `--privileged=false` (real, valid pflag/cobra explicit-boolean CLI
+    syntax both docker and podman accept) false-positived on a
+    security-conscious script being EXPLICIT about not enabling it, since
+    the original check gated on the bare flag name alone with no value
+    check at all. Bypass-hunting found and closed five real, reproduced
+    bypasses before merge: `--cap-add=CAP_SYS_ADMIN` (the `CAP_`-prefixed
+    spelling Docker's own capability normalization treats as identical to
+    bare `SYS_ADMIN`) evaded the bare-name-only original cap-add check
+    entirely; `--mount ...,src=...` (the documented alias for `source=`)
+    evaded both the socket-mount and root-mount `--mount` checks, which
+    only recognized `source=`; a glued short `-v` value with no separator
+    at all (`-v/:/host`, real docker/podman shorthand-flag-gluing CLI
+    parsing, the same mechanism that makes `-p8080:80` work) evaded the
+    root-mount check's original `(?:=|\s+)`-forced separator; `nsenter -t 1
+    -a`/`--all` (nsenter's own flag for entering EVERY namespace of the
+    target process, mount included, without ever spelling `--mount`/`-m`
+    literally) evaded the mount-only nsenter check entirely, despite being
+    arguably the single most direct primitive in this guard's whole scope;
+    and the verb-to-escape-flag bounded-gap window (see above) was found
+    exceeded by ordinary, non-adversarial commands, not just contrived ones
+    -- closed by the independent-AND restructuring described above rather
+    than by widening the bound again, since QA judged any FIXED bound
+    inherently re-exploitable by a sufficiently flag-heavy but still
+    entirely ordinary command."""
+    cfg = getattr(policy, "container_escape", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "container-escape-protect-monitor")
+            return None
+        return would
+
+    if not _is_shell(ev):
+        return None
+    cmd = _shell_scan(ev)
+    run_verb_hit = bool(patterns.CONTAINER_RUNTIME_VERB_RE.search(cmd))
+    privileged_hit = run_verb_hit and bool(patterns.CONTAINER_PRIVILEGED_RE.search(cmd))
+    socket_hit = run_verb_hit and bool(patterns.CONTAINER_SOCKET_MOUNT_RE.search(cmd))
+    cap_add_hit = run_verb_hit and bool(patterns.CONTAINER_CAP_ADD_RE.search(cmd))
+    root_mount_hit = run_verb_hit and bool(patterns.CONTAINER_ROOT_MOUNT_RE.search(cmd))
+    nsenter_hit = bool(patterns.CONTAINER_NSENTER_HOST_RE.search(cmd))
+    if not (privileged_hit or socket_hit or cap_add_hit or root_mount_hit or nsenter_hit):
+        return None
+    if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CONTAINER_ESCAPE")
+            or _container_escape_allowed_by_policy(cfg, _cmd(ev))):
+        return None
+    if privileged_hit:
+        reason = "A container is being started with --privileged"
+    elif socket_hit:
+        reason = "The container runtime's own control socket is being mounted into a container"
+    elif cap_add_hit:
+        reason = "A container is being granted SYS_ADMIN/ALL capabilities"
+    elif root_mount_hit:
+        reason = "The host's root filesystem is being bind-mounted into a container"
+    else:
+        reason = "The host's PID-1 namespace is being entered directly (nsenter)"
+    return _finish(Decision(action, "container-escape-protect",
+                     f"{reason} — this hands the container (or this process) the means "
+                     "to reach or control the HOST it runs on, not just its own "
+                     "filesystem, with no further Aegis oversight once it runs: "
+                     "everything that happens next is invisible to this guard. A "
+                     "human may append '# aegis-allow', or set "
+                     "AEGIS_ALLOW_CONTAINER_ESCAPE=1; a spawned agent cannot."))
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -5557,6 +5756,7 @@ _CORE_RULES = (
     rule_pysite_protect,
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
+    rule_container_escape_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,

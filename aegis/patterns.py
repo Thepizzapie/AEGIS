@@ -4178,3 +4178,144 @@ _COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 
 def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
+
+
+# ---- container-runtime escape-to-host protection ------------------------------
+# `docker`/`podman`/`nerdctl`/`ctr` flags that hand a container the means to
+# reach or control the HOST it runs on, not just the container's own
+# filesystem, plus the direct nsenter-into-host-PID-1 primitive a process
+# already holding CAP_SYS_ADMIN uses to step onto the host with no container
+# runtime named at all. See ``rule_container_escape_protect``'s own docstring
+# in rules.py for the full threat model.
+_CONTAINER_RUNTIME_RE = r"\b(?:docker|podman|nerdctl|ctr)\b"
+_CONTAINER_VERB_RE = r"\b(?:run|create|exec)\b"
+
+# Runtime-name-to-verb proximity only ("docker ... run") is bounded at 200
+# chars, the same window AWS_CRED_PROCESS_CLI_RE/KUBE_EXEC_CRED_CLI_RE settle
+# on above -- global flags ahead of the verb are naturally short. The
+# escape-granting flag itself is checked SEPARATELY below (not chained onto
+# this with a second bounded gap): QA (bypass-hunting round) found a fixed
+# verb-to-flag gap bound -- even a generous 400 chars -- silently missed an
+# entirely ORDINARY invocation once past roughly a dozen routine `-e KEY=val`
+# flags (measured: 15 env flags, ~433 chars, no obfuscation involved)ended
+# up wider than the bound. Splitting "runtime+verb present" and "escape flag
+# present" into two independently-bounded regexes ANDed together in Python
+# (see rule_container_escape_protect) removes the shared-gap ceiling
+# entirely -- the same "weak content check + strong context check, combined
+# outside the regex" shape AWS_CRED_PROCESS_CONTENT_RE/AWS_CONFIG_PATH_RE
+# already use above, at the cost of the same accepted trade-off: an escape
+# flag appearing anywhere in a long compound command that also separately
+# mentions a container-runtime run/create/exec verb gates even when the two
+# aren't really the same invocation (a narrower false-ASK, not a
+# false-negative bypass) -- deliberately, the same "whole command, not
+# clause-scoped" choice GIT_ATTRS_EXEC_SHELL_RE's own docstring makes and
+# defends after finding every clause-scoping attempt opened a worse bypass.
+CONTAINER_RUNTIME_VERB_RE = re.compile(
+    _CONTAINER_RUNTIME_RE + r"[^|;&\n]{0,200}?" + _CONTAINER_VERB_RE,
+    re.IGNORECASE,
+)
+
+# The single flag Docker's own docs name as sufficient, alone, for a full
+# host escape (turns off every namespace/cgroup/seccomp/AppArmor restriction
+# a container normally has). Excludes an explicit `=false`/`=0`/`=no` value
+# -- QA (design/consistency round) found real docker/podman CLI parsers
+# (pflag/cobra) accept `--privileged=false` as valid, explicit boolean
+# syntax, and the bare-flag-name-only original check false-positived on a
+# security-conscious script being EXPLICIT about not enabling it.
+CONTAINER_PRIVILEGED_RE = re.compile(
+    r"--privileged\b(?!\s*=\s*(?:false|0|no)\b)",
+    re.IGNORECASE,
+)
+
+# Mounting the container-runtime control SOCKET into the container -- "Docker
+# outside of Docker" -- hands the container an unauthenticated handle to the
+# HOST's own runtime daemon, equivalent to root on the host (create a new
+# container from there with `-v /:/host`, exec into it, done). Matches
+# -v/--volume and --mount's source=/src= form (both spellings are real,
+# interchangeable docker/podman `--mount` keys -- QA (bypass-hunting round)
+# found the original `source=`-only check missed the equally-valid `src=`
+# alias entirely). No forced separator between the flag and the path (an
+# optional quote, then the literal path directly) so a glued short form
+# (`-v/var/run/docker.sock:...`, no space -- real docker/podman CLI parsing,
+# the same shorthand-flag gluing `-p8080:80` uses) still matches. Anchored
+# with a trailing lookahead requiring the path be followed by the `:`
+# SRC:DST separator (or a closing quote/space/end) -- QA (design/consistency
+# round) found the original, unanchored version matched ANY path merely
+# STARTING WITH the socket string (a `docker.sock.bak`/`docker.sock-old`
+# lookalike backup file) and, for the `-v`/`--volume` form, matched on
+# either side of the `:` -- contradicting this guard's own "the bind SOURCE
+# is the signal, not the destination" design (already true for the
+# `--mount source=` form, which names the key explicitly): `-v
+# /home/user/fake.sock:/var/run/docker.sock:ro` false-positived on an
+# arbitrary, harmless bind whose real SOURCE was nowhere near the actual
+# socket -- only its container-side DESTINATION happened to be named
+# similarly. Anchoring the match immediately after the flag (source
+# position only) and requiring the path end at a real separator closes both
+# at once.
+CONTAINER_SOCKET_MOUNT_RE = re.compile(
+    r"(?:-v|--volume)(?:=|\s*)[\"']?(?:/var/run/docker\.sock|/run/docker\.sock"
+    r"|/var/run/podman/podman\.sock|\\\\\.\\pipe\\docker_engine)(?=:|[\"'\s]|$)"
+    r"|--mount\b[^|;&\n]{0,80}?(?:source|src)=[\"']?"
+    r"(?:/var/run/docker\.sock|/run/docker\.sock"
+    r"|/var/run/podman/podman\.sock|\\\\\.\\pipe\\docker_engine)(?=[,\"'\s]|$)",
+    re.IGNORECASE,
+)
+
+# --cap-add=SYS_ADMIN/ALL grants the one capability --privileged itself
+# relies on; a container started WITHOUT --privileged but WITH this cap
+# alone is still escape-capable (mount(2)/pivot_root(2)/etc. all become
+# available again). Accepts an optional `CAP_` prefix -- QA (bypass-hunting
+# round) found Docker's own capability normalization (moby's
+# NormalizeLegacyCapabilities) treats `--cap-add=CAP_SYS_ADMIN` as identical
+# to `--cap-add=SYS_ADMIN`, so the bare-name-only original check missed a
+# form the daemon itself resolves to the same grant.
+CONTAINER_CAP_ADD_RE = re.compile(
+    r"--cap-add(?:=|\s+)[\"']?(?:CAP_)?(?:SYS_ADMIN|ALL)\b",
+    re.IGNORECASE,
+)
+
+# Bind-mounting the HOST's own root filesystem into the container -- `-v
+# /:/host` (then `chroot`/`nsenter` into it from inside) needs no
+# --privileged/--cap-add/socket mount at all if the container can otherwise
+# write into that mount. Anchored on the bind SOURCE being exactly `/`, not
+# merely containing a slash -- `-v /home/user:/work` must not match. The
+# `-v`/`--volume` separator is `(?:=|\s*)` (zero-or-more, not one-or-more)
+# so a glued form (`-v/:/host`, no space) still matches -- QA (bypass-
+# hunting round) found the original `\s+`-only separator missed exactly
+# this, the same real docker/podman shorthand-flag-gluing behavior
+# CONTAINER_SOCKET_MOUNT_RE's own docstring above documents; the immediately
+# -following literal `/:` still disambiguates from an unrelated `-v`-prefixed
+# token with no separator-length trade-off. `--mount`'s `source=`/`src=`
+# form gets the same alias fix as the socket-mount check above.
+CONTAINER_ROOT_MOUNT_RE = re.compile(
+    r"(?:-v|--volume)(?:=|\s*)[\"']?/:(?=/|[\"'\s]|$)"
+    r"|--mount\b[^|;&\n]{0,80}?(?:source|src)=/(?=[,\s\"']|$)",
+    re.IGNORECASE,
+)
+
+# The direct host-namespace-entry primitive: a process that ALREADY holds
+# CAP_SYS_ADMIN (e.g. because it's running inside a --privileged container,
+# or directly on the bare host) uses `nsenter --target 1 --mount` (host
+# init's PID, host's mount namespace) to step onto the host with no
+# container runtime named at all -- gating this on a preceding docker/podman
+# mention would miss the exact case it exists to catch, the same "must not
+# require the other half of the pair to already be present" reasoning
+# KUBE_EXEC_CRED_STRONG_RE's own path-independent triad check applies.
+# `(?<!\S)` (not `\b`) ahead of the short `-t`/`-m`/`-a` flags -- a leading
+# `-` is a non-word character so `\b` never matches there, the same
+# convention GIT_CONFIG_CREDENTIAL_HELPER_RE's own `-c`/`--config` check
+# already uses. Also accepts `--all`/`-a` as an alternative to `--mount`/
+# `-m` -- QA (bypass-hunting round) found nsenter's own `--all` flag enters
+# EVERY namespace of the target process (mount included) without ever
+# spelling `--mount`/`-m` literally, a complete escape primitive the
+# original mount-only check missed entirely. PID 1 only (the canonical,
+# universal host-init target) -- a non-1 host-visible PID (reachable once
+# `--pid=host` is already in play) is a disclosed gap, see
+# rule_container_escape_protect's own docstring.
+CONTAINER_NSENTER_HOST_RE = re.compile(
+    r"\bnsenter\b[^|;&\n]{0,80}?(?:--target(?:=|\s+)1\b|(?<!\S)-t\s*1\b)"
+    r"[^|;&\n]{0,80}?(?:--mount\b|(?<!\S)-m\b|--all\b|(?<!\S)-a\b)"
+    r"|\bnsenter\b[^|;&\n]{0,80}?(?:--mount\b|(?<!\S)-m\b|--all\b|(?<!\S)-a\b)"
+    r"[^|;&\n]{0,80}?(?:--target(?:=|\s+)1\b|(?<!\S)-t\s*1\b)",
+    re.IGNORECASE,
+)

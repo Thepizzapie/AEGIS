@@ -107,7 +107,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `container_escape`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -154,8 +154,8 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
-     `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `fetch_to_file`,
-     `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
+     `claude_hooks`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `container_escape`,
+     `fetch_to_file`, `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
 """,

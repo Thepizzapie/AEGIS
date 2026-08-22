@@ -278,6 +278,19 @@ class Policy:
     # every future credential resolution through that profile/context. See
     # rules.rule_cloud_cred_exec_protect.
     cloud_cred_exec: dict = field(default_factory=dict)
+    # Container-runtime escape-to-host protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on command]}. Empty -> defaults (mode=ask) apply.
+    # Covers docker/podman/nerdctl/ctr run|create|exec with --privileged, a
+    # bind-mount of the runtime's own control socket (/var/run/docker.sock,
+    # Docker Desktop's named pipe, podman's rootless socket -- "Docker
+    # outside of Docker"), --cap-add=SYS_ADMIN/ALL, or a bind-mount of the
+    # host's root filesystem (-v /:/host) -- plus, independent of any
+    # container runtime, `nsenter --target 1 --mount` (the direct
+    # host-namespace-entry primitive). Each hands the container (or this
+    # process) the means to reach or control the HOST it runs on, with no
+    # further Aegis oversight once it runs. See
+    # rules.rule_container_escape_protect.
+    container_escape: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing
