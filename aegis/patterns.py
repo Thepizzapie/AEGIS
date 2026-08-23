@@ -4178,8 +4178,8 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
 # embedded credentials (`private_key`/`password`) to a host of the
 # attacker's choosing via its own `inline`/`script` commands. Same "write
 # now, auto-exec later, on someone else's future invocation" shape every
-# sibling `*_protect` guard in this file gates -- here the trigger is the
-# single most common infra-as-code operation there is (`terraform apply`,
+# sibling `*_protect` guard in this file gates -- here the trigger is one of
+# the most common infra-as-code operations there are (`terraform apply`,
 # routinely run unattended by a CI/CD auto-apply pipeline, not necessarily
 # this session) and the payoff is live cloud/cluster credentials, the same
 # caliber `AWS_CRED_PROCESS_CONTENT_RE`/`KUBE_EXEC_CRED_STRONG_RE` above
@@ -4212,36 +4212,78 @@ TERRAFORM_PATH_RE = re.compile(
 )
 
 # Weak, path-CONFIRMED-only check: the bare provisioner-type declaration
-# alone, with no command-carrying key visible yet -- mirrors
-# `AWS_CRED_PROCESS_CONTENT_RE`'s own "an Edit's `new_string` is typically
-# just the couple of lines being inserted" reasoning: the block-opening line
-# a diff inserts often doesn't repeat the `command =`/`inline = [...]` line
-# that already sits a few lines further down in the same hunk or file.
+# alone, opening its block, with no command-carrying key visible yet --
+# mirrors `AWS_CRED_PROCESS_CONTENT_RE`'s own "an Edit's `new_string` is
+# typically just the couple of lines being inserted" reasoning: the
+# block-opening line a diff inserts often doesn't repeat the `command =`/
+# `inline = [...]` line that already sits a few lines further down in the
+# same hunk or file. The HCL branch requires the block's own opening `{`
+# (QA -- bypass-hunting round -- found that without it, an ordinary
+# non-comment string ELSEWHERE in the file merely naming the feature in
+# English, e.g. a `description = "... avoids provisioner 'local-exec' ..."`
+# attribute, false-positived; a real declaration always opens its block,
+# so requiring the brace closes the false positive without narrowing real
+# coverage -- `test_bare_provisioner_declaration_gated_when_path_confirmed`
+# already exercises the brace-included shape a diff actually inserts).
 # Covers both native HCL syntax (`provisioner "local-exec" {`) and
-# Terraform's own, less common JSON configuration syntax
-# (`"provisioner": {"local-exec": {`) -- a `.tf.json` file is a fully
-# equivalent, documented alternative to `.tf`, not a distinct mechanism.
+# Terraform's own JSON configuration syntax, EITHER of its two legal
+# representations for a repeatable nested block: the single-object
+# shorthand (`"provisioner": {"local-exec": {`) and the full array form
+# (`"provisioner": [{"local-exec": {`, used when a resource declares more
+# than one provisioner) -- QA (bypass-hunting round) found the original
+# pattern hard-coded `\{` immediately after the colon, silently missing the
+# array form entirely (a real, canonical, undoctored `.tf.json` shape, not
+# an obfuscation trick); closed by making the `[` optional immediately
+# before the required `{`, which accepts both without needing two separate
+# alternatives. Matches only when `local-exec`/`remote-exec` is the FIRST
+# object in the array -- a provisioner of a DIFFERENT type (e.g. `"file"`)
+# listed before it in the same array is a known, disclosed residual gap,
+# not silently missed (see the guard's own docstring in rules.py).
 TERRAFORM_PROVISIONER_CONTENT_RE = re.compile(
-    r"\bprovisioner\s*['\"](?:local-exec|remote-exec)['\"]"
-    r"|['\"]provisioner['\"]\s*:\s*\{\s*['\"](?:local-exec|remote-exec)['\"]",
+    r"\bprovisioner\s*['\"](?:local-exec|remote-exec)['\"]\s*\{"
+    r"|['\"]provisioner['\"]\s*:\s*\[?\s*\{\s*['\"](?:local-exec|remote-exec)['\"]",
     re.IGNORECASE,
 )
 
 # Strong, path-INDEPENDENT shape: the provisioner type AND a command-
-# carrying key (`command`/the `remote-exec`-only `inline`/`script`) in the
+# carrying key (`command`/the `remote-exec`-only `inline`/`scripts`) in the
 # same block -- mirrors `KUBE_EXEC_CRED_STRONG_RE`'s own type+key pairing.
 # 400-char gap: a real provisioner block routinely carries
 # `interpreter`/`environment`/`working_dir`/`when`/`on_failure` keys (and,
 # for `remote-exec`, an entire nested `connection { ... }` block) ahead of
-# the actual command line. Same HCL/JSON dual-syntax coverage as the weak
-# check above.
+# the actual command line. `scripts` (plural -- `remote-exec`'s own
+# list-of-script-paths key, distinct from the singular `script`) added
+# after QA (bypass-hunting round) found the original `command|inline|
+# script` alternation's required immediate `\s*=`/`\s*:` never matched the
+# plural form's own trailing `s`, so a complete, working `scripts`-based
+# remote-exec block staged in a non-`.tf`-named file (defeating the weak
+# check's own path-confirmation requirement) evaded this strong,
+# path-independent check entirely. Same HCL/array-JSON dual-syntax
+# coverage as the weak check above, same first-array-element scope note.
 TERRAFORM_PROVISIONER_STRONG_RE = re.compile(
     r"\bprovisioner\s*['\"](?:local-exec|remote-exec)['\"]\s*\{"
-    r".{0,400}?\b(?:command|inline|script)\s*="
-    r"|['\"]provisioner['\"]\s*:\s*\{\s*['\"](?:local-exec|remote-exec)['\"]\s*:\s*\{"
-    r".{0,400}?['\"](?:command|inline|script)['\"]\s*:",
+    r".{0,400}?\b(?:command|inline|scripts?)\s*="
+    r"|['\"]provisioner['\"]\s*:\s*\[?\s*\{\s*['\"](?:local-exec|remote-exec)['\"]\s*:\s*\{"
+    r".{0,400}?['\"](?:command|inline|scripts?)['\"]\s*:",
     re.IGNORECASE | re.DOTALL,
 )
+
+# HCL's own block-comment delimiters, `/* ... */` -- distinct from the
+# full-line `#`/`//` comments `strip_comment_lines` already handles, and
+# spanning potentially many lines. QA (bypass-hunting round) found an
+# illustrative "do NOT write code like this" example wrapped in a `/* */`
+# block comment still false-positived, since nothing stripped it before
+# the content-shape checks ran. Non-greedy `.*?` keeps this O(n) even on
+# an adversarial input with an unmatched opening `/*` and no closing `*/`
+# (it simply scans to end-of-string once, the same "no exponential
+# backtracking" property every non-greedy dot-star span in this file
+# relies on) -- verified by this guard's own ReDoS test.
+HCL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def strip_hcl_block_comments(text: str) -> str:
+    return HCL_BLOCK_COMMENT_RE.sub("", text)
+
 
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-

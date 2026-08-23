@@ -4970,8 +4970,8 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     credentials (``private_key``/``password``) to a host of the attacker's
     choosing via its own ``inline``/``script`` commands. Same "write now,
     auto-exec later, on someone else's future invocation" shape every
-    sibling ``*_protect`` guard in this file gates -- here the trigger is the
-    single most common infra-as-code operation there is (``terraform
+    sibling ``*_protect`` guard in this file gates -- here the trigger is one
+    of the most common infra-as-code operations there are (``terraform
     apply``, routinely run unattended by a CI/CD auto-apply pipeline, not
     necessarily this session) and the payoff is live cloud/cluster
     credentials, the same caliber ``rule_cloud_cred_exec_protect`` already
@@ -5012,16 +5012,27 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``terraform apply -var``/CLI flag.
 
     Covers both native HCL syntax (``provisioner "local-exec" {``) and
-    Terraform's own, less common JSON configuration syntax (a ``.tf.json``
-    file's ``"provisioner": {"local-exec": {...}}``) -- a fully equivalent,
-    documented alternative to ``.tf``, not a distinct mechanism.
+    Terraform's own JSON configuration syntax, EITHER of its two legal
+    representations for a repeatable nested block: the single-object
+    shorthand (``"provisioner": {"local-exec": {...}}``) and the full array
+    form (``"provisioner": [{"local-exec": {...}}]``, used when a resource
+    declares more than one provisioner) -- a fully equivalent, documented
+    alternative to ``.tf``, not a distinct mechanism. Comments are stripped
+    before every content-shape check: a full-line ``#``/``//`` comment (via
+    ``patterns.strip_comment_lines``) and an HCL ``/* ... */`` block comment
+    (via ``patterns.strip_hcl_block_comments``, applied first), so an
+    illustrative example or a documentation mention inside either comment
+    form does not false-positive.
 
     Honest scope, the same denylist trade-offs every guard in this file
-    accepts: a ``command``/``inline``/``script`` value assembled indirectly
+    accepts: a ``command``/``inline``/``scripts`` value assembled indirectly
     (an HCL local, a `templatefile()` interpolation building the string)
     rather than appearing as one contiguous literal defeats the strong
     check, the same "computed indirectly" class every sibling guard already
-    accepts; no ``find``-path-indirection fallback (a ``.tf`` module has no
+    accepts; a provisioner of a DIFFERENT type (e.g. ``"file"``) listed
+    BEFORE the ``local-exec``/``remote-exec`` entry in the same JSON array
+    is not matched -- both JSON checks above match only the array's first
+    element; no ``find``-path-indirection fallback (a ``.tf`` module has no
     single canonical parent directory to fall back on, the same disclosed
     absence ``rule_conftest_protect``'s own docstring accepts for its own
     bare-filename target); a direct fetch-to-file write (``curl -o main.tf
@@ -5030,11 +5041,55 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``patterns.TERRAFORM_PATH_RE`` directly, the same way it backstops every
     sibling guard; ``provisioner "file"`` (an upload with no command
     execution of its own) is a related but DISTINCT, lower-severity
-    primitive this guard does not cover; and Terragrunt's own
-    ``before_hook``/``after_hook`` ``execute = [...]`` blocks in a
-    ``terragrunt.hcl`` are a related but DISTINCT auto-exec mechanism this
-    guard does not cover at all -- a known, disclosed gap, not silently
-    missed."""
+    primitive this guard does not cover; content STAGED IN ONE call (a
+    scratch file with no ``.tf`` path and no command-carrying key -- just
+    the bare declaration), then renamed/moved into a real ``.tf`` path and
+    given its ``command =``/``inline =``/``scripts =`` line in a SEPARATE,
+    later call, evades every check here -- the same blanket "each tool call
+    is evaluated independently" limitation ``rule_package_manifest_
+    protect``'s own docstring already discloses for its own split-across-
+    calls gap, not unique to this guard; and Terragrunt's own ``before_
+    hook``/``after_hook`` ``execute = [...]`` blocks in a ``terragrunt.hcl``
+    are a related but DISTINCT auto-exec mechanism this guard does not
+    cover at all -- a known, disclosed gap, not silently missed.
+
+    QA history (two independent adversarial reviews, run in parallel --
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file follows): design/consistency review confirmed all
+    sibling-parity wiring (the ``Policy`` dataclass field, all three
+    ``loader.py`` spots, both ``skills.py`` knob-list strings, ``_CORE_
+    RULES`` position, the ``_FETCH_HUMAN_ESCAPABLE`` entry, and the README
+    table row + Limits disclosure) was complete and correct on first pass,
+    and flagged one wording overstatement since fixed (this docstring and
+    its ``patterns.py`` counterpart originally called ``terraform apply``
+    "the single most common infra-as-code operation there is" -- an
+    unhedged superlative not needed for the threat-model point, the same
+    flavor of overreach ``rule_cloud_cred_exec_protect``'s own QA history
+    records and fixed once already). Bypass-hunting found and closed four
+    real, reproduced issues before merge: the JSON array form of a
+    repeatable ``provisioner`` block (canonical, undoctored syntax, not an
+    obfuscation trick) bypassed both JSON checks entirely, since they
+    hard-coded an object immediately after the colon and never accounted
+    for Terraform's own array representation; ``remote-exec``'s plural
+    ``scripts`` key was missing from the strong check's key alternation, so
+    a complete, working ``scripts``-based block staged in a non-``.tf``-
+    named file (defeating the weak check's path confirmation too) evaded
+    detection entirely; the weak, path-confirmed check had no requirement
+    that the declaration actually open its block, so an ordinary English
+    sentence merely naming the feature with single quotes (e.g. a
+    ``description`` attribute reading "avoids provisioner 'local-exec'")
+    false-positived -- closed by requiring the block's own opening ``{``,
+    which every real declaration already has and the guard's own diff-
+    shaped test fixture already exercised; and an HCL ``/* ... */`` block
+    comment wrapping an illustrative example was never stripped before the
+    content-shape checks ran, unlike the full-line ``#``/``//`` forms --
+    closed by adding ``strip_hcl_block_comments``, applied before ``strip_
+    comment_lines`` in both branches. The already-disclosed, blanket
+    split-across-calls limitation (stage the bare declaration in one call,
+    append the command-carrying key in a later, separate call) was
+    confirmed reproducible but is a pre-existing, file-wide accepted trade-
+    off, not a defect unique to this guard, and is called out above rather
+    than re-litigated per guard."""
     cfg = getattr(policy, "terraform_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5059,7 +5114,8 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         path_text = p
         if ev.action == ActionClass.MCP:
             path_text = p + " " + " ".join(_flatten_strings(a))
-        scan_content = patterns.strip_comment_lines(content)
+        scan_content = patterns.strip_comment_lines(
+            patterns.strip_hcl_block_comments(content))
         path_confirmed = bool(path_text and patterns.TERRAFORM_PATH_RE.search(path_text))
         hit = bool(
             patterns.TERRAFORM_PROVISIONER_STRONG_RE.search(scan_content)
@@ -5083,7 +5139,7 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        scan_cmd = patterns.strip_comment_lines(cmd)
+        scan_cmd = patterns.strip_comment_lines(patterns.strip_hcl_block_comments(cmd))
         path_hit = bool(patterns.TERRAFORM_PATH_RE.search(scan_cmd))
         hit = bool(
             patterns.TERRAFORM_PROVISIONER_STRONG_RE.search(scan_cmd)
