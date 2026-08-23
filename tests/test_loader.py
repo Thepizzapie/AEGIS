@@ -108,6 +108,23 @@ def test_gitmodules_knob_absent_by_default(tmp_path):
     assert pol.gitmodules == {}
 
 
+def test_terraform_exec_knob_wired_through_loader(tmp_path):
+    """The `terraform_exec` guard-config knob must round-trip from YAML onto
+    the Policy through all three loader.py spots (the `st` defaults dict,
+    the `_merge_file` knob-key tuple, and the final `Policy(...)`
+    constructor call) — the same regression `test_gitmodules_knob_wired_
+    through_loader` above guards against for a new guard's knob being
+    silently dropped by real YAML-based policy loading."""
+    pol = load_policy(_write(tmp_path,
+                              "terraform_exec:\n  mode: deny\n  allow: ['trusted-bootstrap']\n"))
+    assert pol.terraform_exec == {"mode": "deny", "allow": ["trusted-bootstrap"]}
+
+
+def test_terraform_exec_knob_absent_by_default(tmp_path):
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.terraform_exec == {}
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
     assert validate_policy(_write(tmp_path, LIFECYCLE)) == []

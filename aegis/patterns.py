@@ -4163,6 +4163,86 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Terraform provisioner exec-hijack: `provisioner "local-exec"`/`"remote-exec"`
+#
+# THREAT MODEL: a `provisioner "local-exec"` block in ANY `.tf`/`.tf.json`
+# resource (not just `null_resource` -- it attaches to any resource type)
+# runs an arbitrary shell command on the MACHINE RUNNING `terraform apply` --
+# the operator's laptop or, just as often, a CI runner that already holds the
+# live cloud credentials (AWS/GCP/Azure env vars, an instance profile, a
+# service account) Terraform itself is authenticated with. `remote-exec`
+# does the same on the freshly-provisioned remote resource over the
+# `connection` block (typically SSH), with the same unattended-execution
+# shape one hop further out, and can exfiltrate that connection's own
+# embedded credentials (`private_key`/`password`) to a host of the
+# attacker's choosing via its own `inline`/`script` commands. Same "write
+# now, auto-exec later, on someone else's future invocation" shape every
+# sibling `*_protect` guard in this file gates -- here the trigger is the
+# single most common infra-as-code operation there is (`terraform apply`,
+# routinely run unattended by a CI/CD auto-apply pipeline, not necessarily
+# this session) and the payoff is live cloud/cluster credentials, the same
+# caliber `AWS_CRED_PROCESS_CONTENT_RE`/`KUBE_EXEC_CRED_STRONG_RE` above
+# already gate one layer up in AWS's/Kubernetes' own credential-brokering
+# config. Unlike those two, a Terraform diff is typically reviewed at the
+# resource level (`+ resource "null_resource" "x"`), not by reading every
+# provisioner block's command text line by line -- an easy needle-in-
+# haystack injection with no dedicated guard anywhere in this file today.
+#
+# Both provisioner types are also routine, documented, legitimate Terraform
+# features (HashiCorp calls them "a last resort" but they are common —
+# post-boot bootstrap scripts, config-management handoff) -- there is no
+# safe/dangerous split by TYPE the way `credential_process`/`exec:` have
+# none by value either, so this is gated the same way: on the shape, ask by
+# default, human review decides.
+#
+# Bare-filename match, no fixed parent directory -- like `conftest.py`/a
+# `.pth` file, a `.tf` module has no single canonical parent (repo root,
+# `modules/<name>/`, and every environment subdirectory are all equally
+# legitimate places for one), so there is no directory-name `cd`-fallback to
+# add here; the bare-filename match already reaches every depth on its own.
+# `.tf.json` (Terraform's own, less common JSON-syntax alternative) is
+# covered by the same pattern; a `.tfvars`/`.tfstate` file never declares a
+# resource block at all and is deliberately NOT matched (the trailing
+# `_CI_END` boundary fails right after `.tf` for either, since neither
+# continues with `.json` nor ends there).
+TERRAFORM_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])[\w.\-]+\.tf(?:\.json)?" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Weak, path-CONFIRMED-only check: the bare provisioner-type declaration
+# alone, with no command-carrying key visible yet -- mirrors
+# `AWS_CRED_PROCESS_CONTENT_RE`'s own "an Edit's `new_string` is typically
+# just the couple of lines being inserted" reasoning: the block-opening line
+# a diff inserts often doesn't repeat the `command =`/`inline = [...]` line
+# that already sits a few lines further down in the same hunk or file.
+# Covers both native HCL syntax (`provisioner "local-exec" {`) and
+# Terraform's own, less common JSON configuration syntax
+# (`"provisioner": {"local-exec": {`) -- a `.tf.json` file is a fully
+# equivalent, documented alternative to `.tf`, not a distinct mechanism.
+TERRAFORM_PROVISIONER_CONTENT_RE = re.compile(
+    r"\bprovisioner\s*['\"](?:local-exec|remote-exec)['\"]"
+    r"|['\"]provisioner['\"]\s*:\s*\{\s*['\"](?:local-exec|remote-exec)['\"]",
+    re.IGNORECASE,
+)
+
+# Strong, path-INDEPENDENT shape: the provisioner type AND a command-
+# carrying key (`command`/the `remote-exec`-only `inline`/`script`) in the
+# same block -- mirrors `KUBE_EXEC_CRED_STRONG_RE`'s own type+key pairing.
+# 400-char gap: a real provisioner block routinely carries
+# `interpreter`/`environment`/`working_dir`/`when`/`on_failure` keys (and,
+# for `remote-exec`, an entire nested `connection { ... }` block) ahead of
+# the actual command line. Same HCL/JSON dual-syntax coverage as the weak
+# check above.
+TERRAFORM_PROVISIONER_STRONG_RE = re.compile(
+    r"\bprovisioner\s*['\"](?:local-exec|remote-exec)['\"]\s*\{"
+    r".{0,400}?\b(?:command|inline|script)\s*="
+    r"|['\"]provisioner['\"]\s*:\s*\{\s*['\"](?:local-exec|remote-exec)['\"]\s*:\s*\{"
+    r".{0,400}?['\"](?:command|inline|script)['\"]\s*:",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
@@ -4172,8 +4252,13 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
 # before every content-shape check below (both branches, both ecosystems) --
 # harmless for a real payload (never itself commented out) and, as a side
 # effect, correctly stops treating an entirely commented-out shell line as a
-# real invocation either.
-_COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
+# real invocation either. Also strips a full-line `//` comment (HCL's own
+# alternate line-comment marker, alongside `#` -- both are valid and common
+# in real Terraform code) for `rule_terraform_exec_protect`'s own use of this
+# same helper; harmless for the AWS/Kubernetes formats above, neither of
+# which ever treats a line starting with `//` as anything but a literal,
+# already-invalid value.
+_COMMENT_LINE_RE = re.compile(r"^[ \t]*(?:#|//).*$", re.MULTILINE)
 
 
 def strip_comment_lines(text: str) -> str:

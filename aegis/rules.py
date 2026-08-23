@@ -4606,6 +4606,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
+    (patterns.TERRAFORM_PATH_RE, "a Terraform resource config"),
 )
 
 
@@ -4940,6 +4941,166 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "resolution through that profile/context. A human "
                          "may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_CLOUD_CRED_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
+def _terraform_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a Terraform ``provisioner "local-exec"``/``"remote-exec"`` block
+    being planted in a ``.tf``/``.tf.json`` resource.
+
+    THREAT MODEL: ``local-exec`` runs an arbitrary shell command on the
+    MACHINE RUNNING ``terraform apply`` -- the operator's laptop or, just as
+    often, a CI runner that already holds the live cloud credentials
+    (AWS/GCP/Azure env vars, an instance profile, a service account)
+    Terraform itself is authenticated with. It attaches to ANY resource type,
+    not just ``null_resource``. ``remote-exec`` runs on the freshly-
+    provisioned remote resource instead, over the ``connection`` block
+    (typically SSH), and can exfiltrate that connection's own embedded
+    credentials (``private_key``/``password``) to a host of the attacker's
+    choosing via its own ``inline``/``script`` commands. Same "write now,
+    auto-exec later, on someone else's future invocation" shape every
+    sibling ``*_protect`` guard in this file gates -- here the trigger is the
+    single most common infra-as-code operation there is (``terraform
+    apply``, routinely run unattended by a CI/CD auto-apply pipeline, not
+    necessarily this session) and the payoff is live cloud/cluster
+    credentials, the same caliber ``rule_cloud_cred_exec_protect`` already
+    gates one layer up in AWS's/Kubernetes' own credential-brokering config.
+    A Terraform diff is typically reviewed at the resource level (``+
+    resource "null_resource" "x"``), not by reading every provisioner
+    block's command text line by line -- an easy needle-in-haystack
+    injection with no guard anywhere else in this file.
+
+    Config (``policy.terraform_exec``): ``mode`` (deny|ask|monitor|off,
+    default ``ask``), ``allow`` (regexes on the path/command that skip the
+    gate -- a repo's own trusted, reviewed bootstrap provisioner, say).
+    Defaults to ``ask`` for the same reason ``rule_cloud_cred_exec_protect``
+    does: both provisioner types are routine, documented, legitimate
+    Terraform features (HashiCorp calls them "a last resort" but they are
+    common -- post-boot bootstrap scripts, config-management handoff), so
+    there is no safe/dangerous split by TYPE the way ``credential_process``/
+    ``exec:`` have none by value either -- it just needs a human to have
+    actually looked at the specific command being wired in.
+
+    Escapable only by a human: a trailing ``# aegis-allow`` on the shell
+    form, or the env toggle ``AEGIS_ALLOW_TERRAFORM_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Two checks, mirroring ``rule_cloud_cred_exec_protect``'s own weak/strong
+    split: a bare ``provisioner "local-exec"``/``"remote-exec"`` declaration
+    gates once the path is confirmed as a real ``.tf``/``.tf.json`` file (an
+    Edit's ``new_string`` is often just the block-opening line a diff
+    inserted, with the command-carrying key sitting in a later hunk/line
+    already in the file); the full ``provisioner { ... command|inline|script
+    = ... }`` shape gates on its own, path-independent, the same "looks like
+    the real primitive, wherever it's staged" precision every strong check
+    in this file applies. No CLI-settable form exists for this guard to
+    cover the way ``aws configure set``/``kubectl config set-credentials``
+    do -- a provisioner is declared only in HCL, never injectable via a
+    ``terraform apply -var``/CLI flag.
+
+    Covers both native HCL syntax (``provisioner "local-exec" {``) and
+    Terraform's own, less common JSON configuration syntax (a ``.tf.json``
+    file's ``"provisioner": {"local-exec": {...}}``) -- a fully equivalent,
+    documented alternative to ``.tf``, not a distinct mechanism.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    accepts: a ``command``/``inline``/``script`` value assembled indirectly
+    (an HCL local, a `templatefile()` interpolation building the string)
+    rather than appearing as one contiguous literal defeats the strong
+    check, the same "computed indirectly" class every sibling guard already
+    accepts; no ``find``-path-indirection fallback (a ``.tf`` module has no
+    single canonical parent directory to fall back on, the same disclosed
+    absence ``rule_conftest_protect``'s own docstring accepts for its own
+    bare-filename target); a direct fetch-to-file write (``curl -o main.tf
+    ...``) is caught by none of this guard's own checks -- closed instead by
+    ``rule_fetch_to_file_protect``'s backstop, which reuses
+    ``patterns.TERRAFORM_PATH_RE`` directly, the same way it backstops every
+    sibling guard; ``provisioner "file"`` (an upload with no command
+    execution of its own) is a related but DISTINCT, lower-severity
+    primitive this guard does not cover; and Terragrunt's own
+    ``before_hook``/``after_hook`` ``execute = [...]`` blocks in a
+    ``terragrunt.hcl`` are a related but DISTINCT auto-exec mechanism this
+    guard does not cover at all -- a known, disclosed gap, not silently
+    missed."""
+    cfg = getattr(policy, "terraform_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "terraform-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            path_text = p + " " + " ".join(_flatten_strings(a))
+        scan_content = patterns.strip_comment_lines(content)
+        path_confirmed = bool(path_text and patterns.TERRAFORM_PATH_RE.search(path_text))
+        hit = bool(
+            patterns.TERRAFORM_PROVISIONER_STRONG_RE.search(scan_content)
+            or (path_confirmed
+                and patterns.TERRAFORM_PROVISIONER_CONTENT_RE.search(scan_content)))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_TERRAFORM_EXEC")
+                or _terraform_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "terraform-exec-protect",
+                         f"'{p}' is being written with a Terraform local-exec/"
+                         "remote-exec provisioner — it runs an arbitrary "
+                         "external command, with the privileges of whatever "
+                         "machine runs 'terraform apply' next (this session, "
+                         "a teammate, or a CI auto-apply pipeline), and that "
+                         "machine typically holds live cloud credentials. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_TERRAFORM_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        path_hit = bool(patterns.TERRAFORM_PATH_RE.search(scan_cmd))
+        hit = bool(
+            patterns.TERRAFORM_PROVISIONER_STRONG_RE.search(scan_cmd)
+            or (path_hit and patterns.TERRAFORM_PROVISIONER_CONTENT_RE.search(scan_cmd)))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_TERRAFORM_EXEC")
+                or _terraform_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "terraform-exec-protect",
+                         "A Terraform local-exec/remote-exec provisioner is "
+                         "being planted from a shell — it runs an arbitrary "
+                         "external command, with the privileges of whatever "
+                         "machine runs 'terraform apply' next, and that "
+                         "machine typically holds live cloud credentials. A "
+                         "human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_TERRAFORM_EXEC=1; a spawned agent "
                          "cannot."))
     return None
 
@@ -5557,6 +5718,7 @@ _CORE_RULES = (
     rule_pysite_protect,
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
+    rule_terraform_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
