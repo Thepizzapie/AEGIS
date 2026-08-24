@@ -2590,27 +2590,74 @@ CLAUDE_HOOKS_JQ_RE = re.compile(
 # makes for `hooks`.
 #
 # Content-only check for a CONFIRMED settings.local.json path: a `statusLine`
-# key being introduced with a `command` sub-key in the same JSON object, the
-# two-signal shape Claude Code's own schema requires (`{"statusLine":
-# {"type": "command", "command": "..."}}`) -- gating on `statusLine` alone
-# would ask on a value-only tweak to an already-reviewed line (padding, type),
-# so both signals are required, within a bounded window, before this fires.
+# key being introduced with a `"type": "command"` sub-pair in the same JSON
+# object -- the ENABLING signal, not the `command` value itself. QA finding
+# (independent adversarial review, round A): an earlier draft gated on the
+# `command` KEY instead, which is a confirmed, reproduced two-call bypass --
+# an agent plants `{"statusLine": {"type": "command"}}` first (no `command`
+# key yet, so the earlier draft never fired), then a SECOND, narrowly-scoped
+# Edit adds `"command": "..."` next to the already-present `"type":
+# "command"` text without ever repeating the literal substring `statusLine`
+# in that second call's own diff -- evading a check that required both
+# `statusLine` and `command` to co-occur in one call. `type: "command"` is
+# itself the dangerous, enabling switch (Claude Code's schema names no other
+# supported `type`), so gating on ITS co-occurrence with `statusLine` catches
+# the bypass's own first call instead of waiting for a `command` value that
+# may never appear in the same diff as `statusLine` again.
+#
+# Matched against a NORMALIZED copy of the scanned text (see
+# `_statusline_normalize` in rules.py), not raw content -- QA finding (round
+# A, reproduced): the original 400-char tempered-dot window between
+# `statusLine`'s opening brace and `"command"` is trivially outrun with
+# schema-legal whitespace padding (400+ spaces/newlines, all honored
+# verbatim by real Claude Code); normalizing collapses any whitespace run to
+# one space before this pattern ever sees the text, so padding of any length
+# no longer consumes window budget. The same normalization step also JSON-
+# `\uXXXX`-decodes the text first, closing the identical escape-spelling
+# evasion `_claude_hooks_json_key_hit`'s whole-file JSON parse already closes
+# for `hooks` -- but applied here to PARTIAL Edit/MCP fragments a standalone
+# `json.loads` never validates in the first place (a fragment is the common
+# real-world shape for an Edit's `new_string`).
 CLAUDE_STATUSLINE_KEY_RE = re.compile(
-    r"[\"']statusLine[\"']\s*:\s*\{(?:(?!\}).){0,400}?[\"']command[\"']\s*:",
+    r"[\"']statusLine[\"']\s*:\s*\{(?:(?!\}).){0,400}?[\"']type[\"']\s*:\s*[\"']command[\"']",
     re.IGNORECASE | re.DOTALL,
 )
 
 # jq has no `-i` flag, so a scripted edit is either a temp-file-then-`mv`
 # (caught by the shared write-verb check at the rule's call site) or piped
 # through `sponge` -- the same `CLAUDE_HOOKS_JQ_RE` shape one key over: jq
-# itself, an assignment-shaped operator, and BOTH `statusLine` and `command`
-# as bare substrings (order-agnostic, matching a `.statusLine.command = "..."`
-# path expression regardless of how it's spelled) before this fires.
+# (or a drop-in clone -- `gojq`/`jaq` share jq's own path-assignment syntax
+# byte-for-byte; QA finding, round A: `\bjq\b` alone missed both, a
+# confirmed, reproduced bypass), an assignment-shaped operator, and BOTH
+# `statusLine` and `command` as bare substrings (order-agnostic, matching a
+# `.statusLine.command = "..."` path expression regardless of how it's
+# spelled) before this fires.
+#
+# Matched against the same normalized copy `CLAUDE_STATUSLINE_KEY_RE` uses
+# (whitespace-collapsed, `\uXXXX`-decoded) -- QA findings (round A, all
+# reproduced): (1) the lookaheads' `[^...\n]` exclusion let a multi-line jq
+# `-e`/heredoc-free program (a bare newline INSIDE the single-quoted
+# argument, valid jq syntax) push the assignment/key tokens past the
+# exclusion boundary; normalizing removes the newline before this pattern
+# ever runs, closing it the same way it closes `CLAUDE_STATUSLINE_KEY_RE`'s
+# whitespace-padding evasion. (2) a jq path segment spelled with jq's own
+# `\uXXXX` string escape (`.statusLine["command"]`) evaded a purely
+# textual `command` check the identical way JSON's `\uXXXX` does elsewhere;
+# closed by the same decode step. `&` is dropped from the lookaheads'
+# exclusion set entirely (round A also found and closed a reproduced
+# bypass: a `&` character inside a QUOTED jq string/program value, not a
+# real shell control operator, stopped the lookahead the same way an
+# unescaped one legitimately would) -- accepted trade-off, the same
+# "narrower false ask over a false negative" call
+# `rule_git_attributes_exec_protect`'s own docstring makes after its own
+# four rounds of adversarial review: this lookahead can now cross a real
+# `&&`-joined clause boundary onto an unrelated jq mention, but never misses
+# a real one, and the 400-char bound still caps the blast radius.
 CLAUDE_STATUSLINE_JQ_RE = re.compile(
-    r"\bjq\b"
-    r"(?=[^;&\n]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
-    r"(?=[^;&\n]{0,400}\.?statusLine\b)"
-    r"(?=[^;&\n]{0,400}\bcommand\b)",
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]{0,400}\.?statusLine\b)"
+    r"(?=[^;]{0,400}\bcommand\b)",
     re.IGNORECASE,
 )
 
