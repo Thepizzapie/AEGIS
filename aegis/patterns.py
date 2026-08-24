@@ -2572,6 +2572,48 @@ CLAUDE_HOOKS_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code statusline-hijack protection (.claude/settings.local.json) ---
+# A second, distinct auto-exec surface in the same file `CLAUDE_LOCAL_SETTINGS_
+# PATH_RE` above already locates: Claude Code's `statusLine` setting names a
+# command the RUNTIME itself spawns and re-invokes on an ongoing timer/UI-refresh
+# cadence (not just once, and not gated behind any tool call at all) to render
+# the status bar. Unlike a `hooks` entry -- which still needs a future matching
+# PreToolUse/PostToolUse/Stop event -- a planted `statusLine.command` starts
+# running with no trigger whatsoever: it is already executing, repeatedly, the
+# moment settings.local.json is next read. `rule_claude_hooks_protect`'s own
+# docstring explicitly lists `statusLine` among the file's "plenty of other
+# personal config ... edited for entirely benign reasons" it deliberately does
+# NOT gate on -- true for the key's mere presence, but the key's dangerous
+# shape (a `type: "command"` block naming a `command` to run) is a distinct,
+# ungated auto-exec primitive this pattern targets specifically, the same
+# "gate the file AND the specific dangerous key" split `CLAUDE_HOOKS_KEY_RE`
+# makes for `hooks`.
+#
+# Content-only check for a CONFIRMED settings.local.json path: a `statusLine`
+# key being introduced with a `command` sub-key in the same JSON object, the
+# two-signal shape Claude Code's own schema requires (`{"statusLine":
+# {"type": "command", "command": "..."}}`) -- gating on `statusLine` alone
+# would ask on a value-only tweak to an already-reviewed line (padding, type),
+# so both signals are required, within a bounded window, before this fires.
+CLAUDE_STATUSLINE_KEY_RE = re.compile(
+    r"[\"']statusLine[\"']\s*:\s*\{(?:(?!\}).){0,400}?[\"']command[\"']\s*:",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# jq has no `-i` flag, so a scripted edit is either a temp-file-then-`mv`
+# (caught by the shared write-verb check at the rule's call site) or piped
+# through `sponge` -- the same `CLAUDE_HOOKS_JQ_RE` shape one key over: jq
+# itself, an assignment-shaped operator, and BOTH `statusLine` and `command`
+# as bare substrings (order-agnostic, matching a `.statusLine.command = "..."`
+# path expression regardless of how it's spelled) before this fires.
+CLAUDE_STATUSLINE_JQ_RE = re.compile(
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}\.?statusLine\b)"
+    r"(?=[^;&\n]{0,400}\bcommand\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

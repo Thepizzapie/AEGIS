@@ -59,7 +59,7 @@ def load_policy(path) -> Policy:
         "package_manifest": {}, "git_config_exec": {}, "git_attributes_exec": {},
         "gitmodules": {},
         "service_persist": {}, "ld_preload": {}, "devcontainer_exec": {}, "vscode_tasks_exec": {},
-        "path_hijack": {}, "claude_hooks": {}, "conftest": {}, "pysite": {},
+        "path_hijack": {}, "claude_hooks": {}, "statusline": {}, "conftest": {}, "pysite": {},
         "ipython_startup": {}, "cloud_cred_exec": {}, "fetch_to_file": {},
         "inject": {}, "failures": {},
         "completion": {},
@@ -103,6 +103,7 @@ def load_policy(path) -> Policy:
                   vscode_tasks_exec=st["vscode_tasks_exec"],
                   path_hijack=st["path_hijack"],
                   claude_hooks=st["claude_hooks"],
+                  statusline=st["statusline"],
                   conftest=st["conftest"],
                   pysite=st["pysite"],
                   ipython_startup=st["ipython_startup"],
@@ -141,7 +142,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
                 "shell_persist", "direnv", "package_manifest", "git_config_exec",
                 "git_attributes_exec", "gitmodules", "service_persist", "ld_preload",
                 "devcontainer_exec",
-                "vscode_tasks_exec", "path_hijack", "claude_hooks", "conftest", "pysite",
+                "vscode_tasks_exec", "path_hijack", "claude_hooks", "statusline", "conftest", "pysite",
                 "ipython_startup", "cloud_cred_exec", "fetch_to_file",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
