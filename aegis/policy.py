@@ -287,6 +287,16 @@ class Policy:
     # every future credential resolution through that profile/context. See
     # rules.rule_cloud_cred_exec_protect.
     cloud_cred_exec: dict = field(default_factory=dict)
+    # GCP Application Default Credentials executable-sourced-credential
+    # hijack protection: {mode: deny|ask|monitor|off, allow: [regex on
+    # path/command]}. Empty -> defaults (mode=ask) apply. Covers a GCP
+    # `external_account` credential config's `credential_source.executable.
+    # command` (any path, or the `gcloud iam workload-identity-pools
+    # create-cred-config --executable-command` CLI form) -- names an
+    # external command google-auth executes and hands a live GCP access
+    # token to on every future token refresh through that credential file.
+    # See rules.rule_gcp_adc_exec_protect.
+    gcp_adc_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing
