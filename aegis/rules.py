@@ -5353,7 +5353,26 @@ def rule_gcp_adc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     top-level keys, and ``create-cred-config``'s own larger, routine flag
     surface -- with no obfuscation involved at all; widened to 2000 and
     300/300/600 respectively, see each regex's own comment in
-    ``patterns.py`` for the measured reproductions."""
+    ``patterns.py`` for the measured reproductions.
+
+    A follow-up, independent adversarial round targeting THAT fix
+    specifically (not re-litigating the earlier findings, verifying them
+    instead) confirmed all three land in the code as described and found
+    one new, real but bounded issue: widening ``GCP_ADC_STRONG_RE``'s gap
+    to 2000 chars raises the odds of two SEMANTICALLY UNRELATED JSON
+    fragments -- a ``credential_source`` key used in some unrelated sense,
+    and an unrelated ``executable``/``command`` pair (e.g. a build-pipeline
+    step) coincidentally sitting within 2000 chars of it in the same
+    file -- producing a same-file false ASK with no real causal link
+    between them, since ``.{0,2000}?`` is a pure linear-distance check, not
+    brace/nesting-aware. Accepted, not chased further: this is the
+    identical "whole-scan, no per-clause adjacency" trade-off ``rule_
+    fetch_to_file_protect``'s own docstring already discloses for the
+    identical shape, it fires in the SAFE direction (ASK, a human
+    confirmation, not a silent ALLOW -- the opposite direction from the
+    three bypasses this round closed), and tightening the gap back down
+    reopens the real padding-based bypass the widening exists to close. No
+    fix applied; disclosed here instead."""
     cfg = getattr(policy, "gcp_adc_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

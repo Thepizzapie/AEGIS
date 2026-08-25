@@ -231,6 +231,38 @@ def test_realistic_long_cli_flag_list_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_unrelated_fragments_within_gap_produce_accepted_false_ask():
+    """Follow-up adversarial round (verifying the fix above, not
+    re-litigating the original finding): widening `GCP_ADC_STRONG_RE`'s
+    gap to 2000 chars raises the odds of two SEMANTICALLY UNRELATED JSON
+    fragments — a `credential_source` key used in some unrelated sense,
+    and an unrelated `executable`/`command` pair (e.g. a build-pipeline
+    step) coincidentally within 2000 chars of it — producing a same-file
+    false ASK with no real causal link, since `.{0,2000}?` is a pure
+    linear-distance check, not brace/nesting-aware.
+
+    This is documented here as an ACCEPTED trade-off, not a bug to fix:
+    the identical "whole-scan, no per-clause adjacency" shape
+    `rule_fetch_to_file_protect`'s own docstring already discloses, it
+    fires in the SAFE direction (ASK, not a silent ALLOW), and tightening
+    the gap back down would reopen the real padding-based bypass the
+    widening exists to close."""
+    content = (
+        '{\n  "auth_config": {\n    "credential_source": {\n'
+        '      "type": "env", "note": "unrelated internal auth lookup, not GCP ADC"\n'
+        '    }\n  },\n'
+        + "".join(
+            '  "service_%02d": {"enabled": true, "region": "us-central1", '
+            '"notes": "ordinary unrelated config line %02d"},\n' % (i, i)
+            for i in range(14))
+        + '  "build_pipeline": {\n    "steps": [\n      {"name": "build", '
+          '"executable": {"path": "/usr/bin/npm", "command": "npm run build"}}\n'
+          '    ]\n  }\n}\n'
+    )
+    d = evaluate(_write("staging/combined-service-config.json", content=content), EMPTY)
+    assert d.action == Action.ASK  # accepted, not a silent ALLOW
+
+
 # ---- gcloud CLI form (never mentions any file path at all) --------------------
 
 def test_gcloud_create_cred_config_cli_gated():
