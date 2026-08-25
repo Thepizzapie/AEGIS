@@ -4252,6 +4252,97 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- GCP Application Default Credentials executable-sourced-credential ------
+# hijack: a THIRD credential-BROKERING primitive naming an arbitrary EXTERNAL
+# COMMAND in a config file, the GCP/Workload-Identity-Federation analog of
+# `credential_process`/kubeconfig `exec:` above -- explicitly disclosed as an
+# uncovered gap in this file's own cloud-cred-exec docstring until now. A GCP
+# `external_account` credential config's `credential_source.executable.
+# command` names a program that google-auth (any GCP client library, or
+# `gcloud` itself) EXECUTES to obtain a subject token, exchanged for a live
+# GCP access token -- on every future token refresh resolved through that
+# credential file, unattended, by this agent, a teammate, or CI. Same "write
+# now, auto-exec later, on someone else's future invocation" shape as its two
+# siblings above.
+#
+# Unlike AWS_CONFIG_PATH_RE/KUBE_CONFIG_PATH_RE, this file has no single
+# canonical location the way `~/.aws/config`/`~/.kube/config` do -- it is
+# commonly generated at an arbitrary path by `gcloud iam workload-identity-
+# pools create-cred-config --output-file=<path>` and referenced via
+# `GOOGLE_APPLICATION_CREDENTIALS` from wherever it lands. So detection here
+# leans primarily on a STRONG, path-INDEPENDENT content check rather than a
+# path match: `"credential_source"` containing a nested `"executable"` object
+# with a `"command"` key is genuinely distinctive JSON vocabulary -- no
+# ordinary config file (GCP-related or not) uses this exact nesting for any
+# other purpose, so no section-header/type-literal anchor is needed the way
+# AWS_CRED_PROCESS_INI_RE anchors on a `[profile ...]` header. The bare
+# `"executable"` + `"command"` PAIR alone (no `credential_source` anchor) is
+# kept as the WEAKER, path-CONFIRMED-only tier -- mirrors KUBE_EXEC_CRED_
+# CONTENT_RE's own reasoning: an Edit's `new_string` may only be inserting/
+# changing the `command` line of an ALREADY-EXISTING `credential_source`
+# block, the same "new_string is just the inserted lines, the header is
+# old_string context" shape every sibling weak tier in this file already
+# accepts.
+#
+# Honest, disclosed scope, the same trade-offs every guard in this file
+# accepts: a `credential_source.executable.command` value assembled
+# indirectly (string concatenation, a wrapper script) defeats every check
+# here; no `find`-path-indirection fallback (same disclosed absence
+# `rule_git_config_exec_protect`/`rule_cloud_cred_exec_protect` already
+# accept, since the CLI form is the dominant expected way this file is
+# generated); google-auth's own `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1`
+# opt-in (a real safety check the library itself added) does NOT reduce the
+# risk this guard gates on -- that variable is commonly exported once in a
+# shell profile/CI config for an entire environment, so the PLANTING write
+# gated here is still the moment a human should look, not a later, unrelated
+# invocation this guard never sees.
+GCP_ADC_PATH_RE = re.compile(
+    r"\bapplication_default_credentials" + _WIN_TRIM + r"\.json\b"
+    r"|(?:^|[\s'\"/\\=])\.config" + _SEP + r"gcloud\b"
+    r"|(?:^|[\s'\"/\\=])gcloud" + _SEP + r"application_default_credentials\b"
+    r"|--output-file(?:\s+|=)['\"]?[^\s'\"|;&\n]+",
+    re.IGNORECASE,
+)
+# Strong, path-INDEPENDENT triad: `credential_source` anchoring a nested
+# `executable` object with a `command` key -- distinctive enough on its own
+# (see module comment above) to need no further path/type confirmation.
+# Gaps bounded at 2000 chars each, matching AWS_CRED_PROCESS_INI_RE's own
+# co-occurrence budget for a realistic JSON/INI body -- QA (bypass-hunting
+# round) found the original 500-char gaps silently missed a real
+# `external_account` config once ordinary, non-adversarial extra sibling
+# keys (`audience`, `subject_token_type`, `token_url`, `workforce_pool_
+# user_project`, ...) pushed `executable`/`command` further from
+# `credential_source` than 500 chars, with no obfuscation involved at all.
+GCP_ADC_STRONG_RE = re.compile(
+    r'"credential_source"\s*:\s*\{'
+    r'.{0,2000}?"executable"\s*:\s*\{'
+    r'.{0,2000}?"command"\s*:',
+    re.IGNORECASE | re.DOTALL,
+)
+# Weak, path-CONFIRMED-only pair check -- mirrors KUBE_EXEC_CRED_CONTENT_RE.
+GCP_ADC_CONTENT_RE = re.compile(
+    r'"executable"\s*:\s*\{.{0,2000}?"command"\s*:',
+    re.IGNORECASE | re.DOTALL,
+)
+# `gcloud iam workload-identity-pools create-cred-config ... --executable-
+# command=<cmd> ...` -- the documented gcloud CLI form that plants the
+# identical mechanism with no literal JSON ever appearing in the tool call.
+# Gaps bounded at 300/300/600 chars -- QA (bypass-hunting round) found the
+# original 200/200/300 gaps (borrowed as-is from AWS_CRED_PROCESS_CLI_RE/
+# KUBE_EXEC_CRED_CLI_RE) too tight for this specific command: a realistic,
+# non-adversarial invocation naming several of `create-cred-config`'s own
+# routine flags ahead of `--executable-command` (`--service-account`,
+# `--service-account-token-lifetime-seconds`, `--subject-token-type`,
+# `--scopes`, `--output-file`) measured at 496 chars, already past the
+# borrowed 300-char budget with no obfuscation at all -- this command's own
+# flag surface is simply larger than `aws configure set`'s or `kubectl
+# config set-credentials`'s.
+GCP_ADC_CLI_RE = re.compile(
+    r"\bgcloud\b[^|;&\n]{0,300}\bworkload-identity-pools\b[^|;&\n]{0,300}"
+    r"\bcreate-cred-config\b[^|;&\n]{0,600}--executable-command\b",
+    re.IGNORECASE,
+)
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/

@@ -4894,6 +4894,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
+    (patterns.GCP_ADC_PATH_RE, "a GCP Application Default Credentials file"),
 )
 
 
@@ -5096,8 +5097,8 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     paragraph above). A GCP Application Default Credentials
     ``external_account`` executable-sourced-credential JSON
     (``credential_source.executable.command``) is a related but DISTINCT
-    mechanism this guard does not cover at all -- a known, disclosed gap,
-    not silently missed.
+    mechanism this guard does not cover -- closed instead by the separate
+    ``rule_gcp_adc_exec_protect`` sibling guard below.
 
     QA history (two independent adversarial reviews, run in parallel --
     bypass-hunting and design/consistency, the same convention every
@@ -5111,6 +5112,14 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``rule_containment`` directly -- and flagged one wording overstatement
     since fixed (this docstring originally said "every API call" where
     AWS's SDK-level caching means "every credential refresh" is accurate).
+
+    UPDATE: the GCP Application Default Credentials ``external_account``
+    executable-sourced-credential gap disclosed above is no longer
+    uncovered -- ``rule_gcp_adc_exec_protect`` (below) closes it as its own,
+    separate guard rather than folding a third ecosystem into this
+    function, since GCP's file has no fixed canonical path the way this
+    guard's two do and leans on a different, path-independent detection
+    shape (see that rule's own docstring).
     Bypass-hunting found and closed three real, reproduced issues before
     merge: an MCP-tool write whose path argument used a key name outside
     ``_path()``'s fixed allowlist (``location``/``dest``/...) left path
@@ -5228,6 +5237,223 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "resolution through that profile/context. A human "
                          "may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_CLOUD_CRED_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
+def _gcp_adc_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_gcp_adc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block a GCP Application Default Credentials ``external_account``
+    executable-sourced-credential config: ``credential_source.executable.
+    command`` names an arbitrary EXTERNAL COMMAND that google-auth (any GCP
+    client library, or ``gcloud`` itself) EXECUTES to obtain a subject
+    token, exchanged for a live GCP access token.
+
+    THREAT MODEL: the third credential-BROKERING primitive of this shape in
+    this file, after AWS ``credential_process`` and Kubernetes kubeconfig
+    ``exec:`` (both in ``rule_cloud_cred_exec_protect`` above) -- a
+    "write now, auto-exec later, on someone else's future invocation, reads
+    as a routine config file" persistence primitive, except the payoff here
+    is a live GCP access token for whatever identity Workload Identity
+    Federation resolves through the planted config, handed to an
+    attacker-chosen command on every future token refresh, unattended, not
+    just once. This is real, documented Google Cloud infrastructure
+    (Workload Identity Federation's executable-sourced credentials, the
+    mechanism ``gcloud iam workload-identity-pools create-cred-config
+    --executable-command=...`` generates), not a theoretical construct.
+
+    Previously a KNOWN, DISCLOSED gap: ``rule_cloud_cred_exec_protect``'s
+    own docstring named this exact mechanism as "a related but distinct
+    mechanism this guard does not cover at all." Closed here as a separate
+    guard rather than folded into that function, because GCP's file has no
+    single canonical path the way ``~/.aws/config``/``~/.kube/config`` do --
+    it is typically generated at an arbitrary path via ``--output-file`` and
+    referenced by ``GOOGLE_APPLICATION_CREDENTIALS`` from wherever it
+    lands -- so this guard leans primarily on a STRONG, path-INDEPENDENT
+    content check (see ``patterns.GCP_ADC_STRONG_RE``'s own module comment
+    for why that JSON nesting is distinctive enough to need no path/type
+    anchor) rather than a fixed path regex.
+
+    NOT covered by ``rule_containment``'s ``CRED_RE`` at all, unlike AWS/
+    Kubernetes' ordinary paths: ``CRED_RE`` matches ``.ssh``/``.aws``/
+    ``.azure``/``.gnupg``/``.kube`` path segments but has no ``.config/
+    gcloud`` or ``gcloud`` entry -- so this guard is the FIRST guard of any
+    kind to gate the default ``~/.config/gcloud/application_default_
+    credentials.json`` location, not a backstop/MCP-only addition the way
+    ``rule_cloud_cred_exec_protect`` is for its own two ecosystems.
+
+    Config (``policy.gcp_adc_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the
+    gate). Defaults to ``ask`` for the same reason every sibling
+    ``*_protect`` guard does: executable-sourced credentials are routine,
+    sanctioned infrastructure (CI/CD workload identity, on-prem-to-GCP
+    federation) -- it just needs a human to have actually looked at the
+    specific command being wired in.
+
+    Escapable only by a human: a trailing ``# aegis-allow`` on the shell
+    form, or the env toggle ``AEGIS_ALLOW_GCP_ADC_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form -- the
+    same invariant every escapable guard in this file holds; a spawned
+    agent cannot set its own env for a hook invocation it doesn't control.
+
+    Honest, disclosed scope, the same trade-offs every guard in this file
+    accepts: a ``credential_source.executable.command`` value assembled
+    indirectly (string concatenation, a wrapper script) defeats every check
+    here; no ``find``-path-indirection fallback (the CLI form is the
+    dominant expected way this file is generated, the same reasoning
+    ``rule_git_config_exec_protect``/``rule_cloud_cred_exec_protect``
+    already accept for their own CLI-dominant surfaces); google-auth's own
+    ``GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1`` opt-in does not reduce
+    the risk gated here -- see ``patterns.py``'s module comment for why the
+    planting write is still the moment that matters; a direct
+    fetch-to-file write (``curl -o application_default_credentials.json
+    ...``) to a path this guard's own ``GCP_ADC_PATH_RE`` recognizes is
+    closed by ``rule_fetch_to_file_protect``'s backstop, which reuses that
+    same regex, the same way it backstops every sibling guard; and an MCP
+    tool nesting BOTH its path and its content argument more than 12 levels
+    deep evades ``_flatten_strings()``'s shared recursion cap entirely -- a
+    pre-existing, disclosed limit of that shared helper itself (see its own
+    docstring), not unique to this guard, and not fixed here.
+
+    QA history (two independent adversarial reviews, run in parallel --
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file follows): design/consistency confirmed all wiring correct
+    (``_CORE_RULES``, the three ``loader.py`` spots, ``Policy``, both
+    ``skills.py`` knob lists, the ``_REMEDIES`` row, the README table row
+    and the ``rule_cloud_cred_exec_protect`` cross-reference, the
+    human-only/agent-cannot-self-escape invariant) and independently
+    verified the README's "first guard of any kind" claim by reading
+    ``CRED_RE`` directly rather than trusting the docstring. Bypass-hunting
+    found and closed three real, reproduced bypasses before merge: the
+    content scan only populated from a literal ``content``/``new_string``
+    key with an MCP-only ``_flatten_strings()`` fallback, so a native
+    ``MultiEdit``/``NotebookEdit`` call (whose payload sits under
+    ``edits: [{new_string: ...}]``/its own shape, not those two keys) went
+    completely unscanned -- worse than the identical gap in
+    ``rule_cloud_cred_exec_protect``, since that guard's own AWS/Kube
+    ordinary paths are backstopped by ``rule_containment``'s ``CRED_RE``
+    where this guard's GCP path has no such backstop at all; closed by
+    adopting ``rule_devcontainer_exec_protect``/``rule_vscode_tasks_
+    protect``'s own fix unchanged (fall back to the flattened sweep
+    whenever the literal key is empty, for every ``ActionClass``, not just
+    MCP). ``GCP_ADC_STRONG_RE``/``GCP_ADC_CONTENT_RE``'s original 500-char
+    inter-key gaps and ``GCP_ADC_CLI_RE``'s original 200/200/300-char gaps
+    (borrowed as-is from ``AWS_CRED_PROCESS_CLI_RE``/``KUBE_EXEC_CRED_
+    CLI_RE``) both silently missed entirely realistic, non-adversarial
+    inputs -- a real ``external_account`` config's own ordinary extra
+    top-level keys, and ``create-cred-config``'s own larger, routine flag
+    surface -- with no obfuscation involved at all; widened to 2000 and
+    300/300/600 respectively, see each regex's own comment in
+    ``patterns.py`` for the measured reproductions.
+
+    A follow-up, independent adversarial round targeting THAT fix
+    specifically (not re-litigating the earlier findings, verifying them
+    instead) confirmed all three land in the code as described and found
+    one new, real but bounded issue: widening ``GCP_ADC_STRONG_RE``'s gap
+    to 2000 chars raises the odds of two SEMANTICALLY UNRELATED JSON
+    fragments -- a ``credential_source`` key used in some unrelated sense,
+    and an unrelated ``executable``/``command`` pair (e.g. a build-pipeline
+    step) coincidentally sitting within 2000 chars of it in the same
+    file -- producing a same-file false ASK with no real causal link
+    between them, since ``.{0,2000}?`` is a pure linear-distance check, not
+    brace/nesting-aware. Accepted, not chased further: this is the
+    identical "whole-scan, no per-clause adjacency" trade-off ``rule_
+    fetch_to_file_protect``'s own docstring already discloses for the
+    identical shape, it fires in the SAFE direction (ASK, a human
+    confirmation, not a silent ALLOW -- the opposite direction from the
+    three bypasses this round closed), and tightening the gap back down
+    reopens the real padding-based bypass the widening exists to close. No
+    fix applied; disclosed here instead."""
+    cfg = getattr(policy, "gcp_adc_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "gcp-adc-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        # `content`/`new_string` is only populated for a single-edit Edit/
+        # Write call -- MultiEdit's `edits: [{new_string: ...}]` array and
+        # NotebookEdit's own shape leave both keys empty even for a native,
+        # non-MCP call. QA (bypass-hunting round) found the original
+        # MCP-only `_flatten_strings()` fallback left those two native tool
+        # shapes completely unscanned (a full canonical-path ADC payload
+        # via MultiEdit sailed through as a silent ALLOW) -- the identical
+        # bug class `rule_devcontainer_exec_protect`/`rule_vscode_tasks_
+        # protect` already fixed by falling back to the flattened sweep
+        # whenever the literal key is empty, for EVERY ActionClass, not
+        # just MCP. Adopted unchanged here.
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            path_text = p + " " + " ".join(_flatten_strings(a))
+        scan_content = patterns.strip_comment_lines(content)
+        path_confirmed = bool(path_text and patterns.GCP_ADC_PATH_RE.search(path_text))
+        hit = bool(
+            patterns.GCP_ADC_STRONG_RE.search(scan_content)
+            or (path_confirmed and patterns.GCP_ADC_CONTENT_RE.search(scan_content)))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_GCP_ADC_EXEC")
+                or _gcp_adc_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "gcp-adc-exec-protect",
+                         f"'{p}' is being written with a GCP Application "
+                         "Default Credentials executable-sourced-credential "
+                         "block (credential_source.executable.command) — it "
+                         "runs an arbitrary external command, with the "
+                         "invoking process's privileges, and is handed a "
+                         "live GCP access token every time it runs, on "
+                         "every future token refresh through that "
+                         "credential file (this session, a teammate, or "
+                         "CI), with no further confirmation after this "
+                         "write. Review the change, then confirm with "
+                         "AEGIS_ALLOW_GCP_ADC_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        path_hit = bool(patterns.GCP_ADC_PATH_RE.search(scan_cmd))
+        hit = bool(
+            patterns.GCP_ADC_CLI_RE.search(scan_cmd)
+            or patterns.GCP_ADC_STRONG_RE.search(scan_cmd)
+            or (path_hit and patterns.GCP_ADC_CONTENT_RE.search(scan_cmd)))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GCP_ADC_EXEC")
+                or _gcp_adc_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "gcp-adc-exec-protect",
+                         "A GCP Application Default Credentials "
+                         "executable-sourced-credential block is being set "
+                         "from a shell — it runs an arbitrary external "
+                         "command, with the invoking process's privileges, "
+                         "and is handed a live GCP access token every time "
+                         "it runs, on every future token refresh through "
+                         "that credential file. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_GCP_ADC_EXEC=1; a spawned agent "
                          "cannot."))
     return None
 
@@ -5846,6 +6072,7 @@ _CORE_RULES = (
     rule_pysite_protect,
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
+    rule_gcp_adc_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
