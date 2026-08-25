@@ -5314,11 +5314,46 @@ def rule_gcp_adc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     already accept for their own CLI-dominant surfaces); google-auth's own
     ``GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1`` opt-in does not reduce
     the risk gated here -- see ``patterns.py``'s module comment for why the
-    planting write is still the moment that matters; and a direct
+    planting write is still the moment that matters; a direct
     fetch-to-file write (``curl -o application_default_credentials.json
     ...``) to a path this guard's own ``GCP_ADC_PATH_RE`` recognizes is
     closed by ``rule_fetch_to_file_protect``'s backstop, which reuses that
-    same regex, the same way it backstops every sibling guard."""
+    same regex, the same way it backstops every sibling guard; and an MCP
+    tool nesting BOTH its path and its content argument more than 12 levels
+    deep evades ``_flatten_strings()``'s shared recursion cap entirely -- a
+    pre-existing, disclosed limit of that shared helper itself (see its own
+    docstring), not unique to this guard, and not fixed here.
+
+    QA history (two independent adversarial reviews, run in parallel --
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file follows): design/consistency confirmed all wiring correct
+    (``_CORE_RULES``, the three ``loader.py`` spots, ``Policy``, both
+    ``skills.py`` knob lists, the ``_REMEDIES`` row, the README table row
+    and the ``rule_cloud_cred_exec_protect`` cross-reference, the
+    human-only/agent-cannot-self-escape invariant) and independently
+    verified the README's "first guard of any kind" claim by reading
+    ``CRED_RE`` directly rather than trusting the docstring. Bypass-hunting
+    found and closed three real, reproduced bypasses before merge: the
+    content scan only populated from a literal ``content``/``new_string``
+    key with an MCP-only ``_flatten_strings()`` fallback, so a native
+    ``MultiEdit``/``NotebookEdit`` call (whose payload sits under
+    ``edits: [{new_string: ...}]``/its own shape, not those two keys) went
+    completely unscanned -- worse than the identical gap in
+    ``rule_cloud_cred_exec_protect``, since that guard's own AWS/Kube
+    ordinary paths are backstopped by ``rule_containment``'s ``CRED_RE``
+    where this guard's GCP path has no such backstop at all; closed by
+    adopting ``rule_devcontainer_exec_protect``/``rule_vscode_tasks_
+    protect``'s own fix unchanged (fall back to the flattened sweep
+    whenever the literal key is empty, for every ``ActionClass``, not just
+    MCP). ``GCP_ADC_STRONG_RE``/``GCP_ADC_CONTENT_RE``'s original 500-char
+    inter-key gaps and ``GCP_ADC_CLI_RE``'s original 200/200/300-char gaps
+    (borrowed as-is from ``AWS_CRED_PROCESS_CLI_RE``/``KUBE_EXEC_CRED_
+    CLI_RE``) both silently missed entirely realistic, non-adversarial
+    inputs -- a real ``external_account`` config's own ordinary extra
+    top-level keys, and ``create-cred-config``'s own larger, routine flag
+    surface -- with no obfuscation involved at all; widened to 2000 and
+    300/300/600 respectively, see each regex's own comment in
+    ``patterns.py`` for the measured reproductions."""
     cfg = getattr(policy, "gcp_adc_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5335,9 +5370,19 @@ def rule_gcp_adc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
-            content = " ".join(_flatten_strings(a))
+        # `content`/`new_string` is only populated for a single-edit Edit/
+        # Write call -- MultiEdit's `edits: [{new_string: ...}]` array and
+        # NotebookEdit's own shape leave both keys empty even for a native,
+        # non-MCP call. QA (bypass-hunting round) found the original
+        # MCP-only `_flatten_strings()` fallback left those two native tool
+        # shapes completely unscanned (a full canonical-path ADC payload
+        # via MultiEdit sailed through as a silent ALLOW) -- the identical
+        # bug class `rule_devcontainer_exec_protect`/`rule_vscode_tasks_
+        # protect` already fixed by falling back to the flattened sweep
+        # whenever the literal key is empty, for EVERY ActionClass, not
+        # just MCP. Adopted unchanged here.
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
         if not content:
             return None
         path_text = p

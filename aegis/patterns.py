@@ -4306,25 +4306,40 @@ GCP_ADC_PATH_RE = re.compile(
 # Strong, path-INDEPENDENT triad: `credential_source` anchoring a nested
 # `executable` object with a `command` key -- distinctive enough on its own
 # (see module comment above) to need no further path/type confirmation.
+# Gaps bounded at 2000 chars each, matching AWS_CRED_PROCESS_INI_RE's own
+# co-occurrence budget for a realistic JSON/INI body -- QA (bypass-hunting
+# round) found the original 500-char gaps silently missed a real
+# `external_account` config once ordinary, non-adversarial extra sibling
+# keys (`audience`, `subject_token_type`, `token_url`, `workforce_pool_
+# user_project`, ...) pushed `executable`/`command` further from
+# `credential_source` than 500 chars, with no obfuscation involved at all.
 GCP_ADC_STRONG_RE = re.compile(
     r'"credential_source"\s*:\s*\{'
-    r'.{0,500}?"executable"\s*:\s*\{'
-    r'.{0,500}?"command"\s*:',
+    r'.{0,2000}?"executable"\s*:\s*\{'
+    r'.{0,2000}?"command"\s*:',
     re.IGNORECASE | re.DOTALL,
 )
 # Weak, path-CONFIRMED-only pair check -- mirrors KUBE_EXEC_CRED_CONTENT_RE.
 GCP_ADC_CONTENT_RE = re.compile(
-    r'"executable"\s*:\s*\{.{0,500}?"command"\s*:',
+    r'"executable"\s*:\s*\{.{0,2000}?"command"\s*:',
     re.IGNORECASE | re.DOTALL,
 )
 # `gcloud iam workload-identity-pools create-cred-config ... --executable-
 # command=<cmd> ...` -- the documented gcloud CLI form that plants the
 # identical mechanism with no literal JSON ever appearing in the tool call.
-# Gaps bounded at 200/200/300 chars, matching AWS_CRED_PROCESS_CLI_RE/
-# KUBE_EXEC_CRED_CLI_RE's own verb-adjacency convention.
+# Gaps bounded at 300/300/600 chars -- QA (bypass-hunting round) found the
+# original 200/200/300 gaps (borrowed as-is from AWS_CRED_PROCESS_CLI_RE/
+# KUBE_EXEC_CRED_CLI_RE) too tight for this specific command: a realistic,
+# non-adversarial invocation naming several of `create-cred-config`'s own
+# routine flags ahead of `--executable-command` (`--service-account`,
+# `--service-account-token-lifetime-seconds`, `--subject-token-type`,
+# `--scopes`, `--output-file`) measured at 496 chars, already past the
+# borrowed 300-char budget with no obfuscation at all -- this command's own
+# flag surface is simply larger than `aws configure set`'s or `kubectl
+# config set-credentials`'s.
 GCP_ADC_CLI_RE = re.compile(
-    r"\bgcloud\b[^|;&\n]{0,200}\bworkload-identity-pools\b[^|;&\n]{0,200}"
-    r"\bcreate-cred-config\b[^|;&\n]{0,300}--executable-command\b",
+    r"\bgcloud\b[^|;&\n]{0,300}\bworkload-identity-pools\b[^|;&\n]{0,300}"
+    r"\bcreate-cred-config\b[^|;&\n]{0,600}--executable-command\b",
     re.IGNORECASE,
 )
 

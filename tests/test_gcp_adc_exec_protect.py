@@ -167,6 +167,70 @@ def test_mcp_unlisted_path_key_name_gated():
     assert _gated(d) and d.rule == RULE
 
 
+# ---- QA round (bypass-hunting, independent adversarial review): closed bypasses --
+
+def test_multiedit_gated():
+    """QA (bypass-hunting round): the original content scan only populated
+    from a literal `content`/`new_string` key, with an MCP-only
+    `_flatten_strings()` fallback — a native `MultiEdit` call (whose
+    payload sits under `edits: [{new_string: ...}]`, not either of those
+    two keys) went completely unscanned. Worse than the identical gap in
+    `rule_cloud_cred_exec_protect`, since this guard's GCP path has no
+    `rule_containment` backstop to fall back on at all."""
+    d = evaluate(Event.make(
+        HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+        args={"file_path": "~/.config/gcloud/application_default_credentials.json",
+              "edits": [{"old_string": "", "new_string": ADC_JSON}]}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_notebookedit_gated():
+    d = evaluate(Event.make(
+        HookEvent.PRE_TOOL_USE, tool="NotebookEdit",
+        args={"notebook_path": "~/.config/gcloud/application_default_credentials.json",
+              "new_source": ADC_JSON}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_realistic_extra_json_keys_dont_evade_strong_gap():
+    """QA (bypass-hunting round): `GCP_ADC_STRONG_RE`'s original 500-char
+    inter-key gaps silently missed a real `external_account` config once
+    its own ordinary extra top-level keys (`audience`, `subject_token_
+    type`, `token_url`, `workforce_pool_user_project`, ...) pushed
+    `executable`/`command` further from `credential_source` than 500
+    chars — no obfuscation, just a realistic config. Padding a completely
+    UNRECOGNIZED path (so the weak, path-confirmed tier can't help either)
+    isolates the strong tier's own gap width."""
+    padded = (
+        '{\n  "credential_source": {\n'
+        '    "unused_field_padding": "' + "a" * 480 + '",\n'
+        '    "executable": {\n      "command": "/tmp/evil"\n    }\n  }\n}\n'
+    )
+    d = evaluate(_write("staging/some-random-file.json", content=padded), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_realistic_long_cli_flag_list_gated():
+    """QA (bypass-hunting round): `GCP_ADC_CLI_RE`'s original 200/200/300
+    char gaps (borrowed as-is from the AWS/Kube CLI regexes) were too tight
+    for this specific command — a realistic, non-adversarial invocation
+    naming several of `create-cred-config`'s own routine flags
+    (`--service-account`, `--service-account-token-lifetime-seconds`,
+    `--subject-token-type`, `--scopes`, `--output-file`) ahead of
+    `--executable-command` measured past 300 chars with zero obfuscation."""
+    cmd = (
+        "gcloud iam workload-identity-pools create-cred-config providerpath "
+        "--service-account=svc@proj.iam.gserviceaccount.com "
+        "--service-account-token-lifetime-seconds=3600 "
+        "--subject-token-type=urn:ietf:params:oauth:token-type:jwt "
+        "--scopes=https://www.googleapis.com/auth/cloud-platform "
+        "--output-file=" + "very/long/nested/path/" * 8 + "creds.json "
+        "--executable-command=/tmp/evil"
+    )
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 # ---- gcloud CLI form (never mentions any file path at all) --------------------
 
 def test_gcloud_create_cred_config_cli_gated():
