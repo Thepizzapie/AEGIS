@@ -115,15 +115,43 @@ def rule_elicitation_governance(ev: Event, policy=None) -> Optional[Decision]:
         return None
 
 
+# Plausible top-level key names an elicitation's actual content (the message
+# shown to the user, and/or its requestedSchema) could sit under in ``ev.raw``,
+# across an adapter's own payload shape and the underlying MCP JSON-RPC
+# envelope (``{"params": {"message": ..., "requestedSchema": ...}}``). NOT the
+# same thing as scanning the whole raw payload (QA design-review round found
+# that scanning ALL of ``ev.raw`` pulls in unrelated session metadata --
+# cwd/tool_name/session_id/hook_event_name -- and false-positived on an
+# elicitation as innocuous as "Which project would you like to open?" purely
+# because the session's cwd happened to be a directory named
+# ``api-key-gateway``. This allowlist keeps the same schema-agnostic recall
+# for wherever the content actually lives (each key's value is still
+# recursively flattened in full) without pulling in the surrounding envelope.
+_ELICIT_CONTENT_KEYS = (
+    "message", "requestedSchema", "schema", "prompt", "params",
+    "elicitation", "request", "content", "properties", "fields",
+)
+
+
 def _elicitation_text(ev: Event) -> str:
-    """Every string/number leaf of the elicitation payload, args first then raw
-    (deduped isn't needed — a regex search over a slightly redundant string is
-    cheap and harmless). Schema-agnostic on purpose: neither the exact Claude
-    Code Elicitation hook payload shape nor a third-party MCP server's own
-    ``message``/``requestedSchema`` field names are fixed enough to key off,
-    the same "flatten every leaf" posture ``rules._net_text``/``_flatten_strings``
-    already use for MCP tool-arg scanning elsewhere in this codebase."""
-    parts = flatten_strings(ev.args or {}) + flatten_strings(ev.raw or {})
+    """Every string/number leaf of the elicitation's actual content: all of
+    ``ev.args`` (an adapter that folds the request into ``tool_input`` lands
+    here), plus ``ev.raw``'s value under each of ``_ELICIT_CONTENT_KEYS`` (an
+    adapter or MCP envelope that instead carries it at/near the payload's top
+    level) -- deliberately NOT the whole of ``ev.raw`` (see
+    ``_ELICIT_CONTENT_KEYS``'s own docstring for why). Schema-agnostic on
+    purpose: neither the exact Claude Code Elicitation hook payload shape nor
+    a third-party MCP server's own field-naming convention is fixed enough to
+    key off a single name, the same "flatten every leaf" posture
+    ``rules._net_text``/``_flatten_strings`` already use for MCP tool-arg
+    scanning elsewhere in this codebase -- just scoped to content-shaped keys
+    instead of the full payload."""
+    parts = flatten_strings(ev.args or {})
+    raw = ev.raw or {}
+    if isinstance(raw, dict):
+        for k in _ELICIT_CONTENT_KEYS:
+            if k in raw:
+                parts.extend(flatten_strings(raw[k]))
     return " ".join(parts)
 
 

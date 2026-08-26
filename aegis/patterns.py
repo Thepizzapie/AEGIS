@@ -4289,6 +4289,15 @@ def strip_comment_lines(text: str) -> str:
 ELICITATION_SECRET_RE = re.compile(
     r"\bpass(?:word|phrase|wd)\b"
     r"|\b(?:api|secret|private|access|master)[\s_-]?key\b"
+    # "private KEY" with a key-TYPE noun in between (RSA/PGP/encryption/SSH/...) --
+    # QA (bypass-hunting round) found the adjacent-only form above misses this
+    # common, natural phishing phrasing entirely ("What is your private RSA
+    # key?"), silently defeating detection (including the spawned-agent
+    # unconditional deny) for the flagship secret type this guard exists to
+    # catch. Bounded to 1-2 intervening words (fixed repetition, no nested
+    # unbounded quantifiers -- no ReDoS risk) so it stays a targeted widening,
+    # not an unbounded "private ... key" match across an unrelated sentence.
+    r"|\bprivate\b(?:[\s_-]+\w+){1,2}[\s_-]+key\b"
     r"|\bclient[\s_-]?secret\b"
     r"|\b(?:seed|recovery|mnemonic)[\s_-]?phrase\b"
     r"|\bssh[\s_-]?(?:private[\s_-]?)?key\b"

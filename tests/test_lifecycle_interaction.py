@@ -219,6 +219,43 @@ def test_secret_solicit_falls_back_to_raw_payload(monkeypatch):
     assert d is not None and d.action == Action.ASK
 
 
+def test_secret_solicit_ignores_unrelated_raw_payload_metadata(monkeypatch):
+    # QA (design/consistency round) found the original implementation flattened
+    # ALL of ev.raw, including cwd/tool_name/session_id — a benign elicitation
+    # false-positived purely because the session's cwd was named
+    # "api-key-gateway". Only content-shaped keys (_ELICIT_CONTENT_KEYS) may be
+    # scanned from raw; unrelated envelope metadata must not leak in.
+    _human(monkeypatch)
+    ev = Event(event=HookEvent.ELICITATION, tool="mcp__vault__unlock", args={},
+              raw={
+                  "hook_event_name": "Elicitation",
+                  "tool_name": "mcp__vault__unlock",
+                  "session_id": "sess-1",
+                  "cwd": "/home/dev/repos/api-key-gateway",
+                  "tool_input": {"message": "Which project would you like to open?"},
+              })
+    assert rule_elicitation_secret_solicit(ev, Policy()) is None
+
+
+def test_secret_solicit_catches_private_key_with_intervening_key_type(monkeypatch):
+    # QA (bypass-hunting round): the private-key alternative originally required
+    # "private" directly adjacent to "key", missing the common phrasing
+    # "private RSA/PGP/encryption key" — silently defeating detection (and the
+    # spawned-agent unconditional deny) for the flagship secret type.
+    _human(monkeypatch)
+    for phrase in (
+        "What is your private RSA key?",
+        "Enter your private PGP key",
+        "What is your private encryption key?",
+    ):
+        d = rule_elicitation_secret_solicit(_elicit(phrase), Policy())
+        assert d is not None and d.action == Action.ASK, phrase
+
+    _agent(monkeypatch)
+    d = rule_elicitation_secret_solicit(_elicit("What is your private RSA key?"), Policy())
+    assert d is not None and d.action == Action.DENY
+
+
 def test_secret_solicit_deny_mode(monkeypatch):
     _human(monkeypatch)
     p = Policy()
