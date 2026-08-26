@@ -50,3 +50,29 @@ def confine_allow(policy) -> list:
 def abspath(path: str, base: Optional[str]) -> str:
     base = base or os.getcwd()
     return os.path.abspath(os.path.join(base, os.path.expanduser(path)))
+
+
+def flatten_strings(v, _depth: int = 0) -> list:
+    """Every string/number leaf inside a (possibly nested) value, depth-capped.
+    Mirrors ``rules._flatten_strings`` (duplicated, not imported, to keep the
+    lifecycle -> rules dependency one-way — see module docstring). Used to scan
+    arbitrary-shaped event payloads (MCP tool args, an Elicitation request's
+    message/requestedSchema) without assuming a fixed set of key names, since
+    that shape varies by MCP server/runtime with no fixed convention."""
+    if _depth > 12:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return [str(v)]
+    if isinstance(v, dict):
+        out = []
+        for x in v.values():
+            out.extend(flatten_strings(x, _depth + 1))
+        return out
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            out.extend(flatten_strings(x, _depth + 1))
+        return out
+    return []

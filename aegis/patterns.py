@@ -4267,3 +4267,39 @@ _COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 
 def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
+
+
+# MCP Elicitation secret-solicitation vocabulary -- a connected MCP server can
+# mid-session pop a form asking the human directly for a value (the protocol's
+# own Elicitation feature -- message + a requestedSchema of fields). Every
+# guard above governs a TOOL CALL (shell/file/git/network); this is a
+# different channel entirely -- no tool runs, no argument is a path or a URL,
+# so none of them ever see it. A malicious or later-rug-pulled server can
+# reuse that same legitimate feature to phish a real secret straight out of a
+# trusting human (a value that then goes to the server verbatim, in the
+# elicitation RESULT) -- distinct from CRED_RE (local credential files
+# already on disk) and CLOUD_METADATA_RE (a network fetch of a live
+# credential): this is solicited directly from the person, no exfil call for
+# any guard to catch afterward. Curated free-text vocabulary, not a path --
+# deliberately broad-but-bounded (secret/password/key/token/code/number
+# families) rather than an exhaustive enumeration, the same "known-dangerous
+# shapes, not every shape" posture every guard in this file discloses. `\b`-
+# delimited, no nested quantifiers (no catastrophic-backtracking risk -- see
+# EXFIL_RE's/CLOUD_METADATA_RE's own QA history for why that matters here).
+ELICITATION_SECRET_RE = re.compile(
+    r"\bpass(?:word|phrase|wd)\b"
+    r"|\b(?:api|secret|private|access|master)[\s_-]?key\b"
+    r"|\bclient[\s_-]?secret\b"
+    r"|\b(?:seed|recovery|mnemonic)[\s_-]?phrase\b"
+    r"|\bssh[\s_-]?(?:private[\s_-]?)?key\b"
+    r"|\b(?:auth|access|bearer|refresh|session|api)[\s_-]?token\b"
+    r"|\b(?:credit[\s_-]?card|card[\s_-]?number|cvv2?|cvc2?)\b"
+    r"|\bsocial[\s_-]?security(?:[\s_-]?number)?\b|\bssn\b"
+    r"|\b(?:security|verification|pin)[\s_-]?code\b"
+    r"|\botp\b"
+    r"|\b(?:one[\s_-]?time|2fa|two[\s_-]?factor)[\s_-]?(?:code|passcode|pin)\b"
+    r"|\brecovery[\s_-]?code\b"
+    r"|\bwallet[\s_-]?(?:private[\s_-]?)?key\b"
+    r"|\bconnection[\s_-]?string\b",
+    re.IGNORECASE,
+)

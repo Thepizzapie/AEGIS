@@ -113,7 +113,10 @@ class Policy:
     # agent's human-only PermissionRequest prompts instead of hanging on them.
     permission: dict = field(default_factory=dict)
     # MCP-input governance: {block_elicitation: bool} — deny MCP elicitation side
-    # channels for a spawned/unattended agent.
+    # channels for a spawned/unattended agent. Plus content-gated secret-
+    # solicitation detection: {secret_elicitation: ask|deny|off (default ask),
+    # secret_elicitation_allow: [regex exemptions]} — see
+    # lifecycle.interaction.rule_elicitation_secret_solicit.
     mcp: dict = field(default_factory=dict)
     # Forced install review: {mode: off|monitor|ask, deep: bool,
     # require_pinned: bool, allow: [regex on command]}. Empty -> defaults
