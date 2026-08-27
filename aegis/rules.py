@@ -4098,6 +4098,320 @@ def rule_statusline_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _permission_bypass_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_PERMISSION_BYPASS_WS_RUN_RE = re.compile(r"\s+")
+_PERMISSION_BYPASS_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _permission_bypass_normalize(text: str) -> str:
+    """Collapse whitespace runs to one space and decode JSON ``\\uXXXX``
+    escapes before either `PERMISSION_BYPASS_MODE_KEY_RE`/
+    `PERMISSION_BYPASS_JQ_RE` ever sees the text — the identical evasion
+    class `_statusline_normalize` closes for `statusLine`/`command`, applied
+    here to `defaultMode`/`bypassPermissions`. A malformed ``\\u`` escape
+    (non-hex digits) is left as-is rather than raising."""
+    def _decode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    decoded = _PERMISSION_BYPASS_UNICODE_ESCAPE_RE.sub(_decode, text)
+    return _PERMISSION_BYPASS_WS_RUN_RE.sub(" ", decoded)
+
+
+def _permission_bypass_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for a dict
+    key that IS ``defaultMode``, or ENDS WITH the dotted-path suffix
+    ``.defaultMode`` (a flat ``"permissions.defaultMode"`` key some config-set
+    tools use as their own convention, never actually nested), whose value is
+    the string ``bypassPermissions`` — the same enabling-signal shape
+    `PERMISSION_BYPASS_MODE_KEY_RE` requires textually, applied to a
+    structural MCP arg shape (a filesystem server's own ``{"json":
+    {"permissions": {...}}}`` edit-tool convention, or a flat dotted-key
+    convention) no substring regex would see on its own, the identical gap
+    `_statusline_struct_key_hit` closes for `statusLine`. A real ``defaultMode``
+    key nested anywhere below a ``permissions`` wrapper is caught by this same
+    check during the ordinary recursive walk — no separate "parent must be
+    named `permissions`" requirement needed. QA finding (independent
+    adversarial review, round A, confirmed reproduced): an earlier draft
+    required the ``permissions`` wrapper explicitly and matched ``defaultMode``
+    only as an exact-match key — both a flat top-level
+    ``"permissions.defaultMode"`` key (no wrapper dict at all) and the
+    dotted-suffix spelling sailed through untouched. Same depth cap (12) as
+    its siblings."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str):
+                kl = k.strip().lower()
+                if ((kl == "defaultmode" or kl.endswith(".defaultmode"))
+                        and isinstance(val, str) and val.strip().lower() == "bypasspermissions"):
+                    return True
+            if _permission_bypass_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_permission_bypass_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _permission_bypass_mcp_bareword_hit(a: dict) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: a ``defaultMode`` leaf
+    (bare, or dotted-suffix ``...defaultmode`` — the same flat-key convention
+    `_permission_bypass_struct_key_hit` covers) co-occurring with a
+    ``bypassPermissions`` leaf, both exact-match, as plain string LEAVES
+    anywhere in the (recursively) flattened raw MCP args — closes a "set
+    config value"-style MCP tool's ``{"key": "permissions.defaultMode",
+    "value": "bypassPermissions"}`` shape, the same bareword-leaf gap
+    `_statusline_mcp_bareword_hit` already closes for its own target. QA
+    finding (independent adversarial review, round A, confirmed reproduced):
+    an earlier draft required the ``defaultmode`` leaf to match EXACTLY, which
+    a real MCP set-config tool's own flattened ``"permissions.defaultMode"``
+    key value never does — closed by also accepting the dotted-suffix form.
+    Both signals still required to keep this MCP-only fallback narrow."""
+    leaves = {s.strip().lower() for s in _flatten_strings(a) if isinstance(s, str)}
+    default_mode_hit = any(leaf == "defaultmode" or leaf.endswith(".defaultmode") for leaf in leaves)
+    return default_mode_hit and "bypasspermissions" in leaves
+
+
+def _permission_bypass_json_key_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result SEMANTICALLY via `_permission_bypass_struct_key_hit` — an
+    additional signal alongside `PERMISSION_BYPASS_MODE_KEY_RE`'s textual
+    check, not a replacement for it, the same JSON-\\uXXXX-escape-evasion
+    closure `_statusline_json_key_hit` already applies to `statusLine`."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _permission_bypass_struct_key_hit(obj)
+
+
+def rule_permission_bypass_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a ``permissions.defaultMode: "bypassPermissions"``
+    entry in ``.claude/settings.local.json`` — the same project-local,
+    gitignored-by-default sibling of ``.claude/settings.json``
+    `rule_claude_hooks_protect`/`rule_statusline_protect` already guard for
+    their own keys in this file — and block the equivalent, file-free
+    ``claude --dangerously-skip-permissions``/``--permission-mode
+    bypassPermissions`` CLI invocation.
+
+    THREAT MODEL: every guard in this file protects ONE auto-exec surface —
+    a hook, a statusline command, a git hook, an MCP server. This one
+    protects the mechanism that decides whether the human is ever asked
+    before ANY of them, planted or organic, runs at all. Claude Code prompts
+    the human before a tool call unless ``permissions.defaultMode`` says
+    otherwise; set to ``"bypassPermissions"``, every future Bash/Edit/Write/
+    MCP-tool call in that project (or, via the CLI flag, in a freshly spawned
+    session) auto-runs with no confirmation, for as long as the setting
+    stands — not one planted command, but the removal of the backstop
+    standing in front of every tool call this file's own rule set doesn't
+    happen to have a specific pattern for. `rule_claude_hooks_protect`'s own
+    docstring lists ``permissions`` by name among the file's "plenty of other
+    personal config ... edited for entirely benign reasons" it deliberately
+    leaves ungated — true for the key's ordinary uses (narrowing ``allow``,
+    adding a project to ``additionalDirectories``), but not for this one
+    value: Claude Code's own schema names exactly one string with this
+    effect, the same "the value, not the key, is the enabling switch"
+    property `rule_vscode_tasks_protect`'s ``runOn``/`rule_statusline_
+    protect`'s `type: "command"` already establish for their own targets.
+
+    Distinct from disabling Aegis itself: Aegis's own PreToolUse hook is a
+    separate mechanism from Claude Code's native permission prompt and keeps
+    running regardless of ``defaultMode`` — this guard exists because Aegis's
+    own rule set, however wide, is still a denylist, not a proof of
+    completeness; Claude Code's own prompt is the general-purpose backstop
+    for every tool call no *_protect guard here specifically names, and
+    ``bypassPermissions`` removes exactly that backstop, leaving only
+    Aegis's explicit coverage between the agent and the machine.
+
+    Two surfaces, matching the "file write and CLI form" split `rule_mcp_
+    config_protect`/`rule_direnv_protect` already make for their own targets:
+    (1) an Edit/Write/MCP-tool write or a shell `jq`/`sponge` scripted edit
+    introducing `defaultMode: "bypassPermissions"` into `.claude/settings.
+    local.json`, and (2) the CLI's own `--dangerously-skip-permissions`/
+    `--permission-mode bypassPermissions` flag, which needs no file write of
+    its own at all.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows). Design/consistency review (round A) found no defects:
+    verified every wiring spot a sibling guard has (`Policy`, all three
+    `loader.py` spots, both `skills.py` knob lists, the `_REMEDIES` table,
+    README, `_CORE_RULES`), verified each specific factual docstring claim
+    against the actual sibling code it cites, and confirmed the escape-
+    hatch/mode/monitor conventions match every sibling guard exactly.
+    Bypass-hunting (round A) found and closed three real, reproduced gaps:
+    (1) a CRITICAL full bypass — `PERMISSION_BYPASS_JQ_RE`'s original
+    400-char bounded lookaheads (copied from `CLAUDE_STATUSLINE_JQ_RE`) were
+    defeated by a jq `#`-comment (real jq syntax, ignored by jq itself) used
+    as filler: ~380 non-whitespace characters right after the `jq` token
+    pushed `defaultMode`/`bypassPermissions` outside the window, and no
+    other pattern in this guard fired either (a jq path-assignment has no
+    colon-JSON shape, and `sponge` carries no write-verb for self-protect to
+    catch) — the command evaluated to a bare `ALLOW` with no rule at all.
+    Closed by dropping the fixed bound in favor of an unbounded, `;`-scoped
+    lookahead (see `PERMISSION_BYPASS_JQ_RE`'s own comment for the full
+    trade-off analysis); the identical shape reproduces against
+    `CLAUDE_STATUSLINE_JQ_RE` too, disclosed there as a pre-existing gap in a
+    different, already-shipped guard, out of scope for this guard alone to
+    fix. (2) an MCP "set config value"-style tool's flat dotted-path key
+    convention (`{"key": "permissions.defaultMode", "value":
+    "bypassPermissions"}`) evaded both the structural walk (required a
+    literal nested `permissions` dict) and the bareword fallback (required
+    an exact `defaultmode` leaf); closed by accepting a dotted-path SUFFIX
+    match in both. (3) the same flat dotted-key spelling as a literal JSON
+    key in Edit/Write content evaded `PERMISSION_BYPASS_MODE_KEY_RE`; closed
+    by widening it to accept an optional `permissions.` prefix inside the
+    quoted key. Full suite green throughout (1944 tests after the fixes).
+    Follow-up verification pass confirmed all three fixes close their PoCs
+    with no regressions (the widened MCP-suffix/regex checks stay
+    character-exact — `"myapp.notDefaultMode"`/`"my.permissions.defaultMode"`
+    do not false-positive) and no ReDoS from the now-unbounded jq lookaheads,
+    but also reproduced one further, real gap: filler placed BEFORE the
+    signal (`jq`/the path/the assignment itself) rather than after, once long
+    enough, is truncated away entirely by `normalize.scan_surface`'s own
+    shared ``cmd[:_MAX]`` (20,000-char) cap — applied to the whole raw
+    command before ANY pattern in ANY guard ever sees it, this guard's own
+    unbounded window included — producing a silent `ALLOW` with no rule
+    firing. Confirmed pre-existing in `normalize.py`, untouched by this
+    commit, and shared by every guard that goes through `_shell_scan`, not
+    something the jq-window fix introduced or could close on its own;
+    disclosed below rather than patched here, the same disposition this
+    guard already gives the analogous inherited `CLAUDE_STATUSLINE_JQ_RE`
+    gap.
+
+    Config (``policy.permission_bypass``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted, reviewed automation that legitimately runs
+    unattended, say). Defaults to ``ask`` for the same reason every sibling
+    ``*_protect`` guard does: a human deliberately choosing to run a fully
+    autonomous, unattended session is a real, sanctioned use of this exact
+    setting — it just needs to have actually been a human's choice.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_PERMISSION_BYPASS=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: reaches the user-level ``~/.claude/settings.local.json`` the
+    same incidental, suffix-only way `rule_claude_hooks_protect`/`rule_
+    statusline_protect` reach it (no anchoring to project root); a
+    ``defaultMode``/``bypassPermissions`` value assembled indirectly (a
+    templating step, a build script) rather than appearing as a literal is
+    not caught; a direct fetch-to-file write (``curl -o
+    .claude/settings.local.json ...``) is caught by none of THIS guard's own
+    checks, but is closed end-to-end by the separate `rule_fetch_to_file_
+    protect` backstop, which reuses `CLAUDE_LOCAL_SETTINGS_PATH_RE` as one of
+    its own protected targets, the same way `rule_statusline_protect`
+    discloses for its own surface; the CLI-form pattern is anchored to the
+    literal `claude` binary name, so an aliased/renamed binary, or a wrapper
+    script that itself calls `claude --dangerously-skip-permissions`
+    internally without that flag appearing in the outer command line, is not
+    caught; a shell command padded with enough filler BEFORE the actual
+    signal (rather than after, where this guard's own unbounded jq window
+    now holds regardless of length) is truncated away by `normalize.
+    scan_surface`'s own shared 20,000-character cap before this guard, or
+    any other in this file, ever sees the truncated tail — a real,
+    reproduced gap (QA follow-up verification pass), but one in shared
+    normalization infrastructure this commit doesn't touch, not specific to
+    this guard; and, matching every sibling guard here, this reaches only
+    the tool-call surface Aegis's own PreToolUse hook is wired into — a CLI
+    invocation from OUTSIDE any Aegis-guarded session (a human's own
+    terminal, an unrelated automation) is out of scope by design, the same
+    boundary every guard in this file already accepts."""
+    cfg = getattr(policy, "permission_bypass", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "permission-bypass-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.PERMISSION_BYPASS_MODE_KEY_RE.search(_permission_bypass_normalize(content))
+                   or _permission_bypass_json_key_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = bool(_permission_bypass_struct_key_hit(a) or _permission_bypass_mcp_bareword_hit(a))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PERMISSION_BYPASS")
+                or _permission_bypass_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "permission-bypass-protect",
+                         f"'{p}' is being written with `permissions.defaultMode` "
+                         "set to \"bypassPermissions\" — this silences Claude "
+                         "Code's own confirmation prompt for EVERY future tool "
+                         "call (Bash, Edit, Write, every MCP tool), not one "
+                         "planted command, and (being gitignored by default) "
+                         "with no diff and no code review. Review the change, "
+                         "then confirm with AEGIS_ALLOW_PERMISSION_BYPASS=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        cli_hit = bool(patterns.PERMISSION_BYPASS_CLI_RE.search(cmd))
+        path_hit = False
+        jq_hit = key_hit = False
+        if not cli_hit:
+            cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+            path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                             or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+            if not path_hit:
+                return None
+            normalized_cmd = _permission_bypass_normalize(cmd)
+            jq_hit = bool(patterns.PERMISSION_BYPASS_JQ_RE.search(normalized_cmd))
+            key_hit = bool(patterns.PERMISSION_BYPASS_MODE_KEY_RE.search(normalized_cmd))
+            if not (jq_hit or key_hit):
+                return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PERMISSION_BYPASS")
+                or _permission_bypass_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        if cli_hit:
+            msg = ("The `claude` CLI is being launched with "
+                   "`--dangerously-skip-permissions`/`--permission-mode "
+                   "bypassPermissions` — this spawns a new session with "
+                   "Claude Code's own confirmation prompt already removed "
+                   "for its entire lifetime, no file write needed. A human "
+                   "may append '# aegis-allow', or set "
+                   "AEGIS_ALLOW_PERMISSION_BYPASS=1; a spawned agent cannot.")
+        else:
+            msg = ("`permissions.defaultMode` is being set to "
+                   "\"bypassPermissions\" in .claude/settings.local.json "
+                   "from a shell — this silences Claude Code's own "
+                   "confirmation prompt for EVERY future tool call, and "
+                   "(being gitignored by default) with no diff and no code "
+                   "review. A human may append '# aegis-allow', or set "
+                   "AEGIS_ALLOW_PERMISSION_BYPASS=1; a spawned agent cannot.")
+        return _finish(Decision(action, "permission-bypass-protect", msg))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -5842,6 +6156,7 @@ _CORE_RULES = (
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,
+    rule_permission_bypass_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
