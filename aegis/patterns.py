@@ -2690,9 +2690,13 @@ CLAUDE_STATUSLINE_JQ_RE = re.compile(
 # escape-spelling evasion `_statusline_normalize`/`_claude_hooks_json_key_hit`
 # already close for their own keys) so `"defaultMode"` or a
 # `bypassPermissions` value decode to the same signal a purely textual
-# check would otherwise miss.
+# check would otherwise miss. The key itself also accepts an optional
+# `permissions.` dotted-path prefix (`"permissions.defaultMode"`) — QA
+# finding (independent adversarial review, round A): a flat top-level key
+# spelled with the dotted path some config-set tools use as their own key
+# convention evaded a check anchored to the bare `defaultMode` quote alone.
 PERMISSION_BYPASS_MODE_KEY_RE = re.compile(
-    r"[\"']defaultMode[\"']\s*:\s*[\"']bypassPermissions[\"']",
+    r"[\"'](?:permissions\.)?defaultMode[\"']\s*:\s*[\"']bypassPermissions[\"']",
     re.IGNORECASE,
 )
 
@@ -2702,18 +2706,45 @@ PERMISSION_BYPASS_MODE_KEY_RE = re.compile(
 # `CLAUDE_HOOKS_JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE` already close for their own
 # keys, one key over: jq (or `gojq`/`jaq`), an assignment-shaped operator, and
 # BOTH `defaultMode` and `bypassPermissions` as bare substrings (order-
-# agnostic), all within the same bounded, `;`-only-excluded window those two
-# sibling patterns already use (deliberately not excluding `&`/`|`/newline —
-# see `CLAUDE_STATUSLINE_JQ_RE`'s own comment for why: a `&` or newline inside
-# a QUOTED jq program value is not a real shell control operator, and
-# excluding either closed a confirmed, reproduced bypass there). Matched
-# against the same normalized (whitespace-collapsed, `\uXXXX`-decoded) copy
-# `CLAUDE_STATUSLINE_JQ_RE` is, for the identical padding/escape evasions.
+# agnostic), deliberately not excluding `&`/`|`/newline from the lookahead
+# tail either (see `CLAUDE_STATUSLINE_JQ_RE`'s own comment for why: a `&` or
+# newline inside a QUOTED jq program value is not a real shell control
+# operator).
+#
+# UNLIKE `CLAUDE_HOOKS_JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE`, deliberately NOT
+# bounded to a fixed character count. QA finding (independent adversarial
+# review, round A, confirmed reproduced): those two sibling patterns' shared
+# 400-char tempered-dot window is itself the bypass surface, not just
+# something padding can outrun — a jq `#`-comment (real jq syntax, valid
+# inside a single-quoted shell argument, ignored by jq itself, terminated by
+# an actual newline that `_permission_bypass_normalize`'s whitespace-collapse
+# step only shrinks, doesn't remove) is NON-whitespace filler: ~380 such
+# characters right after the `jq` token pushes `defaultMode`/
+# `bypassPermissions` outside a 400-char window while whitespace-collapse
+# normalization does nothing to shrink it, since none of it is whitespace.
+# The identical shape (a jq comment, or equally a `"long string" as $unused |`
+# no-op binding) would defeat ANY fixed bound, not just 400 — closing this
+# guard-by-guard with a wider number just moves the flip point, so the
+# lookahead window here is unbounded within one `;`-delimited statement
+# instead (the same class of unbounded-but-statement-scoped design
+# `MCP_CLI_ADD_RE`/`PERMISSION_BYPASS_CLI_RE` already use for their own CLI-
+# form checks). A `[^;]*` run followed by a literal is linear-time to match,
+# not exponential, so this carries no ReDoS regression despite dropping the
+# bound. The accepted trade-off is the same direction every guard in this
+# file already takes when forced to choose: a genuinely unrelated `jq`
+# invocation and an unrelated, far-apart mention of `defaultMode`/
+# `bypassPermissions` in the SAME `;`-delimited shell statement (a real but
+# unusual shape) now asks unnecessarily — a narrow false positive, not a
+# missed real plant, which is the one direction this file always resolves in
+# favor of. The identical fixed-window bypass shape reproduces against
+# `CLAUDE_STATUSLINE_JQ_RE` too (out of scope for this guard alone — a
+# pre-existing gap in a different, already-shipped guard, not a regression
+# introduced here).
 PERMISSION_BYPASS_JQ_RE = re.compile(
     r"\b(?:(?:go)?jq|jaq)\b"
-    r"(?=[^;]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
-    r"(?=[^;]{0,400}\.?defaultMode\b)"
-    r"(?=[^;]{0,400}\bbypassPermissions\b)",
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\.?defaultMode\b)"
+    r"(?=[^;]*\bbypassPermissions\b)",
     re.IGNORECASE,
 )
 

@@ -4129,24 +4129,34 @@ def _permission_bypass_normalize(text: str) -> str:
 
 
 def _permission_bypass_struct_key_hit(v, _depth: int = 0) -> bool:
-    """Walk an MCP tool's raw (possibly nested) JSON args looking for
-    ``permissions`` as an actual DICT KEY whose value is itself a dict
-    carrying a ``defaultMode`` key set to ``bypassPermissions`` — the same
-    enabling-signal shape `PERMISSION_BYPASS_MODE_KEY_RE` requires textually,
-    applied to a structural MCP arg shape (a filesystem server's own
-    ``{"json": {"permissions": {...}}}`` edit-tool convention) no substring
-    regex would see, the identical gap `_statusline_struct_key_hit` closes
-    for `statusLine`. Same depth cap (12) as its siblings."""
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for a dict
+    key that IS ``defaultMode``, or ENDS WITH the dotted-path suffix
+    ``.defaultMode`` (a flat ``"permissions.defaultMode"`` key some config-set
+    tools use as their own convention, never actually nested), whose value is
+    the string ``bypassPermissions`` — the same enabling-signal shape
+    `PERMISSION_BYPASS_MODE_KEY_RE` requires textually, applied to a
+    structural MCP arg shape (a filesystem server's own ``{"json":
+    {"permissions": {...}}}`` edit-tool convention, or a flat dotted-key
+    convention) no substring regex would see on its own, the identical gap
+    `_statusline_struct_key_hit` closes for `statusLine`. A real ``defaultMode``
+    key nested anywhere below a ``permissions`` wrapper is caught by this same
+    check during the ordinary recursive walk — no separate "parent must be
+    named `permissions`" requirement needed. QA finding (independent
+    adversarial review, round A, confirmed reproduced): an earlier draft
+    required the ``permissions`` wrapper explicitly and matched ``defaultMode``
+    only as an exact-match key — both a flat top-level
+    ``"permissions.defaultMode"`` key (no wrapper dict at all) and the
+    dotted-suffix spelling sailed through untouched. Same depth cap (12) as
+    its siblings."""
     if _depth > 12:
         return False
     if isinstance(v, dict):
         for k, val in v.items():
-            if (isinstance(k, str) and k.strip().lower() == "permissions"
-                    and isinstance(val, dict)
-                    and any(isinstance(dk, str) and dk.strip().lower() == "defaultmode"
-                            and isinstance(dv, str) and dv.strip().lower() == "bypasspermissions"
-                            for dk, dv in val.items())):
-                return True
+            if isinstance(k, str):
+                kl = k.strip().lower()
+                if ((kl == "defaultmode" or kl.endswith(".defaultmode"))
+                        and isinstance(val, str) and val.strip().lower() == "bypasspermissions"):
+                    return True
             if _permission_bypass_struct_key_hit(val, _depth + 1):
                 return True
         return False
@@ -4156,15 +4166,22 @@ def _permission_bypass_struct_key_hit(v, _depth: int = 0) -> bool:
 
 
 def _permission_bypass_mcp_bareword_hit(a: dict) -> bool:
-    """Fallback signal for ``ActionClass.MCP`` only: both ``defaultMode`` and
-    ``bypassPermissions`` appear, exact-match, as plain string LEAVES anywhere
-    in the (recursively) flattened raw MCP args — closes a "set config
-    value"-style MCP tool's ``{"key": "permissions.defaultMode", "value":
-    "bypassPermissions"}`` shape, the same bareword-leaf gap
-    `_statusline_mcp_bareword_hit` already closes for its own target. Both
-    signals required to keep this MCP-only fallback narrow."""
+    """Fallback signal for ``ActionClass.MCP`` only: a ``defaultMode`` leaf
+    (bare, or dotted-suffix ``...defaultmode`` — the same flat-key convention
+    `_permission_bypass_struct_key_hit` covers) co-occurring with a
+    ``bypassPermissions`` leaf, both exact-match, as plain string LEAVES
+    anywhere in the (recursively) flattened raw MCP args — closes a "set
+    config value"-style MCP tool's ``{"key": "permissions.defaultMode",
+    "value": "bypassPermissions"}`` shape, the same bareword-leaf gap
+    `_statusline_mcp_bareword_hit` already closes for its own target. QA
+    finding (independent adversarial review, round A, confirmed reproduced):
+    an earlier draft required the ``defaultmode`` leaf to match EXACTLY, which
+    a real MCP set-config tool's own flattened ``"permissions.defaultMode"``
+    key value never does — closed by also accepting the dotted-suffix form.
+    Both signals still required to keep this MCP-only fallback narrow."""
     leaves = {s.strip().lower() for s in _flatten_strings(a) if isinstance(s, str)}
-    return "defaultmode" in leaves and "bypasspermissions" in leaves
+    default_mode_hit = any(leaf == "defaultmode" or leaf.endswith(".defaultmode") for leaf in leaves)
+    return default_mode_hit and "bypasspermissions" in leaves
 
 
 def _permission_bypass_json_key_hit(content: str) -> bool:
@@ -4225,6 +4242,41 @@ def rule_permission_bypass_protect(ev: Event, policy=None) -> Optional[Decision]
     local.json`, and (2) the CLI's own `--dangerously-skip-permissions`/
     `--permission-mode bypassPermissions` flag, which needs no file write of
     its own at all.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows). Design/consistency review (round A) found no defects:
+    verified every wiring spot a sibling guard has (`Policy`, all three
+    `loader.py` spots, both `skills.py` knob lists, the `_REMEDIES` table,
+    README, `_CORE_RULES`), verified each specific factual docstring claim
+    against the actual sibling code it cites, and confirmed the escape-
+    hatch/mode/monitor conventions match every sibling guard exactly.
+    Bypass-hunting (round A) found and closed three real, reproduced gaps:
+    (1) a CRITICAL full bypass — `PERMISSION_BYPASS_JQ_RE`'s original
+    400-char bounded lookaheads (copied from `CLAUDE_STATUSLINE_JQ_RE`) were
+    defeated by a jq `#`-comment (real jq syntax, ignored by jq itself) used
+    as filler: ~380 non-whitespace characters right after the `jq` token
+    pushed `defaultMode`/`bypassPermissions` outside the window, and no
+    other pattern in this guard fired either (a jq path-assignment has no
+    colon-JSON shape, and `sponge` carries no write-verb for self-protect to
+    catch) — the command evaluated to a bare `ALLOW` with no rule at all.
+    Closed by dropping the fixed bound in favor of an unbounded, `;`-scoped
+    lookahead (see `PERMISSION_BYPASS_JQ_RE`'s own comment for the full
+    trade-off analysis); the identical shape reproduces against
+    `CLAUDE_STATUSLINE_JQ_RE` too, disclosed there as a pre-existing gap in a
+    different, already-shipped guard, out of scope for this guard alone to
+    fix. (2) an MCP "set config value"-style tool's flat dotted-path key
+    convention (`{"key": "permissions.defaultMode", "value":
+    "bypassPermissions"}`) evaded both the structural walk (required a
+    literal nested `permissions` dict) and the bareword fallback (required
+    an exact `defaultmode` leaf); closed by accepting a dotted-path SUFFIX
+    match in both. (3) the same flat dotted-key spelling as a literal JSON
+    key in Edit/Write content evaded `PERMISSION_BYPASS_MODE_KEY_RE`; closed
+    by widening it to accept an optional `permissions.` prefix inside the
+    quoted key. Full suite green throughout (1944 tests after the fixes),
+    and all three new patterns clean on adversarial input up to 20,000
+    characters (`normalize.scan_surface`'s own shared truncation cap)
+    through the live `evaluate()` pipeline.
 
     Config (``policy.permission_bypass``): ``mode`` (deny|ask|monitor|off,
     default ask), ``allow`` (regexes on the path/command that skip the gate

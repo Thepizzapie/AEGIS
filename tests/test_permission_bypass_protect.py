@@ -314,6 +314,112 @@ def test_shell_jq_ampersand_in_quoted_value_gated():
     assert _gated(d) and d.rule == "permission-bypass-protect"
 
 
+def test_shell_jq_comment_padding_over_400_chars_still_gated():
+    """QA finding (independent adversarial review, round A, confirmed
+    reproduced): a jq `#`-comment (real jq syntax, terminated by an actual
+    newline, ignored by jq itself) is NON-whitespace filler that
+    `_permission_bypass_normalize`'s whitespace-collapse step does nothing
+    to shrink — >~380 such characters right after the `jq` token pushed
+    `defaultMode`/`bypassPermissions` outside the original 400-char bounded
+    window, and no other pattern in this guard fired either (a jq
+    path-assignment has no `"key": "value"` colon shape for
+    `PERMISSION_BYPASS_MODE_KEY_RE` to match, and `sponge` carries no
+    write-verb for self-protect to catch). Closed by dropping the fixed
+    bound entirely in favor of an unbounded, `;`-scoped lookahead."""
+    filler = "#" + ("a" * 380) + "\n"
+    cmd = ("cat .claude/settings.local.json | jq '" + filler
+           + '.permissions.defaultMode = "bypassPermissions"'
+           + "' | sponge .claude/settings.local.json")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "permission-bypass-protect"
+
+
+def test_shell_jq_string_literal_padding_over_400_chars_still_gated():
+    """The identical bypass shape using a jq no-op string-literal binding
+    (`"..." as $unused |`) instead of a `#`-comment — confirms the fix is a
+    real unbounded window, not merely a comment-stripping patch that would
+    leave this equally-valid filler shape open."""
+    filler = '"' + ("a" * 380) + '" as $unused | '
+    cmd = ("jq '" + filler + '.permissions.defaultMode = "bypassPermissions"'
+           + "' .claude/settings.local.json | sponge .claude/settings.local.json")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "permission-bypass-protect"
+
+
+def test_shell_jq_genuinely_unrelated_far_mention_in_same_statement_asks():
+    """Accepted trade-off of dropping the bound: a legitimate `jq` edit
+    against `.claude/settings.local.json` (no dangerous assignment of its
+    own) followed, in the SAME `;`-free compound command, by an unrelated
+    mention of both signal words now asks unnecessarily — a narrow false
+    positive, not a missed real plant, the direction this file always
+    resolves in favor of. Pinned here so a future change that narrows this
+    back down doesn't silently reopen the finding this fix closes."""
+    cmd = ('jq \'.foo = 1\' .claude/settings.local.json && '
+           'echo "totally unrelated: defaultMode bypassPermissions"')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "permission-bypass-protect"
+
+
+def test_shell_jq_unrelated_mention_past_semicolon_boundary_not_gated():
+    """The window still stops at a real `;` statement boundary — only `&`/
+    `|`/newline are left unexcluded (matching `CLAUDE_STATUSLINE_JQ_RE`'s own
+    documented reasoning), so an unrelated mention in a genuinely SEPARATE
+    `;`-delimited statement stays out of scope."""
+    cmd = ('jq \'.foo = 1\' .claude/settings.local.json ; '
+           'echo "totally unrelated: defaultMode bypassPermissions"')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert not _gated(d)
+
+
+def test_mcp_dotted_key_set_config_shape_gated():
+    """QA finding (independent adversarial review, round A, confirmed
+    reproduced): a "set config value"-style MCP tool's own flat dotted-path
+    key convention (`{"key": "permissions.defaultMode", "value":
+    "bypassPermissions"}`) evaded both the structural walk (required a
+    literal nested `permissions` dict) and the bareword fallback (required
+    an EXACT `defaultmode` leaf) — neither matches a single flattened string
+    leaf `"permissions.defaultmode"`. Closed by also accepting a dotted-path
+    SUFFIX match in both."""
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions.defaultMode",
+                                 "bypassPermissions"), EMPTY)
+    assert _gated(d) and d.rule == "permission-bypass-protect"
+
+
+def test_mcp_dotted_key_other_value_not_gated():
+    d = evaluate(_mcp_key_value(".claude/settings.local.json", "permissions.defaultMode",
+                                 "acceptEdits"), EMPTY)
+    assert not _gated(d)
+
+
+def test_flat_dotted_key_write_content_gated():
+    """The same dotted-path spelling as a literal JSON key in Edit/Write
+    content — closed by widening `PERMISSION_BYPASS_MODE_KEY_RE` to accept
+    an optional `permissions.` prefix inside the quoted key."""
+    d = evaluate(_write(".claude/settings.local.json",
+                         '{"permissions.defaultMode": "bypassPermissions"}'), EMPTY)
+    assert _gated(d) and d.rule == "permission-bypass-protect"
+
+
+def test_flat_dotted_key_struct_walk_gated():
+    d = evaluate(_mcp_nested_json(".claude/settings.local.json",
+                                   {"permissions.defaultMode": "bypassPermissions"}), EMPTY)
+    assert _gated(d) and d.rule == "permission-bypass-protect"
+
+
+def test_perf_no_redos_on_jq_comment_padding_near_normalize_cap():
+    """The unbounded lookaheads (`[^;]*` in place of the original
+    `[^;]{0,400}`) must still be linear-time, not quadratic/exponential,
+    even against filler sized right up against `normalize.scan_surface`'s
+    own shared 20,000-char truncation cap."""
+    filler = "#" + ("a" * 19000) + "\n"
+    cmd = ("jq '" + filler + '.permissions.defaultMode = "bypassPermissions"'
+           + "' .claude/settings.local.json | sponge .claude/settings.local.json")
+    start = time.time()
+    d = evaluate(_shell(cmd), EMPTY)
+    assert time.time() - start < 1.0
+    assert _gated(d)
+
+
 def test_shell_gojq_drop_in_gated():
     d = evaluate(_shell(
         'gojq \'.permissions.defaultMode = "bypassPermissions"\' '
