@@ -2661,6 +2661,79 @@ CLAUDE_STATUSLINE_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code permission-bypass protection (.claude/settings.local.json) ---
+# A THIRD, distinct auto-exec/auto-approve surface in the same file
+# `CLAUDE_LOCAL_SETTINGS_PATH_RE` locates, one layer above `hooks`/`statusLine`:
+# Claude Code's own `permissions.defaultMode` setting controls whether the
+# runtime asks the human before EVERY tool call at all. Set to
+# `"bypassPermissions"`, it silences that prompt for every future tool call —
+# Bash, Edit, Write, every MCP tool, not one planted command like `hooks` or
+# `statusLine`, but the human checkpoint standing in front of ALL of them,
+# including any tool call this file's own rule set has no specific pattern
+# for. `rule_claude_hooks_protect`'s own docstring lists `permissions` by name
+# among the settings.local.json content it deliberately leaves ungated (true
+# for the key's ordinary, benign uses — narrowing `allow`, adding a project to
+# `additionalDirectories`) — but `defaultMode: "bypassPermissions"` is a
+# distinct, single enabling switch the same way `statusLine`'s `type:
+# "command"` is: Claude Code's own schema names exactly one value with this
+# effect, and once set, it does not merely add a new backdoor — it removes the
+# backstop protecting every OTHER surface Aegis's own guards don't happen to
+# name.
+#
+# Content-only check for a CONFIRMED settings.local.json path: `defaultMode`
+# being set to `bypassPermissions`, matched directly (no tempered-dot window
+# needed — unlike `statusLine`/`hooks`, whose dangerous sub-key sits inside a
+# nested object an attacker can pad, `defaultMode`'s value is a bare JSON
+# string immediately following the key, so `\s*` alone already absorbs any
+# amount of legitimate whitespace between key/colon/value with no bound to
+# outrun). Matched against a normalized copy (`\uXXXX`-decoded, the same
+# escape-spelling evasion `_statusline_normalize`/`_claude_hooks_json_key_hit`
+# already close for their own keys) so `"defaultMode"` or a
+# `bypassPermissions` value decode to the same signal a purely textual
+# check would otherwise miss.
+PERMISSION_BYPASS_MODE_KEY_RE = re.compile(
+    r"[\"']defaultMode[\"']\s*:\s*[\"']bypassPermissions[\"']",
+    re.IGNORECASE,
+)
+
+# jq has no `-i` flag, so a scripted edit is either a temp-file-then-`mv`
+# (caught by self-protect's own write-verb check, non-escapable for this
+# entire file) or piped through `sponge` — the same write-verb-less shape
+# `CLAUDE_HOOKS_JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE` already close for their own
+# keys, one key over: jq (or `gojq`/`jaq`), an assignment-shaped operator, and
+# BOTH `defaultMode` and `bypassPermissions` as bare substrings (order-
+# agnostic), all within the same bounded, `;`-only-excluded window those two
+# sibling patterns already use (deliberately not excluding `&`/`|`/newline —
+# see `CLAUDE_STATUSLINE_JQ_RE`'s own comment for why: a `&` or newline inside
+# a QUOTED jq program value is not a real shell control operator, and
+# excluding either closed a confirmed, reproduced bypass there). Matched
+# against the same normalized (whitespace-collapsed, `\uXXXX`-decoded) copy
+# `CLAUDE_STATUSLINE_JQ_RE` is, for the identical padding/escape evasions.
+PERMISSION_BYPASS_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]{0,400}\.?defaultMode\b)"
+    r"(?=[^;]{0,400}\bbypassPermissions\b)",
+    re.IGNORECASE,
+)
+
+# A second, file-free bypass of the exact same switch: the `claude` CLI's own
+# `--dangerously-skip-permissions` flag (and its `--permission-mode
+# bypassPermissions` equivalent) launches a NEW Claude Code process with the
+# identical safety net already removed for that process's whole lifetime —
+# no `.claude/settings.local.json` write at all, so no path-based check above
+# ever sees it, and no diff, `git status`, or code review either. An agent
+# reaching for this from its own Bash tool spawns a child session with no
+# further human checkpoint for anything IT does. Anchored to the `claude`
+# binary name (matching `MCP_CLI_ADD_RE`'s own CLI-form style) so an unrelated
+# mention of either flag in prose/a comment/a commit message sharing a shell
+# line with something else entirely doesn't also match.
+PERMISSION_BYPASS_CLI_RE = re.compile(
+    r"\bclaude\b[^|;&\n]*--dangerously-skip-permissions\b"
+    r"|\bclaude\b[^|;&\n]*--permission-mode(?:=|\s+)[\"']?bypassPermissions\b",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

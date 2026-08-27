@@ -248,6 +248,16 @@ class Policy:
     # git/CI/session-restart trigger needed at all, unlike every other
     # auto-exec surface this file guards. See rules.rule_statusline_protect.
     statusline: dict = field(default_factory=dict)
+    # Claude Code permission-bypass protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers a `permissions.defaultMode: "bypassPermissions"` entry planted in
+    # `.claude/settings.local.json` -- the same file `claude_hooks`/
+    # `statusline` guard for their own keys -- which silences Claude Code's
+    # own confirmation prompt for every future tool call, not one planted
+    # command; and the equivalent, file-free `claude
+    # --dangerously-skip-permissions`/`--permission-mode bypassPermissions`
+    # CLI invocation. See rules.rule_permission_bypass_protect.
+    permission_bypass: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a
