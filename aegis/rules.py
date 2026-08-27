@@ -4273,10 +4273,23 @@ def rule_permission_bypass_protect(ev: Event, policy=None) -> Optional[Decision]
     match in both. (3) the same flat dotted-key spelling as a literal JSON
     key in Edit/Write content evaded `PERMISSION_BYPASS_MODE_KEY_RE`; closed
     by widening it to accept an optional `permissions.` prefix inside the
-    quoted key. Full suite green throughout (1944 tests after the fixes),
-    and all three new patterns clean on adversarial input up to 20,000
-    characters (`normalize.scan_surface`'s own shared truncation cap)
-    through the live `evaluate()` pipeline.
+    quoted key. Full suite green throughout (1944 tests after the fixes).
+    Follow-up verification pass confirmed all three fixes close their PoCs
+    with no regressions (the widened MCP-suffix/regex checks stay
+    character-exact — `"myapp.notDefaultMode"`/`"my.permissions.defaultMode"`
+    do not false-positive) and no ReDoS from the now-unbounded jq lookaheads,
+    but also reproduced one further, real gap: filler placed BEFORE the
+    signal (`jq`/the path/the assignment itself) rather than after, once long
+    enough, is truncated away entirely by `normalize.scan_surface`'s own
+    shared ``cmd[:_MAX]`` (20,000-char) cap — applied to the whole raw
+    command before ANY pattern in ANY guard ever sees it, this guard's own
+    unbounded window included — producing a silent `ALLOW` with no rule
+    firing. Confirmed pre-existing in `normalize.py`, untouched by this
+    commit, and shared by every guard that goes through `_shell_scan`, not
+    something the jq-window fix introduced or could close on its own;
+    disclosed below rather than patched here, the same disposition this
+    guard already gives the analogous inherited `CLAUDE_STATUSLINE_JQ_RE`
+    gap.
 
     Config (``policy.permission_bypass``): ``mode`` (deny|ask|monitor|off,
     default ask), ``allow`` (regexes on the path/command that skip the gate
@@ -4307,8 +4320,15 @@ def rule_permission_bypass_protect(ev: Event, policy=None) -> Optional[Decision]
     literal `claude` binary name, so an aliased/renamed binary, or a wrapper
     script that itself calls `claude --dangerously-skip-permissions`
     internally without that flag appearing in the outer command line, is not
-    caught; and, matching every sibling guard here, this reaches only the
-    tool-call surface Aegis's own PreToolUse hook is wired into — a CLI
+    caught; a shell command padded with enough filler BEFORE the actual
+    signal (rather than after, where this guard's own unbounded jq window
+    now holds regardless of length) is truncated away by `normalize.
+    scan_surface`'s own shared 20,000-character cap before this guard, or
+    any other in this file, ever sees the truncated tail — a real,
+    reproduced gap (QA follow-up verification pass), but one in shared
+    normalization infrastructure this commit doesn't touch, not specific to
+    this guard; and, matching every sibling guard here, this reaches only
+    the tool-call surface Aegis's own PreToolUse hook is wired into — a CLI
     invocation from OUTSIDE any Aegis-guarded session (a human's own
     terminal, an unrelated automation) is out of scope by design, the same
     boundary every guard in this file already accepts."""

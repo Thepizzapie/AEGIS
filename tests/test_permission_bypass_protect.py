@@ -420,6 +420,25 @@ def test_perf_no_redos_on_jq_comment_padding_near_normalize_cap():
     assert _gated(d)
 
 
+def test_shell_filler_before_signal_past_normalize_cap_not_gated_disclosed_gap():
+    """QA follow-up verification finding: filler placed BEFORE the signal
+    (rather than after, where the unbounded window above holds regardless of
+    length) is truncated away by `normalize.scan_surface`'s own shared
+    `cmd[:_MAX]` (20,000-char) cap before ANY pattern in ANY guard ever sees
+    the truncated tail — a real gap, but in shared normalization
+    infrastructure this guard doesn't own or touch (confirmed pre-existing,
+    present for every guard that goes through `_shell_scan`), disclosed in
+    `rule_permission_bypass_protect`'s own docstring rather than fixed here.
+    Pinned so a future change to the shared cap is verified against this
+    guard too."""
+    filler = "#" + ("a" * 21000) + "\n"
+    cmd = (filler + "cat .claude/settings.local.json | jq "
+           '\'.permissions.defaultMode = "bypassPermissions"\' | '
+           "sponge .claude/settings.local.json")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert not _gated(d)  # disclosed gap, not a passing security property
+
+
 def test_shell_gojq_drop_in_gated():
     d = evaluate(_shell(
         'gojq \'.permissions.defaultMode = "bypassPermissions"\' '
