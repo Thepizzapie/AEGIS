@@ -5379,10 +5379,24 @@ def _gcp_adc_json_weak_hit(content: str) -> bool:
     ``GCP_ADC_CONTENT_RE``'s textual check, not a replacement for it (an
     ordinary Edit's ``new_string`` is usually a partial fragment with no
     enclosing braces, which never parses standalone JSON, so the textual
-    check still carries most of the real-world load)."""
+    check still carries most of the real-world load).
+
+    Also catches ``RecursionError``: CPython's own ``json`` decoder is
+    recursive-descent, so a deeply-nested-enough payload (e.g. ``"[" * 100000``)
+    raises it instead of a clean ``ValueError`` -- reachable input, not a
+    theoretical edge case, and `engine._run`'s own per-rule ``except
+    Exception`` would eventually catch it too, but only by failing the
+    ENTIRE ``rule_cloud_cred_exec_protect`` call open, silently losing an
+    already-computed real AWS/Kube hit from the SAME call alongside the GCP
+    check that crashed. Catching it locally instead keeps a crafted-GCP-
+    payload failure scoped to this one signal, not to the whole guard --
+    the same defensive-scope reasoning ``_claude_hooks_json_key_hit``'s own
+    sibling ``except (ValueError, TypeError)`` should arguably also widen
+    to, a shared, pre-existing gap in this file, not unique to this
+    addition."""
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return False
     return _gcp_adc_weak_struct_hit(obj)
 
@@ -5392,7 +5406,7 @@ def _gcp_adc_json_strong_hit(content: str) -> bool:
     struct_hit`` instead."""
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return False
     return _gcp_adc_strong_struct_hit(obj)
 

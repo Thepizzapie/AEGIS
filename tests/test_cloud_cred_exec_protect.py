@@ -516,6 +516,28 @@ def test_gcp_adc_json_walk_ignores_invalid_json():
     assert not _gated(d)
 
 
+def test_gcp_adc_deeply_nested_json_does_not_crash_or_hang():
+    """`json.loads` is recursive-descent -- a deeply-nested-enough payload
+    raises `RecursionError`, not a clean `ValueError`/`TypeError`. Must not
+    propagate (crashing/hanging `evaluate()`) and, since the AWS/Kube
+    checks in this SAME rule call run first, must not swallow an
+    already-computed real AWS/Kube hit in the same call either."""
+    deep = "[" * 100000 + "]" * 100000
+    d = evaluate(_write("staging/x.json", content=deep), EMPTY)
+    assert not _gated(d)
+
+
+def test_gcp_adc_deeply_nested_json_does_not_mask_real_aws_hit_same_call():
+    """The regression this guards against: a crafted, deeply-nested GCP-
+    shaped payload sitting alongside a REAL AWS credential_process
+    directive in the same Write must not suppress detection of the real
+    hit via an uncaught RecursionError blowing up the whole rule call."""
+    deep = "[" * 100000 + "]" * 100000
+    content = "credential_process = /tmp/evil\n" + deep
+    d = evaluate(_write(".aws/config", content=content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_gcloud_create_cred_config_realistic_long_flags_gated():
     """QA finding (bypass-hunting round): the original 300-char gap between
     `create-cred-config` and `--executable-command` was too tight for an
