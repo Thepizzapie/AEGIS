@@ -4421,10 +4421,20 @@ GCP_ADC_PATH_RE = re.compile(
 # the `alpha`/`beta` command-group prefix) that PLANTS this exact JSON shape
 # to disk in one shell invocation, no literal JSON text ever appearing in
 # the tool call at all. Mirrors AWS_CRED_PROCESS_CLI_RE/KUBE_EXEC_CRED_CLI_
-# RE's own 200/300-char verb-adjacency convention.
+# RE's own verb-adjacency convention -- widened past their 200/300-char
+# gaps to 500 between `create-cred-config` and `--executable-command`: QA
+# (bypass-hunting round) found the original 300-char gap too tight for an
+# entirely realistic, non-adversarial invocation -- a full workload-
+# identity-pool resource path plus a couple of routine flags straight from
+# Google's own WIF documentation (`--service-account=`, `--service-
+# account-token-lifetime-seconds=`, `--output-file=`) ahead of
+# `--executable-command` routinely exceeds 300 chars with no obfuscation
+# involved, the identical "realistic invocation, not an attack, defeats a
+# too-tight bound" class the AWS/Kube CLI regexes' own prior QA rounds
+# already found and fixed.
 GCP_ADC_CLI_RE = re.compile(
     r"\bgcloud\b[^|;&\n]{0,200}\bworkload-identity-pools\b[^|;&\n]{0,200}"
-    r"\bcreate-cred-config\b[^|;&\n]{0,300}--executable-command\b",
+    r"\bcreate-cred-config\b[^|;&\n]{0,500}--executable-command\b",
     re.IGNORECASE,
 )
 

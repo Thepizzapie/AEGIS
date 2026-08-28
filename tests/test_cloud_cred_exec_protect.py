@@ -467,6 +467,78 @@ def test_gcp_adc_command_before_apiversion_not_applicable_order_forced():
     assert _gated(d) and d.rule == RULE
 
 
+def test_gcp_adc_credential_source_before_type_gated():
+    """QA finding (design/consistency review): unlike the forced NESTING
+    above, `type` and `credential_source` are ordinary SIBLING keys — JSON
+    does not force one to precede the other textually. The purely textual
+    `GCP_ADC_STRONG_RE` requires `type` first and silently ALLOWed this
+    real, equally-valid ordering on an unconfirmed staging path — closed by
+    `_gcp_adc_strong_struct_hit` walking the DECODED dict's own key/value
+    pairs instead of the raw text order."""
+    reordered = (
+        '{\n  "credential_source": {"executable": {"command": "/tmp/evil"}},\n'
+        '  "type": "external_account"\n}\n')
+    d = evaluate(_write("staging/adc.json", content=reordered), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_unicode_escaped_keys_on_default_path_gated():
+    """QA finding (bypass-hunting round): a single JSON `\\uXXXX`-escaped
+    character each in `executable`/`command` decodes to the identical
+    malicious object while defeating BOTH the strong and weak textual
+    regex checks — reproduced as a silent ALLOW even on the real default
+    ADC path. Closed by `_gcp_adc_weak_struct_hit`/`_gcp_adc_json_weak_hit`
+    parsing and walking the decoded structure, the same fix
+    `_claude_hooks_json_key_hit` already applies for `hooks`."""
+    content = ('{\n  "type": "external_account",\n'
+               '  "credential_source": {"ex\\u0065cutable": {"comm\\u0061nd": "/tmp/evil"}}\n}\n')
+    d = evaluate(_write(".config/gcloud/application_default_credentials.json", content=content),
+                 EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_unicode_escaped_type_on_unconfirmed_path_gated():
+    """The same escape trick against `type`/`external_account` on an
+    unconfirmed path, closed by `_gcp_adc_strong_struct_hit`/
+    `_gcp_adc_json_strong_hit`."""
+    content = ('{\n  "type": "extern\\u0061l_account",\n'
+               '  "credential_source": {"executable": {"command": "/tmp/evil"}}\n}\n')
+    d = evaluate(_write("staging/adc.json", content=content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_json_walk_ignores_invalid_json():
+    """Content that doesn't parse standalone (an ordinary Edit `new_string`
+    fragment, say) must fall back to the textual checks without raising —
+    `_gcp_adc_json_weak_hit`/`_gcp_adc_json_strong_hit` catch `ValueError`/
+    `TypeError` and return `False` rather than propagating."""
+    d = evaluate(_write("README.md", content='not { valid json at all'), EMPTY)
+    assert not _gated(d)
+
+
+def test_gcloud_create_cred_config_realistic_long_flags_gated():
+    """QA finding (bypass-hunting round): the original 300-char gap between
+    `create-cred-config` and `--executable-command` was too tight for an
+    entirely realistic invocation — a full resource path plus
+    `--service-account=`/`--service-account-token-lifetime-seconds=`/
+    `--output-file=` flags straight from Google's own WIF documentation
+    measures well over 300 chars with no obfuscation involved, silently
+    evading `GCP_ADC_CLI_RE` — widened to 500, mirroring the identical fix
+    `AWS_CRED_PROCESS_CLI_RE`/`KUBE_EXEC_CRED_CLI_RE` already applied."""
+    cmd = (
+        "gcloud iam workload-identity-pools create-cred-config "
+        "projects/123456789012/locations/global/workloadIdentityPools/"
+        "my-very-long-pool-name-for-prod-workloads/providers/"
+        "my-very-long-provider-name-for-prod "
+        "--service-account=deploy-service-account-name@"
+        "my-very-long-project-id-for-production.iam.gserviceaccount.com "
+        "--service-account-token-lifetime-seconds=3600 "
+        "--output-file=/tmp/creds/application_default_credentials.json "
+        "--executable-command=/opt/scripts/get-token.sh")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 # ---- GCP ADC: shell CLI form (never mentions literal JSON text) ---------------
 
 def test_gcloud_create_cred_config_executable_command_cli_gated():

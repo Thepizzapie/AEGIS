@@ -5306,6 +5306,97 @@ def _cloud_cred_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
+def _gcp_adc_weak_struct_hit(v, _depth: int = 0) -> bool:
+    """Walk decoded JSON for the ``credential_source`` -> ``executable`` ->
+    ``command`` nesting as actual DICT KEYS -- closes the identical
+    ``\\uXXXX``-escape class ``_claude_hooks_json_key_hit`` already closes
+    for ``hooks``, here for GCP ADC's own key vocabulary: any of
+    ``credential_source``/``executable``/``command`` can be spelled
+    byte-for-byte differently in the raw text via JSON's own per-character
+    ``\\uXXXX`` escape while decoding to the exact same key, defeating a
+    purely textual regex that never performs that decode. Same depth cap
+    (12) as every sibling structural walker in this file (``_claude_hooks_
+    struct_key_hit``, ``_devcontainer_struct_key_hit``, ...).
+
+    QA finding (independent adversarial review, bypass-hunting round):
+    reproduced as a silent ALLOW against a whole-file ``Write`` straight to
+    the real default ADC path (``~/.config/gcloud/application_default_
+    credentials.json``) with one escaped character each in ``executable``/
+    ``command`` -- the worst-case outcome this guard exists to prevent,
+    closed here the same way ``rule_claude_hooks_protect`` closed its own
+    reproduced instance of this exact bug class."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        cs = v.get("credential_source")
+        if isinstance(cs, dict):
+            ex = cs.get("executable")
+            if isinstance(ex, dict) and "command" in ex:
+                return True
+        return any(_gcp_adc_weak_struct_hit(val, _depth + 1) for val in v.values())
+    if isinstance(v, (list, tuple)):
+        return any(_gcp_adc_weak_struct_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _gcp_adc_strong_struct_hit(v, _depth: int = 0) -> bool:
+    """Same walk as ``_gcp_adc_weak_struct_hit``, additionally requiring the
+    ``type: external_account`` discriminator as a SIBLING key of the
+    matched ``credential_source`` dict -- the semantic, decode-based
+    equivalent of ``GCP_ADC_STRONG_RE``'s textual triad. Closes both that
+    regex's literal-substring weakness (the same ``\\uXXXX`` class
+    ``_gcp_adc_weak_struct_hit`` closes) AND, independently, its
+    sibling-key-ORDER dependency: JSON's own nesting rules force ``command``
+    to appear textually inside ``executable`` inside ``credential_source``
+    (a real object can't be written any other way), but ``type`` and
+    ``credential_source`` are ordinary SIBLING keys at the same dict level
+    -- nothing in JSON forces one to precede the other textually, so a
+    ``credential_source`` block written before its file's ``type`` key
+    (equally valid, equally common depending on which key a generator
+    happens to emit first) defeated the order-sensitive textual regex
+    outright, a real, reproduced silent-ALLOW QA finding (design/
+    consistency review) on an unconfirmed staging path. Checking the
+    DECODED dict's own key/value pairs, regardless of the order they were
+    written in, has no such dependency at all."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        cs = v.get("credential_source")
+        if isinstance(cs, dict):
+            ex = cs.get("executable")
+            if (isinstance(ex, dict) and "command" in ex
+                    and str(v.get("type", "")).strip().lower() == "external_account"):
+                return True
+        return any(_gcp_adc_strong_struct_hit(val, _depth + 1) for val in v.values())
+    if isinstance(v, (list, tuple)):
+        return any(_gcp_adc_strong_struct_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _gcp_adc_json_weak_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    it with ``_gcp_adc_weak_struct_hit`` -- an additional signal alongside
+    ``GCP_ADC_CONTENT_RE``'s textual check, not a replacement for it (an
+    ordinary Edit's ``new_string`` is usually a partial fragment with no
+    enclosing braces, which never parses standalone JSON, so the textual
+    check still carries most of the real-world load)."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _gcp_adc_weak_struct_hit(obj)
+
+
+def _gcp_adc_json_strong_hit(content: str) -> bool:
+    """Same as ``_gcp_adc_json_weak_hit``, walking with ``_gcp_adc_strong_
+    struct_hit`` instead."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _gcp_adc_strong_struct_hit(obj)
+
+
 def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block three cloud/cluster credential-BROKERING primitives that name
     an arbitrary EXTERNAL COMMAND in a config file: AWS CLI/SDK's
@@ -5458,12 +5549,19 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     (a templating step, a generator script) rather than appearing as a
     literal defeats every check here; no ``find``-path-indirection
     fallback (same disclosed absence the AWS/Kube halves of this guard
-    already accept); and the JSON-nesting checks are regex-based, not a
-    real JSON parse, so a byte-identical key name reached through
-    unusual-but-valid JSON whitespace/escaping between tokens the
-    ``{0,500}``/``{0,2000}`` gaps don't anticipate could evade detection
-    the same "denylist, not a parser" trade-off every guard in this file
-    accepts.
+    already accept); and, for the Edit/Write/MCP branch only, the
+    JSON-nesting checks are backed by BOTH a textual regex AND a semantic
+    ``json.loads``-and-walk pass (``_gcp_adc_weak_struct_hit``/
+    ``_gcp_adc_strong_struct_hit``) that is order- and escaping-
+    independent by construction -- QA (see below) found and closed both a
+    sibling-key ordering dependency and a JSON ``\\uXXXX``-escape bypass
+    the textual-only regex originally had. The semantic walk only fires
+    when the scanned content parses as STANDALONE valid JSON, so an
+    ordinary Edit's ``new_string`` fragment (no enclosing braces) still
+    relies on the textual regex alone, and the walk is not wired into the
+    shell branch at all (a heredoc-embedded JSON payload is scanned as raw
+    text) -- the same Edit-fragment/shell-branch scope
+    ``_claude_hooks_json_key_hit`` already accepts for ``hooks``.
 
     QA history (two independent adversarial reviews, run in parallel --
     bypass-hunting and design/consistency, the same convention every
@@ -5499,7 +5597,63 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     closed by stripping full-line ``#`` comments (via ``patterns.strip_
     comment_lines``) from both branches' scanned text before every
     content-shape check, which also, as a side effect, correctly stops
-    treating an entirely commented-out shell line as a real invocation."""
+    treating an entirely commented-out shell line as a real invocation.
+
+    QA history, GCP ADC addition (two independent adversarial reviews, run
+    in parallel -- bypass-hunting and design/consistency, the same
+    convention the original AWS/Kube round above used): design/consistency
+    review confirmed the ``_FETCH_HUMAN_ESCAPABLE`` wiring for ``GCP_ADC_
+    PATH_RE`` end to end (a live ``wget -O`` write to a relative default-
+    ADC-shaped path correctly delegates to ``fetch-to-file-protect``),
+    round-tripped a real ``cloud_cred_exec:`` YAML policy block through
+    ``load_policy()``/``aegis validate`` for the GCP branch specifically
+    (not just AWS/Kube, which already had coverage), confirmed the README
+    table row and Limits-paragraph wording against the code, and confirmed
+    no regression of the earlier "every API call" wording issue -- but
+    found ``GCP_ADC_STRONG_RE``'s ordering assumption unsound: JSON forces
+    ``command`` to nest inside ``executable`` inside ``credential_source``
+    (a real object cannot be written any other way), but ``type`` and
+    ``credential_source`` are ordinary SIBLING keys with no such
+    constraint, and a real, equally-valid ``credential_source``-before-
+    ``type`` ordering defeated the order-sensitive textual regex outright
+    on an unconfirmed staging path -- a silent ALLOW, not merely a
+    disclosed gap. Bypass-hunting independently found and reproduced two
+    more real issues: JSON's own per-character ``\\uXXXX`` escape lets
+    ``executable``/``command``/``type``/``external_account`` be spelled
+    byte-for-byte differently in the raw text while decoding to the exact
+    same keys/value -- reproduced as a silent ALLOW even on a whole-file
+    ``Write`` straight to the REAL default ADC path (``~/.config/gcloud/
+    application_default_credentials.json``), the worst-case outcome this
+    guard exists to prevent, not a corner case; and ``GCP_ADC_CLI_RE``'s
+    original 300-char gap between ``create-cred-config`` and
+    ``--executable-command`` reintroduced the exact "too-tight bound for a
+    realistic, non-adversarial invocation" bug class the AWS/Kube CLI
+    regexes' own prior QA round above already found and fixed -- a full
+    workload-identity-pool resource path plus routine
+    ``--service-account=``/``--service-account-token-lifetime-seconds=``/
+    ``--output-file=`` flags straight from Google's own WIF documentation
+    measures well over 300 chars with no obfuscation at all. All three
+    closed before merge: the ordering and escaping issues together by
+    ``_gcp_adc_weak_struct_hit``/``_gcp_adc_strong_struct_hit`` parsing
+    ``json.loads``-valid content and walking the DECODED structure's own
+    key/value pairs (order- and escaping-independent by construction) as
+    an additional signal alongside the textual regexes -- not a
+    replacement for them, the identical "textual check still carries most
+    of the real-world load, semantic walk closes what it structurally
+    cannot see" division ``_claude_hooks_json_key_hit`` already
+    established for ``hooks`` -- and the CLI gap widened to 500 chars.
+    Residual, explicitly accepted scope: the semantic walk only fires on
+    content that parses as STANDALONE valid JSON (an ordinary Edit's
+    ``new_string`` is usually a partial fragment with no enclosing braces,
+    which never parses on its own, so the textual regexes still carry that
+    case); a value assembled indirectly (a templating step, a generator
+    script) still defeats both the textual and semantic checks alike, the
+    same "computed indirectly" class every sibling guard in this file
+    already accepts; and the semantic walk is not itself wired into the
+    shell branch (a heredoc-embedded JSON payload is scanned as raw shell
+    text, not isolated and parsed), mirroring the same scope
+    ``_claude_hooks_json_key_hit`` accepts for its own Edit/Write/MCP-only
+    reach."""
     cfg = getattr(policy, "cloud_cred_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5549,8 +5703,10 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         gcp_path_confirmed = bool(path_text and patterns.GCP_ADC_PATH_RE.search(path_text))
         gcp_hit = bool(
             patterns.GCP_ADC_STRONG_RE.search(scan_content)
+            or _gcp_adc_json_strong_hit(scan_content)
             or (gcp_path_confirmed
-                and patterns.GCP_ADC_CONTENT_RE.search(scan_content)))
+                and (patterns.GCP_ADC_CONTENT_RE.search(scan_content)
+                     or _gcp_adc_json_weak_hit(scan_content))))
         if not (aws_hit or kube_hit or gcp_hit):
             return None
         if (os.environ.get("AEGIS_ALLOW_CLOUD_CRED_EXEC")
