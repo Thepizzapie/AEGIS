@@ -4284,7 +4284,8 @@ def gitmodules_add_loose_hit(cmd: str) -> bool:
 # inline forms are the dominant, expected way this surface is reached). A
 # GCP Application Default Credentials `external_account` executable-
 # sourced-credential JSON (`credential_source.executable.command`) is a
-# related but DISTINCT mechanism this guard does not cover at all.
+# related but DISTINCT mechanism -- covered separately below by
+# GCP_ADC_STRONG_RE/GCP_ADC_CONTENT_RE/GCP_ADC_PATH_RE/GCP_ADC_CLI_RE.
 
 AWS_CONFIG_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.aws" + _WIN_TRIM + _SEP + r"(?:config|credentials)" + _CI_END,
@@ -4353,6 +4354,87 @@ KUBE_EXEC_CRED_STRONG_RE = re.compile(
 KUBE_EXEC_CRED_CLI_RE = re.compile(
     r"\bkubectl\b[^|;&\n]{0,200}\bconfig\b[^|;&\n]{0,200}\bset-credentials\b"
     r"[^|;&\n]{0,300}--exec-command\b",
+    re.IGNORECASE,
+)
+
+# GCP Application Default Credentials (ADC) "external_account" EXECUTABLE-
+# sourced credential -- Workload Identity Federation's own documented
+# mechanism (google-auth's `ExternalAccountCredentials`, used by gcloud,
+# every google-cloud-* SDK, and Terraform's own GCP provider) for exchanging
+# a third-party token for a live GCP access token. A nested
+# `credential_source.executable.command` key names an arbitrary EXTERNAL
+# COMMAND that library EXECUTES and parses stdout from as the source token
+# on every credential refresh -- the identical "write now, auto-exec later,
+# handed a live credential every time it runs" shape AWS_CRED_PROCESS_*/
+# KUBE_EXEC_CRED_* above already cover, one cloud provider over. Google's
+# own client libraries require an explicit `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_
+# EXECUTABLES=1` opt-in before an executable-sourced credential will run at
+# all -- friction Google itself added in response to exactly this risk --
+# but that env var is something the SAME agent session (or a build script it
+# plants alongside) can set right next to planting the file, so it is not a
+# substitute for gating the plant itself.
+#
+# JSON key nesting makes the ORDER structurally forced, unlike Kubernetes'
+# sibling `exec:`/`apiVersion:`/`command:` keys above: `command` can only
+# ever appear, textually, inside `executable`, which can only ever appear
+# inside `credential_source` -- no reverse-order variant is needed the way
+# KUBE_EXEC_CRED_STRONG_RE needs one for `apiVersion:`/`command:`.
+#
+# Strong, path-INDEPENDENT triad: the top-level `"type": "external_account"`
+# discriminator (the field separating this from an ordinary GCP service-
+# account KEY file, which has no `credential_source` at all) followed by the
+# full `credential_source` -> `executable` -> `command` nesting.
+GCP_ADC_STRONG_RE = re.compile(
+    r'"type"\s*:\s*"external_account"'
+    r'.{0,2000}?"credential_source"\s*:\s*\{'
+    r'.{0,500}?"executable"\s*:\s*\{'
+    r'.{0,500}?"command"\s*:',
+    re.IGNORECASE | re.DOTALL,
+)
+# Weak, path-CONFIRMED-only pair check -- mirrors KUBE_EXEC_CRED_CONTENT_RE:
+# an Edit's `new_string` may only be inserting the `credential_source` block
+# itself into an already-scaffolded file, with the `"type": "external_
+# account"` line sitting in `old_string` context that never appears in
+# `new_string` -- the identical "new_string is just the inserted lines"
+# reasoning every sibling weak check already applies.
+GCP_ADC_CONTENT_RE = re.compile(
+    r'"credential_source"\s*:\s*\{.{0,500}?"executable"\s*:\s*\{.{0,500}?"command"\s*:',
+    re.IGNORECASE | re.DOTALL,
+)
+# Config file locations, mirroring AWS_CONFIG_PATH_RE/KUBE_CONFIG_PATH_RE:
+# gcloud's own default ADC file (`~/.config/gcloud/application_default_
+# credentials.json`, `%APPDATA%\gcloud\application_default_credentials.json`
+# on Windows -- `_SEP` already accepts either slash, and the `.config`
+# prefix is optional since a relocated/staged copy may sit directly under a
+# bare `gcloud/` directory), or any path referenced by a literal
+# `GOOGLE_APPLICATION_CREDENTIALS=<path>` env-var assignment -- the exact
+# mechanism every google-cloud SDK/library reads to locate this file at an
+# arbitrary, non-`.config/gcloud` path.
+GCP_ADC_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])(?:\.config" + _SEP + r")?gcloud" + _SEP
+    + r"application_default_credentials\.json" + _CI_END
+    + r"|GOOGLE_APPLICATION_CREDENTIALS(?:\s*=|\s+)['\"]?[^\s'\"|;&\n]+",
+    re.IGNORECASE,
+)
+# `gcloud iam workload-identity-pools create-cred-config ... --executable-
+# command=<cmd>` -- the documented, real gcloud CLI form (also reachable via
+# the `alpha`/`beta` command-group prefix) that PLANTS this exact JSON shape
+# to disk in one shell invocation, no literal JSON text ever appearing in
+# the tool call at all. Mirrors AWS_CRED_PROCESS_CLI_RE/KUBE_EXEC_CRED_CLI_
+# RE's own verb-adjacency convention -- widened past their 200/300-char
+# gaps to 500 between `create-cred-config` and `--executable-command`: QA
+# (bypass-hunting round) found the original 300-char gap too tight for an
+# entirely realistic, non-adversarial invocation -- a full workload-
+# identity-pool resource path plus a couple of routine flags straight from
+# Google's own WIF documentation (`--service-account=`, `--service-
+# account-token-lifetime-seconds=`, `--output-file=`) ahead of
+# `--executable-command` routinely exceeds 300 chars with no obfuscation
+# involved, the identical "realistic invocation, not an attack, defeats a
+# too-tight bound" class the AWS/Kube CLI regexes' own prior QA rounds
+# already found and fixed.
+GCP_ADC_CLI_RE = re.compile(
+    r"\bgcloud\b[^|;&\n]{0,200}\bworkload-identity-pools\b[^|;&\n]{0,200}"
+    r"\bcreate-cred-config\b[^|;&\n]{0,500}--executable-command\b",
     re.IGNORECASE,
 )
 
