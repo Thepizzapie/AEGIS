@@ -5208,6 +5208,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
+    (patterns.GCP_ADC_PATH_RE, "a GCP Application Default Credentials file"),
 )
 
 
@@ -5306,10 +5307,12 @@ def _cloud_cred_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
 
 
 def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
-    """Block two cloud/cluster credential-BROKERING primitives that name an
-    arbitrary EXTERNAL COMMAND in a config file: AWS CLI/SDK's
-    ``credential_process`` and Kubernetes kubeconfig's ``exec:``
-    credential-plugin block.
+    """Block three cloud/cluster credential-BROKERING primitives that name
+    an arbitrary EXTERNAL COMMAND in a config file: AWS CLI/SDK's
+    ``credential_process``, Kubernetes kubeconfig's ``exec:``
+    credential-plugin block, and GCP's Application Default Credentials
+    ``external_account`` executable-sourced credential
+    (``credential_source.executable.command``).
 
     THREAT MODEL: unlike a git alias or a shell startup file, the command
     planted here is handed a LIVE, freshly-minted credential every time it
@@ -5328,23 +5331,32 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``aws-iam-authenticator``/``gke-gcloud-auth-plugin`` legitimately use)
     does the same for a cluster bearer token or client certificate, on
     each token refresh any ``kubectl`` invocation or client-go-based tool
-    triggers through that context. Same "write now, auto-exec later, on
-    someone else's future invocation, reads as a routine one-line config
-    addition" shape ``rule_git_config_exec_protect``'s own ``credential.
-    helper`` half already covers for git -- here the payoff is live
-    cloud/cluster credentials instead of a git host's, and the blast
+    triggers through that context. GCP's Workload Identity Federation
+    ``external_account`` credential JSON does the same one cloud provider
+    over: a nested ``credential_source.executable.command`` key names an
+    external command that google-auth (and every google-cloud-* SDK,
+    Terraform's GCP provider, and ``gcloud`` itself) executes and parses
+    stdout from as the source token, on every credential refresh resolved
+    through that ADC file -- via ``GOOGLE_APPLICATION_CREDENTIALS``, the
+    default ``~/.config/gcloud/application_default_credentials.json``, or a
+    workload's attached credential config. Same "write now, auto-exec
+    later, on someone else's future invocation, reads as a routine one-line
+    config addition" shape ``rule_git_config_exec_protect``'s own
+    ``credential.helper`` half already covers for git -- here the payoff is
+    live cloud/cluster credentials instead of a git host's, and the blast
     radius is every future credential refresh resolved through that
-    profile/context, by this agent, a teammate, or CI, not just this
-    session.
+    profile/context/ADC file, by this agent, a teammate, or CI, not just
+    this session.
 
     Config (``policy.cloud_cred_exec``): ``mode`` (deny|ask|monitor|off,
     default ask), ``allow`` (regexes on the path/command that skip the
     gate -- a repo's own trusted, reviewed credential-process bootstrap,
     say). Defaults to ``ask`` for the same reason every sibling
-    ``*_protect`` guard does: ``credential_process``/an ``exec:`` plugin
-    is routine, sanctioned infrastructure (SSO bootstrapping, EKS/GKE/AKS
-    cluster auth) -- it just needs a human to have actually looked at the
-    specific command being wired in.
+    ``*_protect`` guard does: ``credential_process``/an ``exec:`` plugin/an
+    ``external_account`` executable-sourced credential is routine,
+    sanctioned infrastructure (SSO bootstrapping, EKS/GKE/AKS cluster auth,
+    GCP Workload Identity Federation) -- it just needs a human to have
+    actually looked at the specific command being wired in.
 
     Escapable only by a human: a trailing '# aegis-allow' on the shell
     form, or the env toggle ``AEGIS_ALLOW_CLOUD_CRED_EXEC=1`` set by the
@@ -5360,7 +5372,15 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     gated on the documented ``command:``/``apiVersion:`` shape
     client-go itself requires for this mechanism to work at all, which
     keeps the check specific to a real credential-exec plugin rather than
-    firing on the word "exec" alone.
+    firing on the word "exec" alone. The GCP ADC form is gated on the
+    documented ``credential_source`` -> ``executable`` -> ``command``
+    JSON nesting google-auth itself requires for an executable-sourced
+    credential to work at all -- the strong check additionally requires
+    the top-level ``"type": "external_account"`` discriminator (the field
+    separating this from an ordinary service-account KEY file, which has
+    no ``credential_source`` at all), keeping the check specific to a real
+    executable-sourced credential rather than firing on the generic word
+    "command" alone.
 
     Overlap with ``rule_containment``, the same nuance ``rule_shell_
     persist_protect``'s own docstring discloses for ``~/.ssh/*``: the
@@ -5383,7 +5403,23 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     requires a separator immediately before the dot; this guard's
     patterns accept start-of-string too); and (4) content staged in a
     differently-named file before being moved into place (the strong,
-    path-independent section/triad check).
+    path-independent section/triad check). For the GCP ADC form
+    specifically, this guard's coverage is NOT redundant with
+    ``rule_containment`` at all, for any of the three forms above --
+    ``CRED_RE`` matches a ``.aws``/``.kube`` path SEGMENT, but has no
+    ``.config/gcloud`` (or bare ``gcloud``) segment in its list, so an
+    ordinary absolute ``~/.config/gcloud/application_default_credentials.
+    json`` write is not pre-empted by containment the way ``~/.aws/
+    config``/``~/.kube/config`` are -- this guard is the FIRST and only
+    line of defense for that file, not a supplement to a stronger
+    existing one. A known, disclosed, separate gap this does NOT close:
+    containment's confidentiality-side READ protection for that same
+    file (an agent reading and exfiltrating the ADC JSON's long-lived
+    refresh material, independent of the executable-hijack write this
+    guard targets) stays uncovered -- out of scope for this guard, which
+    only gates the write/plant of an executable-sourced credential block,
+    the same "one guard, one primitive" scoping every sibling in this
+    file uses.
 
     Honest scope, the same denylist trade-offs every guard in this file
     accepts: ``AWS_CONFIG_FILE``/``AWS_SHARED_CREDENTIALS_FILE``/
@@ -5404,14 +5440,30 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     .aws/config``, ``curl -o .kube/config``) to a RELATIVE path is
     caught by none of this guard's own checks -- closed instead by
     ``rule_fetch_to_file_protect``'s backstop, which reuses ``AWS_
-    CONFIG_PATH_RE``/``KUBE_CONFIG_PATH_RE`` directly, the same way it
-    backstops every sibling guard (an ABSOLUTE/home-relative target is
-    caught earlier still, by ``rule_containment``, per the overlap
-    paragraph above). A GCP Application Default Credentials
-    ``external_account`` executable-sourced-credential JSON
-    (``credential_source.executable.command``) is a related but DISTINCT
-    mechanism this guard does not cover at all -- a known, disclosed gap,
-    not silently missed.
+    CONFIG_PATH_RE``/``KUBE_CONFIG_PATH_RE``/``GCP_ADC_PATH_RE`` directly,
+    the same way it backstops every sibling guard (an ABSOLUTE/home-
+    relative AWS/Kube target is caught earlier still, by
+    ``rule_containment``, per the overlap paragraph above -- the GCP ADC
+    path is NOT, per that same paragraph, so this backstop is its only
+    coverage against a direct ``curl -o``/``wget -O`` write). GCP-specific
+    disclosed gaps: ``GOOGLE_APPLICATION_CREDENTIALS`` is matched only as
+    a literal env-var-assignment prefix in the same command text (the
+    same "computed indirectly" class every sibling guard already
+    accepts) -- a workload's ambient/attached credential config (GCE/
+    GKE/Cloud Run metadata-based ADC, with no on-disk JSON file and no
+    env var at all) is a distinct GCP credential-resolution path this
+    guard structurally cannot reach, since there is no file write or
+    shell command for any content-based guard to observe; a
+    ``credential_source.executable.command`` value assembled indirectly
+    (a templating step, a generator script) rather than appearing as a
+    literal defeats every check here; no ``find``-path-indirection
+    fallback (same disclosed absence the AWS/Kube halves of this guard
+    already accept); and the JSON-nesting checks are regex-based, not a
+    real JSON parse, so a byte-identical key name reached through
+    unusual-but-valid JSON whitespace/escaping between tokens the
+    ``{0,500}``/``{0,2000}`` gaps don't anticipate could evade detection
+    the same "denylist, not a parser" trade-off every guard in this file
+    accepts.
 
     QA history (two independent adversarial reviews, run in parallel --
     bypass-hunting and design/consistency, the same convention every
@@ -5494,7 +5546,12 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             patterns.KUBE_EXEC_CRED_STRONG_RE.search(scan_content)
             or (kube_path_confirmed
                 and patterns.KUBE_EXEC_CRED_CONTENT_RE.search(scan_content)))
-        if not (aws_hit or kube_hit):
+        gcp_path_confirmed = bool(path_text and patterns.GCP_ADC_PATH_RE.search(path_text))
+        gcp_hit = bool(
+            patterns.GCP_ADC_STRONG_RE.search(scan_content)
+            or (gcp_path_confirmed
+                and patterns.GCP_ADC_CONTENT_RE.search(scan_content)))
+        if not (aws_hit or kube_hit or gcp_hit):
             return None
         if (os.environ.get("AEGIS_ALLOW_CLOUD_CRED_EXEC")
                 or _cloud_cred_exec_allowed_by_policy(cfg, p)):
@@ -5502,7 +5559,9 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         reason = (f"'{p}' is being written with an AWS credential_process directive"
                   if aws_hit else
                   f"'{p}' is being written with a Kubernetes exec-credential-"
-                  "plugin block")
+                  "plugin block" if kube_hit else
+                  f"'{p}' is being written with a GCP Application Default "
+                  "Credentials external_account executable-sourced credential")
         return _finish(Decision(action, "cloud-cred-exec-protect",
                          f"{reason} — it runs an arbitrary external command, "
                          "with the invoking process's privileges, and is "
@@ -5527,13 +5586,20 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             patterns.KUBE_EXEC_CRED_CLI_RE.search(scan_cmd)
             or patterns.KUBE_EXEC_CRED_STRONG_RE.search(scan_cmd)
             or (kube_path_hit and patterns.KUBE_EXEC_CRED_CONTENT_RE.search(scan_cmd)))
-        if not (aws_hit or kube_hit):
+        gcp_path_hit = bool(patterns.GCP_ADC_PATH_RE.search(scan_cmd))
+        gcp_hit = bool(
+            patterns.GCP_ADC_CLI_RE.search(scan_cmd)
+            or patterns.GCP_ADC_STRONG_RE.search(scan_cmd)
+            or (gcp_path_hit and patterns.GCP_ADC_CONTENT_RE.search(scan_cmd)))
+        if not (aws_hit or kube_hit or gcp_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLOUD_CRED_EXEC")
                 or _cloud_cred_exec_allowed_by_policy(cfg, _cmd(ev))):
             return None
         reason = ("An AWS credential_process directive is being set" if aws_hit
-                  else "A Kubernetes exec-credential-plugin block is being set")
+                  else "A Kubernetes exec-credential-plugin block is being set" if kube_hit
+                  else "A GCP Application Default Credentials external_account "
+                  "executable-sourced credential is being set")
         return _finish(Decision(action, "cloud-cred-exec-protect",
                          f"{reason} from a shell — it runs an arbitrary "
                          "external command, with the invoking process's "
