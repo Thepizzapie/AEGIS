@@ -590,6 +590,19 @@ def rule_git_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _husky_cwd_relative_hit(ev: Event, text: str) -> bool:
+    """True if `ev.cwd` (the adapter-reported current working directory) is
+    already `.husky/` itself and `text` names a bare git-hook filename with
+    no `.husky` prefix of its own -- the fixed-parent-directory `cd`-into-X
+    fallback `HUSKY_HOOK_BARE_NAME_RE`/`HUSKY_CWD_TAIL_RE` exist for (see
+    their own comments in patterns.py for the confirmed, reproduced bypass
+    this closes)."""
+    cwd = getattr(ev, "cwd", None)
+    if not cwd or not patterns.HUSKY_CWD_TAIL_RE.search(str(cwd)):
+        return False
+    return bool(patterns.HUSKY_HOOK_BARE_NAME_RE.search(text))
+
+
 def _hook_manager_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -699,11 +712,62 @@ def rule_hook_manager_protect(ev: Event, policy=None) -> Optional[Decision]:
     their own targets); a direct fetch-to-file write (``curl -o
     .pre-commit-config.yaml ...``) is caught by none of the shell branch's
     write-verb checks, the same inherited gap every other guard in this file
-    already discloses; and a dangerous ``entry:``/``run:`` value assembled
+    already discloses; a dangerous ``entry:``/``run:`` value assembled
     indirectly (a YAML anchor/alias, string concatenation in a wrapper
     script the entry then calls) rather than appearing as a literal in the
     scanned text defeats the content check, the same "computed indirectly"
-    class every sibling content-gated guard already accepts."""
+    class every sibling content-gated guard already accepts; and the shared
+    ``_path()`` helper every ``*_protect`` guard in this file reads MCP
+    tool-call arguments through only checks a fixed key allowlist
+    (``file_path``/``path``/``target_file``/``targetFile``/``filename``/
+    ``file``/``uri``/...) -- an MCP tool naming its target argument outside
+    that list (``target``, ``location``, ``dest``, ...) is missed the same
+    pre-existing, shared-infrastructure gap ``rule_pysite_protect``'s own
+    docstring already discloses and does not fix per-guard.
+
+    The one gap closed rather than merely disclosed: the Husky branch's
+    ``HUSKY_HOOK_PATH_RE``/``HUSKY_DIR_RE`` alone require the literal
+    substring ``.husky`` to appear in the scanned text, which a plain
+    relative write -- ``file_path="pre-commit"``, whether from an agent's
+    ordinary relative-path habit or a prior, separate shell ``cd .husky`` in
+    the same session -- never carries at all. Closed via
+    ``HUSKY_HOOK_BARE_NAME_RE``/``HUSKY_CWD_TAIL_RE`` (see their own
+    comments in patterns.py): when the event's OWN reported ``ev.cwd`` is
+    already ``.husky/``, a bare hook-name write is unambiguous, the same
+    fixed-parent-directory ``cd``-into-X fallback ``.vscode``/
+    ``.devcontainer``/``.claude`` siblings already use, just keyed off the
+    adapter-reported cwd instead of shell command text. ``.pre-commit-
+    config.yaml``/the lefthook filenames need no equivalent fallback -- both
+    already match as bare filenames with no fixed parent directory required,
+    so a relative write to either already matches directly.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows): design/consistency review verified the wiring correct
+    everywhere its siblings are (``Policy``, all three ``loader.py`` spots,
+    both ``skills.py`` knob lists, ``_CORE_RULES``, README), verified an
+    actual YAML ``hook_manager:`` block round-trips through
+    ``load_policy()`` into a live ``evaluate()`` decision, read every test
+    for a misnamed-assertion defect (found none), and confirmed every
+    "Honest scope" claim in this docstring true by direct falsification
+    attempt rather than by inspection alone -- flagging two real but minor
+    test-COVERAGE gaps (an MCP-alternate-key-variant test and a case-
+    insensitivity test, both now added; the underlying behavior was already
+    correct in both cases). Bypass-hunting found and closed one real,
+    reproduced, HIGH-severity bypass -- the Husky bare-relative-path gap
+    above -- and confirmed two further findings as accurate, accepted
+    disclosures rather than fixable bugs: the shared ``_path()`` MCP-
+    alternate-key gap (now disclosed above; it wasn't before) and the
+    ``PRECOMMIT_LOCAL_ENTRY_RE`` cross-block false-ASK class (already
+    disclosed above prior to this round). Every other avenue tried --
+    base64/heredoc obfuscation, path-separator/Windows-trim evasion, MCP
+    standard-key variants, archive/sync extraction into ``.husky/``, forced-
+    symlink swaps, case/quoting variants, ReDoS on all three new regexes up
+    to 480KB adversarial input, and a battery of false-positive checks
+    (unrelated YAML, docs mentions, upstream-only configs, plain reads) --
+    was tried and found already correctly handled. Recommended PASS after
+    the one fix; no further round needed. Full suite green throughout (1990
+    passed after the fix's own regression tests)."""
     cfg = getattr(policy, "hook_manager", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -729,7 +793,7 @@ def rule_hook_manager_protect(ev: Event, policy=None) -> Optional[Decision]:
             if not content or not patterns.precommit_local_hook_hit(content):
                 return None
             reason = f"'{p}' is being written with a pre-commit `repo: local` hook `entry:`"
-        elif patterns.HUSKY_HOOK_PATH_RE.search(p):
+        elif patterns.HUSKY_HOOK_PATH_RE.search(p) or _husky_cwd_relative_hit(ev, p):
             reason = f"Husky git hook '{p}' is being written"
         elif patterns.LEFTHOOK_CONFIG_PATH_RE.search(p):
             reason = f"lefthook config '{p}' is being written"
@@ -765,7 +829,8 @@ def rule_hook_manager_protect(ev: Event, policy=None) -> Optional[Decision]:
             if not patterns.precommit_local_hook_hit(cmd):
                 return None
             reason = "A pre-commit `repo: local` hook `entry:` is being planted from a shell"
-        elif patterns.HUSKY_HOOK_PATH_RE.search(cmd) or patterns.HUSKY_DIR_RE.search(cmd):
+        elif (patterns.HUSKY_HOOK_PATH_RE.search(cmd) or patterns.HUSKY_DIR_RE.search(cmd)
+                or _husky_cwd_relative_hit(ev, cmd)):
             reason = "A Husky git hook is being planted from a shell"
         elif patterns.LEFTHOOK_CONFIG_PATH_RE.search(cmd):
             reason = "A lefthook config is being planted from a shell"

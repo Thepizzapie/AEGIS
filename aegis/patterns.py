@@ -1184,6 +1184,35 @@ HUSKY_DIR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A BARE hook name with no `.husky` prefix at all -- on its own this is far
+# too broad to gate on directly (`pre-commit`/`pre-push`/etc. are common
+# words/identifiers outside any git context), so it is used ONLY alongside
+# `HUSKY_CWD_TAIL_RE` below: when the event's OWN reported `cwd` already sits
+# inside `.husky/`, a relative write naming just the bare hook filename is
+# unambiguous (there is nothing else that directory legitimately holds a
+# same-named file for) the same way a fixed-parent-directory `cd`-into-X
+# fallback works for `.vscode`/`.devcontainer`/`.claude` elsewhere in this
+# file (QA finding, independent adversarial bypass-hunting review: a Write/
+# Edit call with a plain relative path -- `file_path="pre-commit"` -- while
+# already positioned inside `.husky/`, whether via a PRIOR, separate shell
+# `cd` in the same session or simply an agent's ordinary relative-path habit,
+# carried no `.husky` substring anywhere in ITS OWN args at all and was a
+# confirmed, reproduced, complete bypass of `HUSKY_HOOK_PATH_RE`/
+# `HUSKY_DIR_RE` alike, since both require that literal substring to appear
+# in the scanned text).
+HUSKY_HOOK_BARE_NAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])(?:" + _GIT_HOOK_NAMES + r")" + _CI_END,
+    re.IGNORECASE,
+)
+# The event's reported `cwd` itself ending in `.husky` (optionally with a
+# trailing separator) -- deliberately checked against `ev.cwd` alone, never
+# against path TEXT inside a command/argument (that's what
+# `HUSKY_DIR_RE`/`HUSKY_HOOK_PATH_RE` already cover), so this pattern only
+# ever runs against the short, adapter-reported cwd string, not attacker-
+# controlled command text -- no bounded-window/backtracking concerns to
+# disclose here the way the content-scanning patterns above have.
+HUSKY_CWD_TAIL_RE = re.compile(r"(?:^|[/\\])\.husky[/\\]*$", re.IGNORECASE)
+
 # lefthook's own config file -- `.yml`/`.yaml`, with or without the leading
 # dot, and the `-local` (gitignored-by-convention, personal-override) variant
 # every lefthook setup also recognizes. Gated on PATH ALONE, no content check
