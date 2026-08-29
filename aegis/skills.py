@@ -37,6 +37,7 @@ _REMEDIES = """\
 | mcp-config-protect | wrote an MCP server config (durable auto-run backdoor) | ask the human; they can set AEGIS_ALLOW_MCP_CONFIG=1 after review |
 | ci-workflow-protect | wrote a CI/CD pipeline definition (runs later, on the CI runner) | ask the human; they can set AEGIS_ALLOW_CI_WORKFLOW=1 after review |
 | git-hooks-protect | wrote a git hook / redirected core.hooksPath (runs later, untracked by git) | ask the human; they can set AEGIS_ALLOW_GIT_HOOKS=1 after review |
+| hook-manager-protect | wrote a pre-commit `repo: local` hook entry, a Husky `.husky/<hook>` script, or a lefthook config (runs on the next git commit/push, a surface git-hooks-protect's own `.git/hooks/` path check doesn't reach) | ask the human; they can set AEGIS_ALLOW_HOOK_MANAGER=1 after review |
 | agent-def-protect | wrote CLAUDE.md/AGENTS.md or a .claude/agents or .claude/commands definition (auto-loaded/auto-invoked next session) | ask the human; they can set AEGIS_ALLOW_AGENT_DEF=1 after review |
 | shell-persist-protect | wrote a shell startup/profile file or an SSH persistence target (runs on the next shell open / ssh connection) | ask the human; they can set AEGIS_ALLOW_SHELL_PERSIST=1 after review |
 | direnv-protect | wrote a project .envrc or the global direnvrc, or ran direnv allow/permit/edit (runs on the next `cd` into the project) | ask the human; they can set AEGIS_ALLOW_DIRENV=1 after review |
@@ -109,7 +110,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -153,7 +154,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
    - declarative rule: `rules: [{{name, action: allow|deny|ask, tools/actions/
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
-     `mcp_config`, `ci_workflow`, `git_hooks`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
+     `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
      `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `fetch_to_file`,

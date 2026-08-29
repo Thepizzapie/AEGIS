@@ -1073,6 +1073,130 @@ GIT_HOOKS_ARCHIVE_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Hook-manager config (pre-commit / husky / lefthook) protection -----------
+# Three more "write now, auto-exec later, unattended" surfaces GIT_HOOKS_PATH_RE
+# does NOT reach: it is a literal `.git/hooks/*` (or `core.hooksPath`-config)
+# check, but the three most widely used git-hook-manager tools keep their own
+# active hook-definition surface OUTSIDE `.git/hooks/` entirely, so a write to
+# any of them sails past that guard with zero detection:
+#
+#   - pre-commit (the Python `pre-commit` framework, ubiquitous in this repo's
+#     own ecosystem): once a contributor/CI has run the routine, ordinary
+#     `pre-commit install` once, `.git/hooks/pre-commit` becomes a generic,
+#     UNCHANGING stub that just execs into the `pre-commit` framework, which in
+#     turn reads `.pre-commit-config.yaml` FRESH on every run and dynamically
+#     executes whatever it finds there. A `repo: local` hook's `entry:` is run
+#     the same way `.git/hooks/pre-commit` itself is: with the invoking user's
+#     or CI's full privileges, on the very next `git commit` (or the next
+#     `pre-commit run`/`pre-commit run --all-files`, something CI pipelines
+#     commonly invoke on every PR). Unlike `.git/hooks/*`, this file IS
+#     tracked -- but a `repo: local` block reads as routine, plausible tooling
+#     config (a repo's own lint/format wrapper is a common, entirely benign
+#     use of exactly this mechanism), so it does not stand out in review the
+#     way a diff to something more obviously exec-shaped would.
+#
+#   - husky (the dominant Node/JS git-hook manager): `husky` >= 6 works by
+#     setting `core.hooksPath` to `.husky/` (already caught, ONCE, at the
+#     moment that redirect itself is written, by `GIT_HOOKS_CONFIG_RE`/
+#     `GIT_HOOKS_CONFIG_INI_RE`) and then dropping one script file per hook
+#     name directly under that directory -- `.husky/pre-commit`,
+#     `.husky/pre-push`, etc. A LATER edit to the CONTENT of one of those
+#     already-installed hook files is a plain file write to a path that never
+#     contains the literal substring `.git/hooks/` at all, so
+#     `GIT_HOOKS_PATH_RE`'s own anchor never matches it -- the same
+#     "invoking user's full privileges, on the very next matching git
+#     operation" trigger `rule_git_hooks_protect` itself already targets for
+#     `.git/hooks/*`, just one indirection layer away from that guard's own
+#     literal path check.
+#
+#   - lefthook (the Go-ecosystem equivalent): `lefthook.yml`/`.lefthook.yml`/
+#     `lefthook-local.yml` declares, per git-hook-stage key, a `commands:` map
+#     whose `run:` value IS the executed shell command -- the same
+#     config-drives-the-exec-command shape pre-commit's own `entry:` has, one
+#     tool over.
+#
+# All three share `rule_git_hooks_protect`'s own "runs later, unattended, with
+# no further agent action needed" shape and its own "routine, sanctioned dev
+# work most of the time" trade-off (installing a pre-commit/husky/lefthook
+# hook manager is ordinary, common project setup) -- hence `ask`, not `deny`,
+# by default, the same as every sibling `*_protect` guard in this file.
+PRECOMMIT_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.pre-commit-config\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `repo: local` (optionally quoted) followed, within a bounded lookahead
+# window, by an `entry:` value -- a local hook's `entry:` IS the shell
+# command/executable pre-commit invokes directly for that hook, regardless of
+# which `language:` the hook block also declares (unlike a hook pulled from a
+# remote `repo:` URL, a local hook names no separately-reviewable upstream
+# source at all: the entire payload lives right here, in this file, in this
+# one write). Position-independent (no module-level/column-0 requirement --
+# unlike `CONFTEST_MODULE_LEVEL_RE`, a YAML mapping has no equivalent
+# "executes unconditionally vs. only if called" distinction to preserve: EVERY
+# `repo: local` hook's `entry:` runs whenever that hook's stage fires, full
+# stop), so this same pattern is reused unchanged for both the Edit/Write/MCP
+# branch and the shell branch below, the same way `CONFTEST_DANGEROUS_CALL_RE`
+# (rather than the position-aware `CONFTEST_MODULE_LEVEL_RE`) is reused for
+# a single-line shell payload. Window (2000 chars, DOTALL so it spans lines):
+# a real `hooks:` list entry for one local hook is a handful of short keys
+# (`id`, `name`, `entry`, `language`, `files`, `pass_filenames`, ...), so 2000
+# chars comfortably covers one hook block without reaching into an unrelated,
+# LATER `repo:` entry's own fields on anything but a pathological single-hook
+# block -- the same fixed-bound, not-a-real-parse trade-off
+# `CONFTEST_AUTOEXEC_HOOK_RE`'s own 4000-char window already discloses.
+PRECOMMIT_LOCAL_ENTRY_RE = re.compile(
+    r"repo:\s*['\"]?local['\"]?(?=.{0,2000}?entry:\s*\S)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def precommit_local_hook_hit(content: str) -> bool:
+    """True if `content` carries a pre-commit `repo: local` hook definition
+    with an `entry:` value -- see `PRECOMMIT_LOCAL_ENTRY_RE`'s own comment for
+    why this one pattern, position-independent, covers both the Edit/Write/MCP
+    branch (real YAML with real indentation) and the shell branch (a
+    de-obfuscated one-line or heredoc command) of
+    `rules.rule_hook_manager_protect` unchanged."""
+    return bool(PRECOMMIT_LOCAL_ENTRY_RE.search(content))
+
+
+# husky >= 6's own per-hook script files -- reuses `_GIT_HOOK_NAMES` (the same
+# githooks(5) name list `GIT_HOOKS_PATH_RE` matches under `.git/hooks/`) since
+# husky names its files identically, just under `.husky/` instead. Gated on
+# PATH ALONE, no content check -- the same "gate on the mechanism's mere
+# presence" choice `GIT_HOOKS_PATH_RE` itself makes for `.git/hooks/*`, since
+# (like a real git hook script) there is no benign, non-executing purpose for
+# a file at this exact path: git runs whatever is there, unconditionally, on
+# the next matching operation.
+HUSKY_HOOK_PATH_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.husky" + _WIN_TRIM + _SEP
+    + r"(?:" + _GIT_HOOK_NAMES + r")" + _CI_END,
+    re.IGNORECASE,
+)
+# Bare `.husky` DIRECTORY, no specific hook filename required -- the same
+# archive/sync fallback `GIT_HOOKS_DIR_RE` provides for `.git/hooks`, needed
+# for the identical reason: an `rsync`/`tar`/`unzip` extraction can write
+# multiple hook files into the directory without ever naming one specific
+# hook filename as a contiguous substring anywhere in the command.
+HUSKY_DIR_RE = re.compile(
+    _GIT_HOOKS_LEAD + r"\.husky" + _CI_END,
+    re.IGNORECASE,
+)
+
+# lefthook's own config file -- `.yml`/`.yaml`, with or without the leading
+# dot, and the `-local` (gitignored-by-convention, personal-override) variant
+# every lefthook setup also recognizes. Gated on PATH ALONE, no content check
+# -- unlike `.pre-commit-config.yaml` (whose ordinary, non-`local`-hook use is
+# extremely common and would false-ASK on sight if gated on path alone), this
+# exact filename has no widely-used purpose OTHER than lefthook's own
+# hook-stage-to-command config, so there is no comparable false-positive
+# surface to narrow away.
+LEFTHOOK_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.?lefthook(?:-local)?\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+
 # ---- Agent-instructions / agent-definition file protection --------------------
 # Two more auto-loaded, no-per-use-trust-check surfaces the mcp_config/
 # ci_workflow/git_hooks family doesn't reach:

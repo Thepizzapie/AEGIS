@@ -131,6 +131,16 @@ class Policy:
     # path/command]}. Empty -> defaults (mode=ask) apply. See
     # rules.rule_git_hooks_protect.
     git_hooks: dict = field(default_factory=dict)
+    # Hook-manager config/script protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers a pre-commit `repo: local` hook's `entry:` in
+    # `.pre-commit-config.yaml`, a Husky per-hook script under `.husky/`, or
+    # a lefthook config (`lefthook.yml`/`.lefthook.yml`/`lefthook-local.yml`)
+    # -- three git-hook-manager surfaces `git_hooks` above does not reach,
+    # since each keeps its active hook-definition surface outside the
+    # literal `.git/hooks/` path that guard checks. See
+    # rules.rule_hook_manager_protect.
+    hook_manager: dict = field(default_factory=dict)
     # Agent-instructions / agent-definition protection: {mode: deny|ask|
     # monitor|off, allow: [regex on path/command]}. Empty -> defaults
     # (mode=ask) apply. Covers CLAUDE.md/AGENTS.md and .claude/agents/*.md,
