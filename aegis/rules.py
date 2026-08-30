@@ -5879,7 +5879,36 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     without naming it as a discrete write-verb argument is not covered (no
     `ARCHIVE_SYNC_VERB_RE`-style check here, matching
     `rule_git_attributes_exec_protect`'s own disclosed scope limit for the
-    identical gap)."""
+    identical gap).
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): a design/wiring review
+    confirmed correct registration and round-tripping everywhere its
+    siblings are (`_CORE_RULES`, `_FETCH_HUMAN_ESCAPABLE`, `Policy`, all
+    three `loader.py` spots, both `skills.py` knob lists, the `_REMEDIES`
+    table, the README guard table), a live YAML `terraform_exec:` block
+    through `load_policy()` into `evaluate()` for both `mode` and `allow`,
+    and the full suite green throughout, with no findings. A parallel
+    bypass-hunting review found no false-ALLOW bypass on any realistic,
+    Terraform-valid payload (HCL and `.tf.json` JSON-syntax forms, case/
+    quote variants, heredocs, MultiEdit/deeply-nested-MCP argument shapes,
+    base64-piped writes — the shared `_shell_scan` de-obfuscation layer
+    already handles the last one) and no ReDoS (every quantifier in
+    `TF_PATH_RE`/`TF_EXEC_HIT_RE` is bounded; stress-tested against
+    multi-MB adversarial input). It found and this fix closes one real,
+    reproduced bug: unlike `rule_cloud_cred_exec_protect`'s own content
+    check, this guard did not strip `#`-comment lines before matching, so
+    a documentation/TODO comment merely MENTIONING `"local-exec"` (never
+    a real provisioner) false-positived identically to a genuine block —
+    the same comment-blind gap `AWS_CRED_PROCESS_INI_RE`/
+    `KUBE_EXEC_CRED_STRONG_RE`'s own QA history already fixed once for
+    cloud-cred-exec. Closed the same way, via `patterns.strip_comment_
+    lines`, on both the Edit/Write/MCP content branch and the shell
+    branch; a trailing same-line `# aegis-allow` escape is unaffected,
+    since `strip_comment_lines` only strips a line whose FIRST
+    non-whitespace character is `#`, not an inline comment following real
+    command text on the same line, and the override check itself scans
+    the original, unstripped command regardless."""
     cfg = getattr(policy, "terraform_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5905,7 +5934,22 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             content = raw_content
         else:
             content = " ".join(_flatten_strings(a))
-        if not content or not patterns.TF_EXEC_HIT_RE.search(content):
+        if not content:
+            return None
+        # Strip full-line `#` comments before matching -- both HCL and
+        # `.tf.json` treat a line whose first non-whitespace character is
+        # `#` as inert (HCL also accepts `//`, deliberately not stripped
+        # here to keep this a narrow, low-risk fix; `strip_comment_lines`
+        # only handles `#`, the same scope `rule_cloud_cred_exec_protect`
+        # already accepts for its own AWS/kubeconfig INI content). QA
+        # finding (independent adversarial review): without this, a
+        # documentation/TODO comment merely MENTIONING "local-exec" (e.g.
+        # `# TODO: consider provisioner "local-exec" later for bootstrap`)
+        # false-positived identically to a real provisioner block, the same
+        # comment-blind gap `AWS_CRED_PROCESS_INI_RE`/`KUBE_EXEC_CRED_
+        # STRONG_RE`'s own QA history already fixed for cloud-cred-exec.
+        scan_content = patterns.strip_comment_lines(content)
+        if not patterns.TF_EXEC_HIT_RE.search(scan_content):
             return None
         if (os.environ.get("AEGIS_ALLOW_TERRAFORM_EXEC")
                 or _terraform_exec_allowed_by_policy(cfg, p)):
@@ -5924,7 +5968,18 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        if not (patterns.TF_PATH_RE.search(cmd) and patterns.TF_EXEC_HIT_RE.search(cmd)):
+        # Same comment-stripping as the Edit/Write/MCP branch above (see its
+        # own comment) -- a `#`-prefixed comment LINE is inert to both HCL
+        # and the shell itself, so scanning it for the path/hit check is the
+        # same false-ASK-on-a-mention gap `rule_cloud_cred_exec_protect`'s
+        # own shell branch already closed via `strip_comment_lines`. A
+        # trailing same-line `# aegis-allow` escape is unaffected --
+        # `strip_comment_lines` only strips a line whose FIRST non-
+        # whitespace character is `#`, not an inline comment following real
+        # command text on the same line, and `_override_allowed` below
+        # scans the ORIGINAL, unstripped `_cmd(ev)` regardless.
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        if not (patterns.TF_PATH_RE.search(scan_cmd) and patterns.TF_EXEC_HIT_RE.search(scan_cmd)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_TERRAFORM_EXEC")
                 or _terraform_exec_allowed_by_policy(cfg, _cmd(ev))):
