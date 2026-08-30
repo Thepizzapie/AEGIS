@@ -4509,6 +4509,83 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Terraform provisioner / external-data-source exec-hijack protection ------
+# Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
+# `external` provider's `data "external"` data source all name an arbitrary
+# program that TERRAFORM ITSELF executes -- `local-exec`/`remote-exec` on the
+# next `terraform apply` that creates, updates, or (with `when = destroy`)
+# destroys the wrapping resource; `data "external"` on the next `terraform
+# plan`/`refresh`/`validate -json` with no `apply`/`-auto-approve`
+# confirmation gate at all, since a data source is read during planning, not
+# applying. Both run with whatever credentials/environment the invoking
+# user's or CI runner's Terraform process already carries -- frequently live
+# cloud credentials (AWS/GCP/Azure), the same blast-radius extension
+# `rule_cloud_cred_exec_protect` exists to gate one layer up in this same
+# file. A `.tf`/`.tf.json` file is routinely TRACKED and pushed with the
+# repo, so a planted provisioner/data block reads as ordinary
+# infrastructure-as-code in a PR diff unless a reviewer actually opens and
+# reads the specific resource body -- the same "trusted file type, unread
+# body" trap `rule_ci_workflow_protect`/`rule_git_hooks_protect` exist for.
+#
+# Path: any `.tf` or `.tf.json` file, anywhere in the tree -- unlike CI
+# workflows or devcontainer configs, Terraform config has no fixed directory
+# convention (`infra/main.tf`, `modules/foo/variables.tf`, a bare
+# `main.tf` at repo root are all equally normal), so this is a bare
+# extension match, the same convention `_UNIT_EXT` uses for systemd units.
+TF_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])" + _CI_SEG + r"\.tf\.json" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])" + _CI_SEG + r"\.tf" + _CI_END,
+    re.IGNORECASE,
+)
+# Content check: the exec-capable construct itself, not the whole file --
+# gating on EVERY `.tf` write would be far too noisy (ordinary infra changes
+# -- a new bucket, an IAM role -- touch `.tf` files constantly, unlike a git
+# hook or a CI workflow file which are rarely edited at all).
+#
+# `"local-exec"`/`"remote-exec"` are matched as bare quoted literals, with
+# NO requirement that the `provisioner` keyword sit immediately adjacent --
+# deliberately, the same "gate on the distinctive token alone" choice
+# `GIT_ATTRS_EXEC_KEY_RE` makes for `core.fsmonitor`: requiring adjacency
+# would need to model HCL's block syntax (`provisioner "local-exec" {`) AND
+# Terraform's OWN `.tf.json` JSON-syntax equivalent (`"provisioner":
+# {"local-exec": {...}}`, where the two tokens are separated by a `:` and a
+# `{`, not whitespace) with one regex, or maintain two -- both real, both
+# already-supported Terraform syntaxes. The literal strings "local-exec" and
+# "remote-exec" have no legitimate meaning outside a provisioner-type
+# position in either syntax, so matching them alone catches both syntaxes
+# uniformly with no adjacency modeling at all, at the cost of a false ASK on
+# the vanishingly unlikely case of an unrelated resource/variable NAMED
+# literally "local-exec" -- the same false-positives-are-the-safe-direction
+# trade-off this file takes throughout.
+#
+# `data "external"` (HCL) / `"data": {"external": ...}` (JSON) both need
+# the `data`/`external` PAIRING checked -- "external" alone is far too
+# generic a word (a variable, a comment, an unrelated provider's resource
+# name) to gate on by itself, unlike "local-exec"/"remote-exec" above.
+TF_EXEC_HIT_RE = re.compile(
+    r"[\"']local-exec[\"']"
+    r"|[\"']remote-exec[\"']"
+    r"|\bdata\b[^{}\"'\n]{0,60}[\"']external[\"']"
+    r"|[\"']data[\"']\s*:\s*\{\s*[\"']external[\"']",
+    re.IGNORECASE,
+)
+# Known, disclosed gaps (same shape every sibling `*_protect` guard in this
+# file already accepts): a destination assembled indirectly (a Terraform
+# `templatefile()`/variable interpolation building the block text, a
+# generator script) rather than appearing as one contiguous literal defeats
+# this check; a `command`/`program` value supplied entirely through a
+# Terraform variable (`command = var.payload`) with the actual dangerous
+# string injected only via a separate `-var`/`-var-file` CLI flag or a
+# `.tfvars` file leaves the `.tf` file itself looking inert -- the same
+# "computed indirectly" class `GIT_ATTRS_EXEC_KEY_RE`'s own comment
+# discloses for a driver name built outside the literal config line; and,
+# like every content-based `*_protect` guard's shell branch, this is
+# deliberately NOT clause-scoped (see `gitattrs_wiring_hit`'s own comment
+# for the full QA history behind that choice) -- an unrelated `&&`/`;`-
+# joined command naming a `.tf` file in one clause and an unrelated
+# "local-exec"-shaped substring in another produces a same-command false
+# ASK, not a false ALLOW.
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
