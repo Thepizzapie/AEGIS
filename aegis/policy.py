@@ -307,6 +307,17 @@ class Policy:
     # every future credential resolution through that profile/context. See
     # rules.rule_cloud_cred_exec_protect.
     cloud_cred_exec: dict = field(default_factory=dict)
+    # Terraform provisioner / external-data-source exec-hijack protection:
+    # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/
+    # `"remote-exec"` block or a `data "external"` data source planted in a
+    # .tf/.tf.json file -- Terraform itself executes these, the provisioner
+    # on the next `terraform apply` touching the wrapping resource, the
+    # external data source on the next `plan`/`refresh` with no apply/
+    # confirmation gate at all, commonly with live cloud credentials the
+    # Terraform process is already authenticated with. See
+    # rules.rule_terraform_exec_protect.
+    terraform_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing

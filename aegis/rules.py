@@ -5467,6 +5467,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
+    (patterns.TF_PATH_RE, "a Terraform config file"),
 )
 
 
@@ -5801,6 +5802,144 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "resolution through that profile/context. A human "
                          "may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_CLOUD_CRED_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
+def _terraform_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Terraform `provisioner "local-exec"`/`"remote-exec"`
+    block, or a `data "external"` data-source block, in a `.tf`/`.tf.json`
+    file.
+
+    THREAT MODEL: unlike every other `*_protect` guard in this file, which
+    gates a config file that some OTHER program (git, a shell, an
+    interpreter) later reads and auto-execs, a `local-exec`/`remote-exec`
+    provisioner or an `external` data source is executed by TERRAFORM
+    ITSELF, as a documented, first-class feature — no config-parsing bug or
+    hijack needed, just an ordinary `terraform apply`/`plan`. `local-exec`/
+    `remote-exec` fire on the next apply that creates, updates, or (with
+    `when = destroy`) destroys the wrapping resource — a routine, expected
+    trigger for infrastructure-as-code, run by this session, a teammate, or
+    an unattended CI/CD pipeline (Atlantis, Terraform Cloud, a GitHub
+    Actions `terraform apply` job) with no further human action after this
+    write. `data "external"` is worse: it is evaluated during `terraform
+    plan`/`refresh`/`validate -json` — no `apply`, no `-auto-approve`, no
+    confirmation gate of any kind stands between planting the block and it
+    running, since Terraform must read every data source to compute the
+    plan at all. Both commonly run with whatever cloud credentials the
+    invoking Terraform process is already authenticated with (AWS/GCP/Azure
+    via env vars, an instance profile, or a configured provider block) —
+    the same credential-exposure blast radius `rule_cloud_cred_exec_protect`
+    exists to gate for AWS's `credential_process`/Kubernetes's `exec:` one
+    layer up in this same file, here reached through routine IaC instead of
+    a credential-broker hijack. A `.tf`/`.tf.json` file is ordinarily
+    TRACKED and reviewed like any other source file, so a provisioner/data
+    block planted inside an otherwise-unremarkable resource (a new S3
+    bucket that ALSO carries a `local-exec` "just to tag it") reads as
+    routine infrastructure code unless a reviewer opens that specific
+    resource body — the same "trusted file type, unread body" trap
+    `rule_ci_workflow_protect`/`rule_git_hooks_protect` already exist for.
+
+    Config (`policy.terraform_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate — a
+    repo's own reviewed, intentional bootstrap provisioner, say). Defaults
+    to `ask`, not `deny`, for the same reason every sibling `*_protect`
+    guard does: `.tf` files change constantly as routine, sanctioned work,
+    and this guard already narrows to the specific exec-capable construct
+    (not every `.tf` write) — it just needs a human to have actually
+    looked at this one.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle `AEGIS_ALLOW_TERRAFORM_EXEC=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable, the same invariant
+    every escapable guard in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses (see `TF_EXEC_HIT_RE`'s own comment in patterns.py for the
+    full reasoning): a destination/command value assembled indirectly
+    (Terraform variable interpolation, a `-var`/`-var-file` CLI flag, a
+    `templatefile()` call, a generator script) rather than appearing as one
+    contiguous literal in the scanned text defeats this check, the same
+    "computed indirectly" class every sibling guard already accepts; the
+    shell branch is deliberately NOT clause-scoped, the same trade-off
+    `gitattrs_wiring_hit` documents at length for the identical shape; and
+    an archive/sync tool (`rsync`/`tar`/`unzip`) placing a `.tf` file
+    without naming it as a discrete write-verb argument is not covered (no
+    `ARCHIVE_SYNC_VERB_RE`-style check here, matching
+    `rule_git_attributes_exec_protect`'s own disclosed scope limit for the
+    identical gap)."""
+    cfg = getattr(policy, "terraform_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "terraform-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.TF_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content or not patterns.TF_EXEC_HIT_RE.search(content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_TERRAFORM_EXEC")
+                or _terraform_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "terraform-exec-protect",
+                         f"'{p}' is planting a Terraform provisioner "
+                         "(local-exec/remote-exec) or an external-data-"
+                         "source block — it runs automatically, with this "
+                         "Terraform run's own credentials/environment, on "
+                         "the next 'terraform apply' (provisioner) or even "
+                         "'plan'/'refresh' (external data source — no "
+                         "apply/confirmation needed at all). Review the "
+                         "change, then confirm with "
+                         "AEGIS_ALLOW_TERRAFORM_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not (patterns.TF_PATH_RE.search(cmd) and patterns.TF_EXEC_HIT_RE.search(cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_TERRAFORM_EXEC")
+                or _terraform_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "terraform-exec-protect",
+                         "A Terraform provisioner (local-exec/remote-exec) "
+                         "or external-data-source block is being planted in "
+                         "a .tf/.tf.json file from a shell — it runs "
+                         "automatically, with this Terraform run's own "
+                         "credentials/environment, on the next 'terraform "
+                         "apply' (provisioner) or even 'plan'/'refresh' "
+                         "(external data source — no apply/confirmation "
+                         "needed at all). A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_TERRAFORM_EXEC=1; a spawned agent "
                          "cannot."))
     return None
 
@@ -6421,6 +6560,7 @@ _CORE_RULES = (
     rule_pysite_protect,
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
+    rule_terraform_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
