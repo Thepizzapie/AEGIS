@@ -154,6 +154,16 @@ class Policy:
     # explicit per-invocation approval, a surface rule_agent_def_protect
     # was never extended to reach. See rules.rule_skills_protect.
     skills_protect: dict = field(default_factory=dict)
+    # Third-party AI coding-assistant rule-file protection: {mode: deny|ask|
+    # monitor|off, allow: [regex on path/command]}. Empty -> defaults
+    # (mode=ask) apply. Covers Cursor's .cursorrules/.cursor/rules/*.mdc,
+    # Windsurf's .windsurfrules/.windsurf/rules/*.md, Cline's .clinerules
+    # (file or directory), and GitHub Copilot's .github/copilot-instructions.md/
+    # .github/instructions/*.instructions.md -- the same "folded into a future
+    # session's context, unattended" primitive rule_agent_def_protect already
+    # guards for CLAUDE.md/AGENTS.md, on filenames that guard's own pattern
+    # was never extended to reach. See rules.rule_ai_rules_protect.
+    ai_rules: dict = field(default_factory=dict)
     # Shell-startup / SSH persistence protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers ~/.bashrc/~/.zshrc/~/.profile/fish's config.fish/

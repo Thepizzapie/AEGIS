@@ -108,6 +108,23 @@ def test_gitmodules_knob_absent_by_default(tmp_path):
     assert pol.gitmodules == {}
 
 
+def test_ai_rules_knob_wired_through_loader(tmp_path):
+    """The `ai_rules` guard-config knob must round-trip from YAML onto the
+    Policy through all three loader.py spots (the `st` defaults dict, the
+    `_merge_file` knob-key tuple, and the final `Policy(...)` constructor
+    call) — same regression class `test_gitmodules_knob_wired_through_loader`
+    exists for: a new guard's knob silently dropped by real YAML-based policy
+    loading despite `Policy(ai_rules=...)` working fine when constructed
+    directly in Python."""
+    pol = load_policy(_write(tmp_path, "ai_rules:\n  mode: deny\n  allow: ['trusted-tool']\n"))
+    assert pol.ai_rules == {"mode": "deny", "allow": ["trusted-tool"]}
+
+
+def test_ai_rules_knob_absent_by_default(tmp_path):
+    pol = load_policy(_write(tmp_path, GOOD))
+    assert pol.ai_rules == {}
+
+
 def test_validate_ok(tmp_path):
     assert validate_policy(_write(tmp_path, GOOD)) == []
     assert validate_policy(_write(tmp_path, LIFECYCLE)) == []

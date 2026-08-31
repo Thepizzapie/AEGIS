@@ -330,6 +330,31 @@ def test_no_quadratic_blowup_on_adversarial_path_input():
     assert elapsed4 < 1.0, f"ARCHIVE_SYNC_VERB_RE took {elapsed4:.2f}s on adversarial input"
 
 
+def test_no_quadratic_blowup_on_repeated_dot_slash_padding():
+    """QA finding (independent adversarial review, discovered while
+    hardening the unrelated new rule_ai_rules_protect guard, which was
+    modeled on this pattern's shape): the old `(?:_AGENT_DEF_SEG){0,4}`
+    repeated-segment construction was quadratic-time on a NO-MATCH input
+    padded with repeated `./` units -- a real, ordinary Windows-relative-
+    path shape (not a contrived string), ~5s measured at 100 padding units,
+    reachable through the real evaluate() pipeline for this NEVER-disabled-
+    by-default core guard. The prior perf test above used
+    `.claude/agents/`*8000 with no such dot/slash ambiguity anywhere, so it
+    never exercised this shape. Fixed with a single lazy-bounded span
+    (_AGENT_DEF_MID) replacing the repeated compound group."""
+    from aegis import patterns
+    adversarial = ".claude/agents/" + "./" * 20000 + "x"  # no ".md" -> no match anywhere
+    start = time.time()
+    patterns.AGENT_DEF_PATH_RE.search(adversarial)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"AGENT_DEF_PATH_RE took {elapsed:.2f}s on dot-slash adversarial input"
+
+    start = time.time()
+    evaluate(_shell("echo x > " + adversarial), EMPTY)
+    elapsed2 = time.time() - start
+    assert elapsed2 < 1.0, f"rule_agent_def_protect took {elapsed2:.2f}s on dot-slash adversarial input"
+
+
 # ---- escape hatches: human-only ----------------------------------------------------
 
 def test_human_can_override_shell_with_comment():

@@ -298,6 +298,23 @@ def test_skills_find_no_quadratic_blowup():
     assert elapsed < 1.0, f"rule_skills_protect took {elapsed:.2f}s on adversarial find input"
 
 
+def test_no_quadratic_blowup_on_repeated_dot_slash_padding():
+    """QA finding (independent adversarial review, discovered while
+    hardening the unrelated new rule_ai_rules_protect guard): SKILL_PATH_RE
+    shares AGENT_DEF_PATH_RE's own `_AGENT_DEF_SEG`-based quadratic-time bug
+    on a no-match input padded with repeated `./` units -- ~3s measured at
+    200 padding units against this guard's longer fixed root. The existing
+    perf test below (`.claude/skills/`*8000, no dot/slash ambiguity) never
+    exercised this shape. Fixed with a single lazy-bounded span
+    (_SKILL_MID) replacing the repeated compound group."""
+    from aegis import patterns
+    adversarial = ".claude/skills/foo/" + "./" * 20000 + "x"  # no "SKILL.md" -> no match
+    start = time.time()
+    patterns.SKILL_PATH_RE.search(adversarial)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"SKILL_PATH_RE took {elapsed:.2f}s on dot-slash adversarial input"
+
+
 def test_no_quadratic_blowup_on_adversarial_path_input():
     from aegis import patterns
     adversarial = ".claude/skills/" * 8000  # ~130KB, no real match at any point
