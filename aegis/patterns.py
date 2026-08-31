@@ -1445,6 +1445,102 @@ def skill_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, SKILL_FIND_PREDICATE_RE)
 
 
+# ---- Third-party AI coding-assistant rule-file protection -----------------------
+# Sibling of AGENT_INSTRUCTIONS_PATH_RE, on ground that pattern was never built to
+# reach. CLAUDE.md/AGENTS.md is Claude Code's/the cross-tool AGENTS.md convention's
+# own auto-loaded project-instructions file, but nearly every OTHER mainstream AI
+# coding assistant has grown the exact same primitive under its own name, folded
+# straight into ITS OWN system prompt on every future session with no per-
+# invocation human approval at all — the identical "runs later, unattended, in the
+# model's own context" shape this file's own AGENT_INSTRUCTIONS_PATH_RE/
+# AGENT_DEF_PATH_RE comments already document, just on a filename neither
+# alternation lists:
+#   - Cursor: `.cursorrules` (legacy root file, still read as a fallback) and
+#     `.cursor/rules/*.mdc` (current "Project Rules" directory form)
+#   - Windsurf: `.windsurfrules` (legacy root file) and `.windsurf/rules/*.md`
+#   - Cline: `.clinerules`, either a single file or a directory of `.md` files —
+#     both forms are auto-loaded
+#   - GitHub Copilot: `.github/copilot-instructions.md` (repo-wide) and its path-
+#     scoped sibling `.github/instructions/*.instructions.md`
+# A repo touched by more than one AI tool — or by Claude Code today and a
+# different tool tomorrow, the same developer, same repo — leaves every one of
+# these files completely outside AGENT_INSTRUCTIONS_PATH_RE/AGENT_DEF_PATH_RE's
+# own alternations: neither lists any of these names, and none of these paths
+# contain a `.claude` substring for CONFIG_DIR_RE to catch incidentally either
+# (unlike `.claude/agents/*` overlapping self-protect's broader match). A prompt-
+# injected Claude Code session — or any other agent Aegis is wired into via the
+# `generic` adapter — can plant one of these completely unnoticed today: nothing
+# in `_CORE_RULES` has an opinion on any of them. First real coverage for this
+# surface, not a hardening of existing coverage.
+_AI_RULES_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+_AI_RULES_CURSOR_ROOT = r"(?:^|[\s'\"/\\=])\.cursor" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
+_AI_RULES_WINDSURF_ROOT = r"(?:^|[\s'\"/\\=])\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
+_AI_RULES_COPILOT_ROOT = r"(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"instructions" + _WIN_TRIM + _SEP
+
+# Flat, fixed-name files (any directory depth) — the same shape
+# AGENT_INSTRUCTIONS_PATH_RE uses for CLAUDE.md/AGENTS.md. `.clinerules`'s
+# trailing `_CI_END` lookahead (`[/\\;&|)]|\s|['"]|$`) already accepts a following
+# `/`, so this same alternative also matches `.clinerules/notes.md` — Cline's
+# directory form — with no separate directory-plus-filename alternative needed,
+# unlike Cursor/Windsurf/Copilot below, whose distinctive marker (`rules`/
+# `instructions`) sits one path segment further in.
+AI_RULES_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cursorrules" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.windsurfrules" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.clinerules" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"copilot-instructions"
+      + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _AI_RULES_CURSOR_ROOT + r"(?:" + _AI_RULES_SEG + r"){0,4}" + _CI_SEG
+      + r"\.mdc" + _CI_END
+    + r"|" + _AI_RULES_WINDSURF_ROOT + r"(?:" + _AI_RULES_SEG + r"){0,4}" + _CI_SEG
+      + r"\.md" + _CI_END
+    + r"|" + _AI_RULES_COPILOT_ROOT + r"(?:" + _AI_RULES_SEG + r"){0,4}" + _CI_SEG
+      + r"\.instructions" + _WIN_TRIM + r"\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — the same archive/sync-tool bypass
+# AGENT_DEF_DIR_RE/SKILL_DIR_RE close for their own surfaces: `rsync -a evil/
+# .cursor/rules/` or `tar xf payload.tar -C .clinerules/` never names a `.mdc`/
+# `.md` file as one contiguous string, so AI_RULES_PATH_RE alone can't see it.
+# `.clinerules` itself is included here too (not just in AI_RULES_PATH_RE above)
+# since it can be a directory Cline reads every `.md` file from, the same
+# ambiguous file-or-directory shape as `.claude/skills/<name>/` one level up.
+AI_RULES_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cursor" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.clinerules" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"instructions" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# AGENT_DEF_FIND_PREDICATE_RE/SKILL_FIND_PREDICATE_RE exist for their own
+# surfaces — a `-regex` VALUE is itself a regex and routinely separates path
+# components with its own wildcard (`-regex '.*\.cursor.*rules.*style\.mdc'`),
+# so the tight `\.cursor[/\\]rules\b`-style alternatives (which require their
+# two halves to sit directly adjacent) never fire on it alone. Closed the
+# same way AGENT_DEF_FIND_PREDICATE_RE/SKILL_FIND_PREDICATE_RE already do for
+# `.claude`: a bare fallback for each marker that is high-signal ON ITS OWN
+# (`.cursor`, `.windsurf`, `.clinerules` have no legitimate use outside their
+# respective AI tool). Deliberately NOT extended to a bare `\.github\b`
+# fallback — unlike `.claude`/`.cursor`/`.windsurf`, `.github` is an ordinary,
+# extremely common directory for reasons unrelated to this guard's surface
+# (workflows, issue templates, funding config); the same "too generic"
+# trade-off `SHELL_PERSIST_FIND_RE`'s own docstring already makes for the
+# bare words "config"/"profile". A `-regex` value that specifically splits
+# `.github` from `instructions`/`copilot-instructions.md` with a wildcard is
+# an accepted, disclosed residual gap.
+AI_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules\b|\.cursor[/\\]rules\b|\.cursor\b|\.windsurfrules\b"
+    r"|\.windsurf[/\\]rules\b|\.windsurf\b|\.clinerules\b"
+    r"|copilot-instructions\.md\b|\.github[/\\]instructions\b)")
+
+
+def ai_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, AI_RULES_FIND_PREDICATE_RE)
+
+
 # ---- Shell-startup / SSH persistence protection --------------------------------
 # Two more "runs later, unattended, with the human's full privileges" triggers
 # that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,

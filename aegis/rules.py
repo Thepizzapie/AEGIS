@@ -1190,6 +1190,141 @@ def rule_skills_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- third-party AI coding-assistant rule-file protection: escapable with human --
+def _ai_rules_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_ai_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a third-party AI coding assistant's own
+    auto-loaded project-rules file: Cursor's ``.cursorrules`` (legacy root
+    file) or ``.cursor/rules/*.mdc`` (current directory form), Windsurf's
+    ``.windsurfrules`` or ``.windsurf/rules/*.md``, Cline's ``.clinerules``
+    (a single file OR a directory of ``.md`` files, both auto-loaded), and
+    GitHub Copilot's ``.github/copilot-instructions.md`` plus its path-scoped
+    sibling ``.github/instructions/*.instructions.md``.
+
+    THREAT MODEL: this is the exact same primitive ``rule_agent_def_protect``
+    already guards for Claude Code — a file folded directly into an agent's
+    OWN system prompt on every FUTURE session, unattended, with no per-
+    invocation human approval — on ground that guard was never built to
+    reach. ``AGENT_INSTRUCTIONS_PATH_RE``'s alternation lists only ``CLAUDE.md``/
+    ``AGENTS.md``; none of the filenames above appear in it, and none of
+    them contain a ``.claude`` substring for ``rule_self_protect``'s
+    ``CONFIG_DIR_RE`` to catch incidentally either (unlike ``.claude/agents/*``,
+    which overlaps that broader match). A repo worked on by more than one AI
+    coding tool — or by Claude Code today and a different tool tomorrow, the
+    same developer, same repo, no unusual setup required — leaves every one
+    of these files with zero coverage from any existing guard: a prompt-
+    injected Claude Code session can plant a poisoned ``.cursorrules`` that a
+    human teammate's Cursor session (or that same human, switching tools
+    next week) auto-loads unattended, with no future git/CI/session-restart
+    trigger needed beyond opening the file's own tool. First coverage for
+    this surface, not a hardening of existing coverage.
+
+    Config (``policy.ai_rules``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate). Defaults
+    to ``ask`` for the same reason ``rule_agent_def_protect`` does: editing a
+    project-rules file is routine, sanctioned dev work for a team using that
+    tool, unlike e.g. planting an MCP server.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_AI_RULES=1`` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot set
+    its own env for a hook invocation it doesn't control, so neither path is
+    agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path-string match (``AI_RULES_PATH_RE`` for a named file,
+    checked in the Edit/Write/MCP branch below; ``AI_RULES_DIR_RE`` as a
+    bare-directory backstop, checked ONLY in the shell branch for an
+    archive/sync tool that never names a discrete filename at all --
+    deliberately narrower than ``rule_skills_protect``'s own choice to check
+    its ``*_DIR_RE`` in every branch, since each of these tools (unlike a
+    Claude Code Skill's whole directory of bundled, executable resources)
+    reads only a specific extension/filename out of its rules directory, so
+    gating an unrelated file merely sitting alongside one (a `.orig` backup,
+    a README) would be a pure false ASK with no matching threat; plus
+    ``ai_rules_find_hit`` for ``find``-predicate indirection) -- the same
+    three-piece shape ``rule_agent_def_protect`` uses (also Edit/Write-
+    branch-narrow, unlike ``rule_skills_protect``). Known
+    residual gaps, same spirit as every sibling guard: a direct fetch-to-file
+    write (``curl -o .cursorrules``, ``wget -O ...``) is not covered by this
+    guard's own write-verb checks (closed instead by
+    ``rule_fetch_to_file_protect``, which reuses ``AI_RULES_PATH_RE`` the same
+    way it reuses every other sibling guard's own path regex); a project-
+    rules filename outside the recognized set (a future tool, or a renamed/
+    relocated one); an MCP filesystem tool naming its target argument outside
+    ``_path()``'s recognized key list; nesting past 4 levels under
+    ``.cursor/rules``/``.windsurf/rules``/``.github/instructions`` evading the
+    filename form of ``AI_RULES_PATH_RE`` (the bare-directory backstop above
+    still catches an archive/sync tool's own target argument regardless of
+    nesting); and a shell command that computes the target path indirectly
+    across separate variable assignments (the ``find``-indirection case is
+    covered; a ``for``/``xargs`` loop or ``basename``/``dirname``
+    reconstruction is not), the same disclosed gap
+    ``rule_self_protect``/``rule_agent_def_protect``/``rule_skills_protect``
+    already carry."""
+    cfg = getattr(policy, "ai_rules", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.AI_RULES_PATH_RE.search(p):
+            return None
+        if os.environ.get("AEGIS_ALLOW_AI_RULES") or _ai_rules_allowed_by_policy(cfg, p):
+            return None
+        would = Decision(action, "ai-rules-protect",
+                         f"Third-party AI assistant rules file '{p}' is being written "
+                         "-- its content is folded directly into that tool's own "
+                         "context on every future session, unattended. Review the "
+                         "change, then confirm with AEGIS_ALLOW_AI_RULES=1; a spawned "
+                         "agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "ai-rules-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.AI_RULES_PATH_RE.search(cmd)
+                             or patterns.AI_RULES_DIR_RE.search(cmd)
+                             or patterns.ai_rules_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AI_RULES")
+                or _ai_rules_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "ai-rules-protect",
+                         "A third-party AI assistant rules file is being modified "
+                         "from a shell -- its content is auto-loaded into that "
+                         "tool's own context in a future session with no further "
+                         "review. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_AI_RULES=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "ai-rules-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- shell-startup / SSH persistence protection: escapable with human confirm --
 def _shell_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -5445,6 +5580,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
+    (patterns.AI_RULES_PATH_RE, "a third-party AI assistant rules file"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
@@ -6597,6 +6733,7 @@ _CORE_RULES = (
     rule_hook_manager_protect,
     rule_agent_def_protect,
     rule_skills_protect,
+    rule_ai_rules_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
     rule_package_manifest_protect,
