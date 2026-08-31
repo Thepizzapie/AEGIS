@@ -337,6 +337,20 @@ def test_reading_rules_file_allowed():
     assert not _gated(evaluate(read_ev, EMPTY))
 
 
+def test_case_insensitive_gated():
+    assert _gated(evaluate(_write(".CURSORRULES"), EMPTY))
+    assert _gated(evaluate(_write(".cursor/Rules/style.MDC"), EMPTY))
+    assert _gated(evaluate(_write(".github/COPILOT-INSTRUCTIONS.md"), EMPTY))
+
+
+def test_agent_def_paths_not_claimed_by_this_guard():
+    """`.claude/agents/*.md`/`.claude/commands/*.md`/`.claude/output-styles/*.md`
+    is rule_agent_def_protect's own surface — disjoint from this guard's
+    patterns (no cursor/windsurf/cline/copilot marker there)."""
+    d = evaluate(_write(".claude/agents/reviewer.md"), EMPTY)
+    assert d.rule != "ai-rules-protect"
+
+
 def test_claude_md_not_claimed_by_this_guard():
     """CLAUDE.md/AGENTS.md is rule_agent_def_protect's own surface — this
     guard's pattern is disjoint from it (no cursor/windsurf/cline/copilot
@@ -403,3 +417,82 @@ def test_policy_allow_regex_exempts_trusted_shell_command():
     assert not _gated(evaluate(
         _shell("trusted-sync-script.sh > .cursorrules"), pol))
     assert _gated(evaluate(_shell("echo x > .cursorrules"), pol))
+
+
+# ---- QA round: adversarial bypass-hunting review findings, now fixed --------------
+# (independent adversarial review, run in parallel with a design/consistency
+# review, the same convention every guard in this file follows)
+
+def test_glued_shell_operator_no_longer_bypasses():
+    """A redirect/pipe glued directly to the target with no space
+    (`>.cursorrules`, real, ordinary shell syntax) previously left the path
+    with no leading-boundary character this guard's patterns recognized —
+    a TOTAL bypass, confirmed still live with AEGIS_AGENT_NAME set. Fixed by
+    widening the leading boundary class (`_AI_RULES_BOUND`) to the common
+    shell metacharacters that can legitimately sit directly against a path."""
+    assert _gated(evaluate(_shell("echo evil >.cursorrules"), EMPTY))
+    assert _gated(evaluate(_shell("echo evil>>.windsurfrules"), EMPTY))
+    assert _gated(evaluate(_shell("cat evil|tee>.clinerules"), EMPTY))
+    assert _gated(evaluate(_shell("echo evil >.cursor/rules/evil.mdc"), EMPTY))
+
+
+def test_glued_shell_operator_bypass_closed_for_agent_too(monkeypatch):
+    monkeypatch.setenv("AEGIS_AGENT_NAME", "builder")
+    assert _gated(evaluate(_shell("echo evil >.cursorrules"), EMPTY))
+
+
+def test_deep_nesting_now_gated_via_edit():
+    """Cursor/Windsurf/Copilot all glob their rules directories recursively
+    in practice, so a rule file nested past the old 4-level segment cap was
+    a live, loadable file this guard's Edit/Write/MCP branch missed
+    entirely (no shell involved at all). `AI_RULES_PATH_RE` now tolerates
+    arbitrary nesting depth via a single bounded lazy span."""
+    d = evaluate(_write(".cursor/rules/a/b/c/d/e/x.mdc"), EMPTY)
+    assert _gated(d) and d.rule == "ai-rules-protect"
+    assert _gated(evaluate(_write(".windsurf/rules/a/b/c/d/e/x.md"), EMPTY))
+
+
+def test_mcp_source_destination_arg_keys_gated():
+    """The official @modelcontextprotocol/server-filesystem `move_file` tool
+    uses source/destination, neither of which `_path()` recognizes — the
+    `_flatten_strings` fallback now catches it."""
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__move_file",
+                            action=ActionClass.MCP,
+                            args={"source": "evil.md", "destination": ".cursorrules"}), EMPTY)
+    assert _gated(d) and d.rule == "ai-rules-protect"
+
+
+def test_mcp_nested_arg_shape_gated():
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__write",
+                            action=ActionClass.MCP,
+                            args={"input": {"path": ".cursor/rules/evil.mdc"}}), EMPTY)
+    assert _gated(d) and d.rule == "ai-rules-protect"
+
+
+def test_bsdtar_and_pax_now_gated():
+    """`bsdtar` uses tar's own extract-flag syntax, but `\\btar\\b`'s leading
+    word boundary never fired inside "bsdtar" — a real, ordinary alias for
+    tar on BSD/macOS, not a contrived tool name."""
+    assert _gated(evaluate(_shell("bsdtar xf p.zip -C .cursor/rules/"), EMPTY))
+    assert _gated(evaluate(_shell("pax -r -f p.pax .clinerules/"), EMPTY))
+
+
+def test_redos_on_repeated_dot_slash_padding_stays_fast():
+    """QA finding (independent adversarial review): the original
+    `(?:_AI_RULES_SEG){0,4}` repeated-segment construction was quadratic-
+    time on a no-match input padded with repeated `./` units (a real,
+    ordinary Windows-relative-path shape, not a contrived string) — ~5s at
+    100 padding units, reached through the real evaluate() pipeline. Fixed
+    with a single lazy-bounded span (AI_RULES_MID) instead of a repeated
+    compound group."""
+    cmd = "echo x > .cursor/rules/" + "./" * 300 + "x"
+    start = time.time()
+    evaluate(_shell(cmd), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"rule_ai_rules_protect took {elapsed:.2f}s on adversarial dot-slash input"
+
+    from aegis import patterns
+    start = time.time()
+    patterns.AI_RULES_PATH_RE.search(".cursor/rules/" + "./" * 300 + "x")  # no-match case
+    elapsed2 = time.time() - start
+    assert elapsed2 < 1.0, f"AI_RULES_PATH_RE took {elapsed2:.2f}s on adversarial no-match input"

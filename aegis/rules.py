@@ -1242,8 +1242,10 @@ def rule_ai_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     Honest scope, the same denylist trade-offs every guard in this file
     discloses: a path-string match (``AI_RULES_PATH_RE`` for a named file,
-    checked in the Edit/Write/MCP branch below; ``AI_RULES_DIR_RE`` as a
-    bare-directory backstop, checked ONLY in the shell branch for an
+    checked in the Edit/Write/MCP branch below plus a whole-argument
+    ``_flatten_strings`` fallback for an MCP tool whose target argument sits
+    under a key/nesting shape ``_path()`` doesn't recognize; ``AI_RULES_DIR_RE``
+    as a bare-directory backstop, checked ONLY in the shell branch for an
     archive/sync tool that never names a discrete filename at all --
     deliberately narrower than ``rule_skills_protect``'s own choice to check
     its ``*_DIR_RE`` in every branch, since each of these tools (unlike a
@@ -1251,26 +1253,69 @@ def rule_ai_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     reads only a specific extension/filename out of its rules directory, so
     gating an unrelated file merely sitting alongside one (a `.orig` backup,
     a README) would be a pure false ASK with no matching threat; plus
-    ``ai_rules_find_hit`` for ``find``-predicate indirection) -- the same
-    three-piece shape ``rule_agent_def_protect`` uses (also Edit/Write-
-    branch-narrow, unlike ``rule_skills_protect``). Known
-    residual gaps, same spirit as every sibling guard: a direct fetch-to-file
-    write (``curl -o .cursorrules``, ``wget -O ...``) is not covered by this
-    guard's own write-verb checks (closed instead by
+    ``ai_rules_find_hit`` for ``find``-predicate indirection). ``AI_RULES_PATH_RE``
+    tolerates arbitrary nesting depth (a single bounded lazy span between the
+    tool's root directory and the required extension, not a fixed segment
+    count -- see its own QA history in ``patterns.py``), since Cursor/
+    Windsurf/Copilot all glob their rules directories recursively in
+    practice. Known residual gaps, same spirit as every sibling guard: a
+    direct fetch-to-file write (``curl -o .cursorrules``, ``wget -O ...``) is
+    not covered by this guard's own write-verb checks (closed instead by
     ``rule_fetch_to_file_protect``, which reuses ``AI_RULES_PATH_RE`` the same
     way it reuses every other sibling guard's own path regex); a project-
     rules filename outside the recognized set (a future tool, or a renamed/
-    relocated one); an MCP filesystem tool naming its target argument outside
-    ``_path()``'s recognized key list; nesting past 4 levels under
-    ``.cursor/rules``/``.windsurf/rules``/``.github/instructions`` evading the
-    filename form of ``AI_RULES_PATH_RE`` (the bare-directory backstop above
-    still catches an archive/sync tool's own target argument regardless of
-    nesting); and a shell command that computes the target path indirectly
-    across separate variable assignments (the ``find``-indirection case is
-    covered; a ``for``/``xargs`` loop or ``basename``/``dirname``
-    reconstruction is not), the same disclosed gap
+    relocated one); a write verb outside the six checked here -- QA review
+    (independent adversarial review) confirmed real, reproduced ALLOWs for
+    `patch <file> < diff`, `git checkout -- <path>`/`git restore`, `git
+    clone <url> <dest>`, `zstd -d p.zst -o <file>`, `split -b N f <file>`,
+    and `sponge <file> < input` naming the target literally -- the same
+    "not every possible write primitive" trade-off every guard in this file
+    accepts, `git checkout -- <path>` being the most realistic (no network,
+    no unusual tooling, just ordinary git); ``ai_rules_find_hit``'s deliberate
+    exclusion of a bare `cursor`/`windsurf` fallback (unlike `.cursor`/
+    `.windsurf` with the leading dot) since both are common enough words
+    (a mouse cursor, a DB cursor, a network appliance) that a bare-word
+    fallback risked real ask-fatigue -- the same "too generic" trade-off
+    ``AI_RULES_FIND_PREDICATE_RE``'s own comment already makes for `.github`;
+    and a shell command that computes the target path indirectly across
+    separate variable assignments (the ``find``-indirection case is covered;
+    a ``for``/``xargs`` loop or ``basename``/``dirname`` reconstruction is
+    not), the same disclosed gap
     ``rule_self_protect``/``rule_agent_def_protect``/``rule_skills_protect``
-    already carry."""
+    already carry. An archive/sync tool's own destination flag GLUED
+    directly to the path with no space (`tar xf p.tar -C.cursor/rules/`,
+    `unzip p.zip -d.clinerules/`) defeats ``AI_RULES_DIR_RE``/``AI_RULES_PATH_RE``
+    the same way ``rule_skills_protect``'s own docstring already discloses
+    for `SKILL_DIR_RE`/`SKILL_PATH_RE` -- a real, confirmed, reproduced gap
+    (QA finding, independent adversarial review), but a cross-cutting one
+    that needs to touch the shared boundary class every `*_protect` guard
+    using `_AGENT_DEF_ROOT`'s shape inherits, not something fixable in this
+    guard alone. Also inherited, not introduced by this guard:
+    ``INPLACE_WRITE_RE``'s bare ``\\bed\\b``/``\\bcp\\b``/``\\bdd\\b`` alternatives
+    false-ASK a purely read-only command that happens to contain those two
+    letters as a whole word (`grep -c ed .cursorrules`) -- shared by every
+    sibling guard reusing that same pattern, not unique to this surface.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): a bypass-hunting review
+    found and this guard's own patterns closed two live, reproduced total
+    bypasses -- the glued shell-operator leading-boundary gap and a
+    quadratic-time hang on the repeated-segment construction (the latter
+    traced to, and fixed at the same time in, the shared ``_AGENT_DEF_SEG``
+    building block ``AGENT_DEF_PATH_RE``/``SKILL_PATH_RE`` also relied on --
+    a pre-existing bug in already-shipped guards, found incidentally while
+    hardening this new one, the same "discovered adversarially testing an
+    unrelated new guard" precedent ``FIND_PROTECTED_RE``'s and ``EXFIL_RE``'s
+    own QA histories already have) -- plus the MCP nested-argument-key gap
+    and the missing ``bsdtar``/``pax``/``Copy-Item -Recurse`` archive-tool
+    forms (the latter fixed in the shared ``ARCHIVE_SYNC_VERB_RE``, benefiting
+    every sibling guard reusing it). A parallel design/consistency review
+    confirmed correct registration and round-tripping everywhere its
+    siblings are (``_CORE_RULES``, ``Policy``, all three ``loader.py`` spots,
+    both ``skills.py`` knob lists, the ``_FETCH_HUMAN_ESCAPABLE`` table, the
+    README guard table), a live YAML ``ai_rules:`` block through
+    ``load_policy()`` into ``evaluate()`` for both ``mode`` and ``allow``,
+    and the full suite green throughout, with no wiring findings."""
     cfg = getattr(policy, "ai_rules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1280,13 +1325,28 @@ def rule_ai_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
-        if not p or not patterns.AI_RULES_PATH_RE.search(p):
+        hit = p if (p and patterns.AI_RULES_PATH_RE.search(p)) else None
+        if not hit and ev.action == ActionClass.MCP:
+            # QA finding (independent adversarial review): _path()'s fixed
+            # key-name list misses a real, official MCP filesystem tool --
+            # @modelcontextprotocol/server-filesystem's own `move_file` uses
+            # source/destination, not any key _path() recognizes -- and any
+            # nested-argument shape ({"input": {"path": ...}}). Fall back to
+            # scanning every string/number leaf the way _net_text() already
+            # does for network-shaped tool calls, so an MCP tool naming its
+            # target argument outside _path()'s list is still caught.
+            for candidate in _flatten_strings(ev.args or {}):
+                if patterns.AI_RULES_PATH_RE.search(candidate):
+                    hit = candidate
+                    break
+        if not hit:
             return None
+        p = hit
         if os.environ.get("AEGIS_ALLOW_AI_RULES") or _ai_rules_allowed_by_policy(cfg, p):
             return None
         would = Decision(action, "ai-rules-protect",
                          f"Third-party AI assistant rules file '{p}' is being written "
-                         "-- its content is folded directly into that tool's own "
+                         "— its content is folded directly into that tool's own "
                          "context on every future session, unattended. Review the "
                          "change, then confirm with AEGIS_ALLOW_AI_RULES=1; a spawned "
                          "agent cannot.")
@@ -1314,7 +1374,7 @@ def rule_ai_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         would = Decision(action, "ai-rules-protect",
                          "A third-party AI assistant rules file is being modified "
-                         "from a shell -- its content is auto-loaded into that "
+                         "from a shell — its content is auto-loaded into that "
                          "tool's own context in a future session with no further "
                          "review. A human may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_AI_RULES=1; a spawned agent cannot.")

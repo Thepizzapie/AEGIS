@@ -1278,27 +1278,48 @@ AGENT_INSTRUCTIONS_PATH_RE = re.compile(
 
 # `.claude/agents/`, `.claude/commands/`, and `.claude/output-styles/` allow
 # one level of namespacing (Claude Code resolves `.claude/commands/foo/
-# bar.md` as `/foo:bar`) — the bounded `{0,4}` repeated segment mirrors
-# GIT_HOOKS_PATH_RE's own `_SUBMODULE_SEG` treatment for the identical
-# reason: real nesting is shallow, and an UNBOUNDED repeated group here
-# would reopen the exact catastrophic-backtracking shape this file's own
-# comments (see _WIN_TRIM, FIND_WORD_RE) already document and fix
-# elsewhere. Known, disclosed, precedent-matched limit (same as
-# GIT_HOOKS_PATH_RE's own submodule bound): nesting past 4 levels evades
-# this pattern's filename form — AGENT_DEF_DIR_RE below (a bare directory
-# reference, no filename required) is the backstop for that, paired with
-# ARCHIVE_SYNC_VERB_RE, since a deeply-nested write is still a write INTO
-# the top-level directory as far as an archive/sync tool's own target
-# argument is concerned.
-_AGENT_DEF_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+# bar.md` as `/foo:bar`) — real nesting is shallow, but see the round-2 QA
+# note below for how this is now bounded.
+#
+# QA finding (independent adversarial review, round 2 — discovered while
+# adversarially hardening the unrelated new `rule_ai_rules_protect` guard,
+# which was modeled on this pattern's shape): the original `(?:_AGENT_DEF_SEG
+# ){0,4}` construction — `_AGENT_DEF_SEG` itself being `[^\s'"/\\]{1,200}` +
+# `_WIN_TRIM` (`[ .]*`) + `_SEP` (`[/\\]+(?:\.[/\\]+)*`) — was believed safe
+# because it mirrors `GIT_HOOKS_PATH_RE`'s own bounded `_SUBMODULE_SEG`
+# treatment, but is NOT: `_WIN_TRIM` and `_SEP`'s own inner `(?:\.[/\\]+)*`
+# loop both match runs of `.`/`/` characters, so a single `.claude/agents/`
+# followed by many repeated `./` units (a real, ordinary Windows-relative-
+# path padding sequence, not a contrived string) has many ways to partition
+# across each of the {0,4} repetitions' own content-class/_WIN_TRIM/_SEP
+# boundary — quadratic (measured: ~5s at 100 units, ~40s+ extrapolated
+# beyond) on the NO-MATCH case specifically (a filename with no trailing
+# `.md`), reached through the real `evaluate()` pipeline for this NEVER-
+# disabled-by-default core guard. `SKILL_PATH_RE` below, sharing the same
+# `_AGENT_DEF_SEG` building block, has the identical bug (confirmed,
+# ~3s at 200 units against a longer fixed root). Per the README's own
+# documented "fail-open by default" posture, a hang here doesn't just block
+# this guard — it fails the whole hook open, unguarded, for every guard
+# after it in `_CORE_RULES` too.
+#
+# Fixed by replacing the repeated-segment construction with a single lazy-
+# bounded span (`_AGENT_DEF_MID`) between the fixed root and the required
+# `.md` extension — the same "one bounded quantifier, no nested repetition
+# to re-partition" shape `EXFIL_RE`'s own `{0,200}?` fix already uses
+# elsewhere in this file. This is STRICTLY MORE permissive than the old
+# `{0,4}`-segment cap (arbitrary nesting depth up to 400 chars total, not
+# just 4 levels), a disclosed, deliberate widening — not a narrowing — of
+# real coverage, verified against the full existing agent_def/skills_protect
+# test suites with no regressions.
+_AGENT_DEF_MID = r"[^\s'\"]{1,400}?"
 _AGENT_DEF_ROOT = r"(?:^|[\s'\"/\\=])\.claude" + _WIN_TRIM + _SEP
 AGENT_DEF_PATH_RE = re.compile(
     _AGENT_DEF_ROOT + r"agents" + _WIN_TRIM + _SEP
-    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
+    + _AGENT_DEF_MID + r"\.md" + _CI_END
     + r"|" + _AGENT_DEF_ROOT + r"commands" + _WIN_TRIM + _SEP
-    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
+    + _AGENT_DEF_MID + r"\.md" + _CI_END
     + r"|" + _AGENT_DEF_ROOT + r"output-styles" + _WIN_TRIM + _SEP
-    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END,
+    + _AGENT_DEF_MID + r"\.md" + _CI_END,
     re.IGNORECASE,
 )
 
@@ -1342,7 +1363,21 @@ ARCHIVE_SYNC_VERB_RE = re.compile(
     r"|\bunzip\b"
     r"|\b7z[az]?\b(?=[^|;&\n]{0,50}\b[xe]\b)"
     r"|\binstall\b(?=[^|;&\n]{0,50}(?:-m\b|--mode\b))"
-    r"|\bunrar\b|\bcpio\b|\bExpand-Archive\b|\bxcopy\b|\brobocopy\b",
+    r"|\bunrar\b|\bcpio\b|\bExpand-Archive\b|\bxcopy\b|\brobocopy\b"
+    # QA finding (independent adversarial review, discovered while hardening
+    # the new `rule_ai_rules_protect` guard): `bsdtar` uses tar's own
+    # extract-flag syntax but `\btar\b`'s leading word boundary never fires
+    # inside "bsdtar" (no boundary between "bsd" and "tar", both \w chars),
+    # so `bsdtar xf p.tar -C .cursor/rules/` sailed through with zero
+    # detection despite behaving identically to `tar` for every guard
+    # reusing this pattern. `pax` (POSIX archive tool, same tar-like
+    # extract semantics) and PowerShell's `Copy-Item -Recurse` (the
+    # recursive-copy analog `xcopy`/`robocopy` already cover) were two more
+    # ordinary, real tools missing entirely.
+    r"|\bbsdtar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+-{0,2}[a-zA-Z]{0,5}x[a-zA-Z]{0,5}\b)"
+    r"|\bbsdtar\b(?=(?:" + _TAR_TOKEN + r"){0,4}?\s+--extract\b)"
+    r"|\bpax\b"
+    r"|\bCopy-Item\b(?=[^|;&\n]{0,50}-Recurse\b)",
     re.IGNORECASE,
 )
 
@@ -1417,9 +1452,16 @@ def agent_def_find_hit(cmd: str) -> bool:
 # in practice: SKILL_DIR_RE below is checked in EVERY branch of rule_skills_protect
 # (Edit/Write/MCP and shell alike), not just the shell one, precisely so a bundled
 # resource file gets the same coverage SKILL.md itself does.
+# QA finding (independent adversarial review, round 2 — same discovery as
+# `AGENT_DEF_PATH_RE`'s own note above, since this shares the identical
+# `_AGENT_DEF_SEG` building block): had the same quadratic-time bug on the
+# no-match case. Fixed the same way, with a zero-minimum lazy span
+# (`_SKILL_MID`) since `SKILL.md` can sit directly under a skill's own
+# directory with no further nesting at all.
 _SKILL_ROOT = _AGENT_DEF_ROOT + r"skills" + _WIN_TRIM + _SEP
+_SKILL_MID = r"[^\s'\"]{0,400}?"
 SKILL_PATH_RE = re.compile(
-    _SKILL_ROOT + r"(?:" + _AGENT_DEF_SEG + r"){0,4}SKILL" + _WIN_TRIM + r"\.md" + _CI_END,
+    _SKILL_ROOT + _SKILL_MID + r"SKILL" + _WIN_TRIM + r"\.md" + _CI_END,
     re.IGNORECASE,
 )
 
@@ -1472,10 +1514,43 @@ def skill_find_hit(cmd: str) -> bool:
 # `generic` adapter — can plant one of these completely unnoticed today: nothing
 # in `_CORE_RULES` has an opinion on any of them. First real coverage for this
 # surface, not a hardening of existing coverage.
-_AI_RULES_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
-_AI_RULES_CURSOR_ROOT = r"(?:^|[\s'\"/\\=])\.cursor" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
-_AI_RULES_WINDSURF_ROOT = r"(?:^|[\s'\"/\\=])\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
-_AI_RULES_COPILOT_ROOT = r"(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"instructions" + _WIN_TRIM + _SEP
+# QA finding (independent adversarial review, round 1): the leading boundary
+# group used everywhere below was originally `(?:^|[\s'"/\\=])` — copied from
+# AGENT_INSTRUCTIONS_PATH_RE/AGENT_DEF_PATH_RE, which have the identical
+# gap — so a shell redirect/pipe/separator glued directly to the target with
+# NO space (`echo evil >.cursorrules`, `cmd|tee>.windsurfrules`, real,
+# ordinary shell syntax, not obscure) left the path with no character in
+# that class immediately before it, and the whole guard missed it — a TOTAL
+# bypass, still live with `AEGIS_AGENT_NAME` set (no `# aegis-allow` needed).
+# `_AI_RULES_BOUND` widens the class to the common shell metacharacters that
+# can legitimately sit directly against a path with no whitespace. Scoped to
+# this guard's own patterns only — deliberately NOT backported to
+# `AGENT_INSTRUCTIONS_PATH_RE`/`AGENT_DEF_PATH_RE` (which share the identical
+# gap) to avoid touching those already-hardened, separately-tested patterns'
+# behavior as a side effect of this guard's own QA; left disclosed here as an
+# inherited gap those two, and every sibling guard using the same
+# `(?:^|[\s'"/\\=])` shape, still carry.
+_AI_RULES_BOUND = r"(?:^|[\s'\"/\\=<>|;&(){}:$`])"
+
+# QA finding (independent adversarial review, round 1): the original
+# `_AI_RULES_SEG` — `[^\s'"/\\]{1,200}` + `_WIN_TRIM` + `_SEP` inside a
+# `(?:...){0,4}` repeat — is the exact same shape independently found to be
+# quadratic-time on the no-match case in `AGENT_DEF_PATH_RE`/`SKILL_PATH_RE`
+# (see those patterns' own QA notes above); this guard's copy has the
+# identical bug (confirmed: ~5s at 100 padding units). Fixed the same way,
+# with a single lazy-bounded span (`_AI_RULES_MID`) instead of a repeated
+# compound group — also a disclosed, deliberate widening of real coverage
+# (arbitrary nesting depth up to 400 chars, not just 4 levels), addressing
+# a second, independent QA finding that Cursor/Windsurf/Copilot all glob
+# their rules directories recursively, so a rule file nested past the old
+# 4-level cap was a live, loadable file this guard's Edit/Write/MCP branch
+# (which never consulted `AI_RULES_DIR_RE`, unlike `rule_skills_protect`'s
+# deliberately broader choice — see this guard's own docstring) let through
+# with no shell involved at all.
+_AI_RULES_MID = r"[^\s'\"]{1,400}?"
+_AI_RULES_CURSOR_ROOT = _AI_RULES_BOUND + r"\.cursor" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
+_AI_RULES_WINDSURF_ROOT = _AI_RULES_BOUND + r"\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _WIN_TRIM + _SEP
+_AI_RULES_COPILOT_ROOT = _AI_RULES_BOUND + r"\.github" + _WIN_TRIM + _SEP + r"instructions" + _WIN_TRIM + _SEP
 
 # Flat, fixed-name files (any directory depth) — the same shape
 # AGENT_INSTRUCTIONS_PATH_RE uses for CLAUDE.md/AGENTS.md. `.clinerules`'s
@@ -1485,17 +1560,14 @@ _AI_RULES_COPILOT_ROOT = r"(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"ins
 # unlike Cursor/Windsurf/Copilot below, whose distinctive marker (`rules`/
 # `instructions`) sits one path segment further in.
 AI_RULES_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cursorrules" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.windsurfrules" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.clinerules" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"copilot-instructions"
+    _AI_RULES_BOUND + r"\.cursorrules" + _CI_END
+    + r"|" + _AI_RULES_BOUND + r"\.windsurfrules" + _CI_END
+    + r"|" + _AI_RULES_BOUND + r"\.clinerules" + _CI_END
+    + r"|" + _AI_RULES_BOUND + r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions"
       + _WIN_TRIM + r"\.md" + _CI_END
-    + r"|" + _AI_RULES_CURSOR_ROOT + r"(?:" + _AI_RULES_SEG + r"){0,4}" + _CI_SEG
-      + r"\.mdc" + _CI_END
-    + r"|" + _AI_RULES_WINDSURF_ROOT + r"(?:" + _AI_RULES_SEG + r"){0,4}" + _CI_SEG
-      + r"\.md" + _CI_END
-    + r"|" + _AI_RULES_COPILOT_ROOT + r"(?:" + _AI_RULES_SEG + r"){0,4}" + _CI_SEG
-      + r"\.instructions" + _WIN_TRIM + r"\.md" + _CI_END,
+    + r"|" + _AI_RULES_CURSOR_ROOT + _AI_RULES_MID + r"\.mdc" + _CI_END
+    + r"|" + _AI_RULES_WINDSURF_ROOT + _AI_RULES_MID + r"\.md" + _CI_END
+    + r"|" + _AI_RULES_COPILOT_ROOT + _AI_RULES_MID + r"\.instructions" + _WIN_TRIM + r"\.md" + _CI_END,
     re.IGNORECASE,
 )
 
@@ -1507,10 +1579,10 @@ AI_RULES_PATH_RE = re.compile(
 # since it can be a directory Cline reads every `.md` file from, the same
 # ambiguous file-or-directory shape as `.claude/skills/<name>/` one level up.
 AI_RULES_DIR_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cursor" + _WIN_TRIM + _SEP + r"rules" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.clinerules" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP + r"instructions" + _CI_END,
+    _AI_RULES_BOUND + r"\.cursor" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    + r"|" + _AI_RULES_BOUND + r"\.windsurf" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    + r"|" + _AI_RULES_BOUND + r"\.clinerules" + _CI_END
+    + r"|" + _AI_RULES_BOUND + r"\.github" + _WIN_TRIM + _SEP + r"instructions" + _CI_END,
     re.IGNORECASE,
 )
 
