@@ -2918,6 +2918,85 @@ PERMISSION_BYPASS_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code permission-allowlist self-escalation protection (.claude/settings.local.json) ---
+# A FOURTH, distinct auto-approve surface in the same file `CLAUDE_LOCAL_SETTINGS_
+# PATH_RE` locates, alongside `hooks`/`statusLine`/`defaultMode`: Claude Code's
+# `permissions.allow` array lets a project pre-approve specific tool-call shapes so
+# the human is never asked again for anything matching them. `rule_claude_hooks_
+# protect`'s own docstring — and `rule_permission_bypass_protect`'s own test suite
+# (`test_additional_directories_not_gated`) — both explicitly leave `permissions.
+# allow` ungated as "ordinary... ...entirely benign" content, and that's true for its
+# everyday, narrowly-SCOPED use (`"Bash(npm run build:*)"`, `"Read(src/**)"`). It is
+# NOT true for one specific value shape: an allow entry that grants the Bash tool
+# with NO command restriction at all — the bare string `"Bash"` (no parenthesized
+# specifier means no scope, so every command matches it) or the explicit wildcard
+# `"Bash(*)"`. That single array entry pre-approves arbitrary shell execution,
+# silently and durably (every future session that reads this file, not just this
+# one), for every future Bash call the runtime doesn't separately deny — the same
+# practical reach `permissions.defaultMode: "bypassPermissions"` has, but scoped to
+# one tool (still the one tool that alone can reach everything else this whole file
+# guards: exfiltration, deletion, persistence) — and reached without ever touching
+# `defaultMode` at all, so it evades `rule_permission_bypass_protect` entirely.
+# Deliberately narrower than "any `allow` addition", the same "the VALUE's shape is
+# the enabling switch, not the key's mere presence" design `CLAUDE_STATUSLINE_KEY_RE`
+# already uses for `type: "command"`: an ordinary, narrowly-scoped grant must not
+# gate, only the specific "no meaningful restriction at all" shape.
+#
+# Case-sensitive by design (no IGNORECASE): Claude Code's own tool-name matching is
+# case-sensitive, so a lowercase `"bash"` string in an allow array does not actually
+# grant the real `Bash` tool at all — treating it as a hit would be a pure false
+# positive with no matching real capability, not a defense-in-depth catch.
+_PERMISSION_ALLOWLIST_UNSCOPED_BASH = r"\bBash\b(?:\(\s*\*\s*\))?(?!\()"
+
+# Bounded tempered-dot window from an `"allow"` array's opening bracket to an
+# unscoped Bash grant inside it, excluding a crossed `]` — a real `permissions.
+# allow` array is a flat list of short quoted strings with no legitimate `]`
+# before its own close, so the exclusion alone keeps this scoped to ONE array
+# regardless of window size. The 2000-char bound exists only to cap worst-case
+# regex work (the same reason `CLAUDE_HOOKS_KEY_RE`/`CLAUDE_STATUSLINE_KEY_RE`
+# stay bounded rather than unbounded like `PERMISSION_BYPASS_JQ_RE`'s single-pair
+# window) — comfortably fits dozens of realistic, legitimately-scoped grants ahead
+# of the dangerous one. A PARTIAL Edit fragment (not valid standalone JSON) padded
+# past the bound is a disclosed residual gap for this textual check specifically;
+# `_permission_allowlist_struct_hit` (rules.py) closes it for any WHOLE-FILE-valid
+# JSON via a real recursive walk with no such bound.
+PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE = re.compile(
+    r'["\']allow["\']\s*:\s*\[(?:(?!\]).){0,2000}?' + _PERMISSION_ALLOWLIST_UNSCOPED_BASH,
+    re.DOTALL,
+)
+
+# jq has no `-i` flag, so a scripted edit is either a temp-file-then-`mv` (caught by
+# self-protect's own write-verb check, non-escapable for this entire file) or piped
+# through `sponge` — the same write-verb-less shape every sibling `*_JQ_RE` pattern
+# in this file already closes, one key over: jq (or `gojq`/`jaq`), an
+# assignment-shaped operator, `allow` as a bare substring (covers `.permissions.
+# allow`/bracket-index spellings alike, the same "don't enumerate jq's path grammar"
+# call `CLAUDE_HOOKS_JQ_RE` already makes), and an unscoped `Bash` mention —
+# unbounded within one `;`-delimited statement, matching `PERMISSION_BYPASS_JQ_RE`'s
+# own fix for the identical fixed-window bypass class (a jq comment or no-op
+# string-literal binding used as filler); a jq program is a short single
+# expression, not a large data blob, so this doesn't need the array guard's
+# padding-tolerant 2000-char bound.
+PERMISSION_ALLOWLIST_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\.?allow\b)"
+    r"(?=[^;]*" + _PERMISSION_ALLOWLIST_UNSCOPED_BASH + r")",
+)
+
+# A second, file-free grant of the exact same switch: the `claude` CLI's own
+# `--allowedTools`/`--allowed-tools` flag pre-approves the listed tools for that
+# session's whole lifetime with no settings.local.json write at all — the same
+# "file write and CLI form" split `PERMISSION_BYPASS_CLI_RE` already makes for
+# `defaultMode`. Anchored to the `claude` binary name; the flag's value is scanned
+# within a bounded distance for an unscoped Bash entry so an unrelated, far-apart
+# mention of both on the same shell line doesn't false-positive as readily as an
+# unbounded window would.
+PERMISSION_ALLOWLIST_CLI_RE = re.compile(
+    r"\bclaude\b[^|;&\n]*--allowed-?[Tt]ools\b(?:=|\s+)[^|;&\n]{0,500}?"
+    + _PERMISSION_ALLOWLIST_UNSCOPED_BASH,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

@@ -60,6 +60,7 @@ def load_policy(path) -> Policy:
         "gitmodules": {},
         "service_persist": {}, "ld_preload": {}, "devcontainer_exec": {}, "vscode_tasks_exec": {},
         "path_hijack": {}, "claude_hooks": {}, "statusline": {}, "permission_bypass": {},
+        "permission_allowlist": {},
         "conftest": {}, "pysite": {},
         "ipython_startup": {}, "cloud_cred_exec": {}, "terraform_exec": {}, "fetch_to_file": {},
         "inject": {}, "failures": {},
@@ -107,6 +108,7 @@ def load_policy(path) -> Policy:
                   claude_hooks=st["claude_hooks"],
                   statusline=st["statusline"],
                   permission_bypass=st["permission_bypass"],
+                  permission_allowlist=st["permission_allowlist"],
                   conftest=st["conftest"],
                   pysite=st["pysite"],
                   ipython_startup=st["ipython_startup"],
@@ -148,7 +150,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
                 "git_attributes_exec", "gitmodules", "service_persist", "ld_preload",
                 "devcontainer_exec",
                 "vscode_tasks_exec", "path_hijack", "claude_hooks", "statusline",
-                "permission_bypass", "conftest", "pysite",
+                "permission_bypass", "permission_allowlist", "conftest", "pysite",
                 "ipython_startup", "cloud_cred_exec", "terraform_exec", "fetch_to_file",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):

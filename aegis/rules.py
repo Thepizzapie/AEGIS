@@ -4671,6 +4671,245 @@ def rule_permission_bypass_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+def _permission_allowlist_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _permission_allowlist_bash_value_hit(s) -> bool:
+    """True iff ``s`` is exactly an unscoped Bash grant string — the bare
+    ``"Bash"`` or the explicit wildcard ``"Bash(*)"`` (optional internal
+    whitespace), and nothing else. A narrowly-scoped grant like
+    ``"Bash(git diff:*)"`` must not match — `re.fullmatch` (not `.search`)
+    is what enforces that: the whole string, not a substring, must be one of
+    these two shapes."""
+    if not isinstance(s, str):
+        return False
+    return bool(re.fullmatch(r"Bash(?:\(\s*\*\s*\))?", s.strip()))
+
+
+def _permission_allowlist_struct_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args, or a whole-file-valid
+    JSON document, looking for a dict key that IS ``allow``, or ENDS WITH the
+    dotted-path suffix ``.allow`` (the same flat ``"permissions.allow"``
+    convention `_permission_bypass_struct_key_hit` already accepts for
+    `defaultMode`), whose value is a list containing an unscoped Bash grant
+    string. Same depth cap (12) as every sibling structural walk in this file."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str):
+                kl = k.strip().lower()
+                if (kl == "allow" or kl.endswith(".allow")) and isinstance(val, (list, tuple)):
+                    if any(_permission_allowlist_bash_value_hit(x) for x in val):
+                        return True
+            if _permission_allowlist_struct_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_permission_allowlist_struct_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _permission_allowlist_mcp_bareword_hit(a: dict) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: an ``allow``/``...allow``
+    leaf co-occurring with an unscoped-Bash leaf, both as plain string LEAVES
+    anywhere in the (recursively) flattened raw MCP args — closes a "set
+    config value"-style MCP tool's flat ``{"key": "permissions.allow", "value":
+    "Bash"}`` shape, the same bareword-leaf gap `_permission_bypass_mcp_
+    bareword_hit` already closes for its own key. Both signals required to
+    keep this MCP-only fallback narrow."""
+    leaves = [s.strip() for s in _flatten_strings(a) if isinstance(s, str)]
+    allow_hit = any(leaf.lower() == "allow" or leaf.lower().endswith(".allow") for leaf in leaves)
+    bash_hit = any(_permission_allowlist_bash_value_hit(leaf) for leaf in leaves)
+    return allow_hit and bash_hit
+
+
+def _permission_allowlist_json_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result via `_permission_allowlist_struct_hit` — an additional signal
+    alongside `PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE`'s bounded textual check,
+    not a replacement for it: this walk has no window bound, so it closes the
+    array-guard's own disclosed padding gap for any WHOLE-FILE-valid JSON
+    (typically a Write of the entire file), the same relationship
+    `_permission_bypass_json_key_hit` has to `PERMISSION_BYPASS_MODE_KEY_RE`."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _permission_allowlist_struct_hit(obj)
+
+
+def rule_permission_allowlist_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering an unrestricted ``Bash`` grant — the bare
+    ``"Bash"`` or explicit wildcard ``"Bash(*)"`` — inside ``permissions.allow``
+    in ``.claude/settings.local.json``, the same project-local,
+    gitignored-by-default sibling of ``.claude/settings.json`` `rule_claude_
+    hooks_protect`/`rule_statusline_protect`/`rule_permission_bypass_protect`
+    already guard for their own keys in this file, and the equivalent,
+    file-free ``claude --allowedTools``/``--allowed-tools`` CLI invocation.
+
+    THREAT MODEL: `rule_permission_bypass_protect` protects the ONE switch
+    that silences Claude Code's confirmation prompt for EVERY future tool
+    call (``permissions.defaultMode: "bypassPermissions"``). This guard
+    protects a narrower, more surgical variant of the identical threat that
+    evades it entirely: `permissions.allow` lets a project pre-approve
+    specific tool-call SHAPES so the human is never asked again for anything
+    matching them — its everyday, narrowly-scoped use (``"Bash(npm run
+    build:*)"``, ``"Read(src/**)"``) is genuinely benign, and both `rule_
+    claude_hooks_protect`'s own docstring and `rule_permission_bypass_
+    protect`'s own test suite (``test_additional_directories_not_gated``)
+    explicitly say so. But one specific value shape is not benign: a ``Bash``
+    grant with NO command restriction at all silently pre-approves arbitrary
+    shell execution — the one tool that alone can reach exfiltration,
+    deletion, and persistence — for as long as the file stands, without ever
+    setting ``defaultMode``. An agent (or a prompt-injected instruction
+    reaching an agent with edit access) that wants a standing, unattended
+    "just let me run anything" grant, but expects `defaultMode:
+    "bypassPermissions"` itself to draw scrutiny in review, reaches for this
+    narrower-looking, equally complete substitute instead.
+
+    Four detection layers, matching the structure `rule_permission_bypass_
+    protect` already established for its own key: (1) a bounded textual
+    regex (`PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE`) over Edit/Write/MCP
+    content, generous enough (2000 chars) for a realistic allow list; (2) an
+    unbounded structural JSON walk (`_permission_allowlist_struct_hit`) for
+    any content that parses as valid JSON on its own, closing (1)'s window
+    for a whole-file Write; (3) an MCP-only structural/bareword fallback for
+    tool-arg shapes a plain JSON parse never sees; (4) a shell jq/sponge form
+    (`PERMISSION_ALLOWLIST_JQ_RE`, unbounded within one `;`-delimited
+    statement, the same fix `PERMISSION_BYPASS_JQ_RE` already needed after
+    its own padding-bypass finding) and a file-free CLI form
+    (`PERMISSION_ALLOWLIST_CLI_RE`).
+
+    Distinct from `rule_permission_bypass_protect`'s own coverage: that guard's
+    test suite pins `permissions.allow` content as explicitly out of its
+    scope, and its own docstring lists `permissions` among the settings.local.
+    json content it deliberately leaves ungated — true for the key generally,
+    not for this one value shape, the identical "narrower than the bare key,
+    gated on the dangerous VALUE" split `CLAUDE_STATUSLINE_KEY_RE` already
+    makes one key over for `statusLine`'s `type: "command"`.
+
+    Same self-protect-precedence interaction as every sibling settings.local.
+    json guard: an ordinary redirect/sed-i/mv shell write is already caught
+    upstream by self-protect (non-escapable) before this guard ever runs —
+    this guard's own real shell-form coverage is the write-verb-less jq/
+    sponge shape self-protect never sees.
+
+    Config (``policy.permission_allowlist``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate).
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_PERMISSION_ALLOWLIST=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form — a
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest, disclosed scope, the same denylist trade-offs every guard in this
+    file discloses: deliberately Bash-only — an unrestricted grant for
+    another tool (bare ``Write``, ``Edit``, ``WebFetch``) is a related but
+    distinct primitive this guard does not cover, the single highest-value
+    target chosen first the same way `rule_cloud_cred_exec_protect` covers
+    AWS/Kubernetes first and discloses GCP ADC as a related, uncovered
+    surface; a value assembled indirectly (shell variable concatenation, a
+    templating step) defeats every check here, the same "computed
+    indirectly" class every sibling guard already accepts; case-sensitive by
+    design (a lowercase `"bash"` string grants nothing real, so it is not
+    treated as a hit); the CLI-form pattern is anchored to the literal
+    `claude` binary name, so an aliased/renamed binary, or a wrapper script
+    that itself calls `claude --allowedTools Bash` internally without that
+    flag appearing in the outer command line, is not caught, the identical
+    gap `PERMISSION_BYPASS_CLI_RE` already discloses for its own flag; a
+    direct fetch-to-file write (``curl -o .claude/settings.local.json ...``)
+    is caught by none of THIS guard's own checks, but is closed end-to-end by
+    the separate `rule_fetch_to_file_protect` backstop, which already reuses
+    `CLAUDE_LOCAL_SETTINGS_PATH_RE` as one of its own protected targets for
+    this exact file; and this reaches only the tool-call surface Aegis's own
+    PreToolUse hook is wired into — a CLI invocation from OUTSIDE any
+    Aegis-guarded session is out of scope by design, the same boundary every
+    guard in this file already accepts."""
+    cfg = getattr(policy, "permission_allowlist", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "permission-allowlist-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE.search(content)
+                   or _permission_allowlist_json_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = bool(_permission_allowlist_struct_hit(a) or _permission_allowlist_mcp_bareword_hit(a))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PERMISSION_ALLOWLIST")
+                or _permission_allowlist_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "permission-allowlist-protect",
+                         f"'{p}' is being written with `permissions.allow` granting "
+                         "the Bash tool with NO command restriction (a bare "
+                         "\"Bash\" or \"Bash(*)\" entry) — this silently "
+                         "pre-approves EVERY future shell command, the single "
+                         "tool that alone can reach exfiltration, deletion, and "
+                         "persistence, without ever touching `permissions."
+                         "defaultMode`. Review the change, then confirm with "
+                         "AEGIS_ALLOW_PERMISSION_ALLOWLIST=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        cli_hit = bool(patterns.PERMISSION_ALLOWLIST_CLI_RE.search(cmd))
+        if not cli_hit:
+            cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+            path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                             or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+            if not path_hit:
+                return None
+            if not (patterns.PERMISSION_ALLOWLIST_JQ_RE.search(cmd)
+                     or patterns.PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE.search(cmd)):
+                return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PERMISSION_ALLOWLIST")
+                or _permission_allowlist_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        if cli_hit:
+            msg = ("The `claude` CLI is being launched with `--allowedTools`/"
+                   "`--allowed-tools` granting the Bash tool with no command "
+                   "restriction — this pre-approves every shell command for "
+                   "the new session's whole lifetime, no file write needed. A "
+                   "human may append '# aegis-allow', or set "
+                   "AEGIS_ALLOW_PERMISSION_ALLOWLIST=1; a spawned agent "
+                   "cannot.")
+        else:
+            msg = ("`permissions.allow` is being granted an unrestricted Bash "
+                   "entry in .claude/settings.local.json from a shell — this "
+                   "silently pre-approves every future shell command, and "
+                   "(being gitignored by default) with no diff and no code "
+                   "review. A human may append '# aegis-allow', or set "
+                   "AEGIS_ALLOW_PERMISSION_ALLOWLIST=1; a spawned agent "
+                   "cannot.")
+        return _finish(Decision(action, "permission-allowlist-protect", msg))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -6611,6 +6850,7 @@ _CORE_RULES = (
     rule_claude_hooks_protect,
     rule_statusline_protect,
     rule_permission_bypass_protect,
+    rule_permission_allowlist_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,

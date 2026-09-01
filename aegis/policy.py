@@ -268,6 +268,19 @@ class Policy:
     # --dangerously-skip-permissions`/`--permission-mode bypassPermissions`
     # CLI invocation. See rules.rule_permission_bypass_protect.
     permission_bypass: dict = field(default_factory=dict)
+    # Claude Code permission-allowlist self-escalation protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty -> defaults
+    # (mode=ask) apply. Covers an unrestricted Bash grant (a bare `"Bash"` or
+    # wildcard `"Bash(*)"` entry, with no command restriction at all) planted
+    # into `permissions.allow` in `.claude/settings.local.json` -- the same
+    # file `claude_hooks`/`statusline`/`permission_bypass` guard for their own
+    # keys -- or the equivalent, file-free `claude --allowedTools`/
+    # `--allowed-tools` CLI invocation. Narrower than `permission_bypass`
+    # (Bash only, not every tool), but reaches the identical practical outcome
+    # -- every future shell command silently pre-approved -- without ever
+    # touching `defaultMode`, so it evades that guard entirely. See
+    # rules.rule_permission_allowlist_protect.
+    permission_allowlist: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a
