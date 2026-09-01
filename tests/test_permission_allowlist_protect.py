@@ -110,6 +110,36 @@ def test_scoped_bash_grant_not_gated():
         assert not _gated(d), entry
 
 
+def test_bash_as_substring_of_unrelated_scoped_grant_not_gated():
+    """QA finding (independent adversarial review, bypass-hunting round,
+    confirmed reproduced): an earlier draft anchored the unscoped-Bash
+    pattern on a plain `\\b` word boundary, which matched "Bash" as a whole
+    WORD embedded inside an unrelated, legitimately-scoped grant string —
+    none of these grant the Bash tool at all, and all three false-positived
+    (wrongly asked) before the fix anchored the match to a real value
+    boundary (quote/comma/`=`/whitespace) instead."""
+    for entry in (
+        '"Read(Bash-scripts/**)"',
+        '"Edit(src/Bash.Utils/**)"',
+        '"WebFetch(domain:Bash.example.com)"',
+    ):
+        d = evaluate(_write(".claude/settings.local.json",
+                             '{"permissions": {"allow": [' + entry + ']}}'), EMPTY)
+        assert not _gated(d), entry
+
+
+def test_bash_as_substring_via_jq_not_gated():
+    d = evaluate(_shell(
+        'jq \'.permissions.allow += ["Read(Bash-scripts/**)"]\' '
+        '.claude/settings.local.json | sponge .claude/settings.local.json'), EMPTY)
+    assert not _gated(d)
+
+
+def test_cli_allowed_tools_bash_substring_of_scoped_tool_not_gated():
+    d = evaluate(_shell('claude --allowedTools "Read(Bash-scripts/**)" -p "go"'), EMPTY)
+    assert not _gated(d)
+
+
 def test_other_tools_scoped_or_unscoped_not_gated():
     """Deliberately Bash-only: an unrestricted grant for a different tool is
     a disclosed, out-of-scope gap, not something this guard claims to catch."""
@@ -156,6 +186,45 @@ def test_additional_directories_and_other_permissions_keys_not_gated():
                          '{"permissions": {"additionalDirectories": ["../docs"], '
                          '"defaultMode": "acceptEdits"}}'), EMPTY)
     assert not _gated(d)
+
+
+def test_unicode_escaped_allow_key_gated():
+    """QA finding (independent adversarial review, design/consistency
+    round): a partial Edit fragment (not valid standalone JSON) spelling
+    `allow` with a JSON `\\uXXXX` escape defeated every detection layer at
+    once before `_permission_allowlist_normalize` existed — the textual
+    regex never decoded it, and `json.loads()` raised on the non-standalone
+    fragment so the structural walk never ran either. A confirmed,
+    reproduced full bypass (silent ALLOW, no rule firing), closed by
+    porting `_permission_bypass_normalize` over unchanged."""
+    d = evaluate(_edit(".claude/settings.local.json",
+                        '"\\u0061llow": ["Bash"]'), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_unicode_escaped_allow_key_via_write_gated():
+    d = evaluate(_write(".claude/settings.local.json",
+                         '"\\u0061llow": ["Bash"]'), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_unicode_escaped_bash_value_gated():
+    d = evaluate(_edit(".claude/settings.local.json",
+                        '"allow": ["\\u0042ash"]'), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_unicode_escaped_key_via_mcp_edit_nested_gated():
+    d = evaluate(_mcp_edit_nested(".claude/settings.local.json", "{}",
+                                   '"\\u0061llow": ["Bash"]'), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_unicode_escaped_shell_jq_sponge_gated():
+    d = evaluate(_shell(
+        'jq \'."\\u0061llow" += ["Bash"]\' .claude/settings.local.json '
+        '| sponge .claude/settings.local.json'), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
 
 
 def test_nested_project_path_gated():
@@ -272,6 +341,87 @@ def test_shell_whitespace_padding_does_not_defeat_window_gated():
                 '| sponge .claude/settings.local.json')
     d = evaluate(_shell(padded), EMPTY)
     assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_shell_jq_update_assign_operator_gated():
+    d = evaluate(_shell(
+        'jq \'.permissions.allow |= . + ["Bash"]\' .claude/settings.local.json '
+        '| sponge .claude/settings.local.json'), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_shell_jq_bracket_index_notation_gated():
+    d = evaluate(_shell(
+        'jq \'.["permissions"]["allow"] += ["Bash"]\' '
+        '.claude/settings.local.json | sponge .claude/settings.local.json'), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_jq_equality_comparison_not_gated():
+    d = evaluate(_shell(
+        'jq \'select(.permissions.allow == ["Bash"])\' '
+        '.claude/settings.local.json'), EMPTY)
+    assert not _gated(d)
+
+
+def test_shell_jq_multiline_program_gated():
+    cmd = ('jq \'.permissions.allow +=\n  ["Bash"]\' '
+           '.claude/settings.local.json | sponge .claude/settings.local.json')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_shell_jq_ampersand_in_quoted_value_gated():
+    cmd = ('jq \'.permissions.allow = ["Read(a&b)", "Bash"]\' '
+           '.claude/settings.local.json | sponge .claude/settings.local.json')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_shell_jq_string_literal_padding_over_400_chars_still_gated():
+    """The identical bypass shape using a jq no-op string-literal binding
+    (`"..." as $unused |`) instead of a `#`-comment — confirms the unbounded
+    `;`-scoped window is a real fix, not merely a comment-stripping patch
+    that would leave this equally-valid filler shape open."""
+    filler = '"' + ("a" * 380) + '" as $unused | '
+    cmd = ("jq '" + filler + '.permissions.allow += ["Bash"]'
+           + "' .claude/settings.local.json | sponge .claude/settings.local.json")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_shell_jq_genuinely_unrelated_far_mention_in_same_statement_asks():
+    """Accepted trade-off of the unbounded window, matching `PERMISSION_
+    BYPASS_JQ_RE`'s own documented trade-off: a legitimate `jq` edit against
+    `.claude/settings.local.json` (no dangerous assignment of its own)
+    followed, in the SAME `;`-free compound command, by an unrelated mention
+    of both signal words now asks unnecessarily — a narrow false positive,
+    not a missed real plant."""
+    cmd = ('jq \'.foo = 1\' .claude/settings.local.json && '
+           'echo "totally unrelated: allow Bash"')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "permission-allowlist-protect"
+
+
+def test_shell_jq_unrelated_mention_past_semicolon_boundary_not_gated():
+    """The window still stops at a real `;` statement boundary."""
+    cmd = ('jq \'.foo = 1\' .claude/settings.local.json ; '
+           'echo "totally unrelated: allow Bash"')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert not _gated(d)
+
+
+def test_perf_no_redos_on_jq_comment_padding_near_normalize_cap():
+    """The unbounded jq lookaheads must stay linear-time even against filler
+    sized right up against `normalize.scan_surface`'s own shared 20,000-char
+    truncation cap."""
+    filler = "#" + ("a" * 19000) + "\n"
+    cmd = ("jq '" + filler + '.permissions.allow += ["Bash"]'
+           + "' .claude/settings.local.json | sponge .claude/settings.local.json")
+    start = time.time()
+    d = evaluate(_shell(cmd), EMPTY)
+    assert time.time() - start < 1.0
+    assert _gated(d)
 
 
 def test_shell_jq_comment_padding_over_400_chars_still_gated():

@@ -2946,7 +2946,35 @@ PERMISSION_BYPASS_CLI_RE = re.compile(
 # case-sensitive, so a lowercase `"bash"` string in an allow array does not actually
 # grant the real `Bash` tool at all — treating it as a hit would be a pure false
 # positive with no matching real capability, not a defense-in-depth catch.
-_PERMISSION_ALLOWLIST_UNSCOPED_BASH = r"\bBash\b(?:\(\s*\*\s*\))?(?!\()"
+#
+# QA finding (independent adversarial review, bypass-hunting round, confirmed
+# reproduced): an earlier draft anchored only on `\bBash\b` — a plain word
+# boundary, not a real array-element/string boundary — so "Bash" appearing as a
+# whole WORD anywhere inside an unrelated, legitimately-scoped grant string
+# false-positived: `"Read(Bash-scripts/**)"`, `"Edit(src/Bash.Utils/**)"`, and
+# `"WebFetch(domain:Bash.example.com)"` all wrongly asked, none of them granting
+# the Bash tool at all. `-`/`.`/`:` are non-word characters, so `\b` alone never
+# excluded them. Closed by requiring the match to sit at an actual VALUE
+# boundary instead of a mere word boundary: immediately preceded by a quote,
+# comma, `=`, whitespace, or the start of the scanned text (covers both a JSON
+# array element's opening quote and a CLI list's bare/comma/`=`-delimited
+# token), and immediately followed by a quote, comma, whitespace, or the end of
+# the scanned text. A scoped grant's specifier text (`-scripts/**`, `.Utils/**`,
+# `.example.com`) now sits between "Bash" and that closing delimiter, so the
+# trailing check alone rejects it — the same trailing-delimiter check also
+# subsumes the old dedicated `(?!\()` exclusion for `"Bash(git diff:*)"`-style
+# scoped grants, since an unconsumed `(` is never itself a valid trailing
+# delimiter either. `=` is included as a delimiter specifically for the CLI
+# `--allowedTools=Bash` equals-form (`PERMISSION_ALLOWLIST_CLI_RE`'s own
+# `(?:=|\s+)` lead-in already matches the `=`, but a lookbehind re-examines the
+# literal character in the string regardless of what an earlier part of the
+# same overall pattern consumed, so it must be included here too or that form
+# regresses). A Python lookbehind must be fixed-width, so the zero-width
+# start-of-text case is a separate `^` alternative rather than folded into one
+# variable-width lookbehind alternation.
+_PERMISSION_ALLOWLIST_UNSCOPED_BASH = (
+    r"(?:(?<=[\"',=\s])|^)Bash(?:\(\s*\*\s*\))?(?=[\"',\s]|$)"
+)
 
 # Bounded tempered-dot window from an `"allow"` array's opening bracket to an
 # unscoped Bash grant inside it, excluding a crossed `]` — a real `permissions.

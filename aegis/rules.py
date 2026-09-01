@@ -4681,6 +4681,30 @@ def _permission_allowlist_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
+def _permission_allowlist_normalize(text: str) -> str:
+    """Decode JSON ``\\uXXXX`` escapes before `PERMISSION_ALLOWLIST_ALLOW_
+    ARRAY_RE`/`PERMISSION_ALLOWLIST_JQ_RE`/`PERMISSION_ALLOWLIST_CLI_RE` ever
+    see the text — the identical evasion class `_permission_bypass_normalize`
+    already closes for `defaultMode`/`bypassPermissions`, ported over here
+    (QA finding, independent adversarial review: an earlier draft of this
+    guard applied this decode step only inside `_permission_allowlist_json_
+    hit`'s `json.loads()` call, which only ever runs on content that is
+    ALREADY valid standalone JSON — a partial Edit/MCP fragment with the
+    `allow` key or a `Bash` value spelled with a `\\u`-escape, e.g.
+    `"\\u0061llow": ["Bash"]`, is not valid JSON on its own, so `json.loads()`
+    raises and the struct walk never runs, leaving the raw, still-escaped
+    text to the textual regex alone — which had no decode step of its own,
+    a confirmed, reproduced full bypass returning a bare `ALLOW` with no rule
+    firing at all). A malformed ``\\u`` escape (non-hex digits) is left as-is
+    rather than raising, matching the sibling's own tolerance."""
+    def _decode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    return re.sub(r"\\u([0-9a-fA-F]{4})", _decode, text)
+
+
 def _permission_allowlist_bash_value_hit(s) -> bool:
     """True iff ``s`` is exactly an unscoped Bash grant string — the bare
     ``"Bash"`` or the explicit wildcard ``"Bash(*)"`` (optional internal
@@ -4802,6 +4826,70 @@ def rule_permission_allowlist_protect(ev: Event, policy=None) -> Optional[Decisi
     this guard's own real shell-form coverage is the write-verb-less jq/
     sponge shape self-protect never sees.
 
+    QA history (two independent adversarial-review rounds, bypass-hunting and
+    design/consistency, run in parallel — the same convention every sibling
+    guard in this file follows). Design/consistency round (round A) found and
+    closed one real, reproduced full bypass before merge — the
+    Edit/Write/MCP textual check (`PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE`) had
+    no JSON ``\\uXXXX``-escape decode step of its own, unlike `rule_
+    permission_bypass_protect`'s own `_permission_bypass_normalize`, which
+    an earlier round of THAT guard's own review added specifically to close
+    this exact evasion class for `defaultMode`/`bypassPermissions`. A
+    PARTIAL Edit/MCP fragment (not valid standalone JSON on its own — the
+    ordinary shape of an Edit's `new_string`) spelling the `allow` key or a
+    `Bash` value with a `\\u`-escape (e.g. `"\\u0061llow": ["Bash"]`) defeated
+    every layer at once: the textual regex never decoded the escape, and
+    `_permission_allowlist_json_hit`'s `json.loads()` raised on the
+    non-standalone fragment, so the structural walk never ran either —
+    reproduced as a bare `ALLOW` with no rule firing. Closed by porting
+    `_permission_bypass_normalize` over as `_permission_allowlist_normalize`
+    and decoding the scanned text before every textual/jq/CLI pattern in
+    this guard, matching the sibling exactly; whole-file-valid JSON Writes
+    were already unaffected (`json.loads` decodes escapes for free), so the
+    fix is scoped to the textual-regex path only. Full suite green
+    throughout (2099 tests) both before and after the fix — the gap produced
+    a silent pass, not a crash, which is why it needed adversarial review
+    rather than the test suite to surface.
+
+    Bypass-hunting round (round B, independently confirmed the round-A
+    `\\uXXXX` finding above and found one further real, reproduced defect):
+    the original `_PERMISSION_ALLOWLIST_UNSCOPED_BASH` fragment anchored only
+    on a plain `\\b` word boundary, not a real array-element/string boundary —
+    `-`/`.`/`:` are non-word characters, so "Bash" appearing as a whole WORD
+    embedded inside an unrelated, legitimately-scoped grant string
+    false-positived: `"Read(Bash-scripts/**)"`, `"Edit(src/Bash.Utils/**)"`,
+    and `"WebFetch(domain:Bash.example.com)"` all wrongly asked, none of them
+    granting the Bash tool at all. Closed by anchoring to an actual value
+    boundary (a preceding quote/comma/`=`/whitespace/start-of-text, a
+    following quote/comma/whitespace/end-of-text) instead of a bare `\\b` —
+    see the pattern's own comment in patterns.py for the fixed-width-lookbehind
+    mechanics. Round B also surfaced two gaps confirmed to be pre-existing and
+    shared with sibling guards, not introduced by or unique to this commit —
+    noted here rather than fixed guard-by-guard, matching this file's own
+    convention for shared-infrastructure gaps: (1) bash's ANSI-C `$'...'`
+    quoting decodes a `\\uHHHH` escape to a real Unicode character (confirmed
+    in a live shell), but the shared `normalize.py` de-obfuscation layer every
+    guard's `_shell_scan` goes through has no `u`/`U` case in its own escape
+    handling, so `claude --allowedTools=$'\\u0042ash'` reaches this guard (and
+    `PERMISSION_BYPASS_CLI_RE`, confirmed independently vulnerable the same
+    way) as inert, undecoded text — a real gap, but in shared normalization
+    infrastructure neither guard owns or touches; (2) jq's own `reduce`/
+    `foreach` grammar legitimately nests a `;` inside ONE single-quoted jq
+    program (`reduce EXPR as $x (INIT; UPDATE)`), which is not a shell-level
+    statement boundary at all, so wrapping a dangerous assignment inside one
+    pushes it outside `PERMISSION_ALLOWLIST_JQ_RE`'s (and, confirmed
+    independently, `PERMISSION_BYPASS_JQ_RE`'s) `;`-scoped unbounded window —
+    a latent gap in the shared "unbounded within one `;`-delimited statement"
+    design both guards inherit from `PERMISSION_BYPASS_JQ_RE`'s own original
+    fix, newly surfaced by this round rather than introduced by it. Round B
+    additionally flagged `"Bash()"` (empty parens) and `"Bash(**)"` (double
+    wildcard) as unconfirmed: neither matches this guard's own wildcard check
+    (which requires exactly one `*`), and neither is verified here against
+    real Claude Code's own specifier grammar to actually behave as an
+    unrestricted grant — disclosed as an open question rather than guessed at.
+    Full suite green throughout (2116 tests, including new regression tests
+    for the round-B fix) both before and after.
+
     Config (``policy.permission_allowlist``): ``mode`` (deny|ask|monitor|off,
     default ask), ``allow`` (regexes on the path/command that skip the gate).
     Escapable only by a human: a trailing '# aegis-allow' on the shell form,
@@ -4855,7 +4943,8 @@ def rule_permission_allowlist_protect(ev: Event, policy=None) -> Optional[Decisi
             return None
         if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
-        hit = bool(patterns.PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE.search(content)
+        hit = bool(patterns.PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE.search(
+                       _permission_allowlist_normalize(content))
                    or _permission_allowlist_json_hit(content))
         if not hit and ev.action == ActionClass.MCP:
             hit = bool(_permission_allowlist_struct_hit(a) or _permission_allowlist_mcp_bareword_hit(a))
@@ -4884,8 +4973,9 @@ def rule_permission_allowlist_protect(ev: Event, policy=None) -> Optional[Decisi
                              or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
             if not path_hit:
                 return None
-            if not (patterns.PERMISSION_ALLOWLIST_JQ_RE.search(cmd)
-                     or patterns.PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE.search(cmd)):
+            normalized_cmd = _permission_allowlist_normalize(cmd)
+            if not (patterns.PERMISSION_ALLOWLIST_JQ_RE.search(normalized_cmd)
+                     or patterns.PERMISSION_ALLOWLIST_ALLOW_ARRAY_RE.search(normalized_cmd)):
                 return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PERMISSION_ALLOWLIST")
                 or _permission_allowlist_allowed_by_policy(cfg, _cmd(ev))):
