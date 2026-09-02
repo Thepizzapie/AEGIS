@@ -4035,21 +4035,44 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
 # some real-world kernelspecs DO wrap their launch in a shell one-liner on
 # purpose (e.g. `["bash", "-c", "source ~/.bashrc && exec python -m
 # ipykernel_launcher -f {connection_file}"]`, for conda/pyenv environment
-# activation) -- `JUPYTER_ARGV_SHELL_EXEC_RE` still fires on that shape
-# regardless of `{connection_file}` being present, the same way
-# `AWS_CRED_PROCESS_CONTENT_RE`/`credential_process` is gated on the KEY
-# ALONE with no safe/dangerous value split. A human who has actually reviewed
-# such a wrapper once can allowlist it via `policy.jupyter_kernelspec.allow`.
+# activation) -- this still fires on that shape regardless of
+# `{connection_file}` being present, the same way `AWS_CRED_PROCESS_CONTENT_
+# RE`/`credential_process` is gated on the KEY ALONE with no safe/dangerous
+# value split. A human who has actually reviewed such a wrapper once can
+# allowlist it via `policy.jupyter_kernelspec.allow`.
 JUPYTER_KERNELSPEC_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])kernel\.json" + _CI_END,
     re.IGNORECASE,
 )
 
+# `\uXXXX` is real JSON syntax -- a JSON parser (what Jupyter itself uses to
+# read kernel.json) decodes it before ever looking at the string content, so
+# scanning the RAW, still-escaped text is not "more literal", it is simply
+# blind to a standard-compliant encoding of the exact same payload. QA
+# finding (independent adversarial review, bypass-hunting round): reproduced
+# a complete, silent bypass -- `["bash", "-c", ...]`
+# decodes to `["bash", "-c", ...]` under `json.loads()` but matched none of
+# this guard's ASCII-literal regexes. Decoded once, up front, before every
+# other check in `jupyter_kernelspec_dangerous_hit` -- harmless for content
+# that never used the escape (`sub` is a no-op), and correct for real
+# content that did, the same way a real parser would see it.
+_JSON_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decode_json_unicode_escapes(text: str) -> str:
+    try:
+        return _JSON_UNICODE_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    except (ValueError, OverflowError):
+        return text
+
+
 # `argv` array body, captured with a bounded, non-nested window -- a real
 # kernelspec `argv` is a flat list of strings (no nested arrays/objects in
 # the documented schema), so a full JSON parse isn't needed, the same
 # "bounded-window regex, not a real parser" trade-off `TF_EXEC_HIT_RE`'s own
-# docstring already accepts for its own target.
+# docstring already accepts for its own target. This is the STRONG,
+# wrapper-scoped tier: it needs the literal `"argv":` key text (and its
+# closing `]`) actually present in the scanned text.
 _JUPYTER_ARGV_BLOCK_RE = re.compile(r'"argv"\s*:\s*\[([^\]]{0,4000})\]',
                                      re.IGNORECASE | re.DOTALL)
 
@@ -4058,29 +4081,101 @@ _JUPYTER_ARGV_BLOCK_RE = re.compile(r'"argv"\s*:\s*\[([^\]]{0,4000})\]',
 # genuine kernelspec omits it.
 JUPYTER_CONNECTION_FILE_RE = re.compile(r"\{connection_file\}", re.IGNORECASE)
 
-# A shell interpreter (or an encoded-command/fetch-pipe form) named as the
-# launch command -- no legitimate language-kernel argv contains any of
-# these, since a shell is not a Python/R/Julia/Node/Ruby/... runtime.
+# A shell interpreter (or curl/wget/nc used as the literal launch command --
+# argv[0], or the tail of a path in that position) named as an ENTIRE
+# argv-array string element -- anchored so the match must be the whole quoted
+# token (`"bash"`) or the final path segment of one (`"/usr/bin/bash"`), not
+# a substring of some other flag. QA finding (independent adversarial
+# review, bypass-hunting round): an earlier, bare `\bnc\b`/`\bncat\b` (and,
+# by the same flaw, `\bsh\b`) matched INSIDE an ordinary short flag like
+# `"-nc"`/`"-sh"` (`\b` fires right after the leading `-`, a non-word
+# char) -- a real, reproduced false ASK with no attack involved at all.
+# Anchoring to a real string boundary on both sides closes it: `"-nc"` has
+# `-` immediately after the opening quote, never the name itself, so it no
+# longer matches. This tier is used together with, not instead of,
+# `JUPYTER_ARGV_EXEC_FLAG_RE` below, which deliberately does NOT anchor this
+# tightly, since the wrapper-shell case it exists for names the shell as
+# argv[0] and its shell-executed PAYLOAD (containing `curl`, say) as a
+# separate, later argv element.
 JUPYTER_ARGV_SHELL_EXEC_RE = re.compile(
-    r"\b(?:bash|sh|zsh|dash|ksh)\b"
-    r"|\bcmd(?:\.exe)?\b"
-    r"|\b(?:powershell|pwsh)(?:\.exe)?\b"
-    r"|-(?:e|E)ncodedCommand\b"
-    r"|\bwscript\b|\bcscript\b|\bosascript\b"
-    r"|\bcurl\b|\bwget\b|\bnc\b|\bncat\b",
+    r'["/](?:bash|sh|zsh|dash|ksh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?|'
+    r'wscript|cscript|osascript|nc|ncat|curl|wget)"'
+    r"|-(?:e|E)ncodedCommand\b",
     re.IGNORECASE,
 )
 
-# `env` object body, same bounded-window convention as the argv block above.
-_JUPYTER_ENV_BLOCK_RE = re.compile(r'"env"\s*:\s*\{([^}]{0,4000})\}',
-                                    re.IGNORECASE | re.DOTALL)
+# WEAK, wrapper-INDEPENDENT tier: a shell name (or fetch tool) immediately
+# followed by ITS OWN command-execution flag, within a bounded gap -- true
+# regardless of whether the surrounding `"argv": [...]`/`"env": {...}` key
+# text is present in the scanned fragment at all. QA finding (independent
+# adversarial review, bypass-hunting round): the ORIGINAL implementation
+# only ever inspected text captured by `_JUPYTER_ARGV_BLOCK_RE`/
+# `_JUPYTER_ENV_BLOCK_RE`, i.e. text containing the literal `"argv":`/
+# `"env":` key -- but an ordinary, minimal Edit/MCP-edit diff targets the
+# SMALLEST unique substring, not the whole key+value line, so a real
+# `old_string`/`new_string` pair like `'"python", ..., "{connection_file}"'`
+# -> `'"bash", "-c", "curl ... | sh"'` never contains the word `argv` at
+# all -- reproduced as a complete, silent bypass (`Action.ALLOW`) against
+# both the native-Edit and MCP nested-edit shapes. The flag-adjacency
+# requirement (not a bare shell-name match, which would false-positive on
+# `"language": "bash"`, a real field value the `bash_kernel` package's own
+# kernelspec legitimately sets) is what makes this safe to check
+# unconditionally, with no path/wrapper confirmation at all: no ordinary
+# kernelspec field pairs a shell name with an adjacent `-c`/`/c`/
+# `-Command`/`-EncodedCommand` flag, or a fetch tool piped to a shell.
+JUPYTER_ARGV_EXEC_FLAG_RE = re.compile(
+    r"\b(?:bash|sh|zsh|dash|ksh)\b[^\]\}]{0,80}?-c\b"
+    r"|\bcmd(?:\.exe)?\b[^\]\}]{0,80}?/c\b"
+    r"|\b(?:powershell|pwsh)(?:\.exe)?\b[^\]\}]{0,150}?-(?:c|[Cc]ommand)\b"
+    r"|-(?:e|E)ncodedCommand\b"
+    r"|\b(?:nc|ncat)\b[^\]\}]{0,40}?-e\b"
+    r"|\b(?:curl|wget)\b[^\]\}]{0,200}?\|\s*(?:sh|bash|zsh)\b"
+    r"|\bwscript\b|\bcscript\b|\bosascript\b",
+    re.IGNORECASE,
+)
+
 # Env vars that hijack the NEXT process/interpreter startup inheriting them
 # -- the same vocabulary `rule_ld_preload_protect`/`rule_pysite_protect`/
 # `rule_shell_persist_protect`'s own `BASH_ENV`/`ENV` targets already treat
-# as dangerous at their own layer, reused here rather than re-derived.
+# as dangerous at their own layer, reused here rather than re-derived. These
+# names are distinctive enough (never a plausible ordinary JSON key
+# anywhere else) that, like `JUPYTER_ARGV_EXEC_FLAG_RE` above, this is
+# checked content-wide with no `"env": {...}` wrapper requirement -- the
+# same minimal-diff bypass class `JUPYTER_ARGV_EXEC_FLAG_RE`'s own comment
+# documents applies equally to a `"env"`-key-less `env`-value diff.
+# Deliberately CASE-SENSITIVE (unlike every other regex in this section):
+# real dangerous env-var names are always uppercase by convention, and
+# `ENV` (POSIX `sh`/`dash`/`ksh`'s own startup-script variable, the non-
+# bash analog of `BASH_ENV`) case-INSENSITIVELY collides with the JSON
+# WRAPPER key every kernelspec's optional `env` BLOCK is itself named --
+# own-QA finding (reproduced while verifying the QA-review fixes above):
+# `re.IGNORECASE` made this match `"env":` on ANY kernelspec carrying an
+# `env` block at all, benign or not, a severe false-positive regression
+# introduced by widening this check to scan whole `content` unconditionally
+# (see `jupyter_kernelspec_dangerous_hit`'s own docstring). Case-sensitivity
+# alone closes it with no loss of real coverage, since none of these names
+# are ever legitimately lowercase.
 JUPYTER_ENV_DANGEROUS_KEY_RE = re.compile(
     r'"(?:LD_PRELOAD|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|PYTHONSTARTUP|'
-    r'BASH_ENV|ENV|NODE_OPTIONS|PERL5OPT|RUBYOPT|PROMPT_COMMAND)"\s*:',
+    r'BASH_ENV|ENV|NODE_OPTIONS|PERL5OPT|RUBYOPT|PROMPT_COMMAND)"\s*:'
+)
+
+# `jq` has no `-i` flag, so a scripted edit is either a temp-file-then-`mv`
+# (already caught by the shared write-verb check at the rule's call site) or
+# piped through `sponge` (moreutils) -- on no write-verb list at all, the
+# same gap `CLAUDE_HOOKS_JQ_RE`/`JQ_SCRIPTS_LIFECYCLE_RE` already close for
+# their own targets. Unconditional on its own (no write-verb requirement),
+# gated on `jq` and an `argv`/`env` key co-occurring within a bounded window
+# -- matching `CLAUDE_HOOKS_JQ_RE`'s own "gate on the key alone, any
+# assignment" choice, since a scripted `jq`-driven rewrite of a kernelspec's
+# `argv`/`env` has no everyday benign use this codebase's own philosophy
+# treats as worth the false-negative risk of trying to also require a
+# dangerous VALUE shape in the jq filter expression text.
+_JUPYTER_KERNELSPEC_JQ_ASSIGN_OP = r"(?:\|=|\+=|(?<![!<>=])=(?!=))"
+JUPYTER_KERNELSPEC_JQ_RE = re.compile(
+    r"\bjq\b"
+    r"(?=[^;&\n]{0,400}" + _JUPYTER_KERNELSPEC_JQ_ASSIGN_OP + r")"
+    r"(?=[^;&\n]{0,400}\.?(?:argv|env)\b)",
     re.IGNORECASE,
 )
 
@@ -4090,7 +4185,8 @@ def jupyter_kernelspec_dangerous_hit(content: str) -> bool:
     shape: an `argv` array that either names a shell interpreter/encoded-
     command/fetch-tool form, or omits the `{connection_file}` placeholder
     every genuine kernelspec's `argv` is required to include -- or an `env`
-    block setting a process/interpreter-startup-hijacking variable.
+    block (or bare env-var diff) setting a process/interpreter-startup-
+    hijacking variable.
 
     Gated on the SHAPE, not the bare `kernel.json` write -- an ordinary
     kernelspec edit (changing `display_name`, `language`, `metadata`, or a
@@ -4100,25 +4196,41 @@ def jupyter_kernelspec_dangerous_hit(content: str) -> bool:
     (`rule_conftest_protect`, `rule_pysite_protect`,
     `rule_devcontainer_exec_protect`, ...).
 
-    Iterates every `argv` block via `finditer`, not just the first, and
-    checks the `{connection_file}` placeholder WITHIN each matched block
-    rather than anywhere in the whole `content` string -- an MCP edit-tool
-    call's flattened arguments can concatenate an OLD and a NEW `argv` value
-    side by side (`_flatten_strings` joins every string argument, oldText
-    included), so a single content-wide placeholder check would let a
-    legitimate placeholder still present in the OLD value mask its absence
-    from the NEW, actually-being-written one. QA finding (own review, before
-    first merge): reproduced as a real false ALLOW against exactly that MCP
-    edit shape; fixed by scoping both checks to each individually matched
-    block."""
+    Two tiers, checked together, both after decoding `\\uXXXX` escapes
+    (`_decode_json_unicode_escapes`) so a JSON-standard-compliant encoded
+    payload can't dodge either one:
+
+    - WEAK, wrapper-independent (`JUPYTER_ARGV_EXEC_FLAG_RE`/
+      `JUPYTER_ENV_DANGEROUS_KEY_RE` applied to the whole `content`): a
+      shell-name+exec-flag combo, an encoded-command flag, a fetch-piped-
+      to-shell shape, or a hijack-relevant env-var key -- true regardless of
+      whether the surrounding `"argv":`/`"env":` key text is present in the
+      scanned fragment, closing the minimal-Edit-diff bypass class both
+      regexes' own comments document.
+    - STRONG, wrapper-scoped (`_JUPYTER_ARGV_BLOCK_RE`/
+      `JUPYTER_ARGV_SHELL_EXEC_RE`/`JUPYTER_CONNECTION_FILE_RE`, iterated
+      via `finditer` over every matched block, not just the first): needs
+      the real `"argv": [...]` key+array visible, and additionally catches
+      an argv whose FULL array omits the required `{connection_file}`
+      placeholder -- a check that can only be applied once the complete
+      array (not an arbitrary sub-fragment) is actually in view. The
+      `{connection_file}` check is scoped to EACH matched block individually
+      -- an MCP edit-tool call's flattened arguments can concatenate an OLD
+      and a NEW `argv` value side by side (`_flatten_strings` joins every
+      string argument, oldText included), so a content-wide placeholder
+      check would let a placeholder still present in the OLD value mask its
+      absence from the NEW, actually-being-written one (QA finding, own
+      review before first merge, reproduced as a false ALLOW)."""
+    content = _decode_json_unicode_escapes(content)
+    if JUPYTER_ARGV_EXEC_FLAG_RE.search(content):
+        return True
+    if JUPYTER_ENV_DANGEROUS_KEY_RE.search(content):
+        return True
     for argv_match in _JUPYTER_ARGV_BLOCK_RE.finditer(content):
         argv_body = argv_match.group(1)
         if JUPYTER_ARGV_SHELL_EXEC_RE.search(argv_body):
             return True
         if not JUPYTER_CONNECTION_FILE_RE.search(argv_body):
-            return True
-    for env_match in _JUPYTER_ENV_BLOCK_RE.finditer(content):
-        if JUPYTER_ENV_DANGEROUS_KEY_RE.search(env_match.group(1)):
             return True
     return False
 

