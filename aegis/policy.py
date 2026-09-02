@@ -318,6 +318,16 @@ class Policy:
     # Terraform process is already authenticated with. See
     # rules.rule_terraform_exec_protect.
     terraform_exec: dict = field(default_factory=dict)
+    # Jupyter kernelspec launch-command hijack protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a `kernel.json` `argv` array naming a
+    # shell interpreter/encoded-command/fetch-tool form (or omitting the
+    # `{connection_file}` placeholder every genuine kernelspec is required to
+    # include), or a kernelspec `env` block setting a process/interpreter-
+    # startup-hijacking variable (LD_PRELOAD, PYTHONSTARTUP, BASH_ENV, ...)
+    # -- Jupyter execs `argv` unconditionally on every kernel launch, no
+    # opt-in needed. See rules.rule_jupyter_kernelspec_protect.
+    jupyter_kernelspec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing

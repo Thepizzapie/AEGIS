@@ -5468,6 +5468,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.JUPYTER_KERNELSPEC_PATH_RE, "a Jupyter kernelspec"),
 )
 
 
@@ -5995,6 +5996,162 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "needed at all). A human may append "
                          "'# aegis-allow', or set "
                          "AEGIS_ALLOW_TERRAFORM_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
+def _jupyter_kernelspec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_jupyter_kernelspec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Jupyter kernelspec launch-command hijack: a
+    `kernel.json` `argv` array that names a shell interpreter/encoded-
+    command/fetch-tool form, or omits the `{connection_file}` placeholder
+    every genuine kernelspec is required to include -- or a kernelspec `env`
+    block setting a process/interpreter-startup-hijacking variable
+    (`LD_PRELOAD`, `PYTHONSTARTUP`, `BASH_ENV`, ...).
+
+    THREAT MODEL: Jupyter execs a kernel's `argv` unconditionally, verbatim,
+    every time that kernel is launched -- opening a notebook, "Restart
+    Kernel", `jupyter console`/`lab`/`notebook`, or a headless run (`jupyter
+    nbconvert --execute`, papermill). No opt-in beyond having selected that
+    kernel once, no git/CI/session-restart trigger needed -- the same
+    "no future trigger, the very next ordinary invocation" property
+    `rule_ipython_startup_protect`'s own docstring highlights for its
+    ADJACENT surface (code IPython runs AFTER a kernel has started); this
+    guard covers the command Jupyter uses to START the kernel process in the
+    first place, reached before that guard's own surface ever runs.
+    Overwriting an EXISTING, already-trusted kernelspec (the default
+    "python3" one at `<sys.prefix>/share/jupyter/kernels/python3/
+    kernel.json`, `~/.local/share/jupyter/kernels/...`, `~/Library/Jupyter/
+    kernels/...`, or `%APPDATA%\\jupyter\\kernels\\...`) is the highest-risk
+    shape -- a user who already trusts and routinely picks that kernel name
+    gets no visual cue anything changed. Nothing else in this file reaches
+    this surface: `IPYTHON_STARTUP_PATH_RE` gates a completely different
+    file (`.ipython/profile_*/startup/*.py|.ipy`), and no guard anywhere
+    models `argv`/`env` JSON keys in a Jupyter-specific config.
+
+    Config (`policy.jupyter_kernelspec`): `mode` (deny|ask|monitor|off,
+    default ask), `allow` (regexes on the path/command that skip the gate --
+    a repo's own trusted, reviewed kernel wrapper, say). Defaults to `ask`
+    for the same reason every sibling `*_protect` guard does.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle `AEGIS_ALLOW_JUPYTER_KERNELSPEC=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Gated on the SHAPE (`patterns.jupyter_kernelspec_dangerous_hit`), not
+    the bare `kernel.json` write -- an ordinary kernelspec edit (changing
+    `display_name`/`language`/`metadata`, or a routine `argv` pointing at a
+    real interpreter with `{connection_file}` intact) stays allowed, the
+    same false-positive trade-off every sibling content-gated guard in this
+    file already discloses for its own target.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    accepts: a real-world kernelspec that intentionally wraps its launch in
+    a shell one-liner (conda/pyenv environment activation via `["bash",
+    "-c", "source ~/.bashrc && exec python -m ipykernel_launcher -f
+    {connection_file}"]`) still gates -- `JUPYTER_ARGV_SHELL_EXEC_RE` fires
+    on the shell-interpreter token alone, the same "gate on the key/token
+    alone, no safe/dangerous value split" choice `AWS_CRED_PROCESS_CONTENT_
+    RE`/`credential_process` already makes; a human who has reviewed such a
+    wrapper once can allowlist it via `policy.jupyter_kernelspec.allow`. The
+    CLI-driven `jupyter kernelspec install <dir>` activation form (the
+    documented way a staged kernelspec directory gets copied into its final
+    location) is not separately gated -- unlike `direnv allow`/`kubectl
+    config set-credentials --exec-command`, the command text alone never
+    carries the staged kernel.json's own content for this guard's content
+    check to inspect, and gating the bare verb alone (routine for anyone
+    registering a conda/venv kernel) would be far too noisy; the staged
+    file itself is still caught by this guard's own Edit/Write/MCP branch
+    at whatever path it's first written to, since the path gate is a bare
+    filename match with no directory restriction, the same choice
+    `CONFTEST_PATH_RE` already makes for `conftest.py`. `JUPYTER_KERNELSPEC_
+    PATH_RE`'s bare-filename match also means an unrelated, non-Jupyter
+    project that happens to name one of its own files exactly `kernel.json`
+    could false-ASK -- accepted as a theoretical trade-off, the same class
+    `IPYTHON_STARTUP_PATH_RE`'s own unrestricted `profile_[\\w.\\-]+`
+    segment already accepts. A `JUPYTER_PATH`/`JUPYTER_DATA_DIR` relocation
+    of where Jupyter looks for kernelspecs is not specially covered -- the
+    same "computed indirectly" class `rule_shell_persist_protect`'s own
+    `$ZDOTDIR` gap already accepts, though it doesn't matter here since the
+    path gate has no directory requirement in the first place. No `find`-
+    path-indirection fallback (same disclosed absence `rule_ipython_
+    startup_protect`/`rule_cloud_cred_exec_protect` already accept for their
+    own targets). Content assembled indirectly (a generator script, string
+    concatenation) rather than appearing as a literal defeats every check
+    here, the same class every sibling guard already accepts."""
+    cfg = getattr(policy, "jupyter_kernelspec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "jupyter-kernelspec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.JUPYTER_KERNELSPEC_PATH_RE.search(p):
+            return None
+        if not patterns.jupyter_kernelspec_dangerous_hit(content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_JUPYTER_KERNELSPEC")
+                or _jupyter_kernelspec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "jupyter-kernelspec-protect",
+                         f"'{p}' is being written with a Jupyter kernelspec "
+                         "launch-command hijack shape -- Jupyter execs "
+                         "`argv` unconditionally on the very next kernel "
+                         "launch (opening a notebook, Restart Kernel, "
+                         "`jupyter console`/`lab`, a headless nbconvert/"
+                         "papermill run), by this agent, a teammate, or "
+                         "CI, with no further confirmation after this "
+                         "write. Review the change, then confirm with "
+                         "AEGIS_ALLOW_JUPYTER_KERNELSPEC=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+        if not patterns.JUPYTER_KERNELSPEC_PATH_RE.search(cmd):
+            return None
+        if not patterns.jupyter_kernelspec_dangerous_hit(cmd):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JUPYTER_KERNELSPEC")
+                or _jupyter_kernelspec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "jupyter-kernelspec-protect",
+                         "A Jupyter kernelspec launch-command hijack shape "
+                         "is being planted from a shell -- Jupyter execs it "
+                         "on the very next kernel launch, by this agent, a "
+                         "teammate, or CI. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_JUPYTER_KERNELSPEC=1; a spawned agent "
                          "cannot."))
     return None
 
@@ -6616,6 +6773,7 @@ _CORE_RULES = (
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
     rule_terraform_exec_protect,
+    rule_jupyter_kernelspec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,

@@ -3971,6 +3971,158 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))
 
 
+# ---- Jupyter kernelspec launch-command hijack protection (kernel.json ---------
+# ---- argv/env) ------------------------------------------------------------
+# Every Jupyter/IPython kernel -- the default Python one, and every other-
+# language kernel (R's IRkernel, Julia's IJulia, Node's IJavascript, Ruby's
+# IRuby, ...) -- is registered via a `kernel.json` kernelspec whose `argv`
+# array names the literal command Jupyter execs, unconditionally, EVERY time
+# that kernel is launched: opening a notebook, "Restart Kernel", `jupyter
+# console`/`lab`/`notebook`, or a headless run (`jupyter nbconvert
+# --execute`, papermill). No opt-in, no explicit approval beyond having
+# selected that kernel once -- the same "no future git/CI/session-restart
+# trigger, the very next ordinary invocation" property
+# `rule_ipython_startup_protect`'s own docstring highlights for its own,
+# ADJACENT surface (Jupyter's `startup/` hook), one layer further up: that
+# guard covers code IPython runs AFTER a kernel has already started; this one
+# covers the command Jupyter uses to START the kernel process in the first
+# place, reached before that guard's own surface ever runs at all.
+#
+# Nothing else in this file reaches this surface: `IPYTHON_STARTUP_PATH_RE`
+# gates `.ipython/profile_*/startup/*.py|.ipy`, a completely different file;
+# `rule_containment`'s own credential-path checks don't recognize a
+# kernelspec directory at all; no guard anywhere models `argv`/`env` JSON
+# keys in a Jupyter-specific config file.
+#
+# Two distinct planting shapes, mirroring `rule_cloud_cred_exec_protect`'s
+# own two-mechanism bundling in one guard:
+#
+# 1. `argv`: overwriting an EXISTING, already-trusted kernelspec (the
+#    highest-risk case -- the default "python3" kernelspec a user already
+#    picks routinely and reaches with zero further review, at
+#    `<sys.prefix>/share/jupyter/kernels/python3/kernel.json`,
+#    `~/.local/share/jupyter/kernels/...` (Linux), `~/Library/Jupyter/
+#    kernels/...` (macOS), or `%APPDATA%\jupyter\kernels\...` (Windows)), or
+#    planting a brand-new kernelspec under an attacker-chosen name, either
+#    directly at its final installed location or in a staging directory
+#    later moved/`jupyter kernelspec install`-ed into place -- the same
+#    "content-gated regardless of final directory" trade-off
+#    `rule_conftest_protect`'s own bare-filename match already accepts,
+#    since `kernel.json` is a distinctive-enough filename outside a Jupyter
+#    context. Every REAL kernelspec's `argv` is required, by Jupyter's own
+#    documented kernelspec contract, to include the literal placeholder
+#    token `{connection_file}` -- Jupyter substitutes it with the actual
+#    runtime connection-file path at launch, and a kernel that never
+#    receives it can't open the ZMQ channels the frontend needs to talk to
+#    it, so no genuine, working kernelspec omits it. An `argv` that sets
+#    that placeholder aside and instead names a shell interpreter
+#    (`bash`/`sh`/`zsh`/`cmd(.exe)?`/`powershell`/`pwsh`), an
+#    encoded-command flag, or a fetch tool is not a language-kernel launcher
+#    at all -- no legitimate kernel (Python, R, Julia, Node, Ruby, ...) is
+#    implemented as a raw shell invocation, since none of those runtimes IS
+#    a shell.
+#
+# 2. `env`: a kernelspec's optional `env` object sets extra environment
+#    variables inherited by the launched kernel PROCESS -- the same
+#    "hijack the next interpreter/process startup via an inherited env var"
+#    primitive `rule_ld_preload_protect`'s own `/etc/ld.so.preload` and
+#    `rule_pysite_protect`'s own `sitecustomize.py` gate at the OS/CPython
+#    layer, reachable here through a Jupyter-specific JSON key neither
+#    guard's own path pattern recognizes at all.
+#
+# Disclosed trade-off (the "ask, don't silently allow" posture every sibling
+# guard in this file takes for a plausible-but-uncommon legitimate case):
+# some real-world kernelspecs DO wrap their launch in a shell one-liner on
+# purpose (e.g. `["bash", "-c", "source ~/.bashrc && exec python -m
+# ipykernel_launcher -f {connection_file}"]`, for conda/pyenv environment
+# activation) -- `JUPYTER_ARGV_SHELL_EXEC_RE` still fires on that shape
+# regardless of `{connection_file}` being present, the same way
+# `AWS_CRED_PROCESS_CONTENT_RE`/`credential_process` is gated on the KEY
+# ALONE with no safe/dangerous value split. A human who has actually reviewed
+# such a wrapper once can allowlist it via `policy.jupyter_kernelspec.allow`.
+JUPYTER_KERNELSPEC_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])kernel\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `argv` array body, captured with a bounded, non-nested window -- a real
+# kernelspec `argv` is a flat list of strings (no nested arrays/objects in
+# the documented schema), so a full JSON parse isn't needed, the same
+# "bounded-window regex, not a real parser" trade-off `TF_EXEC_HIT_RE`'s own
+# docstring already accepts for its own target.
+_JUPYTER_ARGV_BLOCK_RE = re.compile(r'"argv"\s*:\s*\[([^\]]{0,4000})\]',
+                                     re.IGNORECASE | re.DOTALL)
+
+# Required by Jupyter's own documented kernelspec contract -- absent, a
+# kernel can never complete its ZMQ handshake with the frontend, so no
+# genuine kernelspec omits it.
+JUPYTER_CONNECTION_FILE_RE = re.compile(r"\{connection_file\}", re.IGNORECASE)
+
+# A shell interpreter (or an encoded-command/fetch-pipe form) named as the
+# launch command -- no legitimate language-kernel argv contains any of
+# these, since a shell is not a Python/R/Julia/Node/Ruby/... runtime.
+JUPYTER_ARGV_SHELL_EXEC_RE = re.compile(
+    r"\b(?:bash|sh|zsh|dash|ksh)\b"
+    r"|\bcmd(?:\.exe)?\b"
+    r"|\b(?:powershell|pwsh)(?:\.exe)?\b"
+    r"|-(?:e|E)ncodedCommand\b"
+    r"|\bwscript\b|\bcscript\b|\bosascript\b"
+    r"|\bcurl\b|\bwget\b|\bnc\b|\bncat\b",
+    re.IGNORECASE,
+)
+
+# `env` object body, same bounded-window convention as the argv block above.
+_JUPYTER_ENV_BLOCK_RE = re.compile(r'"env"\s*:\s*\{([^}]{0,4000})\}',
+                                    re.IGNORECASE | re.DOTALL)
+# Env vars that hijack the NEXT process/interpreter startup inheriting them
+# -- the same vocabulary `rule_ld_preload_protect`/`rule_pysite_protect`/
+# `rule_shell_persist_protect`'s own `BASH_ENV`/`ENV` targets already treat
+# as dangerous at their own layer, reused here rather than re-derived.
+JUPYTER_ENV_DANGEROUS_KEY_RE = re.compile(
+    r'"(?:LD_PRELOAD|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|PYTHONSTARTUP|'
+    r'BASH_ENV|ENV|NODE_OPTIONS|PERL5OPT|RUBYOPT|PROMPT_COMMAND)"\s*:',
+    re.IGNORECASE,
+)
+
+
+def jupyter_kernelspec_dangerous_hit(content: str) -> bool:
+    """True if `content` carries a Jupyter kernelspec launch-command hijack
+    shape: an `argv` array that either names a shell interpreter/encoded-
+    command/fetch-tool form, or omits the `{connection_file}` placeholder
+    every genuine kernelspec's `argv` is required to include -- or an `env`
+    block setting a process/interpreter-startup-hijacking variable.
+
+    Gated on the SHAPE, not the bare `kernel.json` write -- an ordinary
+    kernelspec edit (changing `display_name`, `language`, `metadata`, or a
+    routine `argv` pointing at a real interpreter with `{connection_file}`
+    intact) must not gate, the same false-positive trade-off every sibling
+    content-gated guard in this file already discloses for its own target
+    (`rule_conftest_protect`, `rule_pysite_protect`,
+    `rule_devcontainer_exec_protect`, ...).
+
+    Iterates every `argv` block via `finditer`, not just the first, and
+    checks the `{connection_file}` placeholder WITHIN each matched block
+    rather than anywhere in the whole `content` string -- an MCP edit-tool
+    call's flattened arguments can concatenate an OLD and a NEW `argv` value
+    side by side (`_flatten_strings` joins every string argument, oldText
+    included), so a single content-wide placeholder check would let a
+    legitimate placeholder still present in the OLD value mask its absence
+    from the NEW, actually-being-written one. QA finding (own review, before
+    first merge): reproduced as a real false ALLOW against exactly that MCP
+    edit shape; fixed by scoping both checks to each individually matched
+    block."""
+    for argv_match in _JUPYTER_ARGV_BLOCK_RE.finditer(content):
+        argv_body = argv_match.group(1)
+        if JUPYTER_ARGV_SHELL_EXEC_RE.search(argv_body):
+            return True
+        if not JUPYTER_CONNECTION_FILE_RE.search(argv_body):
+            return True
+    for env_match in _JUPYTER_ENV_BLOCK_RE.finditer(content):
+        if JUPYTER_ENV_DANGEROUS_KEY_RE.search(env_match.group(1)):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Fetch-to-file write verb: curl/wget/PowerShell/certutil writing a remote
 # response DIRECTLY to a target path. Every `*_protect` guard above gates its
