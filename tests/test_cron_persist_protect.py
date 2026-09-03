@@ -141,8 +141,79 @@ def test_shell_read_only_spool_not_gated():
     assert not _gated(evaluate(_shell("ls /var/spool/cron/crontabs"), EMPTY))
 
 
+# ---- QA round (independent adversarial review, bypass-hunting): bare link --
+
+def test_bare_symlink_plant_gated():
+    """QA finding (independent adversarial review, bypass-hunting round):
+    FORCED_LINK_WRITE_RE only fires for `-f`/`--force`, sound for a guard
+    protecting an EXISTING tracked file (an unforced `ln` simply fails if
+    the destination exists) but wrong for THIS guard's threat model —
+    planting a brand-new spool crontab for a user who has none yet needs no
+    force flag at all, the normal, common invocation. `ln -s /tmp/evil
+    /var/spool/cron/root` sailed through as a full ALLOW before
+    COPY_WRITE_VERB_RE (already used by conftest/pysite/ipython_startup/
+    hook_manager/self_protect for the identical "planting a new file"
+    threat model) was added to this guard's write-verb checks."""
+    d = evaluate(_shell("ln -s /tmp/evil /var/spool/cron/root"), EMPTY)
+    assert _gated(d) and d.rule == "cron-persist-protect"
+    d2 = evaluate(_shell("ln /tmp/evil /var/spool/cron/crontabs/root"), EMPTY)
+    assert _gated(d2) and d2.rule == "cron-persist-protect"
+
+
+def test_bare_new_item_symlink_plant_gated():
+    d = evaluate(_shell(
+        "New-Item -ItemType SymbolicLink -Path /var/spool/cron/root "
+        "-Value /tmp/evil"), EMPTY)
+    assert _gated(d) and d.rule == "cron-persist-protect"
+
+
 def test_find_path_indirection_spool_gated():
     d = evaluate(_shell("cp evil_cron $(find / -path '*spool/cron*')"), EMPTY)
+    assert _gated(d) and d.rule == "cron-persist-protect"
+
+
+# ---- QA round: find -regex/-path wildcard/escaped-dot separator bypasses --
+
+def test_find_regex_wildcard_separator_spool_gated():
+    """QA finding (independent adversarial review, bypass-hunting round):
+    the original `spool[/\\\\]cron` fragment required a LITERAL slash/
+    backslash between the two words, but `find -regex` is POSIX ERE (an
+    unescaped `.` matches ANY character, including `/`) and `find -path` is
+    a shell glob (`*` matches any string) — both ordinary, non-exotic
+    usage, not obfuscation. Neither word is adjacent to a real separator in
+    either PoC, yet both name the RHEL-layout spool crontab just as
+    directly as a literal path would."""
+    d = evaluate(_shell(
+        "find / -regex '.*var.spool.cron.root' -exec sh -c "
+        "'echo \"* * * * * root touch /tmp/pwned\" >> \"$1\"' _ {} \\;"), EMPTY)
+    assert _gated(d) and d.rule == "cron-persist-protect"
+    d2 = evaluate(_shell(
+        "find / -path '*var*spool*cron*root' -exec sh -c "
+        "'echo \"* * * * * root touch /tmp/pwned\" >> \"$1\"' _ {} \\;"), EMPTY)
+    assert _gated(d2) and d2.rule == "cron-persist-protect"
+
+
+def test_find_regex_escaped_dot_cron_d_gated():
+    """QA finding (independent adversarial review, bypass-hunting round):
+    the identical bug class already found and fixed for LD_PRELOAD_FIND_RE
+    — a textbook-correct ERE escape of the interior dot
+    (`'.*cron\\.d.*'`) inserts a literal backslash between "cron" and "d"
+    in the scanned text, breaking a naive `cron\\.d` fragment — was never
+    ported to CRON_FIND_RE. This assumption-breaking PoC also disproves the
+    claim that containment's PERSIST_RE already backstops every /etc/cron*
+    surface: neither `/etc/cron` (split across find's search-root argument
+    and the -regex value) nor a bare `crontab` appears anywhere in the
+    command."""
+    d = evaluate(_shell(
+        "find /etc -regex '.*cron\\.d.*' -exec sh -c "
+        "'cat > \"$1\"/eviljob <<< \"* * * * * root evil\"' _ {} \\;"), EMPTY)
+    assert _gated(d) and d.rule == "cron-persist-protect"
+
+
+def test_find_regex_escaped_dot_cron_hourly_gated():
+    d = evaluate(_shell(
+        "find /etc -regex '.*cron\\.hourly.*' -exec sh -c "
+        "'cp payload.sh \"$1\"/eviljob && chmod +x \"$1\"/eviljob' _ {} \\;"), EMPTY)
     assert _gated(d) and d.rule == "cron-persist-protect"
 
 

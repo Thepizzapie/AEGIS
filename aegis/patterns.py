@@ -2154,8 +2154,28 @@ CRON_DIR_RE = re.compile(
 # directory literally named any of these) to include outright, the same
 # "distinctive filename, safe to include" reasoning LD_PRELOAD_FIND_RE's own
 # comment gives for "ld.so.preload"/"ld.so.conf".
+#
+# QA findings (independent adversarial review, bypass-hunting round):
+# (1) `cron\.d`/`cron\.(?:...)` required a literal, unescaped dot -- the
+# same bug class already found and fixed for LD_PRELOAD_FIND_RE (see its
+# own comment above): a `find -regex '.*cron\.d.*'` is textbook-correct ERE
+# and inserts a literal backslash between "cron" and "d" in the SCANNED
+# TEXT, breaking the naive fragment. Fixed the same way, with an optional
+# literal backslash (`\\?`) before each interior dot. (2) `spool[/\\]cron`
+# required a literal slash/backslash between the two words, but `find
+# -regex` is POSIX ERE (an unescaped `.` matches ANY character, including
+# `/`) and `find -path` is a shell glob (`*` matches any string) -- both are
+# ordinary, non-exotic `find` usage, not obfuscation, and
+# `find / -regex '.*var.spool.cron.root'` or `-path '*var*spool*cron*root'`
+# sailed through with neither word adjacent to a real separator. Fixed by
+# replacing the fixed `[/\\]` with a small bounded gap of ANY characters
+# (`.{0,3}`, the same "unescaped dot as wildcard, small bound" shape this
+# fragment now shares with fix (1)) — a modest widening that also matches
+# some unrelated "spool"-then-"cron"-within-3-chars text, the accepted,
+# safe-direction trade-off this file's other find-fallbacks already make.
 _CRON_FIND_FRAGMENTS = (
-    r"cron\.d|cron\.(?:hourly|daily|weekly|monthly)|spool[/\\]cron|anacrontab"
+    r"cron\\?\.d|cron\\?\.(?:hourly|daily|weekly|monthly)"
+    r"|spool.{0,3}cron|anacrontab"
 )
 CRON_FIND_RE = _find_predicate_re(r"(?:" + _CRON_FIND_FRAGMENTS + r")")
 
