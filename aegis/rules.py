@@ -5600,6 +5600,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),
     (patterns.SYSTEMD_UNIT_PATH_RE, "a systemd unit"),
     (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
+    (patterns.CRON_FILE_PATH_RE, "a cron persistence file"),
     (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
     (patterns.LD_SO_CONF_PATH_RE, "the dynamic linker's search-path config"),
     (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
