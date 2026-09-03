@@ -2085,6 +2085,85 @@ def ld_preload_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, LD_PRELOAD_FIND_RE)
 
 
+# ---- cron persistence protection --------------------------------------------
+# Linux cron has no separate "enable" step the way systemd/launchd do (see
+# rule_service_persist_protect's own docstring): crond polls /etc/crontab,
+# every file inside /etc/cron.d/, and each user's spool crontab for mtime
+# changes -- typically once a minute, no reboot/login/git/CI trigger needed
+# at all -- and re-reads whichever one changed; run-parts fires every
+# executable dropped into /etc/cron.{hourly,daily,weekly,monthly} on its own
+# schedule. All of it runs as root for the /etc surfaces, as the owning user
+# for a spool crontab.
+#
+# Nothing in this file reaches this surface for an Edit/Write/MCP-tool write
+# today: PERSIST_RE (used by `rule_containment`) is checked ONLY inside
+# `_is_shell(ev)` -- see rule_containment's own
+# `if _is_shell(ev) and patterns.PERSIST_RE.search(text)` gate -- so it never
+# runs against a Read/Edit/Write/MCP event's path or content at all, the
+# identical blind spot `rule_service_persist_protect`'s own docstring already
+# disclosed for systemd/launchd before that guard existed. And even from a
+# SHELL, PERSIST_RE's only cron-related text is the bare word `crontab` and
+# the literal substring `/etc/cron` -- neither ever appears in a command that
+# writes a user's spool crontab file directly
+# (`/var/spool/cron/crontabs/<user>` on Debian/Ubuntu,
+# `/var/spool/cron/<user>` on RHEL/Fedora): `echo '* * * * * evil' >>
+# /var/spool/cron/crontabs/root` installs a root cron job with neither
+# `crontab` nor `/etc/cron` anywhere in the command, sailing through
+# PERSIST_RE's substring match even though it reaches the exact same
+# scheduler the `crontab` CLI itself would have to go through instead.
+_CRON_FILE_END = _CI_END
+CRON_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"cron\.d" + _ETC_SEP
+    + _CI_SEG + _CRON_FILE_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP
+    + r"cron\.(?:hourly|daily|weekly|monthly)" + _ETC_SEP
+    + _CI_SEG + _CRON_FILE_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"crontab" + _CRON_FILE_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"anacrontab" + _CRON_FILE_END
+    + r"|(?:^|[\s'\"/\\=])var" + _ETC_SEP + r"spool" + _ETC_SEP + r"cron"
+    + _ETC_SEP + r"(?:crontabs" + _ETC_SEP + r")?" + _CI_SEG + _CRON_FILE_END,
+    re.IGNORECASE,
+)
+# Bare directory reference (no filename) -- the same archive/sync-tool gap
+# SHELL_PERSIST_DIR_RE/SERVICE_PERSIST_DIR_RE/LD_PRELOAD_DIR_RE exist to
+# close: `rsync -a evil/ /etc/cron.d/` or `tar xf payload.tar -C
+# /var/spool/cron/crontabs/` never names a discrete target file at all.
+# `/etc/crontab`/`/etc/anacrontab` have no directory form (they're plain
+# files, the same reason LD_PRELOAD_DIR_RE never covers `ld.so.preload`
+# itself) -- only the directory surfaces are listed here.
+CRON_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"cron\.d" + _CRON_FILE_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP
+    + r"cron\.(?:hourly|daily|weekly|monthly)" + _CRON_FILE_END
+    + r"|(?:^|[\s'\"/\\=])var" + _ETC_SEP + r"spool" + _ETC_SEP + r"cron"
+    + _CRON_FILE_END
+    + r"|(?:^|[\s'\"/\\=])var" + _ETC_SEP + r"spool" + _ETC_SEP + r"cron"
+    + _ETC_SEP + r"crontabs" + _CRON_FILE_END,
+    re.IGNORECASE,
+)
+# `find -path/-name/-wholename/-regex` indirection, same reason every other
+# `*_FIND_RE` in this file exists. The bare word "crontab"/"crontabs" is
+# deliberately EXCLUDED here (unlike this guard's own path regexes above): a
+# `find -name crontab` command still contains the literal substring
+# "crontab" in the scanned shell text, which PERSIST_RE (`rule_containment`,
+# checked before this guard runs -- see `_CORE_RULES`) already denies
+# non-escapably regardless of `find` syntax; duplicating it here would only
+# add a redundant, never-reached branch. "cron.d"/the four `cron.*`
+# schedule-directory names/"spool/cron"/"anacrontab" carry no such existing
+# coverage and are distinctive enough (no ordinary, unrelated project has a
+# directory literally named any of these) to include outright, the same
+# "distinctive filename, safe to include" reasoning LD_PRELOAD_FIND_RE's own
+# comment gives for "ld.so.preload"/"ld.so.conf".
+_CRON_FIND_FRAGMENTS = (
+    r"cron\.d|cron\.(?:hourly|daily|weekly|monthly)|spool[/\\]cron|anacrontab"
+)
+CRON_FIND_RE = _find_predicate_re(r"(?:" + _CRON_FIND_FRAGMENTS + r")")
+
+
+def cron_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, CRON_FIND_RE)
+
+
 # Dev-container lifecycle config: `.devcontainer/devcontainer.json` (or a
 # named sibling for a multi-config repo, `.devcontainer/<name>/
 # devcontainer.json`) and the root-level `.devcontainer.json` shorthand. This

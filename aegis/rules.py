@@ -2713,6 +2713,151 @@ def rule_service_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cron_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cron_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a cron persistence file: a file inside
+    ``/etc/cron.d/`` or ``/etc/cron.{hourly,daily,weekly,monthly}/``,
+    ``/etc/crontab``, ``/etc/anacrontab``, or a user's spool crontab
+    (``/var/spool/cron/crontabs/<user>`` on Debian/Ubuntu,
+    ``/var/spool/cron/<user>`` on RHEL/Fedora).
+
+    THREAT MODEL: this is the last major Unix scheduling/auto-run primitive
+    with no coverage anywhere in this file — the same "runs later,
+    unattended, with elevated or the human's privileges" shape
+    ``rule_service_persist_protect`` (systemd/launchd) and
+    ``rule_ld_preload_protect`` already cover for their own surfaces. Unlike
+    either of those, cron needs no separate activation step at all: crond
+    polls the mtime of ``/etc/crontab``, every file inside ``/etc/cron.d/``,
+    and each user's spool crontab — typically once a minute — and re-reads
+    whichever one changed, with no reboot/login/git-operation/CI-run
+    required; ``run-parts`` fires every executable dropped into
+    ``/etc/cron.{hourly,daily,weekly,monthly}`` on its own schedule. The
+    ``/etc`` surfaces run as root; a spool crontab runs as the user it's
+    named for. Like a git hook or a shell rc file, none of this is normally
+    tracked by the project's own repo — invisible to ``git status``/``git
+    diff``/code review.
+
+    ``PERSIST_RE`` (used by ``rule_containment``, evaluated before this
+    guard — see ``_CORE_RULES``) already denies, non-escapably, any SHELL
+    command that mentions the bare word ``crontab`` or the literal substring
+    ``/etc/cron`` — but it is checked ONLY inside ``_is_shell(ev)``, so it
+    never runs against an Edit/Write/MCP-tool event's path or content at
+    all, the identical blind spot ``rule_service_persist_protect``'s own
+    docstring already disclosed for systemd/launchd before that guard
+    existed. And even from a shell, PERSIST_RE's text has no alternative for
+    a spool crontab: writing ``/var/spool/cron/crontabs/root`` (or the
+    RHEL-layout ``/var/spool/cron/root``) directly installs a root cron job
+    with neither ``crontab`` nor ``/etc/cron`` anywhere in the command — the
+    same "reaches the target without ever naming the CLI that ordinarily
+    guards it" shape a direct git-config-file write already has relative to
+    the ``git`` CLI. This guard closes both gaps: the file-write vector for
+    every cron surface (previously unreached, of any kind), and the
+    shell-command vector specifically for the spool-crontab path
+    (previously unreached even non-escapably).
+
+    Config (``policy.cron_persist``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted cron-job deploy script, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard does:
+    shipping a cron job for a backup/cleanup task is routine, sanctioned
+    work — it just needs a human to have actually looked at it once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_CRON_PERSIST=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable — the same "an agent
+    can't wave itself past its own guard" invariant every escapable guard in
+    this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path assembled indirectly (shell variable concatenation
+    across separate assignments, a ``for``/``xargs`` loop, ``basename``/
+    ``dirname`` reconstruction) rather than appearing as one contiguous
+    literal is not caught; a direct fetch-to-file write (``curl -o
+    /etc/cron.d/evil ...``, ``wget -O ...``) is caught by none of the shell
+    branch's six write-verb checks — the same inherited gap every other
+    guard in this file already discloses, closed only for the surfaces
+    ``rule_fetch_to_file_protect`` itself enumerates; the bare word
+    ``crontab``/``crontabs`` is deliberately excluded from the
+    ``find``-indirection fallback since PERSIST_RE already denies any shell
+    text containing it non-escapably regardless of ``find`` syntax, so
+    adding it here would only be a redundant, never-reached branch; the
+    macOS spool layout (``/usr/lib/cron/tabs/<user>``) is not covered — this
+    guard targets the Linux crond mechanism, the same platform split
+    ``rule_service_persist_protect`` already draws between systemd (Linux)
+    and launchd (macOS); and the shell-branch spool-crontab check treats any
+    file inside ``/var/spool/cron/`` (or its Debian/Ubuntu ``crontabs/``
+    subdirectory) as sensitive rather than validating the trailing segment
+    against a real system username — the same "conservative over-match
+    beats a real parse of a system table" trade-off ``CRON_FILE_PATH_RE``
+    itself already accepts, and safe in the direction every guard in this
+    file already prefers (an extra ask, never a missed deny)."""
+    cfg = getattr(policy, "cron_persist", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cron-persist-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        hit = bool(p and patterns.CRON_FILE_PATH_RE.search(p))
+        if not hit:
+            return None
+        if os.environ.get("AEGIS_ALLOW_CRON_PERSIST") or _cron_persist_allowed_by_policy(cfg, p):
+            return None
+        return _finish(Decision(action, "cron-persist-protect",
+                         f"Cron file '{p}' is being written — cron re-reads it "
+                         "automatically (typically within a minute, as root for "
+                         "the /etc surfaces), with no separate enable step. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_CRON_PERSIST=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.CRON_FILE_PATH_RE.search(cmd)
+                             or patterns.CRON_DIR_RE.search(cmd)
+                             or patterns.cron_find_hit(cmd))
+        if not names_target:
+            return None
+        touches_target = (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CRON_PERSIST")
+                or _cron_persist_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cron-persist-protect",
+                         "A cron file is being written from a shell — it runs "
+                         "automatically, unattended, the next time cron polls "
+                         "(typically within a minute; no reboot/login/CI "
+                         "trigger needed). A human may append '# aegis-allow', "
+                         "or set AEGIS_ALLOW_CRON_PERSIST=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _ld_preload_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -6604,6 +6749,7 @@ _CORE_RULES = (
     rule_git_attributes_exec_protect,
     rule_gitmodules_protect,
     rule_service_persist_protect,
+    rule_cron_persist_protect,
     rule_ld_preload_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,

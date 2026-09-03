@@ -208,6 +208,16 @@ class Policy:
     # load/bootstrap/enable activation commands. See
     # rules.rule_service_persist_protect.
     service_persist: dict = field(default_factory=dict)
+    # Cron persistence protection: {mode: deny|ask|monitor|off, allow: [regex
+    # on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # /etc/cron.d/*, /etc/cron.{hourly,daily,weekly,monthly}/*,
+    # /etc/crontab, /etc/anacrontab, and a user's spool crontab
+    # (/var/spool/cron/crontabs/<user> on Debian/Ubuntu, /var/spool/cron/
+    # <user> on RHEL/Fedora) -- the one Unix scheduling surface no existing
+    # guard reached: PERSIST_RE (rule_containment) only scans SHELL text and
+    # has no alternative at all for a spool crontab written directly. See
+    # rules.rule_cron_persist_protect.
+    cron_persist: dict = field(default_factory=dict)
     # Dynamic-linker preload / search-path hijack protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers /etc/ld.so.preload (glibc dlopen()s
