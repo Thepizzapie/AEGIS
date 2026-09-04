@@ -5467,6 +5467,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
+    (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
 )
 
@@ -5803,6 +5804,164 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_CLOUD_CRED_EXEC=1; a spawned agent "
                          "cannot."))
+    return None
+
+
+def _docker_cred_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_docker_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Docker credential-helper directive (`credsStore` or
+    `credHelpers`) in `~/.docker/config.json`.
+
+    THREAT MODEL: a third credential-BROKERING primitive that names an
+    arbitrary EXTERNAL COMMAND in a config file, the identical "write now,
+    auto-exec later, handed a live credential every time" shape
+    `rule_cloud_cred_exec_protect` already covers for AWS's
+    `credential_process` and Kubernetes's kubeconfig `exec:` block, one
+    layer down into container-registry auth. Docker's documented
+    credential-helper protocol resolves `credsStore`/`credHelpers` to an
+    executable literally named `docker-credential-<suffix>` on `$PATH` and
+    invokes it with a `get`/`store`/`erase` verb on every `docker login`/
+    `push`/`pull`/`build` touching a registry resolved through it -- `get`
+    hands the helper's stdout (the plaintext registry credential) straight
+    back to the Docker CLI/daemon, and `store` (on `docker login` itself)
+    pipes the helper the credential just entered, over stdin, before it
+    ever reaches disk. A malicious `docker-credential-<suffix>` planted on
+    `$PATH` (or `credHelpers`/`credsStore` simply naming one already there)
+    silently exfiltrates every registry credential resolved through it from
+    that point on, unattended, by this agent, a teammate, or CI -- with no
+    separate network call for a security tool to catch, since the
+    credential handoff IS the attack.
+
+    Config (`policy.docker_cred_exec`): `mode` (deny|ask|monitor|off,
+    default ask), `allow` (regexes on the path/command that skip the gate).
+    Defaults to `ask`, not `deny`, for the same reason `rule_cloud_cred_
+    exec_protect` does: `credsStore`/`credHelpers` are routine, sanctioned
+    config -- Docker Desktop sets `"credsStore": "desktop"` (or
+    `osxkeychain`/`wincred`/`pass`) on every fresh install, unprompted -- it
+    just needs a human to have actually looked at the specific helper name
+    being wired in.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle `AEGIS_ALLOW_DOCKER_CRED_EXEC=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable, the same invariant
+    every escapable guard in this file holds.
+
+    Overlap with `rule_containment`, the identical nuance `rule_cloud_cred_
+    exec_protect`'s own docstring discloses for `~/.aws/*`/`~/.kube/*`: the
+    ORDINARY absolute/home-relative form of this file (`~/.docker/
+    config.json`) is ALREADY denied, non-escapably, by `rule_containment`'s
+    broader `CRED_RE` match on any `.docker/config.json` path segment --
+    for native Edit/Write/Read and shell calls, that rule runs earlier in
+    `BUILTIN_RULES` and `evaluate()` is first-deny-wins, so those cases are
+    pre-empted there (a STRONGER outcome, not a gap). This guard adds real,
+    NON-redundant coverage in exactly the cases `rule_containment` misses,
+    the same two `rule_cloud_cred_exec_protect` closes for AWS/Kubernetes:
+    (1) an MCP-tool write to the ordinary path -- `rule_containment`'s
+    `CRED_RE` check structurally does not run for `ActionClass.MCP` at all;
+    and (2) a relative path with no leading separator (`CRED_RE` requires a
+    `/`/`\\` immediately before the dot; `DOCKER_CONFIG_PATH_RE` accepts
+    start-of-string too). It also independently catches (3) content staged
+    in a differently-named file before being moved into place, via the
+    strong, path-independent JSON key:value check.
+
+    Honest scope, the same denylist trade-offs `rule_cloud_cred_exec_
+    protect` already accepts: `DOCKER_CONFIG` env var relocation to a path
+    with no `.docker` segment at all, or Docker's own `--config <dir>`
+    global flag (a DIRECTORY, not the `config.json` file itself, so no
+    literal "config.json" text ever appears in the flag value) is not
+    covered -- the same "computed indirectly"/env-var-relocation class this
+    file accepts throughout. Planting the malicious `docker-credential-
+    <suffix>` EXECUTABLE ITSELF (as opposed to the config line naming it)
+    is a distinct write covered by `rule_path_hijack_protect`, not this
+    guard. No CLI-form regex exists here (unlike `AWS_CRED_PROCESS_CLI_RE`/
+    `KUBE_EXEC_CRED_CLI_RE`): Docker has no `docker configure set`-style
+    subcommand for this at all -- the file is always edited directly. A
+    direct fetch-to-file write (`curl -o .docker/config.json <url>`) to a
+    RELATIVE path is caught by `rule_fetch_to_file_protect`'s backstop
+    instead (an ABSOLUTE/home-relative target is caught earlier still, by
+    `rule_containment`)."""
+    cfg = getattr(policy, "docker_cred_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "docker-cred-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        # Same MCP path-key widening `rule_cloud_cred_exec_protect`'s own
+        # docstring/QA history explains: an MCP tool naming its path
+        # argument something other than the fixed `_path()` allowlist
+        # (`location`/`dest`/...) would otherwise leave path confirmation
+        # unreachable even though `_flatten_strings()` already sees that
+        # same value fine on the content side.
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            path_text = p + " " + " ".join(_flatten_strings(a))
+        scan_content = patterns.strip_comment_lines(content)
+        path_confirmed = bool(path_text and patterns.DOCKER_CONFIG_PATH_RE.search(path_text))
+        hit = bool(
+            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_content)
+            or (path_confirmed and patterns.DOCKER_CRED_HELPER_BARE_RE.search(scan_content)))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_DOCKER_CRED_EXEC")
+                or _docker_cred_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "docker-cred-exec-protect",
+                         f"'{p}' is being written with a Docker credential-helper "
+                         "(credsStore/credHelpers) directive — it names an arbitrary "
+                         "external command (docker-credential-<name>) that Docker "
+                         "executes and hands a live registry credential to, on every "
+                         "future docker login/push/pull/build resolved through it "
+                         "(this session, a teammate, or CI), with no further "
+                         "confirmation after this write. Review the change, then "
+                         "confirm with AEGIS_ALLOW_DOCKER_CRED_EXEC=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        path_hit = bool(patterns.DOCKER_CONFIG_PATH_RE.search(scan_cmd))
+        hit = bool(
+            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_cmd)
+            or (path_hit and patterns.DOCKER_CRED_HELPER_BARE_RE.search(scan_cmd)))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DOCKER_CRED_EXEC")
+                or _docker_cred_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "docker-cred-exec-protect",
+                         "A Docker credential-helper (credsStore/credHelpers) directive "
+                         "is being set from a shell — it names an arbitrary external "
+                         "command (docker-credential-<name>) that Docker executes and "
+                         "hands a live registry credential to, on every future docker "
+                         "login/push/pull/build resolved through it. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_DOCKER_CRED_EXEC=1; a "
+                         "spawned agent cannot."))
     return None
 
 
@@ -6615,6 +6774,7 @@ _CORE_RULES = (
     rule_pysite_protect,
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
+    rule_docker_cred_exec_protect,
     rule_terraform_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,

@@ -4509,6 +4509,80 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Docker credential-helper exec hijack --------------------------------------
+#
+# A third credential-BROKERING primitive that names an arbitrary EXTERNAL
+# COMMAND in a config file, the same "write now, auto-exec later, handed a
+# live credential every time" shape `AWS_CRED_PROCESS_*`/`KUBE_EXEC_CRED_*`
+# above already cover for AWS/Kubernetes, one layer down into container-
+# registry auth. Docker's credential-helper protocol (documented at
+# https://docs.docker.com/engine/reference/commandline/login/#credential-
+# helpers): `~/.docker/config.json`'s top-level `credsStore` (a single
+# helper used for every registry with no per-registry entry in `auths`) or
+# `credHelpers` (a per-registry map, `{"<registry>": "<helper-suffix>"}`)
+# names a helper SUFFIX; the Docker CLI/daemon resolves that to an
+# executable literally named `docker-credential-<suffix>` on `$PATH` and
+# invokes it with a `get`/`store`/`erase`/`list` verb on stdin. On every
+# `docker login`/`push`/`pull`/`build` (pulling a base image) touching a
+# registry resolved through that helper, `get` is invoked and handed back
+# the plaintext registry username/password/identity-token over stdout --
+# and on `docker login` itself, `store` pipes the helper the ACTUAL
+# credential just entered, over stdin, before it ever touches disk. A
+# malicious `docker-credential-<suffix>` planted anywhere earlier on
+# `$PATH` (or `credHelpers`/`credsStore` simply naming one that already
+# exists) silently exfiltrates every registry credential resolved through
+# it from that point on, with no separate network call for a security tool
+# to catch -- the credential handoff IS the attack, identical in shape to
+# `credential_process`/kubeconfig `exec:` above.
+#
+# `credsStore`/`credHelpers` are ALSO routine, sanctioned config: Docker
+# Desktop sets `"credsStore": "desktop"` (or `osxkeychain`/`wincred`/
+# `pass`/`secretservice`) on every fresh install, unprompted -- the same
+# "this mechanism is normal infrastructure, only the SPECIFIC value needs a
+# human to have looked at it" posture `credential_process`/kubeconfig
+# `exec:` already have, hence `ask` (not `deny`) as this guard's own
+# default below, matching both siblings.
+#
+# Honest, disclosed scope, the same trade-offs `AWS_CRED_PROCESS_*`/
+# `KUBE_EXEC_CRED_*` above already accept: `DOCKER_CONFIG` env var
+# relocating the file to a path with no `.docker` segment at all, or
+# Docker's own `--config <dir>` global flag (which names a DIRECTORY, not
+# the `config.json` file itself, so no literal "config.json" text ever
+# appears in the flag value to match against) is not covered -- the same
+# "computed indirectly"/env-var-relocation class `AWS_CONFIG_FILE`/
+# `KUBECONFIG` already leave open one layer up. Planting the malicious
+# `docker-credential-<suffix>` EXECUTABLE ITSELF (as opposed to the config
+# line that names it) is the PATH binary-shadow surface
+# (`rule_path_hijack_protect`) already covers, a distinct write. No
+# dedicated CLI-form regex exists here (unlike `AWS_CRED_PROCESS_CLI_RE`/
+# `KUBE_EXEC_CRED_CLI_RE`): Docker has no `docker configure set`-style
+# subcommand for `credsStore`/`credHelpers` at all -- the file is always
+# edited directly (by hand, a config-management tool, or an installer).
+DOCKER_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.docker" + _WIN_TRIM + _SEP + r"config\.json" + _CI_END,
+    re.IGNORECASE,
+)
+# Weak, path-CONFIRMED-only key check -- mirrors AWS_CRED_PROCESS_CONTENT_RE:
+# an Edit's `new_string` is typically just the couple of lines being
+# inserted into an ALREADY-EXISTING JSON object (the surrounding `{`/other
+# keys are `old_string` context that never appears in `new_string`), so the
+# bare key alone is enough once the path is confirmed as a real Docker
+# config.
+DOCKER_CRED_HELPER_BARE_RE = re.compile(r"\bcred(?:sStore|Helpers)\b", re.IGNORECASE)
+# Strong, path-INDEPENDENT form: an actual JSON key:value assignment shape,
+# not just the bare word -- distinctive enough alone (neither key has any
+# ordinary meaning outside this exact Docker config shape) that no
+# additional structural context is needed, the same "gate on the
+# distinctive token alone" reasoning `TF_EXEC_HIT_RE` applies to
+# "local-exec"/"remote-exec". Catches content staged in a differently-named
+# file before being moved/copied into place, the same case
+# `AWS_CRED_PROCESS_INI_RE`'s own section-header check exists for.
+DOCKER_CRED_HELPER_STRONG_RE = re.compile(
+    r'["\']credsStore["\']\s*:\s*["\']'
+    r'|["\']credHelpers["\']\s*:\s*\{',
+    re.IGNORECASE,
+)
+
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
 # `external` provider's `data "external"` data source all name an arbitrary

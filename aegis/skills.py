@@ -51,6 +51,7 @@ _REMEDIES = """\
 | conftest-protect | planted a pytest auto-exec shape (module-level code, an autouse fixture, or a hook like pytest_configure) in a conftest.py (runs on the next `pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_CONFTEST=1 after review |
 | pysite-protect | planted a module-level process/code-exec call in sitecustomize.py/usercustomize.py, or a dangerous `import`-prefixed line in a site-packages/dist-packages .pth file (runs on the next `python`/`pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_PYSITE=1 after review |
 | ipython-startup-protect | planted a module-level process/code-exec call (or, in a `.ipy` file, a bare `!<command>` shell-escape line) in `.ipython/profile_*/startup/` (runs on the next `ipython`/Jupyter-kernel launch, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_IPYTHON_STARTUP=1 after review |
+| docker-cred-exec-protect | planted a `credsStore`/`credHelpers` directive in `~/.docker/config.json` (Docker executes the named `docker-credential-<name>` helper and hands it a live registry credential on every future login/push/pull/build) | ask the human; they can set AEGIS_ALLOW_DOCKER_CRED_EXEC=1 after review |
 | terraform-exec-protect | planted a `provisioner "local-exec"`/`"remote-exec"` block or a `data "external"` data source in a .tf/.tf.json file (Terraform itself runs it, the provisioner on the next `apply`, the data source on the next `plan`/`refresh` — no confirmation gate at all) | ask the human; they can set AEGIS_ALLOW_TERRAFORM_EXEC=1 after review |
 | fetch-to-file-protect | a curl/wget/PowerShell/certutil fetch wrote its response directly to a path another guard protects — bypasses that guard's own redirect/copy/move/in-place-edit checks | download to an unprotected scratch path, read it, then let the guard for that surface evaluate the real write; ask the human, who can set AEGIS_ALLOW_FETCH_TO_FILE=1 after review (never escapable for Aegis's own config/policy/source) |
 | workspace-confine | wrote outside the project root the identity is bound to | stay in the project; ask for workspace.allow if a path is legitimate |
@@ -111,7 +112,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_exec`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -158,7 +159,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
-     `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `terraform_exec`, `fetch_to_file`,
+     `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_exec`, `terraform_exec`, `fetch_to_file`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
