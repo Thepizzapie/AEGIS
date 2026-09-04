@@ -263,6 +263,20 @@ def test_mcp_unlisted_path_key_name_gated():
     assert _gated(d2) and d2.rule == RULE
 
 
+def test_mcp_benign_content_key_shadowing_real_payload_gated():
+    """Follow-up QA finding (independent adversarial bypass-hunting review,
+    while reviewing sibling `rule_docker_cred_exec_protect`, which
+    inherited this guard's exact original shape): gating the flatten
+    fallback on `not content` left a real directive unreachable whenever an
+    MCP call carried a present-but-unrelated `content`/`new_string` key (a
+    placeholder) alongside the real payload under a different key name."""
+    d = evaluate(Event.make(
+        HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file", action=ActionClass.MCP,
+        args={"path": "/home/user/.aws/config", "content": "placeholder",
+              "body": "credential_process = /tmp/evil"}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_aws_cli_long_profile_name_gated():
     """QA (bypass-hunting round): the original 30/60-char inter-token gaps
     in `AWS_CRED_PROCESS_CLI_RE` silently missed an entirely realistic,

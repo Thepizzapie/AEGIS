@@ -5708,7 +5708,18 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     closed by stripping full-line ``#`` comments (via ``patterns.strip_
     comment_lines``) from both branches' scanned text before every
     content-shape check, which also, as a side effect, correctly stops
-    treating an entirely commented-out shell line as a real invocation."""
+    treating an entirely commented-out shell line as a real invocation.
+
+    Follow-up QA finding (independent adversarial bypass-hunting review,
+    while reviewing the sibling ``rule_docker_cred_exec_protect``, which
+    inherited this guard's exact original shape): gating the MCP flatten
+    fallback on ``not content`` left a real directive unreachable whenever
+    an MCP call carried a present-but-unrelated ``content``/``new_string``
+    key alongside the actual payload under a different key name (``body``/
+    ``data``/``text``/...), reproduced with an analogous AWS payload --
+    closed by always widening to the ``_flatten_strings()`` sweep for MCP
+    calls (appended to, not conditional on, the direct value), the
+    identical fix applied to ``rule_docker_cred_exec_protect`` itself."""
     cfg = getattr(policy, "cloud_cred_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5726,8 +5737,20 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         p = _path(ev)
         a = ev.args or {}
         content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
-            content = " ".join(_flatten_strings(a))
+        # QA finding (independent adversarial bypass-hunting review, shared
+        # with rule_docker_cred_exec_protect's identical original shape):
+        # gating the flatten fallback on `not content` left the real
+        # payload unreachable whenever an MCP tool call carries a
+        # PRESENT-but-unrelated `content`/`new_string` key (a placeholder
+        # string) alongside the actual directive under a different key name
+        # (`body`/`data`/`text`/...) -- `content` was already truthy, so
+        # this fallback never ran. Always widening to the full flattened-
+        # string sweep for MCP calls -- appended to, not instead of, the
+        # direct content/new_string value -- closes this without weakening
+        # native Edit/Write (which never reaches this branch's MCP-only
+        # widening at all).
+        if ev.action == ActionClass.MCP:
+            content = (content + " " + " ".join(_flatten_strings(a))).strip()
         if not content:
             return None
         # `_path()` only recognizes a fixed key-name allowlist (file_path/
@@ -5805,6 +5828,72 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "AEGIS_ALLOW_CLOUD_CRED_EXEC=1; a spawned agent "
                          "cannot."))
     return None
+
+
+def _docker_cred_helper_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk a parsed JSON value looking for `credsStore`/`credHelpers` as an
+    actual DICT KEY -- same depth cap (12) as `_claude_hooks_struct_key_hit`
+    for identical cyclic/pathological-payload protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() in ("credsstore", "credhelpers"):
+                return True
+            if _docker_cred_helper_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_docker_cred_helper_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _docker_cred_helper_json_key_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result SEMANTICALLY for a ``credsStore``/``credHelpers`` dict key --
+    an additional signal alongside ``DOCKER_CRED_HELPER_BARE_RE``/
+    ``STRONG_RE``'s own textual match, not a replacement for it, the same
+    "parse when it stands alone, fall back to text otherwise" reasoning
+    `_claude_hooks_json_key_hit` already applies to `hooks`.
+
+    QA finding (independent adversarial bypass-hunting review): JSON's own
+    ``\\uXXXX`` escape lets either key be spelled byte-for-byte differently
+    in the raw text (``"cred\\u0073Store"``) while still decoding to the
+    exact same dangerous key -- a confirmed, reproduced silent-ALLOW bypass
+    against both textual regexes on an MCP write and a shell heredoc, since
+    neither shares a literal substring with the escaped form. Unlike the
+    AWS (INI)/Kubernetes (YAML) siblings, this is a gap genuinely unique to
+    this guard: Docker's config file is real JSON, the only one of the
+    three formats with a documented, standard escape mechanism a textual
+    regex can't see through. `json.loads` performs that decode for free;
+    walking its *result* rather than its raw text closes this whole
+    escaping class at once (not just this one example) for any content
+    that stands alone as valid JSON."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _docker_cred_helper_struct_key_hit(obj)
+
+
+def _docker_cred_helper_shell_json_hit(cmd: str) -> bool:
+    """Best-effort JSON-escape-evasion closure for the SHELL branch: find the
+    outermost ``{``..``}`` slice in the command text (the common `echo`/
+    heredoc shape for writing a whole JSON object as one literal) and, only
+    if it parses standalone, walk it the same semantic way
+    ``_docker_cred_helper_json_key_hit`` does for the Edit/Write/MCP branch
+    -- closes the identical ``\\uXXXX``-escape bypass QA reproduced via a
+    ``cat > .docker/config.json <<EOF`` heredoc. A slice that doesn't parse
+    (the overwhelming majority of ordinary commands, and any command with
+    unrelated ``{``/``}`` elsewhere -- brace expansion, an unrelated JSON
+    argument) yields no signal at all: this only ever ADDS coverage, never
+    a false ALLOW, since a parse failure just falls through to the existing
+    textual checks unaffected."""
+    start = cmd.find("{")
+    end = cmd.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return False
+    return _docker_cred_helper_json_key_hit(cmd[start:end + 1])
 
 
 def _docker_cred_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
@@ -5890,7 +5979,42 @@ def rule_docker_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     direct fetch-to-file write (`curl -o .docker/config.json <url>`) to a
     RELATIVE path is caught by `rule_fetch_to_file_protect`'s backstop
     instead (an ABSOLUTE/home-relative target is caught earlier still, by
-    `rule_containment`)."""
+    `rule_containment`).
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): design/consistency review
+    round-tripped a real `docker_cred_exec:` YAML policy block through
+    `load_policy()` into a live `evaluate()` decision for both `mode` and
+    `allow` (confirmed via `aegis validate` too), confirmed the wiring
+    correct everywhere its siblings are (`_CORE_RULES`/`BUILTIN_RULES`,
+    `Policy`, all three `loader.py` spots, both `skills.py` knob lists, the
+    `_REMEDIES` table, the README guard table), reproduced every overlap
+    claim above by calling `rule_containment` directly, and confirmed the
+    "no CLI-form regex" simplification is genuine (Docker really has no
+    `docker configure set`-equivalent subcommand for this) rather than a
+    silently-dropped coverage case -- no findings. A parallel bypass-hunting
+    review found and closed two real, reproduced issues before merge: (1) a
+    JSON `\\uXXXX`-escape evasion unique to this guard among the
+    credential-exec family -- `{"cred\\u0073Store": "docker-credential-
+    evil"}` decodes to the real dangerous key while sharing no literal
+    substring with either textual regex, a gap the AWS (INI)/Kubernetes
+    (YAML) siblings don't have since neither format shares JSON's escape
+    mechanism -- closed via `_docker_cred_helper_json_key_hit` (Edit/Write/
+    MCP branch, parses `content` as JSON and walks the result for the real
+    key) and `_docker_cred_helper_shell_json_hit` (shell branch, extracts
+    the outermost `{`..`}` slice from the command and parses that), the
+    same "parse semantically when it stands alone" technique `_claude_
+    hooks_json_key_hit` already applies to `hooks`; and (2) an MCP
+    "benign content key shadows the real payload" false ALLOW -- gating the
+    flatten fallback on `not content` (inherited verbatim from `rule_cloud_
+    cred_exec_protect`'s own original shape) left a real directive
+    unreachable whenever an MCP call carried a present-but-unrelated
+    `content`/`new_string` key alongside the actual payload under a
+    different key name, since the fallback to the robust `_flatten_
+    strings()` sweep never triggered on already-truthy content -- closed by
+    always widening to that sweep for MCP calls (appended, not
+    conditional), the identical fix also applied to `rule_cloud_cred_exec_
+    protect` itself once the same reproduction succeeded there."""
     cfg = getattr(policy, "docker_cred_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5907,9 +6031,34 @@ def rule_docker_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
-            content = " ".join(_flatten_strings(a))
+        literal_content = str(a.get("content") or a.get("new_string") or "")
+        content = literal_content
+        # QA finding (independent adversarial bypass-hunting review): gating
+        # the flatten fallback on `not content` (as `rule_cloud_cred_exec_
+        # protect` also originally did) left the real payload unreachable
+        # whenever an MCP tool call carries a PRESENT-but-unrelated
+        # `content`/`new_string` key (a placeholder string) alongside the
+        # actual directive under a different key name (`body`/`data`/
+        # `text`/...) -- `content` was already truthy, so the flatten
+        # fallback below never ran, and the differently-named key was never
+        # scanned. Always widening to the full flattened-string sweep for
+        # MCP calls -- appended to, not instead of, the direct content/
+        # new_string value -- closes this without weakening native Edit/
+        # Write (which never reaches this branch at all, `_flatten_strings`
+        # only ever adding coverage, never removing it).
+        json_candidates = [literal_content] if literal_content else []
+        if ev.action == ActionClass.MCP:
+            flat = _flatten_strings(a)
+            content = (content + " " + " ".join(flat)).strip()
+            # The JSON-parse check below needs an UNCONCATENATED candidate
+            # (a real, standalone JSON literal never survives being glued to
+            # unrelated sibling values with a space) -- use each flattened
+            # leaf on its own, which already includes `literal_content`
+            # itself as one element, so this both fixes the shadowed-key
+            # case above AND keeps the concatenated `content` string solely
+            # for the plain textual regex checks below, which don't care
+            # about JSON validity.
+            json_candidates = flat
         if not content:
             return None
         # Same MCP path-key widening `rule_cloud_cred_exec_protect`'s own
@@ -5925,7 +6074,8 @@ def rule_docker_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         path_confirmed = bool(path_text and patterns.DOCKER_CONFIG_PATH_RE.search(path_text))
         hit = bool(
             patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_content)
-            or (path_confirmed and patterns.DOCKER_CRED_HELPER_BARE_RE.search(scan_content)))
+            or (path_confirmed and patterns.DOCKER_CRED_HELPER_BARE_RE.search(scan_content))
+            or any(_docker_cred_helper_json_key_hit(c) for c in json_candidates))
         if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_DOCKER_CRED_EXEC")
@@ -5946,9 +6096,20 @@ def rule_docker_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         cmd = _shell_scan(ev)
         scan_cmd = patterns.strip_comment_lines(cmd)
         path_hit = bool(patterns.DOCKER_CONFIG_PATH_RE.search(scan_cmd))
+        # The JSON-parse check needs the RAW command text, not `scan_cmd`:
+        # `_shell_scan`'s de-obfuscation appends a de-quoted duplicate of
+        # the whole command as extra scan surface (for plain substring/
+        # regex matching, which tolerates it fine) -- run a first-`{`-to-
+        # last-`}` slice against THAT concatenation and it spans across
+        # both copies, landing on the de-quoted duplicate's mangled (no
+        # longer valid-JSON) closing brace instead of the real one, so the
+        # slice never parses. The raw, single, un-duplicated command text
+        # is what actually contains an intact JSON literal, if any.
+        raw_cmd = patterns.strip_comment_lines(_cmd(ev))
         hit = bool(
             patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_cmd)
-            or (path_hit and patterns.DOCKER_CRED_HELPER_BARE_RE.search(scan_cmd)))
+            or (path_hit and patterns.DOCKER_CRED_HELPER_BARE_RE.search(scan_cmd))
+            or _docker_cred_helper_shell_json_hit(raw_cmd))
         if not hit:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DOCKER_CRED_EXEC")

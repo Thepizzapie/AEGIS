@@ -388,3 +388,68 @@ def test_engine_no_quadratic_blowup():
     evaluate(_shell(cmd), EMPTY)
     elapsed = time.time() - start
     assert elapsed < 1.0, f"rule_docker_cred_exec_protect took {elapsed:.2f}s on adversarial input"
+
+
+# ---- QA round (bypass-hunting, independent adversarial review): closed bypasses --
+
+def test_json_unicode_escape_key_evasion_mcp_gated():
+    """QA (bypass-hunting round): `{"cred\\u0073Store": ...}` decodes to the
+    real `credsStore` key but shares no literal substring with either
+    textual regex — a gap unique to this guard among the credential-exec
+    family (JSON's own escape mechanism; the AWS INI/Kubernetes YAML
+    siblings don't have it). Closed via `_docker_cred_helper_json_key_hit`,
+    which parses the content and walks the decoded result."""
+    payload = '{"cred\\u0073Store": "docker-credential-evil"}'
+    d = evaluate(_mcp_write("/home/user/.docker/config.json", payload), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_json_unicode_escape_key_evasion_shell_heredoc_gated():
+    """Same evasion, via a `cat > ... <<EOF` heredoc — closed by
+    `_docker_cred_helper_shell_json_hit`, which extracts the outermost
+    `{`..`}` slice from the RAW (not de-obfuscation-duplicated) command
+    text and parses that."""
+    payload = '{"cred\\u0073Store": "docker-credential-evil"}'
+    cmd = f"cat > .docker/config.json <<EOF\n{payload}\nEOF"
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_mcp_benign_content_key_shadowing_real_payload_gated():
+    """QA (bypass-hunting round): a present-but-unrelated `content` key
+    (a placeholder) alongside the real payload under a different key name
+    (`body`) must not shadow the real payload — gating the flatten
+    fallback on `not content` left this unreachable."""
+    d = evaluate(Event.make(
+        HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file", action=ActionClass.MCP,
+        args={"path": "/home/user/.docker/config.json", "content": "placeholder",
+              "body": '{"credsStore": "evil-helper"}'}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_mcp_multiple_unrelated_string_args_still_parses_standalone_json():
+    """The flatten-based JSON-candidate sweep must not glue unrelated
+    sibling string values together before parsing — each candidate is
+    tried standalone, so an unrelated sibling string (a comment/label
+    field) alongside a real, intact JSON payload must not break the parse
+    that would otherwise catch it."""
+    d = evaluate(Event.make(
+        HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file", action=ActionClass.MCP,
+        args={"path": "/home/user/.docker/config.json",
+              "label": "routine config update",
+              "content": '{"credsStore": "evil-helper"}'}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_json_slice_extraction_no_quadratic_blowup():
+    from aegis import patterns
+    from aegis.rules import _docker_cred_helper_shell_json_hit
+    checks = [
+        "{" + "x" * 1000000,
+        "{" * 100000 + "}" * 100000,
+    ]
+    for adv in checks:
+        start = time.time()
+        _docker_cred_helper_shell_json_hit(adv)
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"took {elapsed:.2f}s on {adv[:30]!r}..."
