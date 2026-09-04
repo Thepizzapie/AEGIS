@@ -441,6 +441,28 @@ def test_mcp_multiple_unrelated_string_args_still_parses_standalone_json():
     assert _gated(d) and d.rule == RULE
 
 
+def test_deeply_nested_json_array_does_not_crash_the_rule():
+    """Follow-up QA finding (independent adversarial review, verifying the
+    JSON-escape fix): a few thousand characters of nothing but nested JSON
+    arrays blows Python's default recursion limit inside `json.loads`
+    itself — `RecursionError` is not a `ValueError`/`TypeError`, so it was
+    originally uncaught, propagating out of the whole rule function and
+    silently failing it open via `engine._run`'s per-rule catch-all
+    (confirmed also reopening the unicode-escape bypass above whenever
+    combined with trivial nesting padding). Must not crash, on either the
+    MCP or the shell branch — a graceful "no extra signal from this one
+    check" is the correct, accepted outcome for this specific pathological
+    input, not a rule-wide fail-open."""
+    nested = "[" * 1200 + "]" * 1200
+    raw = '{"pad": ' + nested + ', "cred\\u0073Store": "docker-credential-evil"}'
+    d = evaluate(_mcp_write("/home/user/.docker/config.json", raw), EMPTY)
+    assert d.action == Action.ALLOW  # no crash; disclosed residual gap of this one check
+
+    cmd = f"cat > .docker/config.json <<EOF\n{raw}\nEOF"
+    d2 = evaluate(_shell(cmd), EMPTY)
+    assert d2.action == Action.ALLOW  # no crash
+
+
 def test_shell_json_slice_extraction_no_quadratic_blowup():
     from aegis import patterns
     from aegis.rules import _docker_cred_helper_shell_json_hit

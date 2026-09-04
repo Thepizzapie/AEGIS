@@ -3878,7 +3878,25 @@ def _claude_hooks_json_key_hit(content: str) -> bool:
     for any content that stands alone as valid JSON."""
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # QA finding (independent adversarial review, while QA'ing the
+        # unrelated `rule_docker_cred_exec_protect`, which copies this
+        # exact try/except shape): a few thousand characters of nothing but
+        # nested JSON ARRAYS (`[[[...]]]`, no dangerous key involved at
+        # all) blow Python's default recursion limit inside `json.loads`
+        # itself -- `RecursionError` is not a `ValueError`/`TypeError`, so
+        # it was uncaught here, propagating out of the calling `rule_*`
+        # function entirely and hitting `engine._run`'s per-rule catch-all,
+        # which silently fails that ONE rule open (not a whole-pipeline
+        # crash -- `_run` continues to the next rule -- but this rule's own
+        # textual regex checks, evaluated via a boolean `or` short-circuit
+        # ahead of this call, never got a chance to fire either whenever
+        # they were evaluated lazily after this one). Caught the same way
+        # every other transient parse failure already is: this function's
+        # whole contract is "an ADDITIONAL signal when content stands alone
+        # as valid JSON", so any reason `json.loads` can't complete --
+        # malformed syntax, or a resource limit like this one -- means
+        # simply "no additional signal", never a crash.
         return False
     return _claude_hooks_struct_key_hit(obj)
 
@@ -4163,7 +4181,12 @@ def _statusline_json_key_hit(content: str) -> bool:
     `_claude_hooks_json_key_hit` already applies to ``hooks``."""
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # Same RecursionError closure `_claude_hooks_json_key_hit`'s own
+        # comment explains in full (deeply-nested JSON arrays blow
+        # Python's default recursion limit inside `json.loads` itself,
+        # otherwise silently failing this one rule open via `engine._run`'s
+        # catch-all).
         return False
     return _statusline_struct_key_hit(obj)
 
@@ -4451,7 +4474,9 @@ def _permission_bypass_json_key_hit(content: str) -> bool:
     closure `_statusline_json_key_hit` already applies to `statusLine`."""
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # Same RecursionError closure `_claude_hooks_json_key_hit`'s own
+        # comment explains in full.
         return False
     return _permission_bypass_struct_key_hit(obj)
 
@@ -5868,10 +5893,29 @@ def _docker_cred_helper_json_key_hit(content: str) -> bool:
     regex can't see through. `json.loads` performs that decode for free;
     walking its *result* rather than its raw text closes this whole
     escaping class at once (not just this one example) for any content
-    that stands alone as valid JSON."""
+    that stands alone as valid JSON.
+
+    Follow-up QA finding (independent adversarial review, verifying this
+    exact fix): a few thousand characters of nothing but nested JSON
+    ARRAYS (`[[[...]]]`, no dangerous key involved at all) blow Python's
+    default recursion limit inside `json.loads` itself -- `RecursionError`
+    is not a `ValueError`/`TypeError`, so it was uncaught, propagating out
+    of `rule_docker_cred_exec_protect` entirely and hitting `engine._run`'s
+    per-rule catch-all, which silently failed this ONE rule open (a
+    genuinely worse outcome than a plain parse failure, since it also
+    skipped this same call's sibling `DOCKER_CRED_HELPER_STRONG_RE`/
+    `BARE_RE` textual checks whenever Python evaluated this call first in
+    the `or` chain). Caught the same way every other transient parse
+    failure already is: this function's whole contract is "an ADDITIONAL
+    signal when content stands alone as valid JSON", so any reason
+    `json.loads` can't complete -- malformed syntax, or a resource limit
+    like this one -- means simply "no additional signal", never a crash.
+    The identical latent gap (same try/except shape) was confirmed to
+    exist in the pre-existing `_claude_hooks_json_key_hit`/`_statusline_
+    json_key_hit`/`_permission_bypass_json_key_hit` and fixed there too."""
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return False
     return _docker_cred_helper_struct_key_hit(obj)
 
