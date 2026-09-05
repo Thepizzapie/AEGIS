@@ -3101,6 +3101,53 @@ REGISTRY_HIJACK_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- pnpm hook-file (.pnpmfile.cjs) exec-hijack protection ---------------------
+# pnpm auto-loads a JS "pnpmfile" hook (default `.pnpmfile.cjs`, legacy
+# `pnpmfile.js`/`pnpmfile.cjs`) from the workspace root and runs it, as
+# arbitrary Node.js, on every `pnpm install`/`add`/`update`/`import`/
+# `dedupe` -- it exports `hooks.readPackage`/`afterAllResolved`/`filterLog`/
+# `importPackage`, called by pnpm itself BEFORE any dependency's own
+# lifecycle scripts run. Unlike `package.json`'s lifecycle-script keys
+# (`LIFECYCLE_SCRIPT_KEY_RE`, a single shell-command STRING gated only when
+# that specific key is set), a pnpmfile IS a full Node.js module --
+# `require('child_process').execSync(...)`, `require('fs')`,
+# `require('https')` -- with no shell-command-string shape to even attempt
+# parsing, and no widely-used benign purpose for the FILE ITSELF other than
+# being exactly what pnpm executes on the next install. Gated on PATH ALONE,
+# the same "gate the mechanism's mere presence" choice `HUSKY_HOOK_PATH_RE`
+# makes for `.husky/<hook>` -- not narrowed by content, because (unlike
+# `package.json`, edited constantly for routine reasons) there is no safe
+# content to narrow past: a pnpmfile write is either a reviewed, intentional
+# hook (patch-package-style dependency patching is a common legitimate use)
+# or exactly this attack, and both look identical from the outside.
+PNPMFILE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.pnpmfile\.c?js" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pnpmfile\.c?js" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The redirect half: pnpm's own `pnpmfile` config key (in `.npmrc` or
+# `pnpm-workspace.yaml`, or via `pnpm config set pnpmfile <path>`) points
+# pnpm's hook loader at an ARBITRARY path instead of the default
+# `.pnpmfile.cjs` -- the same "config points the auto-exec loader somewhere
+# else" shape `core.hooksPath` has for git hooks (`rule_git_hooks_protect`).
+# A write that sets this key needs no `.pnpmfile`-named file at all to be
+# dangerous -- whatever ordinary-looking filename the redirect names is what
+# pnpm loads and executes on the very next install.
+PNPMFILE_REDIRECT_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.npmrc" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pnpm-workspace\.yaml" + _CI_END,
+    re.IGNORECASE,
+)
+PNPMFILE_REDIRECT_RE = re.compile(
+    r"\bpnpmfile\s*[:=]\s*[\"']?\S",
+    re.IGNORECASE,
+)
+PNPMFILE_REDIRECT_CLI_RE = re.compile(
+    r"\bpnpm\s+config\s+set\b[^|;&\n]{0,200}\bpnpmfile\b",
+    re.IGNORECASE,
+)
+
 # ---- Git-config credential/exec hijack protection ------------------------------
 # Two git-config-driven persistence/exfiltration primitives `git_hooks_protect`
 # doesn't reach (it only watches `core.hooksPath`): `credential.helper` and a
