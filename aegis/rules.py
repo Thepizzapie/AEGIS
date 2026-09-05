@@ -1794,6 +1794,202 @@ def rule_package_manifest_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _pnpmfile_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_pnpmfile_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block writing pnpm's hook file (`.pnpmfile.cjs`/`.pnpmfile.mjs`/
+    `.pnpmfile.js`, legacy bare `pnpmfile.cjs`/`pnpmfile.mjs`/`pnpmfile.js`),
+    or redirecting pnpm's own `pnpmfile` config key (`.npmrc`/
+    `pnpm-workspace.yaml`, `pnpm config set pnpmfile <path>`, or the
+    `pnpm_config_pnpmfile`/`PNPM_CONFIG_PNPMFILE` env var) to point pnpm's
+    hook loader at an arbitrary path.
+
+    THREAT MODEL: `rule_package_manifest_protect` gates `package.json`'s
+    lifecycle-script KEYS (`postinstall`, ...) -- a single shell-command
+    STRING, only dangerous when that specific key is set, because
+    `package.json` is edited constantly for routine reasons. A pnpmfile is a
+    different, more powerful mechanism entirely: it is a full Node.js
+    module that pnpm itself `require()`s and calls into (`hooks.
+    readPackage`/`afterAllResolved`/`filterLog`/`importPackage`) on every
+    `pnpm install`/`add`/`update`/`import`/`dedupe` -- BEFORE any
+    dependency's own lifecycle scripts run, with no lifecycle-script key,
+    no `scripts` object entry, and no mention of `package.json` anywhere in
+    the write for `rule_package_manifest_protect`'s own `PACKAGE_SCRIPTS_
+    PATH_RE`/`LIFECYCLE_SCRIPT_KEY_RE` pairing to ever see. Because it is
+    arbitrary Node.js rather than one shell-command string, it needs no
+    shell metacharacters or `child_process` call to LOOK dangerous in a
+    review -- `require('fs').readFileSync(require('os').homedir() +
+    '/.aws/credentials')` piped into a `require('https')` POST inside an
+    innocuous-looking `hooks.readPackage` reads as ordinary dependency-
+    patching logic unless a reviewer actually traces what it does at
+    runtime. Runs with the invoking user's/CI's full privileges, unattended,
+    on the very next install -- this session, a teammate, or an unattended
+    CI runner -- the same "write now, auto-exec later" shape every sibling
+    `*_protect` guard in this file shares, one layer into the package
+    manager's own hook surface instead of the manifest or the manager's
+    lifecycle-script convention.
+
+    The redirect half mirrors `rule_git_hooks_protect`'s `core.hooksPath`
+    check one mechanism over: pnpm's `pnpmfile` config key (default
+    `.pnpmfile.cjs`) can point pnpm's loader at ANY path, so a write that
+    sets it needs no pnpmfile-named file at all -- whatever ordinary file
+    the redirect names becomes what pnpm executes next. It also covers the
+    env-var form of the same redirect (`pnpm_config_pnpmfile`/
+    `PNPM_CONFIG_PNPMFILE`, the prefix pnpm actually reads config overrides
+    from -- it does NOT honor `npm_config_*`) with no `.npmrc`/
+    `pnpm-workspace.yaml` write or `pnpm config set` call needed at all, the
+    same env-injection primitive `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
+    close for `core.hooksPath` one guard over.
+
+    Gated on PATH ALONE for the file itself (no content narrowing, unlike
+    `rule_package_manifest_protect`'s lifecycle-script-key check) -- the
+    same choice `rule_hook_manager_protect` makes for `.husky/<hook>`:
+    unlike `package.json`, a pnpmfile has no routine, high-frequency benign
+    edit pattern that gating on mere presence would swamp with false ASKs,
+    and there is no safe subset of pnpmfile CONTENT to narrow past --
+    reviewed, intentional hook code and this attack look identical from the
+    outside. The redirect half IS content-gated (the specific `pnpmfile`
+    key), since `.npmrc`/`pnpm-workspace.yaml` are ordinary, frequently
+    edited config files for unrelated reasons.
+
+    Config (`policy.pnpmfile_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate -- a
+    repo's own reviewed, already-audited pnpmfile, say). Defaults to `ask`
+    for the same reason every sibling `*_protect` guard does: a pnpmfile
+    hook is sometimes routine, sanctioned dev work (patching a dependency's
+    own broken `package.json`) -- it just needs a human to have actually
+    looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle `AEGIS_ALLOW_PNPMFILE_EXEC=1` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form. A spawned agent
+    cannot set its own env for a hook invocation it doesn't control, so
+    neither path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a `require`/import target assembled indirectly (string
+    concatenation, a template) rather than appearing as a literal defeats
+    nothing here since the file's mere presence is what gates, but a
+    pnpmfile planted via an archive/sync extraction tool this guard's shell
+    branch doesn't recognize as a write verb is not covered; `find
+    -path`/`-name` indirection around the filename isn't covered (no
+    `*_find_hit`-style fallback, the same gap `rule_conftest_protect`/
+    `rule_pysite_protect`/`rule_hook_manager_protect` already disclose for
+    their own targets); a direct fetch-to-file write (`curl -o
+    .pnpmfile.cjs <url>`) is caught by none of the shell branch's write-verb
+    checks, the same inherited gap every sibling guard already discloses
+    (closed for this guard, like every sibling, only via the separate
+    `rule_fetch_to_file_protect` backstop once wired into
+    `_FETCH_HUMAN_ESCAPABLE`); and the shared `_path()` helper every
+    `*_protect` guard in this file reads MCP tool-call arguments through
+    only checks a fixed key allowlist -- an MCP tool naming its target
+    argument outside that list is missed, the same pre-existing,
+    shared-infrastructure gap `rule_pysite_protect`'s own docstring already
+    discloses.
+
+    QA history (two independent adversarial reviews, run in parallel, the
+    same convention every guard in this file follows): a bypass-hunting
+    review found and this fix closes two real, reproduced, silent-ALLOW
+    bypasses -- `.pnpmfile.mjs` (pnpm 11's real, current, higher-priority-
+    than-`.cjs` default ESM hook file, entirely missing from the original
+    `PNPMFILE_PATH_RE`'s `\\.c?js`-only extension alternation) and the
+    `pnpm_config_pnpmfile`/`PNPM_CONFIG_PNPMFILE` env-var redirect (an
+    entirely unhandled primitive despite this guard's own docstring already
+    analogizing itself to the git-config env-injection defense
+    `rule_git_hooks_protect` builds for the equivalent `core.hooksPath`
+    case) -- both closed above, with no ReDoS found on any of the four new
+    regexes under adversarial input. A parallel design/wiring review
+    confirmed correct registration and round-tripping everywhere its
+    siblings are (`_CORE_RULES`, `_FETCH_HUMAN_ESCAPABLE`, `Policy`, all
+    three `loader.py` spots, both `skills.py` knob lists, the `_REMEDIES`
+    table, the README guard table), a live YAML `pnpmfile_exec:` block
+    through `load_policy()` into a live `evaluate()` decision for both
+    `mode` and `allow`, every docstring claim true against the
+    implementation, and the full suite green throughout with no findings."""
+    cfg = getattr(policy, "pnpmfile_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "pnpmfile-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        pnpmfile_hit = bool(patterns.PNPMFILE_PATH_RE.search(p))
+        redirect_hit = False
+        if not pnpmfile_hit and patterns.PNPMFILE_REDIRECT_PATH_RE.search(p):
+            a = ev.args or {}
+            raw_content = a.get("content")
+            if not isinstance(raw_content, str) or not raw_content:
+                raw_content = a.get("new_string")
+            if isinstance(raw_content, str) and raw_content:
+                content = raw_content
+            else:
+                content = " ".join(_flatten_strings(a))
+            redirect_hit = bool(content and patterns.PNPMFILE_REDIRECT_RE.search(content))
+        if not (pnpmfile_hit or redirect_hit):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PNPMFILE_EXEC")
+                or _pnpmfile_exec_allowed_by_policy(cfg, p)):
+            return None
+        reason = (f"'{p}' is pnpm's own hook file" if pnpmfile_hit else
+                  f"'{p}' redirects pnpm's hook-file loader (the 'pnpmfile' config key)")
+        return _finish(Decision(action, "pnpmfile-exec-protect",
+                         f"{reason} — it runs as arbitrary Node.js, "
+                         "automatically and unattended, on the very next "
+                         "'pnpm install'/'add'/'update'/'import', before "
+                         "any dependency's own lifecycle scripts run. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_PNPMFILE_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        redirect_cli_hit = bool(patterns.PNPMFILE_REDIRECT_CLI_RE.search(cmd))
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                           or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd))
+        pnpmfile_hit = bool(write_verb and patterns.PNPMFILE_PATH_RE.search(cmd))
+        redirect_hit = bool(redirect_cli_hit
+                             or (write_verb
+                                 and patterns.PNPMFILE_REDIRECT_PATH_RE.search(cmd)
+                                 and patterns.PNPMFILE_REDIRECT_RE.search(cmd)))
+        if not (pnpmfile_hit or redirect_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PNPMFILE_EXEC")
+                or _pnpmfile_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("pnpm's hook file is being written from a shell" if pnpmfile_hit
+                  else "pnpm's hook-file loader is being redirected from a shell")
+        return _finish(Decision(action, "pnpmfile-exec-protect",
+                         f"{reason} — it runs as arbitrary Node.js, "
+                         "automatically and unattended, on the very next "
+                         "'pnpm install'/'add'/'update'/'import'. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_PNPMFILE_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _git_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -5450,6 +5646,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
     (patterns.PACKAGE_SCRIPTS_PATH_RE, "a package manifest (package.json/composer.json)"),
     (patterns.REGISTRY_CONFIG_PATH_RE, "a package-registry config"),
+    (patterns.PNPMFILE_PATH_RE, "pnpm's hook file"),
     (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
     (patterns.GIT_ATTRS_PATH_RE, "a .gitattributes file"),
     (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),
@@ -6600,6 +6797,7 @@ _CORE_RULES = (
     rule_shell_persist_protect,
     rule_direnv_protect,
     rule_package_manifest_protect,
+    rule_pnpmfile_exec_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_gitmodules_protect,
