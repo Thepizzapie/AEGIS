@@ -1,8 +1,10 @@
 """pnpm hook-file (pnpmfile) exec-hijack protection guard — blocks writing
-pnpm's own JS hook file (``.pnpmfile.cjs``/``.pnpmfile.js``, legacy bare
-``pnpmfile.cjs``/``pnpmfile.js``), or redirecting pnpm's ``pnpmfile`` config
-key (``.npmrc``/``pnpm-workspace.yaml``, or ``pnpm config set pnpmfile
-<path>``) to point pnpm's hook loader at an arbitrary path.
+pnpm's own JS hook file (``.pnpmfile.cjs``/``.pnpmfile.mjs``/
+``.pnpmfile.js``, legacy bare ``pnpmfile.cjs``/``pnpmfile.mjs``/
+``pnpmfile.js``), or redirecting pnpm's ``pnpmfile`` config key
+(``.npmrc``/``pnpm-workspace.yaml``, ``pnpm config set pnpmfile <path>``, or
+the ``pnpm_config_pnpmfile``/``PNPM_CONFIG_PNPMFILE`` env var) to point
+pnpm's hook loader at an arbitrary path.
 
 THREAT MODEL: pnpm ``require()``s a pnpmfile and calls into
 ``hooks.readPackage``/``afterAllResolved``/``filterLog``/``importPackage`` as
@@ -71,6 +73,19 @@ def _mcp_write(path, content=None):
                        action=ActionClass.MCP, args=args)
 
 
+def _mcp_write_nested(path, text):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__write_file",
+                       action=ActionClass.MCP,
+                       args={"path": path,
+                             "content": [{"type": "text", "text": text}]})
+
+
+def _multi_edit(path, new_string):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+                       args={"file_path": path,
+                             "edits": [{"old_string": "x", "new_string": new_string}]})
+
+
 def _gated(d) -> bool:
     return d.action != Action.ALLOW
 
@@ -122,6 +137,35 @@ def test_mcp_write_pnpmfile_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_mcp_write_nested_content_pnpmfile_gated():
+    d = evaluate(_mcp_write_nested(".pnpmfile.cjs", MALICIOUS_PNPMFILE), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_multi_edit_new_string_pnpmfile_gated():
+    d = evaluate(_multi_edit(".pnpmfile.cjs", "hooks.readPackage = () => {}"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_write_mjs_pnpmfile_gated():
+    # QA finding (independent adversarial review): pnpm 11 added
+    # `.pnpmfile.mjs` for ESM, which TAKES PRIORITY over `.pnpmfile.cjs`
+    # when both exist -- a real, current default filename, not a
+    # hypothetical extension.
+    d = evaluate(_write(".pnpmfile.mjs", MALICIOUS_PNPMFILE), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_write_legacy_bare_mjs_pnpmfile_gated():
+    d = evaluate(_write("pnpmfile.mjs", MALICIOUS_PNPMFILE), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_copy_into_mjs_pnpmfile_gated():
+    d = evaluate(_shell("cp evil-hook.mjs .pnpmfile.mjs"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_write_unrelated_js_file_not_gated():
     d = evaluate(_write("src/index.js", MALICIOUS_PNPMFILE), EMPTY)
     assert d.action == Action.ALLOW
@@ -150,6 +194,12 @@ def test_shell_echo_redirect_pnpmfile_gated():
 
 def test_shell_copy_into_pnpmfile_gated():
     d = evaluate(_shell("cp evil-hook.js .pnpmfile.cjs"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_sed_inplace_pnpmfile_gated():
+    d = evaluate(_shell(
+        "sed -i '1i require(\"child_process\").execSync(\"id\")' .pnpmfile.cjs"), EMPTY)
     assert _gated(d) and d.rule == RULE
 
 
@@ -193,6 +243,27 @@ def test_shell_npmrc_append_redirect_gated():
 def test_shell_npmrc_read_only_not_gated():
     d = evaluate(_shell("cat .npmrc"), EMPTY)
     assert d.action == Action.ALLOW
+
+
+def test_shell_env_var_redirect_lowercase_gated():
+    # QA finding (independent adversarial review): pnpm reads config
+    # overrides from `pnpm_config_*`/`PNPM_CONFIG_*`-prefixed env vars (it
+    # deliberately does NOT honor `npm_config_*`), which OVERRIDE
+    # pnpm-workspace.yaml/.npmrc -- so this redirects pnpm's hook loader
+    # with no .npmrc/pnpm-workspace.yaml write and no `pnpm config set`
+    # call at all.
+    d = evaluate(_shell("pnpm_config_pnpmfile=/tmp/evil.cjs pnpm install"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_env_var_redirect_uppercase_gated():
+    d = evaluate(_shell("PNPM_CONFIG_PNPMFILE=/tmp/evil.cjs pnpm add lodash"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_env_var_redirect_export_form_gated():
+    d = evaluate(_shell("export pnpm_config_pnpmfile=/tmp/evil.cjs"), EMPTY)
+    assert _gated(d) and d.rule == RULE
 
 
 # ---- escapability: human-only, matching every sibling *_protect guard --------

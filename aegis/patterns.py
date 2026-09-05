@@ -3102,9 +3102,10 @@ REGISTRY_HIJACK_CLI_RE = re.compile(
 )
 
 # ---- pnpm hook-file (.pnpmfile.cjs) exec-hijack protection ---------------------
-# pnpm auto-loads a JS "pnpmfile" hook (default `.pnpmfile.cjs`, legacy
-# `pnpmfile.js`/`pnpmfile.cjs`) from the workspace root and runs it, as
-# arbitrary Node.js, on every `pnpm install`/`add`/`update`/`import`/
+# pnpm auto-loads a JS "pnpmfile" hook (default `.pnpmfile.cjs`; pnpm 11 added
+# `.pnpmfile.mjs` for ESM, which TAKES PRIORITY over `.cjs` when both exist;
+# legacy bare `pnpmfile.js`/`pnpmfile.cjs`) from the workspace root and runs
+# it, as arbitrary Node.js, on every `pnpm install`/`add`/`update`/`import`/
 # `dedupe` -- it exports `hooks.readPackage`/`afterAllResolved`/`filterLog`/
 # `importPackage`, called by pnpm itself BEFORE any dependency's own
 # lifecycle scripts run. Unlike `package.json`'s lifecycle-script keys
@@ -3120,20 +3121,30 @@ REGISTRY_HIJACK_CLI_RE = re.compile(
 # content to narrow past: a pnpmfile write is either a reviewed, intentional
 # hook (patch-package-style dependency patching is a common legitimate use)
 # or exactly this attack, and both look identical from the outside.
+#
+# QA finding (independent adversarial review): the first version of this
+# regex covered only `.c?js` (`cjs`/`js`), silently missing `.pnpmfile.mjs`
+# entirely -- pnpm's real, current, HIGHER-PRIORITY-than-`.cjs` default ESM
+# hook file, not a hypothetical extension. Closed by widening the extension
+# alternation to `(?:c|m)?js`.
 PNPMFILE_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.pnpmfile\.c?js" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])pnpmfile\.c?js" + _CI_END,
+    r"(?:^|[\s'\"/\\=])\.pnpmfile\.(?:c|m)?js" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pnpmfile\.(?:c|m)?js" + _CI_END,
     re.IGNORECASE,
 )
 
 # The redirect half: pnpm's own `pnpmfile` config key (in `.npmrc` or
-# `pnpm-workspace.yaml`, or via `pnpm config set pnpmfile <path>`) points
-# pnpm's hook loader at an ARBITRARY path instead of the default
-# `.pnpmfile.cjs` -- the same "config points the auto-exec loader somewhere
-# else" shape `core.hooksPath` has for git hooks (`rule_git_hooks_protect`).
-# A write that sets this key needs no `.pnpmfile`-named file at all to be
-# dangerous -- whatever ordinary-looking filename the redirect names is what
-# pnpm loads and executes on the very next install.
+# `pnpm-workspace.yaml`, via `pnpm config set pnpmfile <path>`, or via the
+# `pnpm_config_pnpmfile`/`PNPM_CONFIG_PNPMFILE` env var pnpm reads config
+# from -- the same env-injection primitive `GIT_CONFIG_KEY_n`/
+# `GIT_CONFIG_VALUE_n` close for git-config in this same file) points pnpm's
+# hook loader at an ARBITRARY path instead of the default `.pnpmfile.cjs` --
+# the same "config points the auto-exec loader somewhere else" shape
+# `core.hooksPath` has for git hooks (`rule_git_hooks_protect`). A write (or
+# an env-var assignment, no write at all) that sets this key needs no
+# `.pnpmfile`-named file at all to be dangerous -- whatever ordinary-looking
+# filename the redirect names is what pnpm loads and executes on the very
+# next install.
 PNPMFILE_REDIRECT_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.npmrc" + _CI_END
     + r"|(?:^|[\s'\"/\\=])pnpm-workspace\.yaml" + _CI_END,
@@ -3143,8 +3154,20 @@ PNPMFILE_REDIRECT_RE = re.compile(
     r"\bpnpmfile\s*[:=]\s*[\"']?\S",
     re.IGNORECASE,
 )
+# QA finding (independent adversarial review): pnpm reads config from
+# `pnpm_config_*`/`PNPM_CONFIG_*`-prefixed env vars (it deliberately does NOT
+# honor `npm_config_*`), which OVERRIDE `pnpm-workspace.yaml`/`.npmrc` -- so
+# `pnpm_config_pnpmfile=/tmp/evil.cjs pnpm install` (or a plain `export`)
+# redirects the hook loader with no `.npmrc`/`pnpm-workspace.yaml` write and
+# no `pnpm config set` invocation at all, sailing past both the path-pairing
+# check above and the original version of this CLI regex. Checked
+# unconditionally, no path pairing needed -- the same "no accompanying file
+# path required" shape `GIT_CONFIG_KEY_n=core.hookspath` already has for the
+# identical env-injection class one guard over. `re.IGNORECASE` covers the
+# real, upper-cased `PNPM_CONFIG_PNPMFILE` form pnpm equally honors.
 PNPMFILE_REDIRECT_CLI_RE = re.compile(
-    r"\bpnpm\s+config\s+set\b[^|;&\n]{0,200}\bpnpmfile\b",
+    r"\bpnpm\s+config\s+set\b[^|;&\n]{0,200}\bpnpmfile\b"
+    r"|\bpnpm_config_pnpmfile\s*=\s*\S",
     re.IGNORECASE,
 )
 

@@ -1805,10 +1805,12 @@ def _pnpmfile_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
 
 
 def rule_pnpmfile_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
-    """Block writing pnpm's hook file (`.pnpmfile.cjs`/`.pnpmfile.js`, legacy
-    bare `pnpmfile.cjs`/`pnpmfile.js`), or redirecting pnpm's own `pnpmfile`
-    config key (`.npmrc`/`pnpm-workspace.yaml`, or `pnpm config set
-    pnpmfile <path>`) to point pnpm's hook loader at an arbitrary path.
+    """Block writing pnpm's hook file (`.pnpmfile.cjs`/`.pnpmfile.mjs`/
+    `.pnpmfile.js`, legacy bare `pnpmfile.cjs`/`pnpmfile.mjs`/`pnpmfile.js`),
+    or redirecting pnpm's own `pnpmfile` config key (`.npmrc`/
+    `pnpm-workspace.yaml`, `pnpm config set pnpmfile <path>`, or the
+    `pnpm_config_pnpmfile`/`PNPM_CONFIG_PNPMFILE` env var) to point pnpm's
+    hook loader at an arbitrary path.
 
     THREAT MODEL: `rule_package_manifest_protect` gates `package.json`'s
     lifecycle-script KEYS (`postinstall`, ...) -- a single shell-command
@@ -1839,7 +1841,13 @@ def rule_pnpmfile_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     check one mechanism over: pnpm's `pnpmfile` config key (default
     `.pnpmfile.cjs`) can point pnpm's loader at ANY path, so a write that
     sets it needs no pnpmfile-named file at all -- whatever ordinary file
-    the redirect names becomes what pnpm executes next.
+    the redirect names becomes what pnpm executes next. It also covers the
+    env-var form of the same redirect (`pnpm_config_pnpmfile`/
+    `PNPM_CONFIG_PNPMFILE`, the prefix pnpm actually reads config overrides
+    from -- it does NOT honor `npm_config_*`) with no `.npmrc`/
+    `pnpm-workspace.yaml` write or `pnpm config set` call needed at all, the
+    same env-injection primitive `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
+    close for `core.hooksPath` one guard over.
 
     Gated on PATH ALONE for the file itself (no content narrowing, unlike
     `rule_package_manifest_protect`'s lifecycle-script-key check) -- the
@@ -1885,7 +1893,27 @@ def rule_pnpmfile_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     only checks a fixed key allowlist -- an MCP tool naming its target
     argument outside that list is missed, the same pre-existing,
     shared-infrastructure gap `rule_pysite_protect`'s own docstring already
-    discloses."""
+    discloses.
+
+    QA history (two independent adversarial reviews, run in parallel, the
+    same convention every guard in this file follows): a bypass-hunting
+    review found and this fix closes two real, reproduced, silent-ALLOW
+    bypasses -- `.pnpmfile.mjs` (pnpm 11's real, current, higher-priority-
+    than-`.cjs` default ESM hook file, entirely missing from the original
+    `PNPMFILE_PATH_RE`'s `\\.c?js`-only extension alternation) and the
+    `pnpm_config_pnpmfile`/`PNPM_CONFIG_PNPMFILE` env-var redirect (an
+    entirely unhandled primitive despite this guard's own docstring already
+    analogizing itself to the git-config env-injection defense
+    `rule_git_hooks_protect` builds for the equivalent `core.hooksPath`
+    case) -- both closed above, with no ReDoS found on any of the four new
+    regexes under adversarial input. A parallel design/wiring review
+    confirmed correct registration and round-tripping everywhere its
+    siblings are (`_CORE_RULES`, `_FETCH_HUMAN_ESCAPABLE`, `Policy`, all
+    three `loader.py` spots, both `skills.py` knob lists, the `_REMEDIES`
+    table, the README guard table), a live YAML `pnpmfile_exec:` block
+    through `load_policy()` into a live `evaluate()` decision for both
+    `mode` and `allow`, every docstring claim true against the
+    implementation, and the full suite green throughout with no findings."""
     cfg = getattr(policy, "pnpmfile_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

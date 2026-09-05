@@ -177,13 +177,14 @@ class Policy:
     package_manifest: dict = field(default_factory=dict)
     # pnpm hook-file (pnpmfile) exec-hijack protection: {mode: deny|ask|
     # monitor|off, allow: [regex on path/command]}. Empty -> defaults
-    # (mode=ask) apply. Covers pnpm's own JS hook file (.pnpmfile.cjs/.js,
-    # legacy bare pnpmfile.cjs/.js) -- pnpm require()s and calls into it as
-    # arbitrary Node.js on every install/add/update/import, before any
-    # dependency's own lifecycle scripts run -- and a redirect of pnpm's
-    # `pnpmfile` config key (.npmrc/pnpm-workspace.yaml, or `pnpm config set
-    # pnpmfile <path>`) that points pnpm's loader at an arbitrary path
-    # instead. See rules.rule_pnpmfile_exec_protect.
+    # (mode=ask) apply. Covers pnpm's own JS hook file (.pnpmfile.cjs/.mjs/
+    # .js, legacy bare pnpmfile.cjs/.mjs/.js) -- pnpm require()s/import()s
+    # and calls into it as arbitrary Node.js on every install/add/update/
+    # import, before any dependency's own lifecycle scripts run -- and a
+    # redirect of pnpm's `pnpmfile` config key (.npmrc/pnpm-workspace.yaml,
+    # `pnpm config set pnpmfile <path>`, or the pnpm_config_pnpmfile/
+    # PNPM_CONFIG_PNPMFILE env var) that points pnpm's loader at an
+    # arbitrary path instead. See rules.rule_pnpmfile_exec_protect.
     pnpmfile_exec: dict = field(default_factory=dict)
     # Git-config credential/exec-hijack protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
