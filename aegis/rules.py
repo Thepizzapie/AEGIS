@@ -6772,6 +6772,153 @@ def rule_branch_strands(ev: Event, policy=None) -> Optional[Decision]:
                     "or set AEGIS_ALLOW_STRAND=1.")
 
 
+def _env_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_env_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block setting an interpreter/tool auto-load environment variable
+    (``NODE_OPTIONS``, ``BASH_ENV``, ``ENV``, ``PYTHONSTARTUP``,
+    ``PERL5OPT``, ``RUBYOPT``, the ``LD_PRELOAD`` env var, ``GIT_SSH_COMMAND``)
+    to a code-loading value.
+
+    THREAT MODEL: each of these variables makes a specific interpreter/tool
+    load and run attacker-chosen code on its very NEXT invocation, purely by
+    being set — no config file, no hook, no service unit, no reboot or new
+    shell required. ``NODE_OPTIONS=--require=/tmp/evil.js`` runs on the next
+    ``node``/``npm``/``npx``/``yarn`` invocation; ``BASH_ENV``/``ENV`` are
+    sourced on the next non-interactive/interactive shell invocation
+    respectively (bash and POSIX sh/dash/ksh, in that order);
+    ``PYTHONSTARTUP`` execs on the next interactive Python REPL start;
+    ``PERL5OPT``/``RUBYOPT`` implicitly prepend flags to the next
+    ``perl``/``ruby``/``irb``/``rake``/``bundle exec`` invocation;
+    ``LD_PRELOAD`` — the environment variable, distinct from the persistent
+    ``/etc/ld.so.preload`` FILE ``rule_ld_preload_protect`` already covers —
+    is ``dlopen()``'d into the next dynamically-linked ELF process this
+    shell (or an inheriting child) execs; ``GIT_SSH_COMMAND`` replaces the
+    command git invokes for every ssh-transport fetch/push/pull/clone from
+    the moment it's set. Set from a plain shell command, this taints every
+    later command the SAME agent session runs with no file ever touched —
+    the ephemeral, single-session-scoped sibling of a shell-rc/service-unit/
+    dynamic-linker persistence primitive, reached by no existing guard:
+    ``rule_shell_persist_protect`` gates a shell startup FILE being edited,
+    never the current shell's own environment; ``rule_ld_preload_protect``
+    gates the ``/etc/ld.so.preload`` FILE, never the identically-named
+    environment variable; ``rule_pysite_protect``/``rule_ipython_startup_
+    protect`` gate interpreter-startup FILES, never ``PYTHONSTARTUP`` (an
+    env var naming one); ``rule_git_config_exec_protect`` gates a git-config
+    key/value, never the ``GIT_SSH_COMMAND`` env var git also honors.
+
+    Config (``policy.env_hijack``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the command/content that skip the gate — a
+    repo's own trusted test harness that legitimately sets ``NODE_OPTIONS``
+    for coverage instrumentation, say). Defaults to ``ask`` for the same
+    reason every sibling ``*_protect`` guard does: setting these variables
+    has real, sanctioned uses (``NODE_OPTIONS=--max-old-space-size=4096``,
+    a CI step exporting ``BASH_ENV`` to share helper functions across
+    steps) — it just needs a human to have actually looked at it.
+
+    Value-shape filtering keeps that ``ask`` from firing on the common
+    benign case: ``BASH_ENV``/``ENV``/``PYTHONSTARTUP`` only gate when the
+    value is actually path-shaped (contains a path separator, a leading
+    ``.``/``~``, or a common script extension) — a bare word with no path
+    shape (``ENV=staging``, a common deployment-environment-name
+    convention sharing this exact identifier) can't be sourced as a file by
+    this mechanism at all, so it's inert and excluded; ``NODE_OPTIONS``/
+    ``RUBYOPT`` only gate when the value actually carries a code-loading
+    flag (``--require``/``-r``/``--loader``/``--experimental-loader``/
+    ``--import``) — both have common flag-only uses
+    (``NODE_OPTIONS=--max-old-space-size=4096``, ``RUBYOPT=-W0``) that
+    carry no code-loading risk at all. ``PERL5OPT``/``LD_PRELOAD``/
+    ``GIT_SSH_COMMAND`` have no such benign non-exec use, so any non-empty
+    value gates.
+
+    Escapable only by a human: a trailing ``# aegis-allow`` on the shell
+    form, or the env toggle ``AEGIS_ALLOW_ENV_HIJACK=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-content form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, same denylist trade-offs every guard in this file
+    discloses: a value assembled indirectly (shell variable concatenation
+    across separate assignments, a wrapper script that itself performs the
+    export) rather than appearing as one contiguous literal in the scanned
+    text is not caught; the Edit/Write/MCP branch scans written CONTENT for
+    the same assignment shape (catching it landing in a CI workflow step, a
+    Dockerfile ``ENV`` instruction, or a shell script about to be run) but,
+    like ``rule_git_config_exec_protect``'s own content branch, is not
+    scoped to any particular file path — an unrelated file merely
+    mentioning one of these assignments in a comment or doc string gates
+    the same as a real one, the same "false positives are the safe
+    direction" trade-off those guards already take; a value that RELOCATES
+    via a second layer of indirection (a path built from an already-set
+    environment variable, e.g. ``BASH_ENV=$HOME/.evil.sh``) is treated as
+    path-shaped (it contains ``$``/no separator before expansion) only if
+    the literal text itself already looks like a path — this guard has no
+    shell-expansion awareness, the same "computed indirectly" class every
+    guard in this file already accepts; and, unlike a persistent shell-rc
+    or service-unit write, an ``ALLOW``ed (ungated) assignment here still
+    only affects the current process tree going forward — this guard's own
+    disclosed value-shape filters are a precision/noise trade-off, not a
+    claim of exhaustive coverage of every conceivable code-loading value
+    shape a determined attacker could construct."""
+    cfg = getattr(policy, "env_hijack", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "env-hijack-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        name = patterns.env_hijack_hit(content)
+        if not name:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_ENV_HIJACK")
+                or _env_hijack_allowed_by_policy(cfg, content)):
+            return None
+        return _finish(Decision(action, "env-hijack-protect",
+                         f"'{name}' is being set to a code-loading value in written "
+                         "content — it redirects every subsequent invocation of the "
+                         "interpreter/tool it controls to attacker-chosen code. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_ENV_HIJACK=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        name = patterns.env_hijack_hit(cmd)
+        if not name:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_ENV_HIJACK")
+                or _env_hijack_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "env-hijack-protect",
+                         f"'{name}' is being set to a code-loading value from a "
+                         "shell — it redirects every subsequent invocation of the "
+                         "interpreter/tool it controls to attacker-chosen code, no "
+                         "config file, hook, or reboot needed. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_ENV_HIJACK=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
 def _lifecycle_rules() -> tuple:
     """Pull in the lifecycle-hook rules (ConfigChange / SubagentStart / PreCompact /
     PermissionRequest / WorktreeCreate / ...). Imported here (not at top) so the
@@ -6803,6 +6950,7 @@ _CORE_RULES = (
     rule_gitmodules_protect,
     rule_service_persist_protect,
     rule_ld_preload_protect,
+    rule_env_hijack_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,

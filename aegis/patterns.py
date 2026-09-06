@@ -4,6 +4,7 @@ Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
 import re
+from typing import Optional
 
 # Explicit, recorded override: append '# aegis-allow' (or --aegis-allow) to an
 # ESCAPABLE guard to confirm intent.
@@ -4671,3 +4672,133 @@ _COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 
 def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
+
+
+# ---- Interpreter/tool auto-load environment-variable hijack -----------------
+# A small set of environment variables cause a specific interpreter/tool to
+# load and run attacker-chosen code on its very NEXT invocation, purely by
+# being SET -- no config file, no hook, no service unit, no reboot/new-shell/
+# CI trigger. Nothing else in this file reaches this surface: LD_PRELOAD_PATH_RE
+# above covers only the persistent `/etc/ld.so.preload` FILE, never the
+# same-named environment variable set directly on a command line
+# (`LD_PRELOAD=/tmp/evil.so cmd`) -- the classic, far more common form of that
+# exact technique; SHELL_RC_PATH_RE/SSH_PERSIST_PATH_RE cover a shell startup
+# FILE being edited, not a variable poisoning the CURRENT shell's own
+# environment (and everything it execs from here on, within this same
+# session, before any file is ever touched); PYSITE/IPYTHON_STARTUP cover
+# interpreter-startup FILES, never the env vars below.
+#
+# NODE_OPTIONS: Node.js parses this on every `node`/`npm`/`npx`/`yarn`
+# invocation; `--require`/`--experimental-loader`/`--loader`/`--import`
+# load an arbitrary module before the target script's first line runs.
+# BASH_ENV: bash sources this file for EVERY non-interactive invocation
+# (`bash script.sh`, `bash -c ...`, most CI runners' own shell steps).
+# ENV: POSIX sh/dash/ksh source this file for every interactive invocation.
+# PYTHONSTARTUP: CPython execs this file on every interactive REPL start.
+# PERL5OPT: implicitly prepended perl command-line flags (`-MModule`, `-e`)
+# on every `perl` invocation.
+# RUBYOPT: implicitly prepended ruby flags; `-r`/`--require` auto-loads a
+# module on every `ruby`/`irb`/`rake`/`bundle exec` invocation.
+# LD_PRELOAD (the env var, not the /etc file above): dlopen()'d into the
+# very next dynamically-linked ELF process this shell (or a child inheriting
+# the exported variable) execs.
+# GIT_SSH_COMMAND: replaces the command git invokes for EVERY ssh-transport
+# operation (fetch/push/pull/clone) from the moment it's set.
+#
+# BASH_ENV/ENV/PYTHONSTARTUP only do anything when their value is a real
+# FILE PATH -- a bare word with no path shape (`ENV=staging`, a common
+# deployment-environment-name convention with the same identifier) is inert
+# for this mechanism, so those three are gated on a path-shaped value only,
+# the same "value shape decides risk" split GIT_ATTRS_EXEC/GIT_CONFIG_EXEC's
+# own bang-value checks already use, to keep the ordinary `ENV=production
+# npm start` pattern from asking on every run. NODE_OPTIONS/RUBYOPT are
+# gated on a code-loading flag specifically (`--require`/`-r`/`--loader`/
+# `--import`) -- both variables have common, completely benign non-exec uses
+# (`NODE_OPTIONS=--max-old-space-size=4096`, `RUBYOPT=-W0`) that would
+# otherwise ask on nearly every CI run setting them. PERL5OPT/LD_PRELOAD/
+# GIT_SSH_COMMAND have no such benign non-exec use at all -- any non-empty
+# value is gated.
+_ENV_HIJACK_NAMES = (
+    r"NODE_OPTIONS|BASH_ENV|ENV|PYTHONSTARTUP|PERL5OPT|RUBYOPT|LD_PRELOAD|GIT_SSH_COMMAND"
+)
+# Bounded value token: a quoted string (no embedded newline) or a single
+# whitespace-free word -- mirrors every other guard's `\S+`/quoted-value
+# capture in this file, so it shares their same ReDoS-safety argument (no
+# nested unbounded quantifiers, linear in input length).
+_ENV_HIJACK_VALUE = r"(?:\"[^\"\n]{0,4000}\"|'[^'\n]{0,4000}'|\S+)"
+# `export FOO=bar`, `declare -x FOO=bar`, `env FOO=bar cmd`, or the bare
+# prefix-assignment form `FOO=bar cmd` -- all four look identical at the
+# point of the assignment itself (`\bFOO=value`), so one pattern with no
+# `export`/`declare`/`env` prefix requirement catches all of them at once;
+# `\b` before the name already rejects a longer identifier merely ending in
+# the same word (`MY_NODE_OPTIONS=x`, `SOMEBASH_ENV=x`) since both
+# characters either side stay word characters there. Case-sensitive by
+# design: real shells are case-sensitive for these exact names, and
+# case-sensitivity avoids flagging an unrelated lowercase variable that
+# happens to share a name in a different casing convention.
+ENV_HIJACK_ASSIGN_RE = re.compile(
+    r"\b(?:" + _ENV_HIJACK_NAMES + r")=" + _ENV_HIJACK_VALUE
+)
+_ENV_HIJACK_ASSIGN_CAPTURE_RE = re.compile(
+    r"\b(" + _ENV_HIJACK_NAMES + r")=(" + _ENV_HIJACK_VALUE + r")"
+)
+# PowerShell session-scoped assignment (`$env:NODE_OPTIONS = '...'`) --
+# Windows env var names are case-insensitive by convention, unlike POSIX.
+_ENV_HIJACK_PS_CAPTURE_RE = re.compile(
+    r"\$env:(" + _ENV_HIJACK_NAMES + r")\s*=\s*(" + _ENV_HIJACK_VALUE + r")",
+    re.IGNORECASE,
+)
+# `setx` -- the Windows cmd.exe verb that writes a PERSISTENT user/machine
+# env var (survives to every NEW process from then on, the closest Windows
+# analog to a POSIX shell-rc `export` landing in a dotfile).
+_ENV_HIJACK_SETX_CAPTURE_RE = re.compile(
+    r"\bsetx\s+(" + _ENV_HIJACK_NAMES + r")\s+(" + _ENV_HIJACK_VALUE + r")",
+    re.IGNORECASE,
+)
+
+_NODE_OPTIONS_RISKY_RE = re.compile(
+    r"--(?:require|experimental-loader|loader|import)\b|(?:^|\s)-r(?=\S)",
+    re.IGNORECASE,
+)
+# `-r` takes its module glued (`-rfoo`, the idiomatic ruby/perl-family form)
+# or space-separated (`-r foo`) -- `(?=\S)` accepts either, unlike a `\b`
+# check which misses the glued form (both `r` and the next letter are word
+# characters, so no boundary ever falls between them).
+_RUBYOPT_RISKY_RE = re.compile(r"--require\b|(?:^|\s)-r(?=\S)", re.IGNORECASE)
+# A real path: a separator, a leading `.`/`~` relative/home reference, or a
+# common interpreted-script extension -- excludes a bare deployment-
+# environment-name word like "staging"/"production" that carries no path
+# shape at all and so can't be sourced as a file by this mechanism.
+_ENV_HIJACK_PATHLIKE_RE = re.compile(
+    r"[/\\]|^[.~]|\.(?:sh|bash|zsh|ksh|py|pl|rb|ps1)$",
+    re.IGNORECASE,
+)
+
+
+def env_hijack_hit(text: str) -> Optional[str]:
+    """Return the hijacked env-var NAME if `text` assigns one of the
+    interpreter/tool auto-load env vars a code-loading value, else None.
+    Checked in a fixed order (POSIX assign, then PowerShell, then setx) --
+    order only matters for which single name is reported first when more
+    than one is set in the same text; every match is still found, since the
+    caller only needs to know THAT a hit exists, not enumerate all of them."""
+    for rx in (_ENV_HIJACK_ASSIGN_CAPTURE_RE, _ENV_HIJACK_PS_CAPTURE_RE,
+               _ENV_HIJACK_SETX_CAPTURE_RE):
+        for m in rx.finditer(text):
+            name = m.group(1).upper()
+            value = m.group(2).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if not value:
+                continue
+            if name == "NODE_OPTIONS":
+                if not _NODE_OPTIONS_RISKY_RE.search(value):
+                    continue
+            elif name == "RUBYOPT":
+                if not _RUBYOPT_RISKY_RE.search(value):
+                    continue
+            elif name in ("BASH_ENV", "ENV", "PYTHONSTARTUP"):
+                if not _ENV_HIJACK_PATHLIKE_RE.search(value):
+                    continue
+            return name
+    return None

@@ -227,6 +227,14 @@ class Policy:
     # /etc/ld.so.conf + /etc/ld.so.conf.d/*.conf (shared-library search-path
     # hijack). See rules.rule_ld_preload_protect.
     ld_preload: dict = field(default_factory=dict)
+    # Interpreter/tool auto-load environment-variable hijack protection:
+    # {mode: deny|ask|monitor|off, allow: [regex on command/content]}. Empty
+    # -> defaults (mode=ask) apply. Covers setting NODE_OPTIONS/BASH_ENV/ENV/
+    # PYTHONSTARTUP/PERL5OPT/RUBYOPT/LD_PRELOAD(env var)/GIT_SSH_COMMAND to a
+    # code-loading value -- each redirects a specific interpreter/tool's very
+    # next invocation to attacker-chosen code, with no config file, hook, or
+    # reboot needed. See rules.rule_env_hijack_protect.
+    env_hijack: dict = field(default_factory=dict)
     # Dev-container lifecycle-command protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers .devcontainer/devcontainer.json (+ .devcontainer/<name>/
