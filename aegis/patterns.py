@@ -4705,15 +4705,24 @@ def strip_comment_lines(text: str) -> str:
 # GIT_SSH_COMMAND: replaces the command git invokes for EVERY ssh-transport
 # operation (fetch/push/pull/clone) from the moment it's set.
 #
-# BASH_ENV/ENV/PYTHONSTARTUP only do anything when their value is a real
-# FILE PATH -- a bare word with no path shape (`ENV=staging`, a common
-# deployment-environment-name convention with the same identifier) is inert
-# for this mechanism, so those three are gated on a path-shaped value only,
-# the same "value shape decides risk" split GIT_ATTRS_EXEC/GIT_CONFIG_EXEC's
-# own bang-value checks already use, to keep the ordinary `ENV=production
-# npm start` pattern from asking on every run. NODE_OPTIONS/RUBYOPT are
-# gated on a code-loading flag specifically (`--require`/`-r`/`--loader`/
-# `--import`) -- both variables have common, completely benign non-exec uses
+# BASH_ENV/PYTHONSTARTUP gate on any non-empty value -- neither has a known
+# benign non-path convention, so there's no precision reason to filter
+# them. Bare `ENV` is the one exception: `ENV=staging`/`ENV=production` is
+# a common, genuinely benign deployment-environment-name convention
+# sharing this exact identifier, so bare `ENV` alone is gated on a
+# path-shaped value only (a separator, a leading `.`/`~`, or a common
+# script extension) -- the same "value shape decides risk" split
+# GIT_ATTRS_EXEC/GIT_CONFIG_EXEC's own bang-value checks already use.
+# QA (adversarial review): this necessarily leaves one disclosed residual
+# gap -- a bare relative filename with no separator/extension at all
+# (`ENV=evilrc`) is indistinguishable from the benign convention by shape
+# alone and is not caught for `ENV` specifically (BASH_ENV/PYTHONSTARTUP
+# have no such gap post-fix, since any non-empty value gates for them).
+# NODE_OPTIONS/RUBYOPT are gated on a code-loading flag instead:
+# NODE_OPTIONS on `--require`/`-r`/`--loader`/`--experimental-loader`/
+# `--import` (the full set of Node's own module-preload flags); RUBYOPT on
+# `--require`/`-r` only (ruby has no `--loader`/`--import` flag to begin
+# with). Both variables have common, completely benign non-exec uses
 # (`NODE_OPTIONS=--max-old-space-size=4096`, `RUBYOPT=-W0`) that would
 # otherwise ask on nearly every CI run setting them. PERL5OPT/LD_PRELOAD/
 # GIT_SSH_COMMAND have no such benign non-exec use at all -- any non-empty
@@ -4721,26 +4730,33 @@ def strip_comment_lines(text: str) -> str:
 _ENV_HIJACK_NAMES = (
     r"NODE_OPTIONS|BASH_ENV|ENV|PYTHONSTARTUP|PERL5OPT|RUBYOPT|LD_PRELOAD|GIT_SSH_COMMAND"
 )
-# Bounded value token: a quoted string (no embedded newline) or a single
-# whitespace-free word -- mirrors every other guard's `\S+`/quoted-value
-# capture in this file, so it shares their same ReDoS-safety argument (no
-# nested unbounded quantifiers, linear in input length).
-_ENV_HIJACK_VALUE = r"(?:\"[^\"\n]{0,4000}\"|'[^'\n]{0,4000}'|\S+)"
-# `export FOO=bar`, `declare -x FOO=bar`, `env FOO=bar cmd`, or the bare
-# prefix-assignment form `FOO=bar cmd` -- all four look identical at the
-# point of the assignment itself (`\bFOO=value`), so one pattern with no
-# `export`/`declare`/`env` prefix requirement catches all of them at once;
-# `\b` before the name already rejects a longer identifier merely ending in
-# the same word (`MY_NODE_OPTIONS=x`, `SOMEBASH_ENV=x`) since both
-# characters either side stay word characters there. Case-sensitive by
-# design: real shells are case-sensitive for these exact names, and
-# case-sensitivity avoids flagging an unrelated lowercase variable that
-# happens to share a name in a different casing convention.
-ENV_HIJACK_ASSIGN_RE = re.compile(
-    r"\b(?:" + _ENV_HIJACK_NAMES + r")=" + _ENV_HIJACK_VALUE
-)
+# Bounded value token: a quoted string (embedded newlines allowed -- a real,
+# syntactically valid multi-line double/single-quoted shell string, e.g.
+# `NODE_OPTIONS="--max-old-space-size=4096\n--require=/tmp/evil.js"`, still
+# takes effect at runtime; a shell/Node's own whitespace-based tokenizer
+# doesn't care that a newline sits inside the quotes, so neither should this
+# scan -- QA (adversarial review, confirmed bypass)) or a single
+# whitespace-free word. Still bounded ({0,4000}) and a single negated
+# character class, so the ReDoS argument is unchanged (linear in input
+# length) even with the `\n` exclusion dropped.
+_ENV_HIJACK_VALUE = r"(?:\"[^\"]{0,4000}\"|'[^']{0,4000}'|\S+)"
+# `export FOO=bar`, `declare -x FOO=bar`, `env FOO=bar cmd`, the bare
+# prefix-assignment form `FOO=bar cmd`, or bash's append form `FOO+=bar`
+# (keeps an already-exported variable exported while appending to its
+# value -- QA (adversarial review, confirmed bypass): a plain `NODE_OPTIONS=
+# --max-old-space-size=4096` followed by `NODE_OPTIONS+=" --require=/tmp/
+# evil.js"` is ordinary, unobfuscated bash with the risky literal present
+# verbatim, yet was invisible without `\+?` here) -- all five look
+# identical at the point of assignment itself (`\bFOO\+?=value`), so one
+# pattern with no `export`/`declare`/`env` prefix requirement catches all
+# of them at once; `\b` before the name already rejects a longer identifier
+# merely ending in the same word (`MY_NODE_OPTIONS=x`, `SOMEBASH_ENV=x`)
+# since both characters either side stay word characters there.
+# Case-sensitive by design: real shells are case-sensitive for these exact
+# names, and case-sensitivity avoids flagging an unrelated lowercase
+# variable that happens to share a name in a different casing convention.
 _ENV_HIJACK_ASSIGN_CAPTURE_RE = re.compile(
-    r"\b(" + _ENV_HIJACK_NAMES + r")=(" + _ENV_HIJACK_VALUE + r")"
+    r"\b(" + _ENV_HIJACK_NAMES + r")\+?=(" + _ENV_HIJACK_VALUE + r")"
 )
 # PowerShell session-scoped assignment (`$env:NODE_OPTIONS = '...'`) --
 # Windows env var names are case-insensitive by convention, unlike POSIX.
@@ -4755,6 +4771,24 @@ _ENV_HIJACK_SETX_CAPTURE_RE = re.compile(
     r"\bsetx\s+(" + _ENV_HIJACK_NAMES + r")\s+(" + _ENV_HIJACK_VALUE + r")",
     re.IGNORECASE,
 )
+# Dockerfile's legacy, still-current, space-separated instruction form --
+# `ENV <key> <value>` with NO `=` at all (distinct from, and in addition
+# to, `ENV <key>=<value>`, which the assignment pattern above already
+# matches via its own bare `\bNAME=value` shape regardless of the leading
+# `ENV` keyword). QA (adversarial review, confirmed bypass): the README's
+# own guard-table entry claims Dockerfile `ENV` coverage, but the original
+# assign-only pattern required a literal `=` and so missed this
+# perfectly-valid, still-current legacy form entirely. Anchored to a full
+# line (`^...$`, MULTILINE) so it only fires on an actual Dockerfile
+# instruction line, not an incidental "ENV NODE_OPTIONS ..." substring
+# inside unrelated prose; `(?i:env)` scopes case-insensitivity to the
+# keyword alone (Docker itself is instruction-case-insensitive) without
+# loosening the var-name alternation's own intentional case-sensitivity.
+_ENV_HIJACK_DOCKERFILE_CAPTURE_RE = re.compile(
+    r"^[ \t]*(?i:env)[ \t]+(" + _ENV_HIJACK_NAMES + r")[ \t]+("
+    + _ENV_HIJACK_VALUE + r")[ \t]*$",
+    re.MULTILINE,
+)
 
 _NODE_OPTIONS_RISKY_RE = re.compile(
     r"--(?:require|experimental-loader|loader|import)\b|(?:^|\s)-r(?=\S)",
@@ -4763,12 +4797,16 @@ _NODE_OPTIONS_RISKY_RE = re.compile(
 # `-r` takes its module glued (`-rfoo`, the idiomatic ruby/perl-family form)
 # or space-separated (`-r foo`) -- `(?=\S)` accepts either, unlike a `\b`
 # check which misses the glued form (both `r` and the next letter are word
-# characters, so no boundary ever falls between them).
+# characters, so no boundary ever falls between them). Ruby has no
+# `--loader`/`--experimental-loader`/`--import` flag (those are Node-only
+# ESM-loader flags gated on `NODE_OPTIONS` above), so RUBYOPT's own risky
+# set is `--require`/`-r` only.
 _RUBYOPT_RISKY_RE = re.compile(r"--require\b|(?:^|\s)-r(?=\S)", re.IGNORECASE)
 # A real path: a separator, a leading `.`/`~` relative/home reference, or a
 # common interpreted-script extension -- excludes a bare deployment-
 # environment-name word like "staging"/"production" that carries no path
-# shape at all and so can't be sourced as a file by this mechanism.
+# shape at all and so can't be sourced as a file by this mechanism. Applied
+# to bare `ENV` only (see the module-level comment above for why).
 _ENV_HIJACK_PATHLIKE_RE = re.compile(
     r"[/\\]|^[.~]|\.(?:sh|bash|zsh|ksh|py|pl|rb|ps1)$",
     re.IGNORECASE,
@@ -4778,12 +4816,13 @@ _ENV_HIJACK_PATHLIKE_RE = re.compile(
 def env_hijack_hit(text: str) -> Optional[str]:
     """Return the hijacked env-var NAME if `text` assigns one of the
     interpreter/tool auto-load env vars a code-loading value, else None.
-    Checked in a fixed order (POSIX assign, then PowerShell, then setx) --
-    order only matters for which single name is reported first when more
-    than one is set in the same text; every match is still found, since the
-    caller only needs to know THAT a hit exists, not enumerate all of them."""
+    Checked in a fixed order (POSIX assign, then PowerShell, then setx,
+    then the Dockerfile legacy form) -- order only matters for which single
+    name is reported first when more than one is set in the same text;
+    every match is still found, since the caller only needs to know THAT a
+    hit exists, not enumerate all of them."""
     for rx in (_ENV_HIJACK_ASSIGN_CAPTURE_RE, _ENV_HIJACK_PS_CAPTURE_RE,
-               _ENV_HIJACK_SETX_CAPTURE_RE):
+               _ENV_HIJACK_SETX_CAPTURE_RE, _ENV_HIJACK_DOCKERFILE_CAPTURE_RE):
         for m in rx.finditer(text):
             name = m.group(1).upper()
             value = m.group(2).strip()
@@ -4797,7 +4836,7 @@ def env_hijack_hit(text: str) -> Optional[str]:
             elif name == "RUBYOPT":
                 if not _RUBYOPT_RISKY_RE.search(value):
                     continue
-            elif name in ("BASH_ENV", "ENV", "PYTHONSTARTUP"):
+            elif name == "ENV":
                 if not _ENV_HIJACK_PATHLIKE_RE.search(value):
                     continue
             return name

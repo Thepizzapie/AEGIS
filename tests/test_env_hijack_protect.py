@@ -103,8 +103,13 @@ def test_pythonstartup_gated():
     assert _gated(d) and d.rule == "env-hijack-protect"
 
 
-def test_pythonstartup_bare_word_not_gated():
-    assert not _gated(evaluate(_shell("PYTHONSTARTUP=default python"), EMPTY))
+def test_pythonstartup_bare_word_gated():
+    """No path-shape filter for PYTHONSTARTUP (fixed post-QA, see the
+    bare-relative-filename regression tests below): any non-empty value
+    gates, since PYTHONSTARTUP has no equivalent benign bare-word
+    convention to protect against false positives for."""
+    d = evaluate(_shell("PYTHONSTARTUP=default python"), EMPTY)
+    assert _gated(d) and d.rule == "env-hijack-protect"
 
 
 # ---- PERL5OPT / RUBYOPT ---------------------------------------------------------
@@ -190,6 +195,64 @@ def test_mcp_tool_edits_shape_gated():
 
 def test_unrelated_write_not_gated():
     assert not _gated(evaluate(_write("README.md", content="# hello"), EMPTY))
+
+
+# ---- QA regressions: adversarial-review bypasses, now fixed ------------------------
+
+def test_append_assignment_form_gated():
+    """`FOO+=value` keeps an already-exported variable exported while
+    appending — an ordinary bash idiom, not an indirection trick. QA
+    (adversarial review, confirmed bypass): the original `\\bNAME=value`
+    -only pattern never matched the `+=` operator at all."""
+    d = evaluate(_shell(
+        'export NODE_OPTIONS=--max-old-space-size=4096\n'
+        'NODE_OPTIONS+=" --require=/tmp/evil.js"\n'
+        'node app.js'), EMPTY)
+    assert _gated(d) and d.rule == "env-hijack-protect"
+
+
+def test_multiline_quoted_value_gated():
+    """A real, syntactically valid multi-line double-quoted shell string —
+    Node's own whitespace tokenizer doesn't care the risky flag sits after
+    an embedded newline. QA (adversarial review, confirmed bypass): the
+    value capture's `\\n` exclusion silently truncated the match before
+    the risky flag."""
+    d = evaluate(_shell(
+        'export NODE_OPTIONS="--max-old-space-size=4096\n--require=/tmp/evil.js"\n'
+        'node app.js'), EMPTY)
+    assert _gated(d) and d.rule == "env-hijack-protect"
+
+
+def test_dockerfile_legacy_space_form_gated():
+    """Dockerfile's legacy, still-current `ENV <key> <value>` form (no
+    `=` at all) — distinct from `ENV <key>=<value>`. QA (adversarial
+    review, confirmed bypass): the assign-only pattern required a literal
+    `=`, so this form sailed through despite the guard's own docstring
+    claiming Dockerfile ENV coverage."""
+    d = evaluate(_write("Dockerfile", content="ENV NODE_OPTIONS --require=/app/evil.js\n"), EMPTY)
+    assert _gated(d) and d.rule == "env-hijack-protect"
+
+
+def test_bash_env_bare_relative_filename_gated():
+    """QA (adversarial review, confirmed bypass): BASH_ENV/PYTHONSTARTUP
+    pass their value straight to an open()-equivalent call with no path
+    separator required at all — a bare relative filename is a fully
+    viable attack, not just a benign bare-word convention."""
+    d = evaluate(_shell("export BASH_ENV=evilrc"), EMPTY)
+    assert _gated(d) and d.rule == "env-hijack-protect"
+
+
+def test_pythonstartup_bare_relative_filename_gated():
+    d = evaluate(_shell("export PYTHONSTARTUP=evilstartup"), EMPTY)
+    assert _gated(d) and d.rule == "env-hijack-protect"
+
+
+def test_env_bare_relative_filename_disclosed_gap_not_gated():
+    """Bare `ENV` keeps the path-shape filter (unlike BASH_ENV/
+    PYTHONSTARTUP) because `ENV=staging`-style deployment-environment
+    names are a common, genuinely benign convention sharing this exact
+    identifier — a disclosed, accepted residual gap, not a regression."""
+    assert not _gated(evaluate(_shell("export ENV=evilrc"), EMPTY))
 
 
 # ---- false-positive guards --------------------------------------------------------
@@ -301,3 +364,24 @@ def test_engine_no_quadratic_blowup():
     evaluate(_shell(cmd), EMPTY)
     elapsed = time.time() - start
     assert elapsed < 1.0, f"rule_env_hijack_protect took {elapsed:.2f}s on adversarial input"
+
+
+def test_unclosed_quote_no_quadratic_blowup():
+    """The quoted-value alternative now allows embedded newlines (fix for
+    the multi-line-quoted-value bypass above) — confirm an unclosed quote
+    followed by a huge run of text still stays linear."""
+    from aegis import patterns
+    adversarial = 'export NODE_OPTIONS="' + ("x" * 200000)
+    start = time.time()
+    patterns.env_hijack_hit(adversarial)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"env_hijack_hit took {elapsed:.2f}s on an unclosed-quote adversarial input"
+
+
+def test_dockerfile_pattern_no_quadratic_blowup():
+    from aegis import patterns
+    adversarial = "ENV NODE_OPTIONS x\n" * 20000
+    start = time.time()
+    patterns.env_hijack_hit(adversarial)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"env_hijack_hit took {elapsed:.2f}s on adversarial Dockerfile-form input"

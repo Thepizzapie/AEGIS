@@ -6825,19 +6825,22 @@ def rule_env_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
     steps) — it just needs a human to have actually looked at it.
 
     Value-shape filtering keeps that ``ask`` from firing on the common
-    benign case: ``BASH_ENV``/``ENV``/``PYTHONSTARTUP`` only gate when the
-    value is actually path-shaped (contains a path separator, a leading
-    ``.``/``~``, or a common script extension) — a bare word with no path
-    shape (``ENV=staging``, a common deployment-environment-name
-    convention sharing this exact identifier) can't be sourced as a file by
-    this mechanism at all, so it's inert and excluded; ``NODE_OPTIONS``/
-    ``RUBYOPT`` only gate when the value actually carries a code-loading
-    flag (``--require``/``-r``/``--loader``/``--experimental-loader``/
-    ``--import``) — both have common flag-only uses
-    (``NODE_OPTIONS=--max-old-space-size=4096``, ``RUBYOPT=-W0``) that
-    carry no code-loading risk at all. ``PERL5OPT``/``LD_PRELOAD``/
-    ``GIT_SSH_COMMAND`` have no such benign non-exec use, so any non-empty
-    value gates.
+    benign case: bare ``ENV`` only gates when the value is actually
+    path-shaped (contains a path separator, a leading ``.``/``~``, or a
+    common script extension) — a bare word with no path shape
+    (``ENV=staging``, a common deployment-environment-name convention
+    sharing this exact identifier) can't be reliably distinguished from a
+    real target file by shape alone, so it's excluded (see Honest scope
+    below for the residual gap this trades away); ``BASH_ENV``/
+    ``PYTHONSTARTUP`` have no equivalent benign bare-word convention, so
+    any non-empty value gates for them. ``NODE_OPTIONS`` gates on
+    ``--require``/``-r``/``--loader``/``--experimental-loader``/``--import``
+    (Node's own module-preload flags); ``RUBYOPT`` gates on ``--require``/
+    ``-r`` only (ruby has no ``--loader``/``--import`` flag to begin with)
+    — both have common flag-only uses (``NODE_OPTIONS=--max-old-space-
+    size=4096``, ``RUBYOPT=-W0``) that carry no code-loading risk at all.
+    ``PERL5OPT``/``LD_PRELOAD``/``GIT_SSH_COMMAND`` have no such benign
+    non-exec use, so any non-empty value gates.
 
     Escapable only by a human: a trailing ``# aegis-allow`` on the shell
     form, or the env toggle ``AEGIS_ALLOW_ENV_HIJACK=1`` set by the
@@ -6851,9 +6854,10 @@ def rule_env_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
     export) rather than appearing as one contiguous literal in the scanned
     text is not caught; the Edit/Write/MCP branch scans written CONTENT for
     the same assignment shape (catching it landing in a CI workflow step, a
-    Dockerfile ``ENV`` instruction, or a shell script about to be run) but,
-    like ``rule_git_config_exec_protect``'s own content branch, is not
-    scoped to any particular file path — an unrelated file merely
+    Dockerfile ``ENV`` instruction — both the ``KEY=value`` and the legacy
+    space-separated ``ENV KEY value`` forms — or a shell script about to be
+    run) but, like ``rule_git_config_exec_protect``'s own content branch, is
+    not scoped to any particular file path — an unrelated file merely
     mentioning one of these assignments in a comment or doc string gates
     the same as a real one, the same "false positives are the safe
     direction" trade-off those guards already take; a value that RELOCATES
@@ -6862,12 +6866,64 @@ def rule_env_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
     path-shaped (it contains ``$``/no separator before expansion) only if
     the literal text itself already looks like a path — this guard has no
     shell-expansion awareness, the same "computed indirectly" class every
-    guard in this file already accepts; and, unlike a persistent shell-rc
-    or service-unit write, an ``ALLOW``ed (ungated) assignment here still
+    guard in this file already accepts; a bare relative filename with no
+    separator or recognized extension at all (``ENV=evilrc``) is
+    indistinguishable, by shape alone, from the benign bare-word
+    deployment-environment-name convention ``ENV`` alone is filtered for,
+    and so is not caught for ``ENV`` specifically — an accepted,
+    disclosed precision/recall trade-off, not present for ``BASH_ENV``/
+    ``PYTHONSTARTUP`` (any non-empty value gates for those two, closing
+    the identical gap there); and, unlike a persistent shell-rc or
+    service-unit write, an ``ALLOW``ed (ungated) assignment here still
     only affects the current process tree going forward — this guard's own
     disclosed value-shape filters are a precision/noise trade-off, not a
     claim of exhaustive coverage of every conceivable code-loading value
-    shape a determined attacker could construct."""
+    shape a determined attacker could construct.
+
+    QA history (two independent adversarial reviews, run in parallel):
+    design/consistency review round-tripped a real YAML ``env_hijack:``
+    block through ``load_policy()`` into a live ``evaluate()`` decision,
+    confirmed wiring in ``_CORE_RULES``/``Policy``/all three ``loader.py``
+    spots/both ``skills.py`` knob lists/the README guard table and its
+    Limits-section disclosure, traced structural parity against
+    ``rule_ld_preload_protect``/``rule_git_config_exec_protect`` (mode/
+    monitor/off handling incl. the YAML-boolean ``False`` case, the
+    allow-regex escape hatch, the agent-proof escape hatches), and
+    confirmed the full suite green — then flagged this docstring
+    misattributing ``RUBYOPT``'s risky-flag set to include Node-only
+    ``--loader``/``--experimental-loader``/``--import`` (fixed above) and
+    an unused, never-referenced public ``ENV_HIJACK_ASSIGN_RE`` constant
+    left over from an earlier draft (removed — ``patterns.py`` now exposes
+    only the capture-group variants ``env_hijack_hit`` itself uses).
+    Bypass-hunting review reproduced four real, since-fixed gaps, each
+    confirmed by direct execution before being reported: bash's ``FOO+=``
+    append-assignment form (keeps an already-exported variable exported
+    while appending to its value — an ordinary, unobfuscated single-line
+    idiom, not an indirection trick) was invisible to the original
+    ``\\bNAME=value``-only pattern, fixed by allowing an optional ``+``
+    before the ``=``; a real, syntactically valid multi-line double/single-
+    quoted shell string (the value's ``\\n`` exclusion, originally kept for
+    consistency with sibling guards' single-line value captures) silently
+    truncated the captured value at the embedded newline, hiding a risky
+    flag on a later line of the same quoted string even though the
+    shell's/Node's own whitespace-based tokenizer does not care that a
+    newline sits inside the quotes — fixed by dropping the ``\\n``
+    exclusion (still bounded, so the ReDoS argument is unchanged); the
+    Edit/Write/MCP content branch's own docstring claimed Dockerfile
+    ``ENV`` coverage but the assign-only pattern required a literal ``=``,
+    missing Dockerfile's still-current, legacy space-separated ``ENV <key>
+    <value>`` instruction form entirely — fixed by adding a dedicated,
+    line-anchored pattern for it; and a bare relative filename with no
+    path shape at all (``PYTHONSTARTUP=evilstartup``, ``BASH_ENV=evilrc``)
+    bypassed the original three-variable path-shape filter even though
+    both variables pass such a value straight to an ``open()``-equivalent
+    call with no path requirement — fixed by dropping the path-shape
+    filter for ``BASH_ENV``/``PYTHONSTARTUP`` entirely (any non-empty value
+    now gates for both) and keeping it only for bare ``ENV``, where the
+    benign bare-word convention is common enough that the residual gap
+    (disclosed above) was judged the better trade-off. No exploitable
+    ReDoS and no new false-positive pattern were found in either review
+    beyond the trade-offs already disclosed above."""
     cfg = getattr(policy, "env_hijack", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
