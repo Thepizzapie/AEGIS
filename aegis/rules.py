@@ -355,15 +355,24 @@ def rule_aegis_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     The Edit/Write/MCP branch additionally requires the target path to look
     like something that actually gets loaded into a process environment
     (``patterns.env_carrier_path_hit()`` — a ``.env``, a Dockerfile, a
-    ``.yml``/``.yaml``, a shell/wrapper script) before scanning content at
-    all. QA round 1 (independent adversarial review) found an earlier,
-    path-unrestricted draft hard-denied ORDINARY DOCUMENTATION — a README or
-    troubleshooting doc showing ``AEGIS_PLUGINS=my_org.rules`` as an example,
-    or a bulleted ``AEGIS_HOME: relocates the audit log`` description — with
-    no escape hatch at all, since this guard has none by design. The shell
-    branch has no such path restriction (a shell command is inherently
-    active, not documentation — the same reasoning containment/self-protect
-    already apply to their own unconditional shell scans).
+    ``Procfile``, a ``.yml``/``.yaml``, a shell/wrapper script, OR a shell
+    startup/profile dotfile) before scanning content at all. QA round 1
+    (independent adversarial review) found an earlier, path-unrestricted
+    draft hard-denied ORDINARY DOCUMENTATION — a README or troubleshooting
+    doc showing ``AEGIS_PLUGINS=my_org.rules`` as an example, or a bulleted
+    ``AEGIS_HOME: relocates the audit log`` description — with no escape
+    hatch at all, since this guard has none by design. QA round 3
+    (independent verification of the round-1/round-2 fixes) then found that
+    fix itself had silently DROPPED coverage for a shell startup/profile
+    dotfile (``~/.bashrc``, ``~/.zshrc``, a PowerShell ``$PROFILE``, ...) —
+    no recognized extension, so it fell through to
+    ``rule_shell_persist_protect``'s own human-approvable ``ASK``, a real
+    downgrade of a guard whose whole point is having no escape hatch.
+    ``env_carrier_path_hit()`` now also matches ``patterns.SHELL_RC_PATH_RE``
+    to close that. The shell branch has no path restriction at all (a shell
+    command is inherently active, not documentation — the same reasoning
+    containment/self-protect already apply to their own unconditional shell
+    scans).
 
     Known gaps, disclosed rather than silently accepted: a value assembled
     indirectly (shell variable concatenation, a templating step, a value

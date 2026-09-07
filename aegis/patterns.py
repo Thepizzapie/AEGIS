@@ -275,15 +275,31 @@ AEGIS_ENV_BYPASS_RE = re.compile(
 # positive on documentation). `.env`/`.env.local`/etc. (but not a
 # `.env.example`/`.env.sample`/`.env.template`/`.env.dist` — a template
 # file's whole point is to be copied and hand-edited, never loaded as-is, so
-# it's documentation in every sense that matters here), `Dockerfile`, any
-# `.yml`/`.yaml` (docker-compose, a k8s/Helm manifest, a CI config not
+# it's documentation in every sense that matters here), `Dockerfile`,
+# `Procfile` (Heroku/foreman's own `KEY=value`-per-line process/env config),
+# any `.yml`/`.yaml` (docker-compose, a k8s/Helm manifest, a CI config not
 # already covered by rule_ci_workflow_protect), and common shell/wrapper
 # script extensions.
+#
+# QA round 3 (independent verification pass, run after the round-1/round-2
+# fixes above) diffed this guard's behavior against its own pre-fix version
+# and found the carrier-path gate — necessary to close the round-1 doc false
+# positive — had silently DROPPED coverage the old, path-unrestricted version
+# had for one real, common, high-severity carrier: a shell startup/profile
+# dotfile (`~/.bashrc`, `~/.zshrc`, `~/.profile`, a PowerShell `$PROFILE`,
+# ...) has no extension this list's suffix checks recognize at all, so
+# planting the exact same assignment there silently fell through to
+# `rule_shell_persist_protect`'s own `ASK` — a HUMAN-APPROVABLE downgrade of
+# a guard whose entire design point, called out in its own docstring, is
+# having no escape hatch whatsoever. Reusing `SHELL_RC_PATH_RE` (below in
+# this file) rather than re-deriving the same filename list closes it without
+# duplicating that guard's own maintenance surface.
 _ENV_TEMPLATE_SUFFIX_RE = re.compile(
     r"\.env\.(?:example|sample|template|dist)$", re.IGNORECASE)
 AEGIS_ENV_CARRIER_PATH_RE = re.compile(
     r"(?:^|[/\\])\.env(?:\.[\w-]+)?$"
     r"|(?:^|[/\\])Dockerfile(?:\.[\w.-]+)?$"
+    r"|(?:^|[/\\])Procfile$"
     r"|\.ya?ml$"
     r"|\.(?:sh|bash|zsh|fish|ps1|psm1|bat|cmd)$",
     re.IGNORECASE,
@@ -294,12 +310,17 @@ def env_carrier_path_hit(path: str) -> bool:
     """True if ``path`` looks like a file something actually loads into the
     process environment, as opposed to documentation ABOUT one of these
     variables. See AEGIS_ENV_CARRIER_PATH_RE's own comment for the exact
-    shapes covered and why a template file is excluded."""
+    shapes covered and why a template file is excluded. Also true for a shell
+    startup/profile file (``SHELL_RC_PATH_RE``, defined later in this file) —
+    kept as a separate OR rather than folded into the regex above so this
+    function stays readable despite depending on a pattern declared below it
+    (a forward reference resolved at call time, not import time — safe in
+    Python, and this module has no import-order guard preventing it)."""
     if not path:
         return False
     if _ENV_TEMPLATE_SUFFIX_RE.search(path):
         return False
-    return bool(AEGIS_ENV_CARRIER_PATH_RE.search(path))
+    return bool(AEGIS_ENV_CARRIER_PATH_RE.search(path) or SHELL_RC_PATH_RE.search(path))
 
 # any move/delete verb (used together with ENFORCEMENT_PATH_RE on shell commands)
 DELETE_OR_MOVE_VERB_RE = re.compile(

@@ -299,6 +299,25 @@ def test_still_blocks_real_carrier_paths_despite_carrier_gate():
     assert evaluate(_write("run.ps1", '$env:AEGIS_PLUGINS = "x"\n'), EMPTY).blocked
 
 
+# ---- QA round 3 (independent verification pass): the carrier-path fix
+# itself silently dropped coverage for shell rc/profile dotfiles -----------
+def test_carrier_gate_still_covers_shell_profile_dotfiles():
+    # a shell startup/profile file has no extension the original carrier
+    # list recognized, so it fell through to shell-persist-protect's own
+    # human-APPROVABLE `ASK` — a real downgrade of a guard advertised as
+    # having no escape hatch at all. Must be a hard `aegis-env-protect` DENY,
+    # not merely `.blocked` (which an ASK also satisfies).
+    for path in (".bashrc", ".bash_profile", ".profile", ".zshrc", ".cshrc",
+                 "Microsoft.PowerShell_profile.ps1"):
+        d = evaluate(_write(path, "export AEGIS_PLUGINS=/tmp/evil.py\n"), EMPTY)
+        assert _gated(d) and d.rule == "aegis-env-protect", path
+
+
+def test_carrier_gate_covers_procfile():
+    d = evaluate(_write("Procfile", "web: AEGIS_PLUGINS=/tmp/evil.py bundle exec puma\n"), EMPTY)
+    assert _gated(d) and d.rule == "aegis-env-protect"
+
+
 def test_no_catastrophic_backtracking():
     """Every content-scanning regex in this file has had at least one ReDoS
     round (see AEGIS_SOURCE_RE's / EXFIL_RE's own comments) — checked here at
