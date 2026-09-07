@@ -172,20 +172,38 @@ AEGIS_SKILL_PATH_RE = re.compile(
     re.IGNORECASE)
 
 # Aegis's own trust-boundary env vars — read by aegis.config/aegis.engine/
-# aegis.plugins directly, before any policy rule ever runs, so setting one
-# touches no path ENFORCEMENT_PATH_RE/CONFIG_DIR_RE/AEGIS_SOURCE_RE above
-# recognize at all, yet each is a full or partial bypass of the enforcement
-# engine ITSELF — see rule_aegis_env_protect's own docstring in rules.py for
-# what each of the five actually does once set. Content-gated (not
-# path-gated) like CLAUDE_HOOKS_KEY_RE/PACKAGE manifest patterns below: the
-# dangerous content can land in a project `.env` (loaded by docker-compose /
-# python-dotenv / direnv's own dotenv feature — a file no other guard in this
-# file protects at all), a Dockerfile `ENV` line, `docker-compose.yml`'s
-# `environment:` block, a plain shell `export`/`set`/`setx`/PowerShell
-# `$env:`, or a wrapper script — one fixed path regex could never cover that
-# spread the way ENFORCEMENT_PATH_RE covers a single conventional file.
+# aegis.plugins/aegis.rules._confine_root/aegis.lifecycle._common.confine_root
+# directly, before any policy rule ever runs, so setting one touches no path
+# ENFORCEMENT_PATH_RE/CONFIG_DIR_RE/AEGIS_SOURCE_RE above recognize at all,
+# yet each is a full or partial bypass of the enforcement engine ITSELF — see
+# rule_aegis_env_protect's own docstring in rules.py for what each of the
+# seven actually does once set (the last two, AEGIS_PROJECT/AEGIS_WORKSPACE,
+# added in QA round 2 after independent review found rule_workspace_confine —
+# the OTHER never-escapable guard in this file — reads AEGIS_PROJECT ABOVE
+# policy.workspace.root in its own precedence order, the identical
+# engine-reads-env-before-any-rule-runs shape this guard exists to close).
 #
-# Four assignment shapes, one alternation:
+# Content-gated (not path-gated *for the var-name match itself*) like
+# CLAUDE_HOOKS_KEY_RE/package-manifest patterns below: the dangerous content
+# can land in a project `.env` (loaded by docker-compose / python-dotenv /
+# direnv's own dotenv feature), a Dockerfile `ENV` line, `docker-compose.yml`/
+# a k8s manifest's `environment:`/`env:` block, a plain shell `export`/`set`/
+# `setx`/`setenv`/PowerShell `$env:`, or a wrapper script — one fixed path
+# regex could never cover that spread the way ENFORCEMENT_PATH_RE covers a
+# single conventional file. The Edit/Write/MCP branch in rules.py DOES pair
+# this with a path check (`env_carrier_path_hit()` below) before scanning
+# content at all — QA round 1 (independent adversarial review) found an
+# earlier, path-unrestricted draft hard-denied ordinary documentation (a
+# README/troubleshooting doc showing `AEGIS_PLUGINS=my_org.rules` as an
+# example, or a bulleted `AEGIS_HOME: ...` description) with NO escape hatch
+# at all, since this guard is never-escapable by design. Restricting the
+# Edit/Write/MCP branch to files something actually LOADS into a process
+# environment closes that false positive without reopening the real vector;
+# the shell branch has no such restriction (a shell command is inherently
+# active, not documentation, the same reasoning containment/self-protect
+# already apply to their own unconditional shell scans).
+#
+# Assignment shapes, one alternation:
 #   1. bare `KEY=value` / `KEY = value` — covers POSIX shell `export`/`FOO=x
 #      cmd`, a `.env` line, cmd.exe `set FOO=x`, PowerShell `$env:FOO = "x"`
 #      (the space-then-`=` is still `\s*=`), and a compose/CI list-style
@@ -193,23 +211,95 @@ AEGIS_SKILL_PATH_RE = re.compile(
 #   2. Dockerfile `ENV KEY value` (no `=` required — that instruction's own
 #      two-token form).
 #   3. `setx KEY value` (Windows persistent-env-var CLI — no `=` at all).
-#   4. YAML mapping form (`docker-compose.yml`'s `environment:` block, a k8s
-#      manifest's `env:` list once flattened) — `KEY: value` anchored to the
-#      start of a line (optionally after a list-item `- `) so ordinary prose
-#      that merely mentions one of these names followed by a colon elsewhere
-#      mid-line doesn't also match.
+#   4. YAML mapping form (`docker-compose.yml`'s `environment:` block) —
+#      `KEY: value` anchored to the start of a line (optionally after a
+#      list-item `- `) so ordinary prose that merely mentions one of these
+#      names followed by a colon elsewhere mid-line doesn't also match.
+#   5. bare `export KEY` / csh-tcsh `setenv KEY value` — QA round 1
+#      (independent adversarial review) found `setenv AEGIS_PLUGINS
+#      /tmp/evil.py` (no `=` at all — csh/tcsh's own two-token form, the
+#      Dockerfile-`ENV` shape one shell family over) and a bare `export
+#      AEGIS_PLUGINS` re-exporting a name already assigned some other way
+#      both sailed through alternative 1 untouched.
+#   6. fish shell `set -x`/`set -Ux KEY value` — same QA round, a shell
+#      family with neither `=` nor a recognizable single verb-plus-name pair
+#      shape; requires at least one `-flag` between `set` and the name so an
+#      ordinary sentence ("how do we set AEGIS_PLUGINS") doesn't also match.
+#   7. `printf -v KEY value` (bash/ksh builtin var assignment, no `=`) — QA
+#      round 1 found `printf -v AEGIS_PLUGINS "%s" /tmp/evil.py; export
+#      AEGIS_PLUGINS` (the bare-export alt above then covers the second half)
+#      set the variable with zero hits against the original four alts.
+#   8. Kubernetes/Helm manifest's split `name:`/`value:` env-entry pair
+#      (`env:\n  - name: AEGIS_PLUGINS\n    value: /opt/evil.py`, or the
+#      flow-mapping `{name: AEGIS_PLUGINS, value: /opt/evil.py}` one-liner) —
+#      QA round 1 found this, arguably the single most common way a
+#      containerized agent's own deployment manifest sets an env var, matched
+#      none of the four original alts (neither `=` nor a same-line `KEY:`
+#      pair). Bounded lazy `[\s\S]{0,60}?` between the two keys (not an
+#      unbounded gap) keeps this from ever backtracking pathologically.
+#
 # A bare mention with no assignment syntax at all (a `grep`, a doc sentence,
-# `os.environ.get("AEGIS_PLUGINS")`) matches none of the four — deliberately
-# no separate "mention only" carve-out beyond that, the same trade-off
+# `os.environ.get("AEGIS_PLUGINS")`, `os.environ["AEGIS_PLUGINS"] = x` —
+# the closing bracket/quote breaks every alternative's adjacency requirement)
+# matches none of the above — deliberately no separate "mention only"
+# carve-out beyond that plus the path restriction above, the same trade-off
 # CONFIG_DIR_RE/AEGIS_SOURCE_RE already make for this severity tier: a false
-# positive is the safe direction for a guard with no escape hatch at all.
+# positive on a genuine env-carrying file is the safe direction for a guard
+# with no escape hatch at all.
+#
+# Known, disclosed gap shared with every other literal-substring shell guard
+# in this file (see rule_direnv_protect's own docstring for the fullest
+# writeup of this class): a bare backslash before an ordinary character is
+# removed by bash at parse time (`AEGIS_PLU\GINS=x` IS `AEGIS_PLUGINS=x`) but
+# `normalize.scan_surface` only strips quote characters and ANSI-C escapes,
+# never a bare mid-token backslash — QA round 1 confirmed this evades every
+# alternative here exactly the same way it already evades shell-persist's
+# `~/.ba\shrc`. A real fix belongs in the shared de-obfuscation layer, not
+# duplicated per-guard.
+_AEGIS_ENV_VARS = r"AEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT|PROJECT|WORKSPACE)"
 AEGIS_ENV_BYPASS_RE = re.compile(
-    r"\bAEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b\s*="
-    r"|\bENV\s+AEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b"
-    r"|\bsetx\b[^\r\n]*?\bAEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b"
-    r"|(?:^|\n)[ \t]*-?[ \t]*AEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b[ \t]*:[ \t]*\S",
+    r"\b" + _AEGIS_ENV_VARS + r"\b\s*="
+    r"|\bENV\s+" + _AEGIS_ENV_VARS + r"\b"
+    r"|\bsetx\b[^\r\n]*?\b" + _AEGIS_ENV_VARS + r"\b"
+    r"|(?:^|\n)[ \t]*-?[ \t]*" + _AEGIS_ENV_VARS + r"\b[ \t]*:[ \t]*\S"
+    r"|\b(?:export|setenv)\s+" + _AEGIS_ENV_VARS + r"\b"
+    r"|\bset\s+(?:-[a-zA-Z]+\s+)+" + _AEGIS_ENV_VARS + r"\b"
+    r"|\bprintf\s+-v\s+" + _AEGIS_ENV_VARS + r"\b"
+    r"|\bname\s*:\s*" + _AEGIS_ENV_VARS + r"\b[\s\S]{0,60}?\bvalue\s*:\s*\S",
     re.IGNORECASE,
 )
+
+# The Edit/Write/MCP branch of rule_aegis_env_protect only scans content for a
+# path that looks like something actually LOADS into a process environment —
+# see AEGIS_ENV_BYPASS_RE's own comment above for why (QA round 1 false
+# positive on documentation). `.env`/`.env.local`/etc. (but not a
+# `.env.example`/`.env.sample`/`.env.template`/`.env.dist` — a template
+# file's whole point is to be copied and hand-edited, never loaded as-is, so
+# it's documentation in every sense that matters here), `Dockerfile`, any
+# `.yml`/`.yaml` (docker-compose, a k8s/Helm manifest, a CI config not
+# already covered by rule_ci_workflow_protect), and common shell/wrapper
+# script extensions.
+_ENV_TEMPLATE_SUFFIX_RE = re.compile(
+    r"\.env\.(?:example|sample|template|dist)$", re.IGNORECASE)
+AEGIS_ENV_CARRIER_PATH_RE = re.compile(
+    r"(?:^|[/\\])\.env(?:\.[\w-]+)?$"
+    r"|(?:^|[/\\])Dockerfile(?:\.[\w.-]+)?$"
+    r"|\.ya?ml$"
+    r"|\.(?:sh|bash|zsh|fish|ps1|psm1|bat|cmd)$",
+    re.IGNORECASE,
+)
+
+
+def env_carrier_path_hit(path: str) -> bool:
+    """True if ``path`` looks like a file something actually loads into the
+    process environment, as opposed to documentation ABOUT one of these
+    variables. See AEGIS_ENV_CARRIER_PATH_RE's own comment for the exact
+    shapes covered and why a template file is excluded."""
+    if not path:
+        return False
+    if _ENV_TEMPLATE_SUFFIX_RE.search(path):
+        return False
+    return bool(AEGIS_ENV_CARRIER_PATH_RE.search(path))
 
 # any move/delete verb (used together with ENFORCEMENT_PATH_RE on shell commands)
 DELETE_OR_MOVE_VERB_RE = re.compile(
