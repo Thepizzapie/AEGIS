@@ -170,6 +170,47 @@ AEGIS_SOURCE_RE = re.compile(
 AEGIS_SKILL_PATH_RE = re.compile(
     r"\.claude" + _WIN_TRIM + _SEP + r"skills" + _WIN_TRIM + _SEP + r"aegis-[\w-]+",
     re.IGNORECASE)
+
+# Aegis's own trust-boundary env vars — read by aegis.config/aegis.engine/
+# aegis.plugins directly, before any policy rule ever runs, so setting one
+# touches no path ENFORCEMENT_PATH_RE/CONFIG_DIR_RE/AEGIS_SOURCE_RE above
+# recognize at all, yet each is a full or partial bypass of the enforcement
+# engine ITSELF — see rule_aegis_env_protect's own docstring in rules.py for
+# what each of the five actually does once set. Content-gated (not
+# path-gated) like CLAUDE_HOOKS_KEY_RE/PACKAGE manifest patterns below: the
+# dangerous content can land in a project `.env` (loaded by docker-compose /
+# python-dotenv / direnv's own dotenv feature — a file no other guard in this
+# file protects at all), a Dockerfile `ENV` line, `docker-compose.yml`'s
+# `environment:` block, a plain shell `export`/`set`/`setx`/PowerShell
+# `$env:`, or a wrapper script — one fixed path regex could never cover that
+# spread the way ENFORCEMENT_PATH_RE covers a single conventional file.
+#
+# Four assignment shapes, one alternation:
+#   1. bare `KEY=value` / `KEY = value` — covers POSIX shell `export`/`FOO=x
+#      cmd`, a `.env` line, cmd.exe `set FOO=x`, PowerShell `$env:FOO = "x"`
+#      (the space-then-`=` is still `\s*=`), and a compose/CI list-style
+#      `- FOO=x` entry — one shape, five surfaces.
+#   2. Dockerfile `ENV KEY value` (no `=` required — that instruction's own
+#      two-token form).
+#   3. `setx KEY value` (Windows persistent-env-var CLI — no `=` at all).
+#   4. YAML mapping form (`docker-compose.yml`'s `environment:` block, a k8s
+#      manifest's `env:` list once flattened) — `KEY: value` anchored to the
+#      start of a line (optionally after a list-item `- `) so ordinary prose
+#      that merely mentions one of these names followed by a colon elsewhere
+#      mid-line doesn't also match.
+# A bare mention with no assignment syntax at all (a `grep`, a doc sentence,
+# `os.environ.get("AEGIS_PLUGINS")`) matches none of the four — deliberately
+# no separate "mention only" carve-out beyond that, the same trade-off
+# CONFIG_DIR_RE/AEGIS_SOURCE_RE already make for this severity tier: a false
+# positive is the safe direction for a guard with no escape hatch at all.
+AEGIS_ENV_BYPASS_RE = re.compile(
+    r"\bAEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b\s*="
+    r"|\bENV\s+AEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b"
+    r"|\bsetx\b[^\r\n]*?\bAEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b"
+    r"|(?:^|\n)[ \t]*-?[ \t]*AEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT)\b[ \t]*:[ \t]*\S",
+    re.IGNORECASE,
+)
+
 # any move/delete verb (used together with ENFORCEMENT_PATH_RE on shell commands)
 DELETE_OR_MOVE_VERB_RE = re.compile(
     r"\b(?:rm|remove-item|ri|rmdir|rd|del|erase|mv|move-item|move|ren|rename-item)\b",

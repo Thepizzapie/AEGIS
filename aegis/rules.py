@@ -265,6 +265,108 @@ def rule_self_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- Aegis's own trust-boundary env vars: never escapable --------------------
+def rule_aegis_env_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block setting any of Aegis's five trust-boundary environment
+    variables — ``AEGIS_NO_BUILTINS``, ``AEGIS_PLUGINS``, ``AEGIS_POLICIES``,
+    ``AEGIS_HOME``, ``AEGIS_AUDIT`` — from a shell command, or by planting the
+    assignment in a file (a project ``.env``, a Dockerfile ``ENV`` line, a
+    ``docker-compose.yml``/CI ``environment:`` block, a wrapper script, a
+    shell profile).
+
+    THREAT MODEL: every other guard in this file assumes the enforcement
+    engine ITSELF is intact — that built-in rules run, that policy is loaded
+    from the location a human configured, that a decision lands in the real
+    audit log. These five env vars are read directly by ``aegis.config`` /
+    ``aegis.engine`` / ``aegis.plugins`` at process start, before any policy
+    rule ever runs, so setting one touches no path
+    ``ENFORCEMENT_PATH_RE``/``CONFIG_DIR_RE``/``AEGIS_SOURCE_RE`` (self-protect,
+    above) recognize at all — yet each is a full or partial bypass of the
+    thing self-protect exists to protect:
+
+    - ``AEGIS_NO_BUILTINS`` — ``engine.py``'s ``_builtins_enabled()`` skips
+      EVERY built-in rule in this file outright the moment it's truthy. Every
+      guard above and below this one, gone in one shot; only registered
+      plugin rules and the user's own declarative policy still run.
+    - ``AEGIS_PLUGINS`` — ``aegis.plugins.load_modules()`` imports the named
+      Python module(s) and runs whatever they register as rule functions
+      INSIDE the same trusted process that decides allow/deny for every
+      future tool call this session makes. Unlike every other RCE-shaped
+      guard in this file, this isn't code running "in the sandbox the agent
+      already has" — it's arbitrary code running ON the enforcement boundary
+      itself, with the authority to shape (or simply not raise) every
+      decision after it loads.
+    - ``AEGIS_POLICIES`` — ``config.policy_dir()`` resolves the ENTIRE policy
+      directory here instead of ``./.aegis/policies``, so self-protect's own
+      path patterns (which only recognize the conventional ``.aegis``
+      location) never see the write that plants a permissive
+      ``default_action: allow`` or a malicious ``plugins:`` entry at the new
+      location — the policy file itself can look completely untouched.
+    - ``AEGIS_HOME`` — relocates ``~/.aegis`` (both the policy dir and the
+      audit path fall back through it) the same way, one level up.
+    - ``AEGIS_AUDIT`` — redirects the audit log Aegis appends every decision
+      to. SECURITY.md lists "audit log tampering or suppression" as
+      explicitly in scope; this is exactly that — an agent's own denied
+      actions, or the fact that any of these five vars was ever set, never
+      reach the real ``~/.aegis/audit.jsonl`` a human or ``aegis report``
+      would check.
+
+    Deliberately does NOT gate ``AEGIS_ALLOW_*`` (the per-guard escape
+    hatches ``ci_workflow``/``mcp_config``/``claude_hooks``/etc. already
+    document — a DESIGNED, human-set-only override each of those guards
+    explains is unreachable to a spawned agent, not a gap) or
+    ``AEGIS_IDENTITY_ENFORCE``/``AEGIS_FAIL_CLOSED`` (both make Aegis
+    STRICTER when set — there is nothing to protect by blocking a knob an
+    attacker would only ever want to turn the other way, and this session
+    can't unset an env var a human already exported before launch anyway).
+
+    Never escapable — no ``# aegis-allow``, no ``AEGIS_ALLOW_*`` policy knob,
+    no ``mode: ask``/``monitor`` — the same posture as ``rule_containment``
+    and ``rule_self_protect`` above: this guard exists to keep THOSE guards
+    (and every other one in this file) intact, so it cannot itself be waved
+    through by anything the session under enforcement controls. A human who
+    genuinely needs to reconfigure Aegis this way does it directly, outside
+    the agent-mediated tool-call loop this guard watches — the same
+    reasoning self-protect's own "No" (not even "human only") already
+    applies to editing ``.aegis`` by hand.
+
+    Known gaps, disclosed rather than silently accepted: a value assembled
+    indirectly (shell variable concatenation, a templating step, a value
+    written across two separate Edit calls whose diff never repeats the var
+    name in one call) defeats the content check, the same "computed
+    indirectly" class every sibling ``*_protect`` guard in this file already
+    accepts; a direct fetch-to-file write (``curl -o .env ...``) is covered
+    by ``rule_fetch_to_file_protect``'s own backstop only if ``.env`` is
+    added to its target list, which it is not today; and, like
+    ``rule_ci_workflow_protect``, this only reaches env vars that end up
+    somewhere Aegis's own hook can see (a tracked or working-tree file, or
+    the command text) — a value exported in a shell Aegis's hook is never
+    invoked from at all (a human's own interactive terminal) is outside any
+    hook-based guard's reach by construction, not specific to this one."""
+    if _is_shell(ev):
+        if patterns.AEGIS_ENV_BYPASS_RE.search(_shell_scan(ev)):
+            return Decision(Action.DENY, "aegis-env-protect",
+                            "Setting one of Aegis's own trust-boundary env vars "
+                            "(AEGIS_NO_BUILTINS / AEGIS_PLUGINS / AEGIS_POLICIES / "
+                            "AEGIS_HOME / AEGIS_AUDIT) is blocked — each disables, "
+                            "redirects, or injects code into the enforcement engine "
+                            "itself, not just this one command.")
+        return None
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if content and patterns.AEGIS_ENV_BYPASS_RE.search(content):
+            return Decision(Action.DENY, "aegis-env-protect",
+                            "Planting an assignment to one of Aegis's own "
+                            "trust-boundary env vars (AEGIS_NO_BUILTINS / "
+                            "AEGIS_PLUGINS / AEGIS_POLICIES / AEGIS_HOME / "
+                            "AEGIS_AUDIT) is blocked — each disables, redirects, or "
+                            "injects code into the enforcement engine itself, "
+                            "wherever it later gets loaded into the environment.")
+    return None
+
+
 # ---- MCP server-config protection: escapable with human confirmation ---------
 def _mcp_config_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -6788,6 +6890,7 @@ _CORE_RULES = (
     rule_attest_session,
     rule_containment,
     rule_self_protect,
+    rule_aegis_env_protect,
     rule_mcp_config_protect,
     rule_ci_workflow_protect,
     rule_git_hooks_protect,
