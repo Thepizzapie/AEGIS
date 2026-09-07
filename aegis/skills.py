@@ -34,6 +34,7 @@ _REMEDIES = """\
 | containment-persistence | installed autorun/service/scheduled-task persistence | don't persist; run the task in-session |
 | containment-exfiltration | uploaded local files to the network | keep data local; the human can share files deliberately |
 | self-protect | wrote/deleted Aegis config, policy, engine source, or an aegis-* skill | leave Aegis alone; ask the human to change policy via `aegis-policy` |
+| aegis-env-protect | tried to set AEGIS_NO_BUILTINS/AEGIS_PLUGINS/AEGIS_POLICIES/AEGIS_HOME/AEGIS_AUDIT/AEGIS_PROJECT/AEGIS_WORKSPACE (each disables, redirects, or injects code into the enforcement engine itself) | never escapable — leave Aegis's own env vars alone; ask the human to reconfigure Aegis directly, outside the tool-call loop |
 | mcp-config-protect | wrote an MCP server config (durable auto-run backdoor) | ask the human; they can set AEGIS_ALLOW_MCP_CONFIG=1 after review |
 | ci-workflow-protect | wrote a CI/CD pipeline definition (runs later, on the CI runner) | ask the human; they can set AEGIS_ALLOW_CI_WORKFLOW=1 after review |
 | git-hooks-protect | wrote a git hook / redirected core.hooksPath (runs later, untracked by git) | ask the human; they can set AEGIS_ALLOW_GIT_HOOKS=1 after review |
