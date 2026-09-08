@@ -322,6 +322,75 @@ def env_carrier_path_hit(path: str) -> bool:
         return False
     return bool(AEGIS_ENV_CARRIER_PATH_RE.search(path) or SHELL_RC_PATH_RE.search(path))
 
+
+# ---- Interpreter-launch env-var code-injection (BASH_ENV / NODE_OPTIONS) ------
+# BASH_ENV is bash's own documented mechanism (bash(1), "INVOCATION") to source an
+# arbitrary file at the START of every NON-interactive shell it launches from that
+# point on in this session -- not just the one command that sets it. Once set
+# (exported, or landed in a file something loads into the environment), EVERY
+# subsequent non-interactive `bash` invocation -- another Bash-tool call, a git
+# hook's own `#!/bin/bash` shebang, a CI step, a Makefile recipe -- silently runs
+# the attacker's file first, before that command's own visible text does anything.
+# Unlike every path-based guard in this file, the payload file itself needs no
+# protected path at all -- it can live anywhere, even outside the project (`/tmp`,
+# a scratch dir) -- so a path-based denylist can never close this surface; only
+# the assignment itself is a reliable signal. MITRE ATT&CK T1546.004 names this
+# exact primitive. Any non-empty value is dangerous the same way any value of
+# AEGIS_PLUGINS is (see AEGIS_ENV_BYPASS_RE above), so this reuses that same
+# assignment-shape alternation (export/set/setenv/fish `set -x`/`printf -v`/
+# `setx`/Dockerfile `ENV`/compose-YAML/k8s `name:`/`value:` pair) rather than a
+# narrower one -- one shell surface, eight already-hardened shapes.
+_INTERP_ENV_ASSIGN_VARS = r"BASH_ENV"
+INTERP_ENV_BYPASS_RE = re.compile(
+    r"\b" + _INTERP_ENV_ASSIGN_VARS + r"\b\s*="
+    r"|\bENV\s+" + _INTERP_ENV_ASSIGN_VARS + r"\b"
+    r"|\bsetx\b[^\r\n]*?\b" + _INTERP_ENV_ASSIGN_VARS + r"\b"
+    r"|(?:^|\n)[ \t]*-?[ \t]*" + _INTERP_ENV_ASSIGN_VARS + r"\b[ \t]*:[ \t]*\S"
+    r"|\b(?:export|setenv)\s+" + _INTERP_ENV_ASSIGN_VARS + r"\b"
+    r"|\bset\s+(?:-[a-zA-Z]+\s+)+" + _INTERP_ENV_ASSIGN_VARS + r"\b"
+    r"|\bprintf\s+-v\s+" + _INTERP_ENV_ASSIGN_VARS + r"\b"
+    r"|\bname\s*:\s*" + _INTERP_ENV_ASSIGN_VARS + r"\b[\s\S]{0,60}?\bvalue\s*:\s*\S",
+    re.IGNORECASE,
+)
+
+# NODE_OPTIONS: unlike BASH_ENV, the bare variable is not inherently dangerous
+# (`--max-old-space-size=4096` is ordinary tuning) -- only a value that ALSO names
+# a module-loading flag (`--require`/`-r`, `--loader`/`--experimental-loader`,
+# `--import`) is: Node.js require()s/imports that module into EVERY subsequent
+# `node` invocation (including `npm`/`npx`/any Node-based CLI it shells out to)
+# before that program's own code runs -- the exact persistence primitive real
+# self-propagating npm supply-chain malware has used in the wild to survive past
+# a single `npm install`. Gated on the loader flag appearing within a bounded
+# window of the variable name (bounded, not unbounded, the same ReDoS-safe
+# convention `AEGIS_ENV_BYPASS_RE`'s own `name:`/`value:` alternative already
+# uses) so an ordinary tuning-only value stays allowed. Two shapes: a direct
+# shell/`.env`/Dockerfile-style `NODE_OPTIONS=...flag...` assignment, and a
+# split k8s/Helm `name: NODE_OPTIONS` / `value: ...flag...` pair.
+#
+# QA (independent adversarial review) found two real bypasses in an earlier
+# draft, both fixed here: (1) the direct-assignment gap was originally capped
+# at 200 chars — Node.js itself doesn't care how much whitespace pads
+# `NODE_OPTIONS`, so `NODE_OPTIONS="<220 spaces> --require /tmp/evil.js"`
+# pushed the real flag outside the window and sailed through untouched; widened
+# to 4096 (still bounded — no unbounded/ReDoS-unsafe quantifier — but far past
+# any realistic padding an attacker gains anything from). (2) the k8s
+# `name:`/`value:` alternative's value-side gap excluded `\r\n`, so it could
+# only match a loader flag on the SAME line as `value:` — an entirely ordinary
+# YAML block-scalar value (`value: |` followed by the flag on the next line,
+# common for readability with multiple flags) put the flag out of reach with
+# no line for the exclusion to even need crossing maliciously. Switched to
+# `[\s\S]` (matches newlines too, the same choice `AEGIS_ENV_BYPASS_RE`'s own
+# `name:`/`value:` alternative already makes for BASH_ENV) so a block-scalar
+# value is caught the same as an inline one.
+_NODE_OPTIONS_LOADER_FLAG_RE = r"(?:--require|--loader|--experimental-loader|--import|-r\b)"
+NODE_OPTIONS_HIJACK_RE = re.compile(
+    r"\bNODE_OPTIONS\b\s*=\s*[\"']?[^\"'\r\n]{0,4096}?" + _NODE_OPTIONS_LOADER_FLAG_RE
+    + r"|\bname\s*:\s*NODE_OPTIONS\b[\s\S]{0,60}?\bvalue\s*:\s*[\"']?[\s\S]{0,4096}?"
+    + _NODE_OPTIONS_LOADER_FLAG_RE,
+    re.IGNORECASE,
+)
+
+
 # any move/delete verb (used together with ENFORCEMENT_PATH_RE on shell commands)
 DELETE_OR_MOVE_VERB_RE = re.compile(
     r"\b(?:rm|remove-item|ri|rmdir|rd|del|erase|mv|move-item|move|ren|rename-item)\b",

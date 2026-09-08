@@ -160,6 +160,13 @@ class Policy:
     # /etc/profile.d/*.sh/a PowerShell $PROFILE and ~/.ssh/authorized_keys/
     # ~/.ssh/config/sshd_config/ssh_config. See rules.rule_shell_persist_protect.
     shell_persist: dict = field(default_factory=dict)
+    # Interpreter-launch env-var code-injection protection: {mode: deny|ask|
+    # monitor|off, allow: [regex on path/command]}. Empty -> defaults
+    # (mode=ask) apply. Covers BASH_ENV (any value -- sourced by bash at the
+    # start of every subsequent non-interactive shell this session) and
+    # NODE_OPTIONS when it also carries a module-loading flag (--require/-r/
+    # --loader/--import). See rules.rule_interp_env_hijack_protect.
+    interp_env: dict = field(default_factory=dict)
     # direnv .envrc / global direnvrc auto-exec-on-cd protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a project .envrc (any nesting depth)

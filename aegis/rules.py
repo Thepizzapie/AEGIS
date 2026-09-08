@@ -1550,6 +1550,180 @@ def rule_shell_persist_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- interpreter-launch env-var code-injection: escapable with human confirm --
+def _interp_env_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_interp_env_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block setting ``BASH_ENV`` (any value) or ``NODE_OPTIONS`` (only when its
+    value also names a module-loading flag: ``--require``/``-r``, ``--loader``/
+    ``--experimental-loader``, ``--import``) from a shell command, or by planting
+    the assignment in a file that something actually loads into a process
+    environment (a project ``.env``, a Dockerfile ``ENV`` line, a
+    ``docker-compose.yml``/Kubernetes ``env:`` block, a wrapper script, a shell
+    profile — the same carrier-path check ``rule_aegis_env_protect`` uses).
+
+    THREAT MODEL: every guard above this one that stops a persistence PLANT
+    (git hooks, shell rc files, MCP config, ...) assumes the payload has to land
+    at a path the guard can name and watch. BASH_ENV/NODE_OPTIONS don't fit that
+    shape at all — the assignment itself, not a write to any protected path, IS
+    the attack:
+
+    - ``BASH_ENV`` — bash(1) sources the named file at the START of every
+      NON-interactive shell it launches from the moment it's set, for the rest
+      of the session: another Bash-tool call, a git hook's own ``#!/bin/bash``
+      shebang, a CI step, a Makefile recipe. The payload file can live anywhere
+      — ``/tmp``, a scratch dir never tracked by git — so no path-based guard in
+      this file (or any that could be added) closes it; only the assignment is
+      a reliable signal. This is a documented, named technique (MITRE ATT&CK
+      T1546.004, "Unix Shell Configuration Modification") and a real escalation
+      path from a single allowed ``export`` to arbitrary code on every following
+      shell call this guard set otherwise mediates one at a time.
+    - ``NODE_OPTIONS`` with a loader flag — Node.js ``require()``s/imports the
+      named module into EVERY subsequent ``node`` invocation (``npm``, ``npx``,
+      any Node-based CLI the agent or a later CI step shells out to) before that
+      program's own code runs. This is the exact persistence primitive real
+      self-propagating npm supply-chain malware has used to survive past a
+      single ``npm install`` in the current environment. A bare ``NODE_OPTIONS``
+      with no loader flag (``--max-old-space-size=...``) is ordinary tuning and
+      stays allowed — see ``patterns.NODE_OPTIONS_HIJACK_RE``'s own comment.
+
+    Distinct from ``rule_aegis_env_protect`` (which protects Aegis's OWN
+    trust-boundary vars so the enforcement engine stays intact) and
+    ``rule_shell_persist_protect`` (which protects the FILES a shell loads on
+    startup) — this guard protects the two env vars that make the NEXT
+    interpreter invocation itself the payload carrier, a surface neither
+    existing guard reaches: ``rule_aegis_env_protect``'s var list doesn't include
+    them, and a bare ``export BASH_ENV=/tmp/x.sh`` touches no file at all for
+    ``rule_shell_persist_protect``'s path check to see.
+
+    Config (``policy.interp_env``): ``mode`` (deny|ask|monitor|off, default
+    ask — matching ``shell_persist``'s own default, since a legitimate use of
+    ``NODE_OPTIONS`` for tracing/APM tooling exists and shouldn't hard-deny by
+    default), ``allow`` (regexes on the path/command that skip the gate).
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form, or
+    the env toggle ``AEGIS_ALLOW_INTERP_ENV=1`` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot set
+    its own env for a hook invocation it doesn't control, so neither path is
+    agent-self-escapable.
+
+    Known gaps, disclosed rather than silently accepted: a value assembled
+    indirectly (shell variable concatenation, a templating step, a value split
+    across two Edit calls whose diff never repeats the var name in one call)
+    defeats the content check, the same "computed indirectly" class every
+    sibling ``*_protect`` guard in this file already accepts; the same bare-
+    mid-token-backslash gap ``rule_aegis_env_protect``'s own docstring discloses
+    for ``AEGIS_PLU\\GINS=x`` reproduces here too (``BASH_E\\NV=x``) — the shared
+    de-obfuscation layer's to fix, not duplicated per-guard; a direct
+    fetch-to-file write (``curl -o .env ...``) is covered by
+    ``rule_fetch_to_file_protect``'s own backstop only if ``.env``/``.yml``/
+    ``.bashrc``-shaped paths are on its target list, which they are not today
+    (the same gap ``rule_aegis_env_protect`` already discloses for the same
+    reason); ``ENV`` (POSIX ``sh`` sources it only for an INTERACTIVE shell per
+    spec, but BusyBox ``ash`` — the default ``/bin/sh`` on many minimal
+    container images CI/agent tooling actually runs in — is documented to
+    apply it unconditionally, unlike Debian's own POSIX-conformant ``dash``)
+    and ``PERL5OPT``/``RUBYOPT`` (the
+    same "env var carries an interpreter flag" shape one language runtime over)
+    are related, real, and NOT covered by this guard — a narrower, higher-
+    confidence guard for the two most-documented, most-exploited members of
+    this class was judged a better first cut than one guard chasing every
+    interpreter's own env-driven flag surface at once; and, like every
+    hook-based guard here, a value exported directly in a human's own
+    interactive shell (one Aegis's hook is never invoked from) is outside this
+    guard's reach by construction, not a defect specific to it.
+
+    QA history (independent adversarial review, two parallel rounds — bypass-
+    hunting and design/consistency, the same convention every guard here
+    follows): the bypass-hunting round found and closed two real, reproduced
+    bugs in ``patterns.NODE_OPTIONS_HIJACK_RE`` before merge — the direct-
+    assignment gap's original 200-char bound let simple whitespace padding
+    push a real ``--require``/``-r``/``--loader``/``--import`` flag outside
+    the scanned window even though Node.js itself ignores the padding
+    entirely (widened to 4096, still bounded); and the k8s ``name:``/
+    ``value:`` alternative's value-side gap excluded ``\\r\\n``, so an
+    entirely ordinary YAML block-scalar value (``value: |`` with the flag on
+    the following line) evaded it with no obfuscation needed at all (fixed by
+    switching to ``[\\s\\S]``, the same newline-crossing choice
+    ``AEGIS_ENV_BYPASS_RE``'s own ``name:``/``value:`` alternative already
+    makes for ``BASH_ENV``). The design/consistency round confirmed the
+    guard's wiring, escapability tier, and threat-model claims were otherwise
+    correct, and flagged one doc-accuracy issue (fixed): the "dash" example
+    for POSIX ``ENV``'s non-interactive-sourcing gap was wrong — Debian's
+    ``dash`` is POSIX-conformant there; BusyBox ``ash`` is the documented
+    exception, not ``dash``."""
+    cfg = getattr(policy, "interp_env", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _hit(text: str) -> Optional[str]:
+        if not text:
+            return None
+        if patterns.INTERP_ENV_BYPASS_RE.search(text):
+            return "BASH_ENV"
+        if patterns.NODE_OPTIONS_HIJACK_RE.search(text):
+            return "NODE_OPTIONS"
+        return None
+
+    def _reason(name: str) -> str:
+        if name == "BASH_ENV":
+            return ("Setting BASH_ENV is being attempted — bash sources that file "
+                    "at the start of EVERY subsequent non-interactive shell this "
+                    "session (another command, a git hook, a CI step), with no "
+                    "protected path for a guard to watch")
+        return ("Setting NODE_OPTIONS with a module-loading flag "
+                "(--require/-r/--loader/--import) is being attempted — Node.js "
+                "loads that module into EVERY subsequent node/npm/npx invocation "
+                "this session before that program's own code runs")
+
+    if _is_shell(ev):
+        name = _hit(_shell_scan(ev))
+        if not name:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_INTERP_ENV")
+                or _interp_env_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "interp-env-hijack-protect",
+                         f"{_reason(name)}. A human may append '# aegis-allow', "
+                         "or set AEGIS_ALLOW_INTERP_ENV=1; a spawned agent "
+                         "cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "interp-env-hijack-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        if not patterns.env_carrier_path_hit(_path(ev)):
+            return None
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        name = _hit(content)
+        if not name:
+            return None
+        if os.environ.get("AEGIS_ALLOW_INTERP_ENV") or _interp_env_allowed_by_policy(cfg, content):
+            return None
+        would = Decision(action, "interp-env-hijack-protect",
+                         f"{_reason(name)}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_INTERP_ENV=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "interp-env-hijack-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- direnv .envrc / direnvrc auto-exec-on-cd protection: escapable with human confirm --
 def _direnv_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -6953,6 +7127,7 @@ _CORE_RULES = (
     rule_agent_def_protect,
     rule_skills_protect,
     rule_shell_persist_protect,
+    rule_interp_env_hijack_protect,
     rule_direnv_protect,
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
