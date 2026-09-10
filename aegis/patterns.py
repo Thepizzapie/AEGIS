@@ -2328,12 +2328,35 @@ def sudoers_pam_find_hit(cmd: str) -> bool:
 # syntactically-valid sudoers fragment (`agent ALL=(ALL) NOPASSWD: ALL`) is
 # just as dangerous as an invalid one, and visudo's own validation is no
 # substitute for a human having looked at the change. Matched as a bare
-# command word regardless of arguments (`-f <path>`, `-c` check-only, or no
-# flag at all, which edits the default `/etc/sudoers`) -- unlike
-# `SUDOERS_PATH_RE`, running visudo with NO explicit path argument still
-# targets `/etc/sudoers` (its compiled-in default), so path-based detection
-# alone would miss the single most common invocation shape.
-VISUDO_RE = re.compile(r"(?:^|[;&|\n]\s*)(?:sudo\s+)?visudo\b", re.IGNORECASE)
+# WORD anywhere in the command, not anchored to the command's start or to a
+# `sudo `-prefix immediately before it -- unlike `SUDOERS_PATH_RE`, running
+# visudo with NO explicit path argument still targets `/etc/sudoers` (its
+# compiled-in default), so path-based detection alone would miss the single
+# most common invocation shape.
+#
+# QA finding (independent adversarial review, bypass-hunting round): an
+# earlier version anchored the match to `(?:^|[;&|\n]\s*)(?:sudo\s+)?visudo`
+# -- requiring "visudo" to sit at the true start of the command, right after
+# a clause separator, or right after a bare `sudo ` with NOTHING else in
+# between. Every one of these entirely ORDINARY invocation shapes evaded it
+# completely, confirmed live through the real `aegis hook` CLI: `sudo -E
+# visudo`/`sudo -H visudo` (any flag between `sudo` and `visudo`), a leading
+# env-var assignment (`EDITOR='tee /tmp/x' visudo`, `FOO=bar visudo`), and
+# -- the actual, GTFOBins-documented `visudo` EDITOR-hijack privilege-
+# escalation technique -- `env EDITOR=/bin/sh visudo`/`/usr/bin/env visudo`,
+# plus `command visudo`/`exec visudo` and a one-line shell-function-wrapper
+# invocation. None of these are adversarial obfuscation; they are everyday
+# sysadmin shapes, so the exposure was real, not theoretical. Fixed by
+# dropping the anchor entirely: there is no legitimate reason for the
+# literal token "visudo" to appear anywhere in a shell command except to
+# invoke the visudo binary, so a plain `\bvisudo\b` word match, matching
+# this comment's own "bare word ANYWHERE" description, closes all of the
+# above at once. Accepted, disclosed false-positive trade-off: a filename
+# merely containing "visudo" as a hyphen/dot-delimited word (`cat
+# visudo.1`, `my-visudo-wrapper.sh`) now also asks -- the same "favor a
+# false ask over a false allow" trade-off `AEGIS_UNINSTALL_RE`'s own bare
+# `\baegis\b...\buninstall\b` word-match already makes for its own surface.
+VISUDO_RE = re.compile(r"\bvisudo\b", re.IGNORECASE)
 
 
 # Dev-container lifecycle config: `.devcontainer/devcontainer.json` (or a

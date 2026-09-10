@@ -215,6 +215,35 @@ def test_mention_of_visudo_in_unrelated_word_not_gated():
     assert not _gated(evaluate(_shell("echo 'run visudocheck.sh later'"), EMPTY))
 
 
+def test_visudo_with_flag_between_sudo_and_visudo_gated():
+    """QA finding (independent adversarial review, bypass-hunting round): the
+    original VISUDO_RE anchored to a bare 'sudo ' immediately before
+    'visudo' with nothing in between — any ordinary flag defeated it."""
+    for cmd in ("sudo -E visudo", "sudo -H visudo"):
+        d = evaluate(_shell(cmd), EMPTY)
+        assert _gated(d) and d.rule == "sudoers-pam-protect", cmd
+
+
+def test_visudo_editor_hijack_gated():
+    """The actual, GTFOBins-documented visudo EDITOR-hijack privilege-
+    escalation technique — a leading env-var assignment or `env` invocation
+    completely evaded the original clause-start-anchored VISUDO_RE."""
+    for cmd in (
+        "EDITOR='tee /tmp/x' visudo",
+        "env EDITOR=/bin/sh visudo",
+        "sudo env EDITOR=/bin/sh visudo",
+        "/usr/bin/env visudo",
+    ):
+        d = evaluate(_shell(cmd), EMPTY)
+        assert _gated(d) and d.rule == "sudoers-pam-protect", cmd
+
+
+def test_visudo_via_command_exec_or_function_wrapper_gated():
+    for cmd in ("command visudo", "exec visudo", "v() { visudo; }; v"):
+        d = evaluate(_shell(cmd), EMPTY)
+        assert _gated(d) and d.rule == "sudoers-pam-protect", cmd
+
+
 # ---- path-separator / Windows-trim bypass (same class as sibling guards) -----
 
 def test_doubled_separator_does_not_bypass():

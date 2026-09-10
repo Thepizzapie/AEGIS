@@ -3312,8 +3312,14 @@ def rule_sudoers_pam_protect(ev: Event, policy=None) -> Optional[Decision]:
     is also the one invocation shape a plain path check would miss entirely:
     run with no explicit ``-f``/path argument at all, it still edits the
     compiled-in default ``/etc/sudoers``, so ``VISUDO_RE`` is matched as a
-    bare command word regardless of arguments, independent of the path-named
-    branch below.
+    bare word anywhere in the command -- not anchored to the command's start
+    or to a ``sudo ``-prefix immediately before it, so ``sudo -E visudo``,
+    an ``EDITOR=... visudo``/``env EDITOR=... visudo`` invocation (the
+    actual GTFOBins-documented ``visudo`` EDITOR-hijack technique),
+    ``command visudo``/``exec visudo``, and a shell-function wrapper are all
+    caught the same as bare ``visudo`` -- independent of the path-named
+    branch below. See ``VISUDO_RE``'s own comment in patterns.py for the QA
+    history behind this specific match shape.
 
     Nothing else in this file reaches this surface: ``rule_containment``'s
     ``PERSIST_RE`` covers Windows scheduled tasks/services/registry Run keys,
@@ -3361,13 +3367,67 @@ def rule_sudoers_pam_protect(ev: Event, policy=None) -> Optional[Decision]:
     scoped out as a separate mechanism (no file write at all, and the group
     itself must already carry a sudoers ``%sudo``/``%wheel`` rule for it to
     matter), left for a future, dedicated guard rather than widening this
-    one past the two config surfaces its name promises; and neither
+    one past the two config surfaces its name promises; neither
     ``/etc/sudoers`` nor ``/etc/pam.d`` has an environment-variable
     relocation for an ordinary (non-setuid) process to disclose as a gap --
     both paths are compiled into the ``sudo``/PAM-consuming binaries
     themselves, the same "no env-var-relocation gap to disclose" property
     ``rule_ld_preload_protect``'s own docstring already states for the
-    identical reason."""
+    identical reason; a backslash-escaped literal character inside an
+    unquoted path (``echo x >> /etc/sudo\\ers``, byte-identical to
+    ``/etc/sudoers`` once bash parses it) evades every path-based check
+    here, a shared ``normalize.py`` de-obfuscation gap confirmed to defeat
+    ``rule_ld_preload_protect`` identically on the same trick, not unique to
+    this guard, and out of scope to fix here (the real fix belongs in the
+    shared scan-surface layer every ``*_protect`` guard builds on); and
+    ``scp``/other simple file-transfer verbs sit outside the shared six-verb
+    ``touches_target`` set every sibling guard in this file reuses (``scp
+    evilrule host:/etc/sudoers.d/agent`` is gated only incidentally, by an
+    unrelated exfiltration check, and only when an explicit ``user@`` prefix
+    is present), the same inherited, shared-infrastructure gap
+    ``rule_ld_preload_protect``/every other reuser of that verb set already
+    carries.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): a design/consistency
+    review confirmed correct wiring everywhere its siblings are
+    (``_CORE_RULES``, ``_FETCH_HUMAN_ESCAPABLE``, ``Policy``, all three
+    ``loader.py`` spots, both ``skills.py`` knob lists, the ``_REMEDIES``
+    table, the README guard table and Limits clause) by round-tripping a
+    live YAML ``sudoers_pam:`` block through ``load_policy()`` into a live
+    ``evaluate()`` decision for every ``mode`` (including the YAML-boolean
+    ``off``/``False`` gotcha) rather than trusting the wiring by inspection
+    alone, confirmed no rule earlier in ``_CORE_RULES`` shadows this one for
+    its own targets, and found no structural inconsistency against ``rule_
+    ld_preload_protect`` in the ``mode``/escape-hatch/``touches_target``
+    handling; full suite green throughout (2159 passed), no findings beyond
+    one pre-existing, unrelated gap in a sibling guard's own ``_REMEDIES``
+    row, out of scope for this guard. A parallel bypass-hunting review
+    found and this fix closes one real, reproduced bug: the original
+    ``VISUDO_RE`` anchored the match to the command's start, a clause
+    separator, or a bare ``sudo `` immediately before it, so entirely
+    ORDINARY invocation shapes -- ``sudo -E visudo``, an ``EDITOR=...
+    visudo``/``env EDITOR=... visudo`` invocation (the actual,
+    GTFOBins-documented ``visudo`` EDITOR-hijack privilege-escalation
+    technique), ``command visudo``/``exec visudo``, and a one-line
+    shell-function wrapper -- evaded it completely, confirmed live through
+    the real ``aegis hook`` CLI; none of these are adversarial obfuscation,
+    they are everyday sysadmin shapes. See ``VISUDO_RE``'s own comment in
+    patterns.py for the fix and its own accepted false-positive trade-off.
+    The same review confirmed, without fixing (pre-existing, shared-
+    infrastructure, not new or worse here): the backslash-escape and
+    ``scp``-verb gaps disclosed above (reproduced identically against
+    ``rule_ld_preload_protect`` on the same inputs); the fetch-to-file
+    backstop's own pre-disclosed glued-short-option gap (``curl
+    -sSo/etc/sudoers.d/x ...``) applying identically to this guard's two
+    newly-registered targets; and the ask-fatigue trade-off on a packaging/
+    provisioning tree literally containing an ``etc/sudoers``-shaped
+    relative path (e.g. ``ansible/files/etc/sudoers.d/myapp``), the same
+    "favor an unanchored match over a miss" choice this guard's own
+    ``test_relative_sudoers_gated`` deliberately tests for. No ReDoS found
+    on any of the four new regexes under multi-hundred-KB adversarial
+    input. Recommended PASS after the ``VISUDO_RE`` fix; no further round
+    needed."""
     cfg = getattr(policy, "sudoers_pam", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
