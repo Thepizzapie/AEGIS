@@ -2237,6 +2237,105 @@ def ld_preload_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, LD_PRELOAD_FIND_RE)
 
 
+# ---- sudoers / PAM privilege-escalation & authentication-hijack protection ---
+# `/etc/sudoers` (plus its `/etc/sudoers.d/*` drop-in directory -- the same
+# top-level-file-plus-drop-in-directory shape SSH_PERSIST_PATH_RE/
+# LD_SO_CONF_PATH_RE already cover for their own surfaces) is the single file
+# governing who may run what as root on this machine. A line planted there
+# (`<user> ALL=(ALL) NOPASSWD: ALL`) is a durable, silent privilege escalation
+# that needs no reboot, no new shell, and no git/CI trigger -- it takes effect
+# on the very next `sudo` invocation, by this agent, a teammate, or anything
+# else running as that user. Every sibling `*_persist`/`*_exec` guard in this
+# file gates a mechanism that runs an attacker's PAYLOAD later; this one is
+# worse in kind: it doesn't run anything itself, it just rewrites the trust
+# boundary sudo itself enforces, so every ordinary `sudo` call after the plant
+# silently succeeds instead of prompting or refusing.
+#
+# `/etc/pam.d/*` (plus the legacy combined `/etc/pam.conf`) is the other half
+# of the same trust boundary, one layer up: it's the PLUGGABLE AUTHENTICATION
+# MODULE stack every `sudo`, `login`, `sshd`, `su`, and desktop-lock-screen
+# call on the machine consults before deciding whether a credential is valid
+# at all. A line added to `/etc/pam.d/sudo`/`/etc/pam.d/common-auth` naming
+# `pam_exec.so` runs an arbitrary command on every future authentication
+# attempt through that service (the actual mechanism `pam_backdoor`-class
+# rootkits use); a line naming `pam_permit.so` ahead of the real module makes
+# any credential authenticate. Same "no reboot/new-shell/CI trigger, next
+# ordinary use picks it up" property `LD_PRELOAD_PATH_RE`'s own comment
+# describes, one layer up from the dynamic linker into the authentication
+# stack itself.
+#
+# Nothing else in this file reaches this surface: `rule_containment`'s
+# PERSIST_RE covers Windows scheduled tasks/services/registry Run keys, not a
+# Linux privilege/auth config path; `rule_shell_persist_protect`'s
+# SSH_PERSIST_PATH_RE covers `/etc/ssh/sshd_config`, a different daemon's own
+# config, not the PAM stack sshd itself calls into via `password-auth`/
+# `system-auth`; `rule_path_hijack_protect` covers shadowing the `sudo`
+# *binary* on `$PATH`, not rewriting sudo's own *policy* file; `rule_ld_
+# preload_protect` covers the dynamic-linker preload list, a different
+# process-wide auto-exec primitive that runs a payload rather than rewriting
+# a trust decision.
+#
+# Unlike most sibling guards' targets, neither `/etc/sudoers` nor
+# `/etc/pam.d` has an environment-variable relocation for an ordinary
+# (non-setuid) process to disclose as a gap: both paths are compiled into the
+# `sudo`/PAM-consuming binaries themselves (an alternate path is a
+# BUILD-time `./configure` flag, not a runtime env var), the same "no
+# env-var-relocation gap to disclose" property `LD_PRELOAD_PATH_RE`'s own
+# comment already states for the identical reason.
+_SUDOERS_PAM_END = _CI_END
+SUDOERS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"sudoers" + _SUDOERS_PAM_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"sudoers\.d" + _ETC_SEP
+    + _CI_SEG + _SUDOERS_PAM_END,
+    re.IGNORECASE,
+)
+PAM_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"pam\.d" + _ETC_SEP
+    + _CI_SEG + _SUDOERS_PAM_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"pam\.conf" + _SUDOERS_PAM_END,
+    re.IGNORECASE,
+)
+# Bare directory reference (no filename) -- the same archive/sync-tool gap
+# LD_PRELOAD_DIR_RE/SHELL_PERSIST_DIR_RE exist to close: `rsync -a evil/
+# /etc/sudoers.d/` or `tar xf payload.tar -C /etc/pam.d/` never names a
+# discrete target file at all. Bare `/etc/sudoers` needs no separate
+# directory form (it's already a file, not a directory).
+SUDOERS_PAM_DIR_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"sudoers\.d" + _SUDOERS_PAM_END
+    + r"|(?:^|[\s'\"/\\=])etc" + _ETC_SEP + r"pam\.d" + _SUDOERS_PAM_END,
+    re.IGNORECASE,
+)
+# `find -path/-name/-wholename/-regex` indirection, same reason every other
+# `*_FIND_RE` in this file exists. "sudoers"/"pam.d"/"pam.conf" are fully
+# distinctive (no ordinary, unrelated project has a file literally named any
+# of these) -- safe to include outright, same reasoning `LD_PRELOAD_FIND_
+# FRAGMENTS`'s own comment gives for "ld.so.preload"/"ld.so.conf". The
+# optional `\\?` before "pam.d"/"pam.conf"'s interior dot mirrors `LD_
+# PRELOAD_FIND_FRAGMENTS`'s own fix for a `find -regex` value with its
+# literal dot pre-escaped (`'.*pam\\.d.*'`) -- "sudoers" has no interior dot
+# of its own, so it needs no such tolerance.
+_SUDOERS_PAM_FIND_FRAGMENTS = r"sudoers(?:\.d)?|pam\\?\.d|pam\\?\.conf"
+SUDOERS_PAM_FIND_RE = _find_predicate_re(
+    r"(?:" + _SUDOERS_PAM_FIND_FRAGMENTS + r")")
+
+
+def sudoers_pam_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, SUDOERS_PAM_FIND_RE)
+
+
+# `visudo` is the sanctioned, syntax-validating way to edit `/etc/sudoers`/
+# `/etc/sudoers.d/*` directly -- but sanctioned doesn't mean safe: a
+# syntactically-valid sudoers fragment (`agent ALL=(ALL) NOPASSWD: ALL`) is
+# just as dangerous as an invalid one, and visudo's own validation is no
+# substitute for a human having looked at the change. Matched as a bare
+# command word regardless of arguments (`-f <path>`, `-c` check-only, or no
+# flag at all, which edits the default `/etc/sudoers`) -- unlike
+# `SUDOERS_PATH_RE`, running visudo with NO explicit path argument still
+# targets `/etc/sudoers` (its compiled-in default), so path-based detection
+# alone would miss the single most common invocation shape.
+VISUDO_RE = re.compile(r"(?:^|[;&|\n]\s*)(?:sudo\s+)?visudo\b", re.IGNORECASE)
+
+
 # Dev-container lifecycle config: `.devcontainer/devcontainer.json` (or a
 # named sibling for a multi-config repo, `.devcontainer/<name>/
 # devcontainer.json`) and the root-level `.devcontainer.json` shorthand. This

@@ -227,6 +227,15 @@ class Policy:
     # /etc/ld.so.conf + /etc/ld.so.conf.d/*.conf (shared-library search-path
     # hijack). See rules.rule_ld_preload_protect.
     ld_preload: dict = field(default_factory=dict)
+    # Sudoers / PAM privilege-escalation & authentication-hijack protection:
+    # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers /etc/sudoers + /etc/sudoers.d/*
+    # (directly or via `visudo`) — a planted rule grants root privilege on
+    # the very next `sudo` call, no reboot needed — and /etc/pam.d/* +
+    # /etc/pam.conf, whose stack every sudo/login/sshd/su call consults
+    # before deciding whether a credential is valid at all. See
+    # rules.rule_sudoers_pam_protect.
+    sudoers_pam: dict = field(default_factory=dict)
     # Dev-container lifecycle-command protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers .devcontainer/devcontainer.json (+ .devcontainer/<name>/

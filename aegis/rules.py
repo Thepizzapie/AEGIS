@@ -3264,6 +3264,171 @@ def rule_ld_preload_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _sudoers_pam_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_sudoers_pam_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a sudo privilege rule (``/etc/sudoers``,
+    ``/etc/sudoers.d/*``, including via ``visudo``) or a PAM authentication
+    module (``/etc/pam.d/*``, ``/etc/pam.conf``).
+
+    THREAT MODEL: ``/etc/sudoers`` (plus its ``/etc/sudoers.d/*`` drop-in
+    directory) is the single file governing who may run what as root on this
+    machine. A line planted there (``agent ALL=(ALL) NOPASSWD: ALL``) is a
+    durable, silent privilege escalation that needs no reboot, no new shell,
+    and no git/CI trigger at all -- it takes effect on the very next ``sudo``
+    call, by this agent, a teammate, or anything else running as that user.
+    Unlike every sibling ``*_persist``/``*_exec`` guard in this file, which
+    gates a mechanism that runs an attacker's PAYLOAD later, this one is
+    worse in kind: it doesn't run anything itself, it rewrites the trust
+    boundary ``sudo`` itself enforces, so every ordinary ``sudo`` call after
+    the plant silently succeeds instead of prompting or refusing.
+
+    ``/etc/pam.d/*`` (plus the legacy combined ``/etc/pam.conf``) is the
+    other half of the same trust boundary, one layer up: the Pluggable
+    Authentication Module stack every ``sudo``, ``login``, ``sshd``, ``su``,
+    and desktop-lock-screen call on the machine consults before deciding
+    whether a credential is valid at all. A line naming ``pam_exec.so`` in
+    ``/etc/pam.d/sudo``/``/etc/pam.d/common-auth`` runs an arbitrary command
+    on every future authentication attempt through that service (the actual
+    mechanism real ``pam_backdoor``-class rootkits use); a line naming
+    ``pam_permit.so`` ahead of the real module makes any credential
+    authenticate. Same "no reboot/new-shell/CI trigger, the next ordinary use
+    picks it up" property ``rule_ld_preload_protect``'s own docstring
+    describes, one layer up from the dynamic linker into the authentication
+    stack itself.
+
+    ``visudo`` is the sanctioned, syntax-validating way to edit sudoers
+    directly, but sanctioned doesn't mean safe -- a syntactically valid
+    sudoers fragment is just as dangerous as an invalid one, and its own
+    validation is no substitute for a human having looked at the change. It
+    is also the one invocation shape a plain path check would miss entirely:
+    run with no explicit ``-f``/path argument at all, it still edits the
+    compiled-in default ``/etc/sudoers``, so ``VISUDO_RE`` is matched as a
+    bare command word regardless of arguments, independent of the path-named
+    branch below.
+
+    Nothing else in this file reaches this surface: ``rule_containment``'s
+    ``PERSIST_RE`` covers Windows scheduled tasks/services/registry Run keys,
+    not a Linux privilege/auth config path; ``rule_shell_persist_protect``'s
+    SSH-persistence coverage protects ``/etc/ssh/sshd_config``, a different
+    daemon's own config, not the PAM stack ``sshd`` itself calls into via
+    ``password-auth``/``system-auth``; ``rule_path_hijack_protect`` covers
+    shadowing the ``sudo`` *binary* on ``$PATH``, not rewriting sudo's own
+    *policy* file; ``rule_ld_preload_protect`` covers the dynamic-linker
+    preload list, a different process-wide auto-exec primitive that runs a
+    payload rather than rewriting a trust decision.
+
+    Config (``policy.sudoers_pam``): ``mode`` (deny|ask|monitor|off, default
+    ``ask``), ``allow`` (regexes on the path/command that skip the gate --
+    e.g. a repo's own trusted provisioning script that manages sudoers via a
+    config-management tool). Defaults to ``ask`` for the same reason every
+    sibling ``*_protect`` guard does: legitimate uses exist (an admin
+    granting a service account narrow, audited sudo rights) -- it just needs
+    a human to have actually looked at the change once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_SUDOERS_PAM=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable -- the same "an agent
+    can't wave itself past its own guard" invariant every escapable guard in
+    this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a path assembled indirectly (shell variable concatenation
+    across separate assignments, a ``for``/``xargs`` loop, ``basename``/
+    ``dirname`` reconstruction) rather than appearing as one contiguous
+    literal is not caught, the same class every sibling guard already
+    accepts; a direct fetch-to-file write (``curl -o /etc/sudoers.d/x
+    ...``) is caught by none of the shell branch's write-verb checks --
+    ``rule_fetch_to_file_protect`` is the dedicated backstop for that shape,
+    the same "one rule re-checks every sibling guard's protected path
+    against the fetch-verb shape instead of patching each guard
+    individually" split its own docstring describes; an MCP tool naming its
+    target argument outside ``_path()``'s recognized key list is missed the
+    same way it is for every other ``_path()``-based guard in this file;
+    ``usermod -aG sudo``/``usermod -aG wheel`` (granting sudo via GROUP
+    membership rather than a sudoers rule) is a related but distinct
+    privilege-escalation shape this guard deliberately does not cover --
+    scoped out as a separate mechanism (no file write at all, and the group
+    itself must already carry a sudoers ``%sudo``/``%wheel`` rule for it to
+    matter), left for a future, dedicated guard rather than widening this
+    one past the two config surfaces its name promises; and neither
+    ``/etc/sudoers`` nor ``/etc/pam.d`` has an environment-variable
+    relocation for an ordinary (non-setuid) process to disclose as a gap --
+    both paths are compiled into the ``sudo``/PAM-consuming binaries
+    themselves, the same "no env-var-relocation gap to disclose" property
+    ``rule_ld_preload_protect``'s own docstring already states for the
+    identical reason."""
+    cfg = getattr(policy, "sudoers_pam", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "sudoers-pam-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        sudoers_hit = bool(p and patterns.SUDOERS_PATH_RE.search(p))
+        pam_hit = bool(p and patterns.PAM_PATH_RE.search(p))
+        if not (sudoers_hit or pam_hit):
+            return None
+        if os.environ.get("AEGIS_ALLOW_SUDOERS_PAM") or _sudoers_pam_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"Sudoers file '{p}' is being written — it controls who may run "
+                   "what as root on this machine; a planted rule takes effect on "
+                   "the very next 'sudo' call, no reboot needed" if sudoers_hit else
+                   f"PAM config '{p}' is being written — it is consulted on every "
+                   "future authentication attempt (sudo/login/sshd/su) on this "
+                   "machine, and a planted pam_exec/pam_permit module runs or "
+                   "bypasses auth on the very next one")
+        return _finish(Decision(action, "sudoers-pam-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_SUDOERS_PAM=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        visudo_hit = bool(patterns.VISUDO_RE.search(cmd))
+        names_target = bool(patterns.SUDOERS_PATH_RE.search(cmd)
+                             or patterns.PAM_PATH_RE.search(cmd)
+                             or patterns.SUDOERS_PAM_DIR_RE.search(cmd)
+                             or patterns.sudoers_pam_find_hit(cmd))
+        touches_target = visudo_hit or (names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_SUDOERS_PAM")
+                or _sudoers_pam_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "sudoers-pam-protect",
+                         "The sudoers policy or PAM authentication stack is being "
+                         "modified from a shell — it controls root privilege and "
+                         "authentication for this entire machine, taking effect "
+                         "on the very next sudo/login/auth attempt with no "
+                         "reboot needed. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_SUDOERS_PAM=1; a spawned agent cannot."))
+    return None
+
+
 def _devcontainer_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -5811,6 +5976,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
     (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
     (patterns.LD_SO_CONF_PATH_RE, "the dynamic linker's search-path config"),
+    (patterns.SUDOERS_PATH_RE, "a sudoers file"),
+    (patterns.PAM_PATH_RE, "a PAM authentication module config"),
     (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
     (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
     (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
@@ -6961,6 +7128,7 @@ _CORE_RULES = (
     rule_gitmodules_protect,
     rule_service_persist_protect,
     rule_ld_preload_protect,
+    rule_sudoers_pam_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,
