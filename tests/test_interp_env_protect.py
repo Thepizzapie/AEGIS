@@ -51,10 +51,13 @@ def _mcp_write(path, content):
                        action=ActionClass.MCP, args={"path": path, "content": content})
 
 
-def _mcp_nested(content, path=".env"):
+def _mcp_nested(content, path=".env", prefix_leaf=None):
+    edits = [{"newText": content}]
+    if prefix_leaf is not None:
+        edits = [{"oldText": prefix_leaf}] + edits
     return Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__edit_file",
                        action=ActionClass.MCP,
-                       args={"path": path, "edits": [{"newText": content}]})
+                       args={"path": path, "edits": edits})
 
 
 def _gated(d) -> bool:
@@ -135,6 +138,18 @@ def test_blocks_bash_env_via_mcp_nested_args():
     assert _gated(d)
 
 
+def test_blocks_bash_env_via_mcp_nested_yaml_form_behind_unrelated_leaf():
+    # QA (design/consistency round): flattened MCP string leaves must join
+    # with "\n", not " " -- a space join breaks the always-gated tier's
+    # `(?:^|\n)`-anchored YAML colon-form alternative whenever the dangerous
+    # leaf isn't the first one flattened. The identical bug class already
+    # fixed for rule_conftest_protect/rule_pysite_protect/rule_ipython_
+    # startup_protect, reproduced and closed here too.
+    content = "services:\n  app:\n    environment:\n      BASH_ENV: /tmp/evil.sh\n"
+    d = evaluate(_mcp_nested(content, prefix_leaf="an unrelated preceding leaf"), EMPTY)
+    assert _gated(d) and d.rule == "interp-env-protect"
+
+
 def test_blocks_bash_env_wrapper_script():
     d = evaluate(_write("deploy.sh", "export BASH_ENV=/tmp/evil.sh\n"), EMPTY)
     assert _gated(d) and d.rule == "interp-env-protect"
@@ -177,19 +192,24 @@ def test_blocks_node_options_import_flag():
     assert _gated(d)
 
 
-def test_blocks_perl5opt_capital_m():
-    d = evaluate(_shell("export PERL5OPT=-Mevil::module"), EMPTY)
-    assert _gated(d)
-
-
 def test_blocks_perl5opt_debugger_module():
     d = evaluate(_shell("export PERL5OPT=-d:evil"), EMPTY)
     assert _gated(d)
 
 
-def test_blocks_rubyopt_require():
+def test_blocks_rubyopt_require_glued_form():
     d = evaluate(_shell("export RUBYOPT=-ropen-uri"), EMPTY)
     assert _gated(d)
+
+
+def test_blocks_rubyopt_require_space_separated_form():
+    # QA (bypass-hunting round): both `-rlibrary` and `-r library` are real,
+    # equally-valid Ruby CLI syntax (verified against a real ruby binary --
+    # `RUBYOPT="-r open-uri" ruby ...` actually loads it); an earlier draft
+    # only matched the glued form, a complete, reproduced bypass of the
+    # idiomatic spaced spelling.
+    d = evaluate(_shell('RUBYOPT="-r open-uri" ruby app.rb'), EMPTY)
+    assert _gated(d) and d.rule == "interp-env-protect"
 
 
 def test_blocks_node_options_dockerfile_env_form():
@@ -200,6 +220,24 @@ def test_blocks_node_options_dockerfile_env_form():
 def test_blocks_node_options_via_write_content():
     d = evaluate(_write(".env", "NODE_OPTIONS=--require=/tmp/evil.js\n"), EMPTY)
     assert _gated(d)
+
+
+def test_blocks_node_options_fish_set_dash_x():
+    # QA (design/consistency round): the always-gated tier's own regex has
+    # a fish `set -x` alternative; the flag-gated tier originally lacked
+    # one entirely -- a live, reproduced bypass, closed by adding the same
+    # alternative to `_interp_flag_gated_re`.
+    d = evaluate(_shell("set -x NODE_OPTIONS -- --require=/tmp/evil.js; node app.js"), EMPTY)
+    assert _gated(d) and d.rule == "interp-env-protect"
+
+
+def test_blocks_node_options_require_past_original_200_char_window():
+    # QA (bypass-hunting round): the flag-gated tier's original 200-char
+    # bounded window was defeated by padding a real --require past it with
+    # ordinary, benign-looking flags. Widened to 2000 chars.
+    padding = "--max-old-space-size=4096 " * 9
+    d = evaluate(_shell(f'export NODE_OPTIONS="{padding}--require=/tmp/evil.js"'), EMPTY)
+    assert _gated(d) and d.rule == "interp-env-protect"
 
 
 # ---- false-positive guards: benign, common uses stay allowed ------------------
@@ -213,6 +251,18 @@ def test_allows_node_options_heap_tuning():
 
 def test_allows_rubyopt_warning_suppression():
     assert not _gated(evaluate(_shell("export RUBYOPT=-W0"), EMPTY))
+
+
+def test_allows_perl5opt_common_pragmas():
+    # QA (bypass-hunting round): an earlier draft gated bare -M/-m and
+    # reproduced this as a self-contradicting false positive -- -Mstrict/
+    # -Mwarnings are near-universal Perl pragmas, and this guard's own
+    # docstring names -Mstrict BY NAME as the canonical benign example the
+    # flag-gated tier exists to spare. Narrowed to only -d: (debugger-module
+    # hijack, unambiguous, negligible legitimate one-liner use).
+    assert not _gated(evaluate(_shell("export PERL5OPT=-Mstrict"), EMPTY))
+    assert not _gated(evaluate(_shell("export PERL5OPT=-Mwarnings"), EMPTY))
+    assert not _gated(evaluate(_shell("PERL5OPT=-Mstrict prove t/"), EMPTY))
 
 
 def test_allows_posix_env_app_environment_name():
@@ -328,6 +378,18 @@ def test_no_quadratic_blowup_on_adversarial_input():
         "export " * 50_000,
         "NODE_OPTIONS=" * 30_000,
         "environment:\n  - FOO=bar\n" * 20_000,
+        # QA (design/consistency + follow-up perf round): the flag-gated
+        # tier's 200->2000 char window widening (closing the padding
+        # bypass) turned many-repeated-var-name-occurrences-with-no-danger-
+        # flag inputs into an O(occurrences x window) scan; closed by
+        # gating each variable's expensive windowed regex behind a cheap,
+        # unanchored per-variable pre-check. These three combine a repeated
+        # real var name with a repeated near-miss (but never truly
+        # dangerous for THAT var) substring, the exact shape that first
+        # combined pre-check reproduced a fresh ~2.2s slowdown on.
+        "NODE_OPTIONS=-report " * 30_000,
+        "PERL5OPT=-dxyz " * 30_000,
+        "-report " * 30_000,
     ]
     for text in adversarial:
         start = time.time()
@@ -340,3 +402,18 @@ def test_no_quadratic_blowup_on_adversarial_input():
     evaluate(_shell("echo x " * 20_000), EMPTY)
     elapsed = time.time() - start
     assert elapsed < 1.0, f"rule_interp_env_protect took {elapsed:.2f}s on adversarial input"
+
+
+def test_perf_precheck_does_not_change_detection_semantics():
+    # the per-variable pre-check in interp_env_flag_hit() is an OPTIMIZATION
+    # only -- it must never change which inputs are flagged, just how fast
+    # a non-match is rejected. Cross-check a representative true positive
+    # and true negative for each of the three flag-gated variables.
+    from aegis import patterns
+
+    assert patterns.interp_env_flag_hit("export NODE_OPTIONS=--require=/tmp/evil.js")
+    assert not patterns.interp_env_flag_hit("export NODE_OPTIONS=--max-old-space-size=4096")
+    assert patterns.interp_env_flag_hit('RUBYOPT="-r open-uri" ruby app.rb')
+    assert not patterns.interp_env_flag_hit("export RUBYOPT=-W0")
+    assert patterns.interp_env_flag_hit("export PERL5OPT=-d:evil")
+    assert not patterns.interp_env_flag_hit("export PERL5OPT=-Mstrict")

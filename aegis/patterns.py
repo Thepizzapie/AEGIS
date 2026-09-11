@@ -4237,16 +4237,21 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
 #    extremely common, entirely benign uses Aegis must not ask on by default:
 #    `NODE_OPTIONS=--max-old-space-size=4096` (heap tuning, arguably the
 #    single most common NODE_OPTIONS use in CI), `RUBYOPT=-W0` (silence
-#    warnings), `PERL5OPT=-Mstrict` in a project's OWN test harness. Each
-#    also has one specific flag shape that loads and runs attacker code on
-#    every subsequent interpreter invocation for the rest of the shell
-#    session: Node's `--require`/`-r`/`--loader`/`--experimental-loader`/
-#    `--import` (module-preload flags -- the exact mechanism real npm
-#    supply-chain malware uses to inject a payload into every `node`/`npm
-#    run` invocation without touching `node_modules` at all), Perl's `-M`/
-#    `-m`/`-d:` (load-and-import / debugger-module flags), Ruby's `-r`
-#    (require). Content-gating on the dangerous flag, not the bare var name,
-#    is the same trade-off `rule_cloud_cred_exec_protect` makes gating on
+#    warnings), `PERL5OPT=-Mstrict`/`-Mwarnings` in a project's OWN test
+#    harness (both near-universal Perl pragmas -- an earlier draft of this
+#    guard gated bare `-M`/`-m` and QA reproduced exactly this as a
+#    self-contradicting false positive, closed by narrowing PERL5OPT to only
+#    `-d:`; see `_PERL5OPT_DANGER`'s own comment below for the full
+#    reasoning). Each of the three still has one flag shape that loads and
+#    runs attacker code on every subsequent interpreter invocation for the
+#    rest of the shell session: Node's `--require`/`-r`/`--loader`/
+#    `--experimental-loader`/`--import` (module-preload flags -- the exact
+#    mechanism real npm supply-chain malware uses to inject a payload into
+#    every `node`/`npm run` invocation without touching `node_modules` at
+#    all), Perl's `-d:Module` (load a debugger module), Ruby's `-r`
+#    (require, glued or space-separated). Content-gating on the dangerous
+#    flag, not the bare var name, is the same trade-off `rule_cloud_cred_
+#    exec_protect` makes gating on
 #    `credential_process =` rather than every AWS config key.
 #
 # Nothing else in this file reaches this surface: `rule_pysite_protect`/
@@ -4284,20 +4289,27 @@ INTERP_ENV_ALWAYS_RE = re.compile(
 )
 
 # Flag-gated tier: assignment form captured with a BOUNDED value window
-# (`{0,200}`, excluding the shell command-separator characters `;`/`&`/`|`/
+# (`{0,2000}`, excluding the shell command-separator characters `;`/`&`/`|`/
 # newline so the window can never run past the end of the current clause) --
 # the same bounded-lazy-window discipline `EXFIL_RE`'s own history in this
 # file requires after its earlier catastrophic-backtracking fix, applied here
-# from the start rather than found by a later ReDoS round. Three named
-# alternatives (`=`/`:` form, Dockerfile `ENV KEY value`, `setx KEY value|
-# value`) rather than one combined pattern, so the matched variable name and
-# its value stay unambiguous per branch for `interp_env_flag_hit()` below to
-# dispatch on.
+# from the start rather than found by a later ReDoS round. Widened from an
+# original `{0,200}` after independent QA (bypass-hunting round) padded a
+# real `--require=...` past a 200-char window with nine ordinary,
+# benign-looking `--max-old-space-size=4096 ` flags ahead of it and got a
+# reproduced false ALLOW -- 2000 chars (`AWS_CRED_PROCESS_SECTION_RE`'s own
+# window one guard over) still bounds the match cost the same way, just
+# raises the padding cost far past anything a real, ordinary NODE_OPTIONS/
+# PERL5OPT/RUBYOPT value would ever need; a sufficiently long padding string
+# past even that remains a known, disclosed gap of every bounded-window
+# guard in this file (see e.g. the systemd/launchd guard's own docstring on
+# its 200-char verb-adjacency bound).
+#
 # The assignment and its danger-flag both live in ONE alternative per
 # variable/dialect (never a separately-captured, unbounded-until-a-stop-char
 # value group scanned afterward) -- QA (bypass-hunting on this exact guard)
-# found a first draft that captured a bounded-but-still-wide `{0,200}` value
-# group, then checked THAT captured text for the danger flag in a second
+# found a first draft that captured a bounded-but-still-wide value group,
+# then checked THAT captured text for the danger flag in a second
 # Python-level step, silently broken by `normalize.scan_surface`'s own
 # raw-plus-de-obfuscated-forms convention: the scan surface is `<raw command>
 # <space> <quote-stripped command>`, so a single quoted assignment
@@ -4308,25 +4320,31 @@ INTERP_ENV_ALWAYS_RE = re.compile(
 # occurrence -- while the swallowed value's own leading quote character
 # broke the flag check's word-boundary assumption, a complete, reproduced
 # bypass. Fixed by folding the danger-flag requirement directly into the
-# match itself via a LAZY bounded window (`{0,200}?`): the match now ends
-# (and `finditer`/`search` moves on) the moment a danger flag is found, so it
-# can never over-consume into a later, independent occurrence, and the lazy
+# match itself via a LAZY bounded window: the match now ends (and
+# `finditer`/`search` moves on) the moment a danger flag is found, so it can
+# never over-consume into a later, independent occurrence, and the lazy
 # window happily skips over an interleaving quote character (not excluded
 # from the window's character class) to reach the flag either way.
-_INTERP_FLAG_WINDOW = r"[^\n;&|]{0,200}?"
+_INTERP_FLAG_WINDOW = r"[^\n;&|]{0,2000}?"
 
 
 def _interp_flag_gated_re(var: str, danger: str):
     """One self-contained regex for ``var`` (NODE_OPTIONS/PERL5OPT/RUBYOPT):
-    an assignment (`=`/`:` form, Dockerfile `ENV KEY value`, or `setx KEY
-    value`) followed, within the bounded lazy window above, by one of
-    ``var``'s own dangerous flags -- see the module-level comment above this
-    function for why the danger check is fused into the same match rather
-    than captured and checked separately."""
+    an assignment (`=`/`:` form, Dockerfile `ENV KEY value`, `setx KEY
+    value`, or fish `set -x`/`set -Ux KEY value`) followed, within the
+    bounded lazy window above, by one of ``var``'s own dangerous flags --
+    see the module-level comment above this function for why the danger
+    check is fused into the same match rather than captured and checked
+    separately. The fish form was added after independent design/
+    consistency QA found the always-gated tier's own ``INTERP_ENV_ALWAYS_RE``
+    had a ``set -x``/``set -Ux`` alternative this flag-gated tier lacked
+    entirely -- a live, reproduced bypass (`set -x NODE_OPTIONS --
+    --require=/tmp/evil.js; node app.js` sailed through untouched)."""
     return re.compile(
         r"\b" + var + r"\b\s*[:=]\s*" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")"
         r"|\bENV\s+" + var + r"\b\s+" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")"
-        r"|\bsetx\b\s+" + var + r"\b\s+" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")",
+        r"|\bsetx\b\s+" + var + r"\b\s+" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")"
+        r"|\bset\s+(?:-[a-zA-Z]+\s+)+" + var + r"\b\s+" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")",
         re.IGNORECASE,
     )
 
@@ -4339,21 +4357,73 @@ def _interp_flag_gated_re(var: str, danger: str):
 # character (not a plain `\b`, which also sits between two word characters
 # like the "r" in "-report") plus a lookahead requiring whitespace/`=`/end-
 # of-window right after, so it doesn't false-positive on an unrelated flag
-# merely starting with the letter r (`--report-uncaught-exception`).
+# merely starting with the letter r (`--report-uncaught-exception`); Node
+# itself does not honor a directly-glued `-r/path` (verified against a real
+# `node` binary during QA bypass-hunting), so only the space/`=`/end-anchored
+# forms are gated, not a bare `-r\S`.
 _NODE_OPTIONS_DANGER = (
     r"--require\b|--loader\b|--experimental-loader\b|--import\b"
     r"|(?<![\w-])-r(?=[\s=]|$)"
 )
-# Perl's `-M`/`-m` (load-and-import a module, optionally executing its
-# import-time code) and `-d:Module` (load a debugger module -- the same
-# arbitrary-code-at-startup shape one flag over).
-_PERL5OPT_DANGER = r"(?<![\w-])-M\S|(?<![\w-])-m\S|(?<![\w-])-d:\S"
-# Ruby's `-r` (require a library before the target script runs).
-_RUBYOPT_DANGER = r"(?<![\w-])-r\S"
+# Perl's `-d:Module` (load a debugger module -- unambiguous arbitrary-code-
+# at-startup, negligible legitimate use in an agent's own shell one-liners).
+# Deliberately does NOT gate `-M`/`-m` (load-and-import a module) at all --
+# an earlier draft did, and independent QA (bypass-hunting round) found it a
+# reproduced, self-contradicting FALSE POSITIVE: `PERL5OPT=-Mstrict` and
+# `PERL5OPT=-Mwarnings` are near-universal Perl pragmas (this guard's own
+# docstring cites `-Mstrict` BY NAME as the canonical "common, benign use"
+# example this tier exists to spare), so gating bare `-M`/`-m` asked on
+# almost every real-world Perl CI/test-harness `PERL5OPT` value it would
+# ever see. Unlike Node's `--require`/Ruby's `-r` (each takes a FILE PATH
+# directly), `-M`/`-m` take a MODULE NAME resolved through `@INC` -- real
+# exploitation needs a SECOND condition (a planted `.pm` reachable via
+# `@INC`, e.g. through `PERL5LIB`/`-I`/pre-5.26 dot-in-`@INC`), not one flag
+# alone, a weaker single-flag signal than the other two vars' direct
+# file-path primitives; disclosed here as a known, deliberately-accepted gap
+# rather than chased with a benign-pragma allowlist, which would just move
+# the false-positive/false-negative line rather than remove it.
+_PERL5OPT_DANGER = r"(?<![\w-])-d:\S"
+# Ruby's `-r` (require a library before the target script runs) -- both the
+# glued (`-rlibrary`) and space-separated (`-r library`) forms are real,
+# equally-valid Ruby CLI syntax (verified against a real `ruby` binary
+# during QA bypass-hunting: `RUBYOPT="-r open-uri" ruby ...` actually loads
+# it); an earlier draft only matched the glued form, a reproduced, complete
+# bypass of the idiomatic spaced spelling.
+_RUBYOPT_DANGER = r"(?<![\w-])-r(?:\S|\s+\S)"
 
 NODE_OPTIONS_FLAG_RE = _interp_flag_gated_re("NODE_OPTIONS", _NODE_OPTIONS_DANGER)
 PERL5OPT_FLAG_RE = _interp_flag_gated_re("PERL5OPT", _PERL5OPT_DANGER)
 RUBYOPT_FLAG_RE = _interp_flag_gated_re("RUBYOPT", _RUBYOPT_DANGER)
+
+# Cheap, UNANCHORED (no var name, no window) per-variable pre-check: does
+# THIS variable's own danger-flag text appear ANYWHERE in the text at all?
+# If not, that variable's windowed regex below could not possibly match
+# either (it requires the identical danger-flag text within its own bounded
+# window), so it's skipped entirely. Performance fix found during this
+# guard's own perf/ReDoS test: widening `_INTERP_FLAG_WINDOW` from 200 to
+# 2000 (closing the padding bypass documented on it) turned an input with
+# MANY repeated var-name occurrences and NO matching danger flag at all
+# (e.g. `"NODE_OPTIONS=" * 30_000`) into an O(occurrences x window) scan --
+# each occurrence independently re-scans up to 2000 chars before giving up,
+# ~2.1s measured on that adversarial input. A first fix used ONE combined
+# pre-check across all three variables' danger flags -- cheaper, but still
+# reproduced a ~2.2s slowdown on a second adversarial shape
+# (`"NODE_OPTIONS=-report " * 30_000`): "-report" satisfies RUBYOPT's own
+# (deliberately looser) `-r\S` danger shape, so the COMBINED pre-check found
+# a "candidate" and let `NODE_OPTIONS_FLAG_RE`'s own expensive windowed scan
+# run anyway, at every one of the 30,000 `NODE_OPTIONS=` occurrences, even
+# though NODE_OPTIONS's OWN danger shapes never match "-report" at all
+# (its `-r` alternative requires whitespace/`=`/end right after, "-report"
+# has "e"). Splitting the pre-check per variable -- gating each windowed
+# regex on THAT variable's own danger substring being present anywhere,
+# not any of the three -- closes this: `NODE_OPTIONS_FLAG_RE` never even
+# attempts its windowed scan unless a genuine NODE_OPTIONS-shaped danger
+# flag exists somewhere in the text at all, independent of how many
+# `NODE_OPTIONS=` occurrences (or OTHER variables' danger-shaped
+# substrings) precede it.
+_NODE_OPTIONS_ANY_DANGER_RE = re.compile(_NODE_OPTIONS_DANGER, re.IGNORECASE)
+_PERL5OPT_ANY_DANGER_RE = re.compile(_PERL5OPT_DANGER, re.IGNORECASE)
+_RUBYOPT_ANY_DANGER_RE = re.compile(_RUBYOPT_DANGER, re.IGNORECASE)
 
 
 def interp_env_flag_hit(text: str) -> bool:
@@ -4363,9 +4433,13 @@ def interp_env_flag_hit(text: str) -> bool:
     all three have common, benign uses this must not ask on)."""
     if not text:
         return False
-    return bool(NODE_OPTIONS_FLAG_RE.search(text)
-                or PERL5OPT_FLAG_RE.search(text)
-                or RUBYOPT_FLAG_RE.search(text))
+    if _NODE_OPTIONS_ANY_DANGER_RE.search(text) and NODE_OPTIONS_FLAG_RE.search(text):
+        return True
+    if _PERL5OPT_ANY_DANGER_RE.search(text) and PERL5OPT_FLAG_RE.search(text):
+        return True
+    if _RUBYOPT_ANY_DANGER_RE.search(text) and RUBYOPT_FLAG_RE.search(text):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------

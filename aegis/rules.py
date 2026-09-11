@@ -5809,11 +5809,15 @@ def rule_interp_env_protect(ev: Event, policy=None) -> Optional[Decision]:
       subsequent ``node``/``npm run`` invocation. The documented mechanism
       real npm supply-chain payloads use to hook every future Node
       invocation without touching ``node_modules`` at all.
-    - ``PERL5OPT`` with ``-M``/``-m``/``-d:`` -- loads (and, for ``-d:``,
-      hands debugger control to) an attacker-chosen module on every ``perl``
-      invocation.
-    - ``RUBYOPT`` with ``-r`` -- requires an attacker-chosen library on
-      every ``ruby`` invocation.
+    - ``PERL5OPT`` with ``-d:Module`` -- hands debugger control to an
+      attacker-chosen module on every ``perl`` invocation. Deliberately does
+      NOT gate ``-M``/``-m`` (load-and-import a module) -- see
+      ``patterns.py``'s own comment on ``_PERL5OPT_DANGER`` for why an
+      earlier draft that did was a reproduced, self-contradicting false
+      positive on near-universal pragmas like ``-Mstrict``.
+    - ``RUBYOPT`` with ``-r`` (either the glued ``-rlibrary`` or the
+      space-separated ``-r library`` form -- both real Ruby CLI syntax) --
+      requires an attacker-chosen library on every ``ruby`` invocation.
 
     Deliberately does NOT gate the POSIX ``ENV`` variable (bash's own
     ``BASH_ENV`` sibling for ``sh``/``dash``/``ksh``): ``ENV`` is also an
@@ -5873,7 +5877,58 @@ def rule_interp_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``rule_fetch_to_file_protect``'s own backstop only for the carrier paths
     already on its target list; and, like every hook-based guard here, a
     value exported in a human's own interactive shell that Aegis's hook is
-    never invoked from is outside this guard's reach by construction."""
+    never invoked from is outside this guard's reach by construction.
+
+    Two more disclosed gaps, shared, pre-existing infrastructure limitations
+    confirmed to reproduce here during independent QA rather than something
+    new to this guard: (1) a bare backslash before an ordinary character
+    survives bash's own parse (`BASH_E\\NV=x` IS `BASH_ENV=x`,
+    `NODE_OPTIONS=--req\\uire=x` IS `--require=x`) but
+    ``normalize.scan_surface`` only strips quote characters and ANSI-C
+    escapes, never a bare mid-token backslash -- the identical gap already
+    disclosed for ``rule_direnv_protect``'s own ``~/.ba\\shrc`` and
+    ``rule_aegis_env_protect``'s own ``AEGIS_PLU\\GINS=x``, a real fix
+    belongs in that shared de-obfuscation layer, not duplicated per-guard;
+    (2) the shell branch has no documentation/mention carve-out (unlike the
+    Edit/Write/MCP branch's carrier-path gate) -- an ``echo``/commit-message/
+    heredoc string that merely CONTAINS assignment-shaped text (e.g. a
+    commit message documenting ``BASH_ENV=...`` usage) is indistinguishable
+    from a real assignment to a regex-based guard and asks the same as one,
+    the identical trade-off ``rule_aegis_env_protect``'s own docstring
+    already discloses for its shell branch ("a shell command is inherently
+    active, not documentation"). Both bounded by this guard being
+    human-escapable ``ask``, not a hard, unescapable ``deny``.
+
+    QA history: two independent adversarial-review rounds (bypass-hunting
+    and design/consistency, run in parallel, the same convention every guard
+    in this file follows) found and closed four real, reproduced issues
+    before merge -- a greedy, separately-captured value window that let a
+    single quoted assignment's own de-obfuscated duplicate swallow past a
+    later, independent occurrence (closed by fusing the danger-flag check
+    into the same lazy-windowed match, see ``patterns.py``'s own comment
+    above ``_INTERP_FLAG_WINDOW``); ``RUBYOPT``'s space-separated ``-r
+    library`` form going completely undetected (closed by accepting both the
+    glued and spaced forms); a self-contradicting false positive on
+    ``PERL5OPT=-Mstrict``/``-Mwarnings`` (closed by narrowing ``PERL5OPT`` to
+    only its unambiguous ``-d:`` debugger-module flag); and an MCP nested-arg
+    space-join breaking the always-gated tier's ``(?:^|\\n)``-anchored YAML
+    colon-form alternative, the identical bug class already found and fixed
+    for ``rule_conftest_protect``/``rule_pysite_protect``/``rule_ipython_
+    startup_protect``, reintroduced here and closed the same way (join with
+    ``"\\n"``, not ``" "``). Also widened the flag-gated tier's bounded
+    window from 200 to 2000 chars after a reproduced padding bypass, and
+    added a fish ``set -x``/``set -Ux`` alternative to the flag-gated tier
+    (the always-gated tier already had one, the flag-gated tier did not --
+    a live, reproduced bypass). A follow-up perf pass then found the
+    2000-char widening itself turned a many-repeated-var-name, no-danger-
+    flag input into an O(occurrences x window) scan (~2.1s measured); closed
+    by gating each of the three flag-gated variables' expensive windowed
+    regex behind a cheap, unanchored, per-variable pre-check (see
+    ``patterns.py``'s own comment above ``interp_env_flag_hit()`` for why a
+    first, single COMBINED pre-check attempt still reproduced a second,
+    distinct ~2.2s slowdown before landing on the per-variable version).
+    Full suite green throughout (2161 passed after all fixes' own regression
+    tests)."""
     cfg = getattr(policy, "interp_env_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5910,7 +5965,15 @@ def rule_interp_env_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         a = ev.args or {}
         literal = a.get("content") or a.get("new_string")
-        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        # "\n" join, not " " -- QA (bypass-hunting round) found a space join
+        # here breaks INTERP_ENV_ALWAYS_RE's `(?:^|\n)`-anchored YAML
+        # colon-form alternative whenever the dangerous leaf isn't the first
+        # flattened string, the identical bug already found and fixed for
+        # rule_conftest_protect/rule_pysite_protect/rule_ipython_startup_
+        # protect (see rule_conftest_protect's own comment on this exact
+        # join for the full reasoning) and reproduced here during
+        # independent design/consistency QA.
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
         if not content:
             return None
         hit = bool(patterns.INTERP_ENV_ALWAYS_RE.search(content)

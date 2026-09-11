@@ -336,7 +336,7 @@ class Policy:
     # exist only to source/run a file at interpreter startup) and
     # NODE_OPTIONS/PERL5OPT/RUBYOPT (only when the value carries that
     # interpreter's own module-preload/require flag: --require/-r/--loader/
-    # --experimental-loader/--import, -M/-m/-d:, -r respectively) -- the
+    # --experimental-loader/--import, -d:, -r respectively) -- the
     # env-var layer above rule_ld_preload_protect/rule_pysite_protect/
     # rule_conftest_protect/rule_ipython_startup_protect's own fixed-path
     # file checks: setting one of these from a bare shell `export` makes the
