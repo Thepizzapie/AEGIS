@@ -61,7 +61,7 @@ def load_policy(path) -> Policy:
         "service_persist": {}, "ld_preload": {}, "devcontainer_exec": {}, "vscode_tasks_exec": {},
         "path_hijack": {}, "claude_hooks": {}, "statusline": {}, "permission_bypass": {},
         "conftest": {}, "pysite": {},
-        "ipython_startup": {}, "cloud_cred_exec": {}, "terraform_exec": {}, "fetch_to_file": {},
+        "ipython_startup": {}, "interp_env_exec": {}, "cloud_cred_exec": {}, "terraform_exec": {}, "fetch_to_file": {},
         "inject": {}, "failures": {},
         "completion": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
@@ -111,6 +111,7 @@ def load_policy(path) -> Policy:
                   conftest=st["conftest"],
                   pysite=st["pysite"],
                   ipython_startup=st["ipython_startup"],
+                  interp_env_exec=st["interp_env_exec"],
                   cloud_cred_exec=st["cloud_cred_exec"],
                   terraform_exec=st["terraform_exec"],
                   fetch_to_file=st["fetch_to_file"],
@@ -150,7 +151,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
                 "devcontainer_exec",
                 "vscode_tasks_exec", "path_hijack", "claude_hooks", "statusline",
                 "permission_bypass", "conftest", "pysite",
-                "ipython_startup", "cloud_cred_exec", "terraform_exec", "fetch_to_file",
+                "ipython_startup", "interp_env_exec", "cloud_cred_exec", "terraform_exec", "fetch_to_file",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
             st[key] = dict(data[key])

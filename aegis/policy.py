@@ -329,6 +329,21 @@ class Policy:
     # Terraform process is already authenticated with. See
     # rules.rule_terraform_exec_protect.
     terraform_exec: dict = field(default_factory=dict)
+    # Interpreter env-var auto-exec hijack protection: {mode: deny|ask|
+    # monitor|off, allow: [regex on the shell command, or on the file path
+    # for an Edit/Write/MCP write]}. Empty -> defaults
+    # (mode=ask) apply. Covers BASH_ENV/PYTHONSTARTUP (any value -- both
+    # exist only to source/run a file at interpreter startup) and
+    # NODE_OPTIONS/PERL5OPT/RUBYOPT (only when the value carries that
+    # interpreter's own module-preload/require flag: --require/-r/--loader/
+    # --experimental-loader/--import, -M/-m/-d:, -r respectively) -- the
+    # env-var layer above rule_ld_preload_protect/rule_pysite_protect/
+    # rule_conftest_protect/rule_ipython_startup_protect's own fixed-path
+    # file checks: setting one of these from a bare shell `export` makes the
+    # interpreter auto-run attacker code on its very next invocation, no
+    # file write, reboot, or new shell needed. See
+    # rules.rule_interp_env_protect.
+    interp_env_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing

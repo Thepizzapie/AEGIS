@@ -4193,6 +4193,181 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
     return single_line and bool(IPYTHON_BANG_ANY_RE.search(content))
 
 
+# ---- Interpreter env-var auto-exec hijack protection --------------------------
+# A family of environment variables that make an interpreter/shell auto-load and
+# run a file, or an attacker-chosen module, on its very next ordinary invocation
+# -- no file write to a path any OTHER guard in this file recognizes, no reboot,
+# no new shell, no git/CI trigger needed. Distinct from every sibling guard's
+# threat model: rule_ld_preload_protect/rule_pysite_protect/rule_conftest_
+# protect/rule_ipython_startup_protect all gate a FILE the interpreter loads
+# from a fixed, conventional path; this guard gates the ENV VAR that tells the
+# interpreter where to look in the first place, reachable with a bare `export`
+# in the current shell -- in any runtime whose shell state persists across tool
+# calls (unlike this repo's own dev harness, but true of many agentic runtimes
+# and of any interactive terminal), a single `export BASH_ENV=/tmp/x.sh` early
+# in a session silently backdoors EVERY subsequent non-interactive bash
+# invocation for the rest of that session, with no later diff, file write, or
+# tool call ever mentioning it again.
+#
+# Two severity tiers, split because the false-positive cost differs:
+#
+# 1. BASH_ENV / PYTHONSTARTUP -- gated on assignment alone, any value. Both
+#    exist for exactly one purpose (source/run a file at interpreter startup),
+#    so there is no common benign one-liner reason to set either at all.
+#    BASH_ENV: bash sources the named file before running anything else on
+#    every non-interactive invocation (`bash script.sh`, `bash -c '...'`,
+#    every `#!/bin/bash` script) -- POSIX-portable, not bash-specific in
+#    effect (`sh`/`dash`/`ksh` honor the POSIX-standard `ENV` var the same
+#    way, but `ENV` is deliberately NOT included here: it is also an
+#    extremely common application-level variable name for "which deploy
+#    environment" (`ENV=production`, `-e ENV=staging`), and gating a bare
+#    `ENV=` assignment would ask on that ordinary usage far more often than
+#    it would ever catch the POSIX-shell startup-file mechanism, which in
+#    any case only fires for an INTERACTIVE POSIX-mode shell, not the
+#    non-interactive scripts an agent actually runs -- the same
+#    too-generic-a-name trade-off `SHELL_PERSIST_FIND_RE`'s own comment
+#    already makes for the bare words "config"/"profile"). PYTHONSTARTUP:
+#    the file CPython's interactive REPL execs on startup -- narrower
+#    (interactive-only, like `ENV`) but, unlike `ENV`, not a name anything
+#    else legitimately reuses, so it stays in the always-gated tier.
+#
+# 2. NODE_OPTIONS / PERL5OPT / RUBYOPT -- gated on assignment PLUS a
+#    module/require-loading flag actually present in the value, via
+#    `interp_env_flag_hit()` below, NOT on the bare var name. All three have
+#    extremely common, entirely benign uses Aegis must not ask on by default:
+#    `NODE_OPTIONS=--max-old-space-size=4096` (heap tuning, arguably the
+#    single most common NODE_OPTIONS use in CI), `RUBYOPT=-W0` (silence
+#    warnings), `PERL5OPT=-Mstrict` in a project's OWN test harness. Each
+#    also has one specific flag shape that loads and runs attacker code on
+#    every subsequent interpreter invocation for the rest of the shell
+#    session: Node's `--require`/`-r`/`--loader`/`--experimental-loader`/
+#    `--import` (module-preload flags -- the exact mechanism real npm
+#    supply-chain malware uses to inject a payload into every `node`/`npm
+#    run` invocation without touching `node_modules` at all), Perl's `-M`/
+#    `-m`/`-d:` (load-and-import / debugger-module flags), Ruby's `-r`
+#    (require). Content-gating on the dangerous flag, not the bare var name,
+#    is the same trade-off `rule_cloud_cred_exec_protect` makes gating on
+#    `credential_process =` rather than every AWS config key.
+#
+# Nothing else in this file reaches this surface: `rule_pysite_protect`/
+# `rule_ipython_startup_protect` cover the ANALOGOUS interpreter-startup
+# auto-exec mechanism one layer down (a FILE at a fixed path the interpreter
+# always checks), never the env var that redirects where either interpreter
+# looks; `rule_aegis_env_protect` covers a disjoint, Aegis-specific set of
+# seven env vars that reconfigure the enforcement engine itself, not a
+# general-purpose interpreter.
+#
+# Assignment-shape coverage for the always-gated tier mirrors
+# `AEGIS_ENV_BYPASS_RE`'s own multi-dialect alternation (bare `KEY=value`,
+# Dockerfile `ENV KEY value`, `setx KEY value`, YAML mapping form, bare
+# `export`/`setenv`, fish `set -x`/`set -Ux`) -- kept as an independent,
+# self-contained pattern rather than sharing that regex object, the same
+# one-guard-one-pattern-block convention every `*_protect` guard in this file
+# already follows (see e.g. `LD_PRELOAD_PATH_RE` vs `LD_SO_CONF_PATH_RE`,
+# never factored into one shared helper despite the structural overlap).
+# Deliberately narrower than `AEGIS_ENV_BYPASS_RE`: no `printf -v` builtin
+# form and no Kubernetes split `name:`/`value:` pair -- both are real, QA-
+# found gaps for the never-escapable AEGIS-env tier, but this is a
+# human-escapable `ask`-by-default guard (the same lower completeness bar
+# `rule_cloud_cred_exec_protect`'s own docstring accepts for its own,
+# simpler content-only key match), and disclosed here rather than silently
+# accepted.
+_INTERP_ALWAYS_VARS = r"BASH_ENV|PYTHONSTARTUP"
+INTERP_ENV_ALWAYS_RE = re.compile(
+    r"\b(?:" + _INTERP_ALWAYS_VARS + r")\b\s*="
+    r"|\bENV\s+(?:" + _INTERP_ALWAYS_VARS + r")\b"
+    r"|\bsetx\b[^\r\n]*?\b(?:" + _INTERP_ALWAYS_VARS + r")\b"
+    r"|(?:^|\n)[ \t]*-?[ \t]*(?:" + _INTERP_ALWAYS_VARS + r")\b[ \t]*:[ \t]*\S"
+    r"|\b(?:export|setenv)\s+(?:" + _INTERP_ALWAYS_VARS + r")\b"
+    r"|\bset\s+(?:-[a-zA-Z]+\s+)+(?:" + _INTERP_ALWAYS_VARS + r")\b",
+    re.IGNORECASE,
+)
+
+# Flag-gated tier: assignment form captured with a BOUNDED value window
+# (`{0,200}`, excluding the shell command-separator characters `;`/`&`/`|`/
+# newline so the window can never run past the end of the current clause) --
+# the same bounded-lazy-window discipline `EXFIL_RE`'s own history in this
+# file requires after its earlier catastrophic-backtracking fix, applied here
+# from the start rather than found by a later ReDoS round. Three named
+# alternatives (`=`/`:` form, Dockerfile `ENV KEY value`, `setx KEY value|
+# value`) rather than one combined pattern, so the matched variable name and
+# its value stay unambiguous per branch for `interp_env_flag_hit()` below to
+# dispatch on.
+# The assignment and its danger-flag both live in ONE alternative per
+# variable/dialect (never a separately-captured, unbounded-until-a-stop-char
+# value group scanned afterward) -- QA (bypass-hunting on this exact guard)
+# found a first draft that captured a bounded-but-still-wide `{0,200}` value
+# group, then checked THAT captured text for the danger flag in a second
+# Python-level step, silently broken by `normalize.scan_surface`'s own
+# raw-plus-de-obfuscated-forms convention: the scan surface is `<raw command>
+# <space> <quote-stripped command>`, so a single quoted assignment
+# (`NODE_OPTIONS='-r /tmp/evil.js' node app.js`) produces TWO occurrences of
+# `NODE_OPTIONS=` in the combined text, and the FIRST match's own greedy
+# value capture (no stop character before the second occurrence) swallowed
+# the ENTIRE rest of the string -- including the second, quote-free
+# occurrence -- while the swallowed value's own leading quote character
+# broke the flag check's word-boundary assumption, a complete, reproduced
+# bypass. Fixed by folding the danger-flag requirement directly into the
+# match itself via a LAZY bounded window (`{0,200}?`): the match now ends
+# (and `finditer`/`search` moves on) the moment a danger flag is found, so it
+# can never over-consume into a later, independent occurrence, and the lazy
+# window happily skips over an interleaving quote character (not excluded
+# from the window's character class) to reach the flag either way.
+_INTERP_FLAG_WINDOW = r"[^\n;&|]{0,200}?"
+
+
+def _interp_flag_gated_re(var: str, danger: str):
+    """One self-contained regex for ``var`` (NODE_OPTIONS/PERL5OPT/RUBYOPT):
+    an assignment (`=`/`:` form, Dockerfile `ENV KEY value`, or `setx KEY
+    value`) followed, within the bounded lazy window above, by one of
+    ``var``'s own dangerous flags -- see the module-level comment above this
+    function for why the danger check is fused into the same match rather
+    than captured and checked separately."""
+    return re.compile(
+        r"\b" + var + r"\b\s*[:=]\s*" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")"
+        r"|\bENV\s+" + var + r"\b\s+" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")"
+        r"|\bsetx\b\s+" + var + r"\b\s+" + _INTERP_FLAG_WINDOW + r"(?:" + danger + r")",
+        re.IGNORECASE,
+    )
+
+
+# Node's module-preload flags -- any one of these in NODE_OPTIONS runs
+# arbitrary JS before the target script's own first line, the documented
+# mechanism `require('...')`-shaped npm supply-chain payloads use to hook
+# into every future `node`/`npm run` invocation without touching
+# `node_modules` at all. `-r` uses a negative lookbehind for a word/hyphen
+# character (not a plain `\b`, which also sits between two word characters
+# like the "r" in "-report") plus a lookahead requiring whitespace/`=`/end-
+# of-window right after, so it doesn't false-positive on an unrelated flag
+# merely starting with the letter r (`--report-uncaught-exception`).
+_NODE_OPTIONS_DANGER = (
+    r"--require\b|--loader\b|--experimental-loader\b|--import\b"
+    r"|(?<![\w-])-r(?=[\s=]|$)"
+)
+# Perl's `-M`/`-m` (load-and-import a module, optionally executing its
+# import-time code) and `-d:Module` (load a debugger module -- the same
+# arbitrary-code-at-startup shape one flag over).
+_PERL5OPT_DANGER = r"(?<![\w-])-M\S|(?<![\w-])-m\S|(?<![\w-])-d:\S"
+# Ruby's `-r` (require a library before the target script runs).
+_RUBYOPT_DANGER = r"(?<![\w-])-r\S"
+
+NODE_OPTIONS_FLAG_RE = _interp_flag_gated_re("NODE_OPTIONS", _NODE_OPTIONS_DANGER)
+PERL5OPT_FLAG_RE = _interp_flag_gated_re("PERL5OPT", _PERL5OPT_DANGER)
+RUBYOPT_FLAG_RE = _interp_flag_gated_re("RUBYOPT", _RUBYOPT_DANGER)
+
+
+def interp_env_flag_hit(text: str) -> bool:
+    """True if ``text`` sets NODE_OPTIONS/PERL5OPT/RUBYOPT to a value that
+    actually contains that interpreter's module-load/require flag -- not just
+    the bare variable name (see the flag-gated-tier comment above for why:
+    all three have common, benign uses this must not ask on)."""
+    if not text:
+        return False
+    return bool(NODE_OPTIONS_FLAG_RE.search(text)
+                or PERL5OPT_FLAG_RE.search(text)
+                or RUBYOPT_FLAG_RE.search(text))
+
+
 # ---------------------------------------------------------------------------
 # Fetch-to-file write verb: curl/wget/PowerShell/certutil writing a remote
 # response DIRECTLY to a target path. Every `*_protect` guard above gates its

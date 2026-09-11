@@ -5763,6 +5763,174 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _interp_env_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_interp_env_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block setting an environment variable that makes an interpreter/shell
+    auto-load and run a file, or an attacker-chosen module, on its very next
+    ordinary invocation: ``BASH_ENV``/``PYTHONSTARTUP`` (any value), or
+    ``NODE_OPTIONS``/``PERL5OPT``/``RUBYOPT`` carrying that interpreter's own
+    module-preload/require flag.
+
+    THREAT MODEL: every sibling interpreter-startup guard in this file
+    (``rule_ld_preload_protect``, ``rule_pysite_protect``,
+    ``rule_conftest_protect``, ``rule_ipython_startup_protect``) gates a FILE
+    at a fixed, conventional path the interpreter always checks. This guard
+    covers the layer above all four: the ENV VAR that tells the interpreter
+    WHERE to look in the first place, set with nothing more than a bare
+    ``export`` in the current shell -- no file write any other guard here
+    recognizes, no reboot, no new shell, no git/CI trigger. In any runtime
+    whose shell state persists across tool calls (true of many agentic
+    coding runtimes, and of any interactive terminal a human later opens --
+    not necessarily this repo's own dev harness, whose Bash tool resets
+    shell state between calls), a single ``export BASH_ENV=/tmp/x.sh`` early
+    in a session silently backdoors EVERY subsequent non-interactive
+    ``bash`` invocation for the rest of that session, with no later diff,
+    file write, or tool call ever mentioning it again -- the session-scoped
+    analog of the file-based persistence every guard above already treats
+    as a top-tier threat.
+
+    - ``BASH_ENV`` -- bash sources this file before running anything else on
+      every non-interactive invocation (a script, ``bash -c '...'``, any
+      ``#!/bin/bash`` shebang).
+    - ``PYTHONSTARTUP`` -- CPython execs this file on every interactive REPL
+      startup.
+    - ``NODE_OPTIONS`` with ``--require``/``-r``/``--loader``/
+      ``--experimental-loader``/``--import`` -- Node loads and runs the
+      named module before the target script's own first line, on every
+      subsequent ``node``/``npm run`` invocation. The documented mechanism
+      real npm supply-chain payloads use to hook every future Node
+      invocation without touching ``node_modules`` at all.
+    - ``PERL5OPT`` with ``-M``/``-m``/``-d:`` -- loads (and, for ``-d:``,
+      hands debugger control to) an attacker-chosen module on every ``perl``
+      invocation.
+    - ``RUBYOPT`` with ``-r`` -- requires an attacker-chosen library on
+      every ``ruby`` invocation.
+
+    Deliberately does NOT gate the POSIX ``ENV`` variable (bash's own
+    ``BASH_ENV`` sibling for ``sh``/``dash``/``ksh``): ``ENV`` is also an
+    extremely common application-level variable name for "which deploy
+    environment" (``ENV=production``, ``-e ENV=staging``), and only affects
+    an INTERACTIVE POSIX-mode shell, not the non-interactive scripts an
+    agent actually runs -- gating the bare name would ask on ordinary,
+    benign usage far more often than it would ever catch the real
+    mechanism, the same too-generic-a-name trade-off
+    ``SHELL_PERSIST_FIND_RE``'s own comment already makes for the bare words
+    "config"/"profile". ``NODE_OPTIONS``/``PERL5OPT``/``RUBYOPT`` are
+    content-gated on their dangerous flag rather than the bare var name for
+    the identical reason -- all three have common, entirely benign uses
+    (heap-size tuning, warning suppression, a project's own ``-Mstrict``)
+    this guard must not ask on by default. See ``patterns.py``'s own comment
+    block above ``INTERP_ENV_ALWAYS_RE``/``interp_env_flag_hit()`` for the
+    full reasoning on both tiers.
+
+    Config (``policy.interp_env_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the shell command, or on the file
+    path for an Edit/Write/MCP write -- the same path-not-content convention
+    ``rule_ld_preload_protect``/``rule_cloud_cred_exec_protect``'s own
+    Edit/Write branches already use -- that skip the gate; e.g. a repo's own
+    trusted test harness that legitimately sets ``NODE_OPTIONS=--require
+    ./test/setup.js``). Escapable only by a human:
+    a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_INTERP_ENV=1`` for the Edit/Write/MCP-tool form -- a
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, the same "an agent can't wave itself past its own guard"
+    invariant every escapable guard in this file holds.
+
+    The Edit/Write/MCP branch reuses ``patterns.env_carrier_path_hit()`` --
+    the identical carrier-path gate ``rule_aegis_env_protect`` already uses
+    and already had its own QA history closing a documentation false
+    positive for (a README/troubleshooting doc showing ``BASH_ENV=...`` as
+    an example must not be gated; a ``.env``/Dockerfile/compose/CI-yaml/
+    wrapper-script/shell-rc file that actually LOADS the assignment into a
+    process environment must be) -- rather than re-deriving the same
+    file-shape check.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a value assembled indirectly (shell variable concatenation,
+    a templating step) defeats the content check, the same "computed
+    indirectly" class every sibling guard already accepts; deliberately
+    narrower assignment-shape coverage than ``rule_aegis_env_protect``'s own
+    ``AEGIS_ENV_BYPASS_RE`` -- no ``printf -v`` builtin form and no
+    Kubernetes split ``name:``/``value:`` pair, both real QA-found gaps for
+    that never-escapable tier but accepted here for this human-escapable,
+    ``ask``-by-default guard, the same lower completeness bar
+    ``rule_cloud_cred_exec_protect``'s own simpler content-only key match
+    already accepts; ``csh``/``tcsh`` ``setenv`` (no ``=``) is covered for
+    the always-gated tier but not the flag-gated one, since capturing a
+    bounded value window after a two-token, no-operator assignment adds
+    real ambiguity for little realistic benefit (a Node/Perl/Ruby env var
+    set via ``csh`` is a rare combination); a direct fetch-to-file write
+    (``curl -o .env ...``) targeting a carrier file is covered by
+    ``rule_fetch_to_file_protect``'s own backstop only for the carrier paths
+    already on its target list; and, like every hook-based guard here, a
+    value exported in a human's own interactive shell that Aegis's hook is
+    never invoked from is outside this guard's reach by construction."""
+    cfg = getattr(policy, "interp_env_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "interp-env-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        text = _shell_scan(ev)
+        hit = bool(patterns.INTERP_ENV_ALWAYS_RE.search(text)
+                   or patterns.interp_env_flag_hit(text))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_INTERP_ENV")
+                or _interp_env_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "interp-env-protect",
+                         "Setting BASH_ENV/PYTHONSTARTUP, or NODE_OPTIONS/"
+                         "PERL5OPT/RUBYOPT with a module-load flag, makes "
+                         "the interpreter auto-run this code on its very "
+                         "next invocation -- no file write, no restart, no "
+                         "git/CI trigger needed. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_INTERP_ENV=1; "
+                         "a spawned agent cannot."))
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        if not patterns.env_carrier_path_hit(_path(ev)):
+            return None
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        hit = bool(patterns.INTERP_ENV_ALWAYS_RE.search(content)
+                   or patterns.interp_env_flag_hit(content))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_INTERP_ENV")
+                or _interp_env_allowed_by_policy(cfg, _path(ev))):
+            return None
+        return _finish(Decision(action, "interp-env-protect",
+                         "Planting BASH_ENV/PYTHONSTARTUP, or a NODE_OPTIONS/"
+                         "PERL5OPT/RUBYOPT module-load flag, in a file that "
+                         "gets loaded into a process environment makes the "
+                         "interpreter auto-run this code on its very next "
+                         "invocation, wherever it's later sourced. Review "
+                         "the change, then confirm with "
+                         "AEGIS_ALLOW_INTERP_ENV=1; a spawned agent cannot."))
+    return None
+
+
 # ---- fetch-to-file backstop: closes the "curl -o"/"wget -O" gap every ----------
 # ---- *_protect guard above discloses ------------------------------------------
 
@@ -6970,6 +7138,7 @@ _CORE_RULES = (
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
+    rule_interp_env_protect,
     rule_cloud_cred_exec_protect,
     rule_terraform_exec_protect,
     rule_fetch_to_file_protect,
