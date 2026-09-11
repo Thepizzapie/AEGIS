@@ -346,6 +346,32 @@ def test_no_catastrophic_backtracking():
     assert elapsed < 1.0, f"rule_aegis_env_protect took {elapsed:.2f}s on adversarial input"
 
 
+def test_setx_alternative_no_quadratic_blowup_on_adversarial_input():
+    """Found during round-3 QA follow-up on the unrelated, newer
+    rule_interp_env_protect guard: the `setx` alternative here had an
+    unbounded `[^\\r\\n]*?` gap (not the same bounded-window discipline
+    every other alternative uses), reproduced at ~17s on a Write/Edit
+    content input built from many `setx <unrelated>` occurrences and no
+    real AEGIS_* var anywhere — the lazy quantifier re-attempts an
+    unbounded scan to the end of the string from every `setx` occurrence
+    before giving up on each one. Bounded to `{0,200}?`, ample for any real
+    `setx KEY value` invocation."""
+    import time
+    from aegis import patterns
+
+    text = "setx NODE_OPTIONS val " * 10_000 + "--import"
+    start = time.time()
+    patterns.AEGIS_ENV_BYPASS_RE.search(text)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"AEGIS_ENV_BYPASS_RE took {elapsed:.2f}s on adversarial setx input"
+
+    start = time.time()
+    d = evaluate(_write(".bashrc", text), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"evaluate() took {elapsed:.2f}s on adversarial setx Write content"
+    assert _gated(d)  # shell-persist-protect still gates the .bashrc write
+
+
 def test_allows_designed_allow_star_knobs_untouched():
     # the per-guard AEGIS_ALLOW_* human escape hatches (ci_workflow, mcp_config,
     # claude_hooks, ...) are a DESIGNED surface documented on those guards —

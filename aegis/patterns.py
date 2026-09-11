@@ -260,7 +260,20 @@ _AEGIS_ENV_VARS = r"AEGIS_(?:NO_BUILTINS|PLUGINS|POLICIES|HOME|AUDIT|PROJECT|WOR
 AEGIS_ENV_BYPASS_RE = re.compile(
     r"\b" + _AEGIS_ENV_VARS + r"\b\s*="
     r"|\bENV\s+" + _AEGIS_ENV_VARS + r"\b"
-    r"|\bsetx\b[^\r\n]*?\b" + _AEGIS_ENV_VARS + r"\b"
+    # `setx`'s gap is BOUNDED (`{0,200}?`), not a bare unbounded `[^\r\n]*?`
+    # -- found during round-3 QA follow-up on the unrelated, newer
+    # `rule_interp_env_protect` guard (which briefly had the identical
+    # unbounded shape, copied from here, before being bounded there first):
+    # with `setx` repeated many times and no real AEGIS_* var anywhere in
+    # the text, the lazy quantifier re-attempts an unbounded scan to the end
+    # of the string from EVERY `setx` occurrence before giving up on each
+    # one, reproduced at ~17s on a ~20,000-char adversarial Write/Edit
+    # content input (`"setx NODE_OPTIONS val " * 10_000`) through the real
+    # `evaluate()` path -- this guard's own content-scanning branch, not its
+    # shell branch, since Edit/Write/MCP content has no upstream
+    # `normalize.scan_surface` length cap the shell branch benefits from. A
+    # 200-char bound is ample for any real `setx KEY value` invocation.
+    r"|\bsetx\b[^\r\n]{0,200}?\b" + _AEGIS_ENV_VARS + r"\b"
     r"|(?:^|\n)[ \t]*-?[ \t]*" + _AEGIS_ENV_VARS + r"\b[ \t]*:[ \t]*\S"
     r"|\b(?:export|setenv)\s+" + _AEGIS_ENV_VARS + r"\b"
     r"|\bset\s+(?:-[a-zA-Z]+\s+)+" + _AEGIS_ENV_VARS + r"\b"
@@ -4278,10 +4291,23 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
 # simpler content-only key match), and disclosed here rather than silently
 # accepted.
 _INTERP_ALWAYS_VARS = r"BASH_ENV|PYTHONSTARTUP"
+# The `setx` alternative's gap between the verb and the var name is BOUNDED
+# (`{0,200}?`, not a bare unbounded `[^\r\n]*?`) -- round-3 QA follow-up
+# found an unbounded lazy gap here (copied from `AEGIS_ENV_BYPASS_RE`'s own
+# `setx` alternative, which has the identical unbounded shape and the
+# identical latent bug, confirmed but NOT fixed here -- out of scope for
+# this guard, disclosed below) causes real quadratic-ish cost: with `setx`
+# repeated many times and NO real BASH_ENV/PYTHONSTARTUP anywhere in the
+# text, the lazy quantifier re-attempts an unbounded scan to the end of the
+# string from EVERY `setx` occurrence before giving up on each one --
+# reproduced at ~0.75s on a ~40,000-char adversarial input
+# (`"setx NODE_OPTIONS val " * 10_000` through the real `evaluate()` shell
+# path, `normalize.scan_surface`'s raw+stripped concatenation). A 200-char
+# bound is ample for any real `setx KEY value` invocation.
 INTERP_ENV_ALWAYS_RE = re.compile(
     r"\b(?:" + _INTERP_ALWAYS_VARS + r")\b\s*="
     r"|\bENV\s+(?:" + _INTERP_ALWAYS_VARS + r")\b"
-    r"|\bsetx\b[^\r\n]*?\b(?:" + _INTERP_ALWAYS_VARS + r")\b"
+    r"|\bsetx\b[^\r\n]{0,200}?\b(?:" + _INTERP_ALWAYS_VARS + r")\b"
     r"|(?:^|\n)[ \t]*-?[ \t]*(?:" + _INTERP_ALWAYS_VARS + r")\b[ \t]*:[ \t]*\S"
     r"|\b(?:export|setenv)\s+(?:" + _INTERP_ALWAYS_VARS + r")\b"
     r"|\bset\s+(?:-[a-zA-Z]+\s+)+(?:" + _INTERP_ALWAYS_VARS + r")\b",

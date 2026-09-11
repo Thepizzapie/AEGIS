@@ -404,6 +404,49 @@ def test_no_quadratic_blowup_on_adversarial_input():
     assert elapsed < 1.0, f"rule_interp_env_protect took {elapsed:.2f}s on adversarial input"
 
 
+def test_no_quadratic_blowup_setx_alternative():
+    # QA (round-3 follow-up): an unbounded `[^\r\n]*?` gap in
+    # INTERP_ENV_ALWAYS_RE's own `setx` alternative (copied loosely from
+    # AEGIS_ENV_BYPASS_RE's identical, also-since-fixed shape) let many
+    # repeated `setx <unrelated>` occurrences with no real BASH_ENV/
+    # PYTHONSTARTUP anywhere re-attempt an unbounded scan to the end of the
+    # string from every occurrence -- reproduced through the real shell and
+    # Write/Edit paths, not just the raw pattern.
+    from aegis import patterns
+
+    text = "setx NODE_OPTIONS val " * 10_000 + "--import"
+    start = time.time()
+    patterns.INTERP_ENV_ALWAYS_RE.search(text)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"INTERP_ENV_ALWAYS_RE took {elapsed:.2f}s on adversarial setx input"
+
+    start = time.time()
+    evaluate(_shell(text), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"evaluate() took {elapsed:.2f}s on adversarial setx shell input"
+
+    start = time.time()
+    evaluate(_write(".env", text), EMPTY)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, f"evaluate() took {elapsed:.2f}s on adversarial setx Write content"
+
+
+def test_true_positive_with_many_preceding_occurrences_stays_fast():
+    # a genuine danger flag reachable from only a few of MANY var-name
+    # occurrences must still be both DETECTED and fast -- the per-variable
+    # pre-check in interp_env_flag_hit() must not turn into a false ALLOW
+    # just because most occurrences don't reach the real flag.
+    from aegis import patterns
+
+    unit = "setx NODE_OPTIONS val "
+    text = unit * 800 + "--import"  # real danger flag reachable within window
+    start = time.time()
+    hit = patterns.interp_env_flag_hit(text)
+    elapsed = time.time() - start
+    assert hit, "a genuine, reachable danger flag must still be detected"
+    assert elapsed < 1.0, f"interp_env_flag_hit took {elapsed:.2f}s on a true-positive input"
+
+
 def test_perf_precheck_does_not_change_detection_semantics():
     # the per-variable pre-check in interp_env_flag_hit() is an OPTIMIZATION
     # only -- it must never change which inputs are flagged, just how fast

@@ -5763,6 +5763,24 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# Bounds total scan cost the same way `normalize.scan_surface`'s own
+# `_MAX=20000` bounds shell text -- round-3 QA follow-up found that even
+# after the per-variable pre-check fix (patterns.py's own comment above
+# `interp_env_flag_hit()`), a GENUINE, reachable danger flag preceded by
+# many (not necessarily adversarial-only -- just numerous) occurrences of
+# its own variable name still costs O(occurrences x window) to find, since
+# the pre-check only short-circuits the "no danger flag anywhere" case, not
+# "danger flag present but far from most occurrences": ~0.67s measured on a
+# ~230,000-char uncapped true-positive input with 10,000 var-name
+# occurrences. The Edit/Write/MCP branch's `content` has no upstream length
+# cap the shell branch's `normalize.scan_surface` call already applies, so
+# this guard applies its own, at the same size. A dangerous assignment
+# planted past this bound in an unusually large file is a disclosed,
+# accepted gap -- the identical "never spend unbounded effort on a giant
+# blob" trade-off `normalize.py`'s own cap already makes.
+_INTERP_ENV_SCAN_MAX = 20000
+
+
 def _interp_env_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -5927,8 +5945,28 @@ def rule_interp_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``patterns.py``'s own comment above ``interp_env_flag_hit()`` for why a
     first, single COMBINED pre-check attempt still reproduced a second,
     distinct ~2.2s slowdown before landing on the per-variable version).
-    Full suite green throughout (2161 passed after all fixes' own regression
-    tests)."""
+
+    A third, focused follow-up round (independently re-verifying the four
+    fixes above plus the perf work) confirmed all four hold, found no new
+    correctness bypass, but reproduced two further real performance issues:
+    (1) an unbounded `[^\r\n]*?` gap in ``INTERP_ENV_ALWAYS_RE``'s own
+    ``setx`` alternative (~0.75s on a ~40,000-char adversarial input),
+    closed by bounding it to `{0,200}?` -- the identical unbounded shape
+    was then found, confirmed, and ALSO fixed in the unrelated, pre-existing
+    ``AEGIS_ENV_BYPASS_RE`` it was loosely copied from (a genuine, separate
+    ~17s DoS in an already-shipped guard, reproduced through the real
+    ``evaluate()`` path and fixed the same way -- see that regex's own
+    updated comment in ``patterns.py``); (2) even with the per-variable
+    pre-check, a GENUINE, reachable danger flag preceded by many occurrences
+    of its own var name still costs O(occurrences x window) (~0.67s on a
+    ~230,000-char uncapped true positive), and the Edit/Write/MCP branch's
+    ``content`` has no upstream length cap the shell branch's
+    ``normalize.scan_surface`` call already applies -- closed by capping
+    both branches' scan text to ``_INTERP_ENV_SCAN_MAX`` (20,000 chars, the
+    same bound and the same "never spend unbounded effort on a giant blob"
+    trade-off ``normalize.py``'s own cap already makes), confirmed to hold
+    even at 10x the originally-reported adversarial input size. Full suite
+    green throughout (2164 passed after all fixes' own regression tests)."""
     cfg = getattr(policy, "interp_env_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -5943,7 +5981,7 @@ def rule_interp_env_protect(ev: Event, policy=None) -> Optional[Decision]:
         return would
 
     if _is_shell(ev):
-        text = _shell_scan(ev)
+        text = _shell_scan(ev)[:_INTERP_ENV_SCAN_MAX]
         hit = bool(patterns.INTERP_ENV_ALWAYS_RE.search(text)
                    or patterns.interp_env_flag_hit(text))
         if not hit:
@@ -5976,6 +6014,7 @@ def rule_interp_env_protect(ev: Event, policy=None) -> Optional[Decision]:
         content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
         if not content:
             return None
+        content = content[:_INTERP_ENV_SCAN_MAX]
         hit = bool(patterns.INTERP_ENV_ALWAYS_RE.search(content)
                    or patterns.interp_env_flag_hit(content))
         if not hit:
