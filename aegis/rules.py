@@ -5822,6 +5822,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.HELM_TEMPLATES_PATH_RE, "a Helm chart template"),
 )
 
 
@@ -6408,18 +6409,19 @@ def rule_helm_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
     control, so neither path is agent-self-escapable, the same invariant
     every escapable guard in this file holds.
 
-    Deliberately excluded from the fetch-to-file backstop's
-    `_FETCH_HUMAN_ESCAPABLE` list (unlike most sibling `*_protect` path
-    regexes): `HELM_TEMPLATES_PATH_RE` alone matches ANY YAML file under
-    ANY `templates/` directory, the overwhelming majority of which are
-    ordinary chart resources with no hook annotation at all -- backstopping
-    on that bare path would ask on `curl -o mychart/templates/deployment.yaml
-    ...` for the common case, not just the hook-planting one, the same
-    "name+directory joint condition, too broad to backstop on the path alone"
-    trade-off `rule_path_hijack_protect`'s own exclusion from that same list
-    already documents for a structurally different reason (there: a command
-    name plus a directory; here: a path segment with no content signal at
-    all reachable from the bare path check alone).
+    Included in the fetch-to-file backstop's `_FETCH_HUMAN_ESCAPABLE` list
+    (`rule_fetch_to_file_protect`), the same way `TF_PATH_RE` already is for
+    Terraform: an early draft excluded it on the theory that `HELM_TEMPLATES_
+    PATH_RE` alone (any YAML file under any `templates/` directory, no
+    content signal) was "too generic" to backstop on the bare path -- but
+    `TF_PATH_RE` is equally a bare, content-blind extension match with no
+    fixed directory at all, so that distinction didn't actually hold up
+    under design review and would have been a live gap (a `curl -o
+    mychart/templates/job.yaml ...` sailing through untouched) rather than a
+    principled exclusion. `rule_path_hijack_protect`'s own exclusion from
+    that same list remains structurally different and still applies: a
+    command name PLUS a directory is a joint condition no single path
+    regex here expresses, not a volume argument.
 
     Honest scope, the same denylist trade-offs every guard in this file
     discloses (see `HELM_HOOK_HIT_RE`'s own comment in patterns.py for the
@@ -6497,7 +6499,18 @@ def rule_helm_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
         # same line, and `_override_allowed` below scans the ORIGINAL,
         # unstripped `_cmd(ev)` regardless.
         scan_cmd = patterns.strip_comment_lines(cmd)
-        if not (patterns.HELM_TEMPLATES_PATH_RE.search(scan_cmd) and patterns.HELM_HOOK_HIT_RE.search(scan_cmd)):
+        # QA finding (independent adversarial review): a `cd`/`pushd`-into-
+        # `templates` followed by a bare-filename write (heredoc, `sed -i`,
+        # `jq`+`sponge`, `tee`, ...) never produces the contiguous
+        # `templates/.../x.yaml` match `HELM_TEMPLATES_PATH_RE` alone
+        # requires, the same gap `rule_devcontainer_exec_protect`'s own
+        # `DEVCONTAINER_CD_RE`/`DEVCONTAINER_BARE_FILENAME_RE` pair exists
+        # to close for its own directory -- see `HELM_TEMPLATES_CD_RE`'s own
+        # comment in patterns.py for the full reasoning and QA history.
+        path_hit = (patterns.HELM_TEMPLATES_PATH_RE.search(scan_cmd)
+                    or (patterns.HELM_TEMPLATES_CD_RE.search(scan_cmd)
+                        and patterns.HELM_BARE_YAML_FILENAME_RE.search(scan_cmd)))
+        if not (path_hit and patterns.HELM_HOOK_HIT_RE.search(scan_cmd)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_HELM_HOOKS")
                 or _helm_hooks_allowed_by_policy(cfg, _cmd(ev))):

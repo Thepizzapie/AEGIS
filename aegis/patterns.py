@@ -4847,9 +4847,87 @@ TF_EXEC_HIT_RE = re.compile(
 # immediately before the literal "templates" segment, not just the bare
 # substring -- an unrelated directory that merely ENDS in "templates"
 # (`mytemplates/`, `email-templates/`) must not match.
+#
+# QA finding (independent adversarial review, bypass-hunting round -- TWO
+# rounds; a first fix attempt was itself found insufficient by a follow-up
+# verification pass, noted below). The original nested-subdirectory group
+# used `_CI_MULTI` (which, unlike `_CI_SEG`, does NOT exclude `/`/`\`)
+# sitting directly adjacent to another `_SEP` -- the same catastrophic-
+# backtracking shape `CI_WORKFLOW_PATH_RE`'s own `.github/actions/` branch
+# independently turned out to share (reproduced there too, at smaller
+# scale). A run of alternating `/`/`.` characters (e.g. `templates` + `/.`
+# * 4000 + `/`) gives the engine an exponential number of ways to split
+# that run between `_CI_MULTI` and the following `_SEP`, since both accept
+# the same characters -- reproduced hanging `.search()` for 60+ seconds on
+# an 8000-character string, reachable with NO length cap at all through the
+# Edit/Write/MCP branch's `file_path` argument (unlike the shell branch,
+# which `normalize.scan_surface` caps at 20000 chars -- itself not a real
+# fix, since the hang is well inside that cap).
+#
+# First fix attempt swapped `_CI_MULTI` for `_CI_SEG` in the repeated group
+# (`_CI_SEG` excludes `/`/`\`, the same exclusion every OTHER multi-segment
+# path regex in this file already relies on for this exact reason) --
+# insufficient: `_CI_SEG` still does NOT exclude `.`, so a single `.`
+# still qualifies as a whole one-character "segment", and the SAME
+# adversarial `/.` run can still be partitioned ambiguously between (a) an
+# iteration of the group matching `.` as a segment plus `/` as its
+# following `_SEP`, and (b) `_SEP`'s own internal `(?:\.[/\\]+)*` star
+# consuming multiple `/.` pairs in one iteration directly -- an exponential
+# number of ways to divide the same run between the two constructs either
+# way, confirmed still hanging after the first fix. Actually fixed by
+# excluding `.` from the repeated segment's character class too
+# (`_HELM_SEG_NODOT` below, local to this guard, not the shared `_CI_SEG` --
+# changing that shared constant risks unrelated behavior in every other
+# guard that reuses it) -- with neither `/`, `\`, nor `.` in the repeated
+# segment's alphabet, it can no longer match any part of a `/`/`.`-only run
+# at all, so that run can only ever be consumed by `_SEP` itself, with no
+# competing construct to create ambiguity against. The FINAL segment
+# (the filename immediately before `.ya?ml`) keeps using `_CI_SEG` --
+# fine even though it still allows `.`, since it is matched at most ONCE
+# per overall attempt (not inside a `*` repetition), so its own bounded
+# {1,200} exploration contributes at most a constant amount of extra work,
+# not a multiplicative one. Re-verified against the same 8000-character
+# adversarial input (now resolves in well under 1ms), against a second,
+# independently-constructed adversarial string targeting the middle group
+# specifically, and against every existing positive/negative path test in
+# tests/test_helm_hooks_protect.py. Accepted, narrow scope trade-off: an
+# intermediate chart subdirectory whose name itself contains a literal `.`
+# (e.g. `templates/v1.2/job.yaml`) is not matched -- vanishingly rare for a
+# Helm chart's own directory naming, and a false ASK if it occurs, not a
+# false ALLOW.
+_HELM_SEG_NODOT = r"[^\s'\"/\\.]{1,200}"
 HELM_TEMPLATES_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])templates" + _WIN_TRIM + _SEP
-    + r"(?:" + _CI_MULTI + _SEP + r")?" + _CI_SEG + r"\.ya?ml" + _CI_END,
+    + r"(?:" + _HELM_SEG_NODOT + _SEP + r")*" + _CI_SEG + r"\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+# QA finding (independent adversarial review, bypass-hunting round): like
+# `rule_devcontainer_exec_protect`'s own `DEVCONTAINER_CD_RE`/
+# `DEVCONTAINER_BARE_FILENAME_RE` pair (see that pattern's own comment for
+# the full reasoning), `HELM_TEMPLATES_PATH_RE` requires "templates" and the
+# `.yaml`/`.yml` filename in one CONTIGUOUS match -- an entirely ordinary
+# `cd mychart/templates && cat > job.yaml <<'EOF' ... EOF` (or `pushd`/
+# PowerShell `Set-Location`/`Push-Location`) never produces that adjacency,
+# even though the command unambiguously targets a file under `templates/`
+# with zero obfuscation. Reproduced as a real, silent-ALLOW bypass (a hook
+# Job planted this way sailed through even under `mode: deny`). Companion
+# pair, used together (both required, ANDed at the call site in
+# `rule_helm_hooks_protect`'s shell branch) the same way its devcontainer
+# sibling already does: `HELM_TEMPLATES_CD_RE` flags a `cd`/`pushd`/
+# `Set-Location`/`Push-Location` INTO `templates` (or a subdirectory of it)
+# anywhere in the command, and `HELM_BARE_YAML_FILENAME_RE` flags a bare
+# `*.yaml`/`*.yml` filename reference with no `templates/` prefix required.
+# Neither alone is high-signal (a bare `cd templates` doesn't touch any
+# file; a bare `*.yaml` filename could belong to an unrelated tool) -- both
+# co-occurring in the same whole command, alongside the real hook-annotation
+# content hit `HELM_HOOK_HIT_RE` already requires regardless, is.
+HELM_TEMPLATES_CD_RE = re.compile(
+    r"\b(?:cd|pushd|Set-Location|Push-Location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?templates\b",
+    re.IGNORECASE,
+)
+HELM_BARE_YAML_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])" + _CI_SEG + r"\.ya?ml" + _CI_END,
     re.IGNORECASE,
 )
 # Content check: the hook annotation itself, with a real lifecycle value --
@@ -4869,8 +4947,23 @@ HELM_TEMPLATES_PATH_RE = re.compile(
 # annotation that merely happens to be named similarly doesn't gate. A
 # comma-separated multi-hook value (`pre-install,post-install`) matches on
 # its first name, which is enough signal.
+# QA finding (independent adversarial review, bypass-hunting round): a
+# completely ordinary `/`-delimited `sed -i 's/.../helm.sh\/hook.../'`
+# substitution -- the natural syntax anyone reaches for with sed's own
+# default delimiter, not exotic obfuscation -- must backslash-escape the
+# interior `/` in "helm.sh/hook" so sed doesn't read it as the pattern's own
+# field separator. sed strips that backslash before it ever reaches the
+# file, so the FILE ends up with the real, unescaped `helm.sh/hook`
+# annotation, but the COMMAND TEXT this guard scans still contains the
+# escaped `helm.sh\/hook`, which the original literal-slash match missed
+# entirely -- a real, reproduced false ALLOW. Closed by tolerating one
+# optional backslash immediately before the slash, the same "tolerate an
+# escaped delimiter" fix `rule_ld_preload_protect`'s own QA history already
+# applied for a backslash before each interior dot in "ld.so.preload" (see
+# its docstring in this file) -- harmless for the unescaped, overwhelmingly
+# common case, since an optional group matches zero-width just as well.
 HELM_HOOK_HIT_RE = re.compile(
-    r"[\"']?helm\.sh/hook[\"']?\s*:\s*[\"']?"
+    r"[\"']?helm\.sh\\?/hook[\"']?\s*:\s*[\"']?"
     r"(?:pre-install|post-install|pre-delete|post-delete|pre-upgrade"
     r"|post-upgrade|pre-rollback|post-rollback|test-success|test-failure|test)\b",
     re.IGNORECASE,

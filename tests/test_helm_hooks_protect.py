@@ -266,6 +266,91 @@ def test_shell_hook_literal_without_templates_path_not_gated():
     assert d.action == Action.ALLOW
 
 
+def test_shell_cd_into_templates_then_bare_filename_gated():
+    # QA finding (independent adversarial review, bypass-hunting round): a
+    # `cd`/`pushd` into templates/ followed by a bare-filename heredoc write
+    # never produces the contiguous `templates/.../x.yaml` match
+    # HELM_TEMPLATES_PATH_RE alone requires -- reproduced as a real,
+    # silent-ALLOW bypass (sailed through even under mode: deny) before the
+    # HELM_TEMPLATES_CD_RE/HELM_BARE_YAML_FILENAME_RE co-occurrence fix,
+    # mirroring rule_devcontainer_exec_protect's own identical fix.
+    cmd = ("cd mychart/templates && cat > job.yaml <<'EOF'\n"
+           + PRE_INSTALL_HOOK_YAML + "EOF")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_pushd_into_templates_then_bare_filename_gated():
+    d = evaluate(_shell(
+        "pushd mychart/templates && "
+        "echo '    \"helm.sh/hook\": pre-install' >> job.yaml"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_cd_into_templates_no_hook_content_not_gated():
+    # The cd/bare-filename co-occurrence alone is not high-signal -- it must
+    # still require the real hook-annotation content hit.
+    d = evaluate(_shell(
+        "cd mychart/templates && echo 'kind: ConfigMap' >> data.yaml"), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_shell_bare_filename_without_cd_into_templates_not_gated():
+    # A bare *.yaml filename with the hook literal, but no cd/pushd into
+    # templates/ anywhere in the command, must not gate on the fallback
+    # alone -- it still needs either the direct contiguous path match or
+    # the cd-into-templates signal.
+    d = evaluate(_shell(
+        'echo \'    "helm.sh/hook": pre-install\' >> job.yaml'), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_shell_sed_escaped_delimiter_slash_gated():
+    # QA finding (independent adversarial review, bypass-hunting round): an
+    # ordinary `/`-delimited sed substitution must backslash-escape the
+    # interior `/` in "helm.sh/hook" so sed doesn't read it as its own field
+    # separator -- sed strips that backslash before the file is written, so
+    # the file ends up with the real, unescaped annotation, but the command
+    # text this guard scans kept the backslash. Reproduced as a real false
+    # ALLOW before the optional-backslash fix.
+    cmd = (r'''sed -i 's/replicas: 1/replicas: 1\n  annotations:\n    '''
+           r'''"helm.sh\/hook": pre-install/' mychart/templates/job.yaml''')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_path_regex_no_catastrophic_backtracking():
+    # QA finding (independent adversarial review, bypass-hunting round): the
+    # original nested-subdirectory group used a slash-accepting quantifier
+    # directly adjacent to another slash-only separator, giving the engine
+    # an exponential number of ways to split a run of "/." characters
+    # between them -- reproduced hanging .search() for 40+ seconds on an
+    # 8000-character adversarial `file_path` value, reachable with NO length
+    # cap at all through the Edit/Write/MCP branch (unlike the shell branch,
+    # which normalize.scan_surface caps well above where the hang occurs).
+    # Fixed by rebuilding the nested-path span from non-overlapping
+    # character classes; this must now resolve in well under a second.
+    import time
+    from aegis import patterns
+    p = "templates" + ("/." * 4000) + "/"
+    start = time.time()
+    patterns.HELM_TEMPLATES_PATH_RE.search(p)
+    assert time.time() - start < 1.0
+
+
+def test_edit_form_no_catastrophic_backtracking_via_file_path():
+    # Same adversarial input, but through the actual guard entry point (the
+    # Edit/Write/MCP branch's file_path argument) rather than the pattern
+    # directly -- the Edit/Write/MCP branch has no length cap on file_path
+    # at all, unlike the shell branch's normalize.scan_surface cap.
+    import time
+    p = "templates" + ("/." * 4000) + "/"
+    start = time.time()
+    d = evaluate(_write(p, "kind: Job"), EMPTY)
+    assert time.time() - start < 1.0
+    assert d.action == Action.ALLOW
+
+
 def test_shell_comment_only_mention_not_gated():
     cmd = ('cat >> mychart/templates/job.yaml <<\'EOF\'\n'
            '# TODO: consider helm.sh/hook: pre-install someday\n'
