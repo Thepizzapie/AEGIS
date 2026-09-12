@@ -4947,21 +4947,62 @@ HELM_BARE_YAML_FILENAME_RE = re.compile(
 # annotation that merely happens to be named similarly doesn't gate. A
 # comma-separated multi-hook value (`pre-install,post-install`) matches on
 # its first name, which is enough signal.
-# QA finding (independent adversarial review, bypass-hunting round): a
-# completely ordinary `/`-delimited `sed -i 's/.../helm.sh\/hook.../'`
-# substitution -- the natural syntax anyone reaches for with sed's own
-# default delimiter, not exotic obfuscation -- must backslash-escape the
-# interior `/` in "helm.sh/hook" so sed doesn't read it as the pattern's own
-# field separator. sed strips that backslash before it ever reaches the
-# file, so the FILE ends up with the real, unescaped `helm.sh/hook`
-# annotation, but the COMMAND TEXT this guard scans still contains the
-# escaped `helm.sh\/hook`, which the original literal-slash match missed
-# entirely -- a real, reproduced false ALLOW. Closed by tolerating one
-# optional backslash immediately before the slash, the same "tolerate an
-# escaped delimiter" fix `rule_ld_preload_protect`'s own QA history already
-# applied for a backslash before each interior dot in "ld.so.preload" (see
-# its docstring in this file) -- harmless for the unescaped, overwhelmingly
-# common case, since an optional group matches zero-width just as well.
+# QA finding (independent adversarial review, bypass-hunting round -- TWO
+# rounds; a first fix was itself found incomplete by a follow-up
+# verification pass, noted below). A completely ordinary `/`-delimited
+# `sed -i 's/.../helm.sh\/hook.../'` substitution -- the natural syntax
+# anyone reaches for with sed's own default delimiter, not exotic
+# obfuscation -- must backslash-escape the interior `/` in "helm.sh/hook" so
+# sed doesn't read it as the pattern's own field separator. sed strips that
+# backslash before it ever reaches the file, so the FILE ends up with the
+# real, unescaped `helm.sh/hook` annotation, but the COMMAND TEXT this
+# guard scans still contains the escaped `helm.sh\/hook`, which the
+# original literal-slash match missed entirely -- a real, reproduced false
+# ALLOW. First fix tolerated one optional backslash immediately before the
+# slash in this regex directly, the same "tolerate an escaped delimiter"
+# fix `rule_ld_preload_protect`'s own QA history already applied for a
+# backslash before each interior dot in "ld.so.preload".
+#
+# A follow-up adversarial-verification round (deliberately re-attacking the
+# fix itself, not just re-confirming the original repro) found that fix
+# incomplete: (a) a sed replacement built to leave a DOUBLE backslash in the
+# command text before the delimiter slash (`s/.../helm.sh\\/hook.../`,
+# itself valid sed syntax) still produces the identical single-backslash
+# `helm.sh\/hook` in the FILE -- confirmed via PyYAML, `\/` is a real,
+# standard-permitted double-quoted-scalar escape -- but the regex's
+# single-backslash-only `\\?` didn't match the command text's two
+# backslashes; and (b), more severe, a plain Edit/Write `content` string
+# using YAML's own standard `\xHH` hex-escape (`"helm.sh\x2Fhook"`) decodes
+# to the exact same real annotation key -- confirmed via both PyYAML and
+# Go's `yaml.v3` (the library family Helm/Kubernetes actually use) -- with
+# NO shell/sed trickery needed at all, reachable purely through the
+# Edit/Write/MCP branch. A third form the same round proposed (a backslash
+# before the interior DOT, `helm\.sh\/hook`) was independently re-checked
+# and does NOT hold: `\.` is not a valid YAML double-quoted escape at all
+# (PyYAML raises `ScannerError: found unknown escape character '.'`), so a
+# real `helm`/Kubernetes YAML parser would reject that chart's template
+# outright -- never actually live, not a real bypass, and correctly left
+# ungated.
+#
+# Closed at the source rather than chasing each escape form as its own
+# regex alternative: `decode_common_string_escapes` (below) undoes the
+# small, closed set of YAML/JSON backslash escapes that can encode an
+# arbitrary ASCII character -- doubled backslash, `\xHH`, `\uHHHH`, and a
+# literal `\/` -- against the SCANNED text before this regex ever runs, the
+# same "decode, then match the real content" principle
+# `rule_claude_hooks_protect`'s own QA history already applied for a JSON
+# `\uXXXX`-escaped key (see its docstring) -- deliberately NOT a full
+# `yaml.safe_load()` of the whole file, since a real chart's `templates/`
+# content routinely contains Go template `{{ ... }}` directives that are
+# not valid YAML at all until rendered, so a real parse would raise on the
+# overwhelmingly common case rather than the exception. This textual
+# decode is a heuristic, not a real parser -- the single-backslash
+# tolerance below is kept as redundant defense-in-depth (harmless: decoding
+# already normalizes the common cases to plain text before this regex
+# runs), and `\uXXXX`-surrogate-pair reassembly, `\UXXXXXXXX`, and
+# octal-style escapes remain unhandled, the same "computed indirectly"
+# class every sibling guard in this file already accepts as a disclosed,
+# residual gap.
 HELM_HOOK_HIT_RE = re.compile(
     r"[\"']?helm\.sh\\?/hook[\"']?\s*:\s*[\"']?"
     r"(?:pre-install|post-install|pre-delete|post-delete|pre-upgrade"
@@ -5002,3 +5043,49 @@ _COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 
 def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
+
+
+# Decodes the small, closed set of backslash escapes YAML/JSON double-quoted
+# strings support that can encode an arbitrary ASCII character -- added for
+# `rule_helm_hooks_protect` (see `HELM_HOOK_HIT_RE`'s own comment for the full
+# QA history: a real, reproduced false ALLOW via a plain Edit/Write `content`
+# string using YAML's own standard `\xHH` hex-escape, no shell trickery
+# needed) but written as a general, reusable helper rather than a private
+# one, the same way `strip_comment_lines` already is -- any sibling
+# `*_protect` guard whose content check matches a literal token inside a
+# YAML/JSON string is exposed to the identical escape-encoding bypass class
+# and can reuse this rather than re-deriving it. Handles, in one left-to-
+# right pass: a doubled backslash (`\\` -> `\`, matches both YAML's and
+# JSON's own escaping of a literal backslash), a bare `\/` (not a standard
+# JSON escape, but a real, PyYAML-permitted YAML double-quoted-scalar one,
+# and the exact form a `/`-delimited `sed` substitution naturally leaves
+# behind), `\xHH` (YAML-only, two hex digits), and `\uHHHH` (YAML and JSON,
+# four hex digits). Deliberately NOT a full `yaml.safe_load()`/`json.loads()`
+# of the whole text -- a real Helm chart's `templates/` content routinely
+# contains Go template `{{ ... }}` directives that are not valid YAML at all
+# until rendered, so parsing the whole document would raise on the
+# overwhelmingly common case rather than the exception; this is a narrow,
+# textual, best-effort decode, not a real parser. Known, disclosed gaps
+# (same "computed indirectly" class every guard in this file already
+# accepts): `\uXXXX` surrogate-pair reassembly (a character outside the
+# Basic Multilingual Plane encoded as a UTF-16 surrogate pair across TWO
+# `\uXXXX` escapes decodes to two separate, wrong code points here, not the
+# one intended character), `\UXXXXXXXX` (JSON has no such escape; YAML's own
+# 8-hex-digit form is not handled), and an octal-style `\NNN` escape (not a
+# standard YAML/JSON scalar escape at all, so deliberately not chased) all
+# remain unhandled.
+_STRING_ESCAPE_RE = re.compile(r"\\\\|\\x([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})|\\/")
+
+
+def _decode_one_string_escape(m: "re.Match") -> str:
+    if m.group(0) == "\\\\":
+        return "\\"
+    if m.group(1):
+        return chr(int(m.group(1), 16))
+    if m.group(2):
+        return chr(int(m.group(2), 16))
+    return "/"  # the bare `\/` alternative
+
+
+def decode_common_string_escapes(text: str) -> str:
+    return _STRING_ESCAPE_RE.sub(_decode_one_string_escape, text)

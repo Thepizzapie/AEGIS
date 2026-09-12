@@ -319,6 +319,42 @@ def test_shell_sed_escaped_delimiter_slash_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_shell_sed_doubled_backslash_delimiter_gated():
+    # QA finding (independent adversarial-VERIFICATION round, re-attacking
+    # the fix above rather than just re-confirming it): a sed replacement
+    # built to leave a DOUBLE backslash in the command text before the
+    # delimiter slash (`helm.sh\\/hook`, itself valid sed syntax) still
+    # produces the identical single-backslash `helm.sh\/hook` in the FILE --
+    # `\/` is a real, PyYAML-permitted double-quoted-scalar escape -- but
+    # the single-backslash-only tolerance from the fix above didn't match
+    # two backslashes. Reproduced as a real false ALLOW before the
+    # escape-decode fix.
+    cmd = (r'''sed -i 's/X/"helm.sh\\/hook": pre-install/' '''
+           r'''mychart/templates/job.yaml''')
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_write_yaml_hex_escaped_slash_gated():
+    # QA finding (independent adversarial-verification round): a plain
+    # Edit/Write `content` string using YAML's own standard `\xHH`
+    # hex-escape (no shell/sed trickery at all) decodes to the real
+    # annotation key -- confirmed via both PyYAML and Go's yaml.v3 (the
+    # library family Helm/Kubernetes actually use). Reproduced as a real
+    # false ALLOW, even under mode: deny, before the escape-decode fix.
+    content = ('metadata:\n  annotations:\n    "helm.sh\\x2Fhook": '
+               'pre-install\n')
+    d = evaluate(_write("mychart/templates/job.yaml", content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_write_yaml_unicode_escaped_slash_gated():
+    content = ('metadata:\n  annotations:\n    "helm.sh\\u002Fhook": '
+               'post-upgrade\n')
+    d = evaluate(_write("mychart/templates/job.yaml", content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_path_regex_no_catastrophic_backtracking():
     # QA finding (independent adversarial review, bypass-hunting round): the
     # original nested-subdirectory group used a slash-accepting quantifier

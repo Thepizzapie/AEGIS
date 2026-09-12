@@ -6469,6 +6469,13 @@ def rule_helm_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
         # hook here later`) false-positived identically to a genuine
         # annotation.
         scan_content = patterns.strip_comment_lines(content)
+        # QA finding (independent adversarial-verification round, re-
+        # attacking the sed-escape fix itself): an ordinary YAML `\xHH`
+        # hex-escape in a plain Edit/Write `content` string
+        # (`"helm.sh\x2Fhook"`) decodes to the real annotation key with NO
+        # shell involved at all -- see `HELM_HOOK_HIT_RE`'s own comment in
+        # patterns.py for the full QA history. Decoded before matching.
+        scan_content = patterns.decode_common_string_escapes(scan_content)
         if not patterns.HELM_HOOK_HIT_RE.search(scan_content):
             return None
         if (os.environ.get("AEGIS_ALLOW_HELM_HOOKS")
@@ -6499,6 +6506,13 @@ def rule_helm_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
         # same line, and `_override_allowed` below scans the ORIGINAL,
         # unstripped `_cmd(ev)` regardless.
         scan_cmd = patterns.strip_comment_lines(cmd)
+        # Same escape-decode as the Edit/Write/MCP branch above (see its
+        # own comment, and HELM_HOOK_HIT_RE's in patterns.py) -- a sed
+        # replacement built to leave a doubled backslash in the command
+        # text before the delimiter slash still produces the real,
+        # single-backslash annotation in the FILE, evading a single-
+        # backslash-only tolerance.
+        scan_cmd = patterns.decode_common_string_escapes(scan_cmd)
         # QA finding (independent adversarial review): a `cd`/`pushd`-into-
         # `templates` followed by a bare-filename write (heredoc, `sed -i`,
         # `jq`+`sponge`, `tee`, ...) never produces the contiguous
