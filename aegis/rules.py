@@ -6353,6 +6353,171 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _helm_hooks_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_helm_hooks_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Helm chart lifecycle-hook annotation
+    (`helm.sh/hook: pre-install`/`post-install`/`pre-upgrade`/`post-upgrade`/
+    `pre-rollback`/`post-rollback`/`pre-delete`/`post-delete`/`test`) on a
+    resource under a chart's `templates/` directory.
+
+    THREAT MODEL: the same shape `rule_terraform_exec_protect` exists for,
+    one layer into the Kubernetes/GitOps ecosystem -- Helm itself, as a
+    documented, first-class feature, creates and runs the annotated resource
+    (almost always a `Job`) at the named point in the release lifecycle, no
+    config-parsing bug or hijack needed. `pre-install`/`post-install` fire on
+    the very next `helm install`; `pre-upgrade`/`post-upgrade` on the next
+    `helm upgrade`; `pre-delete`/`post-delete` on the next `helm uninstall` --
+    all routine, expected triggers for a chart under active development, run
+    by this session, a teammate, or (more likely than for Terraform) an
+    unattended GitOps controller (ArgoCD, Flux) reconciling the chart on
+    every push, with no human `apply`-style confirmation gate at all. The
+    hook Job runs with whatever ServiceAccount/RBAC the target namespace
+    grants -- in a GitOps cluster that is frequently the same broad, standing
+    in-cluster credentials the controller itself already holds, the same
+    credential-exposure blast radius `rule_cloud_cred_exec_protect` exists to
+    gate one layer up in this file. A chart's `templates/*.yaml` is
+    ordinarily TRACKED and reviewed like any other source file, so a hook
+    annotation planted on an otherwise-unremarkable resource reads as
+    routine chart code unless a reviewer opens that specific resource's
+    metadata -- the same "trusted file type, unread body" trap
+    `rule_terraform_exec_protect`/`rule_ci_workflow_protect` already exist
+    for.
+
+    Config (`policy.helm_hooks`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate -- a
+    repo's own reviewed, intentional bootstrap/seed hook, say). Defaults to
+    `ask`, not `deny`, for the same reason every sibling `*_protect` guard
+    does: chart template YAML changes constantly as routine, sanctioned
+    work, and this guard already narrows to the specific hook-capable
+    annotation (not every `templates/` write) -- it just needs a human to
+    have actually looked at this one.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle `AEGIS_ALLOW_HELM_HOOKS=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable, the same invariant
+    every escapable guard in this file holds.
+
+    Deliberately excluded from the fetch-to-file backstop's
+    `_FETCH_HUMAN_ESCAPABLE` list (unlike most sibling `*_protect` path
+    regexes): `HELM_TEMPLATES_PATH_RE` alone matches ANY YAML file under
+    ANY `templates/` directory, the overwhelming majority of which are
+    ordinary chart resources with no hook annotation at all -- backstopping
+    on that bare path would ask on `curl -o mychart/templates/deployment.yaml
+    ...` for the common case, not just the hook-planting one, the same
+    "name+directory joint condition, too broad to backstop on the path alone"
+    trade-off `rule_path_hijack_protect`'s own exclusion from that same list
+    already documents for a structurally different reason (there: a command
+    name plus a directory; here: a path segment with no content signal at
+    all reachable from the bare path check alone).
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses (see `HELM_HOOK_HIT_RE`'s own comment in patterns.py for the
+    full reasoning): a hook value assembled indirectly (a Helm template
+    expression, a library-chart helper macro) rather than appearing as one
+    contiguous literal in the scanned text defeats this check, the same
+    "computed indirectly" class every sibling guard already accepts; the
+    shell branch is deliberately NOT clause-scoped, the same trade-off
+    `gitattrs_wiring_hit` documents at length for the identical shape; and an
+    archive/sync tool (`rsync`/`tar`/`unzip`) placing a chart template
+    without naming it as a discrete write-verb argument is not covered, the
+    same disclosed gap `rule_terraform_exec_protect` already accepts."""
+    cfg = getattr(policy, "helm_hooks", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "helm-hooks-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.HELM_TEMPLATES_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        # Strip full-line `#` comments before matching -- YAML treats a line
+        # whose first non-whitespace character is `#` as inert. Same fix,
+        # same reasoning `rule_terraform_exec_protect` already applies for
+        # its own content check: without it, a documentation/TODO comment
+        # merely MENTIONING "helm.sh/hook" (e.g. `# TODO: add a pre-install
+        # hook here later`) false-positived identically to a genuine
+        # annotation.
+        scan_content = patterns.strip_comment_lines(content)
+        if not patterns.HELM_HOOK_HIT_RE.search(scan_content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_HELM_HOOKS")
+                or _helm_hooks_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "helm-hooks-protect",
+                         f"'{p}' is planting a Helm chart lifecycle-hook "
+                         "annotation (helm.sh/hook) — the annotated "
+                         "resource runs automatically, with this release's "
+                         "own ServiceAccount/RBAC credentials, on the next "
+                         "'helm install'/'upgrade'/'uninstall' touching "
+                         "this chart — including an unattended GitOps "
+                         "controller (ArgoCD/Flux) reconciling on the next "
+                         "push, no confirmation gate needed at all. Review "
+                         "the change, then confirm with "
+                         "AEGIS_ALLOW_HELM_HOOKS=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        # Same comment-stripping as the Edit/Write/MCP branch above (see its
+        # own comment) -- a `#`-prefixed comment LINE is inert to YAML
+        # itself, so scanning it for the path/hit check is the same false-
+        # ASK-on-a-mention gap `rule_terraform_exec_protect`'s own shell
+        # branch already closes via `strip_comment_lines`. A trailing
+        # same-line `# aegis-allow` escape is unaffected -- `strip_comment_
+        # lines` only strips a line whose FIRST non-whitespace character is
+        # `#`, not an inline comment following real command text on the
+        # same line, and `_override_allowed` below scans the ORIGINAL,
+        # unstripped `_cmd(ev)` regardless.
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        if not (patterns.HELM_TEMPLATES_PATH_RE.search(scan_cmd) and patterns.HELM_HOOK_HIT_RE.search(scan_cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_HELM_HOOKS")
+                or _helm_hooks_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "helm-hooks-protect",
+                         "A Helm chart lifecycle-hook annotation "
+                         "(helm.sh/hook) is being planted on a resource "
+                         "under templates/ from a shell — it runs "
+                         "automatically, with this release's own "
+                         "ServiceAccount/RBAC credentials, on the next "
+                         "'helm install'/'upgrade'/'uninstall' touching "
+                         "this chart — including an unattended GitOps "
+                         "controller (ArgoCD/Flux) reconciling on the next "
+                         "push, no confirmation gate needed at all. A "
+                         "human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_HELM_HOOKS=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -6972,6 +7137,7 @@ _CORE_RULES = (
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
     rule_terraform_exec_protect,
+    rule_helm_hooks_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,

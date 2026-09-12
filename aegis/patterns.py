@@ -4808,6 +4808,92 @@ TF_EXEC_HIT_RE = re.compile(
 # "local-exec"-shaped substring in another produces a same-command false
 # ASK, not a false ALLOW.
 
+# ---- Helm chart hook exec-on-deploy hijack protection -------------------------
+# A Helm chart resource (almost always a `Job`, occasionally a `Pod`) carrying
+# the annotation `helm.sh/hook: pre-install` (or post-install/pre-upgrade/
+# post-upgrade/pre-rollback/post-rollback/pre-delete/post-delete/test) becomes
+# a Helm lifecycle hook: Helm itself, as a documented, first-class feature --
+# no config-parsing bug or hijack needed -- creates and runs that resource at
+# the named point in the release lifecycle. `pre-install`/`post-install` fire
+# on the very next `helm install`; `pre-upgrade`/`post-upgrade` on the next
+# `helm upgrade`; `pre-delete`/`post-delete` on the next `helm uninstall` --
+# all three routine, expected triggers for a chart under active development,
+# run by this session, a teammate, or (more likely than for Terraform) an
+# unattended GitOps controller (ArgoCD, Flux) reconciling the chart on every
+# push with no human `apply`-style confirmation gate at all. The hook Job's
+# container runs with whatever ServiceAccount/RBAC the target namespace
+# grants -- in a GitOps cluster that is frequently the same broad, standing
+# in-cluster credentials the controller itself holds, the same credential-
+# exposure blast radius `rule_terraform_exec_protect`/
+# `rule_cloud_cred_exec_protect` already exist to gate one layer up in this
+# file, here reached through routine chart authoring instead of IaC or a
+# credential-broker hijack. A chart's `templates/*.yaml` is ordinarily
+# TRACKED and reviewed like any other source file, so a hook annotation
+# planted on an otherwise-unremarkable resource (a new ConfigMap that ALSO
+# carries a `pre-install` hook Job "just to seed some data") reads as routine
+# chart code unless a reviewer opens that specific resource's metadata -- the
+# same "trusted file type, unread body" trap `rule_ci_workflow_protect`/
+# `rule_git_hooks_protect`/`rule_terraform_exec_protect` already exist for.
+#
+# Path: Helm only treats a manifest as hook-eligible when it renders from a
+# file under the chart's `templates/` directory (top-level or a subchart's
+# own `charts/<name>/templates/`) -- unlike a `.tf` file, which has no fixed
+# directory convention at all, "templates" is Helm's own fixed, required
+# location, so this gates on that directory SEGMENT (any depth, any nesting
+# of subdirectories/subcharts beneath it) rather than a bare extension --
+# the same "fixed, required directory" shape `CI_WORKFLOW_PATH_RE` uses for
+# `.github/workflows/`, not the "no fixed directory" shape `TF_PATH_RE` uses.
+# Deliberately requires a real path-separator (or start-of-string/quote)
+# immediately before the literal "templates" segment, not just the bare
+# substring -- an unrelated directory that merely ENDS in "templates"
+# (`mytemplates/`, `email-templates/`) must not match.
+HELM_TEMPLATES_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])templates" + _WIN_TRIM + _SEP
+    + r"(?:" + _CI_MULTI + _SEP + r")?" + _CI_SEG + r"\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+# Content check: the hook annotation itself, with a real lifecycle value --
+# gating on every write under `templates/` would be far too noisy (ordinary
+# chart work -- a new label, a resource limit tweak -- touches template YAML
+# constantly, unlike a git hook or CI workflow file which are rarely edited
+# at all). `helm.sh/hook` has no legitimate meaning outside this one
+# annotation key -- unlike Terraform's generic "external" (which needed a
+# `data`/`external` PAIRING check to avoid gating an unrelated word), this
+# literal key alone is already unambiguous, the same "gate on the
+# distinctive token alone" choice `TF_EXEC_HIT_RE` makes for
+# "local-exec"/"remote-exec". Matches both the quoted YAML form charts
+# conventionally use (`"helm.sh/hook": pre-install`, needed because the bare
+# key contains `.`/`/`) and the unquoted form (`helm.sh/hook: pre-install`),
+# case-insensitively, requiring the value that follows be one of Helm's own
+# real, documented hook names -- not any arbitrary word -- so an unrelated
+# annotation that merely happens to be named similarly doesn't gate. A
+# comma-separated multi-hook value (`pre-install,post-install`) matches on
+# its first name, which is enough signal.
+HELM_HOOK_HIT_RE = re.compile(
+    r"[\"']?helm\.sh/hook[\"']?\s*:\s*[\"']?"
+    r"(?:pre-install|post-install|pre-delete|post-delete|pre-upgrade"
+    r"|post-upgrade|pre-rollback|post-rollback|test-success|test-failure|test)\b",
+    re.IGNORECASE,
+)
+# Known, disclosed gaps (same shape every sibling `*_protect` guard in this
+# file already accepts): a hook value assembled indirectly (a `{{ .Values.
+# hookType }}` template expression, a `range`/`if` block building the
+# annotation, a library-chart helper macro) rather than appearing as one
+# contiguous literal defeats this check, the same "computed indirectly"
+# class `TF_EXEC_HIT_RE`'s own comment already discloses for a Terraform
+# `templatefile()`/variable-interpolated command; the shell branch is
+# deliberately NOT clause-scoped, the same trade-off `gitattrs_wiring_hit`
+# documents at length for the identical shape; an archive/sync tool
+# (`rsync`/`tar`/`unzip`) placing a chart template without naming it as a
+# discrete write-verb argument is not covered, the same disclosed gap
+# `rule_terraform_exec_protect`/`rule_git_attributes_exec_protect` already
+# accept; and a hook defined on a resource rendered from a chart's
+# `crds/` directory (Helm does render CRD manifests, but never treats them
+# as hook-eligible regardless of any annotation on them) is correctly
+# ignored by this guard only because `crds/` fails the `templates/` path
+# check -- deliberate, not a gap, since Helm itself would ignore the same
+# annotation there.
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/

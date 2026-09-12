@@ -329,6 +329,18 @@ class Policy:
     # Terraform process is already authenticated with. See
     # rules.rule_terraform_exec_protect.
     terraform_exec: dict = field(default_factory=dict)
+    # Helm chart hook exec-on-deploy hijack protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a `helm.sh/hook` lifecycle
+    # annotation (pre-install/post-install/pre-upgrade/post-upgrade/
+    # pre-rollback/post-rollback/pre-delete/post-delete/test) planted on a
+    # resource under a chart's templates/ directory -- Helm itself creates
+    # and runs the annotated resource at the named point in the release
+    # lifecycle, on the next `helm install`/`upgrade`/`uninstall` touching
+    # the chart, commonly with the same broad in-cluster credentials a
+    # GitOps controller (ArgoCD/Flux) already holds, with no confirmation
+    # gate needed at all. See rules.rule_helm_hooks_protect.
+    helm_hooks: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing
