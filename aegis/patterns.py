@@ -4823,3 +4823,79 @@ _COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 
 def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
+
+
+# ---- MCP tool-catalog integrity: rug-pull / tool-poisoning heuristics --------
+#
+# Every guard above scans a shell command or a config file's own syntax for a
+# dangerous WRITE. These scan natural-language TEXT an MCP server hands the
+# agent as a tool's own `description` (or a parameter's `description` inside
+# its `inputSchema`) -- read directly into the model's context on every
+# tool-list fetch, with no file write, no git diff, and no code review for any
+# guard above to ever see. See `aegis.mcp_integrity` for the guard that uses
+# these ("Tool Poisoning Attacks" / "MCP rug pulls", Invariant Labs 2025).
+
+# A tag vocabulary lifted from system-prompt convention has no legitimate
+# reason inside text aimed at a human skimming a tool list in a UI -- its only
+# purpose there is to read as a higher-authority instruction to the MODEL
+# parsing the same string.
+MCP_HIDDEN_TAG_RE = re.compile(
+    r"<\s*(?:important|system|instructions?|admin|override)\s*>", re.IGNORECASE)
+
+# Zero-width/invisible Unicode: smuggles text past a human reading the
+# rendered description while an LLM's tokenizer still sees it in full.
+# (escaped, not typed literally -- these characters are invisible in a diff
+# and easy to lose or corrupt through an editor/encoding round-trip)
+MCP_INVISIBLE_UNICODE_RE = re.compile(
+    "[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
+
+# "Don't tell the user" -- the signature of a Tool Poisoning Attack: the
+# payload only works if the human operator never finds out the model was
+# instructed to do something extra.
+MCP_SILENCE_USER_RE = re.compile(
+    r"\b(?:do\s+not|don'?t|never)\s+(?:tell|inform|mention|notify|disclose|show)\s+"
+    r"(?:this\s+|it\s+)?(?:to\s+)?(?:the\s+)?user\b"
+    r"|\bwithout\s+(?:telling|informing|notifying)\s+(?:the\s+)?user\b"
+    r"|\bkeep\s+this\s+(?:secret|hidden)\s+from\s+the\s+user\b",
+    re.IGNORECASE,
+)
+
+# Override-authority language -- the same phrasing a prompt-injected web page
+# or file uses, now arriving through a channel (tool metadata) the model
+# treats as trusted tool-catalog information rather than untrusted content.
+MCP_OVERRIDE_RE = re.compile(
+    # a qualifier is repeatable ("ignore all previous instructions" stacks
+    # "all" AND "previous" ahead of the noun, not just one or the other)
+    r"\b(?:ignore|disregard|override)\s+(?:(?:all|any|every|the\s+above|prior|"
+    r"previous)\s+)+(?:instructions?|rules?|guidance)\b",
+    re.IGNORECASE,
+)
+
+# An instruction to read a credential path and hand its contents back through
+# one of the tool's OWN parameters -- the exfiltration primitive a
+# "helpful-sounding" description uses to turn an unrelated tool call into a
+# credential leak, with no separate network call for Containment's exfil
+# rule to ever catch.
+#
+# No `\b` immediately ahead of the credential-path alternation: `~`/`/`/`.`
+# are all non-word characters, so a boundary assertion there would need a
+# word character on one side -- exactly what "~/.ssh/..." doesn't have right
+# before the tilde, which silently made the whole alternative unmatchable.
+# `credentials?` is the one alternative that starts on a word character, so
+# it keeps its own `\b` to avoid matching inside a longer identifier.
+MCP_CRED_READ_INSTRUCTION_RE = re.compile(
+    r"\b(?:read|include|attach|pass|send|append|copy)\b[^.\n]{0,80}(?:"
+    r"~?/?\.ssh/(?:id_rsa|id_ed25519|config)|\.aws/credentials|\.netrc|"
+    r"\.env\b|environment\s+variables?|api[_ ]?keys?|private[_ ]?keys?|"
+    r"\bcredentials?\b"
+    r")[^.\n]{0,80}\b(?:parameter|field|argument|response|reply)\b",
+    re.IGNORECASE,
+)
+
+MCP_TOOL_POISON_RE = re.compile(
+    "|".join(p.pattern for p in (
+        MCP_HIDDEN_TAG_RE, MCP_SILENCE_USER_RE, MCP_OVERRIDE_RE,
+        MCP_CRED_READ_INSTRUCTION_RE,
+    )),
+    re.IGNORECASE,
+)
