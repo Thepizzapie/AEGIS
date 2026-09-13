@@ -123,6 +123,15 @@ class Policy:
     # allow: [regex on path/command]}. Empty -> defaults (mode=deny) apply.
     # See rules.rule_mcp_config_protect.
     mcp_config: dict = field(default_factory=dict)
+    # MCP tool-catalog integrity (poisoning + rug-pull drift): {mode:
+    # deny|ask|monitor|off, allow: [regex on server id / tool name]}. Empty ->
+    # defaults (mode=ask) apply. Distinct from mcp_config above: that guards
+    # the server-CONFIG file (a durable, cross-session backdoor); this guards
+    # a live server's own tool CATALOG (name/description/inputSchema fetched
+    # via tools/list), which a hook-level rule never sees at all since it
+    # isn't a tool call or a file write. Not evaluated by the rules engine —
+    # called directly via aegis.mcp.audit_tool_list()/aegis.mcp_integrity.
+    mcp_tool_integrity: dict = field(default_factory=dict)
     # CI/CD pipeline-definition protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # See rules.rule_ci_workflow_protect.

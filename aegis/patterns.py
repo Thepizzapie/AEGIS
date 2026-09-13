@@ -4823,3 +4823,114 @@ _COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 
 def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
+
+
+# ---- MCP tool-catalog integrity: rug-pull / tool-poisoning heuristics --------
+#
+# Every guard above scans a shell command or a config file's own syntax for a
+# dangerous WRITE. These scan natural-language TEXT an MCP server hands the
+# agent as a tool's own `description` (or a parameter's `description` inside
+# its `inputSchema`) -- read directly into the model's context on every
+# tool-list fetch, with no file write, no git diff, and no code review for any
+# guard above to ever see. See `aegis.mcp_integrity` for the guard that uses
+# these ("Tool Poisoning Attacks" / "MCP rug pulls", Invariant Labs 2025).
+#
+# DISCLOSED GAP (same shape every content-based guard in this file already
+# accepts, e.g. TF_EXEC_HIT_RE's own comment on indirectly-assembled values):
+# these are closed-vocabulary, English-only heuristics on free-form prose, not
+# an exhaustive classifier. QA (adversarial round) confirmed rewordings that
+# avoid the exact listed verbs/nouns (a synonym, a different closed-vocabulary
+# gap, a homoglyph substitution, a different human language entirely) are NOT
+# caught by these patterns alone. This is the same "false ASK is the safe
+# direction, false ALLOW is the risk we manage in depth" trade-off as
+# everywhere else in this file: the TOFU/drift half of the guard (see
+# `mcp_integrity.audit_tools`) still catches a poisoned definition that
+# changes AFTER first approval regardless of wording, since drift keys on the
+# fingerprint, not on these patterns matching. Report a bypass so it's added
+# here, the same policy `SECURITY.md` states for `normalize.scan_surface()`.
+
+# A tag vocabulary lifted from system-prompt convention has no legitimate
+# reason inside text aimed at a human skimming a tool list in a UI -- its only
+# purpose there is to read as a higher-authority instruction to the MODEL
+# parsing the same string.
+MCP_HIDDEN_TAG_RE = re.compile(
+    r"<\s*(?:important|system|instructions?|admin|override)\s*>", re.IGNORECASE)
+
+# Zero-width/invisible Unicode: smuggles text past a human reading the
+# rendered description while an LLM's tokenizer still sees it in full.
+# (escaped, not typed literally -- these characters are invisible in a diff
+# and easy to lose or corrupt through an editor/encoding round-trip)
+MCP_INVISIBLE_UNICODE_RE = re.compile(
+    "[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
+
+# "Don't tell the user" -- the signature of a Tool Poisoning Attack: the
+# payload only works if the human operator never finds out the model was
+# instructed to do something extra. Covers "user" and the synonyms a server
+# author addressing the human-in-the-loop by a different noun would use
+# (operator/human/owner), plus the "don't surface this in the chat" phrasing
+# that doesn't name the human at all (QA bypass: "keep this quiet from the
+# operator" / "don't surface it in the chat").
+MCP_SILENCE_USER_RE = re.compile(
+    r"\b(?:do\s+not|don'?t|never)\s+(?:tell|inform|mention|notify|disclose|show|surface)\s+"
+    r"(?:this\s+|it\s+)?(?:to\s+|in\s+)?(?:the\s+)?(?:user|operator|human|owner|chat)\b"
+    r"|\bwithout\s+(?:telling|informing|notifying|the\s+knowledge\s+of)\s+"
+    r"(?:the\s+)?(?:user|operator|human|owner)\b"
+    r"|\bkeep\s+(?:this|it)[\s\S]{0,20}?\b(?:secret|hidden|quiet|private)\s+from\s+"
+    r"(?:the\s+)?(?:user|operator|human|owner)\b",
+    re.IGNORECASE,
+)
+
+# Override-authority language -- the same phrasing a prompt-injected web page
+# or file uses, now arriving through a channel (tool metadata) the model
+# treats as trusted tool-catalog information rather than untrusted content.
+# Two shapes: the imperative ("ignore/disregard ... instructions") and the
+# declarative ("these instructions supersede/take precedence over ...") a
+# reworded payload can use instead (QA bypass: "...instructions supersede
+# anything you were told before").
+MCP_OVERRIDE_RE = re.compile(
+    # a qualifier is repeatable ("ignore all previous instructions" stacks
+    # "all" AND "previous" ahead of the noun, not just one or the other)
+    r"\b(?:ignore|disregard|override|bypass)\s+(?:(?:all|any|every|the\s+above|"
+    r"prior|previous|earlier|aforementioned|original|system)\s+)+"
+    r"(?:instructions?|rules?|guidance|prompts?|directives?)\b"
+    r"|\b(?:instructions?|rules?|guidance)\s+(?:supersedes?|overrides?|"
+    r"takes?\s+precedence\s+over)\b",
+    re.IGNORECASE,
+)
+
+# An instruction to read a credential path and hand its contents back through
+# one of the tool's OWN parameters -- the exfiltration primitive a
+# "helpful-sounding" description uses to turn an unrelated tool call into a
+# credential leak, with no separate network call for Containment's exfil
+# rule to ever catch.
+#
+# Deliberately concrete FILE PATHS only, not generic nouns like "credentials"/
+# "api keys"/"environment variables" (an earlier revision included these and
+# QA (design round) confirmed it false-positived on an ordinary, legitimate
+# secrets-manager/vault-fetch tool's own honest description of its declared
+# purpose -- "read the stored credentials ... return them in the response" is
+# such a tool's normal job, not poisoning). A specific dotfile/credential-
+# store PATH named in a read-and-return instruction has no such legitimate
+# ambiguity for an unrelated tool to be reaching into.
+#
+# The destination-side vocabulary is deliberately broad (QA bypass: "...put
+# its contents in the message you return to the user" used no
+# parameter/field/argument/response/reply noun at all) and the middle gap
+# spans sentence/line breaks (QA bypass: splitting the instruction across a
+# period or blank line) -- `[\s\S]` not `[^.\n]`, since an LLM reads straight
+# through a sentence boundary a regex bound at "no dot, no newline" doesn't.
+#
+# No `\b` immediately ahead of the credential-path alternation: `~`/`/`/`.`
+# are all non-word characters, so a boundary assertion there would need a
+# word character on one side -- exactly what "~/.ssh/..." doesn't have right
+# before the tilde, which silently made the whole alternative unmatchable.
+MCP_CRED_READ_INSTRUCTION_RE = re.compile(
+    r"\b(?:read|include|attach|pass|send|append|copy|put|place)\b[\s\S]{0,120}?(?:"
+    r"~?/?\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|config|authorized_keys)|"
+    r"\.aws/(?:credentials|config)|\.netrc|\.npmrc|\.git-credentials|"
+    r"\.pgpass|\.docker/config\.json|\.kube/config|"
+    r"gcloud/[\w./-]*credentials[\w./-]*|\.env\b"
+    r")[\s\S]{0,120}?(?:\b(?:parameter|field|argument|response|reply|message|"
+    r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
+    re.IGNORECASE,
+)

@@ -16,15 +16,27 @@ enforced INSIDE the server — defense the client can't bypass:
 `check` builds a PreToolUse event, resolves the caller identity (signed token if
 present), loads the policy + plugins, and evaluates. Fail-open (never raises into
 the host except the explicit Denied from `guard`).
+
+That covers a tool *call*. A tool's *catalog entry* (name/description/schema,
+fetched once via ``tools/list`` and typically trusted for the rest of the
+session) is a distinct surface no call-level check ever sees — a server can
+poison a description with hidden instructions, or silently swap one in after
+a human already approved it (a "rug pull"). See ``audit_tool_list`` below (
+``aegis.mcp_integrity``) for that guard.
 """
 from __future__ import annotations
 
 import functools
 
-from . import config, identity, plugins
+from . import config, identity, mcp_integrity, plugins
 from .engine import safe_evaluate
 from .events import Event
 from .policy import Decision, Policy
+
+# Tool-catalog integrity (poisoning + rug-pull drift) — re-exported here so
+# both tool-call and tool-catalog defenses live behind `from aegis import mcp`.
+audit_tool_list = mcp_integrity.audit_tools
+forget_tool_pins = mcp_integrity.forget
 
 
 class Denied(Exception):
