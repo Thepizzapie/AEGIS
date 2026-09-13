@@ -153,6 +153,8 @@ for d in mcp.audit_tool_list("finance-server", tools.tools):
 
 Config (`policy.mcp_tool_integrity`): `mode` (`deny`/`ask`/`monitor`/`off`, default `ask`), `allow` (regexes against the server id or tool name). Escapable by a human only: `AEGIS_ALLOW_MCP_TOOL_DRIFT=1` accepts and re-pins the current catalog (an intentional server upgrade) — a spawned agent can't set this for a call it doesn't control the environment of. `mcp.forget_tool_pins(server_id)` clears a server's pins for a deliberate re-baseline.
 
+Known gap: the poisoning scan is a closed-vocabulary, English-only heuristic on free-form prose, not an exhaustive classifier — a rewording, synonym, or different human language can evade it (the same "false ASK is the safe direction" trade-off every content-based guard above accepts; report a bypass and it gets added, per [SECURITY.md](SECURITY.md)). The rug-pull/drift half doesn't depend on wording at all: it fingerprints the whole tool definition (description, input/output schema, annotations, title), so a definition that changes after first approval is still caught regardless of how it's reworded.
+
 ## Install notes
 
 `pip install -e .` inside a venv only wires `aegis` into that venv, but the hooks call `aegis` from wherever the agent runs. Use `pipx install aegis-hooks` for a stable global `aegis`, or scope the command:

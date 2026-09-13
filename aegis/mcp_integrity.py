@@ -42,11 +42,18 @@ a human's approval prompt::
             raise RuntimeError(d.message)
 
 Each tool is TOFU-pinned (trust-on-first-use) per server: its first-seen
-fingerprint (name + description + input schema, hashed) is trusted and
-recorded; any change afterwards is the rug-pull signal above, flagged until
-a human re-confirms with ``AEGIS_ALLOW_MCP_TOOL_DRIFT=1``. Fail-open like the
+fingerprint (name + description + input/output schema + annotations/title,
+hashed) is trusted and recorded; any change afterwards is the rug-pull signal
+above, flagged until a human re-confirms with
+``AEGIS_ALLOW_MCP_TOOL_DRIFT=1``. The poisoning scan (patterns.py's
+``MCP_*`` heuristics) is a closed-vocabulary, English-only best-effort layer
+on free-form prose -- see the "DISCLOSED GAP" note at the top of that
+patterns.py section for what it does and doesn't catch. Fail-open like the
 rest of this package: an internal error scans as "no finding", never a crash
-into the caller.
+into the caller -- but a poisoning hit that *was* already found is never
+discarded by an unrelated bookkeeping failure downstream of it (fingerprinting
+and pin persistence run in their own narrowly-scoped try/except, separate
+from the detection scan).
 """
 from __future__ import annotations
 
@@ -54,6 +61,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -62,9 +70,25 @@ from .policy import Action, Decision
 
 _NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
+# A malicious/malformed schema shouldn't get unbounded recursion (depth) or
+# force a scan of an arbitrarily huge tree (breadth) -- both bounds independent,
+# since a real attacker controls their own schema's shape at zero cost and a
+# depth-only cap is a free bypass (nest the payload one level past the cap).
+_MAX_SCHEMA_DEPTH = 64
+_MAX_SCHEMA_NODES = 5000
+
 
 def _safe_id(server_id: str) -> str:
-    return _NAME_SAFE_RE.sub("_", str(server_id or "unknown"))[:200] or "unknown"
+    """A filesystem-safe, COLLISION-RESISTANT stem for ``server_id``'s pin
+    file. Sanitizing alone (collapsing disallowed characters to `_`) is
+    lossy -- "web:tools" and "web/tools" and "web tools" would all collapse to
+    the same "web_tools" stem, silently merging two different servers' pins.
+    A short hash of the raw id makes every distinct server_id land on a
+    distinct file regardless of how its disallowed characters collapse."""
+    raw = str(server_id or "unknown")
+    sanitized = _NAME_SAFE_RE.sub("_", raw)[:150] or "unknown"
+    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"{sanitized}-{digest}"
 
 
 def pins_path(server_id: str) -> Path:
@@ -72,9 +96,56 @@ def pins_path(server_id: str) -> Path:
     return config.aegis_home() / "mcp_pins" / f"{_safe_id(server_id)}.json"
 
 
+class _PinLock:
+    """A portable advisory lock via exclusive file creation -- no fcntl/msvcrt
+    dependency needed for a single lock-file-exists check, which works
+    identically on POSIX and Windows. Guards the load-modify-save critical
+    section in :func:`audit_tools` so two concurrent audits for the SAME
+    server_id (a multi-worker gateway, fanned-out concurrent tools/list
+    refreshes) can't race and silently clobber each other's newly-pinned
+    tool.
+
+    Best-effort, matching this package's fail-open posture everywhere else:
+    gives up and proceeds WITHOUT the lock after a short timeout rather than
+    hanging or raising (a crashed holder's stale lock file would otherwise
+    wedge every future audit for that server forever)."""
+
+    def __init__(self, path: Path, timeout: float = 2.0):
+        self._lock_path = path.with_name(path.name + ".lock")
+        self._timeout = timeout
+        self._fd = None
+
+    def __enter__(self) -> "_PinLock":
+        deadline = time.monotonic() + self._timeout
+        while True:
+            try:
+                self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+                self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return self
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    return self  # give up on locking; proceed unlocked (fail-open)
+                time.sleep(0.02)
+            except Exception:
+                return self  # any other lock error -- proceed unlocked
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except Exception:
+                pass
+        try:
+            self._lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _load_pins(server_id: str) -> dict:
     try:
-        return json.loads(pins_path(server_id).read_text(encoding="utf-8"))
+        data = json.loads(pins_path(server_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -110,15 +181,38 @@ def _get(tool, key, default=None):
     return getattr(tool, key, default)
 
 
+def _first(tool, *keys, default=None):
+    """The first truthy value among ``keys`` on ``tool``. Checked snake_case
+    first, then camelCase: the official ``mcp`` Python SDK's ``Tool`` model
+    exposes snake_case attributes (``input_schema``, ``output_schema``) on an
+    object, while a raw dict decoded straight from the wire JSON uses the
+    protocol's own camelCase keys (``inputSchema``) -- either shape reaches
+    this function, so both are tried."""
+    for k in keys:
+        v = _get(tool, k)
+        if v:
+            return v
+    return default
+
+
+def _schema_of(tool):
+    return _first(tool, "input_schema", "inputSchema", default={})
+
+
 def _param_descriptions(schema) -> list:
     """Every nested ``description`` string inside an ``inputSchema`` -- tool
     poisoning hides instructions in a PARAMETER's description just as often
-    as the tool's own, and a top-level-only scan would miss it entirely."""
+    as the tool's own, and a top-level-only scan would miss it entirely.
+    Bounded on both depth AND total node count: a depth-only cap is a free
+    bypass for an attacker who controls their own schema (nest the payload
+    one level past the cap, at zero cost to them)."""
     out: list = []
+    budget = [_MAX_SCHEMA_NODES]
 
     def walk(node, depth=0):
-        if depth > 12:  # a malicious/malformed schema shouldn't get unbounded recursion
+        if depth > _MAX_SCHEMA_DEPTH or budget[0] <= 0:
             return
+        budget[0] -= 1
         if isinstance(node, dict):
             d = node.get("description")
             if isinstance(d, str):
@@ -156,14 +250,55 @@ def scan_text(text: str) -> Optional[str]:
     return None
 
 
+def _scan_tool_text(description: str, schema) -> Optional[str]:
+    """Every poisoning-detection text scan for one tool, isolated from any
+    fingerprinting/pin bookkeeping that happens afterward. Kept in its own
+    function (and called from its own try/except in ``audit_tools``) so a
+    downstream bookkeeping failure -- e.g. an unserializable schema raising
+    inside ``_fingerprint`` -- can NEVER discard a detection this function
+    already made. QA (adversarial round) confirmed the previous single
+    shared try/except let exactly that happen: a real, already-computed
+    poisoning hit silently vanished because an unrelated exception was
+    raised later in the SAME try block, before the hit was ever recorded."""
+    hit = scan_text(description)
+    if hit:
+        return hit
+    for pd in _param_descriptions(schema):
+        hit = scan_text(pd)
+        if hit:
+            return hit
+    return None
+
+
 def _fingerprint(tool) -> str:
+    """A stable fingerprint over every field that materially changes what a
+    tool DOES or how a client is likely to auto-trust it: name, description,
+    input/output schema, annotations (readOnlyHint/destructiveHint/...), and
+    title. QA (adversarial round) confirmed that fingerprinting only
+    name+description+inputSchema let a server flip a tool from
+    non-destructive to destructive (via ``annotations``) with zero drift
+    finding -- exactly the metadata a client is most likely to rely on for
+    auto-approval decisions."""
     payload = {
         "name": _get(tool, "name"),
         "description": _get(tool, "description") or "",
-        "inputSchema": _get(tool, "inputSchema") or _get(tool, "input_schema") or {},
+        "inputSchema": _schema_of(tool),
+        "outputSchema": _first(tool, "output_schema", "outputSchema", default={}),
+        "title": _first(tool, "title", default=""),
+        "annotations": _first(tool, "annotations", default={}),
     }
-    blob = json.dumps(payload, sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    try:
+        blob = json.dumps(payload, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        # A pathological (e.g. self-referential) schema can't be JSON-encoded
+        # at all -- json.dumps raises even with default=str, since cycle
+        # detection happens before that callback is ever consulted. repr()
+        # safely detects reference cycles where json.dumps can't, so drift
+        # detection still degrades to SOME fingerprint instead of crashing
+        # (and, per _scan_tool_text above, a poisoning hit already found on
+        # the description text is unaffected either way).
+        blob = repr(payload)
+    return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _allowed_by_policy(cfg: dict, *values: str) -> bool:
@@ -178,13 +313,22 @@ def _allowed_by_policy(cfg: dict, *values: str) -> bool:
 
 
 def _record_monitor(server_id: str, tool_name: str, would: Decision) -> None:
+    """Log a monitor-mode finding the same way every sibling ``*_protect``
+    guard's own ``_record_monitor`` does (``rules.py``): the rule name gets a
+    ``-monitor`` suffix and the message is prefixed with the would-be action,
+    so a human grepping the audit log for ``-monitor`` sees exactly what
+    would have been ASKed/DENIed, not a bare ALLOW indistinguishable from a
+    real one."""
     try:
         from . import audit
         from .events import ActionClass, Event, HookEvent
         ev = Event.make(HookEvent.NOTIFICATION,
                         tool=f"mcp__{server_id}__{tool_name}", action=ActionClass.MCP)
-        audit.write_event(ev, Decision(Action.ALLOW, would.rule, would.message),
-                          config.audit_path())
+        audit.write_event(
+            ev,
+            Decision(Action.ALLOW, f"{would.rule}-monitor",
+                     f"[monitor] would {would.action.value}: {would.message}"),
+            config.audit_path())
     except Exception:
         pass  # audit is best-effort and must never block on a logging failure
 
@@ -208,44 +352,61 @@ def audit_tools(server_id: str, tools, *, policy=None) -> list:
     server upgrade, or a description a human reviewed and judged benign). A
     spawned agent cannot set this for a call it doesn't control the
     environment of.
+
+    Fail-open: a malformed ``policy.mcp_tool_integrity`` (e.g. not a mapping)
+    or any other error resolving config falls back to the ``ask`` default
+    rather than raising into the caller.
     """
-    cfg = (getattr(policy, "mcp_tool_integrity", None) or {}) if policy is not None else {}
-    mode = str(cfg.get("mode", "ask")).lower()
+    try:
+        cfg = (getattr(policy, "mcp_tool_integrity", None) or {}) if policy is not None else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        mode = str(cfg.get("mode", "ask")).lower()
+    except Exception:
+        cfg, mode = {}, "ask"
     if mode == "off":
         return []
     action = Action.DENY if mode == "deny" else Action.ASK
     human_override = bool(os.environ.get("AEGIS_ALLOW_MCP_TOOL_DRIFT"))
 
-    pins = _load_pins(server_id)
     decisions: list = []
-    changed = False
 
-    for tool in (tools or []):
-        try:
-            name = _get(tool, "name") or "<unnamed>"
-            if _allowed_by_policy(cfg, str(server_id), str(name)):
-                continue
+    with _PinLock(pins_path(server_id)):
+        pins = _load_pins(server_id)
+        changed = False
 
-            description = _get(tool, "description") or ""
-            schema = _get(tool, "inputSchema") or _get(tool, "input_schema") or {}
+        for tool in (tools or []):
+            try:
+                name = _get(tool, "name") or "<unnamed>"
+                if _allowed_by_policy(cfg, str(server_id), str(name)):
+                    continue
+                description = _get(tool, "description") or ""
+                schema = _schema_of(tool)
+            except Exception:
+                continue  # can't even read this tool's own fields -- skip it
 
-            hit = scan_text(description)
-            if not hit:
-                for pd in _param_descriptions(schema):
-                    hit = scan_text(pd)
-                    if hit:
-                        break
+            # The poisoning-detection scan runs in ITS OWN try/except, isolated
+            # from fingerprinting/pin bookkeeping below: a bookkeeping failure
+            # must never discard a detection already made (see _scan_tool_text's
+            # docstring for the concrete bug this closes).
+            try:
+                hit = _scan_tool_text(description, schema)
+            except Exception:
+                hit = None
 
-            fp = _fingerprint(tool)
-            prior = pins.get(name)
-            drift = prior is not None and prior.get("fingerprint") != fp
-
-            if prior is None:
-                pins[name] = {"fingerprint": fp}
-                changed = True
-            elif drift and human_override:
-                pins[name] = {"fingerprint": fp}
-                changed = True
+            drift = False
+            try:
+                fp = _fingerprint(tool)
+                prior = pins.get(name)
+                drift = prior is not None and prior.get("fingerprint") != fp
+                if prior is None:
+                    pins[name] = {"fingerprint": fp}
+                    changed = True
+                elif drift and human_override:
+                    pins[name] = {"fingerprint": fp}
+                    changed = True
+            except Exception:
+                pass  # fingerprinting/pinning failed; a poisoning `hit` still stands
 
             if (hit or drift) and not human_override:
                 reason = hit or (
@@ -261,9 +422,8 @@ def audit_tools(server_id: str, tools, *, policy=None) -> list:
                     _record_monitor(server_id, str(name), would)
                 else:
                     decisions.append(would)
-        except Exception:
-            continue
 
-    if changed:
-        _save_pins(server_id, pins)
+        if changed:
+            _save_pins(server_id, pins)
+
     return decisions
