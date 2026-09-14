@@ -169,6 +169,49 @@ def test_staged_elsewhere_realistic_multi_registry_config_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_staged_elsewhere_credhelpers_after_auths_gated():
+    """Same false-negative class as above, `credHelpers` (not `credsStore`)
+    as the sibling key appended after several `auths` entries."""
+    registries = ",".join(
+        f'"registry{i}.example.com": {{"auth": "dXNlcjpwYXNzd29yZC1mb3ItcmVnaXN0cnkte2l9"}}'
+        for i in range(6))
+    content = ('{"auths": {' + registries + '}, '
+               '"credHelpers": {"registry.evil.io": "evil"}}')
+    d = evaluate(_write("staging/docker-bootstrap.json", content=content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_staged_elsewhere_credsstore_before_large_unrelated_field_gated():
+    """QA finding (a third, skeptical verification round): a docker config
+    with an ordinary large unrelated field (a long `identitytoken`/JWT-
+    shaped string, or plain padding) sitting between the object's opening
+    `{` and `credsStore` -- realistic (long tokens exist), and distinct
+    from the multi-registry `auths`-block case above -- must still gate
+    when staged in a differently-named file, as long as the field stays
+    within the window `docker_cred_helper_strong_hit()` actually checks."""
+    content = '{"auths": {}, "detachKeys": "' + ("x" * 500) + '", "credsStore": "evil"}'
+    d = evaluate(_write("staging/docker-bootstrap.json", content=content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_staged_elsewhere_field_beyond_window_not_gated_disclosed_gap():
+    """Known, disclosed scope limit (the same class every bounded-gap check
+    in this file accepts): a single field larger than
+    `_DOCKER_STRONG_BRACE_WINDOW` (2000 chars) sitting between the opening
+    `{` and the key pushes the true brace outside the window this guard
+    actually checks, staged in a differently-named file with no confirmable
+    docker-config path. The ordinary absolute/home-relative path case is
+    unaffected -- the weak, path-confirmed check has no such window at
+    all."""
+    content = '{"auths": {}, "detachKeys": "' + ("x" * 2500) + '", "credsStore": "evil"}'
+    d = evaluate(_write("staging/docker-bootstrap.json", content=content), EMPTY)
+    assert not _gated(d)
+    # Same content at the ordinary, confirmable path still gates -- the
+    # weak, path-confirmed check (no window at all) catches it.
+    d2 = evaluate(_write(".docker/config.json", content=content), EMPTY)
+    assert _gated(d2) and d2.rule == RULE
+
+
 def test_mcp_write_to_ordinary_path_gated():
     """`rule_containment`'s CRED_RE check does not run for `ActionClass.MCP`
     at all (only shell/Edit/Write/Read) — an MCP-tool write to the ordinary
@@ -469,25 +512,29 @@ def test_docker_cred_helper_content_re_no_quadratic_blowup():
     assert elapsed < 1.0, f"took {elapsed:.2f}s"
 
 
-def test_docker_cred_helper_strong_re_no_quadratic_blowup():
-    """Includes adversarial repeated-brace inputs -- the regex's gap is an
-    unrestricted, DOTALL `.{0,2000}?` (matching `AWS_CRED_PROCESS_INI_RE`'s
-    own technique, adopted after two QA rounds each found a more
-    brace-restricted version was a real false negative on realistic,
-    non-adversarial input) rather than a brace-excluding character class, so
-    it's worth confirming that widened match space stays bounded and fast
-    even against deliberately brace-heavy adversarial text."""
+def test_docker_cred_helper_strong_hit_no_quadratic_blowup():
+    """QA (a third, skeptical round): a brace-anchored regex version of this
+    check -- searching from every `{` in the document, one of the most
+    common characters in real JSON -- took several seconds on an ordinary,
+    non-adversarial ~1.6MB brace-dense file with no docker keys at all.
+    `docker_cred_helper_strong_hit()` inverts the anchor (search the rare
+    literal key text first, then check only a bounded preceding window),
+    so a realistically large, brace-dense document with NO matching key at
+    all must resolve near-instantly, and even a pathological input
+    repeating the key text itself many times must stay capped and fast."""
     from aegis import patterns
     checks = [
-        '"credsStore":' + "x" * 500000,
-        '"credHelpers":{' + ("a" * 400 + " ") * 2000,
+        # Realistic-shape stress: large, brace-dense, no docker keys at all.
+        '[' + ",".join('{"id": %d, "name": "item"}' % i for i in range(60000)) + ']',
         "{" * 5000 + "credsStore",
         "{" + ("a{b}" * 3000) + '"credsStore"',
         "{" + "x" * 2000000,
+        # Pathological: the literal key text repeated many times.
+        '"credsStore": "x", ' * 5000,
     ]
     for adv in checks:
         start = time.time()
-        patterns.DOCKER_CRED_HELPER_STRONG_RE.search(adv)
+        patterns.docker_cred_helper_strong_hit(adv)
         elapsed = time.time() - start
         assert elapsed < 1.0, f"took {elapsed:.2f}s on {adv[:30]!r}..."
 

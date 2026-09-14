@@ -6232,11 +6232,11 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     `rule_cloud_cred_exec_protect` gates `credential_process` that way:
     every value names a program Docker will execute and hand a live registry
     credential to, so there is no safe/dangerous split by value. A REAL
-    assignment shape (`DOCKER_CRED_HELPER_STRONG_RE` -- an actual non-empty
-    helper name, not just the key mentioned in passing) is treated as
-    path-independent, the same "distinctive-enough vocabulary, no config-
-    format collision risk" call `AWS_CRED_PROCESS_INI_RE`'s own docstring
-    makes for `credential_process`.
+    assignment shape with a preceding `{` nearby (`patterns.docker_cred_
+    helper_strong_hit()` -- an actual non-empty helper name, not just the
+    key mentioned in passing) is treated as path-independent, the same
+    "distinctive-enough vocabulary, no config-format collision risk" call
+    `AWS_CRED_PROCESS_INI_RE`'s own docstring makes for `credential_process`.
 
     Overlap with `rule_containment`: unlike AWS's/Kubernetes' config files,
     `~/.docker/config.json`'s literal, absolute/home-relative form is
@@ -6307,31 +6307,37 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     a comment false-positived identically to a real write; closed via
     `patterns.strip_comment_lines` on both the Edit/Write/MCP content branch
     and the shell branch. Bypass-hunting separately reproduced a related
-    false positive: the ORIGINAL `DOCKER_CRED_HELPER_STRONG_RE` treated any
+    false positive: a first version of the strong check treated any
     bare `"credsStore": "value"` shape as path-independent-strong with no
     structural bar at all, unlike `AWS_CRED_PROCESS_INI_RE`'s own `[section]`
     -header requirement for its strong form -- a prose doc/postmortem line
     merely quoting the shape as an EXAMPLE false-positived; closed by
     requiring a `{` sit somewhere before the key.
 
-    Two further, sequential rounds verifying that exact fix (each checking
-    the fix itself, not re-litigating the earlier finding) each found the
-    fix had traded the prose false positive for a real false NEGATIVE on a
-    realistic docker config.json (several `auths` entries plus `credsStore`)
-    staged in a differently-named file before a move -- this guard's own
-    disclosed "staged elsewhere" scenario, silently ALLOWED both times, for
-    two DIFFERENT reasons in sequence: first, an added trailing `}`
-    requirement (closed by dropping it, matching `AWS_CRED_PROCESS_INI_RE`'s
-    own one-sided precedent); then, with that gone, a brace-EXCLUDING
-    leading gap that could not bridge across the `auths` block's own nested
-    object sitting between the outer `{` and the key at all, at any bound
-    (closed by switching to that same regex's actual, unrestricted DOTALL
-    `.{0,2000}?` gap). See `DOCKER_CRED_HELPER_STRONG_RE`'s own comment in
-    `patterns.py` for both rounds in full -- the leading `{` requirement
-    alone (no character exclusion, no trailing match) is what keeps a bare,
-    no-brace-anywhere prose line from qualifying, the same property both
-    intermediate, over-constrained versions accidentally weakened along
-    with fixing the FP."""
+    Two further, independent rounds verifying that exact fix (each checking
+    the fix itself, not re-litigating the earlier finding) each found a
+    real problem with how "somewhere before the key" was implemented as one
+    self-contained regex. Round 2 found the fix had traded the prose false
+    positive for a real false NEGATIVE on a realistic docker config.json
+    (several `auths` entries plus `credsStore`) staged in a
+    differently-named file before a move -- this guard's own disclosed
+    "staged elsewhere" scenario -- for two different reasons in sequence:
+    an added trailing `}` requirement too tight for realistic file sizes
+    (dropped, matching `AWS_CRED_PROCESS_INI_RE`'s own one-sided
+    precedent), then a brace-EXCLUDING leading gap that could not bridge
+    across `auths`'s own nested object at all, at any bound (switched to an
+    unrestricted DOTALL gap). Round 3, a further skeptical pass, found that
+    same brace-anchored regex -- searching from EVERY `{` in the document,
+    one of the most common characters in any real JSON file -- was a real,
+    non-adversarial performance problem: an ordinary ~1.6MB brace-dense file
+    with no docker keys at all took several seconds to scan, on every Edit/
+    Write/MCP call touching it. Fixed by inverting the anchor entirely --
+    `patterns.docker_cred_helper_strong_hit()` searches for the rare,
+    literal key text FIRST, then checks only a small preceding window for a
+    `{`, in a capped Python loop, rather than asking the regex engine to
+    retry a bounded gap from every brace in the document. See that
+    function's own module comment in `patterns.py` for all three rounds in
+    full."""
     cfg = getattr(policy, "docker_cred_helper", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -6388,7 +6394,7 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
             path_text = p + " " + " ".join(_flatten_strings(a))
         path_confirmed = bool(path_text and patterns.DOCKER_CONFIG_PATH_RE.search(path_text))
         hit = bool(
-            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_content)
+            patterns.docker_cred_helper_strong_hit(scan_content)
             or (path_confirmed and patterns.DOCKER_CRED_HELPER_CONTENT_RE.search(scan_content)))
         if not hit:
             return None
@@ -6412,7 +6418,7 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
         scan_cmd = patterns.strip_comment_lines(cmd)
         path_hit = bool(patterns.DOCKER_CONFIG_PATH_RE.search(scan_cmd))
         hit = bool(
-            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_cmd)
+            patterns.docker_cred_helper_strong_hit(scan_cmd)
             or (path_hit and patterns.DOCKER_CRED_HELPER_CONTENT_RE.search(scan_cmd)))
         if not hit:
             return None
