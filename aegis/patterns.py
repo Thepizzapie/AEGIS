@@ -4778,10 +4778,10 @@ DOCKER_CONFIG_PATH_RE = re.compile(
 DOCKER_CRED_HELPER_CONTENT_RE = re.compile(
     r'"(?:credsStore|credHelpers)"\s*:', re.IGNORECASE,
 )
-# Strong, path-INDEPENDENT form: a REAL assignment shape EMBEDDED IN A JSON
-# OBJECT LITERAL (a `{...}` wrapping the key), not just the key name in
-# passing. QA (bypass-hunting round) found a first version of this regex --
-# the key:value shape alone, with no brace requirement, mirroring
+# Strong, path-INDEPENDENT form: a REAL assignment shape preceded, somewhere
+# earlier in the text, by a JSON object's OPENING brace -- not just the key
+# name in passing. QA (bypass-hunting round) found a first version of this
+# regex -- the key:value shape alone, with no brace requirement, mirroring
 # `AWS_CRED_PROCESS_CONTENT_RE`'s own "key alone is enough" reasoning -- was
 # actually the WRONG analog: `credential_process`'s own path-INDEPENDENT
 # strong form (`AWS_CRED_PROCESS_INI_RE`) requires a realistic `[section]`
@@ -4791,18 +4791,48 @@ DOCKER_CRED_HELPER_CONTENT_RE = re.compile(
 # the shape as an EXAMPLE (a postmortem/doc/comment: `"credsStore": "evil"`,
 # no surrounding object) false-positived identically to a real write,
 # reproduced live against both a Write to an unrelated `.md` file and a bare
-# shell comment. Requiring the key sit inside an actual `{ ... }` object
-# (bounded lazy `[^{}]{0,300}?` gaps, the same bounded-gap technique
-# `AWS_CRED_PROCESS_INI_RE`'s own `.{0,2000}?` uses to stay ReDoS-safe)
-# restores the "looks like a real config object, not a copy-pasted line"
-# bar every sibling guard's own strong/path-independent form already holds
-# itself to, while still catching content staged in a differently-named file
-# before a move (this guard's own tests keep using realistic, brace-wrapped
-# JSON for exactly that scenario).
+# shell comment. Requiring a `{` sit somewhere before the key (bounded lazy
+# `[^{}]{0,2000}?` gap, the same bound `AWS_CRED_PROCESS_INI_RE`'s own
+# `.{0,2000}?` uses to stay ReDoS-safe) restores the "looks like real JSON,
+# not a copy-pasted line" bar every sibling guard's own strong/
+# path-independent form already holds itself to.
+#
+# Deliberately ONE-SIDED (no matching closing `}` required after the value)
+# AND the leading gap does NOT exclude brace characters (unlike a first
+# attempt at this fix, `[^{}]{0,2000}?`): two independent, sequential QA
+# rounds found each of those choices individually was a real false
+# NEGATIVE, not just a theoretical one.
+#
+# Round 1 (independent follow-up verification): a first version of this fix
+# DID require a trailing `[^{}]{0,300}?\}` too, on the theory that a real
+# config object should close somewhere nearby -- but that silently ALLOWED
+# an entirely realistic docker config.json with several `auths` entries and
+# `credsStore` appended, staged in a differently-named file before a move: a
+# handful of registry entries routinely push the distance from `credsStore`/
+# `credHelpers` to the object's actual closing `}` well past any bound tight
+# enough to stay useful as an anti-prose signal. `AWS_CRED_PROCESS_INI_RE`
+# itself has no such two-sided requirement (only a `[section]` header
+# BEFORE `credential_process`, nothing after) -- dropping the trailing-brace
+# requirement matches that one-sided precedent.
+#
+# Round 2 (verifying round 1's own fix): with the trailing `}` gone, the
+# SAME realistic multi-registry payload above still silently ALLOWED,
+# because the leading gap still excluded brace characters
+# (`[^{}]{0,2000}?`) -- which cannot cross the `auths` block's OWN nested
+# `{...}` sitting between the outer `{` and `credsStore`/`credHelpers` at
+# all, brace-exclusion or not, however large the numeric bound. The
+# character-class exclusion was meant to stop the lazy gap from bridging
+# across an unrelated, already-closed object elsewhere in the text -- but a
+# real docker config.json routinely has credsStore/credHelpers as a SIBLING
+# key after one or more nested objects (`auths`'s own per-registry entries),
+# not before them, so the exclusion broke the dominant realistic shape it
+# was supposed to protect. Switched to `AWS_CRED_PROCESS_INI_RE`'s own
+# actual technique verbatim: an unrestricted, DOTALL `.{0,2000}?` gap
+# (bounded, not character-excluded) -- the same bounded-gap-with-DOTALL
+# shape already proven ReDoS-safe for that regex and reused unmodified here.
 DOCKER_CRED_HELPER_STRONG_RE = re.compile(
-    r'\{[^{}]{0,300}?"credsStore"\s*:\s*"[^"\\]+"[^{}]{0,300}?\}'
-    r'|\{[^{}]{0,300}?"credHelpers"\s*:\s*\{[^{}]{0,300}?"[^"\\]+"\s*:\s*"[^"\\]+"'
-    r'[^{}]{0,300}?\}[^{}]{0,300}?\}',
+    r'\{.{0,2000}?"credsStore"\s*:\s*"[^"\\]+"'
+    r'|\{.{0,2000}?"credHelpers"\s*:\s*\{.{0,2000}?"[^"\\]+"\s*:\s*"[^"\\]+"',
     re.IGNORECASE | re.DOTALL,
 )
 

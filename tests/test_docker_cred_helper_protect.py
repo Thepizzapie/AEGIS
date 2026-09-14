@@ -150,6 +150,25 @@ def test_staged_elsewhere_credsstore_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_staged_elsewhere_realistic_multi_registry_config_gated():
+    """QA finding (independent follow-up verification round): a FIRST
+    version of the strong regex's fix required a matching closing `}`
+    after the value too, tightly bounded -- which silently ALLOWED an
+    entirely realistic multi-registry docker config.json (several `auths`
+    entries pushing `credsStore` well past that bound from the object's
+    actual close) staged in a differently-named file before a move. The
+    fix dropped the trailing-brace requirement (matching
+    `AWS_CRED_PROCESS_INI_RE`'s own one-sided precedent) -- confirm a
+    realistic-sized config with several registries still gates."""
+    registries = ",".join(
+        f'"registry{i}.example.com": {{"auth": "dXNlcjpwYXNzd29yZC1mb3ItcmVnaXN0cnkte2l9"}}'
+        for i in range(6))
+    content = '{"auths": {' + registries + '}, "credsStore": "evil"}'
+    assert len(content) > 300  # confirm this genuinely exceeds the old, too-tight bound
+    d = evaluate(_write("staging/docker-bootstrap.json", content=content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_mcp_write_to_ordinary_path_gated():
     """`rule_containment`'s CRED_RE check does not run for `ActionClass.MCP`
     at all (only shell/Edit/Write/Read) — an MCP-tool write to the ordinary
@@ -451,10 +470,20 @@ def test_docker_cred_helper_content_re_no_quadratic_blowup():
 
 
 def test_docker_cred_helper_strong_re_no_quadratic_blowup():
+    """Includes adversarial repeated-brace inputs -- the regex's gap is an
+    unrestricted, DOTALL `.{0,2000}?` (matching `AWS_CRED_PROCESS_INI_RE`'s
+    own technique, adopted after two QA rounds each found a more
+    brace-restricted version was a real false negative on realistic,
+    non-adversarial input) rather than a brace-excluding character class, so
+    it's worth confirming that widened match space stays bounded and fast
+    even against deliberately brace-heavy adversarial text."""
     from aegis import patterns
     checks = [
         '"credsStore":' + "x" * 500000,
         '"credHelpers":{' + ("a" * 400 + " ") * 2000,
+        "{" * 5000 + "credsStore",
+        "{" + ("a{b}" * 3000) + '"credsStore"',
+        "{" + "x" * 2000000,
     ]
     for adv in checks:
         start = time.time()

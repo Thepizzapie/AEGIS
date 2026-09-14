@@ -6312,8 +6312,26 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     structural bar at all, unlike `AWS_CRED_PROCESS_INI_RE`'s own `[section]`
     -header requirement for its strong form -- a prose doc/postmortem line
     merely quoting the shape as an EXAMPLE false-positived; closed by
-    requiring the key sit inside an actual `{...}` object literal (see that
-    regex's own comment in `patterns.py` for the bounded-gap fix in full)."""
+    requiring a `{` sit somewhere before the key.
+
+    Two further, sequential rounds verifying that exact fix (each checking
+    the fix itself, not re-litigating the earlier finding) each found the
+    fix had traded the prose false positive for a real false NEGATIVE on a
+    realistic docker config.json (several `auths` entries plus `credsStore`)
+    staged in a differently-named file before a move -- this guard's own
+    disclosed "staged elsewhere" scenario, silently ALLOWED both times, for
+    two DIFFERENT reasons in sequence: first, an added trailing `}`
+    requirement (closed by dropping it, matching `AWS_CRED_PROCESS_INI_RE`'s
+    own one-sided precedent); then, with that gone, a brace-EXCLUDING
+    leading gap that could not bridge across the `auths` block's own nested
+    object sitting between the outer `{` and the key at all, at any bound
+    (closed by switching to that same regex's actual, unrestricted DOTALL
+    `.{0,2000}?` gap). See `DOCKER_CRED_HELPER_STRONG_RE`'s own comment in
+    `patterns.py` for both rounds in full -- the leading `{` requirement
+    alone (no character exclusion, no trailing match) is what keeps a bare,
+    no-brace-anywhere prose line from qualifying, the same property both
+    intermediate, over-constrained versions accidentally weakened along
+    with fixing the FP."""
     cfg = getattr(policy, "docker_cred_helper", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
