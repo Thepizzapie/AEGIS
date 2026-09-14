@@ -245,6 +245,29 @@ def test_kube_mcp_write_to_ordinary_path_gated():
 
 # ---- QA round (bypass-hunting, independent adversarial review): closed bypasses --
 
+def test_multiedit_relative_aws_config_gated():
+    """QA finding (found while reviewing the sibling `rule_docker_cred_
+    helper_protect` guard, reproduced here too): `MultiEdit` is
+    `ActionClass.EDIT` (see events.py's `_TOOL_CLASS`), not MCP, and puts
+    its text under `edits: [{new_string}]` -- no top-level `content`/
+    `new_string` key. The MCP-only `_flatten_strings` fallback left
+    `content` empty here, silently ALLOWing exactly this guard's own
+    headline scenario (a relative path, no leading separator)."""
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+        args={"file_path": ".aws/config",
+              "edits": [{"old_string": "", "new_string":
+                  "[default]\ncredential_process = /tmp/evil\n"}]}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_notebookedit_new_source_kube_gated():
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="NotebookEdit",
+        args={"notebook_path": ".kube/config",
+              "new_source": "exec:\n  apiVersion: client.authentication.k8s.io/v1beta1\n"
+                             "  command: /tmp/evil\n"}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_mcp_unlisted_path_key_name_gated():
     """`_path()` only recognizes a fixed key-name allowlist (file_path/path/
     target_file/...) — QA (bypass-hunting round) found an MCP tool naming

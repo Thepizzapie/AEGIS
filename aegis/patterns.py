@@ -4731,6 +4731,153 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Docker credential-helper exec-hijack protection --------------------------
+# Docker CLI's own config file, ~/.docker/config.json (or a project-relative
+# copy staged before being moved into place), supports two keys that name an
+# EXTERNAL COMMAND: `credsStore` (a single global helper, applied to every
+# registry with no per-registry entry) and `credHelpers` (a per-registry
+# override map). Whichever value `V` is set, Docker execs `docker-credential-
+# V` on every future registry auth touching that scope -- `docker login`/
+# `pull`/`push`/`build`/`buildx` -- feeding it the registry hostname on stdin
+# and reading a JSON `{Username, Secret}` (or bearer token) back on stdout for
+# a `get` verb, and handing it the ACTUAL credential material to persist for a
+# `store` verb. Same "write now, auto-exec later, on someone else's future
+# invocation, handed live credentials every time it runs" shape
+# `GIT_CONFIG_CREDENTIAL_HELPER_RE`/`AWS_CRED_PROCESS_*`/`KUBE_EXEC_CRED_*`
+# above already cover for git/AWS/Kubernetes -- here the payoff is a
+# container-registry credential (frequently a cloud registry's own IAM-backed
+# token: ECR, GCR/Artifact Registry, ACR) instead, and unlike a git alias the
+# planted binary only needs to EXIST somewhere on `$PATH` as `docker-
+# credential-<V>` (no absolute path in the config at all), so the write here
+# is only half the attack -- the other half is planting that binary, a
+# surface `rule_path_hijack_protect`'s own PATH-shadow coverage already
+# reaches for a TRUSTED command name, though `docker-credential-<name>` is
+# not itself one of the trusted names that guard's own allowlist covers (a
+# disclosed gap, not a silent one).
+#
+# Unlike ~/.aws/config, ~/.aws/credentials, and ~/.kube/config,
+# ~/.docker/config.json is already in CRED_RE above -- so the literal,
+# absolute/home-relative path is ALREADY denied, non-escapably, by
+# `rule_containment`, for every native Read/Edit/Write and any shell command
+# that mentions that literal path text. `rule_docker_cred_helper_protect`
+# exists for exactly the classes that miss: an MCP-tool write (`CRED_RE`'s
+# check structurally never runs for `ActionClass.MCP`), a relative path with
+# no leading separator (`CRED_RE` requires one immediately before `.docker`),
+# and content staged under an entirely different filename before a move puts
+# it at the real path -- the same non-redundant carve-out
+# `rule_cloud_cred_exec_protect`'s own docstring discloses for its AWS/kube
+# overlap with this same CRED_RE check.
+DOCKER_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.docker" + _WIN_TRIM + _SEP + r"config\.json" + _CI_END,
+    re.IGNORECASE,
+)
+# Weak, path-CONFIRMED-only key check -- either key, bare, mirrors
+# AWS_CRED_PROCESS_CONTENT_RE's own "key alone is enough, once the path is
+# confirmed" reasoning: there is no safe value for either key, only a
+# question of which external command it names.
+DOCKER_CRED_HELPER_CONTENT_RE = re.compile(
+    r'"(?:credsStore|credHelpers)"\s*:', re.IGNORECASE,
+)
+# Strong, path-INDEPENDENT form: a REAL assignment shape preceded, somewhere
+# earlier in the text, by a JSON object's OPENING brace -- not just the key
+# name in passing. Three sequential, independent QA rounds shaped this into
+# a two-part design (a literal-anchored regex pair PLUS a plain-Python
+# bounded-window check, `docker_cred_helper_strong_hit()` below) rather than
+# the single self-contained regex every sibling guard's own strong form
+# uses -- each of the three more "normal-looking" single-regex attempts
+# traded one real bug for another:
+#
+# Round 1 (bypass-hunting): the key:value shape alone, with no brace
+# requirement at all (mirroring `AWS_CRED_PROCESS_CONTENT_RE`'s own "key
+# alone is enough" reasoning), was the WRONG analog -- `credential_process`'s
+# OWN path-independent strong form (`AWS_CRED_PROCESS_INI_RE`) requires a
+# realistic `[section]` header nearby precisely so a bare doc/comment
+# mention with no real INI structure around it does not qualify as
+# "strong". A plain prose line quoting the shape as an EXAMPLE (a
+# postmortem/doc/comment: `"credsStore": "evil"`, no surrounding object)
+# false-positived identically to a real write, reproduced against both a
+# Write to an unrelated `.md` file and a bare shell comment. Fixed by
+# requiring a `{` sit somewhere before the key.
+#
+# Round 2 (independent follow-up verification, checking round 1's fix): a
+# first version required a trailing `[^{}]{0,300}?\}` too (a real config
+# object "should" close nearby) -- but that silently ALLOWED an entirely
+# realistic docker config.json with several `auths` entries and
+# `credsStore` appended, staged in a differently-named file before a move
+# (this guard's own disclosed scenario): a handful of registry entries
+# routinely push the distance to the object's actual closing `}` well past
+# any bound tight enough to stay useful as an anti-prose signal.
+# `AWS_CRED_PROCESS_INI_RE` itself has no such two-sided requirement (only
+# a `[section]` header BEFORE `credential_process`, nothing after) --
+# dropping the trailing brace matched that one-sided precedent. The SAME
+# round's fix also switched the leading gap from a brace-EXCLUDING
+# `[^{}]{0,2000}?` to an unrestricted, DOTALL `.{0,2000}?` (matching
+# `AWS_CRED_PROCESS_INI_RE`'s actual technique) once the brace-exclusion
+# was found to block its own realistic target: a real config routinely has
+# `credsStore`/`credHelpers` as a SIBLING key AFTER one or more nested
+# objects (`auths`'s own per-registry entries), so a gap that cannot cross
+# ANY brace at all can never reach past them, independent of the numeric
+# bound.
+#
+# Round 3 (a further, skeptical final pass): anchoring the regex's search
+# on a bare `\{` -- one of the single most common characters in any real
+# JSON document -- rather than on the rare, distinctive key text itself
+# meant `re`'s engine retried the bounded `.{0,2000}?` gap from EVERY `{`
+# in the document before giving up on a non-match, an O(braces-in-document
+# x 2000) cost with no relation to whether `credsStore`/`credHelpers`
+# appear at all. Reproduced as a genuine, non-adversarial perf problem: an
+# ordinary ~1.6MB brace-dense JSON array with no docker keys anywhere in it
+# took several seconds per scan, on every Edit/Write/MCP call touching such
+# a file -- a real latency/DoS-adjacent cost against Aegis's own hook, not
+# just an adversarial curiosity. `AWS_CRED_PROCESS_INI_RE`'s own `[section]`
+# anchor never has this problem because a `[` this specific (a section
+# header, not any bracket) is inherently rare in real INI content -- the
+# same "anchor the search on a common character" mistake doesn't exist
+# there to copy. Fixed by inverting the anchor: search for the (rare)
+# literal key text FIRST via a plain regex, then check only the up-to-2000
+# preceding characters of each match for a `{`, in a small Python loop
+# (`docker_cred_helper_strong_hit()`) -- cost is now O(occurrences-of-the-
+# key x 2000), and a real file has 0 or 1 such occurrences almost always.
+# Capped at 1000 occurrences per call as a hard ceiling against a
+# pathological input that repeats the literal key text itself thousands of
+# times (still generous for any realistic file; bounds worst-case cost to
+# ~2M char-compares, sub-10ms).
+#
+# Honest, disclosed scope: the window is still a BOUNDED 2000 chars, the
+# same class of "verb/context-adjacency gap" limit every sibling guard's
+# own bounded checks already accept -- an unusually large field (a very
+# long embedded token/blob) sitting between the nearest `{` and the key
+# could still, in principle, push the true opening brace outside that
+# window. 2000 chars comfortably covers a normal `auths` block with several
+# registries' base64 `auth`/`identitytoken` values (the realistic case QA
+# reproduced and this module's own tests exercise); a single field far
+# larger than that is an accepted, bounded-gap trade-off, not a silent one.
+_DOCKER_CREDSSTORE_ASSIGN_RE = re.compile(r'"credsStore"\s*:\s*"[^"\\]+"', re.IGNORECASE)
+_DOCKER_CREDHELPERS_ASSIGN_RE = re.compile(
+    r'"credHelpers"\s*:\s*\{\s*"[^"\\]+"\s*:\s*"[^"\\]+"', re.IGNORECASE | re.DOTALL)
+_DOCKER_STRONG_BRACE_WINDOW = 2000
+_DOCKER_STRONG_MAX_OCCURRENCES = 1000
+
+
+def docker_cred_helper_strong_hit(text: str) -> bool:
+    """True if `text` contains a REAL credsStore/credHelpers assignment shape
+    with a JSON object's opening `{` somewhere in the preceding
+    `_DOCKER_STRONG_BRACE_WINDOW` characters -- the strong, path-independent
+    half of ``rule_docker_cred_helper_protect``. See the module comment
+    directly above for the three QA rounds that shaped this into a
+    literal-anchored search plus a bounded window check, rather than a
+    single brace-anchored regex."""
+    if not text:
+        return False
+    for rx in (_DOCKER_CREDSSTORE_ASSIGN_RE, _DOCKER_CREDHELPERS_ASSIGN_RE):
+        for i, m in enumerate(rx.finditer(text)):
+            if i >= _DOCKER_STRONG_MAX_OCCURRENCES:
+                break
+            start = m.start()
+            if "{" in text[max(0, start - _DOCKER_STRONG_BRACE_WINDOW):start]:
+                return True
+    return False
+
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
 # `external` provider's `data "external"` data source all name an arbitrary
