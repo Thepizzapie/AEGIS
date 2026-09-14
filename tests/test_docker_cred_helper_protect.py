@@ -164,6 +164,27 @@ def test_mcp_nested_edits_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_multiedit_relative_path_gated():
+    """QA finding (bypass-hunting round): `MultiEdit` is `ActionClass.EDIT`
+    (see events.py's `_TOOL_CLASS`), not MCP, and puts its text under
+    `edits: [{new_string}]` -- no top-level `content`/`new_string` key. A
+    first version's MCP-only `_flatten_strings` fallback left `content`
+    empty here, silently ALLOWing exactly this guard's own headline
+    scenario (a relative path, no leading separator)."""
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+        args={"file_path": ".docker/config.json",
+              "edits": [{"old_string": "{}", "new_string": '{"credsStore": "evil"}'}]}),
+        EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_notebookedit_new_source_gated():
+    d = evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="NotebookEdit",
+        args={"notebook_path": ".docker/config.json",
+              "new_source": '{"credHelpers": {"docker.io": "evil"}}'}), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_mcp_unlisted_path_key_name_gated():
     """Same MCP path-key widening `rule_cloud_cred_exec_protect` applies:
     `_path()` only recognizes a fixed key-name allowlist — an MCP tool
@@ -268,6 +289,40 @@ def test_ordinary_auths_only_config_not_gated():
 def test_commit_message_mention_not_gated():
     assert not _gated(evaluate(
         _shell('git commit -m "document credsStore setup for CI"'), EMPTY))
+
+
+def test_shell_comment_only_mention_not_gated():
+    """QA finding (design/consistency round): the shell branch never
+    stripped `#`-prefixed comments, unlike its sibling
+    `rule_cloud_cred_exec_protect` — a documentation/TODO comment merely
+    MENTIONING credsStore false-positived identically to a real write."""
+    d = evaluate(_shell(
+        '# TODO: consider setting "credsStore": "ecr-login" for CI later'), EMPTY)
+    assert not _gated(d)
+
+
+def test_prose_doc_mention_without_braces_not_gated():
+    """QA finding (bypass-hunting round): a doc/postmortem line quoting the
+    dangerous shape as an EXAMPLE (no surrounding `{...}` object, and no
+    confirmed docker-config path) must not false-positive — the strong,
+    path-independent check requires a real JSON object literal, the same
+    "not just a copy-pasted line" bar `AWS_CRED_PROCESS_INI_RE`'s own
+    `[section]`-header requirement holds itself to."""
+    d = evaluate(_write(
+        "docs/incident-postmortem.md",
+        content='Example of the malicious payload we blocked:\n'
+                '"credsStore": "evil"\n'), EMPTY)
+    assert not _gated(d)
+
+
+def test_commented_json_example_with_braces_not_gated():
+    """Exercises comment-stripping actually engaging (not just the brace
+    requirement alone): a full-line `#` comment quoting REAL braced JSON
+    must still be stripped before the strong check runs."""
+    d = evaluate(_write(
+        "staging/notes.json",
+        content='# example only, not a real config: {"credsStore": "evil"}\n'), EMPTY)
+    assert not _gated(d)
 
 
 def test_docker_compose_exec_key_not_confused():

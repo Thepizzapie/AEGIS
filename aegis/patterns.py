@@ -4778,19 +4778,32 @@ DOCKER_CONFIG_PATH_RE = re.compile(
 DOCKER_CRED_HELPER_CONTENT_RE = re.compile(
     r'"(?:credsStore|credHelpers)"\s*:', re.IGNORECASE,
 )
-# Strong, path-INDEPENDENT form: a REAL assignment shape, not just the key
-# name in passing (a comment, a doc line, this guard's own tests) --
-# `credsStore` given an actual non-empty string value, or `credHelpers` given
-# an actual per-registry mapping with at least one real `"<registry>":
-# "<helper>"` entry. Both key names are Docker-specific vocabulary with no
-# realistic cross-format collision (unlike a bare `= !` value prefix), so --
-# same call `AWS_CRED_PROCESS_INI_RE`'s own docstring makes for
-# `credential_process` -- no additional scoping beyond the real-assignment
-# shape itself is needed for this to stay precise.
+# Strong, path-INDEPENDENT form: a REAL assignment shape EMBEDDED IN A JSON
+# OBJECT LITERAL (a `{...}` wrapping the key), not just the key name in
+# passing. QA (bypass-hunting round) found a first version of this regex --
+# the key:value shape alone, with no brace requirement, mirroring
+# `AWS_CRED_PROCESS_CONTENT_RE`'s own "key alone is enough" reasoning -- was
+# actually the WRONG analog: `credential_process`'s own path-INDEPENDENT
+# strong form (`AWS_CRED_PROCESS_INI_RE`) requires a realistic `[section]`
+# header nearby precisely so a bare doc/comment mention with no real INI
+# structure around it does not qualify as "strong" -- the un-braced version
+# here had no equivalent structural bar at all, so a plain prose line quoting
+# the shape as an EXAMPLE (a postmortem/doc/comment: `"credsStore": "evil"`,
+# no surrounding object) false-positived identically to a real write,
+# reproduced live against both a Write to an unrelated `.md` file and a bare
+# shell comment. Requiring the key sit inside an actual `{ ... }` object
+# (bounded lazy `[^{}]{0,300}?` gaps, the same bounded-gap technique
+# `AWS_CRED_PROCESS_INI_RE`'s own `.{0,2000}?` uses to stay ReDoS-safe)
+# restores the "looks like a real config object, not a copy-pasted line"
+# bar every sibling guard's own strong/path-independent form already holds
+# itself to, while still catching content staged in a differently-named file
+# before a move (this guard's own tests keep using realistic, brace-wrapped
+# JSON for exactly that scenario).
 DOCKER_CRED_HELPER_STRONG_RE = re.compile(
-    r'"credsStore"\s*:\s*"[^"\\]+"'
-    r'|"credHelpers"\s*:\s*\{\s*"[^"\\]+"\s*:\s*"[^"\\]+"',
-    re.IGNORECASE,
+    r'\{[^{}]{0,300}?"credsStore"\s*:\s*"[^"\\]+"[^{}]{0,300}?\}'
+    r'|\{[^{}]{0,300}?"credHelpers"\s*:\s*\{[^{}]{0,300}?"[^"\\]+"\s*:\s*"[^"\\]+"'
+    r'[^{}]{0,300}?\}[^{}]{0,300}?\}',
+    re.IGNORECASE | re.DOTALL,
 )
 
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------

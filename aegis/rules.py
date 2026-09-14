@@ -6079,8 +6079,23 @@ def rule_cloud_cred_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
+        # QA finding (found while reviewing the sibling `rule_docker_cred_
+        # helper_protect` guard, reproduced here too): falling back to
+        # `_flatten_strings` only for `ActionClass.MCP` left `MultiEdit`/
+        # `NotebookEdit` -- both `ActionClass.EDIT` (see `events.py`'s
+        # `_TOOL_CLASS`), both carrying their text under a nested `edits`/
+        # `new_source` shape rather than a top-level `content`/`new_string`
+        # key -- with `content` silently empty and this guard returning
+        # None before any regex ever ran. Fixed the same way `rule_
+        # terraform_exec_protect` already does: fall through to the
+        # flattened-string sweep unconditionally, for every action class,
+        # whenever `content`/`new_string` is missing or empty.
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
@@ -6267,7 +6282,38 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     names -- a disclosed, not silent, gap). Podman's/nerdctl's own
     equivalent credential-helper configs (`~/.config/containers/auth.json`,
     `containers-auth.json`'s own `credHelpers`) are a related but DISTINCT
-    file this guard does not scan at all."""
+    file this guard does not scan at all.
+
+    QA history (two independent adversarial reviews, run in parallel --
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file follows): bypass-hunting found and reproduced a total
+    bypass via `MultiEdit`/`NotebookEdit` -- both `ActionClass.EDIT` (see
+    `events.py`'s `_TOOL_CLASS`), both carrying their text under a nested
+    `edits`/`new_source` shape rather than a top-level `content`/`new_string`
+    key, so a first version's MCP-only `_flatten_strings` fallback left
+    `content` empty and the guard silently returned None -- reproduced on
+    exactly this guard's own headline scenario (a relative path, no leading
+    separator). Closed the same way `rule_terraform_exec_protect` already
+    fixes the identical bug class: fall through to the flattened-string
+    sweep unconditionally, for every action class, whenever `content`/
+    `new_string` is missing or empty. The same round independently
+    reproduced the identical bug in `rule_cloud_cred_exec_protect` itself
+    (a pre-existing gap this guard had copied, not introduced fresh) --
+    flagged for that guard's own maintainers, out of scope to fix here.
+    Design/consistency review found this guard never stripped `#`-prefixed
+    comment lines before its content-shape checks, unlike its sibling
+    (`rule_cloud_cred_exec_protect`'s own QA history fixed this exact class)
+    -- a documentation/TODO line merely MENTIONING credsStore/credHelpers in
+    a comment false-positived identically to a real write; closed via
+    `patterns.strip_comment_lines` on both the Edit/Write/MCP content branch
+    and the shell branch. Bypass-hunting separately reproduced a related
+    false positive: the ORIGINAL `DOCKER_CRED_HELPER_STRONG_RE` treated any
+    bare `"credsStore": "value"` shape as path-independent-strong with no
+    structural bar at all, unlike `AWS_CRED_PROCESS_INI_RE`'s own `[section]`
+    -header requirement for its strong form -- a prose doc/postmortem line
+    merely quoting the shape as an EXAMPLE false-positived; closed by
+    requiring the key sit inside an actual `{...}` object literal (see that
+    regex's own comment in `patterns.py` for the bounded-gap fix in full)."""
     cfg = getattr(policy, "docker_cred_helper", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -6284,11 +6330,35 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        content = str(a.get("content") or a.get("new_string") or "")
-        if not content and ev.action == ActionClass.MCP:
+        # QA finding (bypass-hunting round): falling back to `_flatten_
+        # strings` only for `ActionClass.MCP` left `MultiEdit`/`NotebookEdit`
+        # -- both classified `ActionClass.EDIT` (see `events.py`'s
+        # `_TOOL_CLASS`), and both carrying their text under a nested
+        # `edits: [{new_string}, ...]`/`new_source` shape rather than a
+        # top-level `content`/`new_string` key -- with `content` silently
+        # empty and the guard returning None before any regex ever ran, on
+        # EXACTLY this guard's own headline scenario (a relative path with
+        # no leading separator, reproduced live). Fixed the same way
+        # `rule_terraform_exec_protect` already does: fall through to the
+        # flattened-string sweep unconditionally, for every action class,
+        # whenever `content`/`new_string` is missing or empty, not just MCP.
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
+        # Strip full-line `#` comments before matching -- QA finding
+        # (design/consistency round): unlike `rule_cloud_cred_exec_protect`
+        # (which strips comments from this exact content shape for the
+        # identical reason), this guard originally scanned raw content, so
+        # a documentation/template line merely MENTIONING credsStore/
+        # credHelpers inside a `#`-prefixed comment (never actually setting
+        # it) false-positived.
+        scan_content = patterns.strip_comment_lines(content)
         # Same MCP path-key widening `rule_cloud_cred_exec_protect` applies:
         # `_path()` only recognizes a fixed key-name allowlist, so an MCP
         # tool naming its path argument something else entirely would
@@ -6300,8 +6370,8 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
             path_text = p + " " + " ".join(_flatten_strings(a))
         path_confirmed = bool(path_text and patterns.DOCKER_CONFIG_PATH_RE.search(path_text))
         hit = bool(
-            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(content)
-            or (path_confirmed and patterns.DOCKER_CRED_HELPER_CONTENT_RE.search(content)))
+            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_content)
+            or (path_confirmed and patterns.DOCKER_CRED_HELPER_CONTENT_RE.search(scan_content)))
         if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_DOCKER_CRED_HELPER")
@@ -6321,10 +6391,11 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        path_hit = bool(patterns.DOCKER_CONFIG_PATH_RE.search(cmd))
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        path_hit = bool(patterns.DOCKER_CONFIG_PATH_RE.search(scan_cmd))
         hit = bool(
-            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(cmd)
-            or (path_hit and patterns.DOCKER_CRED_HELPER_CONTENT_RE.search(cmd)))
+            patterns.DOCKER_CRED_HELPER_STRONG_RE.search(scan_cmd)
+            or (path_hit and patterns.DOCKER_CRED_HELPER_CONTENT_RE.search(scan_cmd)))
         if not hit:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DOCKER_CRED_HELPER")
