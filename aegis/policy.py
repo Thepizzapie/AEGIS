@@ -327,6 +327,15 @@ class Policy:
     # every future credential resolution through that profile/context. See
     # rules.rule_cloud_cred_exec_protect.
     cloud_cred_exec: dict = field(default_factory=dict)
+    # Docker credential-helper exec-hijack protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers Docker's own `~/.docker/config.json`
+    # `credsStore`/`credHelpers` keys -- either names an external command
+    # (`docker-credential-<value>`, resolved on $PATH) Docker execs on every
+    # future registry auth (`login`/`pull`/`push`/`build`) through that
+    # scope, handing it a live registry credential every time. See
+    # rules.rule_docker_cred_helper_protect.
+    docker_cred_helper: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/

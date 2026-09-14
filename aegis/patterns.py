@@ -4731,6 +4731,68 @@ KUBE_EXEC_CRED_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Docker credential-helper exec-hijack protection --------------------------
+# Docker CLI's own config file, ~/.docker/config.json (or a project-relative
+# copy staged before being moved into place), supports two keys that name an
+# EXTERNAL COMMAND: `credsStore` (a single global helper, applied to every
+# registry with no per-registry entry) and `credHelpers` (a per-registry
+# override map). Whichever value `V` is set, Docker execs `docker-credential-
+# V` on every future registry auth touching that scope -- `docker login`/
+# `pull`/`push`/`build`/`buildx` -- feeding it the registry hostname on stdin
+# and reading a JSON `{Username, Secret}` (or bearer token) back on stdout for
+# a `get` verb, and handing it the ACTUAL credential material to persist for a
+# `store` verb. Same "write now, auto-exec later, on someone else's future
+# invocation, handed live credentials every time it runs" shape
+# `GIT_CONFIG_CREDENTIAL_HELPER_RE`/`AWS_CRED_PROCESS_*`/`KUBE_EXEC_CRED_*`
+# above already cover for git/AWS/Kubernetes -- here the payoff is a
+# container-registry credential (frequently a cloud registry's own IAM-backed
+# token: ECR, GCR/Artifact Registry, ACR) instead, and unlike a git alias the
+# planted binary only needs to EXIST somewhere on `$PATH` as `docker-
+# credential-<V>` (no absolute path in the config at all), so the write here
+# is only half the attack -- the other half is planting that binary, a
+# surface `rule_path_hijack_protect`'s own PATH-shadow coverage already
+# reaches for a TRUSTED command name, though `docker-credential-<name>` is
+# not itself one of the trusted names that guard's own allowlist covers (a
+# disclosed gap, not a silent one).
+#
+# Unlike ~/.aws/config, ~/.aws/credentials, and ~/.kube/config,
+# ~/.docker/config.json is already in CRED_RE above -- so the literal,
+# absolute/home-relative path is ALREADY denied, non-escapably, by
+# `rule_containment`, for every native Read/Edit/Write and any shell command
+# that mentions that literal path text. `rule_docker_cred_helper_protect`
+# exists for exactly the classes that miss: an MCP-tool write (`CRED_RE`'s
+# check structurally never runs for `ActionClass.MCP`), a relative path with
+# no leading separator (`CRED_RE` requires one immediately before `.docker`),
+# and content staged under an entirely different filename before a move puts
+# it at the real path -- the same non-redundant carve-out
+# `rule_cloud_cred_exec_protect`'s own docstring discloses for its AWS/kube
+# overlap with this same CRED_RE check.
+DOCKER_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.docker" + _WIN_TRIM + _SEP + r"config\.json" + _CI_END,
+    re.IGNORECASE,
+)
+# Weak, path-CONFIRMED-only key check -- either key, bare, mirrors
+# AWS_CRED_PROCESS_CONTENT_RE's own "key alone is enough, once the path is
+# confirmed" reasoning: there is no safe value for either key, only a
+# question of which external command it names.
+DOCKER_CRED_HELPER_CONTENT_RE = re.compile(
+    r'"(?:credsStore|credHelpers)"\s*:', re.IGNORECASE,
+)
+# Strong, path-INDEPENDENT form: a REAL assignment shape, not just the key
+# name in passing (a comment, a doc line, this guard's own tests) --
+# `credsStore` given an actual non-empty string value, or `credHelpers` given
+# an actual per-registry mapping with at least one real `"<registry>":
+# "<helper>"` entry. Both key names are Docker-specific vocabulary with no
+# realistic cross-format collision (unlike a bare `= !` value prefix), so --
+# same call `AWS_CRED_PROCESS_INI_RE`'s own docstring makes for
+# `credential_process` -- no additional scoping beyond the real-assignment
+# shape itself is needed for this to stay precise.
+DOCKER_CRED_HELPER_STRONG_RE = re.compile(
+    r'"credsStore"\s*:\s*"[^"\\]+"'
+    r'|"credHelpers"\s*:\s*\{\s*"[^"\\]+"\s*:\s*"[^"\\]+"',
+    re.IGNORECASE,
+)
+
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
 # `external` provider's `data "external"` data source all name an arbitrary
