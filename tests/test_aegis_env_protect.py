@@ -318,6 +318,16 @@ def test_carrier_gate_covers_procfile():
     assert _gated(d) and d.rule == "aegis-env-protect"
 
 
+def test_carrier_gate_covers_makefile_and_justfile():
+    # shared fix with rule_exec_env_hijack_protect's own QA history (both
+    # rules call the same env_carrier_path_hit()) — a Makefile/justfile
+    # recipe line exports a variable into every command it subsequently
+    # runs, but had no entry at all in the original carrier-path list.
+    for path in ("Makefile", "makefile", "GNUmakefile", "build.mk", "justfile"):
+        d = evaluate(_write(path, "deploy:\n\texport AEGIS_PLUGINS=/tmp/evil.py\n"), EMPTY)
+        assert _gated(d) and d.rule == "aegis-env-protect", path
+
+
 def test_no_catastrophic_backtracking():
     """Every content-scanning regex in this file has had at least one ReDoS
     round (see AEGIS_SOURCE_RE's / EXFIL_RE's own comments) — checked here at

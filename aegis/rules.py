@@ -3389,15 +3389,55 @@ def rule_exec_env_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
     fetch-to-file write (``curl -o .env ...``) is covered by
     ``rule_fetch_to_file_protect``'s own backstop only for the carrier
     extensions already on its target list; the ``NODE_OPTIONS`` content gate
-    only recognizes four flag spellings — a fifth code-loading flag Node
-    adds to its own allow-list in the future is not retroactively covered;
-    and, like every other guard here, the assignment and the dangerous flag
-    only need to appear ANYWHERE in the (de-obfuscated) text, not provably
-    in the same statement — a ``NODE_OPTIONS=--max-old-space-size=4096``
-    line and an unrelated ``--require`` elsewhere in a large content/command
-    blob can ask the same way a real single-assignment case does; the cost
-    is one unnecessary human confirmation, not a missed detection, the same
-    accepted direction every sibling guard in this file takes."""
+    only recognizes five flag spellings — a future code-loading flag Node
+    adds to its own allow-list is not retroactively covered; and, like every
+    other guard here, the assignment and the dangerous flag only need to
+    appear ANYWHERE in the (de-obfuscated) text, not provably in the same
+    statement — a ``NODE_OPTIONS=--max-old-space-size=4096`` line and an
+    unrelated ``--require`` elsewhere in a large content/command blob can
+    ask the same way a real single-assignment case does; the cost is one
+    unnecessary human confirmation, not a missed detection, the same
+    accepted direction every sibling guard in this file takes.
+
+    QA history (two independent adversarial reviews, run in parallel — same
+    convention every guard in this file follows): design/consistency review
+    round-tripped an actual YAML ``exec_env_hijack:`` block through
+    ``load_policy()`` into a live ``evaluate()`` decision, confirmed
+    ``_CORE_RULES``/``Policy``/all three ``loader.py`` spots/both
+    ``skills.py`` knob lists/the README table row all correctly wired,
+    confirmed the YAML-1.1 ``mode: off`` → boolean ``False`` handling
+    matches every sibling guard, and ran the full suite green (2255 passed)
+    — no findings. Bypass-hunting found and closed two real, reproduced
+    gaps: (1) ``NODE_OPTIONS=--snapshot-blob=<path>`` — verified live
+    against a real ``node`` binary — loads a V8 startup snapshot and runs
+    whatever ``v8.startupSnapshot.setDeserializeMainFunction()`` callback is
+    baked into the referenced (opaque, non-source) blob file INSTEAD of the
+    target script, a full code-execution primitive with no ``require``/
+    ``import``/``loader`` keyword anywhere in the command; Node accepts this
+    flag via ``NODE_OPTIONS`` (unlike ``--build-snapshot``, which Node
+    itself refuses there) — missing from ``NODE_OPTIONS_DANGEROUS_FLAG_RE``'s
+    original four-flag list, now five; (2) ``Makefile``/``GNUmakefile``/a
+    ``.mk`` include, and ``just``'s own ``justfile`` — one of the single
+    most common, routinely-edited project file types there is — had no
+    entry at all in ``env_carrier_path_hit()``'s carrier list, so planting
+    the exact same assignment inside a recipe (which genuinely exports it
+    into every command that recipe subsequently runs) fell all the way
+    through to a clean ALLOW, with no sibling guard providing a fallback
+    the way ``.envrc``/a canonical systemd unit path/``Jenkinsfile``
+    happen to (confirmed via ``evaluate()`` on each). Fixed by adding both
+    to the shared carrier-path pattern (see ``AEGIS_ENV_CARRIER_PATH_RE``'s
+    own comment in ``patterns.py`` — the fix also closes the identical gap
+    for ``rule_aegis_env_protect``, which shares the same function).
+    Confirmed NOT a bypass on this guard, verified live: every alternate
+    shell-assignment form tried (``declare -x``/``local -x``/``typeset -x``/
+    ``readonly``/``env VAR=val cmd``/Windows quoted ``set "VAR=val"``,
+    heredoc-embedded and multi-statement one-liners, quote-split variable
+    names, case variation), MultiEdit/NotebookEdit's nested ``edits``/
+    ``new_source`` argument shape (the exact bug class ``rule_docker_
+    cred_helper_protect``'s own QA history found and fixed — NOT
+    reintroduced here), both ``--require=`` and ``--require `` spellings,
+    and adversarial input up to 1.3MB with no catastrophic backtracking.
+    Full suite green after both fixes."""
     cfg = getattr(policy, "exec_env_hijack", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

@@ -224,6 +224,19 @@ def test_node_options_dockerfile_require_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_node_options_snapshot_blob_gated():
+    """QA finding (independent adversarial review, round 1 — reproduced live
+    against a real `node` binary): Node accepts `--snapshot-blob=<path>` via
+    NODE_OPTIONS and runs whatever `v8.startupSnapshot.
+    setDeserializeMainFunction()` callback is baked into the referenced
+    (opaque, non-source) blob INSTEAD of the target script — a full
+    code-execution primitive that carries no `require`/`import`/`loader`
+    keyword anywhere in the command, and originally sailed through the
+    four-flag content gate untouched."""
+    d = evaluate(_shell("export NODE_OPTIONS='--snapshot-blob=/tmp/evil.blob'"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 # ---- escape hatches: human-only ---------------------------------------------
 
 def test_human_can_override_shell_with_comment():
@@ -357,6 +370,18 @@ def test_carrier_gate_covers_shell_profile_dotfiles():
 def test_carrier_gate_covers_wrapper_script():
     d = evaluate(_write("entrypoint.sh", "export BASH_ENV=/tmp/evil.sh\n"), EMPTY)
     assert _gated(d) and d.rule == RULE
+
+
+def test_carrier_gate_covers_makefile_and_justfile():
+    """QA finding (independent adversarial review, round 1 — reproduced live
+    via evaluate()): a Makefile/justfile recipe line genuinely exports the
+    variable into every command that recipe subsequently runs, but had no
+    entry at all in the original carrier-path list — one of the single most
+    common, routinely-edited project file types there is, sailing through
+    to a clean ALLOW with no sibling guard providing a fallback."""
+    for path in ("Makefile", "makefile", "GNUmakefile", "build.mk", "justfile"):
+        d = evaluate(_write(path, "deploy:\n\texport LD_PRELOAD=/tmp/evil.so\n"), EMPTY)
+        assert _gated(d) and d.rule == RULE, path
 
 
 # ---- performance / ReDoS -----------------------------------------------------

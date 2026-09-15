@@ -294,6 +294,20 @@ AEGIS_ENV_BYPASS_RE = re.compile(
 # having no escape hatch whatsoever. Reusing `SHELL_RC_PATH_RE` (below in
 # this file) rather than re-deriving the same filename list closes it without
 # duplicating that guard's own maintenance surface.
+#
+# QA finding (independent adversarial review of `rule_exec_env_hijack_
+# protect`, round 1): the carrier list above had no entry at all for a
+# build-recipe file — `Makefile`/`GNUmakefile`/a `.mk` include, or `just`'s
+# own `justfile` — even though an `export FOO=bar` (or bare `FOO=bar`
+# prefix) line inside a recipe genuinely sets that variable in the
+# environment of every command the recipe subsequently runs, confirmed live
+# via `evaluate()` returning a clean ALLOW with NO other guard in the file
+# providing a fallback (unlike `.envrc`/a canonical systemd unit path/
+# `Jenkinsfile`, which a *different*, independently-configured sibling guard
+# happens to also cover). One of the single most common, routinely-edited
+# project file types there is — added here rather than as a one-off fix in
+# the caller, since both `rule_aegis_env_protect` and
+# `rule_exec_env_hijack_protect` share this same function.
 _ENV_TEMPLATE_SUFFIX_RE = re.compile(
     r"\.env\.(?:example|sample|template|dist)$", re.IGNORECASE)
 AEGIS_ENV_CARRIER_PATH_RE = re.compile(
@@ -301,7 +315,10 @@ AEGIS_ENV_CARRIER_PATH_RE = re.compile(
     r"|(?:^|[/\\])Dockerfile(?:\.[\w.-]+)?$"
     r"|(?:^|[/\\])Procfile$"
     r"|\.ya?ml$"
-    r"|\.(?:sh|bash|zsh|fish|ps1|psm1|bat|cmd)$",
+    r"|\.(?:sh|bash|zsh|fish|ps1|psm1|bat|cmd)$"
+    r"|(?:^|[/\\])(?:GNUmakefile|Makefile)(?:\.[\w.-]+)?$"
+    r"|\.mk$"
+    r"|(?:^|[/\\])\.?justfile$",
     re.IGNORECASE,
 )
 
@@ -396,14 +413,31 @@ def _env_assign_alt(vars_src: str) -> str:
 
 EXEC_ENV_HIJACK_RE = re.compile(_env_assign_alt(_EXEC_ENV_ALWAYS_VARS), re.IGNORECASE)
 NODE_OPTIONS_ASSIGN_RE = re.compile(_env_assign_alt(r"NODE_OPTIONS"), re.IGNORECASE)
-# --require/-r, --loader/--experimental-loader, --import -- the documented
-# NODE_OPTIONS-allowed flags that load and run arbitrary code before the
-# target script. `--experimental-policy` (restricts, doesn't load, code) and
-# every perf/diagnostic flag (`--max-old-space-size`, `--stack-size`,
-# `--enable-source-maps`, ...) are deliberately excluded -- routine, harmless
-# values that would otherwise ask on nearly every containerized Node deploy.
+# --require/-r, --loader/--experimental-loader, --import, --snapshot-blob --
+# the documented NODE_OPTIONS-allowed flags that load and run arbitrary code
+# before the target script. `--experimental-policy` (restricts, doesn't
+# load, code) and every perf/diagnostic flag (`--max-old-space-size`,
+# `--stack-size`, `--enable-source-maps`, ...) are deliberately excluded --
+# routine, harmless values that would otherwise ask on nearly every
+# containerized Node deploy.
+#
+# QA finding (independent adversarial review, round 1 -- reproduced live
+# against a real `node` binary): the original four-flag list missed
+# `--snapshot-blob=<path>` entirely. Node accepts it via NODE_OPTIONS (unlike
+# `--build-snapshot`, which Node itself refuses there) and, on load, runs
+# whatever `v8.startupSnapshot.setDeserializeMainFunction()` callback was
+# baked into the referenced blob INSTEAD of the target script's own code --
+# a full code-execution primitive with no `require`/`import`/`loader`
+# keyword anywhere in the command, and no dangerous-looking text at all in
+# the blob file itself (an opaque binary, not source). Same "runtime reads
+# an env var and loads arbitrary code" shape as the other three flags, one
+# more Node-specific mechanism. Honest scope: this is Node's currently
+# documented NODE_OPTIONS allow-list; a future Node release adding another
+# code-loading flag to that allow-list is not retroactively covered, the
+# same "known gap" the guard's own docstring already discloses.
 NODE_OPTIONS_DANGEROUS_FLAG_RE = re.compile(
-    r"--require\b|(?:^|[\s=])-r(?=[\s=]|$)|--loader\b|--experimental-loader\b|--import\b",
+    r"--require\b|(?:^|[\s=])-r(?=[\s=]|$)|--loader\b|--experimental-loader\b"
+    r"|--import\b|--snapshot-blob\b",
     re.IGNORECASE,
 )
 
