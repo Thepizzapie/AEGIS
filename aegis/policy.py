@@ -236,6 +236,20 @@ class Policy:
     # /etc/ld.so.conf + /etc/ld.so.conf.d/*.conf (shared-library search-path
     # hijack). See rules.rule_ld_preload_protect.
     ld_preload: dict = field(default_factory=dict)
+    # Code-injection environment-variable hijack protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers LD_PRELOAD/DYLD_INSERT_LIBRARIES (the
+    # env-var form of the same dlopen()-into-every-process primitive
+    # ld_preload above covers for the persisted /etc/ld.so.preload file --
+    # no root or reboot needed, live for the very next command), BASH_ENV
+    # (bash sources this file for every NON-interactive invocation --
+    # `bash script.sh`, most CI "run a step" shells -- a trigger
+    # shell_persist's own ~/.bashrc coverage never reaches), PERL5OPT/
+    # RUBYOPT (auto -M/-r module load on the next perl/ruby invocation), and
+    # NODE_OPTIONS when paired with one of its own code-loading flags
+    # (--require/-r/--loader/--experimental-loader/--import). See
+    # rules.rule_exec_env_hijack_protect.
+    exec_env_hijack: dict = field(default_factory=dict)
     # Dev-container lifecycle-command protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers .devcontainer/devcontainer.json (+ .devcontainer/<name>/
