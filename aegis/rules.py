@@ -3264,6 +3264,206 @@ def rule_ld_preload_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _exec_env_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_exec_env_hijack_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block setting a code-injection environment variable —
+    ``LD_PRELOAD``/``DYLD_INSERT_LIBRARIES``, ``BASH_ENV``, ``PERL5OPT``/
+    ``RUBYOPT``, or ``NODE_OPTIONS`` together with one of its own code-loading
+    flags (``--require``/``-r``, ``--loader``/``--experimental-loader``,
+    ``--import``) — from a shell, or by planting the assignment in a file
+    something actually loads into a process environment (the same
+    ``env_carrier_path_hit()`` carrier-file check ``rule_aegis_env_protect``
+    uses: a project ``.env``, a Dockerfile ``ENV`` line, a ``docker-
+    compose.yml``/Kubernetes ``env:`` block, a wrapper script, a shell
+    profile).
+
+    THREAT MODEL: every guard above that covers a "write now, auto-exec
+    later" surface gates a FILE the OS or a tool reads back later
+    (``rule_ld_preload_protect``'s own ``/etc/ld.so.preload``,
+    ``rule_shell_persist_protect``'s ``~/.bashrc``, ``rule_pysite_protect``'s
+    ``sitecustomize.py``). These six variables are read directly out of the
+    process ENVIRONMENT instead — by the dynamic linker, a shell, or a
+    language runtime — so setting one touches no path any of those guards'
+    patterns recognize at all, and needs no file write, no reboot, and no
+    new session: an ordinary ``export`` in THIS shell is a live hijack of
+    every matching subprocess for the rest of the session, and of anything
+    that inherits the environment afterward (a backgrounded job, a spawned
+    agent, a later CI step in the same job).
+
+    - ``LD_PRELOAD`` (glibc) / ``DYLD_INSERT_LIBRARIES`` (macOS's dyld
+      equivalent) — the ENV-VAR form of the exact rootkit primitive
+      ``rule_ld_preload_protect`` covers for the persisted ``/etc/
+      ld.so.preload`` file: every shared object named is ``dlopen()``'d into
+      every dynamically-linked binary this shell (and its children)
+      subsequently ``exec()``s. Needs no root and no reboot — live for the
+      very next command, a strictly LOWER bar than the file form that
+      guard's own docstring already covers.
+    - ``BASH_ENV`` — bash reads and executes this file for every
+      *non-interactive* invocation (``bash script.sh``, ``bash -c "..."``,
+      the shape most CI "run a step" invocations actually take), a trigger
+      ``rule_shell_persist_protect``'s own ``~/.bashrc`` coverage never
+      reaches (an interactive-shell rc file is not sourced for a
+      non-interactive script, and vice versa). This is the documented
+      mechanism behind real CI-secret-exfiltration backdoors: every
+      subsequent ``run:`` step in the same job silently sources the named
+      file first, including one that quietly forwards ``$CI_TOKEN``/
+      ``$AWS_SECRET_ACCESS_KEY`` to an attacker-controlled host before the
+      step's own intended command ever runs.
+    - ``PERL5OPT`` / ``RUBYOPT`` — the identical "runtime reads an env var
+      and loads arbitrary code on every subsequent invocation" shape one
+      interpreter family over: ``PERL5OPT`` is prepended to perl's own argv
+      as ``-M<value>``-style options (an arbitrary module ``use``d before
+      the script's own code runs); ``RUBYOPT`` does the same via
+      ``-r<value>`` (``require``d before the script runs). Both fire on the
+      next bare ``perl``/``ruby`` invocation, no future trigger needed.
+    - ``NODE_OPTIONS`` — Node parses this on every subsequent ``node``
+      invocation and honors, among a safe documented allow-list of flags,
+      ``--require``/``--loader``/``--experimental-loader``/``--import``,
+      each of which loads and runs an arbitrary module before the target
+      script's own first line — the same blast radius as the two above,
+      one runtime over.
+
+    Nothing else in this file reaches this surface: ``rule_aegis_env_protect``
+    covers Aegis's own seven trust-boundary vars, a disjoint name list at a
+    different trust boundary (the enforcement engine itself, not the OS/
+    runtime underneath it); ``rule_ld_preload_protect`` covers the persisted
+    ``/etc/ld.so.preload`` FILE, never the ``LD_PRELOAD`` env var itself —
+    its own docstring says so explicitly ("this guard has no equivalent
+    env-var-relocation gap to disclose", written before this guard existed);
+    ``rule_shell_persist_protect`` covers shell STARTUP files, not an env var
+    a non-interactive shell reads instead of any of them; and
+    ``rule_pysite_protect``/``rule_conftest_protect``/``rule_ipython_
+    startup_protect`` cover Python's/pytest's/IPython's own interpreter-
+    startup file mechanisms, never a language runtime's env-var-driven
+    equivalent.
+
+    Config (``policy.exec_env_hijack``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    — a repo's own trusted memory-profiler/EDR-agent bootstrap that
+    legitimately sets ``LD_PRELOAD``, say). Defaults to ``ask`` for the same
+    reason every sibling ``*_protect`` guard does: every one of these
+    variables has a real, sanctioned use (a malloc-debugging library, a
+    documented CI ``BASH_ENV`` bootstrap, a Node ``--require``-based
+    instrumentation loader) — it just needs a human to have actually looked
+    at the specific value once.
+
+    Escapable only by a human: a trailing ``# aegis-allow`` on the shell
+    form, or the env toggle ``AEGIS_ALLOW_EXEC_ENV_HIJACK=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable — the same invariant
+    every escapable guard in this file holds.
+
+    ``NODE_OPTIONS`` is content-gated (``patterns.exec_env_hijack_hit()``
+    requires one of its own code-loading flags alongside the assignment) —
+    unlike the other five, it has plenty of routine, harmless values
+    (``--max-old-space-size=4096``, ``--enable-source-maps``,
+    ``--no-warnings``) that would otherwise ask on nearly every
+    containerized Node deploy; gating on the bare assignment the way the
+    other five vars are gated would be needless friction on the single most
+    common of the six. The other five have no safe/dangerous split by
+    value — the variable's only documented purpose IS loading external code
+    — so they gate on the bare assignment, the same "no safe/dangerous
+    split, gate on the key alone" call ``rule_docker_cred_helper_protect``/
+    ``rule_git_config_exec_protect`` already make for ``credsStore``/
+    ``credential.helper``.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a value assembled indirectly (shell variable concatenation
+    across separate assignments, a templating step, a value written across
+    two separate Edit calls whose diff never repeats the var name in one
+    call) defeats the content check, the same "computed indirectly" class
+    every sibling ``*_protect`` guard already accepts; a bare backslash
+    before an ordinary character survives bash's own parse but not
+    ``normalize.scan_surface``'s de-obfuscation, the identical shared gap
+    ``rule_aegis_env_protect``'s own docstring already discloses; a direct
+    fetch-to-file write (``curl -o .env ...``) is covered by
+    ``rule_fetch_to_file_protect``'s own backstop only for the carrier
+    extensions already on its target list; the ``NODE_OPTIONS`` content gate
+    only recognizes four flag spellings — a fifth code-loading flag Node
+    adds to its own allow-list in the future is not retroactively covered;
+    and, like every other guard here, the assignment and the dangerous flag
+    only need to appear ANYWHERE in the (de-obfuscated) text, not provably
+    in the same statement — a ``NODE_OPTIONS=--max-old-space-size=4096``
+    line and an unrelated ``--require`` elsewhere in a large content/command
+    blob can ask the same way a real single-assignment case does; the cost
+    is one unnecessary human confirmation, not a missed detection, the same
+    accepted direction every sibling guard in this file takes."""
+    cfg = getattr(policy, "exec_env_hijack", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "exec-env-hijack-protect-monitor")
+            return None
+        return would
+
+    reason_common = ("it runs arbitrary code the next time the dynamic linker, "
+                      "a non-interactive shell, or the named language runtime "
+                      "starts — in this session and any child process that "
+                      "inherits the environment, no file write or future "
+                      "trigger needed")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not patterns.env_carrier_path_hit(p):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        scan_content = patterns.strip_comment_lines(content)
+        if not patterns.exec_env_hijack_hit(scan_content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_EXEC_ENV_HIJACK")
+                or _exec_env_hijack_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "exec-env-hijack-protect",
+                         f"'{p}' is planting an assignment to a code-injection "
+                         f"environment variable (LD_PRELOAD/"
+                         f"DYLD_INSERT_LIBRARIES/BASH_ENV/PERL5OPT/RUBYOPT, or "
+                         f"NODE_OPTIONS with a code-loading flag) — {reason_common}, "
+                         "wherever it later gets loaded into the environment. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_EXEC_ENV_HIJACK=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        if not patterns.exec_env_hijack_hit(scan_cmd):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_EXEC_ENV_HIJACK")
+                or _exec_env_hijack_allowed_by_policy(cfg, cmd)):
+            return None
+        return _finish(Decision(action, "exec-env-hijack-protect",
+                         "A code-injection environment variable "
+                         "(LD_PRELOAD/DYLD_INSERT_LIBRARIES/BASH_ENV/PERL5OPT/"
+                         "RUBYOPT, or NODE_OPTIONS with a code-loading flag) "
+                         f"is being set from a shell — {reason_common}. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_EXEC_ENV_HIJACK=1; a spawned agent cannot."))
+    return None
+
+
 def _devcontainer_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7239,6 +7439,7 @@ _CORE_RULES = (
     rule_gitmodules_protect,
     rule_service_persist_protect,
     rule_ld_preload_protect,
+    rule_exec_env_hijack_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_path_hijack_protect,

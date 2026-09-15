@@ -322,6 +322,115 @@ def env_carrier_path_hit(path: str) -> bool:
         return False
     return bool(AEGIS_ENV_CARRIER_PATH_RE.search(path) or SHELL_RC_PATH_RE.search(path))
 
+
+# Code-injection environment variables -- a distinct trust boundary from every
+# *_protect guard above that gates a PERSISTENCE FILE (a shell rc, a systemd
+# unit, /etc/ld.so.preload): each of these is instead read directly out of the
+# process ENVIRONMENT, by the dynamic linker, a shell, or a language runtime,
+# with no file write of any kind required. Setting one from a plain `export`
+# in the CURRENT session is already a live hijack of every matching subprocess
+# for the rest of this session (and anything that inherits its environment,
+# e.g. a backgrounded job or a spawned agent) -- the closest analog is
+# rule_aegis_env_protect's own env-var trust boundary, one layer down from
+# Aegis's own config into the OS/runtime's.
+#
+# - LD_PRELOAD (glibc) / DYLD_INSERT_LIBRARIES (macOS's dyld equivalent) --
+#   the ENV-VAR form of the exact rootkit primitive rule_ld_preload_protect's
+#   own docstring covers for the persisted /etc/ld.so.preload file: every
+#   shared object named is dlopen()'d into every dynamically-linked binary
+#   the current shell (and its children) subsequently exec()s. Unlike the
+#   /etc file, this needs no root and no reboot -- it is live for the very
+#   next command.
+# - BASH_ENV -- bash reads and executes this file for EVERY *non-interactive*
+#   invocation (`bash script.sh`, `bash -c "..."`, most CI "run a step" shells
+#   are non-interactive bash), a trigger rule_shell_persist_protect's own
+#   ~/.bashrc coverage never reaches: an interactive-shell rc file is NOT
+#   sourced for a non-interactive script, and vice versa -- this is the
+#   documented mechanism behind real CI-secret-exfiltration backdoors (every
+#   subsequent "run:" step in the same job silently sources the named file
+#   first, including ones that echo `$CI_TOKEN`/`$AWS_SECRET_ACCESS_KEY` to
+#   an attacker-controlled endpoint).
+# - PERL5OPT / RUBYOPT -- the same "runtime reads an env var and loads
+#   arbitrary code on every subsequent invocation" shape one interpreter
+#   family over: PERL5OPT is prepended to perl's own argv as `-M<value>`-
+#   style options (an arbitrary module `use`d before the script's own code
+#   runs); RUBYOPT does the same via `-r<value>` (`require`d before the
+#   script runs). Both fire on the next bare `perl`/`ruby` invocation, no
+#   future trigger needed, the identical blast radius NODE_OPTIONS has below.
+# - NODE_OPTIONS -- Node parses this on every subsequent `node` invocation
+#   and honors (among a safe, documented allow-list of flags) `--require`/
+#   `--loader`/`--experimental-loader`/`--import`, each of which loads and
+#   runs an arbitrary module before the target script's own first line.
+#   UNLIKE the vars above, NODE_OPTIONS has plenty of routine, harmless
+#   values too (`--max-old-space-size=4096`, `--enable-source-maps`,
+#   `--no-warnings`) -- gating on the bare assignment the way the other five
+#   vars are gated would ask on nearly every containerized Node deploy.
+#   Content-gated instead: an assignment is only flagged when one of the
+#   four code-loading flags also appears (NODE_OPTIONS_DANGEROUS_FLAG_RE),
+#   the same "gate on the dangerous shape, not the mere presence of the
+#   surface" trade-off DOCKER_CRED_HELPER_CONTENT_RE/AWS_CRED_PROCESS_INI_RE
+#   already make for their own always-vs-content-gated splits.
+#
+# Assignment shapes: the identical 8-way alternation AEGIS_ENV_BYPASS_RE
+# already documents in full above (bare `KEY=value`/PowerShell `$env:KEY =`,
+# Dockerfile `ENV KEY value`, `setx KEY value`, a YAML `KEY: value` mapping
+# line, `export`/`setenv KEY`, fish `set -x KEY value`, `printf -v KEY`, and a
+# Kubernetes/Helm split `name:`/`value:` pair) -- reused verbatim rather than
+# re-derived, since every one of these five/six variables is set through the
+# same shell/file surfaces Aegis's own trust-boundary vars are.
+_EXEC_ENV_ALWAYS_VARS = r"LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|PERL5OPT|RUBYOPT"
+
+
+def _env_assign_alt(vars_src: str) -> str:
+    return (
+        r"\b(?:" + vars_src + r")\b\s*="
+        r"|\bENV\s+(?:" + vars_src + r")\b"
+        r"|\bsetx\b[^\r\n]*?\b(?:" + vars_src + r")\b"
+        r"|(?:^|\n)[ \t]*-?[ \t]*(?:" + vars_src + r")\b[ \t]*:[ \t]*\S"
+        r"|\b(?:export|setenv)\s+(?:" + vars_src + r")\b"
+        r"|\bset\s+(?:-[a-zA-Z]+\s+)+(?:" + vars_src + r")\b"
+        r"|\bprintf\s+-v\s+(?:" + vars_src + r")\b"
+        r"|\bname\s*:\s*(?:" + vars_src + r")\b[\s\S]{0,60}?\bvalue\s*:\s*\S"
+    )
+
+
+EXEC_ENV_HIJACK_RE = re.compile(_env_assign_alt(_EXEC_ENV_ALWAYS_VARS), re.IGNORECASE)
+NODE_OPTIONS_ASSIGN_RE = re.compile(_env_assign_alt(r"NODE_OPTIONS"), re.IGNORECASE)
+# --require/-r, --loader/--experimental-loader, --import -- the documented
+# NODE_OPTIONS-allowed flags that load and run arbitrary code before the
+# target script. `--experimental-policy` (restricts, doesn't load, code) and
+# every perf/diagnostic flag (`--max-old-space-size`, `--stack-size`,
+# `--enable-source-maps`, ...) are deliberately excluded -- routine, harmless
+# values that would otherwise ask on nearly every containerized Node deploy.
+NODE_OPTIONS_DANGEROUS_FLAG_RE = re.compile(
+    r"--require\b|(?:^|[\s=])-r(?=[\s=]|$)|--loader\b|--experimental-loader\b|--import\b",
+    re.IGNORECASE,
+)
+
+
+def exec_env_hijack_hit(text: str) -> bool:
+    """True if ``text`` sets one of the always-dangerous code-injection env
+    vars (LD_PRELOAD/DYLD_INSERT_LIBRARIES/BASH_ENV/PERL5OPT/RUBYOPT), or sets
+    NODE_OPTIONS together with one of its own code-loading flags. See the
+    module comment above ``_EXEC_ENV_ALWAYS_VARS`` for the full threat model
+    and why NODE_OPTIONS alone is content-gated while the other five are not.
+
+    Same "adjacent anywhere in the (de-obfuscated) text, not provably in the
+    SAME assignment" trade-off ``rule_shell_persist_protect``'s own docstring
+    already discloses for its write-verb/path pairing: a NODE_OPTIONS
+    assignment on one line and an unrelated ``--require`` elsewhere in a
+    large content/command blob can ask under a mode:ask default the same way
+    a real single-assignment case does. The cost is one unnecessary human
+    confirmation, not a missed detection -- the accepted direction every
+    sibling guard in this file takes."""
+    if not text:
+        return False
+    if EXEC_ENV_HIJACK_RE.search(text):
+        return True
+    return bool(NODE_OPTIONS_ASSIGN_RE.search(text)
+                and NODE_OPTIONS_DANGEROUS_FLAG_RE.search(text))
+
+
 # any move/delete verb (used together with ENFORCEMENT_PATH_RE on shell commands)
 DELETE_OR_MOVE_VERB_RE = re.compile(
     r"\b(?:rm|remove-item|ri|rmdir|rd|del|erase|mv|move-item|move|ren|rename-item)\b",
