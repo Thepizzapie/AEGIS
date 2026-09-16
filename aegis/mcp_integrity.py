@@ -361,19 +361,43 @@ def _get_resource_id(resource) -> Optional[str]:
     return str(uri) if uri else None
 
 
+def _mime_type_values(resource) -> list:
+    """Both ``mimeType`` (the actual MCP wire-format key) and ``mime_type``
+    (the snake_case attribute an object-style SDK model would expose for it)
+    resolve the SAME field. QA (round-2 adversarial review) finding:
+    resolving it with ``_first(resource, "mime_type", "mimeType", ...)`` --
+    a single value, picked in a fixed priority order -- meant a raw dict
+    setting BOTH keys (only possible from a deliberately crafted response;
+    a real client only ever emits one) could carry its real payload in
+    whichever slot ISN'T checked first, as a permanent, undetected decoy:
+    the checked-first key stays clean and pinned forever, the real key
+    silently carries -- and can rug-pull -- the poisoning, in both the scan
+    and the fingerprint, since a single-value ``_first`` never looks at the
+    other key once the first is found. Collecting every present value,
+    not just one, closes that regardless of which key the attacker uses
+    for which role."""
+    out = []
+    for key in ("mime_type", "mimeType"):
+        v = _get(resource, key)
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
 def _scan_resource_text(resource) -> Optional[str]:
     """Resources have no nested schema like a tool's inputSchema -- just a
     handful of top-level strings a poisoned/rug-pulled catalog entry could
     carry hidden instructions in. Includes ``uri``/``mimeType``, not just
-    ``name``/``title``/``description``: both are fingerprinted for drift
-    (see ``_fingerprint_resource``) and both are attacker-controlled strings
+    ``name``/``title``/``description``: all are fingerprinted for drift
+    (see ``_fingerprint_resource``) and all are attacker-controlled strings
     a client can render/log, so a payload planted there on a resource's very
     FIRST fetch (before any pin exists for drift to ever catch it) must be
     caught by this same scan, not silently exempted."""
-    for field in (_get(resource, "uri"), _get(resource, "name"),
-                  _first(resource, "title", default=None),
-                  _get(resource, "description"),
-                  _first(resource, "mime_type", "mimeType", default=None)):
+    fields = [_get(resource, "uri"), _get(resource, "name"),
+              _first(resource, "title", default=None),
+              _get(resource, "description")]
+    fields.extend(_mime_type_values(resource))
+    for field in fields:
         hit = scan_text(field)
         if hit:
             return hit
@@ -386,7 +410,7 @@ def _fingerprint_resource(resource) -> str:
         "name": _get(resource, "name") or "",
         "title": _first(resource, "title", default=""),
         "description": _get(resource, "description") or "",
-        "mimeType": _first(resource, "mime_type", "mimeType", default=""),
+        "mimeType": _mime_type_values(resource),
         "annotations": _first(resource, "annotations", default={}),
         # `size` is deliberately excluded: a legitimate resource's size (a
         # log file, anything backed by a live file) can change on every
@@ -416,8 +440,19 @@ def _prompt_arguments(prompt) -> list:
     short argument descriptions costs the same as scanning one N-times-longer
     description string, and no single string's length is capped anywhere in
     this module -- so there is no truncation to apply here that wouldn't
-    just be a free bypass lever handed to whoever sends the (n+1)th item."""
+    just be a free bypass lever handed to whoever sends the (n+1)th item.
+
+    Accepts a ``tuple`` as well as a ``list``: an object-style prompt model
+    (a namedtuple/frozen-dataclass-backed SDK, unlike the dict straight off
+    the wire) could plausibly expose ``arguments`` as a tuple rather than a
+    list -- QA (round-2 review) finding: an earlier, ``list``-only
+    ``isinstance`` check silently dropped every argument in that shape
+    entirely, the same "whole field goes dark" failure as the node-count
+    slice this function already replaced, just triggered by a different
+    input shape."""
     args = _first(prompt, "arguments", default=[]) or []
+    if isinstance(args, tuple):
+        args = list(args)
     return args if isinstance(args, list) else []
 
 
