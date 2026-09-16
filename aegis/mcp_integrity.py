@@ -270,8 +270,17 @@ def _param_descriptions(schema) -> list:
 def scan_text(text: str) -> Optional[str]:
     """One suspicious-text heuristic hit against ``text``, or ``None``. Public
     so a caller can scan other model-visible MCP text the same way (an
-    elicitation prompt, a resource description)."""
-    if not text:
+    elicitation prompt, a resource description).
+
+    QA (adversarial round) finding: a caller that hands this a non-string
+    value (a malformed server response putting a dict/list where a string
+    field belongs) used to raise ``TypeError`` out of the regex ``.search()``
+    calls below -- and since every caller here wraps its *whole* multi-field
+    scan in one try/except, one bad-typed field silently discarded whatever
+    real poisoning hit a LATER field in the same scan would have produced.
+    Guarding here, once, closes that for every caller instead of requiring
+    each one to remember an ``isinstance`` check."""
+    if not isinstance(text, str) or not text:
         return None
     if patterns.MCP_INVISIBLE_UNICODE_RE.search(text):
         return ("contains invisible/zero-width Unicode (hides text from a "
@@ -355,13 +364,19 @@ def _get_resource_id(resource) -> Optional[str]:
 def _scan_resource_text(resource) -> Optional[str]:
     """Resources have no nested schema like a tool's inputSchema -- just a
     handful of top-level strings a poisoned/rug-pulled catalog entry could
-    carry hidden instructions in."""
-    for field in (_get(resource, "name"), _first(resource, "title", default=None),
-                  _get(resource, "description")):
-        if field:
-            hit = scan_text(field)
-            if hit:
-                return hit
+    carry hidden instructions in. Includes ``uri``/``mimeType``, not just
+    ``name``/``title``/``description``: both are fingerprinted for drift
+    (see ``_fingerprint_resource``) and both are attacker-controlled strings
+    a client can render/log, so a payload planted there on a resource's very
+    FIRST fetch (before any pin exists for drift to ever catch it) must be
+    caught by this same scan, not silently exempted."""
+    for field in (_get(resource, "uri"), _get(resource, "name"),
+                  _first(resource, "title", default=None),
+                  _get(resource, "description"),
+                  _first(resource, "mime_type", "mimeType", default=None)):
+        hit = scan_text(field)
+        if hit:
+            return hit
     return None
 
 
@@ -387,31 +402,39 @@ def _get_prompt_id(prompt) -> Optional[str]:
 
 
 def _prompt_arguments(prompt) -> list:
+    """The full, UNTRUNCATED arguments list -- unlike a tool's ``inputSchema``
+    (an arbitrarily deep/wide tree, where ``_param_descriptions``'s recursive
+    walk needs a node budget to bound genuinely combinatorial traversal
+    cost), a prompt's ``arguments`` is always a single FLAT list straight off
+    the wire with no recursion involved at all. QA (adversarial round)
+    finding: an earlier version sliced this to ``_MAX_SCHEMA_NODES`` entries,
+    which silently dropped every argument past that index from BOTH the
+    poisoning scan (first-sight bypass: pad a benign-looking prefix, hide the
+    real payload past the cutoff) and the rug-pull fingerprint (an argument
+    added/changed past the cutoff produced zero drift finding, forever).
+    A flat list has no combinatorial blow-up to bound against -- scanning N
+    short argument descriptions costs the same as scanning one N-times-longer
+    description string, and no single string's length is capped anywhere in
+    this module -- so there is no truncation to apply here that wouldn't
+    just be a free bypass lever handed to whoever sends the (n+1)th item."""
     args = _first(prompt, "arguments", default=[]) or []
-    if not isinstance(args, list):
-        return []
-    # Bounded the same way a tool's schema walk is bounded (_MAX_SCHEMA_NODES)
-    # -- a malicious/malformed server controls its own arguments list shape
-    # at zero cost, so an unbounded scan is a free DoS lever.
-    return args[:_MAX_SCHEMA_NODES]
+    return args if isinstance(args, list) else []
 
 
 def _scan_prompt_text(prompt) -> Optional[str]:
     for field in (_get(prompt, "name"), _first(prompt, "title", default=None),
                   _get(prompt, "description")):
-        if field:
-            hit = scan_text(field)
-            if hit:
-                return hit
+        hit = scan_text(field)
+        if hit:
+            return hit
     for arg in _prompt_arguments(prompt):
         try:
             d = _get(arg, "description")
         except Exception:
             d = None
-        if d:
-            hit = scan_text(d)
-            if hit:
-                return hit
+        hit = scan_text(d)
+        if hit:
+            return hit
     return None
 
 
@@ -610,9 +633,14 @@ def audit_resources(server_id: str, resources, *, policy=None) -> list:
 
         for resource in (resources or []):
             try:
-                uri = _get_resource_id(resource)
-                if uri is None:
-                    continue  # no stable identifier to key a pin on -- skip
+                # QA (adversarial round) finding: skipping entirely when
+                # `uri` is absent let a malformed/malicious resource with no
+                # `uri` key evade the poisoning SCAN outright (and evade it
+                # permanently, since it was also never pinned) -- the
+                # cheapest possible bypass. Mirror audit_tools' own
+                # `name or "<unnamed>"` fallback instead: always scan, using
+                # a placeholder identifier only for the pin key/message.
+                uri = _get_resource_id(resource) or "<unnamed>"
                 name = _get(resource, "name") or uri
                 if _allowed_by_policy(cfg, str(server_id), str(uri), str(name)):
                     continue
@@ -703,9 +731,12 @@ def audit_prompts(server_id: str, prompts, *, policy=None) -> list:
 
         for prompt in (prompts or []):
             try:
-                name = _get_prompt_id(prompt)
-                if name is None:
-                    continue
+                # QA (adversarial round) finding: see the matching comment in
+                # audit_resources above -- skipping a nameless prompt
+                # entirely (instead of still scanning it) let it evade
+                # poisoning detection outright, permanently. Mirror
+                # audit_tools' own `name or "<unnamed>"` fallback.
+                name = _get_prompt_id(prompt) or "<unnamed>"
                 if _allowed_by_policy(cfg, str(server_id), str(name)):
                     continue
             except Exception:
