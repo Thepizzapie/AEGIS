@@ -132,6 +132,20 @@ class Policy:
     # isn't a tool call or a file write. Not evaluated by the rules engine —
     # called directly via aegis.mcp.audit_tool_list()/aegis.mcp_integrity.
     mcp_tool_integrity: dict = field(default_factory=dict)
+    # MCP resource-catalog integrity (poisoning + rug-pull drift), the same
+    # gap as mcp_tool_integrity above but for `resources/list`: {mode:
+    # deny|ask|monitor|off, allow: [regex on server id / resource uri /
+    # name]}. Empty -> defaults (mode=ask) apply. Not evaluated by the rules
+    # engine — called directly via aegis.mcp.audit_resource_list()/
+    # aegis.mcp_integrity.audit_resources().
+    mcp_resource_integrity: dict = field(default_factory=dict)
+    # MCP prompt-catalog integrity (poisoning + rug-pull drift), the same gap
+    # as mcp_tool_integrity above but for `prompts/list`: {mode:
+    # deny|ask|monitor|off, allow: [regex on server id / prompt name]}.
+    # Empty -> defaults (mode=ask) apply. Not evaluated by the rules engine —
+    # called directly via aegis.mcp.audit_prompt_list()/
+    # aegis.mcp_integrity.audit_prompts().
+    mcp_prompt_integrity: dict = field(default_factory=dict)
     # CI/CD pipeline-definition protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # See rules.rule_ci_workflow_protect.

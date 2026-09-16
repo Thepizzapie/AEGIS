@@ -21,8 +21,10 @@ That covers a tool *call*. A tool's *catalog entry* (name/description/schema,
 fetched once via ``tools/list`` and typically trusted for the rest of the
 session) is a distinct surface no call-level check ever sees — a server can
 poison a description with hidden instructions, or silently swap one in after
-a human already approved it (a "rug pull"). See ``audit_tool_list`` below (
-``aegis.mcp_integrity``) for that guard.
+a human already approved it (a "rug pull"). So are its two sibling catalog
+endpoints, ``resources/list`` and ``prompts/list`` — the same one-time-trust
+shape, one layer over. See ``audit_tool_list``/``audit_resource_list``/
+``audit_prompt_list`` below (``aegis.mcp_integrity``) for those guards.
 """
 from __future__ import annotations
 
@@ -33,9 +35,12 @@ from .engine import safe_evaluate
 from .events import Event
 from .policy import Decision, Policy
 
-# Tool-catalog integrity (poisoning + rug-pull drift) — re-exported here so
-# both tool-call and tool-catalog defenses live behind `from aegis import mcp`.
+# Catalog integrity (poisoning + rug-pull drift), all three MCP list
+# endpoints — re-exported here so every catalog-level defense lives behind
+# `from aegis import mcp`, alongside the tool-CALL guard above.
 audit_tool_list = mcp_integrity.audit_tools
+audit_resource_list = mcp_integrity.audit_resources
+audit_prompt_list = mcp_integrity.audit_prompts
 forget_tool_pins = mcp_integrity.forget
 
 

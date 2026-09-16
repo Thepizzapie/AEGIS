@@ -1,14 +1,27 @@
-"""MCP tool-catalog integrity: rug-pull / tool-poisoning defense.
+"""MCP catalog integrity: rug-pull / poisoning defense for tools, resources,
+and prompts.
 
 Every other guard in this package gates a tool CALL (``PreToolUse``: a tool
 name plus the arguments it's invoked with) or a config-FILE write. Neither
-shape covers the surface this module closes: an MCP server's own tool
-CATALOG -- the ``name``/``description``/``inputSchema`` a client fetches once
-(``tools/list``) and a human approves once, then trusts for the rest of the
-session or indefinitely ("Always allow"). That catalog is never a "call" (no
-``PreToolUse`` event exists for it) and never a tracked file (it lives in a
-remote process's memory, not on this disk), so no hook-level rule -- and no
-file-write guard elsewhere in this package -- ever sees it.
+shape covers the surface this module closes: an MCP server's own CATALOG
+entries -- the ``name``/``description``/``inputSchema`` a client fetches once
+(``tools/list``), and the same shape for its two sibling list endpoints,
+``resources/list`` and ``prompts/list`` -- approved by a human once, then
+trusted for the rest of the session or indefinitely ("Always allow"). None of
+the three is ever a "call" (no ``PreToolUse`` event exists for any of them)
+and none is a tracked file (each lives in a remote process's memory, not on
+this disk), so no hook-level rule -- and no file-write guard elsewhere in
+this package -- ever sees any of them.
+
+``audit_tools`` covers ``tools/list``; ``audit_resources`` and
+``audit_prompts`` below close the identical gap for ``resources/list`` (a
+resource's ``uri``/``name``/``description``, often auto-attached to context
+or offered as an "@mention" a human picks once) and ``prompts/list`` (a
+prompt's ``name``/``description``/``arguments``, whose selected template
+becomes conversation content). All three share the exact same TOFU-pinning
+and text-heuristic machinery; only the identifying field and the fields
+scanned differ, since resources and prompts carry no nested ``inputSchema``
+the way a tool does.
 
 Two attacks live entirely in that gap (Invariant Labs, 2025 -- "Tool
 Poisoning Attacks" / "MCP rug pulls", the same shape independently reported
@@ -142,30 +155,54 @@ class _PinLock:
             pass
 
 
-def _load_pins(server_id: str) -> dict:
+def resource_pins_path(server_id: str) -> Path:
+    """Where this server's TOFU-pinned RESOURCE fingerprints are persisted --
+    a distinct file from ``pins_path`` (tools) so a resource and a tool that
+    happen to share an identifying string on the same server can never
+    collide in the same pin store."""
+    return config.aegis_home() / "mcp_pins" / f"{_safe_id(server_id)}.resources.json"
+
+
+def prompt_pins_path(server_id: str) -> Path:
+    """Where this server's TOFU-pinned PROMPT fingerprints are persisted --
+    likewise distinct from both ``pins_path`` and ``resource_pins_path``."""
+    return config.aegis_home() / "mcp_pins" / f"{_safe_id(server_id)}.prompts.json"
+
+
+def _load_pins_at(path: Path) -> dict:
     try:
-        data = json.loads(pins_path(server_id).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def _save_pins(server_id: str, pins: dict) -> None:
+def _save_pins_at(path: Path, pins: dict) -> None:
     try:
-        p = pins_path(server_id)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(pins, indent=2, sort_keys=True), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(pins, indent=2, sort_keys=True), encoding="utf-8")
     except Exception:
         pass  # persistence is best-effort; a disk error must never block the caller
 
 
+def _load_pins(server_id: str) -> dict:
+    return _load_pins_at(pins_path(server_id))
+
+
+def _save_pins(server_id: str, pins: dict) -> None:
+    _save_pins_at(pins_path(server_id), pins)
+
+
 def forget(server_id: Optional[str] = None) -> None:
-    """Clear pinned tool fingerprints -- for ``server_id``, or every server when
-    omitted. A human's deliberate re-baseline after reviewing a legitimate
-    server upgrade (or after decommissioning a server)."""
+    """Clear pinned tool/resource/prompt fingerprints -- for ``server_id``, or
+    every server when omitted. A human's deliberate re-baseline after
+    reviewing a legitimate server upgrade (or after decommissioning a
+    server)."""
     try:
         if server_id is not None:
             pins_path(server_id).unlink(missing_ok=True)
+            resource_pins_path(server_id).unlink(missing_ok=True)
+            prompt_pins_path(server_id).unlink(missing_ok=True)
             return
         d = config.aegis_home() / "mcp_pins"
         if d.is_dir():
@@ -287,6 +324,12 @@ def _fingerprint(tool) -> str:
         "title": _first(tool, "title", default=""),
         "annotations": _first(tool, "annotations", default={}),
     }
+    return _fingerprint_payload(payload)
+
+
+def _fingerprint_payload(payload: dict) -> str:
+    """Shared by every catalog kind's fingerprint (tool/resource/prompt): a
+    stable hash over a dict of identifying+behavioral fields."""
     try:
         blob = json.dumps(payload, sort_keys=True, default=str)
     except (TypeError, ValueError):
@@ -299,6 +342,97 @@ def _fingerprint(tool) -> str:
         # the description text is unaffected either way).
         blob = repr(payload)
     return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _get_resource_id(resource) -> Optional[str]:
+    """A resource's ``uri`` -- not its human-readable ``name`` -- is the
+    identifier a client actually fetches by (``resources/read``) and is what
+    TOFU pinning keys on here, mirroring a tool's ``name``."""
+    uri = _first(resource, "uri", default=None)
+    return str(uri) if uri else None
+
+
+def _scan_resource_text(resource) -> Optional[str]:
+    """Resources have no nested schema like a tool's inputSchema -- just a
+    handful of top-level strings a poisoned/rug-pulled catalog entry could
+    carry hidden instructions in."""
+    for field in (_get(resource, "name"), _first(resource, "title", default=None),
+                  _get(resource, "description")):
+        if field:
+            hit = scan_text(field)
+            if hit:
+                return hit
+    return None
+
+
+def _fingerprint_resource(resource) -> str:
+    payload = {
+        "uri": _get(resource, "uri"),
+        "name": _get(resource, "name") or "",
+        "title": _first(resource, "title", default=""),
+        "description": _get(resource, "description") or "",
+        "mimeType": _first(resource, "mime_type", "mimeType", default=""),
+        "annotations": _first(resource, "annotations", default={}),
+        # `size` is deliberately excluded: a legitimate resource's size (a
+        # log file, anything backed by a live file) can change on every
+        # read with no rug-pull involved -- fingerprinting it would flood a
+        # human with drift ASKs for entirely benign resources.
+    }
+    return _fingerprint_payload(payload)
+
+
+def _get_prompt_id(prompt) -> Optional[str]:
+    name = _get(prompt, "name")
+    return str(name) if name else None
+
+
+def _prompt_arguments(prompt) -> list:
+    args = _first(prompt, "arguments", default=[]) or []
+    if not isinstance(args, list):
+        return []
+    # Bounded the same way a tool's schema walk is bounded (_MAX_SCHEMA_NODES)
+    # -- a malicious/malformed server controls its own arguments list shape
+    # at zero cost, so an unbounded scan is a free DoS lever.
+    return args[:_MAX_SCHEMA_NODES]
+
+
+def _scan_prompt_text(prompt) -> Optional[str]:
+    for field in (_get(prompt, "name"), _first(prompt, "title", default=None),
+                  _get(prompt, "description")):
+        if field:
+            hit = scan_text(field)
+            if hit:
+                return hit
+    for arg in _prompt_arguments(prompt):
+        try:
+            d = _get(arg, "description")
+        except Exception:
+            d = None
+        if d:
+            hit = scan_text(d)
+            if hit:
+                return hit
+    return None
+
+
+def _fingerprint_prompt(prompt) -> str:
+    norm_args = []
+    for arg in _prompt_arguments(prompt):
+        try:
+            norm_args.append({
+                "name": _get(arg, "name"),
+                "description": _get(arg, "description") or "",
+                "required": bool(_get(arg, "required") or False),
+            })
+        except Exception:
+            continue
+    payload = {
+        "name": _get(prompt, "name"),
+        "title": _first(prompt, "title", default=""),
+        "description": _get(prompt, "description") or "",
+        "arguments": norm_args,
+    }
+    return _fingerprint_payload(payload)
 
 
 def _allowed_by_policy(cfg: dict, *values: str) -> bool:
@@ -425,5 +559,193 @@ def audit_tools(server_id: str, tools, *, policy=None) -> list:
 
         if changed:
             _save_pins(server_id, pins)
+
+    return decisions
+
+
+def audit_resources(server_id: str, resources, *, policy=None) -> list:
+    """Scan one MCP server's ``resources/list`` result for the same
+    poisoning + rug-pull-drift gap :func:`audit_tools` closes for
+    ``tools/list`` -- see the module docstring. Neither ``audit_tools`` nor
+    any hook-level rule ever sees this: a resource's catalog entry (``uri``/
+    ``name``/``description``, often auto-attached to context or exposed as
+    an "@mention" a human picks once) is a third surface distinct from both
+    a tool call and a tracked file, exactly like the tools/list gap this
+    guard's sibling closes.
+
+    ``resources`` is whatever the server/SDK returned: a list of dicts, or
+    objects each exposing ``uri``/``name``/``description`` (``mime_type``/
+    ``mimeType`` and ``title``/``annotations`` also accepted).
+
+    Policy (``policy.mcp_resource_integrity``): ``mode`` (deny|ask|monitor|
+    off, default ``ask``), ``allow`` (regexes checked against the server id,
+    the resource ``uri``, and its ``name``).
+
+    Escapable by a human only: set ``AEGIS_ALLOW_MCP_RESOURCE_DRIFT=1`` to
+    accept the current catalog as-is and re-pin it. A spawned agent cannot
+    set this for a call it doesn't control the environment of.
+
+    Fail-open, matching every guard in this module: a malformed policy, a
+    malformed resource entry, or an internal fingerprinting error never
+    raises into the caller -- worst case is a missed finding, never a crash.
+    """
+    try:
+        cfg = (getattr(policy, "mcp_resource_integrity", None) or {}) if policy is not None else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        mode = str(cfg.get("mode", "ask")).lower()
+    except Exception:
+        cfg, mode = {}, "ask"
+    if mode == "off":
+        return []
+    action = Action.DENY if mode == "deny" else Action.ASK
+    human_override = bool(os.environ.get("AEGIS_ALLOW_MCP_RESOURCE_DRIFT"))
+
+    decisions: list = []
+    pin_file = resource_pins_path(server_id)
+
+    with _PinLock(pin_file):
+        pins = _load_pins_at(pin_file)
+        changed = False
+
+        for resource in (resources or []):
+            try:
+                uri = _get_resource_id(resource)
+                if uri is None:
+                    continue  # no stable identifier to key a pin on -- skip
+                name = _get(resource, "name") or uri
+                if _allowed_by_policy(cfg, str(server_id), str(uri), str(name)):
+                    continue
+            except Exception:
+                continue  # can't even read this resource's own fields -- skip it
+
+            try:
+                hit = _scan_resource_text(resource)
+            except Exception:
+                hit = None
+
+            drift = False
+            try:
+                fp = _fingerprint_resource(resource)
+                prior = pins.get(uri)
+                drift = prior is not None and prior.get("fingerprint") != fp
+                if prior is None:
+                    pins[uri] = {"fingerprint": fp}
+                    changed = True
+                elif drift and human_override:
+                    pins[uri] = {"fingerprint": fp}
+                    changed = True
+            except Exception:
+                pass  # fingerprinting/pinning failed; a poisoning `hit` still stands
+
+            if (hit or drift) and not human_override:
+                reason = hit or (
+                    "definition changed since it was first trusted (a possible "
+                    "rug pull) -- the server changed its name/description/"
+                    "mimeType/annotations after approval")
+                would = Decision(
+                    action, "mcp-resource-poison",
+                    f"MCP resource '{server_id}/{uri}': {reason}. Set "
+                    "AEGIS_ALLOW_MCP_RESOURCE_DRIFT=1 to accept/re-approve; a "
+                    "spawned agent cannot set this.")
+                if mode == "monitor":
+                    _record_monitor(server_id, str(uri), would)
+                else:
+                    decisions.append(would)
+
+        if changed:
+            _save_pins_at(pin_file, pins)
+
+    return decisions
+
+
+def audit_prompts(server_id: str, prompts, *, policy=None) -> list:
+    """Scan one MCP server's ``prompts/list`` result for the same
+    poisoning + rug-pull-drift gap :func:`audit_tools` closes for
+    ``tools/list`` -- see the module docstring. A prompt's own description
+    and its per-argument descriptions are exactly as model-visible, and
+    exactly as durably trusted after one human pick, as a tool's; a
+    ``prompts/get`` response's returned messages become conversation content
+    a human typically never re-reviews per invocation.
+
+    ``prompts`` is whatever the server/SDK returned: a list of dicts, or
+    objects each exposing ``name``/``description``/``arguments`` (a list of
+    ``{name, description, required}``; ``title`` also accepted).
+
+    Policy (``policy.mcp_prompt_integrity``): ``mode`` (deny|ask|monitor|
+    off, default ``ask``), ``allow`` (regexes checked against the server id
+    and the prompt name).
+
+    Escapable by a human only: set ``AEGIS_ALLOW_MCP_PROMPT_DRIFT=1`` to
+    accept the current catalog as-is and re-pin it. A spawned agent cannot
+    set this for a call it doesn't control the environment of.
+
+    Fail-open, matching every guard in this module.
+    """
+    try:
+        cfg = (getattr(policy, "mcp_prompt_integrity", None) or {}) if policy is not None else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        mode = str(cfg.get("mode", "ask")).lower()
+    except Exception:
+        cfg, mode = {}, "ask"
+    if mode == "off":
+        return []
+    action = Action.DENY if mode == "deny" else Action.ASK
+    human_override = bool(os.environ.get("AEGIS_ALLOW_MCP_PROMPT_DRIFT"))
+
+    decisions: list = []
+    pin_file = prompt_pins_path(server_id)
+
+    with _PinLock(pin_file):
+        pins = _load_pins_at(pin_file)
+        changed = False
+
+        for prompt in (prompts or []):
+            try:
+                name = _get_prompt_id(prompt)
+                if name is None:
+                    continue
+                if _allowed_by_policy(cfg, str(server_id), str(name)):
+                    continue
+            except Exception:
+                continue  # can't even read this prompt's own fields -- skip it
+
+            try:
+                hit = _scan_prompt_text(prompt)
+            except Exception:
+                hit = None
+
+            drift = False
+            try:
+                fp = _fingerprint_prompt(prompt)
+                prior = pins.get(name)
+                drift = prior is not None and prior.get("fingerprint") != fp
+                if prior is None:
+                    pins[name] = {"fingerprint": fp}
+                    changed = True
+                elif drift and human_override:
+                    pins[name] = {"fingerprint": fp}
+                    changed = True
+            except Exception:
+                pass  # fingerprinting/pinning failed; a poisoning `hit` still stands
+
+            if (hit or drift) and not human_override:
+                reason = hit or (
+                    "definition changed since it was first trusted (a possible "
+                    "rug pull) -- the server changed its description/arguments "
+                    "after approval")
+                would = Decision(
+                    action, "mcp-prompt-poison",
+                    f"MCP prompt '{server_id}/{name}': {reason}. Set "
+                    "AEGIS_ALLOW_MCP_PROMPT_DRIFT=1 to accept/re-approve; a "
+                    "spawned agent cannot set this.")
+                if mode == "monitor":
+                    _record_monitor(server_id, str(name), would)
+                else:
+                    decisions.append(would)
+
+        if changed:
+            _save_pins_at(pin_file, pins)
 
     return decisions
