@@ -1816,6 +1816,168 @@ def direnv_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, DIRENV_FIND_RE)
 
 
+# ---- mise (formerly rtx) auto-exec-on-cd hook / trust-bypass protection -------
+# mise (https://mise.jdx.dev — the asdf successor: per-project tool-version
+# pinning, env vars, and TASK running) supports a `[hooks]` table in its own
+# TOML config with `enter`/`leave`/`cd` keys that run as an arbitrary shell
+# command in the CURRENT shell (not a subprocess) the next time ANYONE (this
+# agent, a teammate, CI) `cd`s into the project or a descendant of it, plus
+# `preinstall`/`postinstall`/`watch_files` keys that fire on tool
+# install/file-change with no separate confirmation either — the exact same
+# "no git/CI/session-restart trigger needed, fires on the single most common
+# action there is" shape `rule_direnv_protect` already covers for `.envrc`,
+# one popular dev-tool-manager over. mise config is searched up the directory
+# tree the same way direnv's `.envrc` is (a nested project's `mise.toml`
+# doesn't override its parents' hooks, it ADDS to them), and mise ships a
+# GLOBAL config (`~/.config/mise/config.toml`) whose `[hooks]` fire for EVERY
+# mise-managed project on the machine, no per-project trust check at all — the
+# mise analog of direnv's global `direnvrc`.
+#
+# Unlike `.envrc` (wholly executable — ANY write is dangerous), a mise config
+# is mostly benign TOML (tool version pins, `[env]` var exports, named
+# `[tasks]` that require an explicit `mise run <name>` and are never
+# auto-invoked) edited constantly for routine reasons, so — same reasoning
+# `PACKAGE_SCRIPTS_PATH_RE`/`LIFECYCLE_SCRIPT_KEY_RE` give for `package.json`
+# — this guard gates on PATH *and* CONTENT: only a `[hooks]` table (or its
+# single-line dotted-key equivalent, `hooks.enter = "..."`, valid TOML for
+# the identical key with no `[hooks]` header at all — the same "minimal diff"
+# bypass class `NPM_PKG_SET_LIFECYCLE_RE`/`JQ_SCRIPTS_LIFECYCLE_RE` close for
+# package.json's dot-path form) carrying one of the six real hook-key names.
+#
+# mise ships its own defense, structurally identical to direnv's: it refuses
+# to load config from a directory it hasn't been told to trust, until a human
+# runs `mise trust`. Same gap as direnv's own `allow`/`permit`/`edit`: that
+# defense is a CLI subcommand an agent can invoke itself right after planting
+# the payload, not an OS dialog only a human can click. `trusted_config_paths`
+# (a `[settings]` TOML key, the `MISE_TRUSTED_CONFIG_PATHS` env var, or `mise
+# settings set trusted_config_paths ...`) is the mise analog of direnv.toml's
+# `[whitelist]` — it pre-trusts every config under a path UNCONDITIONALLY,
+# strictly more dangerous than trusting one file, since every FUTURE config
+# under that path auto-runs its hooks too with no further per-content check.
+_MISE_END = _CI_END
+# mise's "config environments" feature (`MISE_ENV=production`/`ci`/...,
+# routine in CI) loads `mise.<env>.toml`/`.mise.<env>.toml`/
+# `mise.<env>.local.toml`/`.mise.<env>.local.toml` with the SAME `[hooks]`
+# auto-exec semantics as the base `mise.toml` — QA finding (independent
+# adversarial review, round A): the original pattern required the literal
+# contiguous substring "mise.toml", so any environment suffix (a routine,
+# documented shape, not an obscure one) was a full, silent bypass. `[\w-]+`
+# is bounded by the fixed `\.toml`/`\.local\.toml` suffix that follows it —
+# no nested quantifier, so no new backtracking surface.
+_MISE_ENV_SUFFIX = r"(?:\.[\w-]+)?"
+MISE_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.mise" + _MISE_ENV_SUFFIX + r"\.local\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])mise" + _MISE_ENV_SUFFIX + r"\.local\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])\.mise" + _MISE_ENV_SUFFIX + r"\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])mise" + _MISE_ENV_SUFFIX + r"\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])\.rtx\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])rtx\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])\.mise" + _WIN_TRIM + _SEP + r"config\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])mise" + _WIN_TRIM + _SEP + r"config\.toml" + _MISE_END,
+    re.IGNORECASE,
+)
+
+_MISE_HOOK_NAMES = r"enter|leave|cd|watch_files|preinstall|postinstall"
+
+# Left edge for a hook-key match: not preceded by a word character (ordinary
+# `\b`), OR preceded by a LITERAL two-character `\n` escape sequence — the
+# shape a `printf`/`echo`-style single-line command carries a multi-line TOML
+# body as (the escape is interpreted at RUN time, by `printf`, not by
+# anything in this de-obfuscated scan text, so the key name sits directly
+# against the literal backslash-n with no whitespace between them: `[hooks]\
+# nenter = "..."`). A bare `\b` alone missed this real shape — the trailing
+# `n` of the escape and the leading `e` of `enter` are both word characters,
+# so nothing about a `\b`-only boundary sits between them; `printf '%b'
+# '[hooks]\nenter = "evil"\n'` is real, idiomatic multi-line-from-one-string
+# shell, not a hypothetical.
+_MISE_KEY_LEFT = r"(?:(?<!\w)|(?<=\\n))"
+
+# TOML permits a quoted key (`"enter" = ...` / `'enter' = ...`), which parses
+# identically to a bare key — QA finding (independent adversarial review,
+# round A): the original `\s*=` trailing edge required whitespace-then-`=`
+# immediately after the key, so a quoted key's closing quote (sitting between
+# the key and that whitespace) broke the match entirely, a one-character
+# bypass on a functioning hook. Tolerated on both edges (a quoted TOML key
+# uses the same quote character on both sides, but requiring that here would
+# add a backreference for no real benefit — the trailing quote alone is what
+# breaks the naive match, so closing it off on both sides is the simple,
+# sufficient fix).
+_MISE_QUOTE = r"[\"']?"
+# `[hooks]` table form (header, then a bounded window — stops at the next
+# `[section]`, same `[^\[]{0,N}` trick `REGISTRY_HIJACK_RE`'s poetry-source
+# alternative uses, for the same ReDoS-avoidance reason — before a hook key
+# assignment), OR the single-line dotted-key form with no header at all.
+# Window widened 2000 -> 8000 (QA finding, round A: padding the table with
+# ~2KB of comments/blank lines before the real key pushed it outside a 2000-
+# char window with nothing else to catch it) — still a single bounded
+# negated-class repetition, no nested quantifier, so the wider bound is only
+# a linear cost increase, not a new backtracking shape. A fixed bound can
+# always be outrun by enough padding; 8000 chars raises that bar well past
+# anything an ordinary mise.toml (or a plausible malicious one trying to stay
+# inconspicuous) would carry, without an unbounded scan. See this guard's own
+# docstring for the residual gap disclosed, not solved.
+MISE_HOOK_KEY_RE = re.compile(
+    r"\[hooks(?:\.[\w.\-]+)?\][^\[]{0,8000}" + _MISE_KEY_LEFT
+    + _MISE_QUOTE + r"(?:" + _MISE_HOOK_NAMES + r")" + _MISE_QUOTE + r"\s*="
+    r"|" + _MISE_KEY_LEFT + r"hooks\.(?:" + _MISE_HOOK_NAMES + r")\s*=",
+    re.IGNORECASE,
+)
+
+# `trusted_config_paths` inside a mise config (`[settings]` table or its own
+# dotted-key form, `settings.trusted_config_paths = [...]`) — distinctive
+# enough a key name to need no section-header proximity check, the same
+# "the literal is the signal" call `REGISTRY_HIJACK_RE`'s `replace-with`
+# alternative already makes for Cargo's `[source]` override. Trailing
+# `_MISE_QUOTE` for the same quoted-TOML-key reason `MISE_HOOK_KEY_RE`'s own
+# comment explains (`"trusted_config_paths" = [...]` is valid TOML and, with
+# no tolerance for the closing quote, broke the original `\s*=`-only match —
+# QA finding, round A).
+MISE_TRUST_PATHS_KEY_RE = re.compile(
+    r"\btrusted_config_paths" + _MISE_QUOTE + r"\s*=",
+    re.IGNORECASE,
+)
+
+# The env-var form of the same pre-trust primitive — mise reads it ahead of
+# (and does not require) any config-file write at all, the identical
+# env-injection shape `PNPMFILE_REDIRECT_RE`'s own env-var sibling closes for
+# `PNPM_CONFIG_PNPMFILE`. Checked unconditionally in the shell branch, no
+# path pairing needed.
+MISE_TRUSTED_ENV_RE = re.compile(
+    r"\bMISE_TRUSTED_CONFIG_PATHS\b\s*=",
+    re.IGNORECASE,
+)
+
+# `mise settings set trusted_config_paths ...` — the CLI form of the same
+# pre-trust write, naming no config-file path in the command at all (the
+# identical "resolves the target implicitly" gap `NPM_PKG_SET_LIFECYCLE_RE`'s
+# own comment describes for `npm pkg set`).
+MISE_SETTINGS_TRUST_CLI_RE = re.compile(
+    r"\bmise\s+settings\s+set\b[^|;&\n]{0,200}\btrusted_config_paths\b",
+    re.IGNORECASE,
+)
+
+# `mise trust` (with or without a path/`--all` argument) grants trust to an
+# untrusted/changed config, silencing mise's own warning — same 200-char
+# non-greedy bound `DIRENV_ACTIVATE_RE`/`SERVICE_ACTIVATE_CMD_RE` use so an
+# ordinary intervening flag can't push the verb out of the scan window.
+MISE_TRUST_ACTIVATE_RE = re.compile(
+    r"\bmise\b[^|;&\n]{0,200}?\btrust\b",
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# DIRENV_FIND_RE exists for its own surface. `config.toml` deliberately
+# excluded — too generic a bare word to `find -name` match on its own without
+# a "mise"-specific anchor, the same "too generic" call `SHELL_PERSIST_FIND_RE`
+# already makes for the bare words "config"/"profile".
+_MISE_FIND_FRAGMENTS = r"mise\.local\.toml|mise\.toml|rtx\.toml"
+MISE_FIND_RE = _find_predicate_re(r"(?:" + _MISE_FIND_FRAGMENTS + r")")
+
+
+def mise_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, MISE_FIND_RE)
+
+
 # ---- PATH binary-shadow (hijack) protection -----------------------------------
 # Every guard above this point protects a FILE that runs later, on some future
 # trigger (a git operation, a CI push, a new shell, a `cd`). This surface is

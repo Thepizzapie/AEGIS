@@ -191,6 +191,18 @@ class Policy:
     # untrusted/changed .envrc with no file write of their own. See
     # rules.rule_direnv_protect.
     direnv: dict = field(default_factory=dict)
+    # mise (formerly rtx) auto-exec-on-cd hook / trust-bypass protection:
+    # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a project mise.toml/.mise.toml/
+    # mise.local.toml (any nesting depth), the legacy .rtx.toml, and the
+    # GLOBAL ~/.config/mise/config.toml carrying a [hooks] entry (enter/
+    # leave/cd/watch_files/preinstall/postinstall, table form or the
+    # single-line hooks.<key> dotted equivalent) or a trusted_config_paths
+    # pre-trust entry, plus the mise settings set trusted_config_paths CLI
+    # form, the MISE_TRUSTED_CONFIG_PATHS env var, and the mise trust
+    # activation command that trusts an untrusted/changed config with no
+    # file write of its own. See rules.rule_mise_protect.
+    mise: dict = field(default_factory=dict)
     # Package-manifest lifecycle-script / registry-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers package.json/composer.json lifecycle
