@@ -1741,6 +1741,218 @@ def rule_direnv_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- mise (formerly rtx) auto-exec-on-cd hook / trust-bypass protection -------
+def _mise_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_mise_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a ``[hooks]`` entry (``enter``/``leave``/``cd``/
+    ``watch_files``/``preinstall``/``postinstall``, table form or the
+    single-line ``hooks.<key> = ...`` dotted-key equivalent) in a mise config
+    file (project ``mise.toml``/``.mise.toml``/``mise.local.toml`` at any
+    nesting depth, the legacy ``.rtx.toml``, or the GLOBAL
+    ``~/.config/mise/config.toml``), block pre-trusting a path via
+    ``trusted_config_paths`` (a config key, the ``MISE_TRUSTED_CONFIG_PATHS``
+    env var, or ``mise settings set trusted_config_paths``), and block the
+    ``mise trust`` activation command that trusts an untrusted/changed config
+    with no file write of its own.
+
+    THREAT MODEL: reached by no existing guard — mise (https://mise.jdx.dev,
+    the asdf successor, increasingly the default in Python/Node/Ruby/Go dev
+    setups for per-project tool-version pinning) auto-runs its ``enter``/
+    ``cd`` hooks as arbitrary shell IN THE CURRENT SHELL the next time
+    ANYONE (this agent, a teammate, CI) ``cd``s into the project or a
+    descendant of it — no git operation, CI run, or agent-session restart
+    needed, the exact same "fires on the single most common action there is"
+    shape ``rule_direnv_protect`` already covers for ``.envrc``, one popular
+    dev-tool-manager over; ``preinstall``/``postinstall``/``watch_files`` fire
+    on the next tool install / watched-file change with no separate
+    confirmation either. mise nests the same way direnv does (a descendant
+    project's config ADDS its hooks to its parents', it doesn't replace them),
+    and the GLOBAL config is worse: its ``[hooks]`` fire for EVERY
+    mise-managed project on the whole machine, with no per-project trust
+    check at all — the mise analog of direnv's global ``direnvrc``.
+
+    What makes this surface distinct from ``rule_direnv_protect``'s own:
+    unlike ``.envrc`` (wholly executable — any write is dangerous), a mise
+    config is mostly benign TOML (tool-version pins, ``[env]`` exports, named
+    ``[tasks]`` that require an explicit ``mise run <name>`` and are never
+    auto-invoked) edited constantly for routine reasons, so — the same
+    PATH-and-CONTENT gate ``rule_package_manifest_protect`` uses for
+    ``package.json`` — this guard only fires when the edit ALSO plants one of
+    the six real hook keys or the ``trusted_config_paths`` pre-trust key, not
+    on every touch of the file.
+
+    mise ships its own defense, structurally identical to direnv's: it
+    refuses to load config from a directory it hasn't been told to trust,
+    until a human runs ``mise trust``. Same gap as direnv's ``allow``/
+    ``permit``/``edit``: that defense is a CLI subcommand an agent can invoke
+    itself right after planting the payload, not an OS dialog only a human
+    can click. ``trusted_config_paths`` is the mise analog of direnv.toml's
+    ``[whitelist]`` — it pre-trusts every config under a path UNCONDITIONALLY,
+    strictly more dangerous than trusting one file, since every FUTURE config
+    under that path auto-runs its hooks too with no further per-content
+    check — which is why it's gated the same way the activation command is,
+    not folded into the ordinary hook-key content check.
+
+    Config (``policy.mise``): ``mode`` (deny|ask|monitor|off, default ask),
+    ``allow`` (regexes on the path/command that skip the gate). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard does:
+    planting a legitimate ``postinstall`` hook (e.g. running ``pre-commit
+    install`` after a tool installs) is routine, sanctioned dev work — it
+    just needs a human to have actually looked at it before it runs
+    unattended.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_MISE=1`` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot
+    set its own env for a hook invocation it doesn't control, so neither path
+    is agent-self-escapable.
+
+    QA history (two independent adversarial reviews, run in parallel, the
+    same round-A-bypass/round-B-design-consistency convention
+    ``rule_direnv_protect``/``rule_package_manifest_protect`` used). Round B
+    (design/consistency) found the wiring complete with no gaps (registration,
+    ``Policy``, ``loader.py``, ``skills.py``, README, test file all verified
+    against the codebase, not just read). Round A (bypass hunting) found
+    three real gaps, since fixed: mise's "config environments" feature
+    (``MISE_ENV=production``/``ci``/..., routine in CI) loads
+    ``mise.<env>.toml``/``.mise.<env>.toml``/``mise.<env>.local.toml`` with
+    the same ``[hooks]`` semantics as the base file — the original
+    ``MISE_CONFIG_PATH_RE`` required the literal contiguous substring
+    "mise.toml", missing every environment-suffixed variant entirely (fixed:
+    an optional ``(?:\\.[\\w-]+)?`` segment, bounded — no nested quantifier);
+    a TOML quoted key (``"enter" = ...``) parses identically to a bare one
+    but broke both ``MISE_HOOK_KEY_RE``'s and ``MISE_TRUST_PATHS_KEY_RE``'s
+    trailing ``\\s*=`` edge, a one-character bypass on a functioning hook
+    (fixed: an optional closing-quote tolerance on both keys); and padding a
+    ``[hooks]`` table with ~2KB of comments before the real key pushed it
+    outside the original 2000-char scan window (fixed: widened to 8000 —
+    still one bounded negated-class repetition, a linear cost increase only,
+    not a new backtracking shape — see the widened window's own comment in
+    ``patterns.py`` for why a fixed bound is raised, not eliminated).
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a direct fetch-to-file write (``curl -o mise.toml ...``) is
+    caught by none of the shell branch's write-verb checks, the same
+    inherited gap every sibling guard already discloses; the grouped
+    ``mise/conf.d/*.toml``/``.mise/conf.d/*.toml`` config-fragment directory
+    (an arbitrary filename under it) has no dedicated path coverage, the same
+    "too generic to gate a bare directory on" call ``rule_direnv_protect``'s
+    own docstring makes for ``.envrc``'s parent directory; a path assembled
+    indirectly (shell variable concatenation, ``basename``/``dirname``
+    reconstruction) rather than one contiguous literal is not caught, the
+    same "computed indirectly" class of gap every guard in this file already
+    accepts; padding a ``[hooks]``/``[settings]`` table with more than the
+    (round-A-widened) 8000-char scan window's worth of comments before the
+    real key still evades content detection — a FIXED bound can always be
+    outrun by enough padding, the same bounded-window trade-off
+    ``REGISTRY_HIJACK_RE``'s own poetry-source window already accepts, raised
+    here rather than solved; and a commented-out ``# enter = "..."``/``#
+    trusted_config_paths = ...`` example line still matches and asks
+    unnecessarily (round A, verified, not fixed — the same accepted
+    false-positive-over-false-negative trade-off ``rule_package_manifest_protect``'s
+    own docstring already discloses for a commented-out registry-config
+    line, for the identical reason: real-vs-commented-out is a
+    line-start/comment-syntax distinction this guard's bounded, line-blind
+    scan windows don't track, and adding it would risk missing the real,
+    uncommented form on some other line shape)."""
+    cfg = getattr(policy, "mise", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "mise-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        content = str(a.get("content") or a.get("new_string") or "")
+        if not content and ev.action == ActionClass.MCP:
+            content = " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.MISE_CONFIG_PATH_RE.search(p):
+            return None
+        hook_hit = bool(patterns.MISE_HOOK_KEY_RE.search(content))
+        trust_hit = bool(patterns.MISE_TRUST_PATHS_KEY_RE.search(content))
+        if not (hook_hit or trust_hit):
+            return None
+        if os.environ.get("AEGIS_ALLOW_MISE") or _mise_allowed_by_policy(cfg, p):
+            return None
+        reason = (f"mise config '{p}' is being written with a [hooks] entry — "
+                   "it runs as arbitrary shell, automatically and unattended, "
+                   "the next time anyone `cd`s into this project (or, for the "
+                   "global config, into ANY mise-managed project on this "
+                   "machine)" if hook_hit else
+                   f"mise config '{p}' is being written with "
+                   "`trusted_config_paths` — it pre-trusts every config under "
+                   "that path unconditionally, forever, with no further "
+                   "per-content check")
+        return _finish(Decision(action, "mise-protect",
+                         f"{reason}. Review the change, then confirm with "
+                         "AEGIS_ALLOW_MISE=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.MISE_CONFIG_PATH_RE.search(cmd)
+                             or patterns.mise_find_hit(cmd))
+        # No DESTRUCTIVE_DELETE_RE here, unlike most sibling *_protect guards'
+        # write-verb lists: this guard is content-gated (a hook/trust-path key
+        # must ALSO be visible in the same scanned text), and a pure delete
+        # verb (rm -rf, shred, find -delete) never carries that content — it
+        # removes a file, it doesn't plant one. Including it here would add a
+        # write-verb branch that can never independently flip touches_target
+        # from False to a real detection, at real, measured cost: on the
+        # shared "find . -name x " * 8000 adversarial input every *_protect
+        # guard's own perf test already exercises, DESTRUCTIVE_DELETE_RE
+        # alone (its `\bfind\b[^|;&\n]*-(?:delete\b|exec\s+rm\b)` branch)
+        # costs ~0.4s — already paid once, elsewhere in the pipeline, by
+        # rule_destructive_delete; a second guard calling it again on the
+        # same input doubles that fixed cost for zero added detection power.
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        touches_target = names_target and write_verb
+        hook_hit = touches_target and bool(patterns.MISE_HOOK_KEY_RE.search(cmd))
+        file_trust_hit = touches_target and bool(patterns.MISE_TRUST_PATHS_KEY_RE.search(cmd))
+        env_trust_hit = bool(patterns.MISE_TRUSTED_ENV_RE.search(cmd))
+        cli_trust_hit = bool(patterns.MISE_SETTINGS_TRUST_CLI_RE.search(cmd))
+        activates = bool(patterns.MISE_TRUST_ACTIVATE_RE.search(cmd))
+        if not (hook_hit or file_trust_hit or env_trust_hit or cli_trust_hit or activates):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MISE")
+                or _mise_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A mise [hooks] entry is being planted from a shell" if hook_hit else
+                   "mise's trusted_config_paths is being set from a shell, "
+                   "pre-trusting a path unconditionally" if (file_trust_hit or env_trust_hit or cli_trust_hit) else
+                   "mise is being told to trust a config, silencing its own "
+                   "untrusted-content warning")
+        return _finish(Decision(action, "mise-protect",
+                         f"{reason} — it runs automatically, unattended, the "
+                         "next time anyone `cd`s into this (or any "
+                         "mise-managed) project. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_MISE=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
 # ---- package-manifest lifecycle-script / registry-hijack protection ----------
 def _package_manifest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7232,6 +7444,7 @@ _CORE_RULES = (
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
+    rule_mise_protect,
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
     rule_git_config_exec_protect,
