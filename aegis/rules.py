@@ -2147,6 +2147,162 @@ def rule_pnpmfile_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _yarn_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block writing Yarn Berry's own release/plugin bundle (`.yarn/releases/
+    *.cjs`/`.js`, `.yarn/plugins/**/*.cjs`/`.js`), or redirecting Yarn's exec
+    loader via `.yarnrc.yml`'s `yarnPath`/`plugins` keys, or the CLI commands
+    that rewrite either (`yarn set version ...`, `yarn plugin import ...`).
+
+    THREAT MODEL: this is the Yarn-Berry analog of `rule_pnpmfile_exec_
+    protect`'s pnpmfile, one mechanism over, with a WORSE trigger bar. When
+    `.yarnrc.yml` sets `yarnPath`, every bare `yarn` invocation -- not just
+    `install`/`add`/`update` the way a pnpmfile is gated to, literally
+    `yarn --version`, `yarn run <script>`, `yarn dlx <pkg>`, anything --
+    re-execs the named file as arbitrary Node.js BEFORE Yarn does anything
+    else, including resolving dependencies or running any lifecycle script.
+    `plugins:` entries work the same way one layer further: each entry's
+    local `path:` file is loaded into Yarn's own plugin API (with access to
+    the full plugin surface, not just `child_process`) on every invocation
+    too. Neither carries a `scripts`-object entry or a shell-command string
+    for `rule_package_manifest_protect` to see, and neither needs an install
+    step at all -- the single most ordinary thing there is to run in a JS
+    repo, a bare `yarn`, is the trigger.
+
+    Gated on PATH ALONE for the release/plugin file itself (no content
+    narrowing) -- the same choice `rule_pnpmfile_exec_protect`/
+    `rule_hook_manager_protect` make for their own targets: a real plugin
+    bundle is a large, often-minified blob with no readable shape to
+    distinguish reviewed code from a planted payload, so there is no safe
+    subset of content to narrow past. The redirect half (`.yarnrc.yml`'s
+    `yarnPath`/`plugins` keys) is content-gated, since `.yarnrc.yml` also
+    carries several ordinary, frequently-edited keys (`nodeLinker`,
+    `enableGlobalCache`, ...) unrelated to either surface.
+
+    The CLI half gates `yarn set version` and `yarn plugin import`
+    unconditionally (subcommand presence alone, no write-verb pairing) since
+    both commands themselves perform the write with no separate shell
+    redirect/copy/sed for a write-verb check to see -- the same "the
+    subcommand IS the write" reasoning `rule_direnv_protect` applies to
+    `direnv allow`/`permit`.
+
+    Config (`policy.yarn_exec`): `mode` (deny|ask|monitor|off, default ask),
+    `allow` (regexes on the path/command that skip the gate -- a repo's own
+    reviewed, already-audited release bundle or plugin, say). Defaults to
+    `ask` for the same reason every sibling `*_protect` guard does: nearly
+    every real Yarn-Berry project legitimately commits a `yarnPath` and its
+    release bundle (`yarn set version berry` is the standard way to adopt
+    Yarn Berry at all) -- this guard exists to put a human in the loop on
+    CHANGES to that surface, not to treat its mere existence as inherently
+    hostile.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle `AEGIS_ALLOW_YARN_EXEC=1` set by the orchestrator/human
+    before launch for the Edit/Write/MCP-tool form. A spawned agent cannot
+    set its own env for a hook invocation it doesn't control, so neither
+    path is agent-self-escapable.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a `require`/import target assembled indirectly (string
+    concatenation, a template) rather than appearing as a literal defeats
+    nothing here since the file's mere presence is what gates, but a release/
+    plugin file planted via an archive/sync extraction tool this guard's
+    shell branch doesn't recognize as a write verb is not covered; `find
+    -path`/`-name` indirection around the filename isn't covered (no
+    `*_find_hit`-style fallback, the same gap `rule_pnpmfile_exec_protect`
+    already discloses for its own target); a direct fetch-to-file write
+    (`curl -o .yarn/releases/yarn-evil.cjs <url>`) is caught by none of the
+    shell branch's write-verb checks, closed only via the separate
+    `rule_fetch_to_file_protect` backstop once wired into
+    `_FETCH_HUMAN_ESCAPABLE`, the same inherited gap every sibling guard
+    already discloses; and the shared `_path()` helper every `*_protect`
+    guard in this file reads MCP tool-call arguments through only checks a
+    fixed key allowlist, the same pre-existing, shared-infrastructure gap
+    `rule_pnpmfile_exec_protect`'s own docstring already discloses.
+    """
+    cfg = getattr(policy, "yarn_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "yarn-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        release_hit = bool(patterns.YARN_EXEC_PATH_RE.search(p))
+        redirect_hit = False
+        if not release_hit and patterns.YARNRC_YML_PATH_RE.search(p):
+            a = ev.args or {}
+            raw_content = a.get("content")
+            if not isinstance(raw_content, str) or not raw_content:
+                raw_content = a.get("new_string")
+            if isinstance(raw_content, str) and raw_content:
+                content = raw_content
+            else:
+                content = " ".join(_flatten_strings(a))
+            redirect_hit = bool(content and patterns.YARN_EXEC_REDIRECT_RE.search(content))
+        if not (release_hit or redirect_hit):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_YARN_EXEC")
+                or _yarn_exec_allowed_by_policy(cfg, p)):
+            return None
+        reason = (f"'{p}' is Yarn's own release/plugin bundle" if release_hit else
+                  f"'{p}' redirects Yarn's exec loader ('yarnPath'/'plugins' in .yarnrc.yml)")
+        return _finish(Decision(action, "yarn-exec-protect",
+                         f"{reason} — it runs as arbitrary Node.js, "
+                         "automatically and unattended, on the very next "
+                         "bare 'yarn' invocation of any kind (no install "
+                         "needed), before any dependency's own lifecycle "
+                         "scripts run. Review the change, then confirm with "
+                         "AEGIS_ALLOW_YARN_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        cli_hit = bool(patterns.YARN_EXEC_CLI_RE.search(cmd))
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                           or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd))
+        release_hit = bool(write_verb and patterns.YARN_EXEC_PATH_RE.search(cmd))
+        redirect_hit = bool(write_verb and patterns.YARNRC_YML_PATH_RE.search(cmd)
+                             and patterns.YARN_EXEC_REDIRECT_RE.search(cmd))
+        if not (cli_hit or release_hit or redirect_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_YARN_EXEC")
+                or _yarn_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("'yarn set version'/'yarn plugin import' rewrites Yarn's "
+                  "own exec surface" if cli_hit else
+                  "Yarn's release/plugin bundle is being written from a shell" if release_hit
+                  else "Yarn's exec loader is being redirected from a shell")
+        return _finish(Decision(action, "yarn-exec-protect",
+                         f"{reason} — it runs as arbitrary Node.js, "
+                         "automatically and unattended, on the very next "
+                         "bare 'yarn' invocation of any kind. A human may "
+                         "append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_YARN_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 def _git_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7234,6 +7390,7 @@ _CORE_RULES = (
     rule_direnv_protect,
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
+    rule_yarn_exec_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_gitmodules_protect,
