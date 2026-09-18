@@ -2219,7 +2219,14 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     shell branch doesn't recognize as a write verb is not covered; `find
     -path`/`-name` indirection around the filename isn't covered (no
     `*_find_hit`-style fallback, the same gap `rule_pnpmfile_exec_protect`
-    already discloses for its own target); `git checkout <ref> -- <path>`
+    already discloses for its own target); the `plugins:` redirect check's
+    bounded lookahead no longer requires `path:` to sit inside a plugins
+    list item specifically (the round-1 fix that closed the key-order
+    bypass below also widened it to match a bare `path:` key anywhere in
+    the same 400-char span) -- Yarn Berry's own `.yarnrc.yml` schema has no
+    legitimate key literally named `path:` outside a plugins entry, so this
+    is a synthetic, not realistically triggerable, over-match rather than a
+    practical false positive; `git checkout <ref> -- <path>`
     (restoring a file's content from another ref/branch) genuinely
     overwrites the working-tree file but appears in none of the shell
     branch's write-verb checks -- an inherited gap shared with every sibling
@@ -2250,7 +2257,16 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     key, which YAML key order never guarantees), confirmed the `git
     checkout -- <path>`/comment-mention gaps above as pre-existing and
     shared rather than novel, and found no ReDoS on any of the four new
-    regexes under adversarial input.
+    regexes under adversarial input. A round-2 verification pass reproduced
+    both round-1 fixes independently (the fetch-to-file backstop now gates
+    both new target paths; the reordered-key `plugins:` repro now gates,
+    with the original path-first case still gating too, no regression),
+    confirmed the full suite green, found no new ReDoS on the widened
+    regex, and hunted for a new false positive from dropping the plugins-
+    entry dash anchor -- finding only the synthetic, schema-implausible
+    bare-`path:`-key case already disclosed above, with a realistic
+    multi-key plugins list (`spec:`/`checksum:` only, no `path:` anywhere)
+    confirmed to still stay ALLOW.
     """
     cfg = getattr(policy, "yarn_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
