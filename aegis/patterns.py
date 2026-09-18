@@ -3323,6 +3323,81 @@ PNPMFILE_REDIRECT_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Yarn Berry exec-hijack protection (yarnPath / plugins) --------------------
+# Yarn Berry (>=2.x) resolves a bare `yarn` invocation through its own committed
+# release bundle whenever `.yarnrc.yml` sets `yarnPath` -- the file it names
+# (default `.yarn/releases/yarn-<version>.cjs`) is loaded and run as arbitrary
+# Node.js on EVERY yarn subcommand, not merely install/add/update the way a
+# pnpmfile is gated to -- `yarn --version`, `yarn run`, `yarn dlx`, anything.
+# `.yarnrc.yml`'s `plugins:` list works the same way one layer further: each
+# entry's local `path:` file hooks into Yarn's own plugin API and is loaded on
+# every invocation too. Both are the Yarn-Berry analog of
+# `rule_pnpmfile_exec_protect`'s pnpmfile -- a full JS module the package
+# manager itself executes, no `scripts` entry, no shell-command shape for a
+# review to notice -- but with a WORSE trigger bar than pnpmfile: no install
+# step is required at all, only a bare `yarn` of any kind.
+#
+# Gated on PATH ALONE for the release/plugin file itself, the same "no safe
+# subset of content to narrow past" choice PNPMFILE_PATH_RE/HUSKY_HOOK_PATH_RE
+# make for their own targets -- reviewed, intentional plugin code and this
+# attack look identical from the outside. `_CI_SEG` bounds the release
+# filename (single path segment, no separators) and `_CI_MULTI` bounds the
+# plugin path (may nest, e.g. `.yarn/plugins/@yarnpkg/plugin-foo.cjs`), the
+# same bounded-span convention this file's CI-workflow patterns use for
+# multi-segment paths (see `_CI_MULTI`'s own comment).
+YARN_EXEC_PATH_RE = re.compile(
+    r"\.yarn" + _SEP + r"releases" + _SEP + _CI_SEG + r"\.c?js" + _CI_END
+    + r"|\.yarn" + _SEP + r"plugins" + _SEP + _CI_MULTI + r"\.c?js" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The redirect half's path check: Yarn Berry's own `.yarnrc.yml` (classic
+# `.yarnrc`, space-delimited, has no `yarnPath`/`plugins` keys at all -- those
+# are Berry-only, so this deliberately does NOT reuse REGISTRY_CONFIG_PATH_RE's
+# broader `.yarnrc(?:\.yml)?` match).
+YARNRC_YML_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.yarnrc\.yml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Content-only check for a confirmed `.yarnrc.yml`: a `yarnPath` key (points
+# Yarn's own loader at an arbitrary file instead of the default global yarn
+# binary) or a `plugins:` list entry's local `path:` (loads an arbitrary local
+# JS file into the plugin API). The `plugins:` alternative uses a bounded
+# lookahead ({0,400}, not unbounded -- the same ReDoS-avoidance convention
+# every other bounded gap in this file follows) since a real `plugins:` list
+# entry carries other keys (`spec`, `checksum`) before the `path:` that
+# matters, and a project may list several plugins before the one that does.
+#
+# QA finding (independent adversarial review, round A): the original version
+# anchored `path:` immediately after the list-item dash (`-\s*path\s*:`).
+# YAML mapping key order is irrelevant to Yarn's own parser -- a real
+# `plugins:` entry with `spec:`/`checksum:` written BEFORE `path:` (a very
+# ordinary way to author one; `yarn plugin import` itself doesn't guarantee
+# key order either) loads and executes identically but never matched,
+# sailing straight through as a silent ALLOW. Closed by dropping the dash
+# anchor entirely -- `path:` need only appear somewhere in the bounded span
+# after `plugins:`, not as that entry's first key.
+YARN_EXEC_REDIRECT_RE = re.compile(
+    r"\byarnPath\s*:\s*[\"']?\S"
+    r"|\bplugins\s*:(?=[\s\S]{0,400}?\bpath\s*:\s*[\"']?\S)",
+    re.IGNORECASE,
+)
+
+# CLI forms that rewrite Yarn's own exec surface directly, with no accompanying
+# file write for the Edit/Write branch to ever see: `yarn set version
+# <version|path|url>` (re)writes the release bundle AND points `yarnPath` at
+# it in one step; `yarn plugin import <name|path|url>` fetches or copies a
+# plugin file and wires it into `plugins:`. Both subcommands ARE the write --
+# gated on the subcommand's mere presence, no write-verb pairing needed,
+# mirroring PNPMFILE_REDIRECT_CLI_RE's `pnpm config set ... pnpmfile` case one
+# guard over.
+YARN_EXEC_CLI_RE = re.compile(
+    r"\byarn\s+set\s+version\b"
+    r"|\byarn\s+plugin\s+import\b",
+    re.IGNORECASE,
+)
+
 # ---- Git-config credential/exec hijack protection ------------------------------
 # Two git-config-driven persistence/exfiltration primitives `git_hooks_protect`
 # doesn't reach (it only watches `core.hooksPath`): `credential.helper` and a

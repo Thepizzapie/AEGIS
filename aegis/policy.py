@@ -209,6 +209,16 @@ class Policy:
     # PNPM_CONFIG_PNPMFILE env var) that points pnpm's loader at an
     # arbitrary path instead. See rules.rule_pnpmfile_exec_protect.
     pnpmfile_exec: dict = field(default_factory=dict)
+    # Yarn Berry exec-hijack protection: {mode: deny|ask|monitor|off, allow:
+    # [regex on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # Yarn's own release/plugin bundle (.yarn/releases/*.cjs/.js,
+    # .yarn/plugins/**/*.cjs/.js) -- loaded and run as arbitrary Node.js on
+    # EVERY bare `yarn` invocation, not merely install/add/update, before any
+    # dependency's own lifecycle scripts run -- and a redirect of Yarn's exec
+    # loader via `.yarnrc.yml`'s `yarnPath`/`plugins` keys, or the CLI forms
+    # that rewrite either (`yarn set version ...`, `yarn plugin import ...`).
+    # See rules.rule_yarn_exec_protect.
+    yarn_exec: dict = field(default_factory=dict)
     # Git-config credential/exec-hijack protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers `credential.helper` redirection and any git-config key
