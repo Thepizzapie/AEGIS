@@ -2219,15 +2219,38 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     shell branch doesn't recognize as a write verb is not covered; `find
     -path`/`-name` indirection around the filename isn't covered (no
     `*_find_hit`-style fallback, the same gap `rule_pnpmfile_exec_protect`
-    already discloses for its own target); a direct fetch-to-file write
-    (`curl -o .yarn/releases/yarn-evil.cjs <url>`) is caught by none of the
-    shell branch's write-verb checks, closed only via the separate
-    `rule_fetch_to_file_protect` backstop once wired into
-    `_FETCH_HUMAN_ESCAPABLE`, the same inherited gap every sibling guard
-    already discloses; and the shared `_path()` helper every `*_protect`
-    guard in this file reads MCP tool-call arguments through only checks a
-    fixed key allowlist, the same pre-existing, shared-infrastructure gap
+    already discloses for its own target); `git checkout <ref> -- <path>`
+    (restoring a file's content from another ref/branch) genuinely
+    overwrites the working-tree file but appears in none of the shell
+    branch's write-verb checks -- an inherited gap shared with every sibling
+    `*_protect` guard that uses the same write-verb set, not unique to this
+    guard, and out of scope to close here without re-auditing every sibling
+    that shares it; a `.yarnrc.yml` comment that merely MENTIONS `yarnPath:`
+    (`# yarnPath: /old/path.cjs -- no longer used`) still fires ASK, the
+    same comment-blind trade-off `PNPMFILE_REDIRECT_RE` already accepts for
+    its own `pnpmfile:` key; a direct fetch-to-file write (`curl -o
+    .yarn/releases/yarn-evil.cjs <url>`) is closed via the separate
+    `rule_fetch_to_file_protect` backstop, wired into `_FETCH_HUMAN_
+    ESCAPABLE`; and the shared `_path()` helper every `*_protect` guard in
+    this file reads MCP tool-call arguments through only checks a fixed key
+    allowlist, the same pre-existing, shared-infrastructure gap
     `rule_pnpmfile_exec_protect`'s own docstring already discloses.
+
+    QA history (two independent reviews, run in parallel): a design/wiring
+    review confirmed correct registration everywhere its siblings are
+    (`_CORE_RULES`, `Policy`, all three `loader.py` spots, both `skills.py`
+    knob lists, the `_REMEDIES` table, the README guard table), a live YAML
+    `yarn_exec:` block through `load_policy()` into a live `evaluate()`
+    decision for both `mode` and `allow`, the full suite green throughout --
+    and found one real gap this guard's own target-path regexes were
+    missing from `_FETCH_HUMAN_ESCAPABLE`, closed above. A parallel
+    adversarial bypass-hunting review found and this fix closes one real,
+    reproduced, silent-ALLOW bypass in `YARN_EXEC_REDIRECT_RE`'s `plugins:`
+    alternative (it required `path:` to be a list entry's literal first
+    key, which YAML key order never guarantees), confirmed the `git
+    checkout -- <path>`/comment-mention gaps above as pre-existing and
+    shared rather than novel, and found no ReDoS on any of the four new
+    regexes under adversarial input.
     """
     cfg = getattr(policy, "yarn_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -5960,6 +5983,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.PACKAGE_SCRIPTS_PATH_RE, "a package manifest (package.json/composer.json)"),
     (patterns.REGISTRY_CONFIG_PATH_RE, "a package-registry config"),
     (patterns.PNPMFILE_PATH_RE, "pnpm's hook file"),
+    (patterns.YARN_EXEC_PATH_RE, "Yarn Berry's own release/plugin bundle"),
+    (patterns.YARNRC_YML_PATH_RE, "Yarn Berry's .yarnrc.yml exec-loader config"),
     (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
     (patterns.GIT_ATTRS_PATH_RE, "a .gitattributes file"),
     (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),

@@ -3368,9 +3368,19 @@ YARNRC_YML_PATH_RE = re.compile(
 # every other bounded gap in this file follows) since a real `plugins:` list
 # entry carries other keys (`spec`, `checksum`) before the `path:` that
 # matters, and a project may list several plugins before the one that does.
+#
+# QA finding (independent adversarial review, round A): the original version
+# anchored `path:` immediately after the list-item dash (`-\s*path\s*:`).
+# YAML mapping key order is irrelevant to Yarn's own parser -- a real
+# `plugins:` entry with `spec:`/`checksum:` written BEFORE `path:` (a very
+# ordinary way to author one; `yarn plugin import` itself doesn't guarantee
+# key order either) loads and executes identically but never matched,
+# sailing straight through as a silent ALLOW. Closed by dropping the dash
+# anchor entirely -- `path:` need only appear somewhere in the bounded span
+# after `plugins:`, not as that entry's first key.
 YARN_EXEC_REDIRECT_RE = re.compile(
     r"\byarnPath\s*:\s*[\"']?\S"
-    r"|\bplugins\s*:(?=[\s\S]{0,400}?-\s*path\s*:\s*[\"']?\S)",
+    r"|\bplugins\s*:(?=[\s\S]{0,400}?\bpath\s*:\s*[\"']?\S)",
     re.IGNORECASE,
 )
 
