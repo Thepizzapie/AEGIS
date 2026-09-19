@@ -151,6 +151,49 @@ def test_aegis_var_via_mcp_bareword_leaf_gated():
     assert d.blocked and d.rule == "claude-env-protect"
 
 
+# ---- rename-bypass regression (independent adversarial QA, round A) -----------
+# CONFIRMED, REPRODUCED finding: an Edit tool's `old_string`/`new_string` pair
+# renaming an EXISTING key's bare identifier text never produces the quote+
+# colon adjacency `CLAUDE_ENV_AEGIS_KEY_RE`/`CLAUDE_ENV_HIJACK_KEY_RE`/
+# `CLAUDE_APIKEYHELPER_KEY_RE` require, because those characters sit outside
+# the changed substring and are simply absent from `new_string`. Reproduced
+# as total non-detection (ALLOW, no rule, not even routed through the
+# escapable tier) with no MCP tool and no shell involved — and reproduced
+# working identically for a spawned agent (AEGIS_AGENT_NAME set), i.e. this
+# was not the escape hatch firing, it was zero detection. Closed by the
+# `*_BAREWORD_RE` fallback.
+
+def test_edit_rename_to_aegis_var_gated_and_never_escapable(monkeypatch):
+    d1 = evaluate(_write(".claude/settings.local.json", '{"env": {"DEBUG": "1"}}'), EMPTY)
+    assert not _gated(d1)
+    rename = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                         args={"file_path": ".claude/settings.local.json",
+                               "old_string": "DEBUG", "new_string": "AEGIS_NO_BUILTINS"})
+    d2 = evaluate(rename, EMPTY)
+    assert d2.blocked and d2.rule == "claude-env-protect"
+    # and genuinely never-escapable, even for a spawned agent:
+    monkeypatch.setenv("AEGIS_AGENT_NAME", "spawned-worker")
+    monkeypatch.setenv("AEGIS_ALLOW_CLAUDE_ENV", "1")
+    d3 = evaluate(rename, EMPTY)
+    assert d3.blocked and d3.rule == "claude-env-protect"
+
+
+def test_edit_rename_to_hijack_var_gated():
+    rename = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                         args={"file_path": ".claude/settings.local.json",
+                               "old_string": "DEBUG", "new_string": "BASH_ENV"})
+    d = evaluate(rename, EMPTY)
+    assert _gated(d) and d.rule == "claude-env-protect"
+
+
+def test_edit_rename_to_apikeyhelper_gated():
+    rename = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                         args={"file_path": ".claude/settings.local.json",
+                               "old_string": "myOldHelper", "new_string": "apiKeyHelper"})
+    d = evaluate(rename, EMPTY)
+    assert _gated(d) and d.rule == "claude-env-protect"
+
+
 # ---- process-hijack env vars: human-only ask/deny/monitor ---------------------
 
 def test_bash_env_via_write_gated():
@@ -202,9 +245,16 @@ def test_apikeyhelper_via_edit_gated():
     assert _gated(d) and d.rule == "claude-env-protect"
 
 
-def test_apikeyhelper_empty_string_not_gated():
+def test_apikeyhelper_empty_string_still_asks_via_bareword_fallback():
+    """`CLAUDE_APIKEYHELPER_KEY_RE` alone treats an empty value as safe (no
+    safe value once NON-empty), but the bareword fallback added to close the
+    rename bypass (see `test_rename_bypass.py`-style tests below) can't see
+    the value at all — so any occurrence of the literal `apiKeyHelper`
+    identifier now asks. An accepted, narrow ask-fatigue trade-off, not a
+    regression: pinned here so it isn't silently "fixed" back into the
+    critical rename bypass it exists to close."""
     d = evaluate(_write(".claude/settings.local.json", '{"apiKeyHelper": ""}'), EMPTY)
-    assert not _gated(d)
+    assert _gated(d) and d.rule == "claude-env-protect"
 
 
 def test_apikeyhelper_via_mcp_struct_gated():
@@ -392,3 +442,16 @@ def test_hijack_key_regex_matches_expected_forms():
 
 def test_apikeyhelper_regex_does_not_match_empty_value():
     assert not patterns.CLAUDE_APIKEYHELPER_KEY_RE.search('"apiKeyHelper": ""')
+
+
+def test_bareword_regexes_match_bare_identifier_with_no_quotes_or_colon():
+    for name in patterns.AEGIS_TRUST_VAR_NAMES:
+        assert patterns.CLAUDE_ENV_AEGIS_BAREWORD_RE.search(name), name
+    for name in patterns.CLAUDE_ENV_HIJACK_VAR_NAMES:
+        assert patterns.CLAUDE_ENV_HIJACK_BAREWORD_RE.search(name), name
+    assert patterns.CLAUDE_APIKEYHELPER_BAREWORD_RE.search("apiKeyHelper")
+
+
+def test_bareword_regex_does_not_match_lookalike_suffixed_name():
+    assert not patterns.CLAUDE_ENV_AEGIS_BAREWORD_RE.search("AEGIS_HOME_BACKUP")
+    assert not patterns.CLAUDE_ENV_HIJACK_BAREWORD_RE.search("MY_BASH_ENV_VAR")

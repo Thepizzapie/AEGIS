@@ -3171,6 +3171,35 @@ CLAUDE_APIKEYHELPER_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bareword (no quote/colon adjacency) fallback for the Edit/Write/MCP branch
+# of rule_claude_env_protect — closes a CONFIRMED, REPRODUCED bypass found by
+# independent adversarial QA: an ``Edit`` tool's ``old_string``/``new_string``
+# pair can rename an EXISTING key's bare identifier text (e.g.
+# ``old_string="DEBUG"``, ``new_string="AEGIS_NO_BUILTINS"``) without the
+# surrounding quote/colon characters ever appearing in the diff fragment at
+# all — they sit in the unchanged part of the file, outside the substring
+# Claude Code reports as ``new_string`` — so `CLAUDE_ENV_AEGIS_KEY_RE`/
+# `CLAUDE_ENV_HIJACK_KEY_RE`/`CLAUDE_APIKEYHELPER_KEY_RE` (all anchored to a
+# quote immediately before the name) never see it, on a native `Edit` call
+# with no MCP tool or shell involved, reproduced working even for a spawned
+# agent (no escape hatch used or needed — this was total non-detection, not
+# an escape). Deliberately unquoted and uncoloned, gated only on the target
+# path already being confirmed as ``.claude/settings.local.json`` — an
+# extremely strong prior, since no legitimate edit renames something to the
+# exact literal text ``AEGIS_NO_BUILTINS``/``BASH_ENV``/``apiKeyHelper``
+# inside this specific file — the same "narrower false ask/deny over a false
+# negative" trade-off this file's other guards repeatedly accept. Because a
+# bareword match can't distinguish a real key from a value/comment merely
+# mentioning the name, `apiKeyHelper`'s own "empty value is safe" exception
+# (`CLAUDE_APIKEYHELPER_KEY_RE`'s own ``[^"']`` requirement) does not carry
+# over to this fallback — any occurrence of the literal identifier now asks,
+# an accepted, narrow ask-fatigue cost against closing a critical rename
+# bypass for the identifier itself.
+CLAUDE_ENV_AEGIS_BAREWORD_RE = re.compile(r"\b" + _AEGIS_ENV_VARS + r"\b")
+CLAUDE_ENV_HIJACK_BAREWORD_RE = re.compile(
+    r"\b(?:" + "|".join(CLAUDE_ENV_HIJACK_VAR_NAMES) + r")\b")
+CLAUDE_APIKEYHELPER_BAREWORD_RE = re.compile(r"\bapiKeyHelper\b")
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

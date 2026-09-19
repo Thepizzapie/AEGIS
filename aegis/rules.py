@@ -5384,6 +5384,44 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     project's automation may have a real, reviewed reason to set one of
     these (a CI harness pinning ``GIT_SSH_COMMAND`` for a deploy key, say).
 
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows). Design/consistency review found no defects: verified the
+    ``claude_env`` knob is wired everywhere its three settings.local.json
+    siblings (``claude_hooks``/``statusline``/``permission_bypass``) are
+    (``Policy``, all three ``loader.py`` spots, both ``skills.py`` knob
+    lists, README table + Limits disclosure), verified every specific
+    factual claim this docstring makes against the actual sibling code it
+    cites, and confirmed the never-escapable Aegis-tier check genuinely
+    returns before any mode/allow/env-toggle/comment escape is ever
+    consulted, in both the Edit/Write/MCP and shell branches.
+
+    Bypass-hunting found and closed one CRITICAL, reproduced gap: an
+    ``Edit`` tool's ``old_string``/``new_string`` pair can rename an
+    EXISTING key's bare identifier text (``old_string="DEBUG"``,
+    ``new_string="AEGIS_NO_BUILTINS"``) without the surrounding quote/colon
+    characters ever appearing in the diff fragment at all — those sit in
+    the unchanged part of the file, simply absent from what Claude Code
+    reports as ``new_string`` — so `CLAUDE_ENV_AEGIS_KEY_RE`/`CLAUDE_ENV_
+    HIJACK_KEY_RE`/`CLAUDE_APIKEYHELPER_KEY_RE` (all anchored to a quote
+    immediately before the name) never saw it, on a native ``Edit`` call
+    with no MCP tool or shell involved. Reproduced as total non-detection
+    (a silent ``ALLOW``, no rule at all) rather than an escape — confirmed
+    working identically with ``AEGIS_AGENT_NAME`` set (a spawned agent, the
+    worst-case actor the never-escapable tier exists for), with no ``#
+    aegis-allow``/``AEGIS_ALLOW_CLAUDE_ENV``/policy ``allow`` used or
+    needed. Closed by ``*_BAREWORD_RE`` (see patterns.py's own comment for
+    the full writeup): a quote/colon-free fallback, gated only on the
+    target path already being confirmed as ``.claude/settings.local.json``,
+    applied to the Edit/Write branch as well as MCP. Accepted side effect:
+    `apiKeyHelper`'s own "an empty value is safe" exception (`CLAUDE_
+    APIKEYHELPER_KEY_RE`'s own non-empty-value requirement) doesn't carry
+    over to the bareword fallback, since a bareword match can't see the
+    value at all — any occurrence of the literal ``apiKeyHelper`` identifier
+    in this file now asks, a narrow ask-fatigue cost against closing a
+    critical rename bypass for the identifier itself. Full suite green
+    throughout (2360+ tests).
+
     Known gaps, disclosed rather than silently accepted, the same classes
     every sibling guard in this file already discloses: a var name/value
     assembled indirectly (shell variable concatenation, a templating step,
@@ -5443,7 +5481,18 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         norm = _statusline_normalize(content)
 
-        aegis_hit = bool(patterns.CLAUDE_ENV_AEGIS_KEY_RE.search(norm))
+        # `*_BAREWORD_RE` (no quote/colon adjacency required) closes a
+        # confirmed, reproduced bypass (independent adversarial QA): an Edit
+        # tool's `old_string`/`new_string` pair can rename an EXISTING key's
+        # bare identifier text without the surrounding quote/colon ever
+        # appearing in the diff fragment (they're outside the changed
+        # substring), which `*_KEY_RE`'s quote-anchored check never sees.
+        # Applied to Edit/Write too, not just MCP — the MCP branch's own
+        # structural/bareword fallbacks stay as additional, more precise
+        # signals (they can tell a real dict key from an unrelated string
+        # leaf one level removed) rather than the only defense.
+        aegis_hit = bool(patterns.CLAUDE_ENV_AEGIS_KEY_RE.search(norm)
+                          or patterns.CLAUDE_ENV_AEGIS_BAREWORD_RE.search(norm))
         if not aegis_hit and ev.action == ActionClass.MCP:
             aegis_hit = bool(_claude_env_struct_var_hit(a, _AEGIS_TRUST_VAR_SET)
                               or _claude_env_mcp_bareword_hit(a, _AEGIS_TRUST_VAR_SET))
@@ -5453,7 +5502,9 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
 
         hijack_hit = bool(patterns.CLAUDE_ENV_HIJACK_KEY_RE.search(norm)
-                           or patterns.CLAUDE_APIKEYHELPER_KEY_RE.search(norm))
+                           or patterns.CLAUDE_ENV_HIJACK_BAREWORD_RE.search(norm)
+                           or patterns.CLAUDE_APIKEYHELPER_KEY_RE.search(norm)
+                           or patterns.CLAUDE_APIKEYHELPER_BAREWORD_RE.search(norm))
         if not hijack_hit and ev.action == ActionClass.MCP:
             hijack_hit = bool(_claude_env_struct_var_hit(a, _CLAUDE_ENV_HIJACK_VAR_SET)
                                or _claude_apikeyhelper_struct_hit(a)
