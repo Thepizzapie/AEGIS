@@ -3070,6 +3070,107 @@ PERMISSION_BYPASS_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code env/apiKeyHelper hijack protection (.claude/settings.local.json) ---
+# A fourth and fifth auto-injection surface in the same file
+# `CLAUDE_LOCAL_SETTINGS_PATH_RE` already locates — neither reached by
+# `CLAUDE_HOOKS_KEY_RE`/`CLAUDE_STATUSLINE_KEY_RE`/`PERMISSION_BYPASS_MODE_
+# KEY_RE` above, NOR by `rule_aegis_env_protect`'s own `env_carrier_path_hit()`
+# allowlist — a `.json` file is not one of the carriers `AEGIS_ENV_CARRIER_
+# PATH_RE`/`SHELL_RC_PATH_RE` recognize, so that guard's whole "never
+# escapable" posture for Aegis's own seven trust-boundary vars is silently
+# absent for this specific, real carrier:
+#
+# - `env` — an object of environment variables Claude Code applies to every
+#   subprocess it spawns for the rest of the session: the Bash tool's own
+#   shell, AND (materially worse) Aegis's own PreToolUse/PostToolUse/...
+#   hook invocation — the enforcement process every other guard in this file
+#   assumes is intact. Planting one of Aegis's seven trust-boundary vars here
+#   (`AEGIS_NO_BUILTINS` chief among them — it disables every built-in guard
+#   in this file in one shot) is the exact same attack `rule_aegis_env_
+#   protect` exists to make never-escapable, through a door its own carrier-
+#   path check was never built to see. A curated set of process-hijack vars
+#   (`BASH_ENV`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `RUBYOPT`, `LD_PRELOAD`,
+#   `DYLD_INSERT_LIBRARIES`, `GIT_SSH_COMMAND`) auto-run arbitrary code on the
+#   very next shell/interpreter/git invocation, no future git/CI/session-
+#   restart trigger needed — the same "no future trigger" property `rule_
+#   path_hijack_protect`'s own docstring flags as materially worse than most
+#   of this file's other auto-exec guards. And `ANTHROPIC_BASE_URL`/
+#   `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` re-point every future model
+#   request — and the credential sent with it — at an attacker-controlled
+#   endpoint, the model-traffic analog of `rule_git_config_exec_protect`'s
+#   own `credential.helper` hijack.
+# - `apiKeyHelper` — names a shell command Claude Code execs directly,
+#   outside the tool-call loop, to mint the auth value sent as the
+#   `X-Api-Key`/`Authorization: Bearer` header with every model request — the
+#   same "Claude Code runs this itself, unattended, no tool call for Aegis's
+#   own hook to ever evaluate first" shape `rule_statusline_protect`'s own
+#   docstring establishes for `statusLine`, one settings key over.
+#
+# Two severity tiers, not one, the same per-target escapability split `rule_
+# fetch_to_file_protect` already makes across the surfaces IT backstops:
+# Aegis's own seven trust-boundary vars are never-escapable here too (no
+# mode, no `allow`, no `AEGIS_ALLOW_*`) — the identical posture `rule_aegis_
+# env_protect` already gives the same attack through a shell export, since
+# choosing the `env`-block door instead of `export` doesn't make the
+# underlying bypass any less total. Every other dangerous var/`apiKeyHelper`
+# is human-only ask/deny/monitor, the same convention `claude_hooks`/
+# `statusline`/`permission_bypass` use for their own keys.
+#
+# `AEGIS_TRUST_VAR_NAMES` intentionally duplicates (rather than derives from)
+# `_AEGIS_ENV_VARS`'s own alternation above — both are hand-maintained
+# literals, the same trade-off `_AEGIS_ENV_VARS` itself already accepts over
+# deriving from anything; keep the two lists in sync if Aegis ever adds an
+# eighth trust-boundary variable.
+AEGIS_TRUST_VAR_NAMES = (
+    "AEGIS_NO_BUILTINS", "AEGIS_PLUGINS", "AEGIS_POLICIES", "AEGIS_HOME",
+    "AEGIS_AUDIT", "AEGIS_PROJECT", "AEGIS_WORKSPACE",
+)
+CLAUDE_ENV_AEGIS_KEY_RE = re.compile(
+    r"[\"']" + _AEGIS_ENV_VARS + r"[\"']\s*:", re.IGNORECASE)
+
+CLAUDE_ENV_HIJACK_VAR_NAMES = (
+    "BASH_ENV", "NODE_OPTIONS", "PYTHONSTARTUP", "RUBYOPT", "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES", "GIT_SSH_COMMAND", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+)
+CLAUDE_ENV_HIJACK_KEY_RE = re.compile(
+    r"[\"'](?:" + "|".join(CLAUDE_ENV_HIJACK_VAR_NAMES) + r")[\"']\s*:",
+    re.IGNORECASE,
+)
+
+# `apiKeyHelper` has no safe value once present, the same "no safe value"
+# shape `hooks` already has (unlike `statusLine`'s `type: "command"`
+# co-occurrence requirement) — any non-empty string value is at least one
+# auto-run command.
+CLAUDE_APIKEYHELPER_KEY_RE = re.compile(
+    r"[\"']apiKeyHelper[\"']\s*:\s*[\"'][^\"']", re.IGNORECASE)
+
+# jq/gojq/jaq scripted edit of either surface — the same triple-signal shape
+# (tool + assignment operator + target key, order-agnostic) `CLAUDE_HOOKS_
+# JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE`/`PERMISSION_BYPASS_JQ_RE` each use, but
+# with an unbounded, `;`-scoped lookahead from the start rather than the
+# fixed-width window each of those three needed a QA round to widen after an
+# adversarial comment/whitespace-padding bypass — adopted here up front
+# rather than repeating that already-known finding.
+CLAUDE_ENV_AEGIS_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\b" + _AEGIS_ENV_VARS + r"\b)",
+    re.IGNORECASE,
+)
+CLAUDE_ENV_HIJACK_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\b(?:" + "|".join(CLAUDE_ENV_HIJACK_VAR_NAMES) + r")\b)",
+    re.IGNORECASE,
+)
+CLAUDE_APIKEYHELPER_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\.?apiKeyHelper\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

@@ -312,6 +312,21 @@ class Policy:
     # --dangerously-skip-permissions`/`--permission-mode bypassPermissions`
     # CLI invocation. See rules.rule_permission_bypass_protect.
     permission_bypass: dict = field(default_factory=dict)
+    # Claude Code env/apiKeyHelper hijack protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply to the process-hijack/apiKeyHelper tier; a hit on one of Aegis's
+    # own trust-boundary vars inside the `env` block is never escapable
+    # regardless of this config, the same posture rule_aegis_env_protect
+    # gives the identical vars through a shell export. Covers an `env` entry
+    # (BASH_ENV/NODE_OPTIONS/PYTHONSTARTUP/RUBYOPT/LD_PRELOAD/
+    # DYLD_INSERT_LIBRARIES/GIT_SSH_COMMAND/ANTHROPIC_BASE_URL/
+    # ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN, or any of Aegis's own seven
+    # trust-boundary vars) or an `apiKeyHelper` entry planted in
+    # `.claude/settings.local.json` -- the same file `claude_hooks`/
+    # `statusline`/`permission_bypass` guard for their own keys, and a
+    # carrier `rule_aegis_env_protect`'s own path allowlist does not reach
+    # at all. See rules.rule_claude_env_protect.
+    claude_env: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a

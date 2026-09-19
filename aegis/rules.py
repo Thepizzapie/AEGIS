@@ -5219,6 +5219,309 @@ def rule_permission_bypass_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+# ---- Claude Code env / apiKeyHelper hijack protection: mixed escapability ----
+def _claude_env_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_AEGIS_TRUST_VAR_SET = frozenset(n.lower() for n in patterns.AEGIS_TRUST_VAR_NAMES)
+_CLAUDE_ENV_HIJACK_VAR_SET = frozenset(n.lower() for n in patterns.CLAUDE_ENV_HIJACK_VAR_NAMES)
+
+
+def _claude_env_struct_var_hit(v, names: frozenset, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for one of
+    ``names`` as an actual DICT KEY (not a string value) anywhere below an
+    ``env`` object — the same structural-MCP-arg-shape gap
+    `_claude_hooks_struct_key_hit`/`_statusline_struct_key_hit` already close
+    for their own keys, applied here to whichever env-var name set the
+    caller passes (Aegis's own trust-boundary vars, or the process-hijack
+    set). Matches a bare key OR a dotted-suffix spelling (``"env.BASH_ENV"``)
+    the same flat-key convention `_permission_bypass_struct_key_hit` already
+    accepts for ``defaultMode``. Same depth cap (12) as every sibling
+    structural walker in this file."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str):
+                kl = k.strip().lower()
+                if kl in names or any(kl.endswith("." + n) for n in names):
+                    return True
+            if _claude_env_struct_var_hit(val, names, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_env_struct_var_hit(x, names, _depth + 1) for x in v)
+    return False
+
+
+def _claude_apikeyhelper_struct_hit(v, _depth: int = 0) -> bool:
+    """Same structural walk as `_claude_env_struct_var_hit`, for the single
+    ``apiKeyHelper`` key with a non-empty string value — the value, not just
+    the key's presence, since an MCP tool's structural args can carry the
+    key name as an unrelated string leaf elsewhere (closed separately by
+    `_claude_env_mcp_bareword_hit`)."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if (isinstance(k, str) and k.strip().lower() == "apikeyhelper"
+                    and isinstance(val, str) and val.strip()):
+                return True
+            if _claude_apikeyhelper_struct_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_apikeyhelper_struct_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_env_mcp_bareword_hit(a: dict, names: frozenset) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: one of ``names`` appears
+    exact-match (or as a dotted-path suffix, e.g. ``"env.BASH_ENV"``) as a
+    plain string LEAF anywhere in the (recursively) flattened raw MCP args —
+    closes a "set config value"-style MCP tool's ``{"key": "env.BASH_ENV",
+    "value": ...}`` shape, the same bareword-leaf gap `_claude_hooks_mcp_
+    bareword_hit`/`_statusline_mcp_bareword_hit` already close for their own
+    targets. Deliberately takes ``names`` as a parameter rather than also
+    special-casing ``apiKeyHelper`` here — a caller checking the Aegis
+    trust-boundary tier must never treat an unrelated ``apiKeyHelper`` leaf
+    as a hit; that check lives separately in
+    `_claude_apikeyhelper_mcp_bareword_hit`."""
+    leaves = {s.strip().lower() for s in _flatten_strings(a) if isinstance(s, str)}
+    return bool(leaves & names) or any(
+        leaf.endswith("." + n) for leaf in leaves for n in names)
+
+
+def _claude_apikeyhelper_mcp_bareword_hit(a: dict) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: the literal
+    ``apiKeyHelper`` appears exact-match as a plain string LEAF anywhere in
+    the (recursively) flattened raw MCP args — closes a "set config
+    value"-style MCP tool's ``{"key": "apiKeyHelper", "value": "..."}``
+    shape."""
+    return any(isinstance(s, str) and s.strip().lower() == "apikeyhelper"
+               for s in _flatten_strings(a))
+
+
+def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering an ``env`` entry naming one of Aegis's own
+    trust-boundary vars, a curated process-hijack/credential-redirect env
+    var, or an ``apiKeyHelper`` entry, in ``.claude/settings.local.json`` —
+    a fourth and fifth auto-injection surface in the same project-local,
+    gitignored-by-default file `rule_claude_hooks_protect`/`rule_statusline_
+    protect`/`rule_permission_bypass_protect` already guard for their own
+    keys, and one `rule_aegis_env_protect`'s own carrier-path allowlist does
+    NOT reach at all.
+
+    THREAT MODEL: Claude Code applies ``.claude/settings.local.json``'s
+    ``env`` object to every subprocess it spawns for the rest of the
+    session — the Bash tool's own shell, AND (materially worse) Aegis's own
+    PreToolUse/PostToolUse/... hook invocation, the enforcement process
+    every other guard in this file assumes stays intact. `rule_aegis_env_
+    protect` already treats setting ``AEGIS_NO_BUILTINS``/``AEGIS_PLUGINS``/
+    ``AEGIS_POLICIES``/``AEGIS_HOME``/``AEGIS_AUDIT``/``AEGIS_PROJECT``/
+    ``AEGIS_WORKSPACE`` as never-escapable, from a shell export or a file
+    that ``patterns.env_carrier_path_hit()`` recognizes as something that
+    actually loads into a process environment (a ``.env``, a Dockerfile, a
+    ``.yml``/``.yaml``, a shell/wrapper script, a shell startup/profile
+    dotfile) — but that carrier-path allowlist has no ``.json`` entry at
+    all, so the exact same attack, planted in this file's ``env`` block
+    instead, sails through that guard completely unseen. This guard closes
+    that specific, real gap: it does not change `rule_aegis_env_protect`
+    itself, it reaches the one carrier that guard's own path check was never
+    built to see.
+
+    Beyond Aegis's own vars, the same ``env`` object is also where an agent
+    would plant a process-hijack primitive that needs no future git/CI/
+    session-restart trigger at all — the very next Bash-tool shell or
+    interpreter invocation runs it: ``BASH_ENV`` (sourced by every
+    non-interactive POSIX shell), ``NODE_OPTIONS`` (``--require``/``--loader``
+    arbitrary-module injection into every ``node`` invocation),
+    ``PYTHONSTARTUP`` (sourced on interactive Python startup), ``RUBYOPT``
+    (``-r`` require injection), ``LD_PRELOAD``/``DYLD_INSERT_LIBRARIES`` (the
+    env-var-level sibling of the ``/etc/ld.so.preload`` primitive `rule_ld_
+    preload_protect` already guards at the system-file level — here scoped
+    to the session's own subprocesses rather than the whole machine, but
+    requiring no root and no reboot), and ``GIT_SSH_COMMAND`` (replaces the
+    command git execs over SSH on the very next fetch/push/clone). Three
+    more name Anthropic's own API endpoint/credential directly —
+    ``ANTHROPIC_BASE_URL``/``ANTHROPIC_API_KEY``/``ANTHROPIC_AUTH_TOKEN`` —
+    re-pointing every future model request, and the credential sent with it,
+    at an attacker-controlled endpoint: the model-traffic analog of `rule_
+    git_config_exec_protect`'s own ``credential.helper`` hijack, one layer
+    up into the agent's own provider connection. Separately, ``apiKeyHelper``
+    names a shell command Claude Code execs directly, outside the tool-call
+    loop, to mint the auth value sent with every model request — the same
+    "Claude Code runs this itself, unattended, no tool call for Aegis's own
+    hook to ever evaluate first" shape `rule_statusline_protect`'s own
+    docstring establishes for ``statusLine``, one settings key over, and
+    (unlike ``statusLine``) with no safe value once present, the same "no
+    safe value" property `rule_claude_hooks_protect`'s own ``hooks`` key has.
+
+    Distinct from a path-only guard for the same reason every sibling
+    settings.local.json guard in this file is: the file legitimately carries
+    plenty of other ``env`` entries edited for entirely benign reasons (a
+    project's own ``DEBUG``/telemetry toggle) — gated on path AND one of a
+    curated set of dangerous key names, never the bare ``env`` key alone.
+
+    Two severity tiers, matching `rule_fetch_to_file_protect`'s own
+    per-target escapability split: a hit on one of Aegis's own seven
+    trust-boundary vars is NEVER escapable — no ``mode``, no ``allow``, no
+    ``AEGIS_ALLOW_*`` — the identical posture `rule_aegis_env_protect` already
+    gives the same attack through a shell export, since routing it through
+    this file's ``env`` block instead doesn't make the underlying bypass any
+    less total. A hit on a process-hijack var or ``apiKeyHelper`` is
+    human-only ask/deny/monitor (``policy.claude_env``, default ``ask``),
+    escapable with a trailing ``# aegis-allow`` (shell) or
+    ``AEGIS_ALLOW_CLAUDE_ENV=1`` (file) — the same convention `claude_hooks`/
+    `statusline`/`permission_bypass` use for their own keys — since a
+    project's automation may have a real, reviewed reason to set one of
+    these (a CI harness pinning ``GIT_SSH_COMMAND`` for a deploy key, say).
+
+    Known gaps, disclosed rather than silently accepted, the same classes
+    every sibling guard in this file already discloses: a var name/value
+    assembled indirectly (shell variable concatenation, a templating step,
+    a value written across two separate Edit calls whose diff never repeats
+    the key name in one call) defeats every check here; the curated
+    process-hijack var list is a denylist, not exhaustive — e.g. Perl's
+    ``PERL5LIB``, a JVM's ``JAVA_TOOL_OPTIONS``, or a not-yet-named future
+    interpreter env hook is not covered; the user-level
+    ``~/.claude/settings.local.json`` is reached the same incidental,
+    suffix-only way `rule_claude_hooks_protect`/`rule_statusline_protect`/
+    `rule_permission_bypass_protect` already reach it (no anchoring to
+    project root), and a relocated ``CLAUDE_CONFIG_DIR`` is not specially
+    covered; a direct fetch-to-file write (``curl -o
+    .claude/settings.local.json ...``) is closed end-to-end by the separate
+    `rule_fetch_to_file_protect` backstop, which reuses `CLAUDE_LOCAL_
+    SETTINGS_PATH_RE` as one of its own protected targets, the same way
+    `rule_statusline_protect`/`rule_permission_bypass_protect` disclose for
+    their own surfaces; and, like every `_path()`-based guard in this file,
+    an MCP tool naming its target argument outside `_path()`'s recognized
+    key list is missed."""
+    cfg = getattr(policy, "claude_env", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    # `hijack_disabled` gates ONLY the escapable process-hijack/apiKeyHelper
+    # tier below — the Aegis trust-boundary-var tier is checked first and
+    # returns unconditionally, regardless of `mode`/`allow`/`AEGIS_ALLOW_*`,
+    # the same "no config surface at all" posture `rule_aegis_env_protect`
+    # itself has for the identical vars.
+    hijack_disabled = mode in ("off", "false") or raw_mode is False
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-env-protect-monitor")
+            return None
+        return would
+
+    aegis_msg = ("'{p}' is being written with one of Aegis's own "
+                 "trust-boundary env vars inside a Claude Code `env` block — "
+                 "Claude Code applies these to every subprocess it spawns, "
+                 "including Aegis's own hook invocation, before any policy "
+                 "rule ever runs. This is the same attack `rule_aegis_env_"
+                 "protect` makes never-escapable through a shell export; "
+                 "routing it through settings.local.json's `env` block "
+                 "instead does not make it escapable either. No override "
+                 "exists — reconfigure Aegis directly, outside the "
+                 "agent-mediated session.")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        norm = _statusline_normalize(content)
+
+        aegis_hit = bool(patterns.CLAUDE_ENV_AEGIS_KEY_RE.search(norm))
+        if not aegis_hit and ev.action == ActionClass.MCP:
+            aegis_hit = bool(_claude_env_struct_var_hit(a, _AEGIS_TRUST_VAR_SET)
+                              or _claude_env_mcp_bareword_hit(a, _AEGIS_TRUST_VAR_SET))
+        if aegis_hit:
+            return Decision(Action.DENY, "claude-env-protect", aegis_msg.format(p=p or "the file"))
+        if hijack_disabled:
+            return None
+
+        hijack_hit = bool(patterns.CLAUDE_ENV_HIJACK_KEY_RE.search(norm)
+                           or patterns.CLAUDE_APIKEYHELPER_KEY_RE.search(norm))
+        if not hijack_hit and ev.action == ActionClass.MCP:
+            hijack_hit = bool(_claude_env_struct_var_hit(a, _CLAUDE_ENV_HIJACK_VAR_SET)
+                               or _claude_apikeyhelper_struct_hit(a)
+                               or _claude_env_mcp_bareword_hit(a, _CLAUDE_ENV_HIJACK_VAR_SET)
+                               or _claude_apikeyhelper_mcp_bareword_hit(a))
+        if not hijack_hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_ENV")
+                or _claude_env_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-env-protect",
+                         f"'{p}' is being written with a process-hijack env var "
+                         "(BASH_ENV/NODE_OPTIONS/PYTHONSTARTUP/RUBYOPT/"
+                         "LD_PRELOAD/DYLD_INSERT_LIBRARIES/GIT_SSH_COMMAND) or "
+                         "an ANTHROPIC_* endpoint/credential override, or an "
+                         "`apiKeyHelper` entry — Claude Code applies/executes "
+                         "these automatically, outside the tool-call loop "
+                         "Aegis evaluates, and (being gitignored by default) "
+                         "with no diff and no code review. Review the change, "
+                         "then confirm with AEGIS_ALLOW_CLAUDE_ENV=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        norm_cmd = _statusline_normalize(cmd)
+
+        # Deliberately NOT gated on a write-verb check (unlike `rule_claude_hooks_
+        # protect`'s own shell key-match branch) — the same choice `rule_
+        # permission_bypass_protect`'s own `key_hit` makes for the identical
+        # reason: these key regexes are already narrow (a curated var-name
+        # alternation / `apiKeyHelper`), so path_hit + key_hit alone carries
+        # low false-positive risk, and requiring a write_verb on top would
+        # reopen the `sponge`-without-`jq` gap (no redirect/mv/sed-i/forced-
+        # link token at all — `sponge` reads stdin and writes its named file
+        # directly) that a write_verb-gated check misses entirely.
+        aegis_shell_hit = bool(patterns.CLAUDE_ENV_AEGIS_JQ_RE.search(norm_cmd)
+                                or patterns.CLAUDE_ENV_AEGIS_KEY_RE.search(norm_cmd))
+        if aegis_shell_hit:
+            return Decision(Action.DENY, "claude-env-protect", aegis_msg.format(p="settings.local.json"))
+        if hijack_disabled:
+            return None
+
+        jq_hit = bool(patterns.CLAUDE_ENV_HIJACK_JQ_RE.search(norm_cmd)
+                       or patterns.CLAUDE_APIKEYHELPER_JQ_RE.search(norm_cmd))
+        key_hit = bool(patterns.CLAUDE_ENV_HIJACK_KEY_RE.search(norm_cmd)
+                        or patterns.CLAUDE_APIKEYHELPER_KEY_RE.search(norm_cmd))
+        if not (jq_hit or key_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_ENV")
+                or _claude_env_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-env-protect",
+                         "A process-hijack env var or `apiKeyHelper` entry is "
+                         "being planted in .claude/settings.local.json from a "
+                         "shell — Claude Code applies/executes it "
+                         "automatically, outside the tool-call loop Aegis "
+                         "evaluates, and (being gitignored by default) with "
+                         "no diff and no code review. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_CLAUDE_ENV=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7443,6 +7746,7 @@ _CORE_RULES = (
     rule_claude_hooks_protect,
     rule_statusline_protect,
     rule_permission_bypass_protect,
+    rule_claude_env_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
