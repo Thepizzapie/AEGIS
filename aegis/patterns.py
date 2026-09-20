@@ -3439,13 +3439,34 @@ YARN_EXEC_CLI_RE = re.compile(
 # high-signal here without the false-positive rate `build-backend` alone
 # would carry.
 #
-# Matches the array-opening `[` immediately, so it needs no lookahead past
-# the `=` regardless of whether the array's own entries sit on the same
-# line (`backend-path = ["."]`) or wrap onto following lines (TOML permits
-# both) -- there is no bounded-span gap here to bound in the first place,
-# unlike YARN_EXEC_REDIRECT_RE's `plugins:` case, so no ReDoS surface either.
+# QA finding (independent adversarial review, round A): the original
+# version required a literal `[` right after `=`, on the assumption
+# `backend-path` is always a TOML array. Neither PEP 517 nor pip's own
+# vendored `pyproject_hooks` actually type-check that -- pip's `pyproject.
+# py` does `build_system.get("backend-path", [])` with no validation, and
+# `pyproject_hooks._impl.py` does `[norm_and_check(self.source_dir, p) for
+# p in backend_path]`. Iterating a bare TOML STRING iterates its
+# characters -- so `backend-path = "."` (BY FAR the most common real-world
+# value, a single `.`) resolves to the exact same one-entry, one-character
+# path list as `backend-path = ["."]`, a fully working, identical-effect
+# form the original `\[`-anchored regex silently missed entirely (a real,
+# reproduced silent-ALLOW bypass, confirmed against pip's actual vendored
+# source, not merely valid-but-unrealistic TOML). Separately, TOML permits
+# a quoted key (`"backend-path" = [...]`/`'backend-path' = [...]`,
+# semantically identical to the bare form) that the original regex also
+# missed on the Edit/Write/MCP branch (the shell branch's own quote-
+# stripping de-obfuscation happened to catch it there, by accident, not by
+# design -- an asymmetry not worth relying on). Closed by dropping the
+# `\[`-anchored value requirement entirely (mirroring `PNPMFILE_REDIRECT_
+# RE`/`YARN_EXEC_REDIRECT_RE`'s own `key\s*[:=]\s*\S` shape one guard over
+# -- neither anchors to a specific value syntax either) and allowing an
+# optional quote around the key itself. Still needs no lookahead past the
+# `=` regardless of whether an array's own entries sit on the same line or
+# wrap onto following lines (TOML permits both) -- there is no bounded-span
+# gap here to bound in the first place, unlike YARN_EXEC_REDIRECT_RE's
+# `plugins:` case, so no ReDoS surface either.
 PEP517_BACKEND_PATH_RE = re.compile(
-    r"\bbackend-path\s*=\s*\[",
+    r"[\"']?\bbackend-path\b[\"']?\s*=\s*[\"']?\S",
     re.IGNORECASE,
 )
 

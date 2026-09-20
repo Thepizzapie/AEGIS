@@ -2408,6 +2408,33 @@ def rule_pep517_backend_protect(ev: Event, policy=None) -> Optional[Decision]:
     spawned agent cannot set its own env for a hook invocation it doesn't
     control, so neither path is agent-self-escapable.
 
+    QA history (two independent adversarial reviews, run in parallel, the
+    same convention every guard in this file follows): a bypass-hunting
+    review found and this fix closes two real, reproduced, silent-ALLOW
+    bypasses -- ``backend-path = "."`` (a bare TOML string, not an array;
+    the original ``PEP517_BACKEND_PATH_RE`` required a literal ``[`` right
+    after ``=``, but neither PEP 517 nor pip's own vendored
+    ``pyproject_hooks`` type-check ``backend-path`` at all, and iterating a
+    bare string iterates its characters -- so a single-character string
+    like ``"."``, BY FAR the most common real-world value, resolves to the
+    exact same path list as ``["."]``, a fully working, identical-effect
+    form the original regex silently missed) and a quoted TOML key
+    (``"backend-path" = [...]``, semantically identical to the bare key,
+    missed on the Edit/Write/MCP branch though caught by accident on the
+    shell branch via its own quote-stripping) -- both closed above by
+    dropping the array-value anchor entirely, mirroring ``PNPMFILE_
+    REDIRECT_RE``/``YARN_EXEC_REDIRECT_RE``'s own value-agnostic
+    ``key\\s*[:=]\\s*\\S`` shape, with no ReDoS found on the widened regex
+    under adversarial input. A parallel design/wiring review confirmed
+    correct registration and round-tripping everywhere its siblings are
+    (``_CORE_RULES``, ``Policy``, all three ``loader.py`` spots, both
+    ``skills.py`` knob lists, the ``_REMEDIES`` table, the README guard
+    table), a live YAML ``pep517_backend:`` block through ``load_policy()``
+    into a live ``evaluate()`` decision for both ``mode`` and ``allow``,
+    every docstring claim true against the implementation (including PEP
+    517/518's own spec, cross-checked independently), and the full suite
+    green throughout with no findings.
+
     Content extraction falls through to the flattened-string sweep
     (``_flatten_strings``) unconditionally whenever ``content``/
     ``new_string`` is missing or empty, not merely for ``ActionClass.MCP``

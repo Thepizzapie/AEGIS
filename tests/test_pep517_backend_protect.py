@@ -135,6 +135,48 @@ def test_multiple_directories_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_bare_string_backend_path_gated():
+    # QA finding (independent adversarial review, round A): neither PEP 517
+    # nor pip's own vendored pyproject_hooks type-check backend-path --
+    # pyproject_hooks does `[norm_and_check(...) for p in backend_path]`,
+    # and iterating a bare TOML *string* iterates its characters, so a
+    # single-character string like "." (the single most common real-world
+    # value) resolves to the exact same one-entry path list as ["."] --  a
+    # fully working, identical-effect form the original `\[`-anchored
+    # regex silently missed entirely. This is the reproduction that closed
+    # it.
+    d = evaluate(_write("pyproject.toml",
+                         '[build-system]\nbuild-backend = "_evil"\n'
+                         'backend-path = "."\n'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_bare_string_backend_path_gated_even_in_deny_mode():
+    d = evaluate(_write("pyproject.toml", 'backend-path = "."'), DENY)
+    assert d.action == Action.DENY
+
+
+def test_shell_bare_string_backend_path_gated():
+    d = evaluate(_shell("echo 'backend-path = \".\"' >> pyproject.toml"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_quoted_key_backend_path_gated():
+    # QA finding (independent adversarial review, round A): TOML permits a
+    # quoted key ("backend-path" = [...]), semantically identical to the
+    # bare key -- missed on the Edit/Write/MCP branch by the original
+    # regex (the shell branch happened to catch it only because its own
+    # quote-stripping de-obfuscation runs first, not by design). This is
+    # the reproduction that closed it.
+    d = evaluate(_write("pyproject.toml", '"backend-path" = ["."]'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_single_quoted_key_backend_path_gated():
+    d = evaluate(_write("pyproject.toml", "'backend-path' = ['.']"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 # ---- ordinary, benign pyproject.toml edits stay allowed ------------------------
 
 def test_write_ordinary_pyproject_not_gated():
