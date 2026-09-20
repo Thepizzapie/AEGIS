@@ -55,6 +55,7 @@ _REMEDIES = """\
 | terraform-exec-protect | planted a `provisioner "local-exec"`/`"remote-exec"` block or a `data "external"` data source in a .tf/.tf.json file (Terraform itself runs it, the provisioner on the next `apply`, the data source on the next `plan`/`refresh` — no confirmation gate at all) | ask the human; they can set AEGIS_ALLOW_TERRAFORM_EXEC=1 after review |
 | pnpmfile-exec-protect | wrote pnpm's own hook file (.pnpmfile.cjs/.mjs/.js) or redirected pnpm's `pnpmfile` config key/env var (runs as arbitrary Node.js, before any dependency's own lifecycle scripts, on the next `pnpm install`/`add`/`update`/`import`) | ask the human; they can set AEGIS_ALLOW_PNPMFILE_EXEC=1 after review |
 | yarn-exec-protect | wrote Yarn Berry's own release/plugin bundle (.yarn/releases/*.cjs/.js, .yarn/plugins/**/*.cjs/.js), redirected its exec loader (.yarnrc.yml's `yarnPath`/`plugins` keys), or ran `yarn set version`/`yarn plugin import` (runs as arbitrary Node.js on the very next bare `yarn` invocation of any kind, no install needed) | ask the human; they can set AEGIS_ALLOW_YARN_EXEC=1 after review |
+| pep517-backend-protect | set `backend-path` in pyproject.toml's `[build-system]` table (pip/build prepend that directory to sys.path and import `build-backend` from it, running arbitrary Python on the very next `pip install`/`python -m build`, before any dependency's own build code runs) | ask the human; they can set AEGIS_ALLOW_PEP517_BACKEND=1 after review |
 | fetch-to-file-protect | a curl/wget/PowerShell/certutil fetch wrote its response directly to a path another guard protects — bypasses that guard's own redirect/copy/move/in-place-edit checks | download to an unprotected scratch path, read it, then let the guard for that surface evaluate the real write; ask the human, who can set AEGIS_ALLOW_FETCH_TO_FILE=1 after review (never escapable for Aegis's own config/policy/source) |
 | workspace-confine | wrote outside the project root the identity is bound to | stay in the project; ask for workspace.allow if a path is legitimate |
 | destructive-migration | destructive SQL / migration reset | use a reversible migration; a human may append '-- aegis-allow' |
@@ -114,7 +115,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `pep517_backend`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -159,7 +160,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
      `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
-     `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
+     `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `pep517_backend`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `path_hijack`,
      `claude_hooks`, `statusline`, `permission_bypass`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.

@@ -3398,6 +3398,92 @@ YARN_EXEC_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- PEP 517 build-backend / backend-path exec-hijack protection --------------
+# `pyproject.toml`'s `[build-system]` table is read by pip/`build`/`pipx`
+# BEFORE any of the actual package's own code runs -- `requires` names the
+# build-time dependencies, and `build-backend` names a dotted import path
+# pip imports and calls hooks on (`get_requires_for_build_wheel`,
+# `build_wheel`, ...) to actually build the package. When `backend-path` is
+# also set (a list of directories, resolved relative to `pyproject.toml`'s
+# own directory), pip/`build` prepend those directories to `sys.path` BEFORE
+# importing `build-backend` -- so `build-backend` need not name an installed
+# package at all; it can be an arbitrary local Python module the write just
+# planted. This is the exact same shape `rule_pnpmfile_exec_protect`/
+# `rule_yarn_exec_protect` already gate one ecosystem over: the package
+# manager (here, pip/`build` themselves, per PEP 517) `import`s and calls
+# into a LOCAL, ARBITRARY module before any dependency's own build code
+# runs, unattended, on the very next `pip install .`/`pip install -e .`/
+# `python -m build`/`pip wheel .` -- by this same agent moments later, a
+# teammate, or CI. Like a pnpmfile/Yarn-Berry plugin, it is arbitrary Python
+# (`open(os.path.expanduser('~/.aws/credentials')).read()` piped into a
+# `urllib.request` POST from inside an innocuous-looking `build_wheel`
+# hook), not a shell-command string `rule_package_manifest_protect`'s
+# lifecycle-script check could ever see -- and `rule_package_manifest_
+# protect`'s own `pyproject.toml` coverage only ever looks at
+# `[[tool.poetry.source]]` (registry redirection), never `[build-system]`
+# at all, leaving this mechanism entirely unprotected.
+#
+# Gated on `backend-path`'s mere presence, not narrowed by which directory
+# it names or what `build-backend` is set to -- the same "no safe content to
+# narrow past" choice `PNPMFILE_PATH_RE`/`YARN_EXEC_PATH_RE` make for their
+# own targets. Unlike `build-backend` alone (an ordinary, near-universal key
+# naming an installed backend like `setuptools.build_meta`/`hatchling.build`
+# in the overwhelming majority of real Python projects -- gating on it would
+# fire on nearly every new project's `pyproject.toml` and get this guard
+# disabled from ask-fatigue, the exact failure mode `rule_package_manifest_
+# protect`'s own docstring warns against for path-only gates on a
+# frequently-edited file), `backend-path` itself is genuinely rare: PEP
+# 517 defines it for the narrow case of a project vendoring its own
+# in-tree build backend, and real-world use is a small minority of
+# `[build-system]` tables. That rarity is what keeps a presence-only gate
+# high-signal here without the false-positive rate `build-backend` alone
+# would carry.
+#
+# QA finding (independent adversarial review, round A): the original
+# version required a literal `[` right after `=`, on the assumption
+# `backend-path` is always a TOML array. Neither PEP 517 nor pip's own
+# vendored `pyproject_hooks` actually type-check that -- pip's `pyproject.
+# py` does `build_system.get("backend-path", [])` with no validation, and
+# `pyproject_hooks._impl.py` does `[norm_and_check(self.source_dir, p) for
+# p in backend_path]`. Iterating a bare TOML STRING iterates its
+# characters -- so `backend-path = "."` (BY FAR the most common real-world
+# value, a single `.`) resolves to the exact same one-entry, one-character
+# path list as `backend-path = ["."]`, a fully working, identical-effect
+# form the original `\[`-anchored regex silently missed entirely (a real,
+# reproduced silent-ALLOW bypass, confirmed against pip's actual vendored
+# source, not merely valid-but-unrealistic TOML). Separately, TOML permits
+# a quoted key (`"backend-path" = [...]`/`'backend-path' = [...]`,
+# semantically identical to the bare form) that the original regex also
+# missed on the Edit/Write/MCP branch (the shell branch's own quote-
+# stripping de-obfuscation happened to catch it there, by accident, not by
+# design -- an asymmetry not worth relying on). Closed by dropping the
+# `\[`-anchored value requirement entirely (mirroring `PNPMFILE_REDIRECT_
+# RE`/`YARN_EXEC_REDIRECT_RE`'s own `key\s*[:=]\s*\S` shape one guard over
+# -- neither anchors to a specific value syntax either) and allowing an
+# optional quote around the key itself. Still needs no lookahead past the
+# `=` regardless of whether an array's own entries sit on the same line or
+# wrap onto following lines (TOML permits both) -- there is no bounded-span
+# gap here to bound in the first place, unlike YARN_EXEC_REDIRECT_RE's
+# `plugins:` case, so no ReDoS surface either.
+PEP517_BACKEND_PATH_RE = re.compile(
+    r"[\"']?\bbackend-path\b[\"']?\s*=\s*[\"']?\S",
+    re.IGNORECASE,
+)
+
+# The one path this key is ever meaningful in -- PEP 517/518 define
+# `[build-system]` as a `pyproject.toml`-only table, so (unlike
+# `REGISTRY_CONFIG_PATH_RE`, which also matches `.npmrc`/`.yarnrc*`/
+# `pip.conf`/`.cargo/config.toml` for the registry-redirect check one guard
+# over) this guard's path check is deliberately narrow to `pyproject.toml`
+# alone. Kept as its own regex rather than reusing `REGISTRY_CONFIG_PATH_RE`
+# wholesale, the same "don't reuse the broader sibling regex" choice
+# `YARNRC_YML_PATH_RE`'s own comment explains for `.yarnrc.yml` one guard
+# above.
+PYPROJECT_TOML_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])pyproject\.toml" + _CI_END,
+    re.IGNORECASE,
+)
+
 # ---- Git-config credential/exec hijack protection ------------------------------
 # Two git-config-driven persistence/exfiltration primitives `git_hooks_protect`
 # doesn't reach (it only watches `core.hooksPath`): `credential.helper` and a
