@@ -2433,7 +2433,27 @@ def rule_pep517_backend_protect(ev: Event, policy=None) -> Optional[Decision]:
     into a live ``evaluate()`` decision for both ``mode`` and ``allow``,
     every docstring claim true against the implementation (including PEP
     517/518's own spec, cross-checked independently), and the full suite
-    green throughout with no findings.
+    green throughout with no findings. A round-2 verification pass
+    independently re-traced both bypasses against pip's actual vendored
+    source (``pip/_vendor/pyproject_hooks/_impl.py``'s ``norm_and_check``
+    loop and ``sys.path[:0] = extra_pathitems`` prepend,
+    ``pip/_internal/pyproject.py``'s untyped ``.get("backend-path", [])``
+    read) rather than trusting round 1's claim, reproduced all three
+    bypass repros as closed on every branch (Write/MCP/shell), hunted for
+    new false positives the widened, value-agnostic regex could introduce
+    (an identifier merely containing the substring, e.g. ``my-backend-
+    path-notes = ...``, correctly stays ALLOW since ``\\s*=\\s*`` fails
+    against the trailing text) and found none beyond one pre-existing,
+    non-regressing nuance already latent in the original regex before this
+    round's fix: ``re.IGNORECASE`` lets a differently-cased key
+    (``BACKEND-PATH``) still gate even though TOML keys are case-sensitive
+    and pip's own ``dict.get`` would never actually read one -- inert to
+    pip, over-triggers ASK rather than ever under-triggering, the same
+    false-positive-over-false-negative direction this file's guards
+    already accept throughout, not a bypass and not fixed further -- found
+    no new ReDoS on the widened regex under its own fresh adversarial
+    input, and confirmed the full suite green throughout with no
+    regressions.
 
     Content extraction falls through to the flattened-string sweep
     (``_flatten_strings``) unconditionally whenever ``content``/
