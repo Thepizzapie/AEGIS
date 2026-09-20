@@ -219,6 +219,16 @@ class Policy:
     # that rewrite either (`yarn set version ...`, `yarn plugin import ...`).
     # See rules.rule_yarn_exec_protect.
     yarn_exec: dict = field(default_factory=dict)
+    # PEP 517 build-backend exec-hijack protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply. Covers `pyproject.toml`'s `[build-system]` `backend-path` key --
+    # pip/`build` prepend the named directory to `sys.path` and import
+    # `build-backend` from it, running arbitrary Python, automatically and
+    # unattended, on the very next `pip install .`/`pip install -e .`/
+    # `python -m build`, before any dependency's own build code runs. The
+    # Python/pip analog of `pnpmfile_exec`/`yarn_exec` one ecosystem over.
+    # See rules.rule_pep517_backend_protect.
+    pep517_backend: dict = field(default_factory=dict)
     # Git-config credential/exec-hijack protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers `credential.helper` redirection and any git-config key

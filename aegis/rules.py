@@ -2342,6 +2342,177 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _pep517_backend_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_pep517_backend_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a PEP 517 ``backend-path`` redirect in ``pyproject.
+    toml``'s ``[build-system]`` table.
+
+    THREAT MODEL: pip/``build``/``pipx`` read ``[build-system]`` BEFORE any
+    of the actual package's own code runs -- ``build-backend`` names a
+    dotted import path whose hooks (``get_requires_for_build_wheel``,
+    ``build_wheel``, ...) pip calls to build the package at all. When
+    ``backend-path`` is also set (a list of directories, resolved relative
+    to ``pyproject.toml``'s own directory), pip/``build`` prepend those
+    directories to ``sys.path`` BEFORE importing ``build-backend`` -- so
+    ``build-backend`` need not name an installed package at all; it can be
+    an arbitrary local Python module the write just planted. This is the
+    exact same shape ``rule_pnpmfile_exec_protect``/``rule_yarn_exec_
+    protect`` already gate one ecosystem over: the package tool itself
+    (here, pip/``build``, per PEP 517/518) imports and calls into a LOCAL,
+    ARBITRARY module before any dependency's own build code runs,
+    unattended, on the very next ``pip install .``/``pip install -e .``/
+    ``python -m build``/``pip wheel .`` -- by this same agent moments
+    later, a teammate, or an unattended CI runner. Like a pnpmfile/Yarn-
+    Berry plugin, it is arbitrary Python (reading ``~/.aws/credentials`` or
+    ``~/.ssh/id_rsa`` and POSTing it out from inside an innocuous-looking
+    ``build_wheel`` hook), not a shell-command string ``rule_package_
+    manifest_protect``'s lifecycle-script check could ever see -- and that
+    guard's own ``pyproject.toml`` coverage only ever looks at
+    ``[[tool.poetry.source]]`` (registry redirection), never
+    ``[build-system]`` at all, leaving this mechanism entirely unprotected
+    until now.
+
+    Gated on ``backend-path``'s mere presence, not narrowed further --
+    the same "no safe content to narrow past" choice ``PNPMFILE_PATH_RE``/
+    ``YARN_EXEC_PATH_RE`` make for their own targets. Deliberately does
+    NOT also gate on ``build-backend`` alone: that key names an ordinary,
+    near-universal installed backend (``setuptools.build_meta``,
+    ``hatchling.build``, ``poetry.core.masonry.api``, ...) in the
+    overwhelming majority of real Python projects, and gating on it would
+    fire on nearly every new project's ``pyproject.toml`` -- the exact
+    ask-fatigue failure mode ``rule_package_manifest_protect``'s own
+    docstring warns a path-only gate on a frequently-edited file would
+    cause. ``backend-path`` itself is genuinely rare (PEP 517 defines it
+    for a project vendoring its own in-tree build backend), which is what
+    keeps a presence-only gate high-signal here.
+
+    Config (``policy.pep517_backend``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the
+    gate -- a repo's own reviewed, in-tree build backend, say). Defaults to
+    ``ask`` for the same reason every sibling ``*_protect`` guard does: an
+    in-tree backend is sometimes routine, sanctioned build tooling -- it
+    just needs a human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_PEP517_BACKEND=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Content extraction falls through to the flattened-string sweep
+    (``_flatten_strings``) unconditionally whenever ``content``/
+    ``new_string`` is missing or empty, not merely for ``ActionClass.MCP``
+    -- the fix ``rule_cloud_cred_exec_protect``/``rule_docker_cred_helper_
+    protect``/``rule_terraform_exec_protect`` already carry for the same
+    class of bug: ``MultiEdit``/``NotebookEdit`` are ``ActionClass.EDIT``,
+    not MCP, but carry their text under a nested ``edits``/``new_source``
+    shape rather than a top-level ``content``/``new_string`` key, so an
+    MCP-only fallback would silently miss both. Applied here from the
+    start rather than found by a later QA round.
+
+    Known residual gaps, same spirit as every guard in this file, disclosed
+    rather than fixed: a direct fetch-to-file write (``curl -o
+    pyproject.toml <url>``) is not caught by this guard's own shell branch
+    (closed only via the separate ``rule_fetch_to_file_protect`` backstop,
+    already wired since ``pyproject.toml`` sits in ``_FETCH_HUMAN_
+    ESCAPABLE`` via ``REGISTRY_CONFIG_PATH_RE``); a whole-file replacement
+    via ``cp``/``mv`` (the destination's new content is never visible in
+    the command text at all, unlike a heredoc/``echo``/``sed -i``) is not
+    caught by the shell branch's content check -- the same trade-off
+    ``rule_package_manifest_protect``'s own shell branch already makes by
+    likewise excluding ``COPY_WRITE_VERB_RE`` from its write-verb set,
+    since pairing that verb with a content requirement can never actually
+    fire; a ``backend-path`` value assembled via the target language's own
+    string-building rather than appearing as one contiguous literal in the
+    scanned text defeats the content check, the same "computed indirectly"
+    class of gap every other guard in this file already accepts; a
+    commented-out example line (``#
+    backend-path = ["."]``) still matches and asks unnecessarily, the same
+    accepted false-positive-over-false-negative trade-off ``rule_package_
+    manifest_protect``'s own docstring already discloses for
+    ``REGISTRY_HIJACK_RE``; and a ``requires`` entry naming a local path or
+    ``file://`` URL (pip builds THAT project's own backend as a build
+    dependency, the same "runs unattended" shape one level indirect) is a
+    known, disclosed, unhandled variant of this same mechanism -- narrower
+    and rarer than ``backend-path`` itself, and left uncovered rather than
+    risk flagging the legitimate private-index/vendored-wheel pins
+    ``requires`` ordinarily carries."""
+    cfg = getattr(policy, "pep517_backend", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "pep517-backend-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not (patterns.PYPROJECT_TOML_PATH_RE.search(p)
+                and patterns.PEP517_BACKEND_PATH_RE.search(content)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_PEP517_BACKEND")
+                or _pep517_backend_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "pep517-backend-protect",
+                         f"'{p}' sets PEP 517's 'backend-path' in "
+                         "[build-system] — pip/build prepend that "
+                         "directory to sys.path and import 'build-backend' "
+                         "from it, running arbitrary Python, automatically "
+                         "and unattended, on the very next 'pip install "
+                         ".'/'pip install -e .'/'python -m build', before "
+                         "any dependency's own build code runs. Review the "
+                         "change, then confirm with "
+                         "AEGIS_ALLOW_PEP517_BACKEND=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not (write_verb and patterns.PYPROJECT_TOML_PATH_RE.search(cmd)
+                and patterns.PEP517_BACKEND_PATH_RE.search(cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_PEP517_BACKEND")
+                or _pep517_backend_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "pep517-backend-protect",
+                         "PEP 517's 'backend-path' is being set in "
+                         "pyproject.toml's [build-system] from a shell — "
+                         "it runs arbitrary Python, automatically and "
+                         "unattended, on the very next 'pip install'/"
+                         "'python -m build'. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_PEP517_BACKEND=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _git_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7432,6 +7603,7 @@ _CORE_RULES = (
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
     rule_yarn_exec_protect,
+    rule_pep517_backend_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_gitmodules_protect,
