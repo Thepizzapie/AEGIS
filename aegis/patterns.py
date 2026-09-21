@@ -2533,6 +2533,62 @@ VSCODE_SETTINGS_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# JetBrains File Watchers auto-exec-on-save: `.idea/watcherTasks.xml` — the
+# "Before launch"/External-Tools family of JetBrains auto-run primitives
+# (`rule_vscode_tasks_protect`'s own docstring disclosed a JetBrains
+# `.idea/` run-configuration as a "related but distinct" IDE-auto-run
+# surface, not covered) has a File-Watchers-shaped sibling with a LOWER
+# trigger bar than any of them: a watcher task's `program` runs
+# automatically on the very next matching file SAVE, in every JetBrains IDE
+# (IntelliJ, PyCharm, WebStorm, PhpStorm, RubyMine, CLion, GoLand, Rider,
+# DataGrip, ...) that opens this project — no Run/Debug click, no folder-
+# reopen prompt (VS Code's own one-time "Allow Automatic Tasks" checkpoint
+# has no File-Watchers analog at all), no git/CI/boot trigger. Unlike
+# `.vscode/workspace.json`, `.idea/watcherTasks.xml` is normally a project-
+# shared, TRACKED file (a File Watcher is team tooling — "run prettier on
+# save" — meant to apply to every contributor, not a personal preference
+# like `.idea/workspace.xml`), so a planted watcher reads as ordinary editor
+# tooling in a diff, not a detonator.
+JETBRAINS_WATCHER_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.idea" + _WIN_TRIM + _SEP + r"watcherTasks\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Same `cd`/`pushd`-into-directory-then-bare-filename co-occurrence pair
+# `DEVCONTAINER_CD_RE`/`VSCODE_CD_RE` needed after their own QA rounds found
+# `<path>_PATH_RE`'s single-contiguous-match requirement missed an entirely
+# ordinary `cd .idea && ...watcherTasks.xml` two-step — built in here from
+# the start rather than added as a follow-up fix, now that this codebase's
+# own QA history has established it as a standing gap class for every
+# `*_PATH_RE` in this file.
+JETBRAINS_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.idea" + _CI_END,
+    re.IGNORECASE,
+)
+JETBRAINS_WATCHER_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])watcherTasks\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The exec-capable attribute itself: a File Watcher `<TaskOptions>` entry's
+# `<option name="program" value="...">` names the external program the
+# watcher runs. Gated on the attribute NAME alone, value-agnostic — the same
+# "key alone is enough" reasoning `GIT_ATTRS_EXEC_KEY_RE` applies to
+# `core.fsmonitor`/`filter.<name>.clean`: a `program` option has no purpose
+# in this file OTHER than naming a command to execute, and `watcherTasks.xml`
+# itself has no purpose other than defining File Watcher tasks, so there is
+# no safe value nor a legitimate reason for the key to appear here without
+# one. Matches either quote style and tolerates ordinary whitespace around
+# `=`, but assumes the real serializer's fixed `name` looks like an XML
+# attribute (`name="program"`) rather than a JSON/YAML key — a hand-rolled
+# alternate encoding of the same file is a "computed indirectly" gap this
+# guard shares with every content-based `*_protect` guard in this file.
+JETBRAINS_WATCHER_PROGRAM_RE = re.compile(
+    r"\bname\s*=\s*[\"']program[\"']",
+    re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
