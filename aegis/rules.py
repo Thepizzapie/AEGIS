@@ -4120,6 +4120,165 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _jetbrains_watcher_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a JetBrains File Watcher task in
+    ``.idea/watcherTasks.xml`` (an ``<option name="program" value="...">``
+    entry) — it runs an external program automatically, unattended, on the
+    next matching file save in any JetBrains IDE (IntelliJ, PyCharm,
+    WebStorm, PhpStorm, RubyMine, CLion, GoLand, Rider, DataGrip, ...) that
+    opens this project.
+
+    THREAT MODEL: `rule_devcontainer_exec_protect`'s own docstring flagged a
+    JetBrains ``.idea/`` run-configuration's "Before launch" step as a
+    "related but distinct" IDE-auto-run primitive, disclosed but not
+    covered by either it or `rule_vscode_tasks_protect`. File Watchers are
+    that family's most dangerous member, not merely an uncovered cousin:
+    where a devcontainer lifecycle command needs an environment (re)build/
+    (re)start and a VS Code automatic task needs a folder-open (behind a
+    one-time human confirmation prompt VS Code itself interposes), a File
+    Watcher's trigger is simply "a matching file was saved" — no Run/Debug
+    click, no folder-reopen, no git operation, no CI run, no boot/login,
+    and no confirmation prompt of any kind gates it at all. Saving a file
+    is the single most routine, most frequent action in an entire coding
+    session (an agentic session's own edits included), which makes this
+    the lowest trigger-bar auto-exec surface this file's editor/IDE family
+    of guards covers. Like a devcontainer config or a VS Code task,
+    ``.idea/watcherTasks.xml`` is ordinarily TRACKED and reviewed as
+    routine team tooling (a shared "run prettier/eslint --fix on save"
+    convention), so a planted ``program`` reads as ordinary editor
+    configuration in a diff, not as a planted detonator — the same "hidden
+    in plain sight" property this file's other IDE-auto-run guards share.
+
+    Gated on PATH (``.idea/watcherTasks.xml``) *and* the exec-capable
+    ``program`` attribute NAME alone (value-agnostic) — the same "key alone
+    is enough" reasoning `GIT_ATTRS_EXEC_KEY_RE` applies to
+    ``core.fsmonitor``: this file exists for no purpose other than defining
+    File Watcher tasks, and a ``program`` option inside it exists for no
+    purpose other than naming a command to run, so there is no safe value
+    to distinguish from a dangerous one the way ``runOn: "default"``
+    versus ``"folderOpen"`` requires for VS Code's own guard.
+
+    Config (``policy.jetbrains_watcher_exec``): ``mode``
+    (deny|ask|monitor|off, default ask), ``allow`` (regexes on the
+    path/command that skip the gate — a repo's own reviewed, intentional
+    watcher, say). Defaults to ``ask``, not ``deny``, for the same reason
+    every sibling ``*_protect`` guard in this file does: a real File
+    Watcher can be legitimate, sanctioned team tooling — it just needs a
+    human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC=1`` set by
+    the orchestrator/human before launch for the Edit/Write/MCP-tool form.
+    A spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable, the same invariant
+    every escapable guard in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a ``program``/``arguments``/``workingDir`` value assembled
+    indirectly (a templating step, a build script writing the XML) rather
+    than appearing as a literal attribute defeats this check, the same
+    "computed indirectly" class every sibling guard already accepts; an
+    XML comment (``<!-- ... -->``) wrapping an inert, non-live
+    ``name="program"`` mention is not specially excluded the way a ``#``
+    comment line is for `rule_terraform_exec_protect`'s HCL content, so an
+    XML comment merely mentioning the attribute could false-positive as ASK
+    (fails toward ASK, never ALLOW — the same accepted direction every
+    guard here takes); a direct fetch-to-file write (``curl -o
+    .idea/watcherTasks.xml ...``) is caught by none of the shell branch's
+    write-verb checks — closed instead by `rule_fetch_to_file_protect`
+    reusing this guard's own `JETBRAINS_WATCHER_PATH_RE`, the same division
+    of labor every sibling ``*_protect`` guard relies on; and the
+    JetBrains "Before launch" External-Tools hijack itself
+    (``.idea/runConfigurations/*.xml`` referencing a tool defined in
+    ``.idea/tools/*.xml``) remains a related but distinct, NOT covered
+    IDE-auto-run primitive — disclosed here, not fixed, as the candidate
+    for a follow-up guard, the same "one surface first, siblings
+    disclosed" approach `rule_devcontainer_exec_protect`/
+    `rule_vscode_tasks_protect` themselves took.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): see the guard's commit
+    history for the specific findings each round closed."""
+    cfg = getattr(policy, "jetbrains_watcher_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "jetbrains-watcher-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.JETBRAINS_WATCHER_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        if not patterns.JETBRAINS_WATCHER_PROGRAM_RE.search(content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC")
+                or _jetbrains_watcher_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "jetbrains-watcher-protect",
+                         f"'{p}' is planting/altering a JetBrains File "
+                         "Watcher task's `program` option — it runs an "
+                         "external program automatically, unattended, on "
+                         "the next matching file save in ANY JetBrains IDE "
+                         "that opens this project, no Run/build/git/CI "
+                         "trigger needed. Review the change, then confirm "
+                         "with AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not write_verb:
+            return None
+        cd_hit = bool(patterns.JETBRAINS_CD_RE.search(cmd))
+        path_hit = bool(patterns.JETBRAINS_WATCHER_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.JETBRAINS_WATCHER_BARE_FILENAME_RE.search(cmd)))
+        if not (path_hit and patterns.JETBRAINS_WATCHER_PROGRAM_RE.search(cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC")
+                or _jetbrains_watcher_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "jetbrains-watcher-protect",
+                         "A JetBrains File Watcher `program` option is "
+                         "being planted in .idea/watcherTasks.xml from a "
+                         "shell — it runs an external program "
+                         "automatically, unattended, on the next matching "
+                         "file save in any JetBrains IDE that opens this "
+                         "project. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -6011,6 +6170,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
     (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
     (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
+    (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -7439,6 +7599,7 @@ _CORE_RULES = (
     rule_ld_preload_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
+    rule_jetbrains_watcher_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,

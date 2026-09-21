@@ -276,6 +276,15 @@ class Policy:
     # silences VS Code's one-time confirmation prompt for the former). See
     # rules.rule_vscode_tasks_protect.
     vscode_tasks_exec: dict = field(default_factory=dict)
+    # JetBrains File Watcher auto-exec protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply. Covers .idea/watcherTasks.xml carrying a File Watcher task's
+    # <option name="program" value="..."> — runs an external program
+    # automatically, unattended, on the next matching file save in any
+    # JetBrains IDE (IntelliJ, PyCharm, WebStorm, ...) that opens this
+    # project, no Run/build/git/CI trigger needed. See
+    # rules.rule_jetbrains_watcher_protect.
+    jetbrains_watcher_exec: dict = field(default_factory=dict)
     # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted
