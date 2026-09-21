@@ -3572,12 +3572,15 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     covered by ``DEVCONTAINER_EXEC_JQ_RE`` requiring the assignment shape
     plus a whole-command devcontainer-path check (see QA history below). A
     companion, editor-level auto-run surface — a VS Code ``.vscode/
-    tasks.json`` entry with ``"runOptions": {"runOn": "folderOpen"}``, or a
-    JetBrains ``.idea/`` run-configuration's "Before launch" step — is a
+    tasks.json`` entry with ``"runOptions": {"runOn": "folderOpen"}`` (now
+    covered by `rule_vscode_tasks_protect`), a JetBrains File Watcher's
+    ``.idea/watcherTasks.xml`` (now covered by
+    `rule_jetbrains_watcher_protect`), or a JetBrains ``.idea/``
+    run-configuration's "Before launch" step (still NOT covered) — is a
     related but distinct attack shape (an IDE, not a devcontainer runtime,
     does the auto-running, and VS Code gates it behind a one-time
-    folder-trust prompt) and is disclosed here, not covered, as a candidate
-    for a follow-up guard. The ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
+    folder-trust prompt) disclosed here as a candidate for a follow-up
+    guard, two of the three now shipped. The ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
     FILENAME_RE`` co-occurrence pair is, deliberately, whole-command rather
     than clause-scoped — the same "false ask is recoverable, a false allow
     on a working exploit is not" trade-off ``gitattrs_wiring_hit``'s own
@@ -3922,7 +3925,10 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     disclosed as a follow-up" approach `rule_devcontainer_exec_protect` took
     for its own ``.devcontainer/<name>/`` nesting; a JetBrains ``.idea/``
     run-configuration's "Before launch" step is a related but distinct
-    IDE-auto-run primitive, also not covered; a ``runOn``/
+    IDE-auto-run primitive, still not covered — its File-Watcher sibling
+    (``.idea/watcherTasks.xml``), a lower trigger bar still (no Run/Debug
+    click needed, just an ordinary file save), now IS, by
+    `rule_jetbrains_watcher_protect`; a ``runOn``/
     ``allowAutomaticTasks`` value assembled indirectly (a templating step, a
     build script that writes the JSON) rather than appearing as a literal is
     not caught; and, like `rule_devcontainer_exec_protect`, a direct
@@ -4204,11 +4210,41 @@ def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]
     IDE-auto-run primitive — disclosed here, not fixed, as the candidate
     for a follow-up guard, the same "one surface first, siblings
     disclosed" approach `rule_devcontainer_exec_protect`/
-    `rule_vscode_tasks_protect` themselves took.
+    `rule_vscode_tasks_protect` themselves took; and the MCP structural
+    fallback (`_vscode_struct_kv_hit(a, "name", "program")`, added after QA
+    — see below) requires an actual dict pairing the two, so a value split
+    across two independently-issued tool calls (planted first with an
+    innocuous `name`, then the real MCP write in a later call) evades it,
+    the same split-across-calls limitation `rule_git_hooks_protect`'s own
+    docstring already discloses for its own surface.
 
     QA history (two independent adversarial reviews, run in parallel, same
-    convention every guard in this file follows): see the guard's commit
-    history for the specific findings each round closed."""
+    convention every guard in this file follows): a bypass-hunting round
+    found one real, reproduced bug — a structured MCP-tool arg shape
+    (``{"name": "program", "value": "/tmp/evil.sh"}``, an entirely
+    realistic decomposed-attribute encoding for an XML-authoring MCP tool)
+    was a silent, total bypass, since ``JETBRAINS_WATCHER_PROGRAM_RE``
+    requires the literal text ``name="program"`` and ``_flatten_strings``
+    only ever surfaces "program" as a bare leaf VALUE, never adjacent to a
+    literal ``name=`` — the identical structural-MCP-args gap class
+    `rule_devcontainer_exec_protect`'s own QA history first found and fixed
+    via `_devcontainer_struct_key_hit`. Closed the same way, by reusing
+    `_vscode_struct_kv_hit` (see its own call site's comment above) rather
+    than adding a fourth near-duplicate structural walker. A parallel
+    design/consistency review confirmed correct registration and
+    round-tripping everywhere its siblings are (`_CORE_RULES`,
+    `_FETCH_HUMAN_ESCAPABLE`, `Policy`, all three `loader.py` spots, both
+    `skills.py` knob lists, the `_REMEDIES` table, the README guard table),
+    a live YAML `jetbrains_watcher_exec:` block through `load_policy()`
+    into `evaluate()` for both `mode` and `allow`, identical rule-name
+    spelling everywhere it matters (the `Decision(...)` calls, the
+    monitor-mode `_record_monitor` call, the test file's `RULE` constant,
+    the `_REMEDIES` row), and the full suite green throughout. It also
+    found `rule_devcontainer_exec_protect`'s and
+    `rule_vscode_tasks_protect`'s own docstrings still described the
+    JetBrains "Before launch" surface without noting that this guard now
+    closes its File-Watcher sibling — both updated to cross-reference this
+    guard, alongside the docstring you are reading now."""
     cfg = getattr(policy, "jetbrains_watcher_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -4236,7 +4272,30 @@ def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
-        if not patterns.JETBRAINS_WATCHER_PROGRAM_RE.search(content):
+        hit = bool(patterns.JETBRAINS_WATCHER_PROGRAM_RE.search(content))
+        # QA finding (independent adversarial review, round 1): an MCP tool
+        # that represents the watcher's `<option>` elements STRUCTURALLY —
+        # `{"name": "program", "value": "/tmp/evil.sh"}`, a realistic shape
+        # for any XML-authoring MCP tool that decomposes attributes into
+        # name/value pairs rather than emitting literal markup — defeats
+        # `JETBRAINS_WATCHER_PROGRAM_RE` entirely: "program" surfaces via
+        # `_flatten_strings` as a bare LEAF VALUE (of the `name` key), never
+        # adjacent to a literal `name=`, and was a silent, total bypass with
+        # no rule firing at all (not even under `mode: monitor`). Closed by
+        # reusing `_vscode_struct_kv_hit` (already a generic key/value
+        # structural walker despite its name) to look for a `name` key
+        # mapped to the value `program` anywhere in the raw MCP args, at any
+        # depth. Deliberately no bareword-co-occurrence fallback the way
+        # `_vscode_mcp_bareword_kv_hit` adds for `runOn`/`folderOpen` --
+        # "name" and "program" are both far too common as everyday English
+        # words/JSON keys to bareword-match without a prohibitive false-ASK
+        # rate, so this fallback stays scoped to the precise structural
+        # pairing only. Scoped to `ActionClass.MCP` only, matching every
+        # sibling guard's identical scoping, since Edit/Write `content` is
+        # always real, reliable file text.
+        if not hit and ev.action == ActionClass.MCP:
+            hit = _vscode_struct_kv_hit(a, "name", "program")
+        if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC")
                 or _jetbrains_watcher_allowed_by_policy(cfg, p)):

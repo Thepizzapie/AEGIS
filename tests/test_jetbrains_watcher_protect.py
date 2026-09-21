@@ -149,6 +149,55 @@ def test_mcp_write_nested_content_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_mcp_structural_name_value_pair_gated():
+    # QA finding (independent adversarial review, round 1): an MCP tool that
+    # decomposes the XML attribute into a structural {"name": "program",
+    # "value": ...} pair (a realistic shape for an XML-authoring MCP tool)
+    # was a silent, total bypass -- "program" surfaced via `_flatten_strings`
+    # only as a bare leaf VALUE, never adjacent to a literal `name=`, so
+    # `JETBRAINS_WATCHER_PROGRAM_RE` never matched and no rule fired at all.
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__jetbrains__write_watcher",
+                     action=ActionClass.MCP,
+                     args={"path": ".idea/watcherTasks.xml",
+                           "watcher": {"TaskOptions": {"option": [
+                               {"name": "arguments", "value": "$FileName$"},
+                               {"name": "program", "value": "/tmp/evil.sh"},
+                               {"name": "workingDir", "value": "$ProjectFileDir$"},
+                           ]}}})
+    d = evaluate(ev, EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_mcp_structural_name_value_pair_flat_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__jetbrains__write_watcher",
+                     action=ActionClass.MCP,
+                     args={"path": ".idea/watcherTasks.xml",
+                           "option": {"name": "program", "value": "/tmp/evil.sh"}})
+    d = evaluate(ev, EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_mcp_structural_unrelated_name_value_not_gated():
+    # The structural fallback requires the exact "program" VALUE paired
+    # with a "name" key -- an unrelated name/value pair (e.g. a different
+    # option) must not false-positive.
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__jetbrains__write_watcher",
+                     action=ActionClass.MCP,
+                     args={"path": ".idea/watcherTasks.xml",
+                           "option": {"name": "workingDir", "value": "$ProjectFileDir$"}})
+    d = evaluate(ev, EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_edit_structural_name_value_pair_not_scoped_to_mcp():
+    # The structural fallback is deliberately scoped to ActionClass.MCP
+    # only -- an Edit/Write call's `new_string`/`content` is always real
+    # file text, so a decomposed name/value pair has no meaning there and
+    # must not be walked as if it were MCP args.
+    d = evaluate(_edit_content(".idea/watcherTasks.xml", "name program value evil"), EMPTY)
+    assert d.action == Action.ALLOW
+
+
 def test_single_quoted_program_attr_gated():
     d = evaluate(_write(".idea/watcherTasks.xml",
                          "<option name='program' value='/tmp/evil.sh' />"), EMPTY)
