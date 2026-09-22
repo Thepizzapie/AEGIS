@@ -3576,11 +3576,12 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     covered by `rule_vscode_tasks_protect`), a JetBrains File Watcher's
     ``.idea/watcherTasks.xml`` (now covered by
     `rule_jetbrains_watcher_protect`), or a JetBrains ``.idea/``
-    run-configuration's "Before launch" step (still NOT covered) — is a
+    run-configuration's "Before launch" step (now covered by
+    `rule_jetbrains_external_tool_protect`) — is a
     related but distinct attack shape (an IDE, not a devcontainer runtime,
     does the auto-running, and VS Code gates it behind a one-time
     folder-trust prompt) disclosed here as a candidate for a follow-up
-    guard, two of the three now shipped. The ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
+    guard, all three now shipped. The ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
     FILENAME_RE`` co-occurrence pair is, deliberately, whole-command rather
     than clause-scoped — the same "false ask is recoverable, a false allow
     on a working exploit is not" trade-off ``gitattrs_wiring_hit``'s own
@@ -3925,9 +3926,10 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     disclosed as a follow-up" approach `rule_devcontainer_exec_protect` took
     for its own ``.devcontainer/<name>/`` nesting; a JetBrains ``.idea/``
     run-configuration's "Before launch" step is a related but distinct
-    IDE-auto-run primitive, still not covered — its File-Watcher sibling
+    IDE-auto-run primitive, now covered by
+    `rule_jetbrains_external_tool_protect` — its File-Watcher sibling
     (``.idea/watcherTasks.xml``), a lower trigger bar still (no Run/Debug
-    click needed, just an ordinary file save), now IS, by
+    click needed, just an ordinary file save), was covered first, by
     `rule_jetbrains_watcher_protect`; a ``runOn``/
     ``allowAutomaticTasks`` value assembled indirectly (a templating step, a
     build script that writes the JSON) rather than appearing as a literal is
@@ -4203,14 +4205,15 @@ def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]
     .idea/watcherTasks.xml ...``) is caught by none of the shell branch's
     write-verb checks — closed instead by `rule_fetch_to_file_protect`
     reusing this guard's own `JETBRAINS_WATCHER_PATH_RE`, the same division
-    of labor every sibling ``*_protect`` guard relies on; and the
+    of labor every sibling ``*_protect`` guard relies on; the
     JetBrains "Before launch" External-Tools hijack itself
     (``.idea/runConfigurations/*.xml`` referencing a tool defined in
-    ``.idea/tools/*.xml``) remains a related but distinct, NOT covered
-    IDE-auto-run primitive — disclosed here, not fixed, as the candidate
+    ``.idea/tools/*.xml``) was a related but distinct IDE-auto-run
+    primitive, disclosed here, not fixed, as the candidate
     for a follow-up guard, the same "one surface first, siblings
     disclosed" approach `rule_devcontainer_exec_protect`/
-    `rule_vscode_tasks_protect` themselves took; and the MCP structural
+    `rule_vscode_tasks_protect` themselves took — now covered by
+    `rule_jetbrains_external_tool_protect`; and the MCP structural
     fallback (`_vscode_struct_kv_hit(a, "name", "program")`, added after QA
     — see below) requires an actual dict pairing the two, so a value split
     across two independently-issued tool calls (planted first with an
@@ -4334,6 +4337,185 @@ def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]
                          "file save in any JetBrains IDE that opens this "
                          "project. A human may append '# aegis-allow', or "
                          "set AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
+# ---- JetBrains External Tools / Run Configuration "Before Launch" hijack ----
+def _jetbrains_ext_tool_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_jetbrains_external_tool_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a JetBrains "External Tool" command
+    (``.idea/tools/*.xml``'s ``<exec><option name="COMMAND" value="...">``)
+    or wiring one to fire automatically before every future launch of a run
+    configuration (``.idea/runConfigurations/*.xml``'s ``<option
+    name="ToolBeforeRunTask" ... actionId="Tool_External Tools_<name>">``).
+
+    THREAT MODEL: `rule_jetbrains_watcher_protect`'s own docstring named this
+    exact pair as "a related but distinct, NOT covered IDE-auto-run
+    primitive — disclosed here, not fixed, as the candidate for a follow-up
+    guard." An External Tool's `COMMAND` is the direct analog of a File
+    Watcher's `program` — a program to run, defined once — but the more
+    dangerous half of this surface is the wiring: attaching that tool to a
+    run configuration's "Before Launch" steps means it now fires
+    automatically on every ordinary Run/Debug click of that configuration
+    thereafter, with no further action needed to re-arm it and no separate
+    confirmation the way VS Code's one-time "Allow Automatic Tasks" prompt
+    at least interposes for its own automatic tasks. Run/Debug is clicked
+    far more often, per session, than a File Watcher's own trigger (a
+    matching file save) is rare, or than a human would manually reach for an
+    External Tool from the Tools menu — but unlike a File Watcher, it still
+    needs that one click, so this sits between the watcher's "no click at
+    all" trigger bar and an ordinary manual invocation. Both files are
+    normally TRACKED, shared team tooling (a project's own build/deploy
+    tool, wired as "run before every launch"), so a planted `COMMAND` or a
+    new "Before Launch" step reads as ordinary IDE configuration in a diff,
+    not as a detonator — the same "hidden in plain sight" property this
+    whole guard family shares.
+
+    Gated on PATH (``.idea/tools/*.xml`` / ``.idea/runConfigurations/*.xml``)
+    *and* the respective exec-capable option NAME alone (value-agnostic) —
+    the same "key alone is enough" reasoning `JETBRAINS_WATCHER_PROGRAM_RE`
+    applies to `program`: a `COMMAND` option has no purpose in a tool
+    definition other than naming a command to run, and a
+    `ToolBeforeRunTask` option has no purpose in a run configuration other
+    than wiring an external command to that configuration's launch.
+
+    Config (``policy.jetbrains_external_tool_exec``): ``mode``
+    (deny|ask|monitor|off, default ask), ``allow`` (regexes on the
+    path/command that skip the gate — a repo's own reviewed, intentional
+    tool/wiring, say). Defaults to ``ask``, matching every sibling
+    ``*_protect`` guard in this file: a real External Tool or Before-Launch
+    step can be legitimate, sanctioned team tooling — it just needs a human
+    to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or the env toggle ``AEGIS_ALLOW_JETBRAINS_EXTERNAL_TOOL_EXEC=1``
+    set by the orchestrator/human before launch for the Edit/Write/MCP-tool
+    form. A spawned agent cannot set its own env for a hook invocation it
+    doesn't control, so neither path is agent-self-escapable, the same
+    invariant every escapable guard in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a ``COMMAND``/``PARAMETERS``/``actionId`` value assembled
+    indirectly (a templating step, a build script writing the XML) rather
+    than appearing as a literal attribute defeats this check, the same
+    "computed indirectly" class every sibling guard already accepts; a
+    direct fetch-to-file write (``curl -o .idea/tools/x.xml ...``) is caught
+    by none of the shell branch's write-verb checks — closed instead by
+    `rule_fetch_to_file_protect` reusing this guard's own path regexes, the
+    same division of labor every sibling ``*_protect`` guard relies on; the
+    Tools-menu invocation path (a human manually running an already-planted
+    External Tool with no run-configuration wiring at all) is not itself an
+    auto-exec trigger and stays out of scope, the same way this file never
+    gates a merely-defined-but-unwired git alias/hook; and, like
+    `rule_jetbrains_watcher_protect`, the MCP structural fallback
+    (`_vscode_struct_kv_hit`) requires an actual dict pairing the `name` key
+    to the exact `command`/`toolbeforeruntask` value, so a value split
+    across two independently-issued tool calls evades it, the same
+    split-across-calls limitation `rule_git_hooks_protect`'s own docstring
+    already discloses for its own surface."""
+    cfg = getattr(policy, "jetbrains_external_tool_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "jetbrains-external-tool-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        is_tool = bool(patterns.JETBRAINS_TOOLS_PATH_RE.search(p))
+        is_runconfig = bool(patterns.JETBRAINS_RUNCONFIG_PATH_RE.search(p))
+        if not (is_tool or is_runconfig):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        if is_tool:
+            hit = bool(patterns.JETBRAINS_TOOL_COMMAND_RE.search(content))
+            if not hit and ev.action == ActionClass.MCP:
+                hit = _vscode_struct_kv_hit(a, "name", "command")
+            reason = ("'{p}' is planting/altering a JetBrains External "
+                      "Tool's `COMMAND` option — it names an external "
+                      "program that runs whenever this tool is invoked, "
+                      "including automatically if wired as a run "
+                      "configuration's 'Before Launch' step.")
+        else:
+            hit = bool(patterns.JETBRAINS_TOOL_BEFORE_RUN_RE.search(content))
+            if not hit and ev.action == ActionClass.MCP:
+                hit = _vscode_struct_kv_hit(a, "name", "toolbeforeruntask")
+            reason = ("'{p}' is wiring a JetBrains External Tool as a "
+                      "'Before Launch' step — it runs an external program "
+                      "automatically, unattended, on every future Run/Debug "
+                      "of this configuration, in any JetBrains IDE that "
+                      "opens this project.")
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_JETBRAINS_EXTERNAL_TOOL_EXEC")
+                or _jetbrains_ext_tool_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "jetbrains-external-tool-protect",
+                         reason.format(p=p) + " Review the change, then "
+                         "confirm with "
+                         "AEGIS_ALLOW_JETBRAINS_EXTERNAL_TOOL_EXEC=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not write_verb:
+            return None
+        tools_cd_hit = bool(patterns.JETBRAINS_TOOLS_CD_RE.search(cmd))
+        runconfig_cd_hit = bool(patterns.JETBRAINS_RUNCONFIG_CD_RE.search(cmd))
+        tool_path_hit = bool(patterns.JETBRAINS_TOOLS_PATH_RE.search(cmd)
+                              or (tools_cd_hit and patterns.JETBRAINS_XML_BARE_FILENAME_RE.search(cmd)))
+        runconfig_path_hit = bool(patterns.JETBRAINS_RUNCONFIG_PATH_RE.search(cmd)
+                                   or (runconfig_cd_hit and patterns.JETBRAINS_XML_BARE_FILENAME_RE.search(cmd)))
+        tool_hit = bool(tool_path_hit and patterns.JETBRAINS_TOOL_COMMAND_RE.search(cmd))
+        runconfig_hit = bool(runconfig_path_hit and patterns.JETBRAINS_TOOL_BEFORE_RUN_RE.search(cmd))
+        if not (tool_hit or runconfig_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JETBRAINS_EXTERNAL_TOOL_EXEC")
+                or _jetbrains_ext_tool_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A JetBrains External Tool `COMMAND` option is being "
+                   "planted in .idea/tools/ from a shell — it names an "
+                   "external program that runs whenever this tool is "
+                   "invoked" if tool_hit else
+                   "A JetBrains run configuration is being wired with a "
+                   "'Before Launch' External Tool step from a shell — it "
+                   "runs an external program automatically, unattended, on "
+                   "every future Run/Debug of this configuration")
+        return _finish(Decision(action, "jetbrains-external-tool-protect",
+                         f"{reason}, in any JetBrains IDE that opens this "
+                         "project. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_JETBRAINS_EXTERNAL_TOOL_EXEC=1; a "
                          "spawned agent cannot."))
     return None
 
@@ -6230,6 +6412,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
     (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
+    (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tool definition"),
+    (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -7659,6 +7843,7 @@ _CORE_RULES = (
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_jetbrains_watcher_protect,
+    rule_jetbrains_external_tool_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,

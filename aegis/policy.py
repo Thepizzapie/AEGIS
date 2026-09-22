@@ -285,6 +285,15 @@ class Policy:
     # project, no Run/build/git/CI trigger needed. See
     # rules.rule_jetbrains_watcher_protect.
     jetbrains_watcher_exec: dict = field(default_factory=dict)
+    # JetBrains External Tools / Run Configuration "Before Launch" hijack
+    # protection: {mode: deny|ask|monitor|off, allow: [regex on path/
+    # command]}. Empty -> defaults (mode=ask) apply. Covers
+    # .idea/tools/*.xml's <exec><option name="COMMAND" value="..."> (an
+    # External Tool's own command) and .idea/runConfigurations/*.xml's
+    # <option name="ToolBeforeRunTask" ...> (wiring that tool to run
+    # automatically before every future launch of that configuration). See
+    # rules.rule_jetbrains_external_tool_protect.
+    jetbrains_external_tool_exec: dict = field(default_factory=dict)
     # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted

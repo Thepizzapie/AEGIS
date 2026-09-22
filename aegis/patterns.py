@@ -2589,6 +2589,86 @@ JETBRAINS_WATCHER_PROGRAM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- JetBrains External Tools / Run Configuration "Before Launch" hijack ----
+# `rule_jetbrains_watcher_protect`'s own docstring disclosed this as the
+# related-but-distinct sibling it deliberately left uncovered: an
+# ``.idea/tools/*.xml`` "External Tool" definition's ``<exec><option
+# name="COMMAND" value="...">`` names a program to run, exactly like a File
+# Watcher's own ``program`` option, and an ``.idea/runConfigurations/*.xml``
+# run configuration can wire that tool to fire automatically, unattended, as
+# a "Before Launch" step on every ordinary Run/Debug click of that
+# configuration thereafter — no Tools-menu click, no re-confirmation of the
+# wiring itself, in any JetBrains IDE that opens this project. Both files are
+# normally TRACKED, shared team tooling (a project's own "build before run"
+# convention), so a planted `COMMAND`/wiring reads as routine IDE
+# configuration in a diff, the same "hidden in plain sight" property this
+# whole guard family shares. Filenames under both directories are
+# JetBrains-assigned and commonly contain spaces (the default tool-set file
+# is literally ``External Tools.xml``), unlike ``watcherTasks.xml``'s fixed
+# name, so the segment below tolerates spaces while still excluding quotes/
+# separators/newlines.
+_JETBRAINS_FILENAME_SEG = r"[^'\"/\\\n]{1,200}"
+_JETBRAINS_IDEA_ROOT = r"(?:^|[\s'\"/\\=])\.idea" + _WIN_TRIM + _SEP
+
+JETBRAINS_TOOLS_PATH_RE = re.compile(
+    _JETBRAINS_IDEA_ROOT + r"tools" + _WIN_TRIM + _SEP
+    + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+JETBRAINS_RUNCONFIG_PATH_RE = re.compile(
+    _JETBRAINS_IDEA_ROOT + r"runConfigurations" + _WIN_TRIM + _SEP
+    + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Same `cd`/`pushd`-into-directory-then-bare-filename co-occurrence pair every
+# sibling JetBrains/VS Code/devcontainer guard in this file needed after its
+# own QA round found `<path>_PATH_RE`'s single-contiguous-match requirement
+# misses an entirely ordinary `cd .idea/tools && ...` two-step — built in
+# here from the start given that established history, rather than as a
+# follow-up fix.
+JETBRAINS_TOOLS_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.idea" + _WIN_TRIM + _SEP + r"tools" + _CI_END,
+    re.IGNORECASE,
+)
+JETBRAINS_RUNCONFIG_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.idea" + _WIN_TRIM + _SEP + r"runConfigurations" + _CI_END,
+    re.IGNORECASE,
+)
+JETBRAINS_XML_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])" + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The exec-capable attribute itself, in an External Tool definition: an
+# ``<exec>`` block's ``<option name="COMMAND" value="...">`` names the
+# program the tool runs (a sibling ``PARAMETERS``/``WORKING_DIRECTORY``
+# option carries no exec capability of its own). Gated on the attribute NAME
+# alone, value-agnostic — the same "key alone is enough" reasoning
+# `JETBRAINS_WATCHER_PROGRAM_RE`/`GIT_ATTRS_EXEC_KEY_RE` already apply to
+# `program`/`core.fsmonitor`: a `COMMAND` option has no purpose in this file
+# other than naming a command to execute.
+JETBRAINS_TOOL_COMMAND_RE = re.compile(
+    r"\bname\s*=\s*[\"']COMMAND[\"']",
+    re.IGNORECASE,
+)
+
+# The exec-capable wiring key itself, in a run configuration: a "Before
+# Launch" step referencing an External Tool is recorded as
+# ``<option name="ToolBeforeRunTask" enabled="true" actionId="Tool_External
+# Tools_<name>" />`` inside the configuration's ``<method>`` block. Gated on
+# the ``ToolBeforeRunTask`` option NAME alone, value-agnostic — like
+# `JETBRAINS_TOOL_COMMAND_RE` above, this key has no purpose in this file
+# other than wiring an external command to run automatically before every
+# future launch of this configuration; the specific tool it points at
+# (`actionId`) doesn't change that.
+JETBRAINS_TOOL_BEFORE_RUN_RE = re.compile(
+    r"\bname\s*=\s*[\"']ToolBeforeRunTask[\"']",
+    re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
