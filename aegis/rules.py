@@ -4422,7 +4422,54 @@ def rule_jetbrains_external_tool_protect(ev: Event, policy=None) -> Optional[Dec
     to the exact `command`/`toolbeforeruntask` value, so a value split
     across two independently-issued tool calls evades it, the same
     split-across-calls limitation `rule_git_hooks_protect`'s own docstring
-    already discloses for its own surface."""
+    already discloses for its own surface. A payload staged in an unrelated
+    local file and then placed into either protected path with a plain
+    copy/move/extract verb (`cp`/`install`/`rsync`/`tar -x`/`unzip`) rather
+    than appearing as literal command text or an Edit/Write/MCP `content`
+    argument evades every check here, since the content check runs against
+    the tool-call text itself, never a source file's on-disk bytes — a
+    real, CONFIRMED-shared gap (bypass-hunting QA reproduced the identical
+    result against `rule_jetbrains_watcher_protect`'s own shell branch,
+    `.idea/watcherTasks.xml`, and `rule_devcontainer_exec_protect`'s,
+    `.devcontainer/devcontainer.json`, unmodified — every content-gated
+    `*_protect` guard's shell branch in this file shares it, not introduced
+    fresh here), flagged for a future cross-cutting backstop (the
+    `cp`/`install`/`rsync`/`tar`/`unzip` analog of `rule_fetch_to_file_
+    protect`'s own curl/wget backstop) rather than fixed piecemeal in this
+    one guard.
+
+    QA history (two independent adversarial reviews, run in parallel —
+    bypass-hunting and design/consistency, the same convention every guard
+    in this file follows): bypass-hunting found and reproduced one real,
+    unique-to-this-guard bug — the Edit/Write/MCP path regexes required
+    the filename to sit directly after `tools/`/`runConfigurations/` with
+    no further path separator, so an entirely ordinary extra directory
+    level (`.idea/tools/mygroup/External Tools.xml` — JetBrains itself has
+    no rule against nesting tool sets in subdirectories) was a silent,
+    total bypass of that branch (the shell branch's own `*_CD_RE`
+    fallback already tolerated a trailing `/` and was unaffected). Closed
+    the same "bounded optional nested segments" way `AGENT_DEF_PATH_RE`'s
+    own `_AGENT_DEF_SEG` does for `.claude/agents/` (see
+    `_JETBRAINS_DIR_SEG`'s own comment in patterns.py); verified against a
+    fresh ReDoS probe (bounded, sub-5ms even at 500 nested segments and at
+    a 900-char no-separator adversarial pad) with no regression. The same
+    round separately confirmed the staged-file-then-copy/move/extract gap
+    above is shared, pre-existing, and not unique to this guard (reproduced
+    against two already-shipped sibling guards unmodified) — disclosed
+    above, not fixed here, out of scope for a single-guard change.
+    Design/consistency review independently verified this guard's wiring
+    is complete and correct everywhere its siblings are (`_CORE_RULES`,
+    `_FETCH_HUMAN_ESCAPABLE`, `Policy`, all three `loader.py` spots, both
+    `skills.py` knob lists, the `_REMEDIES` table, the README guard table,
+    a live YAML `jetbrains_external_tool_exec:` block round-tripped through
+    `load_policy()` into `evaluate()` for both `mode` and `allow`, and
+    `aegis validate`), and found one non-code gap: README's own "Limits"
+    section still described this surface as "not covered" in two places,
+    left over from before this guard closed it — corrected, along with
+    `rule_jetbrains_watcher_protect`/`rule_devcontainer_exec_protect`/
+    `rule_vscode_tasks_protect`'s own docstrings, which carried the
+    identical stale cross-reference. Full suite green throughout (2402
+    passed)."""
     cfg = getattr(policy, "jetbrains_external_tool_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

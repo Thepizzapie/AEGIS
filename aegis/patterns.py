@@ -2609,14 +2609,28 @@ JETBRAINS_WATCHER_PROGRAM_RE = re.compile(
 # separators/newlines.
 _JETBRAINS_FILENAME_SEG = r"[^'\"/\\\n]{1,200}"
 _JETBRAINS_IDEA_ROOT = r"(?:^|[\s'\"/\\=])\.idea" + _WIN_TRIM + _SEP
+# QA finding (independent adversarial review, bypass-hunting round): the
+# first version required the filename to sit DIRECTLY after `tools/`/
+# `runConfigurations/` with no further path separator, so an entirely
+# ordinary extra directory level (`.idea/tools/mygroup/External Tools.xml`
+# -- JetBrains itself has no rule against nesting tool sets in
+# subdirectories) was a silent, total bypass of the Edit/Write/MCP branch
+# (unlike the shell branch, whose `*_CD_RE` already tolerates a trailing
+# `/` via `_CI_END`). Closed the same "bounded optional nested segments"
+# way `AGENT_DEF_PATH_RE`'s own `_AGENT_DEF_SEG` does for `.claude/agents/`:
+# 0-4 additional directory segments, each excluding quotes/separators/
+# newlines like the filename segment itself, before the final filename.
+_JETBRAINS_DIR_SEG = _JETBRAINS_FILENAME_SEG + _WIN_TRIM + _SEP
 
 JETBRAINS_TOOLS_PATH_RE = re.compile(
     _JETBRAINS_IDEA_ROOT + r"tools" + _WIN_TRIM + _SEP
+    + r"(?:" + _JETBRAINS_DIR_SEG + r"){0,4}"
     + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
     re.IGNORECASE,
 )
 JETBRAINS_RUNCONFIG_PATH_RE = re.compile(
     _JETBRAINS_IDEA_ROOT + r"runConfigurations" + _WIN_TRIM + _SEP
+    + r"(?:" + _JETBRAINS_DIR_SEG + r"){0,4}"
     + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
     re.IGNORECASE,
 )

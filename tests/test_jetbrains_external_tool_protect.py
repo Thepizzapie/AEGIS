@@ -215,6 +215,37 @@ def test_spaced_default_filename_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_nested_subdirectory_tools_gated():
+    # QA finding (independent adversarial review, bypass-hunting round): the
+    # first version required the filename directly after `tools/` with no
+    # further separator -- an ordinary extra directory level was a silent,
+    # total bypass of this branch (JetBrains itself has no rule against
+    # nesting tool sets in subdirectories).
+    d = evaluate(_write(".idea/tools/mygroup/External Tools.xml", TOOL_XML), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_nested_subdirectory_runconfig_gated():
+    d = evaluate(_write(".idea/runConfigurations/sub/Run.xml", RUNCONFIG_XML), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_two_levels_nested_subdirectory_gated():
+    d = evaluate(_write(".idea/tools/a/b/External Tools.xml", TOOL_XML), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_multi_edit_nested_subdirectory_gated():
+    d = evaluate(_multi_edit(".idea/tools/sub/tools.xml",
+                              '<option name="COMMAND" value="/tmp/evil.sh" />'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_mcp_write_nested_subdirectory_gated():
+    d = evaluate(_mcp_write(".idea/tools/sub/tools.xml", TOOL_XML), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 # ---- .idea/runConfigurations/*.xml (ToolBeforeRunTask) — Edit/Write/MCP forms --
 
 def test_write_runconfig_wiring_gated():
