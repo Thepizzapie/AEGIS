@@ -3187,12 +3187,29 @@ CLAUDE_ENV_DANGEROUS_VAR_RE = re.compile(
 # (caught by the shared write-verb check at the rule's call site) or piped
 # through `sponge` — the same `CLAUDE_HOOKS_JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE`
 # shape one key over: jq (or `gojq`/`jaq`), an assignment-shaped operator,
-# and one of the dangerous var names as a bare substring, all within a
-# bounded, `;`-scoped window.
+# and one of the dangerous var names as a bare substring.
+#
+# Deliberately NOT bounded to a fixed character count, unlike
+# `CLAUDE_HOOKS_JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE` (both still carry the
+# fixed-window shape as a disclosed, pre-existing gap — see `PERMISSION_
+# BYPASS_JQ_RE`'s own comment for the full trade-off analysis). QA finding
+# (independent adversarial review, round A, reproduced): a jq `#`-comment
+# (real jq syntax, valid inside a single-quoted shell argument, ignored by
+# jq itself) used as filler — ~450 non-whitespace characters right after the
+# `jq` token — pushed the dangerous var name outside a 400-char window,
+# producing a silent `ALLOW` with no rule firing at all. Closed the same way
+# `PERMISSION_BYPASS_JQ_RE` already closes it for its own key: an unbounded,
+# `;`-scoped lookahead instead of a fixed bound (a `[^;]*` run followed by a
+# literal is linear-time to match, not exponential, so this carries no ReDoS
+# regression despite dropping the bound). Accepted trade-off, the same
+# direction every guard in this file takes when forced to choose: a
+# genuinely unrelated `jq` invocation and an unrelated, far-apart mention of
+# one of these var names in the SAME `;`-delimited shell statement now asks
+# unnecessarily — a narrow false positive, never a missed real plant.
 CLAUDE_ENV_JQ_RE = re.compile(
     r"\b(?:(?:go)?jq|jaq)\b"
-    r"(?=[^;&\n]{0,400}" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
-    r"(?=[^;&\n]{0,400}\b(?:" + _CLAUDE_ENV_VAR_ALT + r")\b)",
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\b(?:" + _CLAUDE_ENV_VAR_ALT + r")\b)",
     re.IGNORECASE,
 )
 

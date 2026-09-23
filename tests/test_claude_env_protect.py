@@ -132,6 +132,33 @@ def test_partial_edit_fragment_not_valid_json_still_uses_textual_check():
     assert _gated(d) and d.rule == "claude-env-protect"
 
 
+def test_unicode_escaped_key_in_partial_edit_fragment_gated():
+    """QA finding (independent adversarial review, round A): a CONFIRMED,
+    reproduced silent-ALLOW bypass — a `\\uXXXX`-escaped dangerous var name
+    inside a PARTIAL Edit fragment (no enclosing braces, so it never parses
+    standalone as JSON) evaded both the textual check (run against RAW,
+    un-decoded content) and the JSON semantic walk (which only fires on
+    content that validates as JSON on its own). Unlike `hooks` — whose real
+    schema needs the literal substring to appear twice in any real plant,
+    incidentally masking this class — `env` needs only ONE occurrence, so
+    this was a single-call bypass, not just a theoretical one. Closed by
+    `_claude_env_normalize` (whitespace-collapse + `\\uXXXX`-decode) run
+    before the textual regex ever sees the text, the same fix already
+    shipped for `statusLine`/`permissions.defaultMode`."""
+    d = evaluate(_edit(".claude/settings.local.json",
+                        '"env": {"\\u0042ASH_ENV": "/tmp/evil.sh"}'), EMPTY)
+    assert _gated(d) and d.rule == "claude-env-protect"
+
+
+def test_unicode_escaped_key_in_mcp_edit_file_fragment_gated():
+    """The identical fragment-escape bypass, via a third-party MCP
+    filesystem server's own `{path, edits: [{oldText, newText}]}` shape
+    rather than Claude Code's own content/new_string convention."""
+    d = evaluate(_mcp_edit_nested(".claude/settings.local.json", "{}",
+                                   '"env": {"\\u0042ASH_ENV": "/tmp/evil.sh"}'), EMPTY)
+    assert _gated(d) and d.rule == "claude-env-protect"
+
+
 # ---- MCP-tool writes ------------------------------------------------------------
 
 def test_mcp_write_gated():
@@ -234,6 +261,21 @@ def test_shell_jq_bracket_index_notation_gated():
     d = evaluate(_shell(
         'jq \'.env["GIT_SSH_COMMAND"] = "/tmp/evil.sh"\' .claude/settings.local.json '
         '| sponge .claude/settings.local.json'), EMPTY)
+    assert _gated(d) and d.rule == "claude-env-protect"
+
+
+def test_shell_jq_comment_padding_gated():
+    """QA finding (independent adversarial review, round A): a CONFIRMED,
+    reproduced silent-ALLOW bypass — a jq `#`-comment (real jq syntax, valid
+    inside a single-quoted shell argument, ignored by jq itself) used as
+    filler right after the `jq` token pushed the dangerous var name outside
+    the original fixed 400-char lookahead window, the identical bypass class
+    `PERMISSION_BYPASS_JQ_RE`'s own patterns.py comment already discloses
+    and fixes for its own key. Closed the same way: an unbounded,
+    `;`-scoped lookahead instead of a fixed character bound."""
+    d = evaluate(_shell(
+        "jq '#" + "x" * 450 + "\n.env.BASH_ENV = \"/tmp/evil.sh\"' "
+        ".claude/settings.local.json | sponge .claude/settings.local.json"), EMPTY)
     assert _gated(d) and d.rule == "claude-env-protect"
 
 
@@ -400,6 +442,23 @@ def test_off_mode_disables_guard():
 
 
 # ---- perf / ReDoS ------------------------------------------------------------------
+
+def test_shell_jq_unbounded_lookahead_does_not_cross_semicolon():
+    """The now-unbounded `CLAUDE_ENV_JQ_RE` lookahead is `;`-scoped, not
+    truly unbounded across the whole command — an unrelated `jq` invocation
+    followed by a LATER, `;`-separated statement that happens to mention a
+    dangerous var name must not false-positive."""
+    d = evaluate(_shell(
+        'jq \'.model\' .claude/settings.local.json; echo "note BASH_ENV here"'), EMPTY)
+    assert not _gated(d)
+
+
+def test_perf_no_redos_on_unbounded_jq_lookahead():
+    adversarial = "jq '" + "#x" * 100000 + "' .claude/settings.local.json | sponge .claude/settings.local.json"
+    start = time.time()
+    evaluate(_shell(adversarial), EMPTY)
+    assert time.time() - start < 1.0
+
 
 def test_perf_no_redos_on_adversarial_shell_input():
     adversarial = ("jq " + "a" * 5000 + " .claude/settings.local.json | sponge "

@@ -5496,6 +5496,45 @@ def _claude_env_json_key_hit(content: str) -> bool:
     return _claude_env_struct_key_hit(obj)
 
 
+_CLAUDE_ENV_WS_RUN_RE = re.compile(r"\s+")
+_CLAUDE_ENV_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _claude_env_normalize(text: str) -> str:
+    """Collapse whitespace runs to one space and decode JSON ``\\uXXXX``
+    escapes before `CLAUDE_ENV_DANGEROUS_VAR_RE` ever sees the text — the
+    same normalization `_statusline_normalize` applies for `statusLine`.
+
+    QA finding (independent adversarial review, round A, reproduced): an
+    earlier draft ran `CLAUDE_ENV_DANGEROUS_VAR_RE` against RAW, un-decoded
+    content, with `_claude_env_json_key_hit`'s semantic walk as the only
+    `\\uXXXX`-escape closure — but that walk only fires when ``content``
+    parses as STANDALONE valid JSON, true for a whole-file ``Write`` but
+    essentially never true for an ordinary Edit's ``new_string`` or an MCP
+    ``edit_file``'s ``newText`` (both are surgical fragments with no
+    enclosing braces). A single ``\\uXXXX``-escaped character anywhere in a
+    dangerous var name (``"\\u0042ASH_ENV"`` decodes to the real key
+    ``BASH_ENV``) inside such a fragment evaded both signals at once — a
+    confirmed, reproduced silent-ALLOW bypass, and a MATERIALLY LOWER bar
+    than the analogous, already-disclosed gap in `rule_claude_hooks_protect`:
+    that guard's real ``hooks`` schema needs the literal substring ``hooks``
+    to appear TWICE in any real plant (the outer key and a per-matcher inner
+    key), so escaping only one still leaves the other as a plain-text hit;
+    `env` needs only ONE occurrence of a dangerous key, so escaping that one
+    occurrence closed off every check at once. Closed by running the
+    textual regex against a normalized copy instead of raw text, the same
+    fix already shipped for `statusLine`/`permissions.defaultMode`. A
+    malformed ``\\u`` escape (non-hex digits) is left as-is rather than
+    raising."""
+    def _decode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    decoded = _CLAUDE_ENV_UNICODE_ESCAPE_RE.sub(_decode, text)
+    return _CLAUDE_ENV_WS_RUN_RE.sub(" ", decoded)
+
+
 def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting/altering one of a curated set of dangerous env-var
     names inside the ``env`` block of ``.claude/settings.local.json`` — the
@@ -5562,6 +5601,49 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     cannot set its own env for a hook invocation it doesn't control, so
     neither path is agent-self-escapable.
 
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows). Design/consistency review (round A) found no confirmed
+    defects: verified the ``claude_env`` knob is wired everywhere its
+    siblings are (``Policy``, all three ``loader.py`` spots, both
+    ``skills.py`` knob lists, the remedy table, README), verified every
+    specific factual claim in this docstring against the actual sibling code
+    it cites (including that `rule_claude_hooks_protect` really does list
+    ``env`` as deliberately ungated, that `rule_ld_preload_protect` really
+    covers only the ``/etc/ld.so.preload`` FILE and never the env var, and
+    that `rule_git_attributes_exec_protect`'s ``core.sshCommand`` really is a
+    distinct surface from the ``GIT_SSH_COMMAND`` env var here), and
+    confirmed a live YAML round-trip through ``load_policy``. Bypass-hunting
+    (round A) found and closed two real, reproduced gaps: (1) a CRITICAL
+    silent-ALLOW bypass — the textual `CLAUDE_ENV_DANGEROUS_VAR_RE` check ran
+    against RAW, un-decoded content with no normalization step at all (unlike
+    `statusLine`/`permissions.defaultMode`, both already normalized before
+    their own textual check), so a single ``\\uXXXX``-escaped character in a
+    dangerous var name inside a PARTIAL Edit/MCP-``edit_file`` fragment (the
+    common real-world shape — a fragment has no enclosing braces, so it never
+    parses standalone as JSON, leaving `_claude_env_json_key_hit`'s semantic
+    walk unable to help either) evaded every check at once. Materially worse
+    than the analogous, already-disclosed gap in `rule_claude_hooks_protect`:
+    that guard's real schema needs the literal substring ``hooks`` twice in
+    any real plant, incidentally masking a single-escape attempt; ``env``
+    needs only one occurrence. Closed by `_claude_env_normalize`
+    (whitespace-collapse + ``\\uXXXX``-decode), run before the textual check
+    on both the Edit/Write/MCP branch and the shell branch, the same fix
+    already shipped for `statusLine`/`permissions.defaultMode`. (2) a CONFIRMED
+    bypass in `CLAUDE_ENV_JQ_RE`'s original fixed 400-char lookahead window —
+    the identical jq-``#``-comment-padding class `PERMISSION_BYPASS_JQ_RE`'s
+    own comment already discloses and fixes for its own key, silently
+    inherited here with no disclosure; closed the same way, with an
+    unbounded, ``;``-scoped lookahead instead of a fixed bound (see
+    `CLAUDE_ENV_JQ_RE`'s own comment in patterns.py). Two further items were
+    raised and deliberately left open, disclosed below rather than fixed
+    blind: a contrived MCP tool shape that splits a dangerous var name across
+    two separate string args the MCP *server* itself concatenates (no known
+    real MCP tool does this), and a cosmetic false-positive already accepted
+    file-wide for the identical ``hooks``/``statusLine`` key shape. Full suite
+    green throughout (2411 tests, 59 in this guard's own file after the
+    fixes); no round B needed.
+
     Honest scope, the same denylist trade-offs every guard in this file
     discloses: the user-level ``~/.claude/settings.local.json`` is reached
     the same incidental, suffix-only way `rule_claude_hooks_protect` reaches
@@ -5569,8 +5651,13 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     denylist, not an exhaustive survey of every interpreter's own env-based
     auto-exec knob (e.g. a project-specific wrapper script honoring its own
     custom env var is not, and cannot be, covered); a value assembled
-    indirectly (a templating step, a build script) rather than appearing as
-    a literal is not caught; and, like every sibling guard here, a direct
+    indirectly (a templating step, a build script), or split across two
+    string args an MCP tool's own SERVER concatenates server-side before the
+    key name ever appears whole in this tool call's own args, is not caught;
+    a benign string VALUE that merely mentions a dangerous var name in
+    quote-colon form (documenting the threat, say) asks unnecessarily — the
+    same accepted, file-wide false-positive trade-off `CLAUDE_HOOKS_KEY_RE`
+    already makes for ``hooks``; and, like every sibling guard here, a direct
     fetch-to-file write (``curl -o .claude/settings.local.json ...``) is
     caught by none of this guard's own checks, but is closed end-to-end by
     the separate `rule_fetch_to_file_protect` backstop, which already reuses
@@ -5597,7 +5684,7 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
-        hit = bool(patterns.CLAUDE_ENV_DANGEROUS_VAR_RE.search(content)
+        hit = bool(patterns.CLAUDE_ENV_DANGEROUS_VAR_RE.search(_claude_env_normalize(content))
                    or _claude_env_json_key_hit(content))
         if not hit and ev.action == ActionClass.MCP:
             hit = bool(_claude_env_struct_key_hit(a) or _claude_env_mcp_bareword_hit(a))
@@ -5629,8 +5716,9 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
                          or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
         if not path_hit:
             return None
-        jq_hit = bool(patterns.CLAUDE_ENV_JQ_RE.search(cmd))
-        write_hit = bool(write_verb and patterns.CLAUDE_ENV_DANGEROUS_VAR_RE.search(cmd))
+        normalized_cmd = _claude_env_normalize(cmd)
+        jq_hit = bool(patterns.CLAUDE_ENV_JQ_RE.search(normalized_cmd))
+        write_hit = bool(write_verb and patterns.CLAUDE_ENV_DANGEROUS_VAR_RE.search(normalized_cmd))
         if not (jq_hit or write_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_ENV")
