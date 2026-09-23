@@ -321,6 +321,15 @@ class Policy:
     # --dangerously-skip-permissions`/`--permission-mode bypassPermissions`
     # CLI invocation. See rules.rule_permission_bypass_protect.
     permission_bypass: dict = field(default_factory=dict)
+    # Claude Code env-var hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers a dangerous env var (BASH_ENV/NODE_OPTIONS/PERL5OPT/RUBYOPT/
+    # PYTHONSTARTUP/LD_PRELOAD/DYLD_INSERT_LIBRARIES/GIT_SSH_COMMAND) planted
+    # in the `env` block of `.claude/settings.local.json` -- the same file
+    # `claude_hooks`/`statusline`/`permission_bypass` guard for their own
+    # keys -- which Claude Code merges into every subprocess it spawns for
+    # every future session in this project. See rules.rule_claude_env_protect.
+    claude_env: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a
