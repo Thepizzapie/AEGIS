@@ -5437,6 +5437,307 @@ def rule_permission_bypass_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+# ---- Claude Code env-var hijack protection: escapable with human confirm -----
+def _claude_env_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_CLAUDE_ENV_VAR_NAMES = {v.lower() for v in patterns.CLAUDE_ENV_DANGEROUS_VARS}
+
+
+def _claude_env_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for one of
+    the dangerous env-var names as an actual DICT KEY, not a string value —
+    the same structural-fallback shape `_claude_hooks_struct_key_hit` uses
+    for `hooks`, generalized over `patterns.CLAUDE_ENV_DANGEROUS_VARS`. Same
+    depth cap (12) as its siblings for the identical cyclic/pathological-
+    payload protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() in _CLAUDE_ENV_VAR_NAMES:
+                return True
+            if _claude_env_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_env_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_env_mcp_bareword_hit(a: dict) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: one of the dangerous
+    env-var names appears, exact-match (not substring), as a plain string
+    LEAF anywhere in the (recursively) flattened raw MCP args — closes a
+    "set config value"-style MCP tool's ``{"key": "env.BASH_ENV", "value":
+    "..."}``/``{"key": "BASH_ENV", ...}`` shape, the same bareword-leaf gap
+    `_claude_hooks_mcp_bareword_hit` already closes for `hooks`."""
+    return any(isinstance(s, str) and s.strip().lower() in _CLAUDE_ENV_VAR_NAMES
+               for s in _flatten_strings(a))
+
+
+def _claude_env_json_key_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result SEMANTICALLY via `_claude_env_struct_key_hit` — an additional
+    signal alongside `CLAUDE_ENV_DANGEROUS_VAR_RE`'s textual check, not a
+    replacement for it, the same JSON-``\\uXXXX``-escape-evasion closure
+    `_claude_hooks_json_key_hit` already applies to ``hooks``."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _claude_env_struct_key_hit(obj)
+
+
+_CLAUDE_ENV_WS_RUN_RE = re.compile(r"\s+")
+_CLAUDE_ENV_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _claude_env_normalize(text: str) -> str:
+    """Collapse whitespace runs to one space and decode JSON ``\\uXXXX``
+    escapes before `CLAUDE_ENV_DANGEROUS_VAR_RE` ever sees the text — the
+    same normalization `_statusline_normalize` applies for `statusLine`.
+
+    QA finding (independent adversarial review, round A, reproduced): an
+    earlier draft ran `CLAUDE_ENV_DANGEROUS_VAR_RE` against RAW, un-decoded
+    content, with `_claude_env_json_key_hit`'s semantic walk as the only
+    `\\uXXXX`-escape closure — but that walk only fires when ``content``
+    parses as STANDALONE valid JSON, true for a whole-file ``Write`` but
+    essentially never true for an ordinary Edit's ``new_string`` or an MCP
+    ``edit_file``'s ``newText`` (both are surgical fragments with no
+    enclosing braces). A single ``\\uXXXX``-escaped character anywhere in a
+    dangerous var name (``"\\u0042ASH_ENV"`` decodes to the real key
+    ``BASH_ENV``) inside such a fragment evaded both signals at once — a
+    confirmed, reproduced silent-ALLOW bypass, and a MATERIALLY LOWER bar
+    than the analogous, already-disclosed gap in `rule_claude_hooks_protect`:
+    that guard's real ``hooks`` schema needs the literal substring ``hooks``
+    to appear TWICE in any real plant (the outer key and a per-matcher inner
+    key), so escaping only one still leaves the other as a plain-text hit;
+    `env` needs only ONE occurrence of a dangerous key, so escaping that one
+    occurrence closed off every check at once. Closed by running the
+    textual regex against a normalized copy instead of raw text, the same
+    fix already shipped for `statusLine`/`permissions.defaultMode`. A
+    malformed ``\\u`` escape (non-hex digits) is left as-is rather than
+    raising."""
+    def _decode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    decoded = _CLAUDE_ENV_UNICODE_ESCAPE_RE.sub(_decode, text)
+    return _CLAUDE_ENV_WS_RUN_RE.sub(" ", decoded)
+
+
+def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering one of a curated set of dangerous env-var
+    names inside the ``env`` block of ``.claude/settings.local.json`` — the
+    project-local, gitignored-by-default sibling of ``.claude/settings.json``
+    that `rule_claude_hooks_protect`/`rule_statusline_protect`/`rule_
+    permission_bypass_protect` already guard for their own keys in this file.
+
+    THREAT MODEL: Claude Code merges ``env`` straight into the environment of
+    EVERY subprocess it spawns for every future session in this project —
+    every Bash tool call, every MCP server, any interpreter/VCS command the
+    agent shells out to. `rule_claude_hooks_protect`'s own docstring lists
+    ``env`` by name among this file's "plenty of other personal config ...
+    edited for entirely benign reasons" it deliberately leaves ungated — true
+    for the key's ordinary uses (a project's own ``NODE_ENV``/``DEBUG``/API-
+    base-URL tweak), but a fixed, small set of var names are themselves
+    documented interpreter/dynamic-linker/VCS auto-exec primitives, not
+    ordinary configuration:
+
+      - ``BASH_ENV``: bash sources the named file on EVERY non-interactive
+        invocation — exactly what the Bash tool issues. No future trigger at
+        all: the very next Bash tool call, often this same session, runs it.
+      - ``NODE_OPTIONS``: Node applies its flags (``--require``,
+        ``--experimental-loader``, ...) on every ``node``/``npm``/``npx``/
+        ``yarn`` invocation.
+      - ``PERL5OPT``/``RUBYOPT``: Perl/Ruby apply ``-M``/``-e``/``-r`` flags
+        on every invocation of their own interpreter.
+      - ``PYTHONSTARTUP``: executed on every interactive Python REPL startup.
+      - ``LD_PRELOAD``/``DYLD_INSERT_LIBRARIES``: loads a shared object into
+        every subsequently-exec'd dynamically-linked process — the env-var-
+        level sibling `rule_ld_preload_protect`'s own ``/etc/ld.so.preload``
+        file check never reaches (that guard covers the system-wide file;
+        this is the per-session env-var form, delivered through a completely
+        different, unguarded file).
+      - ``GIT_SSH_COMMAND``: overrides the command git execs for every future
+        network operation over SSH — the env-var-level sibling `rule_git_
+        attributes_exec_protect`'s own ``core.sshCommand`` config-key check
+        never reaches.
+
+    Every guard above it in this file gates a FILE (a hook script, a startup
+    file, a config key) that something else then has to go read. This one
+    gates the interpreter/loader/VCS switch that makes reading such a file
+    happen automatically in the first place — one layer further down than
+    any sibling guard in this file reaches, and (being gitignored by
+    default) with no diff and no code review either.
+
+    Distinct from a path-only guard for the same reason `rule_claude_hooks_
+    protect`/`rule_statusline_protect`/`rule_permission_bypass_protect` are:
+    ``settings.local.json`` carries plenty of other personal config edited
+    for entirely benign reasons — gated on PATH *and* one of a curated,
+    named set of dangerous var names, not the ``env`` key's mere presence,
+    the same "the value/name, not the key, is the enabling switch" shape
+    `PERMISSION_BYPASS_MODE_KEY_RE`/`CLAUDE_STATUSLINE_KEY_RE` already draw.
+
+    Config (``policy.claude_env``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate — a
+    repo's own trusted, reviewed local env tweak, say). Defaults to ``ask``
+    for the same reason every sibling ``*_protect`` guard does: a locally
+    preloaded debug/observability shim can be legitimate, sanctioned
+    personal tooling — it just needs a human to have actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_CLAUDE_ENV=1`` set by the orchestrator/
+    human before launch for the Edit/Write/MCP-tool form. A spawned agent
+    cannot set its own env for a hook invocation it doesn't control, so
+    neither path is agent-self-escapable.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel — the same convention every guard in this
+    file follows). Design/consistency review (round A) found no confirmed
+    defects: verified the ``claude_env`` knob is wired everywhere its
+    siblings are (``Policy``, all three ``loader.py`` spots, both
+    ``skills.py`` knob lists, the remedy table, README), verified every
+    specific factual claim in this docstring against the actual sibling code
+    it cites (including that `rule_claude_hooks_protect` really does list
+    ``env`` as deliberately ungated, that `rule_ld_preload_protect` really
+    covers only the ``/etc/ld.so.preload`` FILE and never the env var, and
+    that `rule_git_attributes_exec_protect`'s ``core.sshCommand`` really is a
+    distinct surface from the ``GIT_SSH_COMMAND`` env var here), and
+    confirmed a live YAML round-trip through ``load_policy``. Bypass-hunting
+    (round A) found and closed two real, reproduced gaps: (1) a CRITICAL
+    silent-ALLOW bypass — the textual `CLAUDE_ENV_DANGEROUS_VAR_RE` check ran
+    against RAW, un-decoded content with no normalization step at all (unlike
+    `statusLine`/`permissions.defaultMode`, both already normalized before
+    their own textual check), so a single ``\\uXXXX``-escaped character in a
+    dangerous var name inside a PARTIAL Edit/MCP-``edit_file`` fragment (the
+    common real-world shape — a fragment has no enclosing braces, so it never
+    parses standalone as JSON, leaving `_claude_env_json_key_hit`'s semantic
+    walk unable to help either) evaded every check at once. Materially worse
+    than the analogous, already-disclosed gap in `rule_claude_hooks_protect`:
+    that guard's real schema needs the literal substring ``hooks`` twice in
+    any real plant, incidentally masking a single-escape attempt; ``env``
+    needs only one occurrence. Closed by `_claude_env_normalize`
+    (whitespace-collapse + ``\\uXXXX``-decode), run before the textual check
+    on both the Edit/Write/MCP branch and the shell branch, the same fix
+    already shipped for `statusLine`/`permissions.defaultMode`. (2) a CONFIRMED
+    bypass in `CLAUDE_ENV_JQ_RE`'s original fixed 400-char lookahead window —
+    the identical jq-``#``-comment-padding class `PERMISSION_BYPASS_JQ_RE`'s
+    own comment already discloses and fixes for its own key, silently
+    inherited here with no disclosure; closed the same way, with an
+    unbounded, ``;``-scoped lookahead instead of a fixed bound (see
+    `CLAUDE_ENV_JQ_RE`'s own comment in patterns.py). Two further items were
+    raised and deliberately left open, disclosed below rather than fixed
+    blind: a contrived MCP tool shape that splits a dangerous var name across
+    two separate string args the MCP *server* itself concatenates (no known
+    real MCP tool does this), and a cosmetic false-positive already accepted
+    file-wide for the identical ``hooks``/``statusLine`` key shape. Full suite
+    green throughout (2411 tests, 59 in this guard's own file after the
+    fixes); no round B needed.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: the user-level ``~/.claude/settings.local.json`` is reached
+    the same incidental, suffix-only way `rule_claude_hooks_protect` reaches
+    it (no anchoring to project root); the curated var-name list is a
+    denylist, not an exhaustive survey of every interpreter's own env-based
+    auto-exec knob (e.g. a project-specific wrapper script honoring its own
+    custom env var is not, and cannot be, covered); a value assembled
+    indirectly (a templating step, a build script), or split across two
+    string args an MCP tool's own SERVER concatenates server-side before the
+    key name ever appears whole in this tool call's own args, is not caught;
+    a benign string VALUE that merely mentions a dangerous var name in
+    quote-colon form (documenting the threat, say) asks unnecessarily — the
+    same accepted, file-wide false-positive trade-off `CLAUDE_HOOKS_KEY_RE`
+    already makes for ``hooks``; and, like every sibling guard here, a direct
+    fetch-to-file write (``curl -o .claude/settings.local.json ...``) is
+    caught by none of this guard's own checks, but is closed end-to-end by
+    the separate `rule_fetch_to_file_protect` backstop, which already reuses
+    `CLAUDE_LOCAL_SETTINGS_PATH_RE` as one of its own protected targets."""
+    cfg = getattr(policy, "claude_env", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-env-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.CLAUDE_ENV_DANGEROUS_VAR_RE.search(_claude_env_normalize(content))
+                   or _claude_env_json_key_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = bool(_claude_env_struct_key_hit(a) or _claude_env_mcp_bareword_hit(a))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_ENV")
+                or _claude_env_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-env-protect",
+                         f"'{p}' is being written with a dangerous env var "
+                         "(BASH_ENV/NODE_OPTIONS/PERL5OPT/RUBYOPT/"
+                         "PYTHONSTARTUP/LD_PRELOAD/DYLD_INSERT_LIBRARIES/"
+                         "GIT_SSH_COMMAND) in its `env` block — Claude Code "
+                         "merges it into every subprocess it spawns for "
+                         "every future session in this project, often "
+                         "starting with the very next tool call, and (being "
+                         "gitignored by default) with no diff and no code "
+                         "review. Review the change, then confirm with "
+                         "AEGIS_ALLOW_CLAUDE_ENV=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        normalized_cmd = _claude_env_normalize(cmd)
+        jq_hit = bool(patterns.CLAUDE_ENV_JQ_RE.search(normalized_cmd))
+        write_hit = bool(write_verb and patterns.CLAUDE_ENV_DANGEROUS_VAR_RE.search(normalized_cmd))
+        if not (jq_hit or write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_ENV")
+                or _claude_env_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-env-protect",
+                         "A dangerous env var (BASH_ENV/NODE_OPTIONS/"
+                         "PERL5OPT/RUBYOPT/PYTHONSTARTUP/LD_PRELOAD/"
+                         "DYLD_INSERT_LIBRARIES/GIT_SSH_COMMAND) is being "
+                         "planted in .claude/settings.local.json's `env` "
+                         "block from a shell — Claude Code merges it into "
+                         "every subprocess it spawns for every future "
+                         "session in this project, and (being gitignored by "
+                         "default) with no diff and no code review. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CLAUDE_ENV=1; a spawned agent cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7663,6 +7964,7 @@ _CORE_RULES = (
     rule_claude_hooks_protect,
     rule_statusline_protect,
     rule_permission_bypass_protect,
+    rule_claude_env_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,

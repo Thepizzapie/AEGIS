@@ -3126,6 +3126,93 @@ PERMISSION_BYPASS_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code env-var hijack protection (.claude/settings.local.json) -----
+# A FOURTH, distinct auto-exec surface in the same file `CLAUDE_LOCAL_SETTINGS_
+# PATH_RE` locates, alongside `hooks`/`statusLine`/`permissions.defaultMode`:
+# Claude Code's own `env` setting — the same key `rule_claude_hooks_protect`'s
+# own docstring names by example among the file's "plenty of other personal
+# config ... edited for entirely benign reasons" — merges its object straight
+# into the environment of EVERY subprocess Claude Code spawns for every future
+# session in this project: every Bash tool call, every MCP server, any node/
+# python/perl/ruby/git invocation the agent shells out to. A handful of var
+# names, once merged in, are documented interpreter/dynamic-linker/VCS
+# auto-exec primitives in their own right — setting one is not "configure an
+# environment variable" in the abstract, it is planting a standing, silent
+# auto-run hook one layer below every OTHER guard in this file, which all gate
+# a FILE (a hooks script, a startup file, a config key) rather than the
+# interpreter/loader/git switch that makes reading that file happen at all:
+#   - BASH_ENV: bash sources the named file on EVERY non-interactive
+#     invocation (exactly what the Bash tool issues) — no future trigger at
+#     all, the very next Bash tool call in this same session runs it.
+#   - NODE_OPTIONS: Node.js applies its flags (`--require`, `--experimental-
+#     loader`, ...) on every `node`/`npm`/`npx`/`yarn` invocation.
+#   - PERL5OPT / RUBYOPT: Perl/Ruby apply `-M`/`-e`/`-r` flags on every
+#     invocation of their own interpreter, the identical shape one layer down.
+#   - PYTHONSTARTUP: executed on every interactive Python REPL startup.
+#   - LD_PRELOAD / DYLD_INSERT_LIBRARIES: `dlopen()`s/loads a shared object
+#     into every subsequently-exec'd dynamically-linked process — the ELF/
+#     Mach-O env-var-level sibling `rule_ld_preload_protect`'s own
+#     `/etc/ld.so.preload` file check never reaches (that guard covers the
+#     SYSTEM-WIDE file; this is the per-session env-var form, delivered
+#     through a completely different, unguarded file).
+#   - GIT_SSH_COMMAND: overrides the command git execs for every future
+#     network operation over SSH, the env-var-level sibling
+#     `rule_git_attributes_exec_protect`'s own `core.sshCommand` config-key
+#     check never reaches.
+# `rule_claude_hooks_protect`'s own docstring explicitly disclaims `env` as
+# one of the keys it deliberately leaves ungated — true for the key's
+# ordinary, benign uses (a project's own `NODE_ENV`/`DEBUG`/API-base-URL
+# tweak), but each of the specific names above is itself the enabling
+# switch, the same "the value/name, not the key, is the dangerous part"
+# split `PERMISSION_BYPASS_MODE_KEY_RE`/`CLAUDE_STATUSLINE_KEY_RE` already
+# draw for their own keys in this file.
+#
+# Content-only check for a CONFIRMED settings.local.json path: one of the
+# dangerous var names appearing as a literal JSON key (`"BASH_ENV": "..."`),
+# the same bareword-key shape `CLAUDE_HOOKS_KEY_RE` uses for `hooks` — no
+# nested-object window needed, since (like `hooks`) none of these exact,
+# all-caps, well-known interpreter/env var names has any legitimate reason
+# to appear as a JSON key anywhere else in this file.
+CLAUDE_ENV_DANGEROUS_VARS = (
+    "BASH_ENV", "NODE_OPTIONS", "PERL5OPT", "RUBYOPT", "PYTHONSTARTUP",
+    "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "GIT_SSH_COMMAND",
+)
+_CLAUDE_ENV_VAR_ALT = "|".join(CLAUDE_ENV_DANGEROUS_VARS)
+CLAUDE_ENV_DANGEROUS_VAR_RE = re.compile(
+    r"[\"'](?:" + _CLAUDE_ENV_VAR_ALT + r")[\"']\s*:",
+    re.IGNORECASE,
+)
+
+# jq has no `-i` flag, so a scripted edit is either a temp-file-then-`mv`
+# (caught by the shared write-verb check at the rule's call site) or piped
+# through `sponge` — the same `CLAUDE_HOOKS_JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE`
+# shape one key over: jq (or `gojq`/`jaq`), an assignment-shaped operator,
+# and one of the dangerous var names as a bare substring.
+#
+# Deliberately NOT bounded to a fixed character count, unlike
+# `CLAUDE_HOOKS_JQ_RE`/`CLAUDE_STATUSLINE_JQ_RE` (both still carry the
+# fixed-window shape as a disclosed, pre-existing gap — see `PERMISSION_
+# BYPASS_JQ_RE`'s own comment for the full trade-off analysis). QA finding
+# (independent adversarial review, round A, reproduced): a jq `#`-comment
+# (real jq syntax, valid inside a single-quoted shell argument, ignored by
+# jq itself) used as filler — ~450 non-whitespace characters right after the
+# `jq` token — pushed the dangerous var name outside a 400-char window,
+# producing a silent `ALLOW` with no rule firing at all. Closed the same way
+# `PERMISSION_BYPASS_JQ_RE` already closes it for its own key: an unbounded,
+# `;`-scoped lookahead instead of a fixed bound (a `[^;]*` run followed by a
+# literal is linear-time to match, not exponential, so this carries no ReDoS
+# regression despite dropping the bound). Accepted trade-off, the same
+# direction every guard in this file takes when forced to choose: a
+# genuinely unrelated `jq` invocation and an unrelated, far-apart mention of
+# one of these var names in the SAME `;`-delimited shell statement now asks
+# unnecessarily — a narrow false positive, never a missed real plant.
+CLAUDE_ENV_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\b(?:" + _CLAUDE_ENV_VAR_ALT + r")\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards
