@@ -3213,6 +3213,70 @@ CLAUDE_ENV_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code credential-helper exec-hijack protection (.claude/settings.local.json) ---
+# A FOURTH, distinct auto-exec surface in the same file `CLAUDE_LOCAL_SETTINGS_
+# PATH_RE` locates, alongside `hooks`/`statusLine`/`permissions.defaultMode`/
+# the `env` block: Claude Code's own credential-helper settings each name an
+# external command the RUNTIME itself execs to mint a credential or header
+# value, on a schedule of its own -- not gated behind any tool call this
+# file's rule pipeline ever sees:
+#   - apiKeyHelper: re-run every 5 minutes by default (`CLAUDE_CODE_API_KEY_
+#     HELPER_TTL_MS` overrides the interval) for the whole life of the
+#     session; its stdout is sent as the `X-Api-Key`/`Authorization: Bearer`
+#     header on every model request. No future git/CI/tool-call trigger
+#     needed at all -- the refresh fires on Claude Code's own timer,
+#     independent of anything the agent does next, a WORSE trigger bar than
+#     even `statusLine`'s own "essentially every turn" (that still needs a
+#     turn; this needs nothing).
+#   - awsAuthRefresh / awsCredentialExport: run to refresh/export Bedrock
+#     credentials in `.aws` -- the Claude-Code-settings route to the
+#     identical `credential_process` mechanism `AWS_CRED_PROCESS_CONTENT_RE`/
+#     `AWS_CRED_PROCESS_INI_RE` below already cover for `~/.aws/config`/
+#     `~/.aws/credentials` directly, but never reach here.
+#   - gcpAuthRefresh: the same refresh hook, Google Cloud/Vertex AI side.
+#   - otelHeadersHelper: re-run on an interval to mint rotating
+#     OpenTelemetry headers.
+# All five are documented, top-level settings.json keys, settable in any of
+# the four settings-file scopes Claude Code reads -- `.claude/settings.local
+# .json` included, the project-local, gitignored-by-default file `rule_
+# claude_hooks_protect`/`rule_statusline_protect`/`rule_permission_bypass_
+# protect`/`rule_claude_env_protect` already guard for their own keys in,
+# but that none of them reaches for these five.
+#
+# Content-only check for a CONFIRMED settings.local.json path: one of the
+# five key names appearing as a literal JSON key (`"apiKeyHelper": "..."`),
+# the same bareword-key shape `CLAUDE_HOOKS_KEY_RE`/`CLAUDE_ENV_DANGEROUS_
+# VAR_RE` use for their own keys -- no nested-object window needed, since
+# (like `hooks`) none of these five exact, camelCase, schema-defined key
+# names has any legitimate reason to appear as a JSON key anywhere else in
+# this file.
+CLAUDE_CRED_HELPER_KEYS = (
+    "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh",
+    "otelHeadersHelper",
+)
+_CLAUDE_CRED_HELPER_KEY_ALT = "|".join(CLAUDE_CRED_HELPER_KEYS)
+CLAUDE_CRED_HELPER_KEY_RE = re.compile(
+    r"[\"'](?:" + _CLAUDE_CRED_HELPER_KEY_ALT + r")[\"']\s*:",
+    re.IGNORECASE,
+)
+
+# jq has no `-i` flag, so a scripted edit is either a temp-file-then-`mv`
+# (caught by the shared write-verb check at the rule's call site) or piped
+# through `sponge` -- the same `CLAUDE_ENV_JQ_RE` shape one key set over: jq
+# (or `gojq`/`jaq`), an assignment-shaped operator, and one of the five key
+# names as a bare substring. Unbounded, `;`-scoped lookahead from the start
+# (not a fixed character count) -- `CLAUDE_ENV_JQ_RE`'s own comment already
+# discloses and fixes the identical jq-`#`-comment-padding bypass class for
+# its own, originally-fixed-window predecessor; applying that fix from the
+# first version here rather than waiting for a QA round to rediscover it for
+# a fourth key.
+CLAUDE_CRED_HELPER_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\b(?:" + _CLAUDE_CRED_HELPER_KEY_ALT + r")\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

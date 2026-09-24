@@ -5738,6 +5738,295 @@ def rule_claude_env_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _claude_cred_helper_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_CLAUDE_CRED_HELPER_KEY_NAMES = {k.lower() for k in patterns.CLAUDE_CRED_HELPER_KEYS}
+
+
+def _claude_cred_helper_struct_key_hit(v, _depth: int = 0) -> bool:
+    """Walk an MCP tool's raw (possibly nested) JSON args looking for one of
+    the five dangerous credential-helper key names as an actual DICT KEY,
+    not a string value -- the same structural-fallback shape `_claude_env_
+    struct_key_hit` uses for `CLAUDE_ENV_DANGEROUS_VARS`, generalized over
+    `patterns.CLAUDE_CRED_HELPER_KEYS`. Same depth cap (12) as its siblings
+    for the identical cyclic/pathological-payload protection."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() in _CLAUDE_CRED_HELPER_KEY_NAMES:
+                return True
+            if _claude_cred_helper_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_cred_helper_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_cred_helper_mcp_bareword_hit(a: dict) -> bool:
+    """Fallback signal for ``ActionClass.MCP`` only: one of the five key
+    names appears, exact-match (not substring), as a plain string LEAF
+    anywhere in the (recursively) flattened raw MCP args -- closes a "set
+    config value"-style MCP tool's ``{"key": "apiKeyHelper", "value": "..."}``
+    shape, the same bareword-leaf gap `_claude_env_mcp_bareword_hit` already
+    closes for its own key set."""
+    return any(isinstance(s, str) and s.strip().lower() in _CLAUDE_CRED_HELPER_KEY_NAMES
+               for s in _flatten_strings(a))
+
+
+def _claude_cred_helper_json_key_hit(content: str) -> bool:
+    """Parse ``content`` as JSON (only when it validates on its own) and walk
+    the result SEMANTICALLY via `_claude_cred_helper_struct_key_hit` -- an
+    additional signal alongside `CLAUDE_CRED_HELPER_KEY_RE`'s textual check,
+    not a replacement for it, the same JSON-``\\uXXXX``-escape-evasion
+    closure `_claude_env_json_key_hit` already applies to its own key set."""
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _claude_cred_helper_struct_key_hit(obj)
+
+
+_CLAUDE_CRED_HELPER_WS_RUN_RE = re.compile(r"\s+")
+_CLAUDE_CRED_HELPER_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _claude_cred_helper_normalize(text: str) -> str:
+    """Collapse whitespace runs to one space and decode JSON ``\\uXXXX``
+    escapes before `CLAUDE_CRED_HELPER_KEY_RE` ever sees the text -- the same
+    normalization `_claude_env_normalize`/`_statusline_normalize` apply for
+    their own keys, applied here from the first version rather than after a
+    QA round rediscovers the identical partial-fragment escape bypass for a
+    fourth key in this same file. A malformed ``\\u`` escape (non-hex
+    digits) is left as-is rather than raising."""
+    def _decode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    decoded = _CLAUDE_CRED_HELPER_UNICODE_ESCAPE_RE.sub(_decode, text)
+    return _CLAUDE_CRED_HELPER_WS_RUN_RE.sub(" ", decoded)
+
+
+def rule_claude_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering one of Claude Code's five credential-helper
+    keys (``apiKeyHelper``, ``awsAuthRefresh``, ``awsCredentialExport``,
+    ``gcpAuthRefresh``, ``otelHeadersHelper``) in ``.claude/settings.local
+    .json`` -- the project-local, gitignored-by-default sibling of
+    ``.claude/settings.json`` that `rule_claude_hooks_protect`/`rule_
+    statusline_protect`/`rule_permission_bypass_protect`/`rule_claude_env_
+    protect` already guard for their own keys in this same file.
+
+    THREAT MODEL: each of these five documented settings names an external
+    command the Claude Code RUNTIME itself execs, outside the tool-call loop
+    Aegis's own PreToolUse hook ever evaluates, to mint a credential or
+    header value:
+
+      - ``apiKeyHelper``: re-run every 5 minutes by default
+        (``CLAUDE_CODE_API_KEY_HELPER_TTL_MS`` overrides the interval) for
+        the whole life of the session; its stdout is sent as the
+        ``X-Api-Key``/``Authorization: Bearer`` header on every model
+        request. No future git/CI/tool-call trigger at all -- the refresh
+        fires on Claude Code's own timer, independent of anything the agent
+        does next, a WORSE trigger bar than even `rule_statusline_protect`'s
+        own "essentially every turn" (that still needs a turn to elapse;
+        this needs nothing).
+      - ``awsAuthRefresh``/``awsCredentialExport``: run to refresh/export
+        Bedrock credentials in ``.aws`` -- the Claude-Code-settings route to
+        the identical ``credential_process`` mechanism `rule_cloud_cred_
+        exec_protect` already covers for ``~/.aws/config``/``~/.aws/
+        credentials`` directly, but never reaches here.
+      - ``gcpAuthRefresh``: the same refresh hook, Google Cloud/Vertex AI
+        side.
+      - ``otelHeadersHelper``: re-run on an interval to mint rotating
+        OpenTelemetry headers.
+
+    All five are documented top-level settings.json keys, settable in any of
+    the four settings-file scopes Claude Code reads (managed, project,
+    project-local, user) -- ``.claude/settings.local.json`` included, and
+    (being gitignored by default) a plant here produces no diff, shows in no
+    ``git status``, and survives no code review, the same invisibility
+    property every sibling guard for this file already claims for its own
+    key.
+
+    Distinct from a path-only guard for the same reason every sibling guard
+    for this file is: ``settings.local.json`` carries plenty of other
+    personal config (permissions, env, model, statusLine, outputStyle, ...)
+    edited for entirely benign reasons -- gated on PATH *and* one of the
+    five named keys, not the file alone, the same "gate the file AND the
+    specific dangerous key" split `CLAUDE_HOOKS_KEY_RE`/`CLAUDE_ENV_
+    DANGEROUS_VAR_RE` already draw for their own keys. Unlike ``env``
+    (where the dangerous var sits nested a level down), these five sit at
+    the same top level ``hooks``/``statusLine``/``permissions`` do -- and,
+    like ``hooks``, none of the five has a safe shape once present: any
+    string value assigns an executable command or script path.
+
+    Config (``policy.claude_cred_helper``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    -- a repo's own trusted, reviewed local credential script, say).
+    Defaults to ``ask`` for the same reason every sibling ``*_protect``
+    guard does: a legitimate vault-integration or rotating-token script is a
+    real, sanctioned use of these keys -- it just needs a human to have
+    actually looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_CLAUDE_CRED_HELPER=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows). Design/consistency review found no confirmed defects:
+    verified the ``claude_cred_helper`` knob is wired everywhere its
+    siblings are (`_CORE_RULES`, ``Policy``, all three ``loader.py`` spots
+    -- confirmed with a live YAML round-trip through ``load_policy``, not
+    just a code read --, both ``skills.py`` knob lists, the remedy table,
+    README), confirmed every rule-string/env-toggle/policy-field spelling is
+    identical across every occurrence, and verified this docstring's factual
+    claims (the ``rule_cloud_cred_exec_protect`` citation, the apiKeyHelper
+    5-minute/header claims against `patterns.py`'s own independently-written
+    comment, and the "top-level, no nested-object window" implementation
+    claim against `CLAUDE_CRED_HELPER_KEY_RE` itself). Bypass-hunting
+    structurally diffed this guard's rule body and all five helpers against
+    `rule_claude_env_protect`'s and found the executable logic identical
+    modulo the constant sets and message text -- so every candidate bypass
+    it could construct reproduced identically on `rule_claude_env_protect`
+    too, confirmed live side-by-side, meaning each is INHERITED from the
+    already-hardened reference design, not introduced by this guard's own
+    divergence (top-level camelCase keys vs. `env`-nested ALL_CAPS vars).
+    Three are the same disclosed-gap class every sibling guard above already
+    accepts for its own key set (see each honest-scope paragraph): the
+    MCP-args structural fallback's depth-12 cap (`_flatten_strings`/
+    `_claude_cred_helper_struct_key_hit` alike) evaded by nesting the real
+    key beyond it; a RAW (non-``\\u``-decoded) escaped key spelling inside an
+    MCP tool's own flat bareword ``{"key": ..., "value": ...}`` argument
+    shape, which `_claude_cred_helper_mcp_bareword_hit`'s exact-match check
+    never decodes; and a jq merge with no assignment-shaped operator at all
+    (`. + {apiKeyHelper: "x"}`, bare ``+`` not in `_CLAUDE_HOOKS_JQ_ASSIGN_
+    OP`) piped through `sponge` with a bareword (unquoted) object key, which
+    neither `CLAUDE_CRED_HELPER_JQ_RE` nor the quote-anchored
+    `CLAUDE_CRED_HELPER_KEY_RE` catches. A fourth is a newly-surfaced,
+    shared-not-guest-specific perf note worth recording here even though it
+    isn't this guard's own to fix: `CLAUDE_CRED_HELPER_JQ_RE`'s per-``;``-
+    statement unbounded lookahead (the same shape `CLAUDE_ENV_JQ_RE`/
+    `PERMISSION_BYPASS_JQ_RE` already carry) costs quadratic, not
+    exponential, time in the number of ``jq`` tokens a single shell argument
+    repeats -- bounded, never a hang, but measurably slower (~1-2s at a few
+    thousand repeats) than the single-match-position padding shape the
+    existing `test_perf_no_redos_on_unbounded_jq_lookahead` already covers;
+    out of scope for this guard alone to fix (the pattern family, not this
+    guard's own code, would need a shared bound), so disclosed rather than
+    patched blind. Full suite green throughout (2474 tests); no round B
+    needed.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: the user-level ``~/.claude/settings.local.json`` is reached
+    the same incidental, suffix-only way every sibling guard for this file
+    reaches it (no anchoring to project root); a value assembled indirectly
+    (a templating step, a build script), or split across two string args an
+    MCP tool's own SERVER concatenates server-side before the key name ever
+    appears whole in this tool call's own args, is not caught; a benign
+    string VALUE that merely mentions one of these key names in quote-colon
+    form (documenting the threat, say) asks unnecessarily -- the same
+    accepted, file-wide false-positive trade-off `CLAUDE_HOOKS_KEY_RE`
+    already makes for ``hooks``; the three inherited bypass shapes and the
+    one shared perf note from the QA history above (MCP struct-key depth
+    cap, a raw un-decoded ``\\u`` escape in an MCP bareword key argument, a
+    jq merge with no assignment operator at all, and quadratic -- not
+    catastrophic -- cost on many repeated ``jq`` tokens in one command); and,
+    like every sibling guard here, a direct fetch-to-file write (``curl -o
+    .claude/settings.local.json ...``) is caught by none of this guard's own
+    checks, but is closed end-to-end by the separate `rule_fetch_to_file_
+    protect` backstop, which already reuses `CLAUDE_LOCAL_SETTINGS_PATH_RE`
+    as one of its own protected targets."""
+    cfg = getattr(policy, "claude_cred_helper", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-cred-helper-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.CLAUDE_CRED_HELPER_KEY_RE.search(_claude_cred_helper_normalize(content))
+                   or _claude_cred_helper_json_key_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = bool(_claude_cred_helper_struct_key_hit(a) or _claude_cred_helper_mcp_bareword_hit(a))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_CRED_HELPER")
+                or _claude_cred_helper_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-cred-helper-protect",
+                         f"'{p}' is being written with a Claude Code "
+                         "credential-helper key (apiKeyHelper/awsAuthRefresh/"
+                         "awsCredentialExport/gcpAuthRefresh/otelHeadersHelper) "
+                         "-- Claude Code execs the named command itself, "
+                         "independent of any tool call (apiKeyHelper alone "
+                         "re-runs every 5 minutes for the life of the "
+                         "session, sending its output as the API auth "
+                         "header on every model request), and (being "
+                         "gitignored by default) with no diff and no code "
+                         "review. Review the change, then confirm with "
+                         "AEGIS_ALLOW_CLAUDE_CRED_HELPER=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        normalized_cmd = _claude_cred_helper_normalize(cmd)
+        jq_hit = bool(patterns.CLAUDE_CRED_HELPER_JQ_RE.search(normalized_cmd))
+        write_hit = bool(write_verb and patterns.CLAUDE_CRED_HELPER_KEY_RE.search(normalized_cmd))
+        if not (jq_hit or write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_CRED_HELPER")
+                or _claude_cred_helper_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-cred-helper-protect",
+                         "A Claude Code credential-helper key (apiKeyHelper/"
+                         "awsAuthRefresh/awsCredentialExport/gcpAuthRefresh/"
+                         "otelHeadersHelper) is being planted in "
+                         ".claude/settings.local.json from a shell -- Claude "
+                         "Code execs the named command itself, independent "
+                         "of any tool call, and (being gitignored by "
+                         "default) with no diff and no code review. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CLAUDE_CRED_HELPER=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7965,6 +8254,7 @@ _CORE_RULES = (
     rule_statusline_protect,
     rule_permission_bypass_protect,
     rule_claude_env_protect,
+    rule_claude_cred_helper_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,

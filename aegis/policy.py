@@ -330,6 +330,17 @@ class Policy:
     # keys -- which Claude Code merges into every subprocess it spawns for
     # every future session in this project. See rules.rule_claude_env_protect.
     claude_env: dict = field(default_factory=dict)
+    # Claude Code credential-helper exec-hijack protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty -> defaults
+    # (mode=ask) apply. Covers one of five credential-helper keys
+    # (apiKeyHelper/awsAuthRefresh/awsCredentialExport/gcpAuthRefresh/
+    # otelHeadersHelper) planted in the same `.claude/settings.local.json`
+    # `claude_hooks`/`statusline`/`permission_bypass`/`claude_env` guard for
+    # their own keys -- each names a command Claude Code itself execs on its
+    # own schedule (apiKeyHelper: every 5 minutes for the life of the
+    # session, its output sent as the API auth header) with no tool-call
+    # trigger at all. See rules.rule_claude_cred_helper_protect.
+    claude_cred_helper: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a

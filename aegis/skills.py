@@ -51,6 +51,7 @@ _REMEDIES = """\
 | statusline-protect | planted a `statusLine` entry enabled for `type: "command"` in .claude/settings.local.json (Claude Code spawns it directly on essentially every turn, no tool-call trigger needed at all) | ask the human; they can set AEGIS_ALLOW_STATUSLINE=1 after review |
 | permission-bypass-protect | planted `permissions.defaultMode: "bypassPermissions"` in .claude/settings.local.json, or launched `claude --dangerously-skip-permissions`/`--permission-mode bypassPermissions` (silences Claude Code's own confirmation prompt for every future tool call, not one planted command) | ask the human; they can set AEGIS_ALLOW_PERMISSION_BYPASS=1 after review |
 | claude-env-protect | planted a dangerous env var (BASH_ENV/NODE_OPTIONS/PERL5OPT/RUBYOPT/PYTHONSTARTUP/LD_PRELOAD/DYLD_INSERT_LIBRARIES/GIT_SSH_COMMAND) in .claude/settings.local.json's `env` block (Claude Code merges it into every subprocess it spawns for every future session in this project) | ask the human; they can set AEGIS_ALLOW_CLAUDE_ENV=1 after review |
+| claude-cred-helper-protect | planted a credential-helper key (apiKeyHelper/awsAuthRefresh/awsCredentialExport/gcpAuthRefresh/otelHeadersHelper) in .claude/settings.local.json (Claude Code execs the named command itself on its own schedule — apiKeyHelper every 5 minutes for the life of the session, sending its output as the API auth header — with no tool-call trigger at all) | ask the human; they can set AEGIS_ALLOW_CLAUDE_CRED_HELPER=1 after review |
 | conftest-protect | planted a pytest auto-exec shape (module-level code, an autouse fixture, or a hook like pytest_configure) in a conftest.py (runs on the next `pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_CONFTEST=1 after review |
 | pysite-protect | planted a module-level process/code-exec call in sitecustomize.py/usercustomize.py, or a dangerous `import`-prefixed line in a site-packages/dist-packages .pth file (runs on the next `python`/`pytest` invocation, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_PYSITE=1 after review |
 | ipython-startup-protect | planted a module-level process/code-exec call (or, in a `.ipy` file, a bare `!<command>` shell-escape line) in `.ipython/profile_*/startup/` (runs on the next `ipython`/Jupyter-kernel launch, by anyone, no opt-in needed) | ask the human; they can set AEGIS_ALLOW_IPYTHON_STARTUP=1 after review |
@@ -116,7 +117,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -163,7 +164,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `path_hijack`,
-     `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`,
+     `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
