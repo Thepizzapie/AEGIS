@@ -5884,6 +5884,51 @@ def rule_claude_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     spawned agent cannot set its own env for a hook invocation it doesn't
     control, so neither path is agent-self-escapable.
 
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the same convention every guard in this
+    file follows). Design/consistency review found no confirmed defects:
+    verified the ``claude_cred_helper`` knob is wired everywhere its
+    siblings are (`_CORE_RULES`, ``Policy``, all three ``loader.py`` spots
+    -- confirmed with a live YAML round-trip through ``load_policy``, not
+    just a code read --, both ``skills.py`` knob lists, the remedy table,
+    README), confirmed every rule-string/env-toggle/policy-field spelling is
+    identical across every occurrence, and verified this docstring's factual
+    claims (the ``rule_cloud_cred_exec_protect`` citation, the apiKeyHelper
+    5-minute/header claims against `patterns.py`'s own independently-written
+    comment, and the "top-level, no nested-object window" implementation
+    claim against `CLAUDE_CRED_HELPER_KEY_RE` itself). Bypass-hunting
+    structurally diffed this guard's rule body and all five helpers against
+    `rule_claude_env_protect`'s and found the executable logic identical
+    modulo the constant sets and message text -- so every candidate bypass
+    it could construct reproduced identically on `rule_claude_env_protect`
+    too, confirmed live side-by-side, meaning each is INHERITED from the
+    already-hardened reference design, not introduced by this guard's own
+    divergence (top-level camelCase keys vs. `env`-nested ALL_CAPS vars).
+    Three are the same disclosed-gap class every sibling guard above already
+    accepts for its own key set (see each honest-scope paragraph): the
+    MCP-args structural fallback's depth-12 cap (`_flatten_strings`/
+    `_claude_cred_helper_struct_key_hit` alike) evaded by nesting the real
+    key beyond it; a RAW (non-``\\u``-decoded) escaped key spelling inside an
+    MCP tool's own flat bareword ``{"key": ..., "value": ...}`` argument
+    shape, which `_claude_cred_helper_mcp_bareword_hit`'s exact-match check
+    never decodes; and a jq merge with no assignment-shaped operator at all
+    (`. + {apiKeyHelper: "x"}`, bare ``+`` not in `_CLAUDE_HOOKS_JQ_ASSIGN_
+    OP`) piped through `sponge` with a bareword (unquoted) object key, which
+    neither `CLAUDE_CRED_HELPER_JQ_RE` nor the quote-anchored
+    `CLAUDE_CRED_HELPER_KEY_RE` catches. A fourth is a newly-surfaced,
+    shared-not-guest-specific perf note worth recording here even though it
+    isn't this guard's own to fix: `CLAUDE_CRED_HELPER_JQ_RE`'s per-``;``-
+    statement unbounded lookahead (the same shape `CLAUDE_ENV_JQ_RE`/
+    `PERMISSION_BYPASS_JQ_RE` already carry) costs quadratic, not
+    exponential, time in the number of ``jq`` tokens a single shell argument
+    repeats -- bounded, never a hang, but measurably slower (~1-2s at a few
+    thousand repeats) than the single-match-position padding shape the
+    existing `test_perf_no_redos_on_unbounded_jq_lookahead` already covers;
+    out of scope for this guard alone to fix (the pattern family, not this
+    guard's own code, would need a shared bound), so disclosed rather than
+    patched blind. Full suite green throughout (2474 tests); no round B
+    needed.
+
     Honest scope, the same denylist trade-offs every guard in this file
     discloses: the user-level ``~/.claude/settings.local.json`` is reached
     the same incidental, suffix-only way every sibling guard for this file
@@ -5894,12 +5939,16 @@ def rule_claude_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     string VALUE that merely mentions one of these key names in quote-colon
     form (documenting the threat, say) asks unnecessarily -- the same
     accepted, file-wide false-positive trade-off `CLAUDE_HOOKS_KEY_RE`
-    already makes for ``hooks``; and, like every sibling guard here, a
-    direct fetch-to-file write (``curl -o .claude/settings.local.json
-    ...``) is caught by none of this guard's own checks, but is closed
-    end-to-end by the separate `rule_fetch_to_file_protect` backstop, which
-    already reuses `CLAUDE_LOCAL_SETTINGS_PATH_RE` as one of its own
-    protected targets."""
+    already makes for ``hooks``; the three inherited bypass shapes and the
+    one shared perf note from the QA history above (MCP struct-key depth
+    cap, a raw un-decoded ``\\u`` escape in an MCP bareword key argument, a
+    jq merge with no assignment operator at all, and quadratic -- not
+    catastrophic -- cost on many repeated ``jq`` tokens in one command); and,
+    like every sibling guard here, a direct fetch-to-file write (``curl -o
+    .claude/settings.local.json ...``) is caught by none of this guard's own
+    checks, but is closed end-to-end by the separate `rule_fetch_to_file_
+    protect` backstop, which already reuses `CLAUDE_LOCAL_SETTINGS_PATH_RE`
+    as one of its own protected targets."""
     cfg = getattr(policy, "claude_cred_helper", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
