@@ -7534,7 +7534,35 @@ def rule_gh_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     analog of `rule_path_hijack_protect`'s own PATH-shadow surface, not
     this guard's "write now, auto-exec later via a config key" shape; ask
     for it a rule of its own rather than folding a differently-shaped
-    mechanism into this guard's coverage claim."""
+    mechanism into this guard's coverage claim.
+
+    QA history (two independent adversarial reviews, run in parallel, same
+    convention every guard in this file follows): design/consistency review
+    verified the wiring correct everywhere its siblings are (`_CORE_RULES`/
+    `_FETCH_HUMAN_ESCAPABLE`, `Policy`, all three `loader.py` spots, both
+    `skills.py` knob lists, the README guard table) and round-tripped a real
+    YAML `gh_config_exec:` block through `load_policy()` into a live
+    `evaluate()` decision. Bypass-hunting found and closed four real,
+    reproduced issues in `patterns.py`'s `GH_ALIAS_BANG_YAML_RE`/
+    `GH_ALIAS_BANG_CONTENT_RE`/`GH_ALIAS_SET_CLI_RE` before merge: YAML's
+    single-line flow-mapping syntax (`aliases: {bugs: '!cmd'}`) bypassed the
+    strong check's original `[^\n]*\n`-after-`aliases:` requirement entirely,
+    defeating this guard's own "staged elsewhere, no path confirmation
+    needed" guarantee; a YAML block-scalar value (`bugs: |`/`>`, the actual
+    string content landing UNQUOTED on the following indented line) planted
+    the identical shell-routed alias with no same-line `!` at all, missed by
+    every check; the alias-name token was capped at 80 characters (a git
+    config KEY bound that doesn't apply to gh's own alias-name grammar),
+    letting a longer name slip the CLI check; and a bare, unquoted `!` after
+    a colon false-positived against ordinary CloudFormation/SAM/mkdocs YAML
+    using their own native `!Ref`/`!GetAtt`/`!ENV` tag shorthand alongside
+    an unrelated top-level `aliases:`/`Aliases:` key. See `patterns.py`'s
+    own comment directly above `GH_ALIAS_BANG_YAML_RE` for the full
+    reasoning behind each of the four fixes, including why mandating the
+    quote for the inline-value form closes the false positive with no loss
+    of real-payload coverage (a real YAML plain scalar cannot start with
+    `!` at all -- that position is reserved for a tag indicator -- so a
+    genuine gh-written shell alias is always quoted)."""
     cfg = getattr(policy, "gh_config_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

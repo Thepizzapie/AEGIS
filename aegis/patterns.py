@@ -5190,24 +5190,85 @@ GH_CONFIG_PATH_RE = re.compile(
     + r"|(?:^|[\s'\"/\\=])GitHub\s+CLI" + _WIN_TRIM + _SEP + r"config\.ya?ml" + _CI_END,
     re.IGNORECASE,
 )
-# Path-INDEPENDENT strong form: a real `aliases:` YAML block followed, within
-# a bounded window, by a nested `<name>: '!...'`/`<name>: !...` entry -- same
-# "staged in an arbitrarily-named file, redirected at in a separate call"
-# reasoning `GIT_CONFIG_BANG_VALUE_INI_RE`'s own comment documents, and the
-# same bounded-gap technique `AWS_CRED_PROCESS_INI_RE` uses for its own
+# Path-INDEPENDENT strong form: a real `aliases:` YAML key followed, within a
+# bounded window, by a nested bang-shell alias entry -- same "staged in an
+# arbitrarily-named file, redirected at in a separate call" reasoning
+# `GIT_CONFIG_BANG_VALUE_INI_RE`'s own comment documents, and the same
+# bounded-gap technique `AWS_CRED_PROCESS_INI_RE` uses for its own
 # `[section]`-anchored strong form (a fixed-size DOTALL gap, not a full YAML
 # parse).
+#
+# Two independent, adversarial QA rounds (bypass-hunting + design/
+# consistency, run in parallel) each verified this guard end-to-end;
+# bypass-hunting reproduced four real issues in a first version, all fixed
+# here:
+#
+# (1) The original gap required a literal `\n` immediately after `aliases:`,
+# so YAML's single-line flow-mapping syntax (`aliases: {bugs: '!cmd'}`,
+# real, valid YAML -- no block style required at all) bypassed the strong
+# check entirely, defeating this guard's own disclosed "staged elsewhere,
+# no path confirmation needed" guarantee. Fixed by dropping the `[^\n]*\n`
+# requirement -- the DOTALL gap alone already spans a real newline when one
+# is present, and now spans zero characters just as well for the flow form.
+#
+# (2) A bare, UNQUOTED `!` after a colon (`['\"]?!`, quote optional) collides
+# with YAML's own native custom-tag shorthand (`!Ref`, `!GetAtt`, `!ENV`, ...)
+# used throughout ordinary CloudFormation/SAM/mkdocs YAML that happens to
+# ALSO have a top-level `aliases:`/`Aliases:` key nearby (a CloudFront
+# distribution's `Aliases:` list plus an unrelated `!Ref`/`!GetAtt`
+# elsewhere in the same template; mkdocs nav `aliases:` plus an unrelated
+# `!ENV` value) -- a real, reproduced false ASK on completely unrelated
+# infrastructure-as-code. A real gh-CLI-written shell alias is always
+# QUOTED in the emitted YAML (a plain YAML scalar is not permitted to start
+# with `!` at all -- that position is reserved for a tag indicator, per the
+# YAML core schema -- so gh, and any well-formed hand edit, must quote it).
+# Fixed by requiring the quote (`['\"]!`, no longer optional) for the
+# inline-value alternative below -- a real YAML tag is never wrapped in
+# quotes (quoting it turns it into a plain string, not a tag invocation),
+# so this closes the false positive with no loss of real-payload coverage
+# for the inline form.
+#
+# (3) A block-scalar value (`bugs: |` / `bugs: >`, YAML's own multi-line
+# string syntax, optionally with a chomping `+`/`-` or explicit indentation
+# digit modifier) puts the actual string content -- unquoted, by definition,
+# block scalars are never quoted -- on the FOLLOWING indented line, which
+# neither the inline-quoted alternative above nor the original single-line
+# check could ever see: `bugs: |\n    !gh issue list --label=bug\n` is a
+# fully valid gh config planting the identical shell-routed alias with no
+# quote and no same-line `!` at all. A second alternative, below, matches
+# this shape directly: key, colon, block indicator (+ optional chomp/
+# indent modifier), a real newline, then an indented line starting with
+# `!` -- distinguishable from a YAML tag precisely because a plain
+# (non-quoted, non-tagged) block scalar's content is never itself tag
+# syntax, so an unquoted `!` as the first character of that content is
+# unambiguous, real payload.
+#
+# (4) The alias-NAME token was capped at 80 characters (`{1,80}`, matching
+# `_GIT_CONFIG_KEY_TOKEN`'s own bound) -- but that bound is for a git
+# config KEY, not gh's own alias-name grammar, which has no such limit; an
+# alias name longer than 80 characters slipped the CLI form's first
+# alternative entirely. Widened to 300 here (matching the ~200-300 char
+# convention this file already uses elsewhere after an identical QA finding
+# -- see `AWS_CRED_PROCESS_CLI_RE`/`KUBE_EXEC_CRED_CLI_RE`'s own widened
+# gaps), comfortably past any realistic alias name.
 GH_ALIAS_BANG_YAML_RE = re.compile(
-    r"\baliases\s*:[^\n]*\n.{0,2000}?[\w.:-]{1,80}\s*:\s*['\"]?!",
+    r"\baliases\s*:.{0,2000}?[\w.:-]{1,300}\s*:\s*['\"]!"
+    r"|\baliases\s*:.{0,2000}?[\w.:-]{1,300}\s*:\s*[|>][+-]?\d?[ \t]*\n[ \t]*!",
     re.IGNORECASE | re.DOTALL,
 )
 # Weak, path-CONFIRMED-only key check -- mirrors GIT_CONFIG_BANG_VALUE_CONTENT_RE:
-# once the path is a confirmed gh config.yml, a bare `<name>: '!...'` line (an
-# Edit's `new_string` is typically just the inserted alias line, the `aliases:`
-# header itself is `old_string` context that never appears in `new_string`) is
-# high-signal on its own -- gh's config.yml has no other key whose value would
-# legitimately start with `!`.
-GH_ALIAS_BANG_CONTENT_RE = re.compile(r"[\w.:-]{1,80}\s*:\s*['\"]?!", re.IGNORECASE)
+# once the path is a confirmed gh config.yml, a bare `<name>: '!...'`/
+# `<name>: |\n  !...` line (an Edit's `new_string` is typically just the
+# inserted alias line(s), the `aliases:` header itself is `old_string`
+# context that never appears in `new_string`) is high-signal on its own --
+# gh's config.yml has no other key whose value would legitimately start
+# with `!`. Same quote-required / block-scalar-alternative fixes as the
+# strong form above, for the identical reasons.
+GH_ALIAS_BANG_CONTENT_RE = re.compile(
+    r"[\w.:-]{1,300}\s*:\s*['\"]!"
+    r"|[\w.:-]{1,300}\s*:\s*[|>][+-]?\d?[ \t]*\n[ \t]*!",
+    re.IGNORECASE,
+)
 # CLI form: `gh alias set <name> <expansion>`. The first alternative anchors on
 # the real CLI grammar -- the expansion is the token immediately after the
 # alias name -- the same "value is the token right after the key, not a
@@ -5218,8 +5279,16 @@ GH_ALIAS_BANG_CONTENT_RE = re.compile(r"[\w.:-]{1,80}\s*:\s*['\"]?!", re.IGNOREC
 # the same invocation (either before or after the alias name/expansion --
 # cobra flags are not position-locked) -- that flag alone routes the
 # expansion through a shell with no `!` marker required in the literal text.
+# Unlike the YAML-content checks above, the quote here stays OPTIONAL: a
+# single-word shell expansion at a real shell prompt (`gh alias set x !ls`)
+# needs no quoting to survive shell parsing at all, so mandating one would
+# reopen exactly the bypass the quote requirement above was added to close
+# on the YAML side, in the opposite direction -- this is shell-command text,
+# not a YAML document, so no tag-shorthand collision exists here to guard
+# against in the first place. Same 80->300-char widening as the strong form
+# above, same QA finding.
 GH_ALIAS_SET_CLI_RE = re.compile(
-    r"\bgh\b[^|;&\n]{0,60}\balias\b[^|;&\n]{0,20}\bset\b\s+[\w.:-]{1,80}\s+['\"]?!"
+    r"\bgh\b[^|;&\n]{0,60}\balias\b[^|;&\n]{0,20}\bset\b\s+[\w.:-]{1,300}\s+['\"]?!"
     r"|\bgh\b[^|;&\n]{0,60}\balias\b[^|;&\n]{0,20}\bset\b[^|;&\n]{0,250}"
     r"(?<!\S)(?:-s|--shell)(?=[\s=]|$)",
     re.IGNORECASE,

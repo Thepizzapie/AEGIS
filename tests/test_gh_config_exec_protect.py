@@ -118,11 +118,66 @@ def test_bare_new_string_line_gated_when_path_confirmed():
     assert _gated(d) and d.rule == RULE
 
 
-def test_unquoted_bang_value_gated():
+def test_block_scalar_literal_bang_gated():
+    """QA finding (bypass-hunting round): a YAML block-scalar value (`|`)
+    puts the actual, unquoted string content on the FOLLOWING indented
+    line — a fully valid gh config that still plants the identical
+    shell-routed alias, missed by the original single-line-only check."""
     d = evaluate(_write(
         ".config/gh/config.yml",
-        content="aliases:\n    pwn: !bash -c 'id > /tmp/pwned'\n"), EMPTY)
+        content="aliases:\n    bugs: |\n        !gh issue list --label=bug\n"), EMPTY)
     assert _gated(d) and d.rule == RULE
+
+
+def test_block_scalar_folded_bang_gated():
+    d = evaluate(_write(
+        ".config/gh/config.yml",
+        content="aliases:\n    bugs: >\n        !gh issue list --label=bug\n"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_flow_mapping_single_line_gated():
+    """QA finding (bypass-hunting round): YAML's single-line flow-mapping
+    syntax (`aliases: {bugs: '!cmd'}`) has no newline right after
+    `aliases:` at all — the original strong check required one, defeating
+    this guard's own disclosed 'staged elsewhere, no path confirmation
+    needed' guarantee."""
+    d = evaluate(_write(
+        "staging/gh-bootstrap.yml",
+        content="aliases: {bugs: '!gh issue list --label=bug'}\n"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_long_alias_name_cli_gated():
+    """QA finding (bypass-hunting round): the alias-name token was
+    originally capped at 80 chars, matching a git-config KEY bound that
+    doesn't apply to gh's own alias-name grammar — an alias name longer
+    than that slipped the CLI check entirely."""
+    d = evaluate(_shell(
+        "gh alias set " + ("b" * 100) + " '!gh issue list --label=bug'"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_unquoted_inline_bang_not_gated_yaml_tag_collision():
+    """QA finding (bypass-hunting round): a bare, UNQUOTED `!` after a
+    colon collides with YAML's own native custom-tag shorthand (`!Ref`,
+    `!GetAtt`, `!ENV`, ...) — a real gh-written shell alias is always
+    quoted (a plain YAML scalar cannot start with `!` at all — that
+    position is reserved for a tag indicator), so requiring the quote
+    closes this false-positive with no loss of real-payload coverage."""
+    d = evaluate(_write(
+        "infra/cloudfront.yaml",
+        content="Resources:\n  Distribution:\n    Properties:\n      DistributionConfig:\n"
+                "        Aliases:\n          - example.com\n"
+                "      AcmCertificateArn: !Ref MyCertificate\n"), EMPTY)
+    assert not _gated(d)
+
+
+def test_mkdocs_aliases_with_env_tag_not_gated():
+    d = evaluate(_write(
+        "mkdocs.yml",
+        content="aliases:\n  - old-page.md: new-page.md\nsite_name: !ENV SITE_NAME\n"), EMPTY)
+    assert not _gated(d)
 
 
 def test_staged_elsewhere_gated():
