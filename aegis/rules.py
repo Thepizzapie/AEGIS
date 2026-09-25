@@ -6828,6 +6828,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
+    (patterns.GH_CONFIG_PATH_RE, "a GitHub CLI (gh) config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
 )
 
@@ -7440,6 +7441,169 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
                          "future registry auth through this config. A human "
                          "may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_DOCKER_CRED_HELPER=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
+def _gh_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_gh_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a `!`-prefixed (shell-routed) value on a GitHub CLI
+    (`gh`) alias, in `gh`'s own `config.yml` -- the `gh`-CLI analog of
+    `rule_git_config_exec_protect`'s own `alias.<name>` bang-value check, one
+    already-trusted, already-authenticated CLI tool over.
+
+    THREAT MODEL: `gh alias set <name> <expansion>` stores `<expansion>` in
+    `~/.config/gh/config.yml`'s `aliases:` map. By default gh parses the
+    expansion as more `gh` arguments -- but an expansion that starts with `!`
+    (or is declared with `gh alias set`'s own `-s`/`--shell` flag) is instead
+    handed whole to a shell interpreter (`sh` on Linux/macOS, `cmd.exe` on
+    Windows) on every future `gh <name>` invocation -- the identical
+    "bang-prefixed value = shell command" convention a git alias already
+    uses, reached through `gh`'s own separate config file and CLI instead of
+    `git config`. `gh` is already on `$PATH`, already trusted, and already
+    carries a live, authenticated GitHub token in essentially any repo this
+    agent works in that has a GitHub remote -- so a planted alias runs with
+    that trust and that token, with the invoking user's/CI's full
+    privileges, on the very next bare `gh <name>`, by this agent, a
+    teammate, or an unattended CI step, no git/session-restart trigger
+    needed, and a diff that reads as an ordinary one-line config addition
+    (`bugs: '!gh issue list --label=bug'`), not a backdoor.
+
+    Config (`policy.gh_config_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate -- a
+    repo's own trusted alias-bootstrap script, say). Defaults to `ask` for
+    the same reason every sibling `*_protect` guard does: a shell-routed
+    `gh` alias is routine, sanctioned power-user setup (composing `gh`
+    output through `grep`/`jq`, say) -- it just needs a human to have
+    actually looked at the specific command being wired in.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle `AEGIS_ALLOW_GH_CONFIG_EXEC=1` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable -- the same invariant
+    `rule_git_config_exec_protect` holds for its own alias check.
+
+    Gated on the VALUE (a `!`-prefix, or the `-s`/`--shell` CLI flag), not
+    the key alone -- an ordinary alias (`co: pr checkout`) is extremely
+    common, sanctioned setup, and a key-only gate on `aliases:` would fire
+    on nearly every `gh` power-user's config, the same ask-fatigue trade-off
+    `rule_git_config_exec_protect`'s own bang-value (as opposed to
+    key-only) gate already made for the identical shape.
+
+    Overlap with `rule_containment`: the literal, absolute/home-relative
+    form of `~/.config/gh/config.yml` is ALREADY in `CRED_RE` (containment's
+    own credential-store path list, ``[/\\\\]\\.config[/\\\\]gh\\b``) -- so for a
+    native Read/Edit/Write, or any shell command that mentions that literal
+    path text, containment already denies it non-escapably, running earlier
+    in `BUILTIN_RULES` (a STRONGER outcome, not a gap; `evaluate()` is
+    first-deny-wins). This guard adds real, NON-redundant coverage in
+    exactly the classes containment's path-string check misses, the same
+    three `rule_docker_cred_helper_protect`'s own docstring discloses for
+    its own overlap with the identical check: (1) an MCP-tool write --
+    `CRED_RE`'s check structurally never runs for `ActionClass.MCP`; (2) a
+    relative path with no leading separator (`CRED_RE` requires one
+    immediately before `.config`; this guard's own `GH_CONFIG_PATH_RE`
+    accepts start-of-string too); and (3) content staged in a
+    differently-named file before being moved into place (the strong,
+    path-independent `aliases:`-block check needs no path confirmation at
+    all).
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` relocating the config file
+    to a path with no `.config/gh`/`GitHub CLI` segment at all is not
+    covered -- the same env-var-relocation class `rule_cloud_cred_exec_
+    protect`'s own `AWS_CONFIG_FILE`/`KUBECONFIG` gap already accepts. A
+    value assembled indirectly (shell variable concatenation, a wrapper
+    script that itself invokes `gh alias set`) defeats every check here,
+    the same "computed indirectly" class every sibling guard already
+    accepts. `gh config set editor|pager|browser <cmd>` names an external
+    program gh execs directly, no `!` marker needed -- a related but
+    DISTINCT mechanism this guard does not cover (see `GH_CONFIG_PATH_RE`'s
+    own module comment in `patterns.py`). `gh extension install
+    <owner/repo>` is a related but DISTINCT surface too -- the `gh`-CLI
+    analog of `rule_path_hijack_protect`'s own PATH-shadow surface, not
+    this guard's "write now, auto-exec later via a config key" shape; ask
+    for it a rule of its own rather than folding a differently-shaped
+    mechanism into this guard's coverage claim."""
+    cfg = getattr(policy, "gh_config_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "gh-config-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            path_text = p + " " + " ".join(_flatten_strings(a))
+        scan_content = patterns.strip_comment_lines(content)
+        path_confirmed = bool(path_text and patterns.GH_CONFIG_PATH_RE.search(path_text))
+        hit = bool(
+            patterns.GH_ALIAS_BANG_YAML_RE.search(scan_content)
+            or (path_confirmed and patterns.GH_ALIAS_BANG_CONTENT_RE.search(scan_content)))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_GH_CONFIG_EXEC")
+                or _gh_config_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "gh-config-exec-protect",
+                         f"'{p}' is being written with a '!'-prefixed "
+                         "(shell-routed) GitHub CLI alias — it runs "
+                         "automatically, through a shell interpreter, with "
+                         "the invoking user's/CI's full privileges and a "
+                         "live, authenticated gh token, on the very next "
+                         "matching `gh <alias>` invocation. Review the "
+                         "change, then confirm with "
+                         "AEGIS_ALLOW_GH_CONFIG_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        hit = bool(
+            patterns.GH_ALIAS_SET_CLI_RE.search(scan_cmd)
+            or patterns.GH_ALIAS_BANG_YAML_RE.search(scan_cmd))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_GH_CONFIG_EXEC")
+                or _gh_config_exec_allowed_by_policy(cfg, cmd)):
+            return None
+        return _finish(Decision(action, "gh-config-exec-protect",
+                         "A '!'-prefixed (shell-routed) GitHub CLI alias is "
+                         "being set from a shell — it runs automatically, "
+                         "through a shell interpreter, with the invoking "
+                         "user's/CI's full privileges and a live, "
+                         "authenticated gh token, on the very next matching "
+                         "`gh <alias>` invocation. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_GH_CONFIG_EXEC=1; a spawned agent "
                          "cannot."))
     return None
 
@@ -8260,6 +8424,7 @@ _CORE_RULES = (
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
+    rule_gh_config_exec_protect,
     rule_terraform_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,

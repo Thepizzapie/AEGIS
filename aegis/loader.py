@@ -64,6 +64,7 @@ def load_policy(path) -> Policy:
         "claude_env": {}, "claude_cred_helper": {},
         "conftest": {}, "pysite": {},
         "ipython_startup": {}, "cloud_cred_exec": {}, "docker_cred_helper": {},
+        "gh_config_exec": {},
         "terraform_exec": {}, "fetch_to_file": {},
         "inject": {}, "failures": {},
         "completion": {},
@@ -121,6 +122,7 @@ def load_policy(path) -> Policy:
                   ipython_startup=st["ipython_startup"],
                   cloud_cred_exec=st["cloud_cred_exec"],
                   docker_cred_helper=st["docker_cred_helper"],
+                  gh_config_exec=st["gh_config_exec"],
                   terraform_exec=st["terraform_exec"],
                   fetch_to_file=st["fetch_to_file"],
                   inject=st["inject"], failures=st["failures"],
@@ -159,7 +161,8 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
                 "devcontainer_exec",
                 "vscode_tasks_exec", "jetbrains_watcher_exec", "path_hijack", "claude_hooks", "statusline",
                 "permission_bypass", "claude_env", "claude_cred_helper", "conftest", "pysite",
-                "ipython_startup", "cloud_cred_exec", "docker_cred_helper", "terraform_exec",
+                "ipython_startup", "cloud_cred_exec", "docker_cred_helper", "gh_config_exec",
+                "terraform_exec",
                 "fetch_to_file",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):

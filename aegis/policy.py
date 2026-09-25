@@ -389,6 +389,15 @@ class Policy:
     # scope, handing it a live registry credential every time. See
     # rules.rule_docker_cred_helper_protect.
     docker_cred_helper: dict = field(default_factory=dict)
+    # GitHub CLI (gh) alias exec-hijack protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
+    # apply. Covers a `!`-prefixed (shell-routed) value on a `gh` alias --
+    # `~/.config/gh/config.yml`'s `aliases:` map, or the `gh alias set
+    # <name> <expansion>`/`-s`/`--shell` CLI form -- the gh-CLI analog of
+    # `git_config_exec`'s own `alias.<name>` bang-value check, one
+    # already-trusted, already-authenticated CLI tool over. See
+    # rules.rule_gh_config_exec_protect.
+    gh_config_exec: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/

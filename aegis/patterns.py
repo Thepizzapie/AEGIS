@@ -5160,6 +5160,84 @@ def docker_cred_helper_strong_hit(text: str) -> bool:
                 return True
     return False
 
+# ---- GitHub CLI (gh) alias exec-hijack protection ------------------------------
+# GitHub CLI's own config file (`~/.config/gh/config.yml`, or
+# `%AppData%\GitHub CLI\config.yml` on Windows) supports an `aliases:` mapping
+# whose value gh runs through a SHELL INTERPRETER rather than gh's own command
+# parser whenever that value starts with a `!` marker (or `gh alias set` is
+# invoked with `-s`/`--shell`) -- the exact same "bang-prefixed value = shell
+# command" convention `GIT_CONFIG_BANG_VALUE_RE`/`GIT_CONFIG_BANG_VALUE_INI_RE`
+# already gate for a git config `alias.<name>`, one CLI tool over. `gh` is
+# already trusted, already on `$PATH`, and already authenticated (a live
+# `gh auth status` token) in essentially every repo this agent works in that
+# has a GitHub remote -- so a planted alias runs with that trust and that
+# token, with the invoking user's/CI's full privileges, on the very next
+# `gh <alias-name>` invocation, by this agent, a teammate, or an unattended CI
+# step, no git/session-restart trigger needed. Same "write now, auto-exec
+# later, unattended, reads as an ordinary one-line config addition" shape
+# every `*_protect` guard in this file already covers for its own tool's
+# config surface.
+#
+# Two write shapes, mirroring `rule_git_config_exec_protect`'s own split:
+# a direct write/edit to gh's config.yml planting a bang-prefixed `aliases:`
+# entry, and the CLI form (`gh alias set <name> '!<command>'`, or the
+# equivalent `-s`/`--shell` flag, which routes the expansion through a shell
+# with no `!` needed in the literal text at all) that mutates the same file
+# with no file-write tool call for an Edit/Write-only check to ever see.
+GH_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"gh" + _WIN_TRIM + _SEP
+    + r"config\.ya?ml" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])GitHub\s+CLI" + _WIN_TRIM + _SEP + r"config\.ya?ml" + _CI_END,
+    re.IGNORECASE,
+)
+# Path-INDEPENDENT strong form: a real `aliases:` YAML block followed, within
+# a bounded window, by a nested `<name>: '!...'`/`<name>: !...` entry -- same
+# "staged in an arbitrarily-named file, redirected at in a separate call"
+# reasoning `GIT_CONFIG_BANG_VALUE_INI_RE`'s own comment documents, and the
+# same bounded-gap technique `AWS_CRED_PROCESS_INI_RE` uses for its own
+# `[section]`-anchored strong form (a fixed-size DOTALL gap, not a full YAML
+# parse).
+GH_ALIAS_BANG_YAML_RE = re.compile(
+    r"\baliases\s*:[^\n]*\n.{0,2000}?[\w.:-]{1,80}\s*:\s*['\"]?!",
+    re.IGNORECASE | re.DOTALL,
+)
+# Weak, path-CONFIRMED-only key check -- mirrors GIT_CONFIG_BANG_VALUE_CONTENT_RE:
+# once the path is a confirmed gh config.yml, a bare `<name>: '!...'` line (an
+# Edit's `new_string` is typically just the inserted alias line, the `aliases:`
+# header itself is `old_string` context that never appears in `new_string`) is
+# high-signal on its own -- gh's config.yml has no other key whose value would
+# legitimately start with `!`.
+GH_ALIAS_BANG_CONTENT_RE = re.compile(r"[\w.:-]{1,80}\s*:\s*['\"]?!", re.IGNORECASE)
+# CLI form: `gh alias set <name> <expansion>`. The first alternative anchors on
+# the real CLI grammar -- the expansion is the token immediately after the
+# alias name -- the same "value is the token right after the key, not a
+# freeform later `!`" fix `GIT_CONFIG_BANG_VALUE_RE`'s own docstring discloses
+# needing for the identical git-alias shape (an unrelated `!` appearing later
+# in an ordinary expansion, e.g. an exclamation mark in prose text, must not
+# gate). The second alternative catches `-s`/`--shell` wherever it appears in
+# the same invocation (either before or after the alias name/expansion --
+# cobra flags are not position-locked) -- that flag alone routes the
+# expansion through a shell with no `!` marker required in the literal text.
+GH_ALIAS_SET_CLI_RE = re.compile(
+    r"\bgh\b[^|;&\n]{0,60}\balias\b[^|;&\n]{0,20}\bset\b\s+[\w.:-]{1,80}\s+['\"]?!"
+    r"|\bgh\b[^|;&\n]{0,60}\balias\b[^|;&\n]{0,20}\bset\b[^|;&\n]{0,250}"
+    r"(?<!\S)(?:-s|--shell)(?=[\s=]|$)",
+    re.IGNORECASE,
+)
+# Honest, disclosed scope, the same denylist trade-offs every guard in this
+# file accepts: `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` relocating the config file
+# to a path with no `.config/gh`/`GitHub CLI` segment at all is not covered --
+# the same env-var-relocation class `AWS_CONFIG_FILE`/`KUBECONFIG` already
+# leave open above. `gh config set editor|pager|browser <cmd>` names an
+# external program gh execs directly, no `!` marker needed (closer to
+# `credential_process`'s "key alone is dangerous" shape than to the alias
+# convention) -- a related but DISTINCT mechanism this guard does not cover.
+# `gh extension install <owner/repo>` is a related but DISTINCT surface too:
+# it clones and can auto-run a `gh-<name>` executable on the next bare
+# `gh <name>` invocation, no config-file write at all -- the `gh`-CLI analog
+# of `rule_path_hijack_protect`'s own PATH-shadow surface, not this guard's
+# "write now, auto-exec later via a config key" shape.
+
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
 # `external` provider's `data "external"` data source all name an arbitrary
