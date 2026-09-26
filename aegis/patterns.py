@@ -2620,21 +2620,31 @@ DIR_LOCALS_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# QA finding (independent adversarial review): plain `\s*` gaps tolerate a
+# newline between tokens but not an entirely ordinary Elisp `;`-to-end-of-
+# line comment (e.g. explaining WHY a switch is set) — a real one-line
+# authoring pattern that silently defeated `DIR_LOCALS_ENABLE_EVAL_RE`.
+# `_ELISP_GAP` accepts any mix of whitespace and `;` line-comments between
+# tokens instead, the Elisp-syntax analog of `strip_comment_lines` (which
+# only strips `#`-led lines, the wrong comment character for this language).
+_ELISP_GAP = r"(?:\s|;[^\n]*)*"
+
 # The dangerous key itself, in the only shape `.dir-locals.el`'s own alist
 # file format allows for a per-directory variable binding: a dotted pair,
 # ``(eval . FORM)``. Value-agnostic, the same "key alone is enough" reasoning
 # `JETBRAINS_WATCHER_PROGRAM_RE`/`GIT_ATTRS_EXEC_KEY_RE` already apply to a
 # key with no legitimate purpose here other than naming code to run.
 DIR_LOCALS_EVAL_RE = re.compile(
-    r"\(\s*eval\s*\.",
+    r"\(" + _ELISP_GAP + r"eval" + _ELISP_GAP + r"\.",
 )
 # Companion suppression switches -- either one disarms Emacs's own
 # confirmation prompt for the `eval` form above.
 DIR_LOCALS_ENABLE_EVAL_RE = re.compile(
-    r"\benable-local-eval\s*\.\s*t\b",
+    r"\benable-local-eval\b" + _ELISP_GAP + r"\." + _ELISP_GAP + r"t\b",
 )
 DIR_LOCALS_SAFE_VALUES_RE = re.compile(
-    r"\bsafe-local-variable-values\b[\s\S]{0,200}?\(\s*eval\s*\.",
+    r"\bsafe-local-variable-values\b[\s\S]{0,200}?\("
+    + _ELISP_GAP + r"eval" + _ELISP_GAP + r"\.",
 )
 
 

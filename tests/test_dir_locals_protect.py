@@ -136,6 +136,30 @@ def test_enable_local_eval_switch_alone_gated():
     assert _gated(d) and d.rule == RULE
 
 
+def test_enable_local_eval_with_comment_between_tokens_gated():
+    # QA finding (independent adversarial review): a plain `\s*` gap
+    # tolerates a newline between tokens but not an entirely ordinary Elisp
+    # `;`-to-end-of-line comment explaining WHY the switch is set -- a
+    # complete, silent bypass before `_ELISP_GAP` replaced every inter-token
+    # gap in patterns.py.
+    content = "(enable-local-eval\n ;; approved by team lead\n . t)"
+    d = evaluate(_write(".dir-locals.el", content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_enable_local_eval_with_comment_gated_from_shell():
+    cmd = ("cat > .dir-locals.el <<'EOF'\n"
+           "(enable-local-eval\n ;; approved by team lead\n . t)\nEOF")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_eval_form_with_comment_before_dot_gated():
+    content = "((nil . ((eval ;; run on open\n . (shell-command \"id\")))))"
+    d = evaluate(_write(".dir-locals.el", content), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
 def test_safe_local_variable_values_preapproval_gated():
     content = (
         "((nil . ((eval . (shell-command \"id\"))\n"
@@ -240,6 +264,40 @@ def test_shell_eval_without_dir_locals_path_not_gated():
     # Emacs config files, not a generic "(eval ." ban.
     d = evaluate(_shell("grep -r '(eval .' ."), EMPTY)
     assert d.action == Action.ALLOW
+
+
+def test_known_gap_glued_redirect_not_gated():
+    # KNOWN, DISCLOSED gap (independent adversarial bypass-hunting review):
+    # `DIR_LOCALS_PATH_RE` needs a real separator immediately before the
+    # filename, like every sibling `*_PATH_RE` in this file -- a shell
+    # redirect glued with no space at all (valid, ordinary shell syntax)
+    # evades it. Reproduces identically against
+    # `rule_jetbrains_watcher_protect` (confirmed during QA): a shared,
+    # pre-existing gap in the boundary group every `*_PATH_RE` inherits,
+    # not something introduced by or unique to this guard. This test pins
+    # the current (accepted) behavior, not a passing security property.
+    cmd = "echo '((nil . ((eval . (shell-command \"id\")))))'>.dir-locals.el"
+    d = evaluate(_shell(cmd), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_known_gap_split_across_write_then_edit_not_gated():
+    # KNOWN, DISCLOSED gap (independent adversarial bypass-hunting review):
+    # Aegis evaluates each tool call as an independent Event, so the literal
+    # `(eval . FORM)` text can be assembled across two ORDINARY, separately
+    # -evaluated calls on the same target file -- an unclosed `(eval`
+    # planted by one Write, closed by a later Edit whose `new_string` never
+    # itself contains the word "eval" -- with neither call gating. The same
+    # "split across independently-issued tool calls" limitation
+    # `rule_git_hooks_protect`'s own docstring already discloses for its own
+    # surface; this test pins the current (accepted) behavior, not a
+    # passing security property.
+    d1 = evaluate(_write(".dir-locals.el",
+                          "((nil . ((indent-tabs-mode . nil)\n          (eval"), EMPTY)
+    assert d1.action == Action.ALLOW
+    d2 = evaluate(_edit_content(".dir-locals.el",
+                                 ' . (shell-command "id"))))\n'), EMPTY)
+    assert d2.action == Action.ALLOW
 
 
 # ---- escapability: human-only, matching every sibling *_protect guard --------

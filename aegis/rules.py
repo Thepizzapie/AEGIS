@@ -4439,7 +4439,51 @@ def rule_dir_locals_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``*_protect`` guard relies on; and the MCP structural fallback below
     (a decomposed ``{"var": "eval", "form": "..."}``-shaped tool-arg
     encoding) only recognizes a small, disclosed set of plausible key names
-    (``var``/``variable``/``symbol``), not an exhaustive one."""
+    (``var``/``variable``/``symbol``), not an exhaustive one. Also, since
+    Aegis evaluates each tool call as an independent `Event`, the literal
+    dotted-pair text can be assembled across two ORDINARY, separately-
+    evaluated calls on the same target file (an unclosed `(eval` planted by
+    one `Write`, closed by a later `Edit`'s `new_string` that never itself
+    contains the word "eval") with neither call gating — the same "split
+    across independently-issued tool calls" limitation `rule_git_hooks_
+    protect`'s own docstring already discloses for its own surface, not new
+    to this guard. And `DIR_LOCALS_PATH_RE` — like every sibling
+    ``*_PATH_RE`` in this file, `JETBRAINS_WATCHER_PATH_RE` included — needs
+    a real separator character immediately before the filename
+    (whitespace/quote/slash/`=`); a shell redirect glued with no space at
+    all (`echo ... >.dir-locals.el`, valid, ordinary shell syntax) evades it
+    exactly as it evades every sibling guard sharing that same boundary
+    group — a pre-existing, shared gap confirmed to reproduce identically
+    against `rule_jetbrains_watcher_protect`, disclosed here rather than
+    patched in this one guard alone (a real fix touches the shared boundary
+    group every `*_PATH_RE` in this file inherits from, not this guard's own
+    pattern in isolation).
+
+    QA history (two independent, parallel reviews, same convention
+    `rule_path_hijack_protect`/`rule_claude_cred_helper_protect` used). A
+    design/consistency round confirmed full end-to-end wiring (`_CORE_RULES`,
+    `_FETCH_HUMAN_ESCAPABLE`, `Policy`, all three `loader.py` spots, both
+    `skills.py` knob lists, the `_REMEDIES` table, the README guard table),
+    identical rule-name/env-toggle spelling everywhere it matters, a live
+    YAML `dir_locals_exec:` round-trip through `load_policy()`, and the
+    docstring's own factual claims (the `_vscode_struct_kv_hit` key names,
+    the escapability path) against the actual code — no defects found. An
+    independent adversarial round confirmed one real, undisclosed bug, fixed
+    here: `DIR_LOCALS_ENABLE_EVAL_RE`/`DIR_LOCALS_SAFE_VALUES_RE`'s plain
+    `\\s*` gaps tolerated a newline between tokens but not an entirely
+    ordinary Elisp `;`-to-end-of-line comment explaining WHY a switch was
+    set (`(enable-local-eval\\n ;; approved by team lead\\n . t)`), a
+    complete, silent bypass with no rule firing at all; fixed by replacing
+    every inter-token gap (including inside `DIR_LOCALS_EVAL_RE` itself, for
+    the identical reason) with `_ELISP_GAP`, which tolerates any mix of
+    whitespace and `;`-comments — the Elisp-syntax analog of
+    `strip_comment_lines` (which only strips `#`-led lines, the wrong
+    comment character for this language). The same round also surfaced the
+    glued-redirect and split-across-calls gaps now disclosed above, and
+    confirmed (not a bug, reproduced identically against
+    `rule_jetbrains_watcher_protect`) that the glued-redirect one is
+    inherited/shared, not introduced here. Full suite green throughout
+    (2508 passed before the fix, verified green again after)."""
     cfg = getattr(policy, "dir_locals_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
