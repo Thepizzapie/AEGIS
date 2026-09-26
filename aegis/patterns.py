@@ -2590,6 +2590,64 @@ JETBRAINS_WATCHER_PROGRAM_RE = re.compile(
 )
 
 
+# ---- Emacs directory-local-variables auto-eval hijack ----
+# `.dir-locals.el` (and its Emacs 26.1+ secondary sibling `.dir-locals-2.el`,
+# merged the same way) defines directory-local variables Emacs applies
+# automatically to every buffer visiting a file anywhere under that
+# directory, recursively -- no git/CI/boot/folder-reopen trigger needed, just
+# an ordinary `find-file`/`dired` visit of ANY file in the tree, the same
+# "the single most routine action in a session" trigger bar
+# `rule_jetbrains_watcher_protect` already flagged as this editor/IDE guard
+# family's lowest, one editor over. Directory-local variables are ordinarily
+# inert DATA a major mode merely reads (indentation style, a
+# `compile-command` STRING) -- except the one variable name Emacs itself
+# treats specially: `eval`, bound to an arbitrary Emacs Lisp FORM Emacs
+# `eval`s on that same visit, not data a mode reads. `eval` is hard-coded
+# risky (`risky-local-variable-p` returns t for it unconditionally, upstream,
+# unrelated to the value), so Emacs's own stock behavior is to prompt
+# ("...values that may not be safe... Apply variables...? y/n/!") before
+# running it -- unless one of two companion switches, planted in the SAME
+# file, already disarmed that prompt: `enable-local-eval` bound non-nil
+# (silences the eval-specific confirmation for every `eval` form in the
+# directory tree from that point on) or a `safe-local-variable-values` entry
+# pre-registering this exact `eval` form as already-approved (the cache
+# Emacs's own "!" answer writes to, seeded directly instead of earned). Same
+# "plant the payload AND its own suppression switch in the same write" shape
+# `VSCODE_SETTINGS_PATH_RE`'s `task.allowAutomaticTasks: "on"` already covers
+# for VS Code's own one-time confirmation.
+DIR_LOCALS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.dir-locals(?:-2)?\.el" + _CI_END,
+    re.IGNORECASE,
+)
+
+# QA finding (independent adversarial review): plain `\s*` gaps tolerate a
+# newline between tokens but not an entirely ordinary Elisp `;`-to-end-of-
+# line comment (e.g. explaining WHY a switch is set) — a real one-line
+# authoring pattern that silently defeated `DIR_LOCALS_ENABLE_EVAL_RE`.
+# `_ELISP_GAP` accepts any mix of whitespace and `;` line-comments between
+# tokens instead, the Elisp-syntax analog of `strip_comment_lines` (which
+# only strips `#`-led lines, the wrong comment character for this language).
+_ELISP_GAP = r"(?:\s|;[^\n]*)*"
+
+# The dangerous key itself, in the only shape `.dir-locals.el`'s own alist
+# file format allows for a per-directory variable binding: a dotted pair,
+# ``(eval . FORM)``. Value-agnostic, the same "key alone is enough" reasoning
+# `JETBRAINS_WATCHER_PROGRAM_RE`/`GIT_ATTRS_EXEC_KEY_RE` already apply to a
+# key with no legitimate purpose here other than naming code to run.
+DIR_LOCALS_EVAL_RE = re.compile(
+    r"\(" + _ELISP_GAP + r"eval" + _ELISP_GAP + r"\.",
+)
+# Companion suppression switches -- either one disarms Emacs's own
+# confirmation prompt for the `eval` form above.
+DIR_LOCALS_ENABLE_EVAL_RE = re.compile(
+    r"\benable-local-eval\b" + _ELISP_GAP + r"\." + _ELISP_GAP + r"t\b",
+)
+DIR_LOCALS_SAFE_VALUES_RE = re.compile(
+    r"\bsafe-local-variable-values\b[\s\S]{0,200}?\("
+    + _ELISP_GAP + r"eval" + _ELISP_GAP + r"\.",
+)
+
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the

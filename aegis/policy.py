@@ -285,6 +285,17 @@ class Policy:
     # project, no Run/build/git/CI trigger needed. See
     # rules.rule_jetbrains_watcher_protect.
     jetbrains_watcher_exec: dict = field(default_factory=dict)
+    # Emacs directory-local-variables auto-eval protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers .dir-locals.el/.dir-locals-2.el
+    # carrying an `(eval . FORM)` binding -- Emacs itself `eval`s the FORM
+    # automatically, unattended, the next time ANYONE opens ANY file under
+    # this directory tree in Emacs, no Run/build/git/CI/boot trigger needed
+    # -- and the two companion switches (`enable-local-eval` non-nil, a
+    # `safe-local-variable-values` entry pre-approving the form) that
+    # disarm Emacs's own confirmation prompt for it. See
+    # rules.rule_dir_locals_protect.
+    dir_locals_exec: dict = field(default_factory=dict)
     # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted
