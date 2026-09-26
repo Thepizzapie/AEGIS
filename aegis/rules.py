@@ -4338,6 +4338,200 @@ def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+def _dir_locals_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_dir_locals_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering an Emacs directory-local-variables auto-eval
+    payload in ``.dir-locals.el``/``.dir-locals-2.el`` — an ``(eval . FORM)``
+    binding Emacs `eval`s automatically, unattended, the next time ANYONE
+    opens ANY file anywhere under this directory tree in Emacs, no
+    Run/build/git/CI/boot trigger needed.
+
+    THREAT MODEL: this file's editor/IDE auto-run family
+    (`rule_devcontainer_exec_protect`, `rule_vscode_tasks_protect`,
+    `rule_jetbrains_watcher_protect`) each gate one editor's own "runs
+    unattended, no explicit launch" primitive. Emacs has one none of them
+    reach: `.dir-locals.el` (searched for in every ancestor of the buffer's
+    directory, the same upward-search shape `DIRENV_PATH_RE` already covers
+    for `.envrc`) defines variables Emacs applies to every buffer visiting a
+    file under that directory. Ordinarily these are inert DATA a major mode
+    merely reads (`indent-tabs-mode`, a `compile-command` STRING) — except
+    the one variable name Emacs itself hard-codes as risky regardless of
+    value: `eval`, bound to a live Lisp FORM Emacs actually runs, not data a
+    mode consults. `rule_jetbrains_watcher_protect`'s own docstring called a
+    File Watcher's file-SAVE trigger the lowest bar in that guard family;
+    `.dir-locals.el` sits at that same bar one editor over — a plain
+    `find-file`/`dired` VISIT, the single most routine action in an entire
+    Emacs session, is enough, with no VS Code-style one-time "Allow
+    Automatic Tasks" folder-open checkpoint of its own kind. Like a
+    devcontainer config or a VS Code task, `.dir-locals.el` is ordinarily
+    TRACKED and reviewed as routine shared editor config (indentation/
+    formatting conventions meant to apply to every contributor), so a
+    planted `eval` form reads as ordinary project tooling in a diff, not a
+    detonator — the same "hidden in plain sight" property this guard's
+    whole editor/IDE-auto-run family shares.
+
+    Emacs's OWN stock behavior already prompts before running an `eval` form
+    ("...values that may not be safe... Apply variables...? y/n/!"), so this
+    guard's marginal value is threefold: (1) it fires at WRITE time, in this
+    session, before any human's Emacs ever visits the file and has to make
+    that call at all — the same "catch it before the human's own backstop is
+    even reached" posture every guard in this file takes, not a substitute
+    for trusting that backstop; (2) it also gates the two companion switches
+    that DISARM Emacs's own prompt when planted in the same file —
+    `enable-local-eval` bound non-nil (silences the eval confirmation for
+    every future `eval` form in the tree) and a `safe-local-variable-values`
+    entry pre-registering this exact form as already-approved (seeding the
+    cache Emacs's own "!" answer writes to, instead of earning it) — the
+    same "plant the payload AND its own suppression switch in the same
+    write" shape `rule_vscode_tasks_protect`'s `task.allowAutomaticTasks:
+    "on"` already covers, and Emacs's confirmation is genuinely easy for a
+    busy human to wave through with "!" (remember only this session) or "!"
+    at a project they've cloned specifically to look at, unlike a
+    conscious `AEGIS_ALLOW_*` env-var decision; and (3) a teammate or CI
+    checkout of the SAME repo may run under an Emacs configuration where
+    `enable-local-eval`/`safe-local-variable-values` were already set
+    globally (a `custom.el`/init-file default some users carry), in which
+    case Emacs's own prompt never fires there at all.
+
+    Config (``policy.dir_locals_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the
+    gate — a repo's own reviewed, intentional `.dir-locals.el`, say).
+    Defaults to ``ask``, not ``deny``, matching every sibling ``*_protect``
+    guard in this file: directory-local variables are legitimate, common
+    project tooling — only the `eval`-shaped subset here is gated.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_DIR_LOCALS_EXEC=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable, the same invariant
+    every escapable guard in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: an `eval` value assembled indirectly (a templating step, a
+    build script writing the file) rather than appearing as a literal
+    dotted-pair `(eval . ...)` defeats this check, the same "computed
+    indirectly" class every sibling guard already accepts; Emacs also
+    accepts the equivalent binding via `dir-locals-set-class-variables`/
+    `dir-locals-set-directory-class` (a `.dir-locals.el` that DEFINES a class
+    programmatically rather than writing the literal alist shape this
+    guard's regex expects) or a per-file `-*- eval: ... -*-` first-line
+    cookie / trailing `Local Variables:` block in an ORDINARY source file
+    (file-local, not directory-local, variables — the same risky-by-default
+    `eval` mechanism, one file at a time instead of a whole directory tree) —
+    both real, disclosed, NOT covered by this guard, left as a
+    candidate follow-up the same way `rule_devcontainer_exec_protect`/
+    `rule_vscode_tasks_protect` themselves disclosed the JetBrains
+    "Before launch"/File-Watcher surface before either was covered; a direct
+    fetch-to-file write (``curl -o .dir-locals.el ...``) is caught by none
+    of the shell branch's write-verb checks — closed instead by
+    `rule_fetch_to_file_protect` reusing this guard's own
+    `DIR_LOCALS_PATH_RE`, the same division of labor every sibling
+    ``*_protect`` guard relies on; and the MCP structural fallback below
+    (a decomposed ``{"var": "eval", "form": "..."}``-shaped tool-arg
+    encoding) only recognizes a small, disclosed set of plausible key names
+    (``var``/``variable``/``symbol``), not an exhaustive one."""
+    cfg = getattr(policy, "dir_locals_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "dir-locals-protect-monitor")
+            return None
+        return would
+
+    def _content_hit(content: str) -> bool:
+        return bool(patterns.DIR_LOCALS_EVAL_RE.search(content)
+                    or patterns.DIR_LOCALS_ENABLE_EVAL_RE.search(content)
+                    or patterns.DIR_LOCALS_SAFE_VALUES_RE.search(content))
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.DIR_LOCALS_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        hit = _content_hit(content)
+        # Structural MCP-arg fallback, the same class of gap
+        # `rule_jetbrains_watcher_protect`'s own QA history found for its
+        # `{"name": "program", "value": ...}` shape: an MCP tool that
+        # decomposes the alist entry into a {"var"/"variable"/"symbol":
+        # "eval", ...} pair rather than emitting literal Lisp syntax
+        # defeats `DIR_LOCALS_EVAL_RE` entirely, since "eval" would surface
+        # via `_flatten_strings` only as a bare leaf VALUE, never adjacent
+        # to a literal `(eval .`. Scoped to `ActionClass.MCP` only, matching
+        # every sibling guard's identical scoping, since Edit/Write
+        # `content` is always real, reliable file text.
+        if not hit and ev.action == ActionClass.MCP:
+            hit = (_vscode_struct_kv_hit(a, "var", "eval")
+                   or _vscode_struct_kv_hit(a, "variable", "eval")
+                   or _vscode_struct_kv_hit(a, "symbol", "eval"))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_DIR_LOCALS_EXEC")
+                or _dir_locals_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "dir-locals-protect",
+                         f"'{p}' is planting/altering an Emacs "
+                         "directory-local `eval` form (or a switch that "
+                         "silences Emacs's own confirmation for one) — it "
+                         "runs arbitrary Emacs Lisp automatically, "
+                         "unattended, the next time ANYONE opens ANY file "
+                         "under this directory tree in Emacs, no "
+                         "Run/build/git/CI trigger needed. Review the "
+                         "change, then confirm with "
+                         "AEGIS_ALLOW_DIR_LOCALS_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not write_verb:
+            return None
+        if not patterns.DIR_LOCALS_PATH_RE.search(cmd):
+            return None
+        if not _content_hit(cmd):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_DIR_LOCALS_EXEC")
+                or _dir_locals_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "dir-locals-protect",
+                         "An Emacs directory-local `eval` form (or its own "
+                         "confirmation-silencing switch) is being planted "
+                         "in .dir-locals.el from a shell — it runs "
+                         "arbitrary Emacs Lisp automatically, unattended, "
+                         "the next time anyone opens any file under this "
+                         "directory tree in Emacs. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_DIR_LOCALS_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -6820,6 +7014,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
     (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
+    (patterns.DIR_LOCALS_PATH_RE, "an Emacs directory-local-variables file"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -8249,6 +8444,7 @@ _CORE_RULES = (
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_jetbrains_watcher_protect,
+    rule_dir_locals_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,
