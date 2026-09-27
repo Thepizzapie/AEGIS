@@ -2667,14 +2667,15 @@ JETBRAINS_RUNCONFIG_BEFORE_TASK_RE = re.compile(
     r"\bToolBeforeRunTask\b",
     re.IGNORECASE,
 )
-# The tool-definition key: `COMMAND` IS an ordinary English word (unlike
-# `ToolBeforeRunTask`), so this one DOES need the `name="COMMAND"` attribute
-# adjacency `JETBRAINS_WATCHER_PROGRAM_RE` already requires for `program`,
-# for the identical reason.
-JETBRAINS_TOOLS_COMMAND_RE = re.compile(
-    r"\bname\s*=\s*[\"']COMMAND[\"']",
-    re.IGNORECASE,
-)
+# NOTE: `.idea/tools/*.xml` (the `COMMAND` tool-definition file) has no
+# content regex of its own here at all -- round 1's first draft gated it on
+# a `name="COMMAND"` attribute-adjacency check (the same shape
+# `JETBRAINS_WATCHER_PROGRAM_RE` uses for `program`), but that check had a
+# severe value-only-diff bypass with no bare-value marker available to
+# close it the same way `JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE` below does
+# for `actionId` (an external command's VALUE has no fixed lexical shape).
+# Closed instead by moving that file to PATH-ONLY gating in
+# `rule_jetbrains_run_config_protect` -- see its own docstring QA history.
 # QA finding (independent adversarial review, bypass-hunting round): a
 # single, entirely ordinary Edit-tool call that swaps ONLY the `actionId`
 # VALUE of an already-planted `ToolBeforeRunTask` (`old_string`/`new_string`
