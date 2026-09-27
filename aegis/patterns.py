@@ -2675,6 +2675,31 @@ JETBRAINS_TOOLS_COMMAND_RE = re.compile(
     r"\bname\s*=\s*[\"']COMMAND[\"']",
     re.IGNORECASE,
 )
+# QA finding (independent adversarial review, bypass-hunting round): a
+# single, entirely ordinary Edit-tool call that swaps ONLY the `actionId`
+# VALUE of an already-planted `ToolBeforeRunTask` (`old_string`/`new_string`
+# covering just `Tool_<toolset>_<OldName>` -> `Tool_<toolset>_<EvilName>`, or
+# an `enabled="false"`/`enabled="true"` flip) never repeats the literal
+# `ToolBeforeRunTask` text in that diff fragment at all, silently bypassing
+# `JETBRAINS_RUNCONFIG_BEFORE_TASK_RE` even under `mode: deny` -- the same
+# "value-only Edit diff" bug class this file's own `.gitmodules` guard found
+# and closed in its documented round-2 QA history. Closed the same way
+# there was: a bare-value marker requiring no key adjacency at all. Real
+# IntelliJ External-Tool action IDs are always generated with this exact
+# `Tool_<toolset-name>_<tool-name>` literal prefix (there is no other
+# ordinary reason this token would appear inside a run-configuration file),
+# so a value-only diff that redirects an existing wiring to a DIFFERENT tool
+# is still caught even with no surrounding key text at all. Narrower than
+# `JETBRAINS_RUNCONFIG_BEFORE_TASK_RE`'s bare-token match in one respect,
+# broader in another: it does not require the wiring OPTION itself to be
+# present (so it also catches a value-only diff against an `actionId` that
+# happens to reference an External Tool for some OTHER before/after-run
+# task kind IntelliJ also supports), which is the intended, safe direction
+# for this content-based check (false ASK, never false ALLOW).
+JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
+    r"\bTool_",
+    re.IGNORECASE,
+)
 
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any

@@ -212,16 +212,98 @@ def test_shell_cd_elsewhere_then_bare_filename_runconfig_not_gated():
     assert d.action == Action.ALLOW
 
 
-# ---- .idea/tools/*.xml (COMMAND definition) ------------------------------------
+def test_shell_cd_into_lookalike_runconfig_dir_not_gated():
+    # A directory that merely starts with the same prefix
+    # (`.idea/runConfigurationsOld`, not the real `.idea/runConfigurations`)
+    # must not satisfy `_CI_END`'s boundary check.
+    cmd = ('cd .idea/runConfigurationsOld && echo '
+           '\'<option name="ToolBeforeRunTask" enabled="true" actionId="x" />\' '
+           ">> App.xml")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_shell_sed_insert_runconfig_gated():
+    d = evaluate(_shell(
+        "sed -i '/method/a\\  <option name=\"ToolBeforeRunTask\" enabled=\"true\" "
+        'actionId="x" />\' .idea/runConfigurations/App.xml'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+# ---- value-only-diff regressions (bypass-hunting QA round) --------------------
+# A single, ordinary Edit/MultiEdit/`sed`-style diff that changes ONLY the
+# dangerous VALUE (an `actionId`'s tool-name segment) -- with the adjacent
+# KEY text (`ToolBeforeRunTask`) untouched, on disk, outside that diff
+# fragment entirely -- was a silent, total bypass under `mode: ask` AND
+# `mode: deny` alike (see the rule's own docstring QA history). Closed by
+# `JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE`, a bare marker requiring no key
+# adjacency at all.
+
+def test_edit_actionid_value_only_swap_gated():
+    d = evaluate(_edit_content(".idea/runConfigurations/App.xml",
+                                'actionId="Tool_External Tools_Evil"'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_multi_edit_actionid_value_only_swap_gated():
+    d = evaluate(_multi_edit(".idea/runConfigurations/App.xml",
+                              'actionId="Tool_External Tools_Evil"'), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_sed_actionid_value_only_swap_gated():
+    d = evaluate(_shell(
+        "sed -i 's/Tool_External Tools_Lint/Tool_External Tools_Evil/' "
+        ".idea/runConfigurations/App.xml"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_edit_old_string_context_included_gated():
+    # QA fix: the plain `Edit` branch previously read `new_string` ALONE,
+    # discarding `old_string` -- a real bug independent of the value-only-
+    # diff finding above, since a real Edit call's `old_string` is genuine,
+    # already-on-disk context. Here the KEY text is only present in
+    # `old_string` (the line being replaced), not in `new_string` (the
+    # replacement) -- must still gate.
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                     args={"file_path": ".idea/runConfigurations/App.xml",
+                           "old_string": '<option name="ToolBeforeRunTask" enabled="false" actionId="x" />',
+                           "new_string": '<option name="SOME_OTHER_KEY" enabled="false" actionId="x" />'})
+    d = evaluate(ev, EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_enabled_flip_bare_is_disclosed_residual_gap():
+    # Documented, accepted residual gap (see the rule's own docstring
+    # "Honest scope"): flipping an already-planted, disabled
+    # ToolBeforeRunTask live, with the diff containing neither
+    # `ToolBeforeRunTask` nor a `Tool_`-prefixed actionId value, has no
+    # lexical marker distinguishing it from a routine, unrelated boolean
+    # toggle. Asserting the CURRENT (disclosed, not silently regressed)
+    # behavior, not endorsing it as safe.
+    d = evaluate(_edit_content(".idea/runConfigurations/App.xml", 'enabled="true"'), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+# ---- .idea/tools/*.xml (path-only: no content check to bypass) ----------------
+# QA fix (bypass-hunting round): a content-gated first draft (requiring
+# `name="COMMAND"` literally in the diff) had the identical value-only-diff
+# bug as the runConfigurations branch once had, but with no distinctive
+# bare-value marker available to close it the same way (an external
+# command's VALUE has no fixed lexical shape the way an actionId's
+# `Tool_`-prefix does). Closed instead by moving this file to PATH-ONLY
+# gating -- the same shape `rule_git_hooks_protect` already uses for its own
+# single-purpose target -- so every test below now expects ANY write to this
+# path to gate, regardless of content.
 
 def test_write_tools_command_gated():
     d = evaluate(_write(".idea/tools/External Tools.xml", TOOLS_XML), EMPTY)
     assert _gated(d) and d.rule == RULE
 
 
-def test_write_benign_tools_not_gated():
+def test_write_benign_content_tools_still_gated_path_only():
     d = evaluate(_write(".idea/tools/External Tools.xml", TOOLS_BENIGN_XML), EMPTY)
-    assert d.action == Action.ALLOW
+    assert _gated(d) and d.rule == RULE
 
 
 def test_non_tools_idea_file_not_gated():
@@ -229,10 +311,28 @@ def test_non_tools_idea_file_not_gated():
     assert d.action == Action.ALLOW
 
 
-def test_command_value_elsewhere_not_matching_key_not_gated():
+def test_unrelated_option_content_tools_still_gated_path_only():
     content = '<option name="description" value="the command runs later" />'
     d = evaluate(_write(".idea/tools/External Tools.xml", content), EMPTY)
-    assert d.action == Action.ALLOW
+    assert _gated(d) and d.rule == RULE
+
+
+def test_edit_command_value_only_swap_gated():
+    # The exact bypass the bypass-hunting round reproduced: an Edit diff
+    # covering ONLY the value, no `name="COMMAND"` (or any XML) at all.
+    d = evaluate(_edit_content(".idea/tools/External Tools.xml", "/tmp/evil.sh"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_multi_edit_command_value_only_swap_gated():
+    d = evaluate(_multi_edit(".idea/tools/External Tools.xml", "/tmp/evil.sh"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_shell_sed_command_value_only_swap_gated():
+    d = evaluate(_shell(
+        "sed -i 's#/tmp/safe.sh#/tmp/evil.sh#' '.idea/tools/External Tools.xml'"), EMPTY)
+    assert _gated(d) and d.rule == RULE
 
 
 def test_edit_new_string_tools_gated():
@@ -246,7 +346,10 @@ def test_mcp_write_flat_content_tools_gated():
     assert _gated(d) and d.rule == RULE
 
 
-def test_mcp_structural_name_value_pair_tools_gated():
+def test_mcp_write_nested_structural_content_tools_gated():
+    # Path-only: an MCP tool's decomposed {"name": ..., "value": ...} shape
+    # gates the same as any other content, since there is no content check
+    # left for it to bypass.
     ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__jetbrains__write_tool",
                      action=ActionClass.MCP,
                      args={"path": ".idea/tools/External Tools.xml",
@@ -258,13 +361,19 @@ def test_mcp_structural_name_value_pair_tools_gated():
     assert _gated(d) and d.rule == RULE
 
 
-def test_mcp_structural_unrelated_name_value_tools_not_gated():
+def test_edit_arbitrary_content_tools_still_gated_path_only():
+    d = evaluate(_edit_content(".idea/tools/External Tools.xml",
+                               "name COMMAND value evil"), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_mcp_unrelated_option_content_tools_still_gated_path_only():
     ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__jetbrains__write_tool",
                      action=ActionClass.MCP,
                      args={"path": ".idea/tools/External Tools.xml",
                            "option": {"name": "WORKING_DIRECTORY", "value": "$ProjectFileDir$"}})
     d = evaluate(ev, EMPTY)
-    assert d.action == Action.ALLOW
+    assert _gated(d) and d.rule == RULE
 
 
 def test_single_quoted_command_attr_tools_gated():
@@ -302,6 +411,20 @@ def test_shell_cd_elsewhere_then_bare_filename_tools_not_gated():
            ">> Tools.xml")
     d = evaluate(_shell(cmd), EMPTY)
     assert d.action == Action.ALLOW
+
+
+def test_shell_cd_into_lookalike_tools_dir_not_gated():
+    cmd = ('cd .idea/tools-backup && echo \'<option name="COMMAND" value="x" />\' '
+           ">> Tools.xml")
+    d = evaluate(_shell(cmd), EMPTY)
+    assert d.action == Action.ALLOW
+
+
+def test_shell_sed_insert_tools_gated():
+    d = evaluate(_shell(
+        "sed -i '/exec/a\\  <option name=\"COMMAND\" value=\"/tmp/evil.sh\" />' "
+        "'.idea/tools/External Tools.xml'"), EMPTY)
+    assert _gated(d) and d.rule == RULE
 
 
 def test_non_xml_path_not_gated():
