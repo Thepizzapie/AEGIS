@@ -3576,11 +3576,12 @@ def rule_devcontainer_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     covered by `rule_vscode_tasks_protect`), a JetBrains File Watcher's
     ``.idea/watcherTasks.xml`` (now covered by
     `rule_jetbrains_watcher_protect`), or a JetBrains ``.idea/``
-    run-configuration's "Before launch" step (still NOT covered) — is a
-    related but distinct attack shape (an IDE, not a devcontainer runtime,
-    does the auto-running, and VS Code gates it behind a one-time
-    folder-trust prompt) disclosed here as a candidate for a follow-up
-    guard, two of the three now shipped. The ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
+    run-configuration's "Before launch" step (now covered by
+    `rule_jetbrains_run_config_protect`) — is a related but distinct attack
+    shape (an IDE, not a devcontainer runtime, does the auto-running, and
+    VS Code gates it behind a one-time folder-trust prompt) disclosed here
+    as a candidate for a follow-up guard, all three now shipped. The
+    ``DEVCONTAINER_CD_RE``/``DEVCONTAINER_BARE_
     FILENAME_RE`` co-occurrence pair is, deliberately, whole-command rather
     than clause-scoped — the same "false ask is recoverable, a false allow
     on a working exploit is not" trade-off ``gitattrs_wiring_hit``'s own
@@ -3925,9 +3926,10 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     disclosed as a follow-up" approach `rule_devcontainer_exec_protect` took
     for its own ``.devcontainer/<name>/`` nesting; a JetBrains ``.idea/``
     run-configuration's "Before launch" step is a related but distinct
-    IDE-auto-run primitive, still not covered — its File-Watcher sibling
+    IDE-auto-run primitive, now covered by
+    `rule_jetbrains_run_config_protect` — its File-Watcher sibling
     (``.idea/watcherTasks.xml``), a lower trigger bar still (no Run/Debug
-    click needed, just an ordinary file save), now IS, by
+    click needed, just an ordinary file save), is covered by
     `rule_jetbrains_watcher_protect`; a ``runOn``/
     ``allowAutomaticTasks`` value assembled indirectly (a templating step, a
     build script that writes the JSON) rather than appearing as a literal is
@@ -4203,14 +4205,13 @@ def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]
     .idea/watcherTasks.xml ...``) is caught by none of the shell branch's
     write-verb checks — closed instead by `rule_fetch_to_file_protect`
     reusing this guard's own `JETBRAINS_WATCHER_PATH_RE`, the same division
-    of labor every sibling ``*_protect`` guard relies on; and the
-    JetBrains "Before launch" External-Tools hijack itself
+    of labor every sibling ``*_protect`` guard relies on; the JetBrains
+    "Before launch" External-Tools hijack itself
     (``.idea/runConfigurations/*.xml`` referencing a tool defined in
-    ``.idea/tools/*.xml``) remains a related but distinct, NOT covered
-    IDE-auto-run primitive — disclosed here, not fixed, as the candidate
-    for a follow-up guard, the same "one surface first, siblings
-    disclosed" approach `rule_devcontainer_exec_protect`/
-    `rule_vscode_tasks_protect` themselves took; and the MCP structural
+    ``.idea/tools/*.xml``), disclosed here as the candidate for a follow-up
+    guard the same "one surface first, siblings disclosed" approach
+    `rule_devcontainer_exec_protect`/`rule_vscode_tasks_protect` themselves
+    took, is now covered by `rule_jetbrains_run_config_protect`; and the MCP structural
     fallback (`_vscode_struct_kv_hit(a, "name", "program")`, added after QA
     — see below) requires an actual dict pairing the two, so a value split
     across two independently-issued tool calls (planted first with an
@@ -4334,6 +4335,261 @@ def rule_jetbrains_watcher_protect(ev: Event, policy=None) -> Optional[Decision]
                          "file save in any JetBrains IDE that opens this "
                          "project. A human may append '# aegis-allow', or "
                          "set AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
+def _jetbrains_run_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a JetBrains "Before launch: run External
+    Tool" auto-exec hijack — either wiring a run/debug configuration in
+    `.idea/runConfigurations/*.xml` to run an External Tool automatically
+    before every launch (an `<option name="ToolBeforeRunTask" enabled="true"
+    actionId="Tool_<toolset>_<name>" />` entry), or defining/redefining that
+    tool's actual command in `.idea/tools/*.xml` (`<tool name="...">`'s
+    `<exec><option name="COMMAND" value="..." /></exec>`), in any JetBrains
+    IDE (IntelliJ, PyCharm, WebStorm, PhpStorm, RubyMine, CLion, GoLand,
+    Rider, DataGrip, ...) that opens this project.
+
+    THREAT MODEL: `rule_devcontainer_exec_protect`'s and
+    `rule_vscode_tasks_protect`'s own docstrings, and `rule_jetbrains_
+    watcher_protect`'s own docstring after them, all disclosed this exact
+    surface — a JetBrains run configuration's "Before launch" step — as a
+    "related but distinct" IDE-auto-run primitive, not covered by any of
+    them. This guard closes it. Its trigger bar sits between the two: lower
+    than a devcontainer rebuild/CI run/boot (an ordinary Run/Debug click —
+    one of the single most routine actions in any IDE session — fires it),
+    but higher than a File Watcher's bare file-save (a click is still
+    required). What makes it dangerous despite that higher bar is the split
+    surface: a run configuration wired to an External Tool is ordinarily
+    TRACKED, reviewed team tooling (a shared "run the linter before every
+    debug session" convention, say) — so an attacker/prompt-injected agent
+    doesn't need to touch that reviewed file at all. Redefining the SAME
+    tool NAME's `COMMAND` in `.idea/tools/*.xml` alone silently changes what
+    an already-wired, already-approved "Before launch" step actually runs
+    the next time anyone clicks Run/Debug on that configuration, with zero
+    change to `runConfigurations/*.xml` for a diff/code-review to catch.
+    Symmetrically, wiring `ToolBeforeRunTask` onto an existing configuration
+    is a real attack on its own even if the referenced tool doesn't exist
+    yet, planting the trigger ahead of a later, separately-staged tool
+    definition. Both files are therefore gated independently, not only the
+    pair together — the same "either half is already the attack" reasoning
+    `rule_git_attributes_exec_protect` applies to `.gitattributes`' wiring
+    versus the git-config key that actually runs the driver.
+
+    Gated differently per file, not the same "path + content" shape both
+    ways: `.idea/tools/*.xml` is gated on PATH ALONE, no content check at
+    all — the same "the file's whole purpose is auto-exec" reasoning
+    `rule_git_hooks_protect`/`rule_mcp_config_protect`/`rule_ci_workflow_
+    protect` already apply to their own narrowly-scoped targets, chosen
+    here (round 2) after a content-gated first draft's `name="COMMAND"`
+    adjacency check turned out to have a severe, silent bypass (see QA
+    history below). `.idea/runConfigurations/*.xml` stays content-gated,
+    since — unlike a tool-definition file — it legitimately holds many
+    benign, frequently-edited fields with no auto-exec relevance at all
+    (program arguments, working directory, module name, VM options for the
+    app under test): `ToolBeforeRunTask` is matched bare (no attribute
+    adjacency required) since it is a fixed, distinctive IntelliJ-internal
+    identifier with no ordinary-English-word meaning — the same "key alone
+    is enough" reasoning `GIT_ATTRS_EXEC_KEY_RE` applies to
+    `core.fsmonitor` — and, since round 2, an `actionId` value matching
+    IntelliJ's own `Tool_<toolset>_<name>` generated-ID scheme is ALSO
+    matched bare, independently, for the same reason (see QA history).
+
+    Config (``policy.jetbrains_run_config``): ``mode`` (deny|ask|monitor|
+    off, default ask), ``allow`` (regexes on the path/command that skip the
+    gate — a repo's own reviewed, intentional Before-Launch tool, say).
+    Defaults to ``ask``, not ``deny``, matching every sibling ``*_protect``
+    guard's default: a real Before-Launch External Tool can be legitimate,
+    sanctioned team tooling — it just needs a human to have actually looked
+    at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_JETBRAINS_RUN_CONFIG=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable, the same invariant
+    every escapable guard in this file holds.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a ``ToolBeforeRunTask``/``actionId`` value assembled
+    indirectly (a templating step, a build script writing the XML) rather
+    than appearing as a literal defeats the ``runConfigurations`` branch's
+    check, the same "computed indirectly" class every sibling guard already
+    accepts; an XML comment merely mentioning either token is not specially
+    excluded, so it could false-positive as ASK (fails toward ASK, never
+    ALLOW, the same accepted direction every guard here takes); a direct
+    fetch-to-file write (``curl -o .idea/tools/External Tools.xml ...``) is
+    caught by none of the shell branch's write-verb checks — closed instead
+    by `rule_fetch_to_file_protect` reusing this guard's own path regexes,
+    the same division of labor every sibling ``*_protect`` guard relies on;
+    unlike `watcherTasks.xml`'s fixed filename, a run configuration's and a
+    tool-set's own filenames are user-chosen, so the `cd`-then-bare-filename
+    fallback here matches any bare ``*.xml`` after a scoped `cd` into the
+    right subdirectory rather than one literal name (the same wildcard-
+    filename trade-off `TF_PATH_RE` already accepts for `.tf` files) — a
+    relative write from a directory reached some OTHER way (a symlink, a
+    bind mount) that never names ``.idea/runConfigurations``/``.idea/tools``
+    literally is not covered, the same "computed indirectly" class already
+    accepted; and — the one residual gap round 2 found but could NOT close
+    without reading the file's own on-disk, pre-edit state (a capability no
+    guard in this file has, by design: every `*_protect` guard reasons over
+    the CURRENT tool call's own args alone, never a cross-call/on-disk
+    memory) — a value-only Edit/MultiEdit/`sed`-style diff that flips an
+    ALREADY-PLANTED `<option name="ToolBeforeRunTask" enabled="false" .../>`
+    live (`old_string="enabled=\"false\""`, `new_string="enabled=\"true\""`,
+    with no `ToolBeforeRunTask`/`actionId`/`Tool_` text anywhere in that
+    diff) still evades both `runConfigurations`-branch checks — the same
+    "no cross-call state" limitation `rule_statusline_protect`'s own
+    disclosed `type`-swap gap and `rule_git_hooks_protect`'s own split-
+    across-calls gap already accept, one step narrower here since it needs
+    only ONE call, not two, the same severity class round 2's OTHER
+    findings were before their own fixes. Partially mitigated in practice,
+    not architecturally closed: the Edit tool requires `old_string` to be
+    unique in the file, so a bare `enabled="false"` only stays exploitable
+    in a run-configuration file with exactly one disabled Before-Launch
+    task — a second one anywhere in the same file forces a more specific,
+    longer `old_string` that likely re-includes the option's own name.
+
+    QA history (two independent adversarial-review rounds, run in parallel,
+    same convention every guard in this file follows): round 1 (design/
+    consistency) found the README's own "Known gaps" paragraph and one
+    sibling docstring (`rule_jetbrains_watcher_protect`'s) still described
+    this surface as uncovered after this guard shipped, both updated, plus
+    four test-coverage gaps against this guard's closest sibling
+    (`rule_jetbrains_watcher_protect`'s own test file) filled in. A parallel
+    bypass-hunting round found one real, severe, reproduced bug with several
+    independently-exploitable manifestations: an ordinary, minimal Edit/
+    MultiEdit/`sed -i` diff that changes ONLY the dangerous VALUE (a
+    `.idea/tools/*.xml` `COMMAND`'s value, or a `.idea/runConfigurations/
+    *.xml` `actionId`'s tool-name segment) — the single most natural way any
+    editor/agent makes exactly the change this guard's own threat model
+    calls out as independently gate-worthy — never repeats the adjacent KEY
+    text (`name="COMMAND"`, or `ToolBeforeRunTask`) in that same diff
+    fragment at all, silently bypassing both content checks under `mode:
+    ask` AND `mode: deny` alike, the identical "VALUE-ONLY Edit diff" bug
+    class the `.gitmodules` guard's own round-2 QA history documents finding
+    and closing once already. Closed two different ways, matched to each
+    file's own risk profile: `.idea/tools/*.xml` moved to PATH-ONLY gating
+    (no content check left to bypass at all, the same shape `rule_git_hooks_
+    protect` already uses for its own single-purpose target); `.idea/
+    runConfigurations/*.xml` gained a second, independent bare-value marker
+    (`JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE`, IntelliJ's own generated
+    `Tool_<toolset>_<name>` action-ID prefix) requiring no key adjacency,
+    the same "bare marker closes the value-only-diff class" fix the
+    `.gitmodules` guard's own `GITMODULES_EXT_SCHEME_BARE_RE`/`GITMODULES_
+    TRAVERSAL_BARE_RE` already used; and the plain `Edit` branch's content
+    extraction was widened to include `old_string` alongside `new_string`
+    (previously `new_string`-only — `MultiEdit`'s fallback path already saw
+    both via `_flatten_strings`, an inconsistency this closes), a strict
+    improvement that costs nothing and closes any real-world case where the
+    natural `old_string` already carries enough surrounding context. The one
+    remaining manifestation (a bare `enabled="false"``->``"true"` flip with
+    literally zero distinguishing text in the diff) could not be closed the
+    same way — there is no lexical marker distinguishing that value-only
+    diff from a routine, unrelated boolean toggle — and is disclosed above,
+    in "Honest scope", as an accepted, architecturally-bounded residual gap
+    rather than fixed."""
+    cfg = getattr(policy, "jetbrains_run_config", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "jetbrains-run-config-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        runconfig_path_hit = bool(p and patterns.JETBRAINS_RUNCONFIG_PATH_RE.search(p))
+        tools_path_hit = bool(p and patterns.JETBRAINS_TOOLS_PATH_RE.search(p))
+        if not (runconfig_path_hit or tools_path_hit):
+            return None
+        a = ev.args or {}
+        # `.idea/tools/*.xml` is gated on PATH ALONE (see docstring) -- no
+        # content check to bypass with a value-only diff at all.
+        hit = tools_path_hit
+        if not hit and runconfig_path_hit:
+            raw_content = a.get("content")
+            if not isinstance(raw_content, str) or not raw_content:
+                raw_content = a.get("new_string")
+            # QA fix (bypass-hunting round): a plain `Edit` call's own
+            # `old_string` is real, already-on-disk context the guard was
+            # previously discarding -- concatenate it in rather than reading
+            # `new_string` alone, the same context `MultiEdit`'s
+            # `_flatten_strings` fallback path already saw (a pre-existing
+            # inconsistency between the two, not a deliberate choice).
+            raw_old = a.get("old_string")
+            if isinstance(raw_old, str) and raw_old:
+                raw_content = f"{raw_old} {raw_content}" if raw_content else raw_old
+            if isinstance(raw_content, str) and raw_content:
+                content = raw_content
+            else:
+                content = " ".join(_flatten_strings(a))
+            if content:
+                hit = bool(patterns.JETBRAINS_RUNCONFIG_BEFORE_TASK_RE.search(content)
+                           or patterns.JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE.search(content))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_JETBRAINS_RUN_CONFIG")
+                or _jetbrains_run_config_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "jetbrains-run-config-protect",
+                         f"'{p}' is planting/altering a JetBrains 'Before "
+                         "launch: run External Tool' auto-exec step — it "
+                         "runs an external command automatically, "
+                         "unattended, on the next Run/Debug of the wired "
+                         "configuration in ANY JetBrains IDE that opens "
+                         "this project. Review the change, then confirm "
+                         "with AEGIS_ALLOW_JETBRAINS_RUN_CONFIG=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not write_verb:
+            return None
+        runconfig_cd_hit = bool(patterns.JETBRAINS_RUNCONFIG_CD_RE.search(cmd))
+        tools_cd_hit = bool(patterns.JETBRAINS_TOOLS_CD_RE.search(cmd))
+        bare_xml_hit = bool(patterns.JETBRAINS_RUNCONFIG_BARE_FILENAME_RE.search(cmd))
+        runconfig_path_hit = bool(patterns.JETBRAINS_RUNCONFIG_PATH_RE.search(cmd)
+                                   or (runconfig_cd_hit and bare_xml_hit))
+        tools_path_hit = bool(patterns.JETBRAINS_TOOLS_PATH_RE.search(cmd)
+                               or (tools_cd_hit and bare_xml_hit))
+        # `.idea/tools/*.xml`: path-only, same as the Edit/Write/MCP branch.
+        hit = (tools_path_hit
+               or (runconfig_path_hit
+                   and (patterns.JETBRAINS_RUNCONFIG_BEFORE_TASK_RE.search(cmd)
+                        or patterns.JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE.search(cmd))))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JETBRAINS_RUN_CONFIG")
+                or _jetbrains_run_config_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "jetbrains-run-config-protect",
+                         "A JetBrains 'Before launch: run External Tool' "
+                         "auto-exec step is being planted from a shell — it "
+                         "runs an external command automatically, "
+                         "unattended, on the next Run/Debug of the wired "
+                         "configuration in any JetBrains IDE that opens "
+                         "this project. A human may append '# aegis-allow', "
+                         "or set AEGIS_ALLOW_JETBRAINS_RUN_CONFIG=1; a "
                          "spawned agent cannot."))
     return None
 
@@ -6820,6 +7076,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
     (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
+    (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
+    (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tools definition"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -8249,6 +8507,7 @@ _CORE_RULES = (
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
     rule_jetbrains_watcher_protect,
+    rule_jetbrains_run_config_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,

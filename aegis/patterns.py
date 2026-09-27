@@ -2589,6 +2589,119 @@ JETBRAINS_WATCHER_PROGRAM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# JetBrains "Before launch: run External Tool" hijack — the sibling surface
+# `rule_jetbrains_watcher_protect`'s own docstring disclosed but did not
+# cover: a run/debug configuration's `<method>` block wires an External Tool
+# to run automatically before every launch of that configuration via
+# `<option name="ToolBeforeRunTask" enabled="true" actionId="Tool_<toolset>_
+# <name>" />` in `.idea/runConfigurations/<Name>.xml`, and the tool itself —
+# the actual command executed — is defined separately in
+# `.idea/tools/<ToolSetName>.xml` (`External Tools.xml` by default, but any
+# filename: IntelliJ lets a user split tool sets across multiple files under
+# that directory) as `<tool name="...">`'s `<exec><option name="COMMAND"
+# value="..." /></exec>`. Either half planted/altered is a real step toward
+# this primitive: wiring `ToolBeforeRunTask` onto an EXISTING, already-
+# reviewed run configuration silently attaches a new auto-run step with no
+# change to the tool definition at all, while redefining an ALREADY-WIRED
+# tool's own `COMMAND` in `.idea/tools/*.xml` changes what runs with no
+# change to `runConfigurations/*.xml` at all — so both files are gated
+# independently, not only the pair together, the same "either half is
+# already the attack" reasoning `rule_git_attributes_exec_protect` applies
+# to `.gitattributes`' `filter=<name>` wiring versus the git-config key that
+# actually runs the driver.
+# Neither `_CI_SEG` nor `_CI_MULTI` fits the filename span below -- both
+# exclude whitespace, but IntelliJ's own default tool-set filename is the
+# real, literal `External Tools.xml`, a SPACE embedded in the name itself
+# (found matching this exact real-world default filename against a first
+# draft that reused `_CI_SEG`, then `_CI_MULTI`, before this dedicated
+# segment/comment existed). Bounded the same 1-200 chars every other span in
+# this file is, for the identical reason (see `_CI_SEG`/`_CI_MULTI`'s own
+# comment) — excludes only quotes/newline, so it stays inside one shell/JSON
+# string token.
+_JETBRAINS_FILENAME_SEG = r"[^\"'\n]{1,200}"
+JETBRAINS_RUNCONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.idea" + _WIN_TRIM + _SEP + r"runConfigurations" + _WIN_TRIM + _SEP
+    + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+JETBRAINS_TOOLS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.idea" + _WIN_TRIM + _SEP + r"tools" + _WIN_TRIM + _SEP
+    + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+# `cd`/`pushd`-into-directory-then-bare-filename fallback, scoped to the
+# SPECIFIC subdirectory (not the bare `.idea` `JETBRAINS_CD_RE` already
+# covers for `watcherTasks.xml`, which sits directly in `.idea/` itself) —
+# same "single contiguous match misses a two-step `cd`" gap class every
+# sibling guard's own `*_CD_RE` closes.
+JETBRAINS_RUNCONFIG_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.idea" + _WIN_TRIM + _SEP + r"runConfigurations" + _CI_END,
+    re.IGNORECASE,
+)
+JETBRAINS_TOOLS_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.idea" + _WIN_TRIM + _SEP + r"tools" + _CI_END,
+    re.IGNORECASE,
+)
+# Bare filename after a scoped `cd` above — unlike `watcherTasks.xml`'s
+# fixed name, a run configuration/tool-set filename is user-chosen (and, per
+# the comment above, may itself contain a space), so this is a wildcard
+# `*.xml` match (the same "no fixed filename" trade-off `TF_PATH_RE` already
+# accepts for `.tf` files) rather than one literal name; only ever combined
+# with the scoped `*_CD_RE` above plus this surface's own content check,
+# never used bare.
+JETBRAINS_RUNCONFIG_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])" + _JETBRAINS_FILENAME_SEG + r"\.xml" + _CI_END,
+    re.IGNORECASE,
+)
+
+# The wiring key itself: `ToolBeforeRunTask` is a fixed, distinctive
+# IntelliJ-internal identifier with no ordinary-English-word meaning, so
+# (unlike `program`/`COMMAND` below) it needs no `name="..."` adjacency
+# requirement to stay low-noise — the same "key alone is enough" reasoning
+# `GIT_ATTRS_EXEC_KEY_RE` applies to `core.fsmonitor`, one step stronger
+# here since this token is essentially never going to appear as an
+# unrelated English sentence fragment the way "program" could.
+JETBRAINS_RUNCONFIG_BEFORE_TASK_RE = re.compile(
+    r"\bToolBeforeRunTask\b",
+    re.IGNORECASE,
+)
+# NOTE: `.idea/tools/*.xml` (the `COMMAND` tool-definition file) has no
+# content regex of its own here at all -- round 1's first draft gated it on
+# a `name="COMMAND"` attribute-adjacency check (the same shape
+# `JETBRAINS_WATCHER_PROGRAM_RE` uses for `program`), but that check had a
+# severe value-only-diff bypass with no bare-value marker available to
+# close it the same way `JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE` below does
+# for `actionId` (an external command's VALUE has no fixed lexical shape).
+# Closed instead by moving that file to PATH-ONLY gating in
+# `rule_jetbrains_run_config_protect` -- see its own docstring QA history.
+# QA finding (independent adversarial review, bypass-hunting round): a
+# single, entirely ordinary Edit-tool call that swaps ONLY the `actionId`
+# VALUE of an already-planted `ToolBeforeRunTask` (`old_string`/`new_string`
+# covering just `Tool_<toolset>_<OldName>` -> `Tool_<toolset>_<EvilName>`, or
+# an `enabled="false"`/`enabled="true"` flip) never repeats the literal
+# `ToolBeforeRunTask` text in that diff fragment at all, silently bypassing
+# `JETBRAINS_RUNCONFIG_BEFORE_TASK_RE` even under `mode: deny` -- the same
+# "value-only Edit diff" bug class this file's own `.gitmodules` guard found
+# and closed in its documented round-2 QA history. Closed the same way
+# there was: a bare-value marker requiring no key adjacency at all. Real
+# IntelliJ External-Tool action IDs are always generated with this exact
+# `Tool_<toolset-name>_<tool-name>` literal prefix (there is no other
+# ordinary reason this token would appear inside a run-configuration file),
+# so a value-only diff that redirects an existing wiring to a DIFFERENT tool
+# is still caught even with no surrounding key text at all. Narrower than
+# `JETBRAINS_RUNCONFIG_BEFORE_TASK_RE`'s bare-token match in one respect,
+# broader in another: it does not require the wiring OPTION itself to be
+# present (so it also catches a value-only diff against an `actionId` that
+# happens to reference an External Tool for some OTHER before/after-run
+# task kind IntelliJ also supports), which is the intended, safe direction
+# for this content-based check (false ASK, never false ALLOW).
+JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
+    r"\bTool_",
+    re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
