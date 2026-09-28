@@ -1597,6 +1597,88 @@ def skill_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, SKILL_FIND_PREDICATE_RE)
 
 
+# ---- Cross-agent instruction/rules-file protection ------------------------------
+# AGENT_DEF_PATH_RE/AGENT_INSTRUCTIONS_PATH_RE above reach Claude Code's OWN
+# auto-loaded instruction surface (CLAUDE.md/AGENTS.md, .claude/agents|commands|
+# output-styles) and SKILL_PATH_RE reaches its Skills sibling. None of the three
+# was ever extended to the IDENTICAL surface on a different coding assistant
+# sharing this same checkout. Cursor, Windsurf, Cline, GitHub Copilot, and
+# Continue.dev each auto-fold their own rules/instructions file into THEIR OWN
+# model's context on every future session — the same "planted once, trusted
+# forever, no per-invocation human re-approval" fuse CLAUDE.md has — under a
+# filename none of this file's existing path patterns ever lists. A session
+# already guarded against poisoning its own CLAUDE.md sails straight through
+# planting the identical payload one directory over, for a teammate (or the same
+# human, in a different editor) who opens this checkout in a different tool —
+# a lateral-movement gap across the guarded/unguarded boundary, not a new kind
+# of payload. Covers:
+#   - Cursor:   .cursorrules (legacy root file), .cursor/rules/*.mdc (nested)
+#   - Windsurf: .windsurfrules (legacy root file), .windsurf/rules/*.md
+#   - Cline:    .clinerules (file OR directory of *.md files)
+#   - Copilot:  .github/copilot-instructions.md,
+#               .github/instructions/*.instructions.md
+#   - Continue: .continue/rules/*.md
+# `.cursorrules`/`.windsurfrules`/`.clinerules` are bare top-level filenames, so
+# (like AGENT_DEF_DIR_RE's own bare-directory alternatives) the boundary
+# lookahead in `_CI_END` alone — matching on "/" as much as on end-of-string —
+# already reaches both the legacy single-file form AND a same-named directory
+# holding further files, with no separate bare-directory alternative needed for
+# those three. The nested `rules`/`instructions` subdirectories, by contrast,
+# need the same bounded-segment + separate bare-directory-backstop split
+# AGENT_DEF_PATH_RE/AGENT_DEF_DIR_RE use, since an unqualified `\.cursor\b`
+# would also match unrelated `.cursor/mcp.json`/`.cursor/environment.json` noise
+# this guard has no business gating.
+_CROSS_AGENT_ROOT_CURSOR = r"(?:^|[\s'\"/\\=])\.cursor" + _WIN_TRIM + _SEP
+_CROSS_AGENT_ROOT_WINDSURF = r"(?:^|[\s'\"/\\=])\.windsurf" + _WIN_TRIM + _SEP
+_CROSS_AGENT_ROOT_GITHUB = r"(?:^|[\s'\"/\\=])\.github" + _WIN_TRIM + _SEP
+_CROSS_AGENT_ROOT_CONTINUE = r"(?:^|[\s'\"/\\=])\.continue" + _WIN_TRIM + _SEP
+CROSS_AGENT_RULES_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cursorrules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_CURSOR + r"rules" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.mdc" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.windsurfrules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_WINDSURF + r"rules" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.clinerules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_GITHUB + r"copilot-instructions\.md" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_GITHUB + r"instructions" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.instructions\.md" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_CONTINUE + r"rules" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — the same archive/sync-tool bypass
+# AGENT_DEF_DIR_RE/SKILL_DIR_RE close for their own surfaces: `rsync -a evil/
+# .cursor/rules/` or `tar xf payload.tar -C .github/instructions/` never names
+# a `*.mdc`/`*.md`/`*.instructions.md` file as one contiguous string, so
+# CROSS_AGENT_RULES_PATH_RE alone can't see it. Not needed for `.cursorrules`/
+# `.windsurfrules`/`.clinerules` — their own bare-filename alternatives above
+# already match the directory-nesting form too, the same property
+# AGENT_INSTRUCTIONS_PATH_RE's CLAUDE.md/AGENTS.md alternatives have.
+CROSS_AGENT_RULES_DIR_RE = re.compile(
+    _CROSS_AGENT_ROOT_CURSOR + r"rules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_WINDSURF + r"rules" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_GITHUB + r"instructions" + _CI_END
+    + r"|" + _CROSS_AGENT_ROOT_CONTINUE + r"rules" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-wholename/-regex` indirection, same reason
+# AGENT_DEF_FIND_PREDICATE_RE/SKILL_FIND_PREDICATE_RE exist for their own
+# surfaces — a `-regex` VALUE is itself a regex and can separate path
+# components with its own wildcard, evading the tight adjacency every
+# alternative above requires.
+CROSS_AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules\b|\.cursor[/\\]rules\b|\.windsurfrules\b"
+    r"|\.windsurf[/\\]rules\b|\.clinerules\b|copilot-instructions\.md\b"
+    r"|\.github[/\\]instructions\b|\.continue[/\\]rules\b)")
+
+
+def cross_agent_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, CROSS_AGENT_RULES_FIND_PREDICATE_RE)
+
+
 # ---- Shell-startup / SSH persistence protection --------------------------------
 # Two more "runs later, unattended, with the human's full privileges" triggers
 # that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,

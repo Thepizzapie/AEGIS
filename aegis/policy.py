@@ -177,6 +177,18 @@ class Policy:
     # explicit per-invocation approval, a surface rule_agent_def_protect
     # was never extended to reach. See rules.rule_skills_protect.
     skills_protect: dict = field(default_factory=dict)
+    # Cross-agent instruction/rules-file protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers a SIBLING coding assistant's own auto-loaded rules/instructions
+    # file sharing this checkout -- Cursor (.cursorrules, .cursor/rules/*.mdc),
+    # Windsurf (.windsurfrules, .windsurf/rules/*.md), Cline (.clinerules file
+    # or directory), GitHub Copilot (.github/copilot-instructions.md,
+    # .github/instructions/*.instructions.md), and Continue.dev
+    # (.continue/rules/*.md) -- a surface rule_agent_def_protect/
+    # rule_skills_protect were never extended to reach, since both are scoped
+    # to Claude Code's own instruction/skill filenames. See
+    # rules.rule_cross_agent_rules_protect.
+    cross_agent_rules: dict = field(default_factory=dict)
     # Shell-startup / SSH persistence protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers ~/.bashrc/~/.zshrc/~/.profile/fish's config.fish/

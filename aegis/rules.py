@@ -1347,6 +1347,136 @@ def rule_skills_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- Cross-agent instruction/rules-file protection: escapable with human confirm -
+def _cross_agent_rules_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cross_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering a SIBLING coding assistant's own auto-loaded
+    rules/instructions file: Cursor (``.cursorrules``, ``.cursor/rules/*.mdc``),
+    Windsurf (``.windsurfrules``, ``.windsurf/rules/*.md``), Cline
+    (``.clinerules`` file or directory), GitHub Copilot
+    (``.github/copilot-instructions.md``,
+    ``.github/instructions/*.instructions.md``), and Continue.dev
+    (``.continue/rules/*.md``).
+
+    ``rule_agent_def_protect`` covers Claude Code's OWN instruction surface
+    (``CLAUDE.md``/``AGENTS.md``, ``.claude/agents|commands|output-styles``);
+    ``rule_skills_protect`` covers its Skills sibling. Neither was ever
+    extended to the IDENTICAL surface on a different agentic coding tool
+    sharing this same checkout — a gap this guard exists to close, not new
+    ground the family hasn't already staked out. Each of the files above is
+    folded directly into that OTHER tool's own model context on every future
+    session — the same "runs later, unattended, no per-invocation human
+    re-approval" fuse ``CLAUDE.md`` has — but under a filename
+    ``AGENT_DEF_PATH_RE``/``AGENT_INSTRUCTIONS_PATH_RE``/``SKILL_PATH_RE``
+    never lists. A session already guarded against poisoning its own
+    ``CLAUDE.md`` sails straight through planting the identical payload one
+    directory over: a real lateral-movement path in a mixed-tooling
+    team/monorepo, where a Claude Code session (guarded) and a teammate's
+    Cursor/Windsurf/Cline/Copilot session (reading whatever the repo hands
+    it, unguarded until this rule) share one git history.
+
+    Config (``policy.cross_agent_rules``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate).
+    Defaults to ``ask`` for the same reason ``rule_agent_def_protect`` does:
+    editing a rules file is routine, sanctioned dev work for a team actually
+    using that tool, not inherently malicious the way planting an MCP server
+    is.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or the env toggle ``AEGIS_ALLOW_CROSS_AGENT_RULES=1`` set by the
+    orchestrator/human before launch for the Edit/Write/MCP-tool form. A
+    spawned agent cannot set its own env for a hook invocation it doesn't
+    control, so neither path is agent-self-escapable.
+
+    Honest scope, same denylist trade-offs as every sibling guard in this
+    file: a rules-file naming convention outside the five tools covered
+    (e.g. an editor-specific format not yet common enough to include); an MCP
+    filesystem tool naming its target argument outside ``_path()``'s
+    recognized key list; nesting past 4 levels under ``.cursor/rules``/
+    ``.windsurf/rules``/``.github/instructions``/``.continue/rules`` evading
+    the filename form (the bare-directory backstop still catches an
+    archive/sync tool's own target argument regardless of nesting); a direct
+    fetch-to-file write (``curl -o .cursorrules ...``) caught by none of the
+    five write-verb checks below, the same inherited gap every sibling guard
+    in this file discloses (closed instead by the shared fetch-to-file
+    backstop); and a shell command that computes the target path indirectly
+    across separate variable assignments or a ``for``/``xargs`` loop, the
+    same disclosed gap ``rule_agent_def_protect``/``rule_skills_protect``
+    already carry."""
+    cfg = getattr(policy, "cross_agent_rules", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        # Deliberately CROSS_AGENT_RULES_PATH_RE alone here, not paired with
+        # the bare-directory backstop the shell branch below uses -- the
+        # same choice rule_agent_def_protect makes for its own Edit/Write
+        # branch (CROSS_AGENT_RULES_DIR_RE has no filename/extension
+        # requirement at all, so pairing it here would gate an unrelated
+        # `.orig`/`.bak` sibling file sitting in the same rules directory,
+        # a real false-positive a concrete, already-resolved Edit/Write path
+        # doesn't need the directory-level backstop for in the first place).
+        p = _path(ev)
+        if not p or not patterns.CROSS_AGENT_RULES_PATH_RE.search(p):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CROSS_AGENT_RULES")
+                or _cross_agent_rules_allowed_by_policy(cfg, p)):
+            return None
+        would = Decision(action, "cross-agent-rules-protect",
+                         f"Sibling-tool rules/instructions file '{p}' is being "
+                         "written — its content is folded directly into a "
+                         "different coding assistant's own context on every "
+                         "future session there, unattended. Review the change, "
+                         "then confirm with AEGIS_ALLOW_CROSS_AGENT_RULES=1; a "
+                         "spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "cross-agent-rules-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.CROSS_AGENT_RULES_PATH_RE.search(cmd)
+                             or patterns.CROSS_AGENT_RULES_DIR_RE.search(cmd)
+                             or patterns.cross_agent_rules_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CROSS_AGENT_RULES")
+                or _cross_agent_rules_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "cross-agent-rules-protect",
+                         "A sibling coding assistant's rules/instructions file is "
+                         "being modified from a shell — its content is auto-loaded "
+                         "into that tool's own context in a future session with no "
+                         "further review. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_CROSS_AGENT_RULES=1; a spawned agent "
+                         "cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "cross-agent-rules-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- shell-startup / SSH persistence protection: escapable with human confirm --
 def _shell_persist_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7057,6 +7187,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
+    (patterns.CROSS_AGENT_RULES_PATH_RE, "a sibling coding assistant's rules/instructions file"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
@@ -8494,6 +8625,7 @@ _CORE_RULES = (
     rule_hook_manager_protect,
     rule_agent_def_protect,
     rule_skills_protect,
+    rule_cross_agent_rules_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
     rule_package_manifest_protect,
