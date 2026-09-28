@@ -1411,7 +1411,39 @@ def rule_cross_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]
     backstop); and a shell command that computes the target path indirectly
     across separate variable assignments or a ``for``/``xargs`` loop, the
     same disclosed gap ``rule_agent_def_protect``/``rule_skills_protect``
-    already carry."""
+    already carry.
+
+    QA history (independent adversarial bypass-hunting review, round 1):
+    found and closed two real, reproduced bypasses before merge. (1) An
+    archive tool's destination flag glued directly onto a short option with
+    no separating space (``7z x payload.7z -o.cursor/rules/``, ``unzip
+    payload.zip -d.windsurf/rules/``, ``tar xf payload.tar
+    -C.github/instructions/``) left the target path immediately adjacent to
+    the flag's own trailing letter, never satisfying
+    ``CROSS_AGENT_RULES_PATH_RE``/``CROSS_AGENT_RULES_DIR_RE``'s shared
+    ``(?:^|[\\s'\"/\\\\=])`` lead-in even though ``ARCHIVE_SYNC_VERB_RE``
+    correctly recognized the tool invocation — closed via
+    ``patterns.cross_agent_rules_normalize_glued_dest`` in the shell branch
+    below (see its own comment in ``patterns.py`` for why no tool-name
+    anchor is needed here, unlike ``rule_fetch_to_file_protect``'s own
+    ``-o``/``-O`` glued-destination fix). (2) A ``find -regex`` value
+    separating ``.cursor``/``rules`` (or ``.windsurf``/``rules``,
+    ``.continue``/``rules``) with its own wildcard evaded the tight-adjacency
+    fragments in ``CROSS_AGENT_RULES_FIND_PREDICATE_RE`` — closed with a bare
+    ``\.cursor\b``/``\.windsurf\b``/``\.continue\b`` fallback alternative
+    each, the same fix ``AGENT_DEF_FIND_PREDICATE_RE``'s own bare
+    ``\.claude\b`` makes, safe for the identical reason: each is exclusively
+    that one tool's own directory, unlike ``.github`` (deliberately left
+    without a bare fallback — see ``CROSS_AGENT_RULES_FIND_PREDICATE_RE``'s
+    own comment in ``patterns.py``). A parallel design/consistency review
+    the same round confirmed correct wiring everywhere its siblings are
+    (``_CORE_RULES``, ``Policy``, all three ``loader.py`` spots, both
+    ``skills.py`` knob lists, the fetch-to-file backstop's own target list,
+    the README guard table), zero regex overlap with
+    ``rule_self_protect``/``rule_mcp_config_protect``/
+    ``rule_ci_workflow_protect`` (tested by execution, not just inspection),
+    and every docstring claim here matching the code beneath it, with no
+    findings of its own."""
     cfg = getattr(policy, "cross_agent_rules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1448,9 +1480,20 @@ def rule_cross_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        names_target = bool(patterns.CROSS_AGENT_RULES_PATH_RE.search(cmd)
-                             or patterns.CROSS_AGENT_RULES_DIR_RE.search(cmd)
-                             or patterns.cross_agent_rules_find_hit(cmd))
+        # Target-path detection runs against the glue-normalized text (see
+        # `patterns.cross_agent_rules_normalize_glued_dest`'s own comment) so
+        # an archive tool's glued destination flag (`7z x payload.7z
+        # -o.cursor/rules/`, `unzip payload.zip -d.windsurf/rules/`, `tar xf
+        # payload.tar -C.github/instructions/`) is seen with the same
+        # boundary a spaced form already has — a no-op on a command with no
+        # glued short option at all. QA finding (independent adversarial
+        # bypass-hunting review): all three sailed through undetected before
+        # this normalization existed, even though ARCHIVE_SYNC_VERB_RE below
+        # correctly recognized the tool invocation.
+        target_cmd = patterns.cross_agent_rules_normalize_glued_dest(cmd)
+        names_target = bool(patterns.CROSS_AGENT_RULES_PATH_RE.search(target_cmd)
+                             or patterns.CROSS_AGENT_RULES_DIR_RE.search(target_cmd)
+                             or patterns.cross_agent_rules_find_hit(target_cmd))
         touches_target = names_target and (
             patterns.WRITE_REDIRECT_RE.search(cmd)
             or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)

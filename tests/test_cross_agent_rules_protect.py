@@ -164,6 +164,20 @@ def test_backup_and_disabled_variants_not_gated():
     assert not _gated(evaluate(_write("src/copilot-instructions.md.bak"), EMPTY))
 
 
+def test_case_insensitive_gated():
+    assert _gated(evaluate(_write(".CURSORRULES"), EMPTY))
+    assert _gated(evaluate(_write(".Cursor/Rules/Deploy.MDC"), EMPTY))
+
+
+def test_substring_in_unrelated_filename_not_gated():
+    """A path that merely contains a tool name as a substring of a longer
+    word (not the exact filename/directory segment) must not false-positive."""
+    assert not _gated(evaluate(_write("mycursorrules.py"), EMPTY))
+    assert not _gated(evaluate(_write("docs/windsurfing_guide.md"), EMPTY))
+    assert not _gated(evaluate(_write("src/clinerules_helper.py"), EMPTY))
+    assert not _gated(evaluate(_write("my_continue_script.py"), EMPTY))
+
+
 # ---- MCP-tool writes (no Edit/Write, no shell) ------------------------------------
 
 def test_mcp_tool_write_to_cursorrules_gated():
@@ -211,6 +225,27 @@ def test_archive_and_sync_tools_gated():
     assert _gated(evaluate(_shell("unzip payload.zip -d .windsurf/rules/"), EMPTY))
     assert _gated(evaluate(_shell("rsync evil.md .cursorrules"), EMPTY))
     assert _gated(evaluate(_shell("tar xf payload.tar .clinerules"), EMPTY))
+
+
+# ---- glued-destination-flag bypass (QA finding, independent adversarial ----------
+# bypass-hunting review, round 1): an archive tool's destination flag with no
+# separating space (`-o<dir>`, `-C<dir>`, `-d<dir>`) left the target path
+# adjacent to the flag's own trailing letter, never satisfying the shared
+# lead-in boundary even though ARCHIVE_SYNC_VERB_RE recognized the tool.
+
+def test_archive_tool_glued_destination_flag_gated():
+    assert _gated(evaluate(_shell("7z x payload.7z -o.cursor/rules/"), EMPTY))
+    assert _gated(evaluate(_shell("unzip payload.zip -d.windsurf/rules/"), EMPTY))
+    assert _gated(evaluate(_shell("tar xf payload.tar -C.github/instructions/"), EMPTY))
+    assert _gated(evaluate(_shell("7z x payload.7z -o.cursor/rules/deploy.mdc"), EMPTY))
+
+
+def test_unrelated_glued_short_flag_not_gated():
+    """A `-o`/`-C`/`-d` flag glued to something that ISN'T one of this
+    guard's own rare target prefixes must not false-positive — the
+    normalizer only fires on those exact literals."""
+    assert not _gated(evaluate(_shell("tar xf payload.tar -Csome/other/dir/"), EMPTY))
+    assert not _gated(evaluate(_shell("cc -o.build/output foo.c"), EMPTY))
 
 
 def test_bare_directory_reference_gated():
@@ -265,6 +300,21 @@ def test_find_regex_with_wildcard_between_github_and_instructions_not_gated():
     assert not _gated(evaluate(
         _shell("mv evil.md $(find . -regex '.*\\.github.*instructions.*deploy\\.instructions\\.md')"),
         EMPTY))
+
+
+# ---- find -regex wildcard-split bypass (QA finding, independent adversarial -----
+# bypass-hunting review, round 1): unlike `.github` above, `.cursor`/
+# `.windsurf`/`.continue` are each exclusively that one tool's own directory,
+# so a bare fallback is safe here — closed with the same fix
+# AGENT_DEF_FIND_PREDICATE_RE's own bare `\.claude\b` uses.
+
+def test_find_regex_wildcard_split_now_gated_for_single_purpose_dirs():
+    assert _gated(evaluate(
+        _shell(r"mv evil.mdc $(find . -regex '.*\.cursor.*rules.*deploy\.mdc')"), EMPTY))
+    assert _gated(evaluate(
+        _shell(r"mv evil.md $(find . -regex '.*\.windsurf.*rules.*deploy\.md')"), EMPTY))
+    assert _gated(evaluate(
+        _shell(r"mv evil.md $(find . -regex '.*\.continue.*rules.*deploy\.md')"), EMPTY))
 
 
 def test_forced_symlink_swap_gated():

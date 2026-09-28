@@ -1669,14 +1669,78 @@ CROSS_AGENT_RULES_DIR_RE = re.compile(
 # surfaces — a `-regex` VALUE is itself a regex and can separate path
 # components with its own wildcard, evading the tight adjacency every
 # alternative above requires.
+#
+# QA finding (independent adversarial bypass-hunting review): the tight
+# `\.cursor[/\\]rules\b`/`\.windsurf[/\\]rules\b`/`\.continue[/\\]rules\b`
+# alternatives require their two halves to sit directly adjacent, but a
+# `-regex` VALUE routinely separates them with its own wildcard (`-regex
+# '.*\.cursor.*rules.*deploy\.mdc'`) — a real, ordinary way to write that
+# predicate, and it sailed through undetected. Closed the same way
+# AGENT_DEF_FIND_PREDICATE_RE's own bare `\.claude\b` fallback does: `.cursor`,
+# `.windsurf`, and `.continue` are each exclusively that one tool's own
+# directory (unlike `.github`, an ordinary, multi-purpose directory in nearly
+# every repo — workflows, ISSUE_TEMPLATE, CODEOWNERS, dependabot.yml, ... —
+# where a bare fallback would ask on most unrelated `.github`-touching `find`
+# commands, so `.github` deliberately has NO such fallback here; see
+# `test_find_regex_with_wildcard_between_github_and_instructions_not_gated`).
 CROSS_AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
-    r"(?:\.cursorrules\b|\.cursor[/\\]rules\b|\.windsurfrules\b"
-    r"|\.windsurf[/\\]rules\b|\.clinerules\b|copilot-instructions\.md\b"
-    r"|\.github[/\\]instructions\b|\.continue[/\\]rules\b)")
+    r"(?:\.cursorrules\b|\.cursor[/\\]rules\b|\.cursor\b|\.windsurfrules\b"
+    r"|\.windsurf[/\\]rules\b|\.windsurf\b|\.clinerules\b|copilot-instructions\.md\b"
+    r"|\.github[/\\]instructions\b|\.continue[/\\]rules\b|\.continue\b)")
 
 
 def cross_agent_rules_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, CROSS_AGENT_RULES_FIND_PREDICATE_RE)
+
+
+# Archive-tool destination flags taking their value GLUED directly onto a
+# short flag with no separating space — real, documented syntax, not a
+# contrived evasion (7z's `-o<dir>`, tar's `-C<dir>`, unzip's `-d<dir>`).
+# CROSS_AGENT_RULES_PATH_RE/CROSS_AGENT_RULES_DIR_RE's shared
+# `(?:^|[\s'"/\\=])` lead-in never anticipates this: the character
+# immediately before `.cursor`/`.windsurf`/`.github`/`.continue` is the
+# flag's own trailing letter (a word character), not a separator, so the
+# lead-in silently fails even though `ARCHIVE_SYNC_VERB_RE` correctly
+# recognizes the tool invocation. QA finding (independent adversarial
+# bypass-hunting review): `7z x payload.7z -o.cursor/rules/`, `unzip
+# payload.zip -d.windsurf/rules/`, and `tar xf payload.tar
+# -C.github/instructions/` all sailed through undetected.
+#
+# Unlike `rule_fetch_to_file_protect`'s own `-o`/`-O` glued-destination fix
+# (which must anchor each candidate to curl's/wget's own tool name
+# specifically, since a context-free `-o`/`-O` is a common, ambiguous flag
+# shape shared by countless unrelated tools — an anchor-free version there
+# let an incidental, unrelated `-o`-shaped substring elsewhere in the same
+# command get a synthetic space too), no such anchor is needed here: the
+# lookahead below only fires when the literal text immediately following the
+# flag is one of this guard's own small set of rare, single-purpose target
+# prefixes. An unrelated `-o`/`-C`/`-d` elsewhere in a command can never
+# coincidentally be followed by the literal string `.cursor/rules` (etc.) —
+# and if it genuinely were, that occurrence WOULD be a real destination worth
+# flagging, not a false positive to guard against.
+_CROSS_AGENT_GLUED_DEST_RE = re.compile(
+    r"-[oCd](?="
+    r"\.cursorrules\b"
+    r"|\.cursor[/\\]rules\b"
+    r"|\.windsurfrules\b"
+    r"|\.windsurf[/\\]rules\b"
+    r"|\.clinerules\b"
+    r"|\.github[/\\]copilot-instructions\.md\b"
+    r"|\.github[/\\]instructions\b"
+    r"|\.continue[/\\]rules\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def cross_agent_rules_normalize_glued_dest(cmd: str) -> str:
+    """Insert a synthetic space after a genuine glued archive-tool
+    destination flag (see `_CROSS_AGENT_GLUED_DEST_RE`'s own comment) so the
+    shared `(?:^|[\\s'"/\\\\=])` lead-in every alternative in
+    `CROSS_AGENT_RULES_PATH_RE`/`CROSS_AGENT_RULES_DIR_RE` requires is
+    satisfied the same way an already-spaced `-o <dest>` already is. A no-op
+    on a command with no glued short option at all."""
+    return _CROSS_AGENT_GLUED_DEST_RE.sub(lambda m: m.group(0) + " ", cmd)
 
 
 # ---- Shell-startup / SSH persistence protection --------------------------------
