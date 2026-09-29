@@ -319,3 +319,56 @@ def test_monitor_mode_records_row(monkeypatch):
     monkeypatch.setattr(R, "_record_monitor", lambda ev, would, note="": seen.append(note))
     assert not _hit(_shell("export RUSTC_WRAPPER=/x"), Policy(cargo_exec={"mode": "monitor"}))[0]
     assert seen == ["cargo-exec-protect-monitor"]
+
+
+# ---- QA round 3 fixes ----------------------------------------------------------
+def test_split_flag_elements_and_test_builder_gated():
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustflags = ["-Z", "codegen-backend=/x.so"]\n'))[0]
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustdocflags = ["--test-builder","/tmp/x"]\n'))[0]
+    assert _hit(_shell("export RUSTDOCFLAGS='--test-builder /x'"))[0]
+
+
+def test_cd_with_redirect_then_bare_write_gated():
+    for c in ("cd .cargo 2>/dev/null && echo 'linker=x' > config.toml",
+              "cd .cargo >/dev/null; echo 'linker=x' > config.toml",
+              "pushd .cargo >/dev/null && echo 'linker=x' > config.toml"):
+        assert _hit(_shell(c))[0], c
+
+
+def test_cargo_config_set_with_options_gated():
+    for c in ("cargo config set --global build.rustc-wrapper x",
+              "cargo config set --location global target.x.runner /x",
+              "cargo config set build.rustflags '-Clinker=/x'"):
+        assert _hit(_shell(c))[0], c
+
+
+def test_fd_append_and_more_env_gated():
+    assert _hit(_shell("echo 'linker=x' 1>>.cargo/config.toml"))[0]
+    for c in ("export CARGO_HOST_LINKER=/x", "CARGO_HOST_RUNNER=/x cargo check",
+              "export RUSTFLAGS='-Clinker=/tmp/x'", "RUSTFLAGS='-Zcodegen-backend=/x.so' cargo check",
+              "export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Clinker=/x'"):
+        assert _hit(_shell(c))[0], c
+
+
+def test_mcp_more_shapes_gated():
+    c = '[build]\nrustc-wrapper="x"\n'
+    for args in ({"files": {".cargo/config.toml": c}},
+                 {"files": [{"name": ".cargo/config.toml", "content": c}]},
+                 {"target": ".cargo/config.toml", "data": c}):
+        ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__x__push", args=args)
+        assert _hit(ev)[0], args
+
+
+def test_app_config_after_double_dash_not_gated():
+    for c in ("cargo run -- --config foo.toml", "cargo run -p x -- --config /etc/app.toml",
+              "cargo run --bin x -- --config=./cfg/app.toml"):
+        assert not _hit(_shell(c))[0], c
+    assert _hit(_shell("cargo build --config /tmp/evil.toml"))[0]
+
+
+def test_benign_linker_flags_not_gated():
+    for c in ('[build]\nrustflags=["-Clink-dead-code","-Cprefer-dynamic","-Clinker-plugin-lto"]\n',
+              '[target.x86_64-unknown-linux-gnu]\nrustflags=["-C","target-cpu=native","-C","link-arg=-s"]\n',
+              '[build]\nrustflags=["-C","linker-flavor=ld.lld"]\n'):
+        assert not _hit(_write(".cargo/config.toml", c))[0], c
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustflags=["-Clink-arg=-fuse-ld=/tmp/l"]\n'))[0]

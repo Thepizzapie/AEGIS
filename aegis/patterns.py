@@ -3683,14 +3683,14 @@ PNPMFILE_REDIRECT_CLI_RE = re.compile(
 # except for an opaque copy/move/link INTO the path, where the content
 # isn't visible in the command and the path alone is the only signal.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    r"(?:^|[\s'\"/\\=<>])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
     + r"|\bCARGO_HOME\b[}\"']*" + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # `cd .cargo && echo ... > config.toml` -- the bare filename only counts when
 # the same command `cd`s/`pushd`s into a `.cargo` (or `$CARGO_HOME`) dir.
 CARGO_CD_RE = re.compile(
-    r"\b(?:cd|pushd|set-location|sl)\s+[\"']?[^;&|\n]{0,200}(?:\.cargo|CARGO_HOME)[}\"']*[/\\]*[\"']?\s*(?:&&|;|\|\||\n|$)",
+    r"\b(?:cd|pushd|set-location|sl)\s+[\"']?[^;&|\n]{0,200}(?:\.cargo|CARGO_HOME)[}\"']*[/\\]*[\"']?(?:\s*\d*>&?\s*\S+)*\s*(?:&&|;|\|\||\n|$)",
     re.IGNORECASE,
 )
 CARGO_BARE_CONFIG_RE = re.compile(
@@ -3708,9 +3708,14 @@ CARGO_EXEC_KEY_RE = re.compile(
     r"|credential-provider|global-credential-providers|include)[\"']?\s*="
     # An empty value (`= ''`/`""`/`[]`) CLEARS a setting -- not a plant.
     r"(?!\s*(?:\"\"|''|\[\s*\])?\s*(?:#|$))"
-    r"|-C\s*(?:linker|link-args?|llvm-args)\b|[\"']link-args?="
-    r"|-Z\s*(?:codegen-backend|llvm-plugins|pre-link-args?)\b"
-    r"|--(?:test-)?runtool\b",
+    # `-C linker` (not linker-flavor/linker-plugin-lto); a `link-arg` only
+    # when it selects an alternate linker (`-fuse-ld=`); flag and value may
+    # sit in separate array elements (`"-Z", "codegen-backend=..."`).
+    r"|-C[\"',\s]*(?:linker|llvm-args)(?![\w-])"
+    r"|-C[\"',\s]*link-args?[=\s\"',]+[^\s\"',]*-fuse-ld="
+    r"|[\"']link-args?=[^\s\"',]*-fuse-ld="
+    r"|-Z[\"',\s]*(?:codegen-backend|llvm-plugins|pre-link-args?)\b"
+    r"|--(?:test-)?runtool\b|--test-builder\b",
     re.IGNORECASE | re.MULTILINE,
 )
 # Env-var / CLI spellings, checked with no path pairing. The value must be a
@@ -3718,7 +3723,7 @@ CARGO_EXEC_KEY_RE = re.compile(
 # CLEARS a wrapper, the opposite of an attack).
 _CARGO_ENV_NAMES = (
     r"RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTC|RUSTDOC"
-    r"|CARGO_BUILD_RUSTC(?:_WRAPPER|_WORKSPACE_WRAPPER)?|CARGO_BUILD_RUSTDOC"
+    r"|CARGO_BUILD_RUSTC(?:_WRAPPER|_WORKSPACE_WRAPPER)?|CARGO_BUILD_RUSTDOC|CARGO_HOST_(?:RUNNER|LINKER)"
     r"|CARGO_TARGET_[A-Z0-9_]{1,120}_(?:RUNNER|LINKER)"
     r"|CARGO_REGISTRIES_[A-Z0-9_]{1,120}_CREDENTIAL_PROVIDER"
     r"|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?"
@@ -3734,7 +3739,9 @@ CARGO_EXEC_ENV_RE = re.compile(
     r"|\bSetEnvironmentVariable\s*\(\s*[\"'](?:" + _CARGO_ENV_NAMES + r")[\"']"
     r"|\blaunchctl\s+setenv\s+[\"']?(?:" + _CARGO_ENV_NAMES + r")\b"
     # rustdoc's `--runtool`/`--test-runtool` runs an arbitrary program.
-    r"|\b(?:CARGO_(?:ENCODED_|BUILD_)?)?RUSTDOCFLAGS\s*=[^\n]{0,300}--(?:test-)?runtool\b",
+    r"|\b(?:CARGO_(?:ENCODED_|BUILD_)?)?RUSTDOCFLAGS\s*=[^\n]{0,300}--(?:test-)?(?:runtool|builder)\b"
+    r"|\b(?:CARGO_[A-Z0-9_]{1,120}_|CARGO_(?:ENCODED_|BUILD_)?)?RUSTFLAGS\s*=[^\n]{0,300}"
+    r"(?:-C\s*linker(?![\w-])|-Z\s*(?:codegen-backend|llvm-plugins)|-C\s*link-args?[=\s][^\s]*-fuse-ld=)",
     re.IGNORECASE,
 )
 _CARGO_CFG_KEYS = (
@@ -3747,7 +3754,8 @@ _CARGO_CFG_KEYS = (
 CARGO_EXEC_CLI_RE = re.compile(
     r"--config\b[\s=]+[\"']?(?:" + _CARGO_CFG_KEYS + r")[\"']?\s*="
     # `cargo config set <key> <value>` (unstable subcommand) -- no `=`.
-    r"|\bconfig\s+set\s+[\"']?(?:" + _CARGO_CFG_KEYS + r")\b"
+    r"|\bconfig\s+set\s+(?:--?[\w-]+(?:[=\s]+(?!(?:build|target|registr|include))[\w-]+)?\s+)*[\"']?(?:" + _CARGO_CFG_KEYS + r")\b"
+    r"|\bconfig\s+set\s+(?:--?[\w-]+\s+)*[\"']?build\.rustflags\b[^\n]{0,200}(?:linker|codegen-backend)"
     # `--config <file>`: merges an arbitrary TOML (a path, never `key=value`).
     r"|--config\b[\s=]+[\"']?(?:[^\s\"'=]*[/\\][^\s\"'=]*|[^\s\"'=]*\.toml)[\"']?(?=\s|$)",
     re.IGNORECASE,

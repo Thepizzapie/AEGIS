@@ -2169,8 +2169,12 @@ def _cargo_nested_pairs(v, _depth: int = 0):
     if _depth > 6:
         return
     if isinstance(v, dict):
-        pv = next((v[k] for k in ("path", "file_path", "filepath", "filename", "file")
+        pv = next((v[k] for k in ("path", "file_path", "filepath", "filename", "file",
+                                  "name", "target", "destination", "dest")
                    if isinstance(v.get(k), str)), None)
+        for k, x in v.items():          # {".cargo/config.toml": "<content>"}
+            if isinstance(k, str) and isinstance(x, str) and patterns.CARGO_CONFIG_PATH_RE.search(k):
+                yield k, x
         if pv:
             yield pv, " ".join(_flatten_strings({k: x for k, x in v.items()
                                                   if x is not pv}))
@@ -2267,14 +2271,17 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
+        # Anything after a bare ` -- ` belongs to the program cargo runs
+        # (`cargo run -- --config app.toml`), not to cargo.
+        cli_cmd = re.split(r"\s--\s", cmd, maxsplit=1)[0]
         env_hit = bool(patterns.CARGO_EXEC_ENV_RE.search(cmd)
-                       or patterns.CARGO_EXEC_CLI_RE.search(cmd))
+                       or patterns.CARGO_EXEC_CLI_RE.search(cli_cmd))
         write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                           or patterns.INPLACE_WRITE_RE.search(cmd)
                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
                           or patterns.COPY_WRITE_VERB_RE.search(cmd)
-                          or re.search(r"\b(?:tee|sponge|rsync)\b", cmd))
+                          or re.search(r"\b(?:tee|sponge|rsync)\b|\d>>?", cmd))
         file_hit = False
         if (write_verb and patterns.CARGO_DIR_DEST_RE.search(cmd)
                 and (patterns.COPY_WRITE_VERB_RE.search(cmd)
