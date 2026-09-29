@@ -3737,6 +3737,19 @@ CARGO_OPAQUE_WRITE_RE = re.compile(
     r"\b(?:mv|move-item|move|ren|rename-item)\b",
     re.IGNORECASE,
 )
+# The config file must be the DESTINATION (last operand of its command
+# segment) for an opaque write to count -- `cp .cargo/config.toml /tmp/bak`
+# and `mv config.toml config.toml.bak` only read it / move it away.
+CARGO_OPAQUE_DEST_RE = re.compile(
+    r"config(?:\.toml)?[\"']?\s*(?:$|[;&|)\n])",
+    re.IGNORECASE,
+)
+# A redirect/tee whose payload is fetched from the network (`curl ... >
+# .cargo/config.toml`): the written content is invisible to the guard.
+CARGO_FETCH_RE = re.compile(
+    r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod)\b",
+    re.IGNORECASE,
+)
 
 # ---- Yarn Berry exec-hijack protection (yarnPath / plugins) --------------------
 # Yarn Berry (>=2.x) resolves a bare `yarn` invocation through its own committed

@@ -2190,7 +2190,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     HONEST SCOPE: a `build.rs` (or a proc-macro/dependency) is Rust source
     that runs at build time and is reviewed like any other code — not
     covered. A `[alias]` can only name cargo subcommands and is not gated.
-    A `--config <file>` pointing at an arbitrary TOML, and paths computed
+    A `--config <file>` pointing at an arbitrary TOML, a `CARGO_HOME=<dir>`
+    redirect to an attacker-planted config directory, and paths computed
     indirectly by the shell, are the accepted denylist gap every sibling
     guard shares."""
     cfg = getattr(policy, "cargo_exec", None) or {}
@@ -2243,8 +2244,10 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                             or (patterns.CARGO_CD_RE.search(cmd)
                                 and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
             if path_hit:
-                opaque = bool(patterns.CARGO_OPAQUE_WRITE_RE.search(cmd)
-                              or patterns.COPY_WRITE_VERB_RE.search(cmd))
+                opaque = bool((patterns.CARGO_OPAQUE_WRITE_RE.search(cmd)
+                               or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                               or patterns.CARGO_FETCH_RE.search(cmd))
+                              and patterns.CARGO_OPAQUE_DEST_RE.search(cmd))
                 file_hit = bool(opaque or patterns.CARGO_EXEC_KEY_RE.search(cmd))
         if not (env_hit or file_hit):
             return None
@@ -7178,6 +7181,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.PACKAGE_SCRIPTS_PATH_RE, "a package manifest (package.json/composer.json)"),
     (patterns.REGISTRY_CONFIG_PATH_RE, "a package-registry config"),
     (patterns.PNPMFILE_PATH_RE, "pnpm's hook file"),
+    (patterns.CARGO_CONFIG_PATH_RE, "Cargo's config"),
     (patterns.YARN_EXEC_PATH_RE, "Yarn Berry's own release/plugin bundle"),
     (patterns.YARNRC_YML_PATH_RE, "Yarn Berry's .yarnrc.yml exec-loader config"),
     (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
