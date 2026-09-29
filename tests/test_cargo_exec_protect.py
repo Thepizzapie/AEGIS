@@ -173,7 +173,10 @@ def test_env_forms_gated():
               "CARGO_REGISTRIES_FOO_CREDENTIAL_PROVIDER='cargo:token-from-stdout x' cargo publish",
               "export RUSTC=/tmp/fake-rustc", "env RUSTC_WORKSPACE_WRAPPER=/x cargo test",
               "$env:RUSTC_WRAPPER = 'C:\\x.exe'", "setx RUSTC_WRAPPER C:\\x.exe",
-              "rustc_wrapper=/x cargo build"):
+              "Set-Item Env:RUSTC_WRAPPER C:\\x.exe",
+              "[Environment]::SetEnvironmentVariable('RUSTC_WRAPPER','C:\\x.exe','User')",
+              "launchctl setenv RUSTC_WRAPPER /tmp/x",
+              "RUSTDOCFLAGS='--runtool /tmp/x' cargo doc"):
         assert _hit(_shell(c))[0], c
 
 
@@ -256,3 +259,63 @@ def test_write_branch_allow_list_and_deny_shell():
 
 def test_mode_false_is_off():
     assert not _hit(_shell("export RUSTC_WRAPPER=/x"), Policy(cargo_exec={"mode": False}))[0]
+
+
+# ---- QA round 2 fixes ----------------------------------------------------------
+def test_rustdoc_runtool_and_codegen_backend_gated():
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustdocflags=["--runtool","x"]\n'))[0]
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustdocflags=["--test-runtool=x"]\n'))[0]
+    assert _hit(_shell("echo 'rustflags = [\"-Zcodegen-backend=/tmp/x.so\"]' >> .cargo/config.toml"))[0]
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustflags=["-Zllvm-plugins=/x.so"]\n'))[0]
+
+
+def test_include_key_and_config_file_gated():
+    assert _hit(_write(".cargo/config.toml", 'include = ["/tmp/evil.toml"]\n'))[0]
+    assert _hit(_shell("cargo build --config /tmp/evil.toml"))[0]
+    assert _hit(_shell("cargo build --config 'include=\"/tmp/evil.toml\"'"))[0]
+    assert _hit(_shell("cargo build --config evil.toml"))[0]
+
+
+def test_cargo_config_set_gated():
+    assert _hit(_shell("cargo config set build.rustc-wrapper x"))[0]
+    assert _hit(_shell("cargo -Zunstable-options config set target.x86_64-unknown-linux-gnu.runner x"))[0]
+
+
+def test_mcp_push_files_nested_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__github__push_files",
+                    args={"files": [{"path": "README.md", "content": "hi"},
+                                    {"path": ".cargo/config.toml",
+                                     "content": '[build]\nrustc-wrapper="x"\n'}]})
+    assert _hit(ev)[0]
+    ok = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__github__push_files",
+                    args={"files": [{"path": ".cargo/config.toml", "content": "[net]\nretry=3\n"}]})
+    assert not _hit(ok)[0]
+
+
+def test_opaque_source_writes_gated():
+    for c in ("cat /tmp/c > .cargo/config.toml", "cat /tmp/c | tee .cargo/config.toml",
+              "tee .cargo/config.toml < /tmp/c", "echo x | sponge .cargo/config.toml",
+              "rsync /tmp/e.toml .cargo/config.toml", "cp /tmp/config.toml .cargo/",
+              "cp -t .cargo /tmp/config.toml"):
+        assert evaluate(_shell(c), EMPTY).action != Action.ALLOW, c
+        assert _hit(_shell(c))[0], c
+
+
+def test_lowercase_env_prose_not_gated():
+    for c in ('echo "msrv rustc=1.75" > notes.txt', "rustc=$(which rustc); echo $rustc",
+              "git commit -m 'set rustc = fast'", "echo 'rustc=1' > settings/config.toml"):
+        assert not _hit(_shell(c))[0], c
+
+
+def test_comments_and_empty_values_not_gated():
+    for c in ('# rustc-wrapper = sccache is not used\n[net]\n', "[build]\nrustc-wrapper=''\n",
+              '[build]\nrunner = ""\n', "[build]\nrustflags = []\n"):
+        assert not _hit(_write(".cargo/config.toml", c))[0], c
+
+
+def test_monitor_mode_records_row(monkeypatch):
+    import aegis.rules as R
+    seen = []
+    monkeypatch.setattr(R, "_record_monitor", lambda ev, would, note="": seen.append(note))
+    assert not _hit(_shell("export RUSTC_WRAPPER=/x"), Policy(cargo_exec={"mode": "monitor"}))[0]
+    assert seen == ["cargo-exec-protect-monitor"]

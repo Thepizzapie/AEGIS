@@ -2157,6 +2157,30 @@ def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
+def _cargo_content_hit(content: str) -> bool:
+    # Drop TOML comment lines: `# rustc-wrapper = sccache` plants nothing.
+    body = "\n".join(l for l in content.splitlines() if not l.lstrip().startswith("#"))
+    return bool(body and patterns.CARGO_EXEC_KEY_RE.search(body))
+
+
+def _cargo_nested_pairs(v, _depth: int = 0):
+    """Yield (path, sibling-text) for every nested dict that carries a
+    path-like string beside other strings (an MCP multi-file write)."""
+    if _depth > 6:
+        return
+    if isinstance(v, dict):
+        pv = next((v[k] for k in ("path", "file_path", "filepath", "filename", "file")
+                   if isinstance(v.get(k), str)), None)
+        if pv:
+            yield pv, " ".join(_flatten_strings({k: x for k, x in v.items()
+                                                  if x is not pv}))
+        for x in v.values():
+            yield from _cargo_nested_pairs(x, _depth + 1)
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            yield from _cargo_nested_pairs(x, _depth + 1)
+
+
 def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting a command-executing key in Cargo's config
     (`.cargo/config.toml`, legacy `.cargo/config`, `$CARGO_HOME/config.toml`):
@@ -2193,7 +2217,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     A `--config <file>` pointing at an arbitrary TOML, a `CARGO_HOME=<dir>`
     redirect to an attacker-planted config directory, and paths computed
     indirectly by the shell, are the accepted denylist gap every sibling
-    guard shares."""
+    guard shares. Also out of scope, disclosed as follow-up surfaces: the
+    same env values planted in NON-cargo files (a Makefile, or rust-analyzer's
+    `cargo.extraEnv`/`cargo.extraArgs` in `.vscode/settings.json`/
+    `rust-analyzer.toml`) and patch-based writes (`git apply`/`patch`).
+    Known accepted false positive: an Edit that REMOVES an exec key still
+    asks, because `old_string` is scanned (value-only diffs need it)."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -2209,13 +2238,20 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
-        if not p or not patterns.CARGO_CONFIG_PATH_RE.search(p):
-            return None
         a = ev.args or {}
-        parts = [v for v in (a.get("content"), a.get("new_string"), a.get("old_string"))
-                 if isinstance(v, str) and v]
-        content = " ".join(parts) if parts else " ".join(_flatten_strings(a))
-        if not (content and patterns.CARGO_EXEC_KEY_RE.search(content)):
+        hit = False
+        if p and patterns.CARGO_CONFIG_PATH_RE.search(p):
+            parts = [v for v in (a.get("content"), a.get("new_string"), a.get("old_string"))
+                     if isinstance(v, str) and v]
+            content = " ".join(parts) if parts else " ".join(_flatten_strings(a))
+            hit = _cargo_content_hit(content)
+        if not hit and ev.action == ActionClass.MCP:
+            # e.g. GitHub `push_files`: {"files": [{"path": ..., "content": ...}]}
+            for np, ntext in _cargo_nested_pairs(a):
+                if patterns.CARGO_CONFIG_PATH_RE.search(np) and _cargo_content_hit(ntext):
+                    p, hit = np, True
+                    break
+        if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)):
@@ -2237,16 +2273,22 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                           or patterns.INPLACE_WRITE_RE.search(cmd)
                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                          or patterns.COPY_WRITE_VERB_RE.search(cmd))
+                          or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                          or re.search(r"\b(?:tee|sponge|rsync)\b", cmd))
         file_hit = False
-        if write_verb:
+        if (write_verb and patterns.CARGO_DIR_DEST_RE.search(cmd)
+                and (patterns.COPY_WRITE_VERB_RE.search(cmd)
+                     or patterns.CARGO_OPAQUE_WRITE_RE.search(cmd))):
+            file_hit = True
+        if write_verb and not file_hit:
             path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(cmd)
                             or (patterns.CARGO_CD_RE.search(cmd)
                                 and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
             if path_hit:
                 opaque = bool((patterns.CARGO_OPAQUE_WRITE_RE.search(cmd)
                                or patterns.COPY_WRITE_VERB_RE.search(cmd)
-                               or patterns.CARGO_FETCH_RE.search(cmd))
+                               or patterns.CARGO_FETCH_RE.search(cmd)
+                               or patterns.CARGO_OPAQUE_SRC_RE.search(cmd))
                               and patterns.CARGO_OPAQUE_DEST_RE.search(cmd))
                 file_hit = bool(opaque or patterns.CARGO_EXEC_KEY_RE.search(cmd))
         if not (env_hit or file_hit):

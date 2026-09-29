@@ -3705,9 +3705,13 @@ CARGO_BARE_CONFIG_RE = re.compile(
 # `link-arg` inside a `rustflags` array covers the rustc-flag spelling.
 CARGO_EXEC_KEY_RE = re.compile(
     r"(?:(?<![\w-])|(?<=\\n))(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
-    r"|credential-provider|global-credential-providers)[\"']?\s*="
-    r"|-C\s*(?:linker|link-args?)\b|[\"']link-args?=",
-    re.IGNORECASE,
+    r"|credential-provider|global-credential-providers|include)[\"']?\s*="
+    # An empty value (`= ''`/`""`/`[]`) CLEARS a setting -- not a plant.
+    r"(?!\s*(?:\"\"|''|\[\s*\])?\s*(?:#|$))"
+    r"|-C\s*(?:linker|link-args?|llvm-args)\b|[\"']link-args?="
+    r"|-Z\s*(?:codegen-backend|llvm-plugins|pre-link-args?)\b"
+    r"|--(?:test-)?runtool\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 # Env-var / CLI spellings, checked with no path pairing. The value must be a
 # real non-empty one (`RUSTC_WRAPPER= cargo build`/`RUSTC_WRAPPER="" ...`
@@ -3720,28 +3724,55 @@ _CARGO_ENV_NAMES = (
     r"|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?"
 )
 CARGO_EXEC_ENV_RE = re.compile(
-    r"(?<![\w])(?:" + _CARGO_ENV_NAMES + r")\s*=[\"']?[^\s\"';&|]"
+    # Plain `NAME=value` is case-SENSITIVE (POSIX env names are; a lowercase
+    # `rustc=1.75` in prose/a shell var is not the env var) -- the Windows
+    # setters below are case-insensitive by nature.
+    r"(?<![\w])(?-i:" + _CARGO_ENV_NAMES + r")\s*=[\"']?[^\s\"';&|]"
     r"|\$env:(?:" + _CARGO_ENV_NAMES + r")\s*=\s*[\"']?[^\s\"';&|]"
-    r"|\bsetx?\s+[\"']?(?:" + _CARGO_ENV_NAMES + r")\b[\"']?\s+[\"']?[^\s\"';&|]",
+    r"|\bsetx?\s+[\"']?(?:" + _CARGO_ENV_NAMES + r")\b[\"']?\s+(?!=)[\"']?[^\s\"';&|]"
+    r"|\b(?:set-item|new-item|si|ni)\b[^|;&\n]{0,80}\benv:(?:" + _CARGO_ENV_NAMES + r")\b"
+    r"|\bSetEnvironmentVariable\s*\(\s*[\"'](?:" + _CARGO_ENV_NAMES + r")[\"']"
+    r"|\blaunchctl\s+setenv\s+[\"']?(?:" + _CARGO_ENV_NAMES + r")\b"
+    # rustdoc's `--runtool`/`--test-runtool` runs an arbitrary program.
+    r"|\b(?:CARGO_(?:ENCODED_|BUILD_)?)?RUSTDOCFLAGS\s*=[^\n]{0,300}--(?:test-)?runtool\b",
     re.IGNORECASE,
 )
-CARGO_EXEC_CLI_RE = re.compile(
-    r"--config\b[\s=]+[\"']?(?:build\.(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc)"
+_CARGO_CFG_KEYS = (
+    r"build\.(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc)"
     r"|target\.[^=\n]{1,120}?\.(?:runner|linker)"
     r"|registry\.(?:global-)?credential-providers?"
-    r"|registries\.[^=\s]{1,80}\.credential-provider)[\"']?\s*=",
+    r"|registries\.[^=\s]{1,80}\.credential-provider"
+    r"|include"
+)
+CARGO_EXEC_CLI_RE = re.compile(
+    r"--config\b[\s=]+[\"']?(?:" + _CARGO_CFG_KEYS + r")[\"']?\s*="
+    # `cargo config set <key> <value>` (unstable subcommand) -- no `=`.
+    r"|\bconfig\s+set\s+[\"']?(?:" + _CARGO_CFG_KEYS + r")\b"
+    # `--config <file>`: merges an arbitrary TOML (a path, never `key=value`).
+    r"|--config\b[\s=]+[\"']?(?:[^\s\"'=]*[/\\][^\s\"'=]*|[^\s\"'=]*\.toml)[\"']?(?=\s|$)",
     re.IGNORECASE,
 )
 # Copy/move/link into the path: content opaque, path alone is the signal.
 CARGO_OPAQUE_WRITE_RE = re.compile(
-    r"\b(?:mv|move-item|move|ren|rename-item)\b",
+    r"\b(?:mv|move-item|move|ren|rename-item|rsync)\b",
     re.IGNORECASE,
 )
 # The config file must be the DESTINATION (last operand of its command
 # segment) for an opaque write to count -- `cp .cargo/config.toml /tmp/bak`
 # and `mv config.toml config.toml.bak` only read it / move it away.
 CARGO_OPAQUE_DEST_RE = re.compile(
-    r"config(?:\.toml)?[\"']?\s*(?:$|[;&|)\n])",
+    r"config(?:\.toml)?[\"']?(?:\s*<\s*\S+)?\s*(?:$|[;&|)\n])",
+    re.IGNORECASE,
+)
+# `cp x .cargo/` / `cp -t .cargo x`: destination is the DIRECTORY.
+CARGO_DIR_DEST_RE = re.compile(
+    r"(?:\.cargo|CARGO_HOME)[}\"']*[/\\]*[\"']?\s*(?:$|[;&|)\n])"
+    r"|\s-t\s*[\"']?\S*(?:\.cargo|CARGO_HOME)[}\"']*[/\\]*[\"']?(?:\s|$)",
+    re.IGNORECASE,
+)
+# Commands whose written payload is a file/stream the guard can't see.
+CARGO_OPAQUE_SRC_RE = re.compile(
+    r"\b(?:cat|type|get-content|gc|rsync|sponge|base64|xargs)\b|\btee\b[^|;&\n]*<",
     re.IGNORECASE,
 )
 # A redirect/tee whose payload is fetched from the network (`curl ... >
