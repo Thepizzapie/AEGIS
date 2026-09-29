@@ -2173,8 +2173,14 @@ def _cargo_nested_pairs(v, _depth: int = 0):
                                   "name", "target", "destination", "dest")
                    if isinstance(v.get(k), str)), None)
         for k, x in v.items():          # {".cargo/config.toml": "<content>"}
-            if isinstance(k, str) and isinstance(x, str) and patterns.CARGO_CONFIG_PATH_RE.search(k):
-                yield k, x
+            if isinstance(k, str) and patterns.CARGO_CONFIG_PATH_RE.search(k):
+                yield k, " ".join(_flatten_strings(x))
+        dv = next((v[k] for k in ("directory", "dir", "folder")
+                   if isinstance(v.get(k), str)), None)
+        if pv and dv:
+            pv = dv.rstrip("/\\") + "/" + pv
+        elif dv and not pv:
+            pv = dv
         if pv:
             yield pv, " ".join(_flatten_strings({k: x for k, x in v.items()
                                                   if x is not pv}))

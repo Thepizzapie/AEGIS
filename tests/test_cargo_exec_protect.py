@@ -372,3 +372,28 @@ def test_benign_linker_flags_not_gated():
               '[build]\nrustflags=["-C","linker-flavor=ld.lld"]\n'):
         assert not _hit(_write(".cargo/config.toml", c))[0], c
     assert _hit(_write(".cargo/config.toml", '[build]\nrustflags=["-Clink-arg=-fuse-ld=/tmp/l"]\n'))[0]
+
+
+# ---- QA round 4 fixes ----------------------------------------------------------
+def test_other_tools_config_flag_not_gated():
+    for c in ("black --config pyproject.toml .", "docker --config ~/.docker build .",
+              "pytest --config ./x.ini", "./target/debug/myapp --config ./conf/app.toml"):
+        assert not _hit(_shell(c))[0], c
+    assert _hit(_shell("cargo build --config ci/evil.toml"))[0]
+
+
+def test_doc_browser_and_link_arg_b_specs_gated():
+    assert _hit(_write(".cargo/config.toml", '[doc]\nbrowser = "/tmp/x"\n'))[0]
+    assert _hit(_shell("CARGO_DOC_BROWSER=/tmp/x cargo doc --open"))[0]
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustflags = ["-Clink-arg=-B/tmp/evil"]\n'))[0]
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustflags = ["-Clink-arg=-specs=/tmp/x.specs"]\n'))[0]
+
+
+def test_mcp_dir_plus_filename_and_interpreter_env_gated():
+    c = '[build]\nrustc-wrapper="x"\n'
+    for args in ({"directory": "/h/.cargo", "filename": "config.toml", "content": c},
+                 {"files": {".cargo/config.toml": {"content": c}}}):
+        ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__x__push", args=args)
+        assert _hit(ev)[0], args
+    assert _hit(_shell("python -c \"import os;os.environ['RUSTC_WRAPPER']='/tmp/x'\""))[0]
+    assert _hit(_shell("python -c \"import subprocess;subprocess.run(['cargo','b'],env={'RUSTC_WRAPPER':'/tmp/x'})\""))[0]
