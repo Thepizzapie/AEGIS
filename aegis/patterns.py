@@ -3643,6 +3643,101 @@ PNPMFILE_REDIRECT_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Cargo exec-hijack protection (rustc-wrapper / runner / linker / credential-provider) ----
+# Cargo's own config (`.cargo/config.toml`, legacy `.cargo/config`, or
+# `$CARGO_HOME/config.toml`, discovered by walking UP from the cwd, so a
+# project-level file silently governs every cargo invocation beneath it)
+# carries several keys whose VALUE is a command Cargo itself spawns:
+#   * `[build] rustc-wrapper` / `rustc-workspace-wrapper` -- run in front of
+#     EVERY rustc invocation, i.e. on the very next `cargo build`/`check`/
+#     `test`/`clippy`, and by rust-analyzer's background `cargo check` the
+#     moment an IDE opens the project (no explicit build needed);
+#   * `[build] rustc` / `rustdoc` -- replaces the compiler binary outright;
+#   * `[target.<triple>] runner` -- wraps every `cargo run`/`cargo test`
+#     binary; `[target.<triple>] linker` (or `-C linker=`/`link-arg`
+#     rustflags) -- the program rustc invokes at link time;
+#   * `[registry] credential-provider` / `global-credential-providers` /
+#     `[registries.<n>] credential-provider` -- a `cargo:token-from-stdout
+#     <cmd>` provider is an arbitrary command handed the registry token/
+#     authentication context on every authenticated cargo operation.
+# `rule_package_manifest_protect` already gates this same FILE, but only for
+# registry/index redirects (`replace-with`); none of the exec keys above are
+# in its content regex, so they sailed past it with zero detection. Unlike a
+# `build.rs` (a Rust source file, reviewed like any other and disclosed
+# below as out of scope), these are single TOML lines in a dotfile-directory
+# file nobody diffs closely -- the same "write now, auto-exec later, on a
+# different trigger" shape as `core.hooksPath` for git hooks.
+#
+# Env-var forms: Cargo reads every config key from a `CARGO_*` env var that
+# OVERRIDES the config file (`CARGO_BUILD_RUSTC_WRAPPER`, `CARGO_TARGET_
+# <TRIPLE>_RUNNER`/`_LINKER`, `CARGO_REGISTRIES_<NAME>_CREDENTIAL_PROVIDER`,
+# ...), plus the two historic un-prefixed names `RUSTC_WRAPPER`/
+# `RUSTC_WORKSPACE_WRAPPER` and `RUSTC`/`RUSTDOC`; and `cargo --config
+# 'key=value'` injects any of the keys for one invocation. These need no
+# file path at all, so, like `PNPMFILE_REDIRECT_CLI_RE`, they are checked
+# unconditionally against a shell command.
+#
+# Gated on PATH *and* CONTENT for a file write (`.cargo/config.toml` is
+# edited for ordinary reasons -- `[net]`, `[alias]`, `[profile]`, `[env]`,
+# a registry mirror -- and a path-only gate would fire on every one),
+# except for an opaque copy/move/link INTO the path, where the content
+# isn't visible in the command and the path alone is the only signal.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|\bCARGO_HOME\b[}\"']*" + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# `cd .cargo && echo ... > config.toml` -- the bare filename only counts when
+# the same command `cd`s/`pushd`s into a `.cargo` (or `$CARGO_HOME`) dir.
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd|set-location|sl)\s+[\"']?[^;&|\n]{0,200}(?:\.cargo|CARGO_HOME)[}\"']*[/\\]*[\"']?\s*(?:&&|;|\|\||\n|$)",
+    re.IGNORECASE,
+)
+CARGO_BARE_CONFIG_RE = re.compile(
+    r"(?:^|[\s'\"/\\=<>])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Content check for a CONFIRMED cargo-config path: an exec-carrying key
+# assigned a value. Keys may be bare, quoted, or dotted (`build.rustc-wrapper
+# = ...`, `"linker" = ...`, `[target.x].runner`), so the key is anchored only
+# on what precedes it not being a word/hyphen char (or being a literal `\n`,
+# the newline a `sed -i 's/x/x\nkey=v/'` replacement spells). `-C linker=` /
+# `link-arg` inside a `rustflags` array covers the rustc-flag spelling.
+CARGO_EXEC_KEY_RE = re.compile(
+    r"(?:(?<![\w-])|(?<=\\n))(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
+    r"|credential-provider|global-credential-providers)[\"']?\s*="
+    r"|-C\s*(?:linker|link-args?)\b|[\"']link-args?=",
+    re.IGNORECASE,
+)
+# Env-var / CLI spellings, checked with no path pairing. The value must be a
+# real non-empty one (`RUSTC_WRAPPER= cargo build`/`RUSTC_WRAPPER="" ...`
+# CLEARS a wrapper, the opposite of an attack).
+_CARGO_ENV_NAMES = (
+    r"RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTC|RUSTDOC"
+    r"|CARGO_BUILD_RUSTC(?:_WRAPPER|_WORKSPACE_WRAPPER)?|CARGO_BUILD_RUSTDOC"
+    r"|CARGO_TARGET_[A-Z0-9_]{1,120}_(?:RUNNER|LINKER)"
+    r"|CARGO_REGISTRIES_[A-Z0-9_]{1,120}_CREDENTIAL_PROVIDER"
+    r"|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?"
+)
+CARGO_EXEC_ENV_RE = re.compile(
+    r"(?<![\w])(?:" + _CARGO_ENV_NAMES + r")\s*=[\"']?[^\s\"';&|]"
+    r"|\$env:(?:" + _CARGO_ENV_NAMES + r")\s*=\s*[\"']?[^\s\"';&|]"
+    r"|\bsetx?\s+[\"']?(?:" + _CARGO_ENV_NAMES + r")\b[\"']?\s+[\"']?[^\s\"';&|]",
+    re.IGNORECASE,
+)
+CARGO_EXEC_CLI_RE = re.compile(
+    r"--config\b[\s=]+[\"']?(?:build\.(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc)"
+    r"|target\.[^=\n]{1,120}?\.(?:runner|linker)"
+    r"|registry\.(?:global-)?credential-providers?"
+    r"|registries\.[^=\s]{1,80}\.credential-provider)[\"']?\s*=",
+    re.IGNORECASE,
+)
+# Copy/move/link into the path: content opaque, path alone is the signal.
+CARGO_OPAQUE_WRITE_RE = re.compile(
+    r"\b(?:mv|move-item|move|ren|rename-item)\b",
+    re.IGNORECASE,
+)
+
 # ---- Yarn Berry exec-hijack protection (yarnPath / plugins) --------------------
 # Yarn Berry (>=2.x) resolves a bare `yarn` invocation through its own committed
 # release bundle whenever `.yarnrc.yml` sets `yarnPath` -- the file it names

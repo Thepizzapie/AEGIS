@@ -2147,6 +2147,121 @@ def rule_pnpmfile_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a command-executing key in Cargo's config
+    (`.cargo/config.toml`, legacy `.cargo/config`, `$CARGO_HOME/config.toml`):
+    `build.rustc-wrapper`/`rustc-workspace-wrapper`/`rustc`/`rustdoc`,
+    `target.<triple>.runner`/`linker` (or `-C linker=`/`link-arg` rustflags),
+    and `credential-provider`/`global-credential-providers` — plus the same
+    keys set through their `CARGO_*`/`RUSTC_WRAPPER`/`RUSTC` env vars or a
+    `cargo --config key=value` flag, which need no file at all.
+
+    THREAT MODEL: each of those values is a command Cargo itself spawns —
+    in front of every rustc call (next `cargo build`/`check`/`test`, and
+    rust-analyzer's background `cargo check` the moment an IDE opens the
+    project), around every `cargo run`/`test` binary, at link time, or as a
+    registry-credential helper that receives the auth token. Cargo finds
+    the file by walking up from the cwd, so a project-level file silently
+    governs every cargo invocation beneath it, by this agent, a teammate or
+    CI. `rule_package_manifest_protect` gates this same file only for
+    registry redirects (`replace-with`), so none of these keys were seen.
+    Same "write now, auto-exec on a later trigger" shape as a git hook.
+
+    File writes are gated on PATH and CONTENT (the file is legitimately
+    edited for `[net]`/`[alias]`/`[profile]`/mirror settings, and a
+    path-only gate would fire on all of it); an opaque `mv`/`cp`/`ln`
+    into the path is gated on path alone since the content isn't visible.
+    Env-var and `--config` spellings are checked unconditionally, but only
+    for a non-empty value (`RUSTC_WRAPPER= cargo build` clears a wrapper).
+    Default mode is `ask`: `sccache`/`runner = "qemu-..."`/`probe-rs` are
+    real, sanctioned setups. Policy knob `cargo_exec` ({mode, allow}) or
+    `AEGIS_ALLOW_CARGO_EXEC=1` (set by a human/orchestrator) escapes.
+
+    HONEST SCOPE: a `build.rs` (or a proc-macro/dependency) is Rust source
+    that runs at build time and is reviewed like any other code — not
+    covered. A `[alias]` can only name cargo subcommands and is not gated.
+    A `--config <file>` pointing at an arbitrary TOML, and paths computed
+    indirectly by the shell, are the accepted denylist gap every sibling
+    guard shares."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.CARGO_CONFIG_PATH_RE.search(p):
+            return None
+        a = ev.args or {}
+        parts = [v for v in (a.get("content"), a.get("new_string"), a.get("old_string"))
+                 if isinstance(v, str) and v]
+        content = " ".join(parts) if parts else " ".join(_flatten_strings(a))
+        if not (content and patterns.CARGO_EXEC_KEY_RE.search(content)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' plants a command-executing Cargo config key "
+                         "(rustc-wrapper/runner/linker/credential-provider) "
+                         "— Cargo spawns it automatically and unattended on "
+                         "the next build/run/test (and on rust-analyzer's "
+                         "background check), by anyone who builds this "
+                         "project. Review the change, then confirm with "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        env_hit = bool(patterns.CARGO_EXEC_ENV_RE.search(cmd)
+                       or patterns.CARGO_EXEC_CLI_RE.search(cmd))
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                          or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                          or patterns.INPLACE_WRITE_RE.search(cmd)
+                          or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                          or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        file_hit = False
+        if write_verb:
+            path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(cmd)
+                            or (patterns.CARGO_CD_RE.search(cmd)
+                                and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
+            if path_hit:
+                opaque = bool(patterns.CARGO_OPAQUE_WRITE_RE.search(cmd)
+                              or patterns.COPY_WRITE_VERB_RE.search(cmd))
+                file_hit = bool(opaque or patterns.CARGO_EXEC_KEY_RE.search(cmd))
+        if not (env_hit or file_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A command-executing Cargo setting (rustc-wrapper/"
+                         "runner/linker/credential-provider, via config file, "
+                         "CARGO_*/RUSTC_WRAPPER env var or --config) is being "
+                         "planted from a shell — Cargo spawns it "
+                         "automatically on the next build/run/test. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 def _yarn_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -8498,6 +8613,7 @@ _CORE_RULES = (
     rule_direnv_protect,
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
+    rule_cargo_exec_protect,
     rule_yarn_exec_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,

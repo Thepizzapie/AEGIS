@@ -209,6 +209,14 @@ class Policy:
     # PNPM_CONFIG_PNPMFILE env var) that points pnpm's loader at an
     # arbitrary path instead. See rules.rule_pnpmfile_exec_protect.
     pnpmfile_exec: dict = field(default_factory=dict)
+    # Cargo exec-hijack protection: {mode: deny|ask|monitor|off, allow:
+    # [regex on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # .cargo/config.toml (or $CARGO_HOME/config.toml) keys whose value is a
+    # command Cargo spawns -- build.rustc-wrapper/rustc-workspace-wrapper/
+    # rustc/rustdoc, target.<triple>.runner/linker, credential-provider --
+    # plus their CARGO_*/RUSTC_WRAPPER env vars and `cargo --config` forms.
+    # See rules.rule_cargo_exec_protect.
+    cargo_exec: dict = field(default_factory=dict)
     # Yarn Berry exec-hijack protection: {mode: deny|ask|monitor|off, allow:
     # [regex on path/command]}. Empty -> defaults (mode=ask) apply. Covers
     # Yarn's own release/plugin bundle (.yarn/releases/*.cjs/.js,
