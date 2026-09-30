@@ -4594,6 +4594,147 @@ def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decisi
     return None
 
 
+# Placement verbs the shared write-verb set does not name (`install`, plain
+# `ln -s`, `touch`) -- cheap wins the QA bypass hunt found; still needs a gated path.
+_JVM_EXTRA_WRITE_VERB_RE = re.compile(r"\b(?:install|ln|touch)\b", re.IGNORECASE)
+
+_JVM_GITMETA_REDIRECT_RE = re.compile(
+    r"(?:>>?|\btee\b(?:\s+-\w+)*)\s*['\"]?\S*\.git(?:ignore|attributes)['\"]?"
+    r"|\.git[/\\]info[/\\](?:exclude|attributes)",
+    re.IGNORECASE,
+)
+
+
+def _jvm_build_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Maven/Gradle auto-exec hook: `.mvn/extensions.xml`
+    (core extension jars loaded into Maven's JVM), `.mvn/jvm.config` (JVM
+    flags such as `-javaagent:`), Gradle init scripts (`init.gradle[.kts]`,
+    `init.d/*.gradle[.kts]`), wrapper `distributionUrl`/jar redirects
+    (`gradle-wrapper.properties`, `maven-wrapper.properties`, the wrapper
+    jars), and an exec-capable `gradle.properties` (`org.gradle.jvmargs` with
+    an agent/`OnError` flag, or `org.gradle.java.home`).
+
+    THREAT MODEL: same "write now, auto-exec later" shape as the sibling
+    `*_protect` guards, on the one mainstream build ecosystem none of them
+    reach. The next `mvn`/`./mvnw`/`gradle`/`./gradlew` — by this session, a
+    teammate's IDE import, or CI — runs the planted code with the invoking
+    user's/CI's full privileges and credentials, before any reviewed build
+    logic or dependency-lifecycle step. Home-scope Gradle init scripts run on
+    every build of every project on the machine. These files are small,
+    tracked, and read as routine config in review.
+
+    Gating: PATH ALONE for the files whose whole purpose is loading/pointing
+    at code (extensions.xml, jvm.config, init scripts, wrappers) — a content
+    check would be bypassable by a value-only Edit diff. `gradle.properties`
+    is edited constantly, so it additionally needs an exec-capable token
+    (`GRADLE_PROPERTIES_EXEC_RE`); so is `.mvn/maven.config`. Also gated: `.mavenrc`
+    (sourced by the mvn launcher script), the `gradlew`/`mvnw` launchers, and
+    CLI-driven wrapper rewrites (`gradle wrapper --gradle-distribution-url`,
+    `mvn wrapper:wrapper -DdistributionUrl`).
+
+    Config (``policy.jvm_build_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on path/command). Escapable only by a
+    human: trailing '# aegis-allow' (shell) or AEGIS_ALLOW_JVM_BUILD_EXEC=1.
+
+    Honest scope: `pom.xml`/`build.gradle[.kts]`/`buildSrc/`/`settings.gradle`
+    (arbitrary build logic by design, edited constantly), and `~/.m2/settings.xml` (supply-chain, not auto-exec) are NOT gated; values assembled indirectly (incl. Java-properties `\\u` escapes, `-XX:VMOptionsFile`
+    indirection) are missed; any write verb plus a gated path mentioned as a
+    READ source (`cp .mvn/jvm.config /tmp/b`) false-ASKs, the same shared
+    limitation the sibling path-only guards have; direct fetch-to-file writes are closed by
+    `rule_fetch_to_file_protect` reusing these path regexes."""
+    cfg = getattr(policy, "jvm_build_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "jvm-build-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        exec_path_hit = bool(p and (patterns.JVM_BUILD_EXEC_PATH_RE.search(p)
+                                   or patterns.JVM_LAUNCHER_PATH_RE.search(p)))
+        props_path_hit = bool(p and patterns.GRADLE_PROPERTIES_PATH_RE.search(p))
+        if not (exec_path_hit or props_path_hit):
+            return None
+        hit = exec_path_hit
+        if not hit:
+            a = ev.args or {}
+            parts = [a.get(k) for k in ("content", "new_string", "old_string")
+                     if isinstance(a.get(k), str)]
+            content = " ".join(x for x in parts if x) or " ".join(_flatten_strings(a))
+            hit = bool(content and patterns.GRADLE_PROPERTIES_EXEC_RE.search(content))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_JVM_BUILD_EXEC")
+                or _jvm_build_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "jvm-build-exec-protect",
+                         f"'{p}' is planting/altering a Maven/Gradle auto-exec "
+                         "hook — the next mvn/gradle build (this session, a "
+                         "teammate's IDE, or CI) runs it with full user/CI "
+                         "privileges. Review the change, then confirm with "
+                         "AEGIS_ALLOW_JVM_BUILD_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or _JVM_EXTRA_WRITE_VERB_RE.search(cmd))
+        if not (write_verb or patterns.JVM_WRAPPER_CLI_RE.search(cmd)):
+            return None
+        # A redirect into .gitignore/.gitattributes merely NAMES a build file
+        # (routine `gradle-wrapper.jar binary` lines) -- not a write to it.
+        if not (patterns.JVM_WRAPPER_CLI_RE.search(cmd)):
+            rest = _JVM_GITMETA_REDIRECT_RE.sub(" ", cmd)
+            if rest != cmd and not (patterns.WRITE_REDIRECT_RE.search(rest)
+                                    or _JVM_EXTRA_WRITE_VERB_RE.search(rest)
+                                    or patterns.DELETE_OR_MOVE_VERB_RE.search(rest)
+                                    or patterns.INPLACE_WRITE_RE.search(rest)
+                                    or patterns.FORCED_LINK_WRITE_RE.search(rest)):
+                return None
+        exec_hit = bool(patterns.JVM_WRAPPER_CLI_RE.search(cmd)
+                        or patterns.JVM_BUILD_EXEC_PATH_RE.search(cmd)
+                        or (patterns.JVM_BUILD_CD_RE.search(cmd)
+                            and patterns.JVM_BUILD_BARE_RE.search(cmd))
+                        or (patterns.JVM_INITD_CD_RE.search(cmd)
+                            and patterns.JVM_INITD_BARE_RE.search(cmd))
+                        or (patterns.JVM_GRADLEHOME_CD_RE.search(cmd)
+                            and patterns.JVM_GRADLEHOME_BARE_RE.search(cmd)))
+        props_hit = bool(patterns.GRADLE_PROPERTIES_PATH_RE.search(cmd)
+                         and patterns.GRADLE_PROPERTIES_EXEC_RE.search(cmd))
+        if not (exec_hit or props_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JVM_BUILD_EXEC")
+                or _jvm_build_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "jvm-build-exec-protect",
+                         "A Maven/Gradle auto-exec hook is being planted from "
+                         "a shell — the next mvn/gradle build runs it with "
+                         "full user/CI privileges. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_JVM_BUILD_EXEC=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7078,6 +7219,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
     (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
     (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tools definition"),
+    (patterns.JVM_BUILD_EXEC_PATH_RE, "a Maven/Gradle auto-exec config"),
+    (patterns.GRADLE_PROPERTIES_PATH_RE, "a gradle.properties / .mvn/maven.config"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -8508,6 +8651,7 @@ _CORE_RULES = (
     rule_vscode_tasks_protect,
     rule_jetbrains_watcher_protect,
     rule_jetbrains_run_config_protect,
+    rule_jvm_build_exec_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,

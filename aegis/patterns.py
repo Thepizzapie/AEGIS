@@ -2703,6 +2703,89 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 )
 
 
+# JVM build-tool auto-exec hijack (Maven / Gradle). Both tools read config
+# from the PROJECT TREE (and, for Gradle, the user home) and run it as code
+# on the very next `mvn`/`./mvnw`/`gradle`/`./gradlew`/IDE-import/CI build:
+#   * `.mvn/extensions.xml` -- core extensions are jars fetched and loaded
+#     into Maven's own JVM before any build logic runs, on every invocation.
+#   * `.mvn/jvm.config` -- extra JVM flags for the Maven JVM; `-javaagent:`/
+#     `-agentpath:`/`-XX:OnError=` run attacker code in-process or as a shell.
+#   * `gradle.properties` -- `org.gradle.jvmargs` (same JVM-flag primitive for
+#     the Gradle daemon) or `org.gradle.java.home` (run under a planted JDK).
+#   * `init.gradle[.kts]` / `init.d/*.gradle[.kts]` -- Gradle init scripts are
+#     arbitrary Groovy/Kotlin executed on EVERY build (user-home ones for every
+#     project on the machine, no per-project trust prompt).
+#   * `gradle-wrapper.properties`/`maven-wrapper.properties` (`distributionUrl`)
+#     and the wrapper jars -- `./gradlew`/`./mvnw` download and run whatever
+#     distribution/jar these name, the JVM analog of `yarnPath`.
+# Path-only gating except gradle.properties (edited constantly, so it also
+# needs an exec-capable token) -- a content check on the tiny files above
+# would be bypassable by a value-only Edit diff (see the JetBrains notes).
+_JVM_B = r"(?:^|[\s'\"/\\=])"
+# Gradle auto-loads init scripts only from GRADLE_USER_HOME (~/.gradle) and
+# GRADLE_HOME/init.d, not from arbitrary project subdirectories.
+_GRADLE_HOME_B = (r"(?:^|[\s'\"=]|[/\\])(?:\.gradle|GRADLE_(?:USER_)?HOME\}?|gradle-[\w.]+)"
+                  + _WIN_TRIM + _SEP)
+JVM_BUILD_EXEC_PATH_RE = re.compile(
+    _JVM_B + r"\.mvn" + _WIN_TRIM + _SEP + r"(?:extensions\.xml|jvm\.config)" + _CI_END
+    + r"|" + _JVM_B + r"(?:maven|gradle)-wrapper\.(?:properties|jar)" + _CI_END
+    + r"|" + _GRADLE_HOME_B + r"init\.gradle(?:\.kts)?" + _CI_END
+    + r"|" + _JVM_B + r"\.?mavenrc" + _CI_END
+    + r"|" + _JVM_B + r"MavenWrapperDownloader\.java" + _CI_END
+    + r"|" + _GRADLE_HOME_B + r"init\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Launcher scripts: Edit/Write/MCP path only -- in a shell command `./gradlew`
+# is the ordinary way to RUN a build (`./gradlew build > log`), never a target.
+JVM_LAUNCHER_PATH_RE = re.compile(
+    _JVM_B + r"(?:gradlew|mvnw)(?:\.cmd|\.bat)?" + _CI_END,
+    re.IGNORECASE,
+)
+GRADLE_PROPERTIES_PATH_RE = re.compile(
+    _JVM_B + r"gradle\.properties" + _CI_END
+    + r"|" + _JVM_B + r"\.mvn" + _WIN_TRIM + _SEP + r"maven\.config" + _CI_END,
+    re.IGNORECASE,
+)
+# Exec-capable tokens inside gradle.properties. Bare flags (no key needed) so
+# a value-only Edit diff that never repeats `org.gradle.jvmargs` is still seen.
+GRADLE_PROPERTIES_EXEC_RE = re.compile(
+    r"-javaagent\b|-agentpath\b|-agentlib\b|-Xbootclasspath\b"
+    r"|-XX:(?:OnError|OnOutOfMemoryError)\b|-Djava\.system\.class\.loader\b"
+    r"|-Xrun\w*|-XX:(?:Flags|VMOptionsFile)=|-Djava\.security\.manager\b"
+    r"|(?:^|[\s=\"'])@[^\s\"']"
+    r"|\borg\.gradle\.java\.(?:home|installations\.)|maven\.ext\.class\.path\b",
+    re.IGNORECASE,
+)
+# CLI-driven rewrite of a wrapper's distributionUrl (never names the file).
+JVM_WRAPPER_CLI_RE = re.compile(
+    r"\bgradlew?(?:\.bat)?\b[^|;&\n]{0,200}?--gradle-distribution-url\b"
+    r"|\bmvnw?(?:\.cmd)?\b[^|;&\n]{0,200}?-DdistributionUrl\b",
+    re.IGNORECASE,
+)
+# `cd`/`pushd` into the directory, then a bare filename (two-step write).
+_JVM_CD = r"\b(?:cd|pushd|chdir|sl|set-location)\s+(?:--\s+)?[\"']?(?:[^\s;&|\"'\n]{0,200}[/\\])?"
+JVM_BUILD_CD_RE = re.compile(
+    _JVM_CD + r"(?:\.mvn(?:[/\\]+wrapper)?|gradle[/\\]+wrapper)" + _CI_END,
+    re.IGNORECASE,
+)
+JVM_BUILD_BARE_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])(?:extensions\.xml|jvm\.config|\.?mavenrc|MavenWrapperDownloader\.java"
+    r"|(?:maven|gradle)-wrapper\.(?:properties|jar))" + _CI_END,
+    re.IGNORECASE,
+)
+JVM_INITD_CD_RE = re.compile(
+    _JVM_CD + r"init\.d" + _CI_END,
+    re.IGNORECASE,
+)
+JVM_INITD_BARE_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])" + _CI_SEG + r"\.gradle(?:\.kts)?" + _CI_END,
+    re.IGNORECASE,
+)
+# `cd ~/.gradle` then a bare `init.gradle` (only that name is auto-loaded there).
+JVM_GRADLEHOME_CD_RE = re.compile(_JVM_CD + r"\.gradle" + _CI_END, re.IGNORECASE)
+JVM_GRADLEHOME_BARE_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])init\.gradle(?:\.kts)?" + _CI_END, re.IGNORECASE)
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the
