@@ -187,3 +187,32 @@ def test_qa_round1_regressions():
                 "ln -s /tmp/evil ~/.gradle/init.d/evil.gradle",
                 "touch .mvn/jvm.config", "cd -- .mvn; cp /tmp/x extensions.xml"):
         assert _hit(_shell(cmd))
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x >.mvn/jvm.config;echo a>.gitignore",
+    "tee .gitignore .mvn/jvm.config",
+    "tee -a .gitignore .mvn/extensions.xml",
+    "echo x >.gitignore >.mvn/jvm.config",
+    "echo x >.gitignore 2>.mvn/jvm.config",
+    "echo x >.mvn/jvm.config",
+    "echo 'org.gradle.jvmargs=-javaagent:x'>gradle.properties",
+    "echo x >.mavenrc",
+    "(echo x)>.mvn/jvm.config",
+    "echo x > $GRADLE_USER_HOME/init.d/x.gradle",
+    "echo x > ${GRADLE_USER_HOME}/init.gradle",
+    "echo x > /opt/gradle/init.d/x.gradle",
+    "echo x > ~/.sdkman/candidates/gradle/current/init.d/x.gradle",
+    "cd \"$GRADLE_USER_HOME\" && echo x > init.gradle",
+])
+def test_qa_round2_bypasses_closed(cmd):
+    assert _hit(_shell(cmd))
+
+
+def test_qa_round2_paths_gated():
+    for p in ("$GRADLE_USER_HOME/init.d/x.gradle", "/opt/gradle-8.5/init.d/x.gradle",
+              "C:\\Users\\u\\.gradle\\init.d\\x.gradle"):
+        assert _hit(_write(p, "x"))
+    assert not _hit(_write("proj/init.d/a.gradle", "x"))
+    assert not _hit(_shell("echo 'gradle-wrapper.jar binary' >> .gitattributes"))
+    assert not _hit(_shell("cat a | tee .gitignore"))

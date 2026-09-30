@@ -2721,10 +2721,11 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 # Path-only gating except gradle.properties (edited constantly, so it also
 # needs an exec-capable token) -- a content check on the tiny files above
 # would be bypassable by a value-only Edit diff (see the JetBrains notes).
-_JVM_B = r"(?:^|[\s'\"/\\=])"
+_JVM_B = r"(?:^|[\s'\"/\\=<>(])"
 # Gradle auto-loads init scripts only from GRADLE_USER_HOME (~/.gradle) and
 # GRADLE_HOME/init.d, not from arbitrary project subdirectories.
-_GRADLE_HOME_B = (r"(?:^|[\s'\"=]|[/\\])(?:\.gradle|GRADLE_(?:USER_)?HOME\}?|gradle-[\w.]+)"
+_GRADLE_HOME_B = (r"(?:^|[\s'\"=<>($\{]|[/\\])(?:\.gradle|GRADLE_(?:USER_)?HOME\}?"
+                  r"|gradle(?:-[\w.]+|[/\\]+current)?)"
                   + _WIN_TRIM + _SEP)
 JVM_BUILD_EXEC_PATH_RE = re.compile(
     _JVM_B + r"\.mvn" + _WIN_TRIM + _SEP + r"(?:extensions\.xml|jvm\.config)" + _CI_END
@@ -2769,7 +2770,7 @@ JVM_BUILD_CD_RE = re.compile(
     re.IGNORECASE,
 )
 JVM_BUILD_BARE_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])(?:extensions\.xml|jvm\.config|\.?mavenrc|MavenWrapperDownloader\.java"
+    r"(?:^|[\s'\"/\\=<>(])(?:extensions\.xml|jvm\.config|\.?mavenrc|MavenWrapperDownloader\.java"
     r"|(?:maven|gradle)-wrapper\.(?:properties|jar))" + _CI_END,
     re.IGNORECASE,
 )
@@ -2782,7 +2783,10 @@ JVM_INITD_BARE_RE = re.compile(
     re.IGNORECASE,
 )
 # `cd ~/.gradle` then a bare `init.gradle` (only that name is auto-loaded there).
-JVM_GRADLEHOME_CD_RE = re.compile(_JVM_CD + r"\.gradle" + _CI_END, re.IGNORECASE)
+JVM_GRADLEHOME_CD_RE = re.compile(
+    _JVM_CD + r"\.gradle" + _CI_END
+    + r"|\b(?:cd|pushd|chdir|sl|set-location)\s+(?:--\s+)?[\"']?\$\{?GRADLE_(?:USER_)?HOME\}?[\"']?"
+    + _CI_END, re.IGNORECASE)
 JVM_GRADLEHOME_BARE_RE = re.compile(
     r"(?:^|[\s'\"/\\=])init\.gradle(?:\.kts)?" + _CI_END, re.IGNORECASE)
 

@@ -4599,8 +4599,8 @@ def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decisi
 _JVM_EXTRA_WRITE_VERB_RE = re.compile(r"\b(?:install|ln|touch)\b", re.IGNORECASE)
 
 _JVM_GITMETA_REDIRECT_RE = re.compile(
-    r"(?:>>?|\btee\b(?:\s+-\w+)*)\s*['\"]?\S*\.git(?:ignore|attributes)['\"]?"
-    r"|\.git[/\\]info[/\\](?:exclude|attributes)",
+    r">>?\s*['\"]?[^\s;&|<>'\"]*\.git(?:ignore|attributes)['\"]?(?=\s|$|[;&|])"
+    r"|\btee\b(?:\s+-\w+)*(?:\s+[^\s;&|<>]*\.git(?:ignore|attributes))+(?=\s*(?:$|[;&|]))",
     re.IGNORECASE,
 )
 
@@ -4651,7 +4651,16 @@ def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     indirection) are missed; any write verb plus a gated path mentioned as a
     READ source (`cp .mvn/jvm.config /tmp/b`) false-ASKs, the same shared
     limitation the sibling path-only guards have; direct fetch-to-file writes are closed by
-    `rule_fetch_to_file_protect` reusing these path regexes."""
+    `rule_fetch_to_file_protect` reusing these path regexes.
+
+    QA history: two independent adversarial rounds (bypass hunt + design
+    review, then a verification round). Closed: HeapDump-flag false-ASK,
+    maven.config/.mavenrc/launcher/CLI-wrapper/extra JVM-flag gaps, fetch-to-
+    file for gradle.properties, init-script path anchoring (incl. $GRADLE_
+    USER_HOME, /opt/gradle), `>`-glued redirect boundary, and a chained-write
+    bypass of the .gitignore/.gitattributes mention exemption. Residual,
+    accepted: `gradle -I`/`--init-script` from an ungated path, `git checkout`/
+    `git apply` placement, custom GRADLE_USER_HOME paths."""
     cfg = getattr(policy, "jvm_build_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
