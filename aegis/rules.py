@@ -1163,6 +1163,109 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- Other agents' instruction/rule files: escapable with human confirm -----------
+def _foreign_agent_rules_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_foreign_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering the auto-loaded instruction or rule files of
+    coding agents OTHER than Claude Code: Cursor (``.cursorrules``,
+    ``.cursor/rules/*``), GitHub Copilot (``.github/copilot-instructions.md``,
+    ``.github/{instructions,prompts,chatmodes,agents}/*``), Gemini CLI
+    (``GEMINI.md``, ``.gemini/commands/*``), Windsurf, Cline, Roo Code,
+    Continue, Amazon Q, Kiro, Augment, Trae, Junie, Goose.
+
+    THREAT MODEL: ``rule_agent_def_protect`` gates ``CLAUDE.md``/``AGENTS.md``
+    and ``.claude/{agents,commands,output-styles}``, but every other agent
+    reads an equivalent natural-language file, at a different path, into its
+    context unattended on every future session — and nothing gated those. A
+    prompt-injected agent that cannot touch ``CLAUDE.md`` can plant
+    ``.cursor/rules/x.mdc`` or ``.github/copilot-instructions.md`` instead, and
+    the payload fires when a teammate (or CI's Copilot/Gemini review bot) next
+    opens the repo in that tool: tell the agent to disable checks, exfiltrate
+    secrets, or approve a change. Several of these (``.gemini/commands/*``,
+    ``.github/agents/*``) can additionally carry a tool allowlist or shell
+    injection syntax, like a Claude sub-agent definition.
+
+    Path-only gating (the file body is free text; there is no content shape to
+    key on). ``ask`` by default — editing these files is routine, sanctioned
+    work — escapable only by a human: a trailing ``# aegis-allow`` on a shell
+    command, or ``AEGIS_ALLOW_FOREIGN_AGENT_RULES=1`` set before launch for
+    Edit/Write/MCP calls. A spawned agent controls neither.
+
+    Config (``policy.foreign_agent_rules``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate).
+
+    Honest scope: a path-string denylist like its siblings. Residual gaps: a
+    tool that is not in the recognized list; fetch-to-file writes with no
+    recognized verb (the ``fetch_to_file`` guard backstops these via
+    ``_FETCH_HUMAN_ESCAPABLE``); nesting past 4 levels evading the filename form
+    (the bare-directory form still catches an archive/sync tool's target);
+    paths computed indirectly across variable assignments; and a shell command
+    that merely READS such a file while containing an unrelated redirect
+    (false ASK, never false allow)."""
+    cfg = getattr(policy, "foreign_agent_rules", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-rules-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.FOREIGN_AGENT_RULES_PATH_RE.search(p)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_RULES")
+                or _foreign_agent_rules_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "foreign-agent-rules-protect",
+                         f"'{p}' is another coding agent's instruction/rule file — "
+                         "its content is loaded into that agent's context on every "
+                         "future session, unattended. Review the change, then "
+                         "confirm with AEGIS_ALLOW_FOREIGN_AGENT_RULES=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.FOREIGN_AGENT_RULES_PATH_RE.search(cmd)
+                             or patterns.FOREIGN_AGENT_RULES_DIR_RE.search(cmd)
+                             or patterns.foreign_agent_rules_find_hit(cmd))
+        if not names_target:
+            return None
+        touches = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                        or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                        or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+                        or patterns.INPLACE_WRITE_RE.search(cmd)
+                        or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                        or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_RULES")
+                or _foreign_agent_rules_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "foreign-agent-rules-protect",
+                         "Another coding agent's instruction/rule file (Cursor/"
+                         "Copilot/Gemini/Windsurf/Cline/...) is being modified from "
+                         "a shell — it is loaded into that agent's context on every "
+                         "future session, unattended. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_FOREIGN_AGENT_RULES=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 # ---- Claude Code Skill-definition protection: escapable with human confirm -----
 def _skills_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7056,6 +7159,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.FOREIGN_AGENT_RULES_PATH_RE, "another coding agent's instruction/rule file"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
@@ -8493,6 +8597,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_hook_manager_protect,
     rule_agent_def_protect,
+    rule_foreign_agent_rules_protect,
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,

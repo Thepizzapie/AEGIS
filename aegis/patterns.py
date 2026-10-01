@@ -1523,6 +1523,83 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Other coding agents' auto-loaded instruction/rule files -------------------
+# `rule_agent_def_protect` covers only Claude Code's own `CLAUDE.md`/`AGENTS.md`/
+# `.claude/{agents,commands,output-styles}`. Every other mainstream coding agent
+# has the identical "natural-language file folded into every future session's
+# context, unattended" surface at a DIFFERENT path, none of which that guard (or
+# any other) recognizes: Cursor (`.cursorrules`, `.cursor/rules/*`), GitHub
+# Copilot (`.github/copilot-instructions.md`, `.github/instructions/*`,
+# `.github/prompts/*`, `.github/chatmodes/*`, `.github/agents/*`), Gemini CLI
+# (`GEMINI.md`, `.gemini/commands/*`), Windsurf (`.windsurfrules`,
+# `.windsurf/rules/*`), Cline (`.clinerules` file or directory), Roo Code
+# (`.roorules`, `.roo/rules*/*`), Continue (`.continue/rules/*`), Amazon Q
+# (`.amazonq/rules/*`), Kiro (`.kiro/steering/*`), Augment (`.augment/rules/*`),
+# Trae (`.trae/rules/*`), JetBrains Junie (`.junie/guidelines.md`), Goose
+# (`.goosehints`). A repo planted with one of these hijacks whichever of those
+# agents a teammate/CI opens next, and it is also the standard indirect-prompt-
+# injection persistence spot against a multi-agent workflow. Path-only gating:
+# the payload is free text, so there is no content shape to key on.
+_FOREIGN_RULES_ROOT = r"(?:^|[\s'\"/\\=])"
+_FOREIGN_RULES_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+# `(parent, child)` pairs: `<parent>/<child>/` is a rules directory whose every
+# file (to 4 levels of nesting, same bound/rationale as _AGENT_DEF_SEG) counts.
+_FOREIGN_RULES_DIRS = (
+    r"\.cursor" + _WIN_TRIM + _SEP + r"rules",
+    r"\.windsurf" + _WIN_TRIM + _SEP + r"rules",
+    r"\.roo" + _WIN_TRIM + _SEP + r"rules[\w-]{0,40}",
+    r"\.continue" + _WIN_TRIM + _SEP + r"rules",
+    r"\.amazonq" + _WIN_TRIM + _SEP + r"rules",
+    r"\.kiro" + _WIN_TRIM + _SEP + r"steering",
+    r"\.augment" + _WIN_TRIM + _SEP + r"rules",
+    r"\.trae" + _WIN_TRIM + _SEP + r"rules",
+    r"\.gemini" + _WIN_TRIM + _SEP + r"commands",
+    r"\.github" + _WIN_TRIM + _SEP + r"instructions",
+    r"\.github" + _WIN_TRIM + _SEP + r"prompts",
+    r"\.github" + _WIN_TRIM + _SEP + r"chatmodes",
+    r"\.github" + _WIN_TRIM + _SEP + r"agents",
+    r"\.clinerules",
+)
+# Single well-known files (no directory component to anchor on).
+_FOREIGN_RULES_FILES = (
+    r"\.cursorrules", r"\.windsurfrules", r"\.clinerules", r"\.roorules",
+    r"\.goosehints", r"GEMINI(?:\.local)?\.md",
+    r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions\.md",
+    r"\.junie" + _WIN_TRIM + _SEP + r"guidelines\.md",
+)
+FOREIGN_AGENT_RULES_PATH_RE = re.compile(
+    "|".join(
+        _FOREIGN_RULES_ROOT + d + _WIN_TRIM + _SEP
+        + r"(?:" + _FOREIGN_RULES_SEG + r"){0,4}" + _CI_SEG + _CI_END
+        for d in _FOREIGN_RULES_DIRS)
+    + "|" + "|".join(_FOREIGN_RULES_ROOT + f + _CI_END for f in _FOREIGN_RULES_FILES),
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename) — the same archive/sync-tool backstop
+# AGENT_DEF_DIR_RE / GIT_HOOKS_DIR_RE exist for (`rsync -a payload/
+# .cursor/rules/`, `cd .cursor/rules && echo ... > x.mdc`).
+FOREIGN_AGENT_RULES_DIR_RE = re.compile(
+    "|".join(_FOREIGN_RULES_ROOT + d + _CI_END for d in _FOREIGN_RULES_DIRS),
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-regex` indirection, same reason AGENT_DEF_FIND_PREDICATE_RE
+# exists. Deliberately NOT a bare `.github`/`.cursor` fallback: unlike `.claude`,
+# `.github` is an ordinary search root, so only the specific names are matched.
+FOREIGN_AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules\b|\.windsurfrules\b|\.clinerules\b|\.roorules\b"
+    r"|\.goosehints\b|GEMINI\.md\b|copilot-instructions\.md\b"
+    r"|\.cursor\b.{0,40}\brules\b|\.windsurf\b.{0,40}\brules\b"
+    r"|\.roo\b|\.continue\b.{0,40}\brules\b|\.amazonq\b|\.kiro\b"
+    r"|\.augment\b|\.trae\b|\.junie\b|\.gemini\b"
+    r"|\.github\b.{0,40}\b(?:instructions|prompts|chatmodes|agents)\b)")
+
+
+def foreign_agent_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, FOREIGN_AGENT_RULES_FIND_PREDICATE_RE)
+
+
 # ---- Claude Code Skill-definition protection -----------------------------------
 # A sibling of the agent_def family above, on a surface that family never reaches:
 # `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
