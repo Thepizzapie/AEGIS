@@ -1540,7 +1540,9 @@ def agent_def_find_hit(cmd: str) -> bool:
 # agents a teammate/CI opens next, and it is also the standard indirect-prompt-
 # injection persistence spot against a multi-agent workflow. Path-only gating:
 # the payload is free text, so there is no content shape to key on.
-_FOREIGN_RULES_ROOT = r"(?:^|[\s'\"/\\=])"
+# Includes shell operator characters (`>;(&|`) so a space-less redirect
+# (`echo x>.cursorrules`) is seen -- QA round 1.
+_FOREIGN_RULES_ROOT = r"(?:^|[\s'\"/\\=><;(&|])"
 _FOREIGN_RULES_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
 # `(parent, child)` pairs: `<parent>/<child>/` is a rules directory whose every
 # file (to 4 levels of nesting, same bound/rationale as _AGENT_DEF_SEG) counts.
@@ -1554,6 +1556,13 @@ _FOREIGN_RULES_DIRS = (
     r"\.augment" + _WIN_TRIM + _SEP + r"rules",
     r"\.trae" + _WIN_TRIM + _SEP + r"rules",
     r"\.gemini" + _WIN_TRIM + _SEP + r"commands",
+    r"\.cursor" + _WIN_TRIM + _SEP + r"commands",
+    r"\.windsurf" + _WIN_TRIM + _SEP + r"workflows",
+    r"\.continue" + _WIN_TRIM + _SEP + r"prompts",
+    r"\.kilocode" + _WIN_TRIM + _SEP + r"rules",
+    r"\.opencode" + _WIN_TRIM + _SEP + r"agents?",
+    r"\.amazonq" + _WIN_TRIM + _SEP + r"cli-agents",
+    r"\.kiro" + _WIN_TRIM + _SEP + r"(?:specs|hooks)",
     r"\.github" + _WIN_TRIM + _SEP + r"instructions",
     r"\.github" + _WIN_TRIM + _SEP + r"prompts",
     r"\.github" + _WIN_TRIM + _SEP + r"chatmodes",
@@ -1563,9 +1572,10 @@ _FOREIGN_RULES_DIRS = (
 # Single well-known files (no directory component to anchor on).
 _FOREIGN_RULES_FILES = (
     r"\.cursorrules", r"\.windsurfrules", r"\.clinerules", r"\.roorules",
-    r"\.goosehints", r"GEMINI(?:\.local)?\.md",
+    r"\.goosehints", r"(?-i:GEMINI(?:\.local)?\.md)", r"(?-i:QWEN\.md)", r"\.augment-guidelines",
     r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions\.md",
     r"\.junie" + _WIN_TRIM + _SEP + r"guidelines\.md",
+    r"\.gemini" + _WIN_TRIM + _SEP + r"styleguide\.md",
 )
 FOREIGN_AGENT_RULES_PATH_RE = re.compile(
     "|".join(

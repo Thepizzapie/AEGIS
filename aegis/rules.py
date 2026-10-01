@@ -1250,7 +1250,8 @@ def rule_foreign_agent_rules_protect(ev: Event, policy=None) -> Optional[Decisio
                         or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                         or patterns.INPLACE_WRITE_RE.search(cmd)
                         or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                        or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+                        or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+                        or re.search(r"\binstall\b|\bsponge\b", cmd))
         if not touches:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_RULES")

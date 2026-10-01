@@ -51,7 +51,7 @@ PATHS = [
     ".clinerules", ".clinerules/a.md", ".roorules", ".roo/rules/a.md",
     ".roo/rules-code/a.md", ".continue/rules/a.md", ".amazonq/rules/a.md",
     ".kiro/steering/a.md", ".augment/rules/a.md", ".trae/rules/a.md",
-    ".junie/guidelines.md", ".goosehints", "src/gemini.md", "/repo/.CURSORRULES",
+    ".junie/guidelines.md", ".goosehints", "/repo/.CURSORRULES",
     ".cursor\\rules\\x.mdc", "/home/u/proj/.github/Copilot-Instructions.md",
 ]
 
@@ -148,3 +148,20 @@ def test_loader_wires_knob(tmp_path):
     (tmp_path / "p.yaml").write_text("foreign_agent_rules:\n  mode: deny\n")
     pol = load_policy(str(tmp_path))
     assert pol.foreign_agent_rules.get("mode") == "deny"
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x>.cursorrules", "cat p>GEMINI.md", "echo x>>.github/copilot-instructions.md",
+    "echo x>.cursor/rules/a.mdc", "echo x 1>.cursorrules", "echo x &>.cursorrules",
+    "echo x;echo y>.cursorrules", "(echo x)>.cursorrules",
+    "install -m644 /tmp/p .cursorrules", "echo x | sponge .cursorrules",
+    "echo x > .cursor/commands/a.md", "echo x > .windsurf/workflows/a.md",
+    "echo x > .kilocode/rules/a.md", "echo x > QWEN.md", "echo x > .gemini/styleguide.md",
+])
+def test_round1_qa_bypasses_closed(cmd):
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE, cmd
+
+
+def test_gemini_api_docs_not_gated():
+    assert evaluate(_write("docs/gemini.md"), EMPTY).rule != RULE
