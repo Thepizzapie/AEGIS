@@ -121,3 +121,22 @@ def test_redos_resistant():
     _g(_ev("Bash", command="echo " + ".github/" * 5000 + " > x"))
     _g(_ev("Bash", command="cat " + ".roo/rules" + "a" * 50000 + " > x"))
     assert time.time() - t < 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "rm -rf .cursor", "cp -r a .cursor", "unzip a.zip -d .windsurf",
+    "cd .cursor/rules && echo x > a.mdc", "cd .github && echo x > copilot-instructions.md",
+    "cd .github; cp a agents/x.md", "echo x >.windsurf/rules/a.md", "echo x>.cursorrules",
+    "echo x>.github/prompts/a.md", "cd ./.roo && tee rules/a.md < p",
+])
+def test_qa_round1_bypasses_ask(cmd):
+    d = _g(_ev("Bash", command=cmd))
+    assert d and d.action == Action.ASK, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd .github && echo x > CODEOWNERS", "cd .github/workflows", "cd .cursor && ls",
+    "rm -rf .github/workflows/old.yml", "cp -r a .github",
+])
+def test_qa_round1_no_new_false_positives(cmd):
+    assert _g(_ev("Bash", command=cmd)) is None, cmd

@@ -1478,7 +1478,7 @@ AGENT_DEF_DIR_RE = re.compile(
 # product over. A directory-prefixed alternative matches the bare directory
 # too (via `_CI_END`'s `/` lookahead), so one regex serves as both the
 # filename form and the archive/sync-tool directory backstop.
-_OTHER_AGENT_ROOT = r"(?:^|[\s'\"/\\=])"
+_OTHER_AGENT_ROOT = r"(?:^|[\s'\"/\\=<>|])"
 OTHER_AGENT_INSTRUCTIONS_RE = re.compile(
     _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|cline|roo)rules" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|continue|amazonq|kiro)"
@@ -1492,6 +1492,23 @@ OTHER_AGENT_INSTRUCTIONS_RE = re.compile(
     + r"|" + _OTHER_AGENT_ROOT + r"\.goosehints" + _CI_END,
     re.IGNORECASE,
 )
+
+# Shell-only extras (QA round 1): a bare PARENT directory (`rm -rf .cursor`,
+# `unzip a.zip -d .cursor`) and a `cd` into a target directory followed by a
+# relative write (`cd .cursor/rules && echo x > a.mdc`) never name the full
+# `<parent>/rules/<file>` string OTHER_AGENT_INSTRUCTIONS_RE needs. `.github`
+# is only a parent hit when the command also names one of its agent subpaths.
+_OTHER_AGENT_PARENT = r"\.(?:cursor|windsurf|continue|amazonq|kiro|roo|junie|gemini)"
+OTHER_AGENT_PARENT_DIR_RE = re.compile(
+    _OTHER_AGENT_ROOT + _OTHER_AGENT_PARENT + _CI_END, re.IGNORECASE)
+OTHER_AGENT_CD_RE = re.compile(
+    r"\b(?:cd|pushd|Set-Location|sl)\s+['\"]?[^\s;&|'\"]*"
+    + r"(?:" + _OTHER_AGENT_PARENT + r"|\.github" + r")" + _WIN_TRIM
+    + r"(?:" + _SEP + r"[^\s;&|'\"]*)?['\"]?\s*(?:[;&|]|$)",
+    re.IGNORECASE,
+)
+OTHER_AGENT_GITHUB_SUB_RE = re.compile(
+    r"copilot-instructions|\b(?:instructions|prompts|chatmodes|agents)\b", re.IGNORECASE)
 
 # Archive/sync verbs that place a file WITHOUT any of WRITE_REDIRECT_RE /
 # DELETE_OR_MOVE_VERB_RE / DESTRUCTIVE_DELETE_RE / INPLACE_WRITE_RE /

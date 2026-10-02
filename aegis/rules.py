@@ -1224,7 +1224,11 @@ def rule_agent_instructions_protect(ev: Event, policy=None) -> Optional[Decision
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        if not rx.search(cmd):
+        cd_hit = bool(patterns.OTHER_AGENT_CD_RE.search(cmd)
+                      and (not re.search(r"\.github", cmd, re.IGNORECASE)
+                           or patterns.OTHER_AGENT_PARENT_DIR_RE.search(cmd)
+                           or patterns.OTHER_AGENT_GITHUB_SUB_RE.search(cmd)))
+        if not (rx.search(cmd) or patterns.OTHER_AGENT_PARENT_DIR_RE.search(cmd) or cd_hit):
             return None
         touches = (patterns.WRITE_REDIRECT_RE.search(cmd)
                    or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
