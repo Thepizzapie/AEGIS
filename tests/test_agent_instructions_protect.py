@@ -140,3 +140,12 @@ def test_qa_round1_bypasses_ask(cmd):
 ])
 def test_qa_round1_no_new_false_positives(cmd):
     assert _g(_ev("Bash", command=cmd)) is None, cmd
+
+
+def test_cd_re_no_quadratic_blowup():
+    import time
+    from aegis import patterns
+    for seg in (".github/", ".cursor/"):
+        t = time.time()
+        patterns.OTHER_AGENT_CD_RE.search("cd " + seg * 20000 + " x")
+        assert time.time() - t < 0.5

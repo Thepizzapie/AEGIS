@@ -1502,9 +1502,9 @@ _OTHER_AGENT_PARENT = r"\.(?:cursor|windsurf|continue|amazonq|kiro|roo|junie|gem
 OTHER_AGENT_PARENT_DIR_RE = re.compile(
     _OTHER_AGENT_ROOT + _OTHER_AGENT_PARENT + _CI_END, re.IGNORECASE)
 OTHER_AGENT_CD_RE = re.compile(
-    r"\b(?:cd|pushd|Set-Location|sl)\s+['\"]?[^\s;&|'\"]*"
+    r"\b(?:cd|pushd|Set-Location|sl)\s+['\"]?[^\s;&|'\"]{0,200}?"
     + r"(?:" + _OTHER_AGENT_PARENT + r"|\.github" + r")" + _WIN_TRIM
-    + r"(?:" + _SEP + r"[^\s;&|'\"]*)?['\"]?\s*(?:[;&|]|$)",
+    + r"(?:" + _SEP + r"[^\s;&|'\"/\\]{1,60}){0,4}(?:" + _SEP + r")?['\"]?\s*(?:[;&|]|$)",
     re.IGNORECASE,
 )
 OTHER_AGENT_GITHUB_SUB_RE = re.compile(
