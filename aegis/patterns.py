@@ -1467,6 +1467,32 @@ AGENT_DEF_DIR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Other coding agents' instruction/rules files. `AGENT_INSTRUCTIONS_PATH_RE`
+# above knows only CLAUDE.md/AGENTS.md; Cursor, Windsurf, Cline/Roo, Continue,
+# Amazon Q, Kiro, JetBrains Junie, GitHub Copilot, Gemini CLI, Qwen Code and
+# goose each auto-load their own file into the model's context on every
+# session (some, e.g. Cursor `alwaysApply` rules and Copilot
+# `copilot-instructions.md`, with no per-session prompt at all). A planted
+# instruction there is persistent prompt injection against whichever
+# teammate/CI agent opens the repo next -- the same shape as CLAUDE.md, one
+# product over. A directory-prefixed alternative matches the bare directory
+# too (via `_CI_END`'s `/` lookahead), so one regex serves as both the
+# filename form and the archive/sync-tool directory backstop.
+_OTHER_AGENT_ROOT = r"(?:^|[\s'\"/\\=])"
+OTHER_AGENT_INSTRUCTIONS_RE = re.compile(
+    _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|cline|roo)rules" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|continue|amazonq|kiro)"
+    + _WIN_TRIM + _SEP + r"(?:rules|steering)" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.roo" + _WIN_TRIM + _SEP + r"rules[^\s'\"/\\]{0,40}" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.junie" + _WIN_TRIM + _SEP + r"guidelines\.md" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions\.md" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP
+    + r"(?:instructions|prompts|chatmodes|agents)" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"(?:\.gemini" + _WIN_TRIM + _SEP + r")?(?:GEMINI|QWEN)(?:\.local)?\.md" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.goosehints" + _CI_END,
+    re.IGNORECASE,
+)
+
 # Archive/sync verbs that place a file WITHOUT any of WRITE_REDIRECT_RE /
 # DELETE_OR_MOVE_VERB_RE / DESTRUCTIVE_DELETE_RE / INPLACE_WRITE_RE /
 # FORCED_LINK_WRITE_RE's verb shapes. QA finding (independent adversarial

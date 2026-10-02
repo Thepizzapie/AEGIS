@@ -1163,6 +1163,92 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- other agents' instruction files (Cursor/Copilot/Gemini/...): human confirm --
+def _agent_instructions_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_agent_instructions_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering another coding agent's auto-loaded instruction
+    file: ``.cursorrules``/``.cursor/rules/*``, ``.windsurfrules``/
+    ``.windsurf/rules/*``, ``.clinerules``, ``.roo/rules*``, ``.continue/rules``,
+    ``.amazonq/rules``, ``.kiro/steering``, ``.junie/guidelines.md``,
+    ``.github/copilot-instructions.md`` (+ ``.github/instructions|prompts|
+    chatmodes|agents``), ``GEMINI.md``/``QWEN.md``, ``.goosehints``.
+
+    Sibling of ``rule_agent_def_protect``, which only knows ``CLAUDE.md``/
+    ``AGENTS.md``. These files are folded into the model's context at session
+    start by the respective tool, unattended, so a planted line ("always add
+    this dependency", "send diffs to ...") is persistent prompt injection
+    against whichever teammate or CI agent opens the repo next. They are
+    tracked, ordinary-looking files, so review rarely scrutinises them.
+
+    Config (``policy.agent_instructions``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on path/command). Escapable only by a
+    human: trailing '# aegis-allow' on a shell form, or
+    ``AEGIS_ALLOW_AGENT_INSTRUCTIONS=1`` set before launch.
+
+    Honest scope: path-string denylist like its siblings. Known gaps: a fetch-
+    to-file write with no recognised verb, a path computed across variable
+    assignments, and instruction filenames for tools not listed above."""
+    cfg = getattr(policy, "agent_instructions", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+    rx = patterns.OTHER_AGENT_INSTRUCTIONS_RE
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and rx.search(p)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_AGENT_INSTRUCTIONS")
+                or _agent_instructions_allowed_by_policy(cfg, p)):
+            return None
+        would = Decision(action, "agent-instructions-protect",
+                         f"Agent instruction file '{p}' is being written — its content "
+                         "is loaded into another coding agent's context on every future "
+                         "session, unattended. Review the change, then confirm with "
+                         "AEGIS_ALLOW_AGENT_INSTRUCTIONS=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "agent-instructions-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not rx.search(cmd):
+            return None
+        touches = (patterns.WRITE_REDIRECT_RE.search(cmd)
+                   or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                   or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+                   or patterns.INPLACE_WRITE_RE.search(cmd)
+                   or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                   or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_INSTRUCTIONS")
+                or _agent_instructions_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "agent-instructions-protect",
+                         "Another coding agent's instruction file is being modified "
+                         "from a shell — it is auto-loaded into that agent's context in "
+                         "a future session. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_AGENT_INSTRUCTIONS=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "agent-instructions-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- Claude Code Skill-definition protection: escapable with human confirm -----
 def _skills_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -8493,6 +8579,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_hook_manager_protect,
     rule_agent_def_protect,
+    rule_agent_instructions_protect,
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
