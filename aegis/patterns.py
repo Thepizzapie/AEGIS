@@ -2737,7 +2737,7 @@ _JVM_AGENT_FLAG = (
 # Variable name followed (same logical line, or a YAML `value:` a line away)
 # by an agent flag.
 JVM_OPTS_AGENT_RE = re.compile(
-    r"\b" + _JVM_OPTS_VARS + r"\b[\s\S]{0,4000}?" + _JVM_AGENT_FLAG,
+    r"\b" + _JVM_OPTS_VARS + r"\b[\s\S]{0,1500}?" + _JVM_AGENT_FLAG,
     re.IGNORECASE,
 )
 # Shell forms that PERSIST/EXPORT the variable (an inline `VAR=... mvn test`
@@ -2746,7 +2746,7 @@ JVM_OPTS_PERSIST_RE = re.compile(
     r"(?:\b(?:export|setenv|setx|declare|typeset)\b[^\n;&|]{0,40}?|\benv:"
     r"|\[(?:system\.)?environment\]::setenvironmentvariable\(\s*[\"']"
     r"|\breg\s+add\b[^\n]{0,200}?/v\s+)"
-    r"\b" + _JVM_OPTS_VARS + r"\b[^\n]{0,4000}?" + _JVM_AGENT_FLAG
+    r"\b" + _JVM_OPTS_VARS + r"\b[^\n]{0,1500}?" + _JVM_AGENT_FLAG
     # `set` (cmd/fish) is also English: only VALUE-shaped text counts -- the
     # value is a run of dash-flags ending in the agent flag, not prose.
     + r"|\bset\s+(?:-[a-zA-Z]+\s+)*" + r"\b" + _JVM_OPTS_VARS + r"\b\s*=?\s*[\"']?"
@@ -4247,7 +4247,7 @@ _CONFTEST_AUTOEXEC_HOOKS = (
 )
 CONFTEST_AUTOEXEC_HOOK_RE = re.compile(
     r"def\s+(?:" + _CONFTEST_AUTOEXEC_HOOKS + r")\s*\("
-    r"(?=.{0,4000}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
+    r"(?=.{0,1500}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -4260,7 +4260,7 @@ CONFTEST_AUTOEXEC_HOOK_RE = re.compile(
 # match, same direction as the hook check above.
 CONFTEST_AUTOUSE_RE = re.compile(
     r"autouse\s*=\s*True"
-    r"(?=.{0,4000}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
+    r"(?=.{0,1500}?" + _CONFTEST_EXEC_CALL + r"\s*\()",
     re.IGNORECASE | re.DOTALL,
 )
 
