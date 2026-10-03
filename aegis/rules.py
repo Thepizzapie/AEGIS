@@ -4713,7 +4713,7 @@ def rule_jvm_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                           or patterns.INPLACE_WRITE_RE.search(cmd)
                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
-        broad_verb = write_verb or bool(re.search(r"\b(?:ln|install|rsync|cp|tee)\b", cmd))
+        broad_verb = write_verb or bool(re.search(r"\b(?:ln|install|rsync|cp|tee|unzip|tar|wget|curl|git\s+clone)\b", cmd))
         pure_delete = bool(re.match(r"\s*(?:rm|rmdir|del|erase|remove-item|ri)\b[^;&|]*$", cmd, re.IGNORECASE))
         if not hit and broad_verb and not pure_delete:
             cd_hit = bool(patterns.JVM_CD_RE.search(cmd))
@@ -4734,7 +4734,12 @@ def rule_jvm_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
             hit = _file_hit(init_p, props_p, jvmcfg_p, ext_p, carrier, cmd)
             # cp/mv/cat-redirect/ln/install of an opaque source over these two
             # files: the payload is not in the command, the target is the signal.
-            hit = hit or jvmcfg_p or ext_p or bool(
+            initd_hit = bool(patterns.JVM_GRADLE_INITD_DIR_RE.search(cmd)
+                             and re.search(r"\b(?:cp|mv|ln|install|rsync|unzip|tar|git\s+clone|wget|curl|tee)\b",
+                                           cmd, re.IGNORECASE))
+            hit = hit or initd_hit or jvmcfg_p or ext_p or bool(
+                patterns.JVM_TARGET_ONLY_FILE_RE.search(cmd)
+                and re.search(r"\b(?:cp|mv|ln|install|rsync)\b", cmd, re.IGNORECASE)) or bool(
                 re.search(r"\.(?:jvmopts|sbtopts)\b|jvm\.options\b", cmd, re.IGNORECASE)
                 and patterns.JVM_AGENT_FLAG_RE.search(cmd))
         if not hit:

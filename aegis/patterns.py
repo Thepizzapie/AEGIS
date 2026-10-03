@@ -2756,7 +2756,7 @@ JVM_OPTS_PERSIST_RE = re.compile(
 # Extra carrier paths (beyond env_carrier_path_hit) that load env vars:
 # direnv/mise config and Claude Code / VS Code settings `env` blocks.
 JVM_ENV_EXTRA_CARRIER_RE = re.compile(
-    r"(?:^|[/\\])(?:\.envrc|\.?mise\.toml|\.tool-versions|settings(?:\.local)?\.json|\.?mavenrc|gradlew(?:\.bat)?|setenv\.(?:sh|bat)|environment)$",
+    r"(?:^|[/\\])(?:\.envrc|\.?mise\.toml|\.tool-versions|settings(?:\.local)?\.json|\.?mavenrc|gradlew(?:\.bat)?|mvnw(?:\.cmd)?|setenv\.(?:sh|bat)|environment)$",
     re.IGNORECASE,
 )
 JVM_FLAGFILE_PATH_RE = re.compile(
@@ -2767,6 +2767,15 @@ JVM_GRADLE_INIT_PATH_RE = re.compile(
     + r"|(?:^|[\s'\"/\\=])gradle[^\s'\"/\\]{0,40}" + _SEP + r"init\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?" + _CI_END,
     re.IGNORECASE,
 )
+# The init.d DIRECTORY as a copy/extract destination (cp x ~/.gradle/init.d/,
+# unzip -d, git clone, wget -P ...) or `cp init.gradle ~/.gradle/`.
+JVM_GRADLE_INITD_DIR_RE = re.compile(
+    r"\.gradle" + _WIN_TRIM + _SEP + r"init\.d(?=[/\\]?(?:[\s'\"*;&|)]|$))"
+    r"|(?:^|[\s'\"/\\=])init\.gradle(?:\.kts)?" + _CI_END + r"[^\n;&|]*\.gradle[/\\]?(?=[\s'\"*;&|)]|$)",
+    re.IGNORECASE,
+)
+JVM_TARGET_ONLY_FILE_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.?(?:mavenrc|jvmopts|sbtopts)" + _CI_END, re.IGNORECASE)
 JVM_GRADLE_PROPS_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])gradle\.properties" + _CI_END, re.IGNORECASE)
 JVM_MVN_JVM_CONFIG_PATH_RE = re.compile(
