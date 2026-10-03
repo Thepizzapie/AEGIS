@@ -116,6 +116,9 @@ def test_default_mode_is_ask():
     _shell("cat ~/.gradle/init.gradle"),                       # read
     _shell("ls .mvn/extensions.xml"),
     _shell("echo hi > notes.txt"),
+    _shell(f"grep -r MAVEN_OPTS {AGENT} . > out.txt"),         # mention, not a plant
+    _shell(f"echo 'set MAVEN_OPTS to {AGENT}' > README.md"),
+    _shell(f"env JAVA_TOOL_OPTIONS={AGENT} bash -c 'echo hi' > /tmp/o"),
     _write("proj/gradle.properties", "org.gradle.jvmargs=-Xmx2g"),
     _write("proj/gradle.properties", "org.gradle.daemon=true"),
     _write("proj/.mvn/jvm.config", "-Xmx1g"),
@@ -169,3 +172,17 @@ def test_dotfile_carriers_are_gated_by_something(ev):
     # shell-profile / direnv carriers are owned by their sibling guards; the
     # JVM payload must never fall through to a plain ALLOW.
     assert evaluate(ev, EMPTY).action != Action.ALLOW
+
+
+@pytest.mark.parametrize("ev", [
+    _shell("export JAVA_TOOL_OPTIONS='-XX:OnError=/tmp/x.sh'"),
+    _write("proj/.env", "JAVA_OPTS=-XX:OnOutOfMemoryError=/tmp/x.sh"),
+    _write("proj/gradle.properties", "org.gradle.jvmargs=-Xmx1g \\\n  -javaagent:/t.jar"),
+])
+def test_exec_flags_and_continuations_gated(ev):
+    assert _fires(ev)
+
+
+def test_policy_allow_applies_to_shell():
+    pol = Policy(jvm_agent={"allow": [r"jacoco"]})
+    assert not _fires(_shell("export MAVEN_OPTS=-javaagent:jacoco.jar"), pol)

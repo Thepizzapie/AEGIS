@@ -4714,7 +4714,13 @@ def rule_jvm_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
                             or (cd_hit and re.search(r"\bjvm\.config\b", cmd, re.IGNORECASE)))
             ext_p = bool(patterns.JVM_MVN_EXTENSIONS_PATH_RE.search(cmd)
                          or (cd_hit and re.search(r"\bextensions\.xml\b", cmd, re.IGNORECASE)))
-            hit = _file_hit(init_p, props_p, jvmcfg_p, ext_p, True, cmd)
+            # Env-var plants only count when a token of the command is itself
+            # an env-carrier path (a bare mention in grep/echo-to-notes is not).
+            toks = re.split(r"[\s'\"<>|;&=()]+", cmd)
+            carrier = any(t and (patterns.env_carrier_path_hit(t)
+                                 or patterns.JVM_ENV_EXTRA_CARRIER_RE.search(t))
+                          for t in toks)
+            hit = _file_hit(init_p, props_p, jvmcfg_p, ext_p, carrier, cmd)
         if not hit:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JVM_AGENT")

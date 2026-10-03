@@ -2730,7 +2730,8 @@ _JVM_OPTS_VARS = (
     r"|GRADLE_OPTS|CATALINA_OPTS|SBT_OPTS)"
 )
 _JVM_AGENT_FLAG = (
-    r"-(?:javaagent|agentpath|agentlib|Xbootclasspath(?:/[ap])?|Xrun[A-Za-z0-9_]*)"
+    r"-(?:javaagent|agentpath|agentlib|Xbootclasspath(?:/[ap])?|Xrun[A-Za-z0-9_]*"
+    r"|XX:(?:OnError|OnOutOfMemoryError|Flags)(?==))"
     r"(?![A-Za-z0-9_-])"
 )
 # Variable name followed (same logical line, or a YAML `value:` a line away)
@@ -2742,8 +2743,13 @@ JVM_OPTS_AGENT_RE = re.compile(
 # Shell forms that PERSIST/EXPORT the variable (an inline `VAR=... mvn test`
 # affects one command the agent could have run anyway, so it is not gated).
 JVM_OPTS_PERSIST_RE = re.compile(
-    r"(?:\b(?:export|setenv|setx|declare|typeset|set)\b[^\n;&|]{0,40}?|\$env:|\[environment\]::setenvironmentvariable\(\s*[\"'])"
-    r"\b" + _JVM_OPTS_VARS + r"\b[^\n]{0,300}?" + _JVM_AGENT_FLAG,
+    r"(?:\b(?:export|setenv|setx|declare|typeset)\b[^\n;&|]{0,40}?|\$env:"
+    r"|\[environment\]::setenvironmentvariable\(\s*[\"'])"
+    r"\b" + _JVM_OPTS_VARS + r"\b[^\n]{0,300}?" + _JVM_AGENT_FLAG
+    # `set` (cmd/fish) is also English: only VALUE-shaped text counts -- the
+    # value is a run of dash-flags ending in the agent flag, not prose.
+    + r"|\bset\s+(?:-[a-zA-Z]+\s+)*" + r"\b" + _JVM_OPTS_VARS + r"\b\s*=?\s*[\"']?"
+    r"(?:-[^\s\"']*\s+){0,20}?" + _JVM_AGENT_FLAG,
     re.IGNORECASE,
 )
 # Extra carrier paths (beyond env_carrier_path_hit) that load env vars:
@@ -2779,7 +2785,7 @@ JVM_BARE_FILENAME_RE = re.compile(
 # key/flag in them.
 JVM_MVN_EXTENSION_ELEM_RE = re.compile(r"<\s*extension\b", re.IGNORECASE)
 JVM_GRADLE_PROPS_HIT_RE = re.compile(
-    r"\borg\.gradle\.jvmargs\b[^\n]{0,300}?" + _JVM_AGENT_FLAG
+    r"\borg\.gradle\.jvmargs\b(?:[^\n]|\\\r?\n){0,300}?" + _JVM_AGENT_FLAG
     + r"|\borg\.gradle\.java\.home\b\s*[=:]",
     re.IGNORECASE,
 )
