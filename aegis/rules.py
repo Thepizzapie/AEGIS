@@ -4594,6 +4594,143 @@ def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decisi
     return None
 
 
+def _jvm_agent_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_jvm_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a JVM auto-exec hijack: a ``-javaagent``/``-agentpath``/
+    ``-agentlib``/``-Xbootclasspath`` flag persisted into
+    ``JAVA_TOOL_OPTIONS``/``JDK_JAVA_OPTIONS``/``_JAVA_OPTIONS``/``JAVA_OPTS``/
+    ``MAVEN_OPTS``/``GRADLE_OPTS``/``CATALINA_OPTS``/``SBT_OPTS`` (exported in a
+    shell, or written to a ``.env``/Dockerfile/compose/wrapper script/shell
+    profile/``.envrc``/``mise.toml``/Claude or VS Code ``settings*.json``);
+    writing a Gradle init script (``~/.gradle/init.gradle[.kts]``,
+    ``init.d/*.gradle[.kts]``); an agent flag in ``org.gradle.jvmargs`` or any
+    ``org.gradle.java.home`` in ``gradle.properties``; an agent flag in
+    ``.mvn/jvm.config``; or any ``<extension>`` in ``.mvn/extensions.xml``.
+
+    THREAT MODEL: every one of these loads attacker code into a JVM the next
+    time ``java``/``mvn``/``gradle`` runs — by this agent, a teammate, or CI —
+    without any file Aegis's other guards recognize being touched. The JVM
+    options env vars are read by every ``java`` launch (a ``-javaagent`` runs
+    before ``main()``, the JVM analog of ``LD_PRELOAD``/``NODE_OPTIONS``);
+    a Gradle init script is Groovy/Kotlin run on every Gradle invocation of
+    that user, any project, with no trust prompt; Maven core extensions are
+    jars fetched and loaded into Maven's own classloader before any build
+    step. See the comment above ``_JVM_OPTS_VARS`` in patterns.py.
+
+    Config (``policy.jvm_agent``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on path/command, e.g. a repo's reviewed JaCoCo
+    ``-javaagent``). Default ``ask`` like every sibling ``*_protect`` guard — a
+    JaCoCo/OpenTelemetry/debugger agent is legitimate when a human has looked.
+    Escapable only by a human: ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_JVM_AGENT=1`` set before launch.
+
+    Honest scope: an inline one-shot ``MAVEN_OPTS=-javaagent:x mvn test`` is
+    not gated (it affects one command the agent could have run directly, no
+    persistence); values assembled indirectly (variable concatenation, a build
+    script writing the file) evade the literal check; ``distributionUrl`` in a
+    wrapper properties file and Maven ``settings.xml`` mirrors are the
+    supply-chain sibling, deliberately not covered here (every version bump
+    touches them); a direct fetch-to-file write is covered by
+    ``rule_fetch_to_file_protect``."""
+    cfg = getattr(policy, "jvm_agent", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "jvm-agent-protect-monitor")
+            return None
+        return would
+
+    def _file_hit(init_p: bool, props_p: bool, jvmcfg_p: bool, ext_p: bool,
+                  env_carrier: bool, content: str) -> bool:
+        if init_p:
+            return True
+        if props_p and patterns.JVM_GRADLE_PROPS_HIT_RE.search(content):
+            return True
+        if jvmcfg_p and patterns.JVM_AGENT_FLAG_RE.search(content):
+            return True
+        if ext_p and patterns.JVM_MVN_EXTENSION_ELEM_RE.search(content):
+            return True
+        return bool(env_carrier and patterns.JVM_OPTS_AGENT_RE.search(content))
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        init_p = bool(patterns.JVM_GRADLE_INIT_PATH_RE.search(p))
+        props_p = bool(patterns.JVM_GRADLE_PROPS_PATH_RE.search(p))
+        jvmcfg_p = bool(patterns.JVM_MVN_JVM_CONFIG_PATH_RE.search(p))
+        ext_p = bool(patterns.JVM_MVN_EXTENSIONS_PATH_RE.search(p))
+        env_carrier = bool(patterns.env_carrier_path_hit(p)
+                           or patterns.JVM_ENV_EXTRA_CARRIER_RE.search(p))
+        if not (init_p or props_p or jvmcfg_p or ext_p or env_carrier):
+            return None
+        a = ev.args or {}
+        raw = a.get("content")
+        if not isinstance(raw, str) or not raw:
+            raw = a.get("new_string")
+        content = raw if isinstance(raw, str) and raw else " ".join(_flatten_strings(a))
+        if not _file_hit(init_p, props_p, jvmcfg_p, ext_p, env_carrier, content or ""):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_JVM_AGENT")
+                or _jvm_agent_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "jvm-agent-protect",
+                         f"'{p}' plants a JVM auto-exec hook (a -javaagent/"
+                         "-agentpath/-agentlib flag in a JVM options variable "
+                         "or config, a Gradle init script, or a Maven core "
+                         "extension) — it runs attacker code inside the next "
+                         "java/mvn/gradle process, by anyone or CI. Review, "
+                         "then confirm with AEGIS_ALLOW_JVM_AGENT=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        hit = bool(patterns.JVM_OPTS_PERSIST_RE.search(cmd))
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                          or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                          or patterns.INPLACE_WRITE_RE.search(cmd)
+                          or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not hit and write_verb:
+            cd_hit = bool(patterns.JVM_CD_RE.search(cmd))
+            bare = bool(patterns.JVM_BARE_FILENAME_RE.search(cmd))
+            init_p = bool(patterns.JVM_GRADLE_INIT_PATH_RE.search(cmd)
+                          or (cd_hit and bare and re.search(r"\.gradle(?:\.kts)?\b", cmd, re.IGNORECASE)))
+            props_p = bool(patterns.JVM_GRADLE_PROPS_PATH_RE.search(cmd))
+            jvmcfg_p = bool(patterns.JVM_MVN_JVM_CONFIG_PATH_RE.search(cmd)
+                            or (cd_hit and re.search(r"\bjvm\.config\b", cmd, re.IGNORECASE)))
+            ext_p = bool(patterns.JVM_MVN_EXTENSIONS_PATH_RE.search(cmd)
+                         or (cd_hit and re.search(r"\bextensions\.xml\b", cmd, re.IGNORECASE)))
+            hit = _file_hit(init_p, props_p, jvmcfg_p, ext_p, True, cmd)
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JVM_AGENT")
+                or _jvm_agent_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "jvm-agent-protect",
+                         "A JVM auto-exec hook (-javaagent/-agentpath/-agentlib "
+                         "in a persisted JVM options variable or config, a "
+                         "Gradle init script, or a Maven core extension) is "
+                         "being planted from a shell — it runs attacker code "
+                         "inside the next java/mvn/gradle process. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_JVM_AGENT=1; a spawned agent cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7078,6 +7215,9 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
     (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
     (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tools definition"),
+    (patterns.JVM_GRADLE_INIT_PATH_RE, "a Gradle init script"),
+    (patterns.JVM_MVN_EXTENSIONS_PATH_RE, "Maven core extensions"),
+    (patterns.JVM_MVN_JVM_CONFIG_PATH_RE, "Maven JVM flags"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -8508,6 +8648,7 @@ _CORE_RULES = (
     rule_vscode_tasks_protect,
     rule_jetbrains_watcher_protect,
     rule_jetbrains_run_config_protect,
+    rule_jvm_agent_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,

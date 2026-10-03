@@ -2703,6 +2703,89 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 )
 
 
+# ---- JVM agent / build-tool exec hijack ---------------------------------
+# The JVM ecosystem has its own set of "write now, auto-exec later" switches
+# no sibling guard in this file reaches (`rule_ld_preload_protect` covers the
+# ELF loader, `rule_claude_env_protect` a fixed var list that has no JVM
+# entry, `rule_package_manifest_protect` npm/composer lifecycle scripts):
+#   - `JAVA_TOOL_OPTIONS` / `JDK_JAVA_OPTIONS` / `_JAVA_OPTIONS` are read by
+#     EVERY `java` launch on the machine (Maven, Gradle, Tomcat, an IDE's own
+#     JVM); `MAVEN_OPTS`/`GRADLE_OPTS`/`JAVA_OPTS`/`CATALINA_OPTS`/`SBT_OPTS`
+#     are read by the respective build tool/server wrapper. A `-javaagent:`,
+#     `-agentpath:`, `-agentlib:` or `-Xbootclasspath` flag in any of them
+#     loads attacker code into that JVM before `main()` runs — arbitrary
+#     in-process code, the JVM analog of `LD_PRELOAD`/`NODE_OPTIONS=--require`.
+#   - A Gradle init script (`~/.gradle/init.gradle[.kts]`,
+#     `~/.gradle/init.d/*.gradle[.kts]`) is Groovy/Kotlin run on EVERY Gradle
+#     invocation of that user, any project, no trust prompt.
+#   - `gradle.properties`' `org.gradle.jvmargs` (agent flag) or
+#     `org.gradle.java.home` (point Gradle at an attacker-supplied JDK).
+#   - `.mvn/jvm.config` (JVM flags for every `mvn` run in the tree, agent flag
+#     as above) and `.mvn/extensions.xml` (Maven core extensions: jars fetched
+#     and loaded into Maven's own classloader before any build step runs).
+# Each is an ordinary-looking tracked or dotfile edit that executes on the
+# next `mvn`/`gradle`/`java` run, by this agent, a teammate or CI.
+_JVM_OPTS_VARS = (
+    r"(?:JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS|_JAVA_OPTIONS|JAVA_OPTS|MAVEN_OPTS"
+    r"|GRADLE_OPTS|CATALINA_OPTS|SBT_OPTS)"
+)
+_JVM_AGENT_FLAG = (
+    r"-(?:javaagent|agentpath|agentlib|Xbootclasspath(?:/[ap])?|Xrun[A-Za-z0-9_]*)"
+    r"(?![A-Za-z0-9_-])"
+)
+# Variable name followed (same logical line, or a YAML `value:` a line away)
+# by an agent flag.
+JVM_OPTS_AGENT_RE = re.compile(
+    r"\b" + _JVM_OPTS_VARS + r"\b[\s\S]{0,300}?" + _JVM_AGENT_FLAG,
+    re.IGNORECASE,
+)
+# Shell forms that PERSIST/EXPORT the variable (an inline `VAR=... mvn test`
+# affects one command the agent could have run anyway, so it is not gated).
+JVM_OPTS_PERSIST_RE = re.compile(
+    r"(?:\b(?:export|setenv|setx|declare|typeset|set)\b[^\n;&|]{0,40}?|\$env:|\[environment\]::setenvironmentvariable\(\s*[\"'])"
+    r"\b" + _JVM_OPTS_VARS + r"\b[^\n]{0,300}?" + _JVM_AGENT_FLAG,
+    re.IGNORECASE,
+)
+# Extra carrier paths (beyond env_carrier_path_hit) that load env vars:
+# direnv/mise config and Claude Code / VS Code settings `env` blocks.
+JVM_ENV_EXTRA_CARRIER_RE = re.compile(
+    r"(?:^|[/\\])(?:\.envrc|\.?mise\.toml|\.tool-versions|settings(?:\.local)?\.json)$",
+    re.IGNORECASE,
+)
+JVM_GRADLE_INIT_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.gradle" + _WIN_TRIM + _SEP + r"init(?:\.gradle(?:\.kts)?"
+    r"|\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?)" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])init\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?" + _CI_END,
+    re.IGNORECASE,
+)
+JVM_GRADLE_PROPS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])gradle\.properties" + _CI_END, re.IGNORECASE)
+JVM_MVN_JVM_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.mvn" + _WIN_TRIM + _SEP + r"jvm\.config" + _CI_END, re.IGNORECASE)
+JVM_MVN_EXTENSIONS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.mvn" + _WIN_TRIM + _SEP + r"extensions\.xml" + _CI_END, re.IGNORECASE)
+# `cd .mvn` / `cd ~/.gradle[/init.d]` then a bare filename.
+JVM_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.(?:mvn|gradle(?:" + _SEP + r"init\.d)?)" + _CI_END,
+    re.IGNORECASE,
+)
+JVM_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])(?:jvm\.config|extensions\.xml|gradle\.properties|init\.gradle(?:\.kts)?"
+    r"|" + _CI_SEG + r"\.gradle(?:\.kts)?)" + _CI_END,
+    re.IGNORECASE,
+)
+# Content checks for the files above that are only dangerous with a specific
+# key/flag in them.
+JVM_MVN_EXTENSION_ELEM_RE = re.compile(r"<\s*extension\b", re.IGNORECASE)
+JVM_GRADLE_PROPS_HIT_RE = re.compile(
+    r"\borg\.gradle\.jvmargs\b[^\n]{0,300}?" + _JVM_AGENT_FLAG
+    + r"|\borg\.gradle\.java\.home\b\s*[=:]",
+    re.IGNORECASE,
+)
+JVM_AGENT_FLAG_RE = re.compile(_JVM_AGENT_FLAG, re.IGNORECASE)
+
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the

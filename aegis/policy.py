@@ -296,6 +296,10 @@ class Policy:
     # configuration in any JetBrains IDE that opens this project. See
     # rules.rule_jetbrains_run_config_protect.
     jetbrains_run_config: dict = field(default_factory=dict)
+    # JVM agent / build-tool exec hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply. See
+    # rules.rule_jvm_agent_protect.
+    jvm_agent: dict = field(default_factory=dict)
     # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted
