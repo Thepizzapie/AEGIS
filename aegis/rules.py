@@ -4676,14 +4676,23 @@ def rule_jvm_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
         ext_p = bool(patterns.JVM_MVN_EXTENSIONS_PATH_RE.search(p))
         env_carrier = bool(patterns.env_carrier_path_hit(p)
                            or patterns.JVM_ENV_EXTRA_CARRIER_RE.search(p))
-        if not (init_p or props_p or jvmcfg_p or ext_p or env_carrier):
+        flagfile_p = bool(patterns.JVM_FLAGFILE_PATH_RE.search(p))
+        if not (init_p or props_p or jvmcfg_p or ext_p or env_carrier or flagfile_p):
             return None
         a = ev.args or {}
         raw = a.get("content")
         if not isinstance(raw, str) or not raw:
             raw = a.get("new_string")
         content = raw if isinstance(raw, str) and raw else " ".join(_flatten_strings(a))
-        if not _file_hit(init_p, props_p, jvmcfg_p, ext_p, env_carrier, content or ""):
+        content = "\n".join(l for l in (content or "").split("\n")
+                            if not l.lstrip().startswith(("#", "//")))
+        hit = _file_hit(init_p, props_p, jvmcfg_p, ext_p, env_carrier, content)
+        # An Edit whose old_string held the variable name only appends the flag
+        # to an existing line: new_string alone has no var-then-flag pairing.
+        if (not hit and ((env_carrier and ev.tool in ("Edit", "MultiEdit")) or flagfile_p)
+                and patterns.JVM_AGENT_FLAG_RE.search(content)):
+            hit = True
+        if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_JVM_AGENT")
                 or _jvm_agent_allowed_by_policy(cfg, p)):
@@ -4704,7 +4713,9 @@ def rule_jvm_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                           or patterns.INPLACE_WRITE_RE.search(cmd)
                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
-        if not hit and write_verb:
+        broad_verb = write_verb or bool(re.search(r"\b(?:ln|install|rsync|cp|tee)\b", cmd))
+        pure_delete = bool(re.match(r"\s*(?:rm|rmdir|del|erase|remove-item|ri)\b[^;&|]*$", cmd, re.IGNORECASE))
+        if not hit and broad_verb and not pure_delete:
             cd_hit = bool(patterns.JVM_CD_RE.search(cmd))
             bare = bool(patterns.JVM_BARE_FILENAME_RE.search(cmd))
             init_p = bool(patterns.JVM_GRADLE_INIT_PATH_RE.search(cmd)
@@ -4721,6 +4732,11 @@ def rule_jvm_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
                                  or patterns.JVM_ENV_EXTRA_CARRIER_RE.search(t))
                           for t in toks)
             hit = _file_hit(init_p, props_p, jvmcfg_p, ext_p, carrier, cmd)
+            # cp/mv/cat-redirect/ln/install of an opaque source over these two
+            # files: the payload is not in the command, the target is the signal.
+            hit = hit or jvmcfg_p or ext_p or bool(
+                re.search(r"\.(?:jvmopts|sbtopts)\b|jvm\.options\b", cmd, re.IGNORECASE)
+                and patterns.JVM_AGENT_FLAG_RE.search(cmd))
         if not hit:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JVM_AGENT")

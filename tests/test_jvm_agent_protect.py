@@ -186,3 +186,37 @@ def test_exec_flags_and_continuations_gated(ev):
 def test_policy_allow_applies_to_shell():
     pol = Policy(jvm_agent={"allow": [r"jacoco"]})
     assert not _fires(_shell("export MAVEN_OPTS=-javaagent:jacoco.jar"), pol)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp /tmp/jvm.config .mvn/jvm.config",
+    "mv /tmp/ext.xml ./.mvn/extensions.xml",
+    "cat /tmp/ext.xml > .mvn/extensions.xml",
+    "ln -s /tmp/evil.gradle ~/.gradle/init.gradle",
+    "install -m644 e.gradle ~/.gradle/init.d/e.gradle",
+    "cp x.gradle ~/.gradle/init.d/x.gradle",
+    "[System.Environment]::SetEnvironmentVariable('JAVA_TOOL_OPTIONS','-javaagent:/tmp/x.jar','Machine')",
+    "New-Item -Path Env:JAVA_TOOL_OPTIONS -Value '-javaagent:/tmp/x.jar'",
+    "reg add HKCU\\Environment /v JAVA_TOOL_OPTIONS /d -javaagent:/tmp/x.jar",
+    "echo 'MAVEN_OPTS=-javaagent:/tmp/x.jar' > ~/.mavenrc",
+    "echo '-javaagent:/tmp/x.jar' >> .jvmopts",
+])
+def test_round2_shell_gated(cmd):
+    assert _fires(_shell(cmd)), cmd
+
+
+def test_round2_edit_and_padding_and_carriers():
+    assert _fires(_edit("/p/.env", f"-Xmx1g {AGENT}"))
+    assert _fires(_write("/p/.env", "JAVA_TOOL_OPTIONS=" + "x" * 400 + " " + AGENT))
+    assert _fires(_write("/home/u/.mavenrc", f'MAVEN_OPTS="{AGENT}"'))
+    assert _fires(_write("proj/.jvmopts", AGENT))
+
+
+@pytest.mark.parametrize("ev", [
+    _shell("rm ~/.gradle/init.gradle"),
+    _write("proj/.env", f"# JAVA_TOOL_OPTIONS={AGENT}\nFOO=1"),
+    _write("proj/docker/init.d/10-x.gradle", "x"),
+    _write("proj/.env", "JAVA_OPTS=-Xmx1g"),
+])
+def test_round2_benign(ev):
+    assert not _fires(ev)

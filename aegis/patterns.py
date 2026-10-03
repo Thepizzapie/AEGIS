@@ -2731,21 +2731,22 @@ _JVM_OPTS_VARS = (
 )
 _JVM_AGENT_FLAG = (
     r"-(?:javaagent|agentpath|agentlib|Xbootclasspath(?:/[ap])?|Xrun[A-Za-z0-9_]*"
-    r"|XX:(?:OnError|OnOutOfMemoryError|Flags)(?==))"
+    r"|XX:(?:OnError|OnOutOfMemoryError|Flags|VMOptionsFile)(?==)|-?-patch-module|-?-upgrade-module-path)"
     r"(?![A-Za-z0-9_-])"
 )
 # Variable name followed (same logical line, or a YAML `value:` a line away)
 # by an agent flag.
 JVM_OPTS_AGENT_RE = re.compile(
-    r"\b" + _JVM_OPTS_VARS + r"\b[\s\S]{0,300}?" + _JVM_AGENT_FLAG,
+    r"\b" + _JVM_OPTS_VARS + r"\b[\s\S]{0,4000}?" + _JVM_AGENT_FLAG,
     re.IGNORECASE,
 )
 # Shell forms that PERSIST/EXPORT the variable (an inline `VAR=... mvn test`
 # affects one command the agent could have run anyway, so it is not gated).
 JVM_OPTS_PERSIST_RE = re.compile(
-    r"(?:\b(?:export|setenv|setx|declare|typeset)\b[^\n;&|]{0,40}?|\$env:"
-    r"|\[environment\]::setenvironmentvariable\(\s*[\"'])"
-    r"\b" + _JVM_OPTS_VARS + r"\b[^\n]{0,300}?" + _JVM_AGENT_FLAG
+    r"(?:\b(?:export|setenv|setx|declare|typeset)\b[^\n;&|]{0,40}?|\benv:"
+    r"|\[(?:system\.)?environment\]::setenvironmentvariable\(\s*[\"']"
+    r"|\breg\s+add\b[^\n]{0,200}?/v\s+)"
+    r"\b" + _JVM_OPTS_VARS + r"\b[^\n]{0,4000}?" + _JVM_AGENT_FLAG
     # `set` (cmd/fish) is also English: only VALUE-shaped text counts -- the
     # value is a run of dash-flags ending in the agent flag, not prose.
     + r"|\bset\s+(?:-[a-zA-Z]+\s+)*" + r"\b" + _JVM_OPTS_VARS + r"\b\s*=?\s*[\"']?"
@@ -2755,13 +2756,15 @@ JVM_OPTS_PERSIST_RE = re.compile(
 # Extra carrier paths (beyond env_carrier_path_hit) that load env vars:
 # direnv/mise config and Claude Code / VS Code settings `env` blocks.
 JVM_ENV_EXTRA_CARRIER_RE = re.compile(
-    r"(?:^|[/\\])(?:\.envrc|\.?mise\.toml|\.tool-versions|settings(?:\.local)?\.json)$",
+    r"(?:^|[/\\])(?:\.envrc|\.?mise\.toml|\.tool-versions|settings(?:\.local)?\.json|\.?mavenrc|gradlew(?:\.bat)?|setenv\.(?:sh|bat)|environment)$",
     re.IGNORECASE,
 )
+JVM_FLAGFILE_PATH_RE = re.compile(
+    r"(?:^|[/\\])(?:\.jvmopts|\.sbtopts|jvm\.options)$", re.IGNORECASE)
 JVM_GRADLE_INIT_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.gradle" + _WIN_TRIM + _SEP + r"init(?:\.gradle(?:\.kts)?"
     r"|\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?)" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])init\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?" + _CI_END,
+    + r"|(?:^|[\s'\"/\\=])gradle[^\s'\"/\\]{0,40}" + _SEP + r"init\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?" + _CI_END,
     re.IGNORECASE,
 )
 JVM_GRADLE_PROPS_PATH_RE = re.compile(
