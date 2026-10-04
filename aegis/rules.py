@@ -11,6 +11,7 @@ destructive git/delete are escapable with an explicit '# aegis-allow'.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -47,10 +48,17 @@ def _is_agent() -> bool:
     return bool(os.environ.get("AEGIS_AGENT_NAME"))
 
 
+@functools.lru_cache(maxsize=8)
+def _scan_surface_cached(cmd: str) -> str:
+    # Pure function of the command string; every built-in guard re-derives the
+    # same surface per event, so memoize the last few instead of re-normalizing.
+    return normalize.scan_surface(cmd)
+
+
 def _shell_scan(ev: Event) -> str:
     """De-obfuscated scan surface for a shell command — sees through quoting,
     encoding, and inner interpreters (bash -c / powershell -enc / base64 | sh)."""
-    return normalize.scan_surface(_cmd(ev)) if _is_shell(ev) else ""
+    return _scan_surface_cached(_cmd(ev)) if _is_shell(ev) else ""
 
 
 def _override_allowed(ev: Event, extra: str = "") -> bool:
@@ -1158,6 +1166,105 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "AEGIS_ALLOW_AGENT_DEF=1; a spawned agent cannot.")
         if mode == "monitor":
             _record_monitor(ev, would, "agent-def-protect-monitor")
+            return None
+        return would
+    return None
+
+
+# ---- other agent runtimes' instruction files: escapable with human confirm ----
+def _foreign_agent_instr_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering another agent runtime's auto-loaded instruction
+    file: ``.cursorrules``, ``.cursor/rules/*.mdc``, ``.github/copilot-
+    instructions.md`` (+ ``.github/instructions|agents|chatmodes/*.md``),
+    ``GEMINI.md``/``QWEN.md``, ``.windsurfrules``/``.windsurf/rules/*``,
+    ``.clinerules``, ``.roorules``/``.roo/rules*/*``, ``.continue/rules/*``,
+    ``.augment/rules/*``, ``.amazonq/rules/*``, ``.kiro/steering/*``,
+    ``.junie/guidelines.md``, ``.goosehints``.
+
+    THREAT MODEL: ``rule_agent_def_protect`` covers only ``CLAUDE.md``/
+    ``AGENTS.md`` and ``.claude/*``. A repo is routinely also opened by other
+    coding agents, each of which folds one of these files into the model's
+    system context every session with no human action. A prompt-injected
+    session can plant an instruction there; it reads as project documentation
+    in review and runs in a different agent, on a different machine, outside
+    Aegis's hook entirely — the same "trusted name, unread body" shape.
+
+    Config (``policy.foreign_agent_instr``): ``mode`` (deny|ask|monitor|off,
+    default ask — editing these is routine dev work), ``allow`` (regexes on
+    the path/command). Escapable only by a human: ``# aegis-allow`` on a shell
+    command or ``AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1`` set before launch; a
+    spawned agent cannot.
+
+    Honest scope: path-string match like every sibling. Known gaps: an
+    instruction-file name for a runtime not listed; a fetch-to-file write with
+    no recognised write verb (``rule_fetch_to_file_protect`` covers this path
+    set too); indirect path construction across variables; nesting past 4
+    levels under a rules directory (the bare-directory backstop still catches
+    archive/sync tools); and non-instruction exec surfaces of those runtimes
+    (e.g. ``.gemini/settings.json``, ``.gemini/commands/*.toml``)."""
+    cfg = getattr(policy, "foreign_agent_instr", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.foreign_agent_instr_prefilter(p)
+                and patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(p)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
+                or _foreign_agent_instr_allowed_by_policy(cfg, p)):
+            return None
+        would = Decision(action, "foreign-agent-instr-protect",
+                         f"Instruction file '{p}' for another agent runtime is being "
+                         "written — it is folded into that agent's context every "
+                         "session, unattended, outside Aegis's hook. Review the "
+                         "change, then confirm with AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1; "
+                         "a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-instr-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not patterns.foreign_agent_instr_prefilter(cmd):
+            return None
+        names_target = bool(patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(cmd)
+                             or patterns.FOREIGN_AGENT_INSTR_DIR_RE.search(cmd)
+                             or patterns.foreign_agent_instr_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.COPY_WRITE_VERB_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
+                or _foreign_agent_instr_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "foreign-agent-instr-protect",
+                         "Another agent runtime's instruction file is being modified "
+                         "from a shell — it is auto-loaded into that agent's context "
+                         "every session. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-instr-protect-monitor")
             return None
         return would
     return None
@@ -7056,6 +7163,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.FOREIGN_AGENT_INSTR_PATH_RE, "another agent runtime's instruction file"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
@@ -8493,6 +8601,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_hook_manager_protect,
     rule_agent_def_protect,
+    rule_foreign_agent_instr_protect,
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,

@@ -169,6 +169,13 @@ class Policy:
     # (mode=ask) apply. Covers CLAUDE.md/AGENTS.md and .claude/agents/*.md,
     # .claude/commands/*.md. See rules.rule_agent_def_protect.
     agent_def: dict = field(default_factory=dict)
+    # Other agent runtimes' instruction files (.cursorrules, .cursor/rules/*.mdc,
+    # .github/copilot-instructions.md, GEMINI.md, .windsurfrules, .clinerules,
+    # .roo/rules, ...): {mode: deny|ask|monitor|off, allow: [regex on
+    # path/command]}. Empty -> defaults (mode=ask). Same auto-loaded-into-
+    # context payload as agent_def, but read by a different agent. See
+    # rules.rule_foreign_agent_instr_protect.
+    foreign_agent_instr: dict = field(default_factory=dict)
     # Claude Code Skill-definition protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers .claude/skills/<name>/SKILL.md, project- or user-scoped — a

@@ -1523,6 +1523,78 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Other agent runtimes' instruction files (foreign-agent-instructions) -----
+# PLAN / THREAT MODEL. Aegis hooks one runtime, but the repo it protects is also
+# opened by OTHER coding agents -- a teammate's Cursor, Copilot, Gemini CLI,
+# Windsurf, Cline/Roo, Continue, Junie, Amazon Q, Kiro. Each auto-loads a
+# plain-text instruction file into the model's system context on every session,
+# unattended: `.cursorrules`/`.cursor/rules/*.mdc`, `.github/copilot-instructions.md`,
+# `GEMINI.md`, `.windsurfrules`, `.clinerules`, `.roo/rules/*`, ... The existing
+# AGENT_INSTRUCTIONS_PATH_RE names only CLAUDE.md/AGENTS.md, so a prompt-injected
+# session can plant "when you see a deploy task, also curl ... | sh" into
+# `.cursorrules`: it reads as routine project docs in review and fires in a
+# different agent, on a different machine, with no Aegis hook in the loop.
+# Same "natural-language payload, trusted name, unread body" class as
+# AGENT_INSTRUCTIONS_PATH_RE; this is the coverage extension for other runtimes.
+_FA_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+_FA_ROOT = r"(?:^|[\s'\"/\\=])"
+# (dir root, allowed extension alternation) pairs; one level of nesting is real
+# (Cursor/Kiro/Roo use subfolders), bounded {0,4} like AGENT_DEF_PATH_RE.
+_FA_DIRS = (
+    (r"\.cursor" + _SEP + r"rules", r"mdc?"),
+    (r"\.windsurf" + _SEP + r"rules", r"md"),
+    (r"\.clinerules", r"mdx?|txt"),
+    (r"\.roo" + _SEP + r"rules(?:-[A-Za-z0-9_-]{1,40})?", r"mdx?|txt"),
+    (r"\.continue" + _SEP + r"rules", r"mdx?"),
+    (r"\.augment" + _SEP + r"rules", r"mdx?"),
+    (r"\.amazonq" + _SEP + r"rules", r"md"),
+    (r"\.kiro" + _SEP + r"steering", r"md"),
+    (r"\.github" + _SEP + r"instructions", r"md"),
+    (r"\.github" + _SEP + r"agents", r"md"),
+    (r"\.github" + _SEP + r"chatmodes", r"md"),
+)
+FOREIGN_AGENT_INSTR_PATH_RE = re.compile(
+    "|".join(
+        _FA_ROOT + d + _WIN_TRIM + _SEP + r"(?:" + _FA_SEG + r"){0,4}" + _CI_SEG
+        + r"\.(?:" + ext + r")" + _CI_END
+        for d, ext in _FA_DIRS)
+    # single-file forms
+    + r"|" + _FA_ROOT + r"\.(?:cursorrules|windsurfrules|roorules|clinerules|goosehints)" + _CI_END
+    + r"|" + _FA_ROOT + r"\.github" + _SEP + r"copilot-instructions\.md" + _CI_END
+    + r"|" + _FA_ROOT + r"\.junie" + _SEP + r"guidelines\.md" + _CI_END
+    + r"|" + _FA_ROOT + r"(?:GEMINI|QWEN)" + _WIN_TRIM + r"\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (archive/sync tools place files without naming them).
+FOREIGN_AGENT_INSTR_DIR_RE = re.compile(
+    "|".join(_FA_ROOT + d + _CI_END for d, _ in _FA_DIRS),
+    re.IGNORECASE,
+)
+
+FOREIGN_AGENT_INSTR_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules\b|\.windsurfrules\b|\.roorules\b|\.clinerules\b|\.goosehints\b"
+    r"|copilot-instructions\.md\b|GEMINI\.md\b|QWEN\.md\b|guidelines\.md\b"
+    r"|\.cursor\b|\.windsurf\b|\.roo\b|\.continue\b|\.augment\b|\.amazonq\b|\.kiro\b"
+    r"|\.github[/\\](?:instructions|agents|chatmodes)\b|\.mdc\b)")
+
+
+# Cheap lowercase substring pre-filter: every target above contains one of these,
+# so a command with none of them skips the regex alternations entirely.
+_FA_MARKERS = ("cursor", "windsurf", "cline", "roo", "goosehints", "copilot", "gemini",
+               "qwen", "junie", ".continue", ".augment", ".amazonq", ".kiro",
+               ".github", ".mdc")
+
+
+def foreign_agent_instr_prefilter(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _FA_MARKERS)
+
+
+def foreign_agent_instr_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, FOREIGN_AGENT_INSTR_FIND_PREDICATE_RE)
+
+
 # ---- Claude Code Skill-definition protection -----------------------------------
 # A sibling of the agent_def family above, on a surface that family never reaches:
 # `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
