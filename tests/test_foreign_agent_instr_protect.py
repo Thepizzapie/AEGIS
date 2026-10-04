@@ -20,7 +20,8 @@ HIT_PATHS = [
     "QWEN.md", ".windsurfrules", ".windsurf/rules/r.md", ".clinerules", ".clinerules/a.md",
     ".roorules", ".roo/rules/a.md", ".roo/rules-code/a.md", ".continue/rules/a.md",
     ".augment/rules/a.md", ".amazonq/rules/a.md", ".kiro/steering/a.md",
-    ".junie/guidelines.md", ".goosehints", "/home/u/repo/.cursor/rules/a.mdc",
+    ".junie/guidelines.md", ".goosehints", ".github/prompts/a.prompt.md",
+    ".cursor/commands/a.md", ".windsurf/workflows/a.md", "/home/u/repo/.cursor/rules/a.mdc",
     "C:\\repo\\.cursor\\rules\\a.mdc", ".cursorrules.",
 ]
 MISS_PATHS = [
@@ -95,9 +96,18 @@ def test_bad_allow_regex_ignored():
     assert rules.rule_foreign_agent_instr_protect(_ev("Write", file_path=".cursorrules"), pol)
 
 
-def test_monitor_mode_allows_but_records():
+def test_monitor_mode_allows_but_records(monkeypatch):
+    seen = []
+    monkeypatch.setattr(rules, "_record_monitor", lambda ev, d, tag: seen.append(tag))
     pol = Policy(foreign_agent_instr={"mode": "monitor"})
     assert rules.rule_foreign_agent_instr_protect(_ev("Write", file_path=".cursorrules"), pol) is None
+    assert seen == ["foreign-agent-instr-protect-monitor"]
+
+
+def test_explicit_ask_and_unknown_mode():
+    e = _ev("Write", file_path=".cursorrules")
+    assert rules.rule_foreign_agent_instr_protect(e, Policy(foreign_agent_instr={"mode": "ask"})).action == Action.ASK
+    assert rules.rule_foreign_agent_instr_protect(e, Policy(foreign_agent_instr={"mode": "bogus"})).action == Action.DENY
 
 
 SHELL_HITS = [

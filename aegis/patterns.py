@@ -1552,6 +1552,9 @@ _FA_DIRS = (
     (r"\.github" + _SEP + r"instructions", r"md"),
     (r"\.github" + _SEP + r"agents", r"md"),
     (r"\.github" + _SEP + r"chatmodes", r"md"),
+    (r"\.github" + _SEP + r"prompts", r"md"),
+    (r"\.cursor" + _SEP + r"commands", r"mdc?"),
+    (r"\.windsurf" + _SEP + r"workflows", r"md"),
 )
 FOREIGN_AGENT_INSTR_PATH_RE = re.compile(
     "|".join(
@@ -1576,7 +1579,7 @@ FOREIGN_AGENT_INSTR_FIND_PREDICATE_RE = _find_predicate_re(
     r"(?:\.cursorrules\b|\.windsurfrules\b|\.roorules\b|\.clinerules\b|\.goosehints\b"
     r"|copilot-instructions\.md\b|GEMINI\.md\b|QWEN\.md\b|guidelines\.md\b"
     r"|\.cursor\b|\.windsurf\b|\.roo\b|\.continue\b|\.augment\b|\.amazonq\b|\.kiro\b"
-    r"|\.github[/\\](?:instructions|agents|chatmodes)\b|\.mdc\b)")
+    r"|\.github[/\\](?:instructions|agents|chatmodes|prompts)\b|\.mdc\b)")
 
 
 # Cheap lowercase substring pre-filter: every target above contains one of these,
