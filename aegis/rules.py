@@ -1182,6 +1182,28 @@ def _foreign_agent_instr_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
+_FA_EXTRA_PATH_KEYS = ("filepath", "destination", "relative_path", "target", "paths", "files")
+
+
+def _foreign_agent_instr_hit_path(ev: Event) -> str:
+    """First path-like arg naming a protected file. Beyond ``_path()``'s first
+    non-empty key, checks every path key and flattens list args (e.g. a
+    ``push_files`` ``files: [{path: ...}]``), since ``_path()`` alone misses
+    ``{"file_path": "x", "path": ".cursorrules"}``."""
+    a = ev.args or {}
+    cands = [_path(ev)]
+    for k in ("file_path", "path", "notebook_path", "target_file", "targetFile",
+              "filename", "file", "uri") + _FA_EXTRA_PATH_KEYS:
+        if k in a:
+            cands.extend(_flatten_strings(a[k]))
+    for c in cands:
+        c = str(c or "")
+        if (c and patterns.foreign_agent_instr_prefilter(c)
+                and patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(c)):
+            return c
+    return ""
+
+
 def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting/altering another agent runtime's auto-loaded instruction
     file: ``.cursorrules``, ``.cursor/rules/*.mdc``, ``.github/copilot-
@@ -1220,9 +1242,8 @@ def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decisio
     action = Action.ASK if mode == "ask" else Action.DENY
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
-        p = _path(ev)
-        if not (p and patterns.foreign_agent_instr_prefilter(p)
-                and patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(p)):
+        p = _foreign_agent_instr_hit_path(ev)
+        if not p:
             return None
         if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
                 or _foreign_agent_instr_allowed_by_policy(cfg, p)):
@@ -1252,7 +1273,8 @@ def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decisio
             or patterns.INPLACE_WRITE_RE.search(cmd)
             or patterns.FORCED_LINK_WRITE_RE.search(cmd)
             or patterns.COPY_WRITE_VERB_RE.search(cmd)
-            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+            or re.search(r"(?<![\w./-])touch\b", cmd))
         if not touches_target:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")

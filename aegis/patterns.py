@@ -1537,7 +1537,7 @@ def agent_def_find_hit(cmd: str) -> bool:
 # Same "natural-language payload, trusted name, unread body" class as
 # AGENT_INSTRUCTIONS_PATH_RE; this is the coverage extension for other runtimes.
 _FA_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
-_FA_ROOT = r"(?:^|[\s'\"/\\=])"
+_FA_ROOT = r"(?:^|[\s'\"/\\=<>|;&(])"
 # (dir root, allowed extension alternation) pairs; one level of nesting is real
 # (Cursor/Kiro/Roo use subfolders), bounded {0,4} like AGENT_DEF_PATH_RE.
 _FA_DIRS = (
