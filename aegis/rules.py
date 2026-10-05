@@ -7736,9 +7736,11 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     to run -- there is no safe/dangerous split by value), or path-
     independently on the Cargo-only strong forms (`CARGO_EXEC_STRONG_RE`) so
     content staged under another filename before a move is still caught.
-    Full-line `#` comments are stripped first. Shell commands are gated only
-    when a write verb is present, so reading or `grep`-ing a config does not
-    ask.
+    Full-line `#` comments are stripped first. Shell commands starting with a plain reader (`cat`/`grep`/`rg`/`head`/
+    `tail`/`ls`/`diff`/`sed -n`/...) and containing no write verb are exempt,
+    so reading or `grep`-ing a config does not ask; anything else that
+    carries a hit (heredoc-fed interpreters, `install`, `sponge`, `patch`)
+    is gated.
 
     Config (``policy.cargo_exec``): ``mode`` (deny|ask|monitor|off, default
     ask), ``allow`` (regexes on path/command). Default ``ask``: sccache/
@@ -7757,7 +7759,11 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     config; a direct fetch-to-file write into `.cargo/config*` is already gated by
     `rule_fetch_to_file_protect` via the pre-existing `REGISTRY_CONFIG_PATH_RE`
     entry (same path alternative), independent of this guard's mode. A
-    ``build.rs``/proc-macro is a different (code, not config) surface that
+    two-step write (stage the content under another name with no key text in
+    the `cp`/`mv` command) is only caught at the staging write; a docs/
+    source file quoting `rustc-wrapper = "..."` asks (fails toward ASK);
+    rustflags code-exec via `-C link-arg=`/`-Zcodegen-backend` is not covered.
+    A ``build.rs``/proc-macro is a different (code, not config) surface that
     `cargo build` runs by design and is not covered."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -7778,12 +7784,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw_content = a.get("content")
         if not isinstance(raw_content, str) or not raw_content:
             raw_content = a.get("new_string")
-        if isinstance(raw_content, str) and raw_content:
-            content = raw_content
-        else:
-            # MultiEdit/NotebookEdit nest their text; sweep every leaf.
-            content = " ".join(_flatten_strings(a))
-        if not content:
+        # Scan the primary content AND every other string leaf: a tool may
+        # carry a short `content` plus the payload in `append`/`lines`/etc.,
+        # and MultiEdit/NotebookEdit nest their text.
+        content = ((raw_content if isinstance(raw_content, str) else "")
+                   + "\n" + "\n".join(_flatten_strings(a)))
+        if not content.strip():
             return None
         if not patterns.cargo_exec_quick_reject(content):
             return None
@@ -7817,10 +7823,15 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         hit = bool(patterns.CARGO_EXEC_STRONG_RE.search(scan_cmd)
                    or (path_hit and patterns.CARGO_EXEC_KEY_RE.search(scan_cmd)))
         # Cheap content checks first; the write-verb scan only runs on a hit.
-        if hit and not (patterns.WRITE_REDIRECT_RE.search(cmd)
-                        or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                        or patterns.INPLACE_WRITE_RE.search(cmd)
-                        or patterns.FORCED_LINK_WRITE_RE.search(cmd)):
+        # Inverted gate: a command is exempt only if it is a plain reader
+        # with no write verb. Heredoc-fed interpreters, perl `>>`, install/
+        # sponge/ex/patch etc. have no write-verb match, so "no verb" must
+        # not mean "read-only".
+        if hit and (patterns.CARGO_READONLY_CMD_RE.match(cmd)
+                    and not (patterns.WRITE_REDIRECT_RE.search(cmd)
+                             or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                             or patterns.INPLACE_WRITE_RE.search(cmd)
+                             or patterns.FORCED_LINK_WRITE_RE.search(cmd))):
             hit = False
         if not hit:
             return None

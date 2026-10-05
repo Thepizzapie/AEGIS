@@ -5298,25 +5298,34 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # Weak, path-CONFIRMED-only: a bare key assignment (line-start, dotted
 # `build.x = `, inline-table `{ x = `, or quoted) or a `-C linker=` rustflag.
 CARGO_EXEC_KEY_RE = re.compile(
-    r"(?:^|[\s\[{,.\"'/]|\\[nt])"   # `/`: sed s/a/key = v/; `\\n`: printf/sed/echo -e escape in a shell one-liner
-    r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
-    r"|credential-process|credential-provider)[\"']?[ \t]*="
-    r"|-C[ \t]*linker[ \t]*=",
+    r"(?:^|[\s\[{,.\"'/\\]|\\[nt])"
+    r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker|browser"
+    r"|credential-process|(?:global-)?credential-providers?)[\"']?(?:[ \t]|\\t)*="
+    r"|-C[ \t]*linker[ \t]*="
+    r"|^[ \t]*\[credential-alias\]",
     re.IGNORECASE | re.MULTILINE,
 )
 # Strong, path-INDEPENDENT: `rustc-wrapper`/`rustc-workspace-wrapper`/
-# `credential-provider` are Cargo-only vocabulary (key alone is enough); the
-# ambiguous names (`runner`, `linker`, `rustc`, `rustdoc`, `credential-
-# process`) need a Cargo section header just before them. `[^\[]{0,400}?`
-# cannot cross into another section and is anchored on the (rare) header.
+# `(global-)credential-provider(s)` are Cargo-only vocabulary, so the key
+# alone is enough with NO preceding-char requirement (a sed `1i\`/`$a`/`\x0a`
+# insertion butts it against a letter or escape). The ambiguous names
+# (`runner`, `linker`, `rustc`, `rustdoc`, `credential-process`) need a Cargo
+# section header just before them (CRLF-tolerant, spaces inside the brackets
+# tolerated). `[^\[]{0,800}?` cannot cross into another section and is
+# anchored on the (rare) header.
 CARGO_EXEC_STRONG_RE = re.compile(
-    r"(?:^|[\s\[{,.\"']|\\[nt])(?:rustc-wrapper|rustc-workspace-wrapper|credential-provider)[\"']?[ \t]*=[ \t]*[\"'\[{]"
-    r"|^[ \t]*\[(?:build|target\.[^\]\n]{1,120}|registry|registries\.[^\]\n]{1,60})\][ \t]*(?:#[^\n]*)?\n"
-    r"[^\[]{0,400}?(?:^|[\s,{])(?:rustc|rustdoc|runner|linker|credential-process)[\"']?[ \t]*=[ \t]*[\"'\[]",
+    r"(?:rustc-wrapper|rustc-workspace-wrapper|(?:global-)?credential-providers?)"
+    r"[\"']?(?:[ \t]|\\t)*="
+    r"|^[ \t]*\[credential-alias\]"
+    r"|^[ \t]*\[[ \t]*(?:build|target\.[^\]\n]{1,120}|registry|registries\.[^\]\n]{1,60})[ \t]*\][ \t]*(?:#[^\n]*)?\r?\n"
+    r"[^\[]{0,800}?(?:^|[\s,{])(?:rustc|rustdoc|runner|linker|credential-process)[\"']?[ \t]*=[ \t]*[\"'\[]",
     re.IGNORECASE | re.MULTILINE,
 )
 
-_CARGO_QUICK_TOKENS = ("rustc", "rustdoc", "runner", "linker", "credential-")
+CARGO_READONLY_CMD_RE = re.compile(
+    r"\s*(?:cat|bat|grep|egrep|fgrep|rg|head|tail|less|more|ls|wc|diff|stat|file|nl"
+    r"|sed[ \t]+-n|awk|cargo[ \t]+(?:build|check|test|run|tree|metadata|doc|clippy))\b")
+_CARGO_QUICK_TOKENS = ("rustc", "rustdoc", "runner", "linker", "credential-", "browser")
 
 
 def cargo_exec_quick_reject(text: str) -> bool:

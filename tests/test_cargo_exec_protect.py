@@ -261,3 +261,55 @@ def test_large_input_is_fast():
     t = time.time()
     evaluate(_write("/tmp/big2.toml", body), EMPTY)
     assert time.time() - t < 3
+
+
+# ---- bypass-QA round 1 regressions ---------------------------------------------
+
+def test_python_heredoc_write_gated():
+    for cmd in ("python3 - <<'EOF'\nopen('.cargo/config.toml','w').write('[build]\\nrustc-wrapper=\"x\"')\nEOF",
+                "python3 <<EOF\nopen('.cargo/config.toml','a').write('rustc-wrapper=\"x\"')\nEOF"):
+        assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_perl_append_and_misc_writers_gated():
+    for cmd in ("perl -e 'open(F,\">>.cargo/config.toml\");print F \"\\nrustc-wrapper=1\"'",
+                "echo 'rustc-wrapper=1' | install /dev/stdin .cargo/config.toml",
+                "echo 'rustc-wrapper=1' | sponge .cargo/config.toml",
+                "ex -sc '1i|rustc-wrapper=1' -cx .cargo/config.toml"):
+        assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_sed_insert_forms_gated():
+    for cmd in ("sed -i 's/a/rustc-wrapper=\"x\"/' .cargo/config.toml",
+                "sed -i '1i\\rustc-wrapper=\"x\"' .cargo/config.toml",
+                "sed -i '$arustc-wrapper=\"x\"' .cargo/config.toml",
+                "printf '[build]\\x0arustc-wrapper=\"x\"' > .cargo/config.toml"):
+        assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_escaped_tab_before_equals_gated():
+    assert _gated(evaluate(_shell("printf 'rustc-wrapper\\t=\"x\"' >> .cargo/config.toml"), EMPTY))
+
+
+def test_more_cargo_exec_keys_gated():
+    for body in ('[registry]\nglobal-credential-providers = ["/tmp/x"]\n',
+                 '[credential-alias]\nmy = "/tmp/x"\n',
+                 '[doc]\nbrowser = "/tmp/x"\n'):
+        assert _gated(evaluate(_write(CFG, body), EMPTY)), body
+
+
+def test_staged_crlf_and_long_gap_gated():
+    assert _gated(evaluate(_write("/tmp/e.toml", '[target.x]\r\nlinker = "x"\r\n'), EMPTY))
+    assert _gated(evaluate(_write("/tmp/e.toml", '[build]\n' + "# c\n" * 100 + 'rustc = "x"\n'), EMPTY))
+    assert _gated(evaluate(_write("/tmp/e.toml", '[ target.x ]\nlinker = "x"\n'), EMPTY))
+
+
+def test_payload_in_non_content_field_gated():
+    ev = _ev("Write", file_path=CFG, content="x", append='rustc-wrapper="x"')
+    assert _gated(evaluate(ev, EMPTY))
+
+
+def test_readers_still_allowed():
+    for cmd in ("cat .cargo/config.toml", "grep -n 'rustc-wrapper =' .cargo/config.toml",
+                "sed -n '/linker = /p' .cargo/config.toml", "head .cargo/config.toml"):
+        assert not _gated(evaluate(_shell(cmd), EMPTY)), cmd
