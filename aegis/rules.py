@@ -7086,7 +7086,6 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
-    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
 )
 
@@ -7755,8 +7754,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``cargo --config 'build.rustc-wrapper=...'`` and ``CARGO_BUILD_*``/
     ``RUSTC_WRAPPER``/``RUSTFLAGS`` env vars (non-persistent); values
     assembled indirectly; `-C linker=` is only seen inside a path-confirmed
-    config; a direct fetch-to-file write is closed by
-    `rule_fetch_to_file_protect` reusing `CARGO_CONFIG_PATH_RE`. A
+    config; a direct fetch-to-file write into `.cargo/config*` is already gated by
+    `rule_fetch_to_file_protect` via the pre-existing `REGISTRY_CONFIG_PATH_RE`
+    entry (same path alternative), independent of this guard's mode. A
     ``build.rs``/proc-macro is a different (code, not config) surface that
     `cargo build` runs by design and is not covered."""
     cfg = getattr(policy, "cargo_exec", None) or {}

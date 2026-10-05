@@ -5298,7 +5298,7 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # Weak, path-CONFIRMED-only: a bare key assignment (line-start, dotted
 # `build.x = `, inline-table `{ x = `, or quoted) or a `-C linker=` rustflag.
 CARGO_EXEC_KEY_RE = re.compile(
-    r"(?:^|[\s\[{,.\"']|\\[nt])"   # `\\n`: printf/sed/echo -e escape in a shell one-liner
+    r"(?:^|[\s\[{,.\"'/]|\\[nt])"   # `/`: sed s/a/key = v/; `\\n`: printf/sed/echo -e escape in a shell one-liner
     r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
     r"|credential-process|credential-provider)[\"']?[ \t]*="
     r"|-C[ \t]*linker[ \t]*=",

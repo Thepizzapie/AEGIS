@@ -84,8 +84,6 @@ def test_quoted_key_gated():
 
 
 def test_rustflags_linker_gated_when_path_confirmed():
-    assert _gated(evaluate(_edit(CFG, 'rustflags = ["-C", "linker=/tmp/x"]'), EMPTY)
-                  ) or _gated(evaluate(_edit(CFG, 'rustflags = ["-Clinker=/tmp/x"]'), EMPTY))
     assert _gated(evaluate(_edit(CFG, 'rustflags = ["-Clinker=/tmp/x"]'), EMPTY))
 
 
@@ -158,7 +156,8 @@ def test_unrelated_cargo_config_allowed():
 def test_exec_words_in_unrelated_file_allowed():
     assert not _gated(evaluate(_write("notes.md", "set a runner = x and linker = y"), EMPTY))
     assert not _gated(evaluate(_write("setup.cfg", "[tool]\nrunner = pytest\nlinker = ld\n"), EMPTY))
-    assert not _gated(evaluate(_write("ci.toml", "[target.x]\nrunner = \"a\"\n"), EMPTY)) or True
+    # ...but a Cargo `[target.*]` header + runner is the strong, path-independent form
+    assert _gated(evaluate(_write("ci.toml", "[target.x]\nrunner = \"a\"\n"), EMPTY))
 
 
 def test_ambiguous_keys_without_cargo_section_allowed_elsewhere():
@@ -206,12 +205,39 @@ def test_policy_allow_regex():
 
 def test_monitor_mode_allows():
     pol = Policy(cargo_exec={"mode": "monitor"})
-    assert not _gated(evaluate(_write(CFG, 'rustc-wrapper = "x"'), pol))
+    assert evaluate(_write(CFG, 'rustc-wrapper = "x"'), pol).action == Action.ALLOW
 
 
 def test_off_mode_allows():
-    assert not _gated(evaluate(_write(CFG, 'rustc-wrapper = "x"'),
-                               Policy(cargo_exec={"mode": "off"})))
+    assert evaluate(_write(CFG, 'rustc-wrapper = "x"'),
+                    Policy(cargo_exec={"mode": "off"})).action == Action.ALLOW
+
+
+def test_shell_deny_mode_blocks():
+    d = evaluate(_shell("echo 'linker=\"/x\"' >> .cargo/config.toml"), DENY)
+    assert d.blocked and d.rule == RULE
+
+
+def test_shell_env_escape(monkeypatch):
+    monkeypatch.setenv("AEGIS_ALLOW_CARGO_EXEC", "1")
+    assert not _gated(evaluate(_shell("echo 'linker=\"/x\"' >> .cargo/config.toml"), EMPTY))
+
+
+def test_sed_slash_form_gated():
+    assert _gated(evaluate(_shell("sed -i 's/a/linker = \"x\"/' .cargo/config.toml"), EMPTY))
+
+
+def test_registries_header_credential_provider_gated():
+    assert _gated(evaluate(_write("/tmp/s.toml",
+                                  '[registries.foo]\ncredential-provider = ["/x"]\n'), EMPTY))
+
+
+def test_yaml_policy_roundtrip(tmp_path):
+    from aegis.loader import load_policy
+    f = tmp_path / "p.yaml"
+    f.write_text("cargo_exec:\n  mode: deny\n")
+    pol = load_policy(str(tmp_path))
+    assert pol.cargo_exec == {"mode": "deny"}
 
 
 def test_agent_cannot_self_escape_via_content():
@@ -223,7 +249,7 @@ def test_agent_cannot_self_escape_via_content():
 
 def test_fetch_to_file_into_cargo_config_gated():
     d = evaluate(_shell("curl -o .cargo/config.toml https://example.com/c.toml"), EMPTY)
-    assert d.action != Action.ALLOW
+    assert d.action != Action.ALLOW and d.rule == "fetch-to-file-protect"
 
 
 def test_large_input_is_fast():
