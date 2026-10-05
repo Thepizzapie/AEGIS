@@ -5298,7 +5298,7 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # Weak, path-CONFIRMED-only: a bare key assignment (line-start, dotted
 # `build.x = `, inline-table `{ x = `, or quoted) or a `-C linker=` rustflag.
 CARGO_EXEC_KEY_RE = re.compile(
-    r"(?:^|[\s\[{,.\"'/\\]|\\[nt])"
+    r"(?:^|[\s\[{,.\"'/\\]|\\(?:[nt]|x[0-9a-f]{2}|0[0-7]{2}))"
     r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker|browser"
     r"|credential-process|(?:global-)?credential-providers?)[\"']?(?:[ \t]|\\t)*="
     r"|-C[ \t]*linker[ \t]*="
@@ -5325,6 +5325,20 @@ CARGO_EXEC_STRONG_RE = re.compile(
 CARGO_READONLY_CMD_RE = re.compile(
     r"\s*(?:cat|bat|grep|egrep|fgrep|rg|head|tail|less|more|ls|wc|diff|stat|file|nl"
     r"|sed[ \t]+-n|awk|cargo[ \t]+(?:build|check|test|run|tree|metadata|doc|clippy))\b")
+_CARGO_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\n]")
+
+
+def cargo_cmd_is_readonly(cmd: str) -> bool:
+    """True only if EVERY pipeline/`;`/`&&`/newline segment of `cmd` starts
+    with a plain reader and the command has no heredoc/here-string/
+    substitution. A reader prefix alone must not exempt a later writer
+    (`ls; python - <<EOF ...`, `cat x | sponge .cargo/config.toml`)."""
+    if "<<" in cmd or "`" in cmd or "$(" in cmd:
+        return False
+    segs = [s for s in _CARGO_SEGMENT_SPLIT_RE.split(cmd) if s.strip()]
+    return bool(segs) and all(CARGO_READONLY_CMD_RE.match(s) for s in segs)
+
+
 _CARGO_QUICK_TOKENS = ("rustc", "rustdoc", "runner", "linker", "credential-", "browser")
 
 

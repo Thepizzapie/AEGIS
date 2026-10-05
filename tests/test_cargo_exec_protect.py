@@ -313,3 +313,21 @@ def test_readers_still_allowed():
     for cmd in ("cat .cargo/config.toml", "grep -n 'rustc-wrapper =' .cargo/config.toml",
                 "sed -n '/linker = /p' .cargo/config.toml", "head .cargo/config.toml"):
         assert not _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+# ---- bypass-QA round 2 regressions ---------------------------------------------
+
+def test_reader_prefix_does_not_exempt_writer():
+    for cmd in ("grep a b && python - <<EOF\nopen('.cargo/config.toml','w').write('rustc-wrapper=\"x\"')\nEOF",
+                "ls\npython - <<EOF\nopen('.cargo/config.toml','w').write('rustc-wrapper=\"x\"')\nEOF",
+                "cat <<EOF | sponge .cargo/config.toml\n[build]\nrustc-wrapper=\"/tmp/x\"\nEOF",
+                "cat <<EOF | install -m644 /dev/stdin .cargo/config.toml\n[build]\nrustc-wrapper=\"/x\"\nEOF",
+                "grep -r foo . ; printf 'rustc-wrapper=\"x\"' | sponge .cargo/config.toml",
+                "ls; vim -es -c '1i rustc-wrapper=1' -c x .cargo/config.toml"):
+        assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_hex_octal_newline_escapes_gated():
+    for cmd in ("echo -e '[build]\\x0arustc=\"x\"' > .cargo/config.toml",
+                "printf '[build]\\012rustc=\"x\"' > .cargo/config.toml"):
+        assert _gated(evaluate(_shell(cmd), EMPTY)), cmd

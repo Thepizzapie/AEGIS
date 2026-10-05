@@ -7736,7 +7736,7 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     to run -- there is no safe/dangerous split by value), or path-
     independently on the Cargo-only strong forms (`CARGO_EXEC_STRONG_RE`) so
     content staged under another filename before a move is still caught.
-    Full-line `#` comments are stripped first. Shell commands starting with a plain reader (`cat`/`grep`/`rg`/`head`/
+    Full-line `#` comments are stripped first. Shell commands in which EVERY segment is a plain reader (`cat`/`grep`/`rg`/`head`/
     `tail`/`ls`/`diff`/`sed -n`/...) and containing no write verb are exempt,
     so reading or `grep`-ing a config does not ask; anything else that
     carries a hit (heredoc-fed interpreters, `install`, `sponge`, `patch`)
@@ -7759,7 +7759,7 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     config; a direct fetch-to-file write into `.cargo/config*` is already gated by
     `rule_fetch_to_file_protect` via the pre-existing `REGISTRY_CONFIG_PATH_RE`
     entry (same path alternative), independent of this guard's mode. A
-    two-step write (stage the content under another name with no key text in
+    TOML unicode-escaped key spellings are not decoded; a two-step write (stage the content under another name with no key text in
     the `cp`/`mv` command) is only caught at the staging write; a docs/
     source file quoting `rustc-wrapper = "..."` asks (fails toward ASK);
     rustflags code-exec via `-C link-arg=`/`-Zcodegen-backend` is not covered.
@@ -7827,7 +7827,7 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         # with no write verb. Heredoc-fed interpreters, perl `>>`, install/
         # sponge/ex/patch etc. have no write-verb match, so "no verb" must
         # not mean "read-only".
-        if hit and (patterns.CARGO_READONLY_CMD_RE.match(cmd)
+        if hit and (patterns.cargo_cmd_is_readonly(cmd)
                     and not (patterns.WRITE_REDIRECT_RE.search(cmd)
                              or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                              or patterns.INPLACE_WRITE_RE.search(cmd)
