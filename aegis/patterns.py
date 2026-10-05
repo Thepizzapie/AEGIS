@@ -5273,6 +5273,61 @@ def docker_cred_helper_strong_hit(text: str) -> bool:
                 return True
     return False
 
+# ---- Cargo config exec-hijack protection --------------------------------------
+# Cargo's own config file (`.cargo/config.toml`, legacy `.cargo/config`; the
+# project-level copy is read for every ancestor directory of the cwd, so a
+# file planted in a repo -- or a parent dir -- applies to every `cargo`
+# invocation underneath it) names several programs CARGO ITSELF executes:
+# `[build] rustc-wrapper`/`rustc-workspace-wrapper` (every compiler
+# invocation, `cargo check`/rust-analyzer included), `[build] rustc`/`rustdoc`
+# (replaces the compiler binary), `[target.<triple>] linker` (every link
+# step) and `runner` (every `cargo run`/`cargo test`/`cargo bench`), and
+# `[registry]`/`[registries.<n>] credential-process`/`credential-provider`
+# (handed the registry token). A planted build.rs is an obvious diff; a
+# two-line config addition reads as routine tuning (`linker = "clang"`,
+# sccache as `rustc-wrapper`) and runs on a teammate's/CI's next build. The
+# registry/source REDIRECT half of this file is already covered by
+# `REGISTRY_CONFIG_PATH_RE`/`rule_package_manifest_protect`; this is the exec
+# half. Disclosed gaps: `CARGO_HOME` relocation, `CARGO_BUILD_RUSTC_WRAPPER`-
+# style env vars and one-shot `cargo --config` flags (non-persistent, and the
+# agent could simply run the program itself), `RUSTFLAGS` in the environment.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Weak, path-CONFIRMED-only: a bare key assignment (line-start, dotted
+# `build.x = `, inline-table `{ x = `, or quoted) or a `-C linker=` rustflag.
+CARGO_EXEC_KEY_RE = re.compile(
+    r"(?:^|[\s\[{,.\"']|\\[nt])"   # `\\n`: printf/sed/echo -e escape in a shell one-liner
+    r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
+    r"|credential-process|credential-provider)[\"']?[ \t]*="
+    r"|-C[ \t]*linker[ \t]*=",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Strong, path-INDEPENDENT: `rustc-wrapper`/`rustc-workspace-wrapper`/
+# `credential-provider` are Cargo-only vocabulary (key alone is enough); the
+# ambiguous names (`runner`, `linker`, `rustc`, `rustdoc`, `credential-
+# process`) need a Cargo section header just before them. `[^\[]{0,400}?`
+# cannot cross into another section and is anchored on the (rare) header.
+CARGO_EXEC_STRONG_RE = re.compile(
+    r"(?:^|[\s\[{,.\"']|\\[nt])(?:rustc-wrapper|rustc-workspace-wrapper|credential-provider)[\"']?[ \t]*=[ \t]*[\"'\[{]"
+    r"|^[ \t]*\[(?:build|target\.[^\]\n]{1,120}|registry|registries\.[^\]\n]{1,60})\][ \t]*(?:#[^\n]*)?\n"
+    r"[^\[]{0,400}?(?:^|[\s,{])(?:rustc|rustdoc|runner|linker|credential-process)[\"']?[ \t]*=[ \t]*[\"'\[]",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+_CARGO_QUICK_TOKENS = ("rustc", "rustdoc", "runner", "linker", "credential-")
+
+
+def cargo_exec_quick_reject(text: str) -> bool:
+    """Cheap substring prefilter: True only if `text` contains at least one
+    token any Cargo exec key needs (case-insensitive). Keeps the regexes and
+    comment-stripping off the hot path for the overwhelming majority of
+    calls, which never mention any of them."""
+    low = text.lower()
+    return any(t in low for t in _CARGO_QUICK_TOKENS)
+
+
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
 # `external` provider's `data "external"` data source all name an arbitrary

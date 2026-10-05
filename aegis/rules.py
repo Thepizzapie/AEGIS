@@ -7086,6 +7086,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
 )
 
@@ -7699,6 +7700,141 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
                          "may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_DOCKER_CRED_HELPER=1; a spawned agent "
                          "cannot."))
+    return None
+
+
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a program-naming key in a Cargo config
+    (`.cargo/config.toml`, legacy `.cargo/config`): `rustc-wrapper`,
+    `rustc-workspace-wrapper`, `rustc`, `rustdoc`, a `[target.<triple>]`
+    `linker`/`runner`, or a registry `credential-process`/
+    `credential-provider`.
+
+    THREAT MODEL: Cargo reads `.cargo/config.toml` from the cwd and EVERY
+    ancestor directory, so a file planted in a repo (or a parent of it)
+    applies to every `cargo` command beneath it. Each key above names a
+    program Cargo itself executes, unattended, on routine commands: wrappers
+    and `rustc`/`rustdoc` on every compile (rust-analyzer's background
+    `cargo check` included), `linker` on every link, `runner` on every
+    `cargo run`/`test`/`bench`, credential keys with the registry token in
+    hand. The edit is two lines that read as ordinary build tuning (sccache,
+    mold, a cross-compile runner), unlike a planted `build.rs`, and fires on
+    a teammate's or CI's next build. The registry/source-redirect half of
+    this file is covered by `rule_package_manifest_protect`; this is the exec
+    half it does not reach.
+
+    Gated on the key once the path is confirmed (every value names a program
+    to run -- there is no safe/dangerous split by value), or path-
+    independently on the Cargo-only strong forms (`CARGO_EXEC_STRONG_RE`) so
+    content staged under another filename before a move is still caught.
+    Full-line `#` comments are stripped first. Shell commands are gated only
+    when a write verb is present, so reading or `grep`-ing a config does not
+    ask.
+
+    Config (``policy.cargo_exec``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on path/command). Default ``ask``: sccache/
+    mold/clang linkers are routine -- a human just has to have looked.
+
+    Escapable only by a human: trailing '# aegis-allow' on the shell form, or
+    ``AEGIS_ALLOW_CARGO_EXEC=1`` set by the orchestrator for the Edit/Write/
+    MCP form. A spawned agent cannot set its own env for a hook it does not
+    control.
+
+    Honest scope (same denylist trade-offs as every sibling guard): a
+    relocated ``CARGO_HOME`` with no `.cargo` path segment; one-shot
+    ``cargo --config 'build.rustc-wrapper=...'`` and ``CARGO_BUILD_*``/
+    ``RUSTC_WRAPPER``/``RUSTFLAGS`` env vars (non-persistent); values
+    assembled indirectly; `-C linker=` is only seen inside a path-confirmed
+    config; a direct fetch-to-file write is closed by
+    `rule_fetch_to_file_protect` reusing `CARGO_CONFIG_PATH_RE`. A
+    ``build.rs``/proc-macro is a different (code, not config) surface that
+    `cargo build` runs by design and is not covered."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            # MultiEdit/NotebookEdit nest their text; sweep every leaf.
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        if not patterns.cargo_exec_quick_reject(content):
+            return None
+        scan_content = patterns.strip_comment_lines(content)
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            path_text = p + " " + " ".join(_flatten_strings(a))
+        path_confirmed = bool(path_text and patterns.CARGO_CONFIG_PATH_RE.search(path_text))
+        hit = bool(patterns.CARGO_EXEC_STRONG_RE.search(scan_content)
+                   or (path_confirmed and patterns.CARGO_EXEC_KEY_RE.search(scan_content)))
+        if not hit:
+            return None
+        if os.environ.get("AEGIS_ALLOW_CARGO_EXEC") or _cargo_exec_allowed_by_policy(cfg, p):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is being written with a Cargo config key that "
+                         "names a program Cargo executes (rustc-wrapper/"
+                         "rustc/rustdoc/linker/runner/credential-*) — it runs "
+                         "unattended with the invoking user's privileges on "
+                         "every future build/run/test under this directory "
+                         "(this session, a teammate, or CI). Review the "
+                         "change, then confirm with AEGIS_ALLOW_CARGO_EXEC=1; "
+                         "a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not patterns.cargo_exec_quick_reject(cmd):
+            return None
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd))
+        hit = bool(patterns.CARGO_EXEC_STRONG_RE.search(scan_cmd)
+                   or (path_hit and patterns.CARGO_EXEC_KEY_RE.search(scan_cmd)))
+        # Cheap content checks first; the write-verb scan only runs on a hit.
+        if hit and not (patterns.WRITE_REDIRECT_RE.search(cmd)
+                        or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                        or patterns.INPLACE_WRITE_RE.search(cmd)
+                        or patterns.FORCED_LINK_WRITE_RE.search(cmd)):
+            hit = False
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, cmd)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo config key that names a program Cargo "
+                         "executes (rustc-wrapper/rustc/rustdoc/linker/"
+                         "runner/credential-*) is being written from a shell "
+                         "— it runs unattended on every future build/run/"
+                         "test under this directory. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_CARGO_EXEC=1; "
+                         "a spawned agent cannot."))
     return None
 
 
@@ -8519,6 +8655,7 @@ _CORE_RULES = (
     rule_ipython_startup_protect,
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
+    rule_cargo_exec_protect,
     rule_terraform_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,

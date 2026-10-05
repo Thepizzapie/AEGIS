@@ -400,6 +400,13 @@ class Policy:
     # scope, handing it a live registry credential every time. See
     # rules.rule_docker_cred_helper_protect.
     docker_cred_helper: dict = field(default_factory=dict)
+    # Cargo config exec-hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers `.cargo/config.toml` keys naming a program Cargo itself runs on
+    # every build/run/test (`rustc-wrapper`, `rustc-workspace-wrapper`,
+    # `rustc`, `rustdoc`, `linker`, `runner`, `credential-process`,
+    # `credential-provider`). See rules.rule_cargo_exec_protect.
+    cargo_exec: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/
