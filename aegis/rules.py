@@ -7819,7 +7819,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         if not patterns.cargo_exec_quick_reject(cmd):
             return None
         scan_cmd = patterns.strip_comment_lines(cmd)
-        path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd))
+        path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+                        or patterns.CARGO_CD_RE.search(scan_cmd))
         hit = bool(patterns.CARGO_EXEC_STRONG_RE.search(scan_cmd)
                    or (path_hit and patterns.CARGO_EXEC_KEY_RE.search(scan_cmd)))
         # Cheap content checks first; the write-verb scan only runs on a hit.

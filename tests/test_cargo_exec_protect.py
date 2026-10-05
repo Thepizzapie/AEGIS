@@ -331,3 +331,24 @@ def test_hex_octal_newline_escapes_gated():
     for cmd in ("echo -e '[build]\\x0arustc=\"x\"' > .cargo/config.toml",
                 "printf '[build]\\012rustc=\"x\"' > .cargo/config.toml"):
         assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+# ---- bypass-QA round 3 regressions ---------------------------------------------
+
+def test_no_space_redirect_before_path_gated():
+    for cmd in ("printf '[target.x]\\nlinker=\"/x\"\\n' >.cargo/config.toml",
+                "echo 'build.rustc = \"/x\"' >>.cargo/config.toml",
+                "echo 'build.rustc = \"/x\"' >|.cargo/config.toml",
+                "echo 'build.rustc = \"/x\"' 1>.cargo/config.toml"):
+        assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_cd_cargo_then_relative_write_gated():
+    for cmd in ("cd .cargo && echo 'build.rustc = \"/x\"' > config.toml",
+                "cd proj/.cargo; echo 'target.x.linker=\"/x\"' >> config"):
+        assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_cargo_subcommand_is_not_a_reader():
+    d = evaluate(_shell("cargo check -- .cargo/config.toml 'rustc-wrapper = \"/x\"'"), EMPTY)
+    assert _gated(d)

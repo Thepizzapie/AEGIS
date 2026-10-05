@@ -5292,7 +5292,14 @@ def docker_cred_helper_strong_hit(text: str) -> bool:
 # style env vars and one-shot `cargo --config` flags (non-persistent, and the
 # agent could simply run the program itself), `RUSTFLAGS` in the environment.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>|;&(){},])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# `cd .cargo` (any prefix) followed by a relative `config[.toml]` write: the
+# literal `.cargo/config` never appears, so treat the cd as path confirmation.
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd)[ \t]+[^;&|\n]{0,200}?\.cargo[/\\]?[\"']?[ \t]*(?:$|[;&|\n])"
+    r"[^\n]*?\bconfig(?:\.toml)?\b",
     re.IGNORECASE,
 )
 # Weak, path-CONFIRMED-only: a bare key assignment (line-start, dotted
@@ -5324,7 +5331,7 @@ CARGO_EXEC_STRONG_RE = re.compile(
 
 CARGO_READONLY_CMD_RE = re.compile(
     r"\s*(?:cat|bat|grep|egrep|fgrep|rg|head|tail|less|more|ls|wc|diff|stat|file|nl"
-    r"|sed[ \t]+-n|awk|cargo[ \t]+(?:build|check|test|run|tree|metadata|doc|clippy))\b")
+    r"|sed[ \t]+-n|awk)\b")
 _CARGO_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\n]")
 
 
