@@ -44,6 +44,11 @@ FILES = [
     ".github/prompts/a.prompt.md", ".github/chatmodes/a.chatmode.md",
     ".github/agents/a.agent.md", ".amazonq/rules/a.md", ".junie/guidelines.md",
     ".kiro/steering/product.md", ".augment/rules/a.md",
+    ".kilocode/rules/a.md", ".trae/rules/a.md", ".windsurf/workflows/a.md",
+    ".amazonq/prompts/a.md", ".kiro/hooks/a.json", ".roomodes", ".goosehints",
+    "CONVENTIONS.md", "CRUSH.md", ".gemini/commands/a.toml", ".gemini/styleguide.md",
+    ".codex/prompts/a.md", ".opencode/agent/a.md", "opencode.json",
+    ".cursor/hooks.json", ".zed/rules/a.md", ".cursor/rules", ".cursor/rules/",
     "/repo/.CURSOR/RULES/x.mdc", "C:\\repo\\.cursor\\rules\\x.mdc",
 ]
 

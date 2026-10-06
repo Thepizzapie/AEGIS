@@ -1181,7 +1181,11 @@ def rule_foreign_agent_instructions_protect(ev: Event, policy=None) -> Optional[
     ``.clinerules``, ``.roorules``/``.roo/rules*/``, ``.continuerules``/
     ``.continue/rules/*``, ``.github/copilot-instructions.md`` and
     ``.github/instructions|prompts|chatmodes|agents/*``, ``.amazonq/rules/*``,
-    ``.junie/guidelines.md``, ``.kiro/steering/*``, ``.augment/rules/*``.
+    ``.junie/guidelines.md``, ``.kiro/steering|hooks/*``, ``.augment/rules/*``,
+    ``.kilocode|.trae|.zed|.devin/rules/*``, ``.gemini/commands|styleguide``,
+    ``.codex/prompts``, ``.opencode/agent|command``, ``opencode.json``,
+    ``.cursor/hooks.json``, ``CONVENTIONS.md``/``CRUSH.md``, ``.goosehints``,
+    ``.roomodes``, ``.rules``.
 
     THREAT MODEL: ``rule_agent_def_protect`` gates Claude Code's own auto-loaded
     context (``CLAUDE.md``/``AGENTS.md``, ``.claude/agents|commands|
@@ -1219,7 +1223,19 @@ def rule_foreign_agent_instructions_protect(ev: Event, policy=None) -> Optional[
     fetch-to-file write (``curl -o``) is closed by ``rule_fetch_to_file_protect``
     via ``_FETCH_HUMAN_ESCAPABLE``; and a ``.github/agents`` hit via the
     generic ``.github`` find-predicate fallback can false-positive as ASK
-    (fails toward ASK, never ALLOW)."""
+    (fails toward ASK, never ALLOW).
+
+    Inherited gaps shared with ``rule_agent_def_protect`` (QA round 1, disclosed
+    not fixed): a git/``install``/``touch``/``chmod`` overwrite of an existing
+    file (``git checkout x -- GEMINI.md``, ``git apply``) isn't a recognised
+    write verb; a path assembled across variable assignments, NTFS ``::$DATA``/
+    8.3 short names, or a ``cd .cursor && echo > rules/a.mdc`` cwd split; MCP
+    tools naming their target outside ``_path()``'s key list (``filepath``,
+    ``destination``, a ``files: [{path}]`` list as in GitHub's ``push_files``);
+    and read-plus-unrelated-redirect commands (``cat GEMINI.md > out``) that ask
+    spuriously — fails toward ASK. Round-1 fixes: added Kilo/Trae/Zed/Devin/
+    Gemini-commands/Codex/OpenCode/Cursor-hooks/Aider/Goose/Crush targets, and
+    a bare-directory Edit/Write path now hits like the shell form."""
     cfg = getattr(policy, "foreign_agent_instructions", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

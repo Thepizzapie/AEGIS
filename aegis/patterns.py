@@ -1550,7 +1550,14 @@ _FA_ROOT = r"(?:^|[\s'\"/\\=])"
 # trailing-boundary lookahead in _CI_END accepts both).
 FOREIGN_AGENT_FILE_RE = re.compile(
     _FA_ROOT + r"(?:GEMINI|QWEN)" + _WIN_TRIM + r"(?:\.local)?\.md" + _CI_END
-    + r"|" + _FA_ROOT + r"\.(?:cursor|windsurf|cline|roo|continue)rules" + _CI_END
+    + r"|" + _FA_ROOT + r"(?:CRUSH|CONVENTIONS)" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _FA_ROOT + r"\.(?:cursor|windsurf|cline|roo|continue|aide)rules" + _CI_END
+    + r"|" + _FA_ROOT + r"\.(?:goosehints|roomodes|rules)" + _CI_END
+    + r"|" + _FA_ROOT + r"\.gemini" + _WIN_TRIM + _SEP + r"styleguide" + _WIN_TRIM
+    + r"\.md" + _CI_END
+    + r"|" + _FA_ROOT + r"opencode" + _WIN_TRIM + r"\.jsonc?" + _CI_END
+    + r"|" + _FA_ROOT + r"\.cursor" + _WIN_TRIM + _SEP + r"hooks" + _WIN_TRIM
+    + r"\.json" + _CI_END
     + r"|" + _FA_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions"
     + _WIN_TRIM + r"\.md" + _CI_END
     + r"|" + _FA_ROOT + r"\.junie" + _WIN_TRIM + _SEP + r"guidelines"
@@ -1562,11 +1569,15 @@ FOREIGN_AGENT_FILE_RE = re.compile(
 # placing files without naming one).
 _FA_DIR_ALT = (
     r"(?:\.cursor" + _WIN_TRIM + _SEP + r"(?:rules|commands)"
-    r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.windsurf" + _WIN_TRIM + _SEP + r"(?:rules|workflows)"
     r"|\.continue" + _WIN_TRIM + _SEP + r"rules"
-    r"|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
-    r"|\.kiro" + _WIN_TRIM + _SEP + r"steering"
+    r"|\.amazonq" + _WIN_TRIM + _SEP + r"(?:rules|prompts)"
+    r"|\.kiro" + _WIN_TRIM + _SEP + r"(?:steering|hooks)"
     r"|\.augment" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.(?:kilocode|trae|zed|devin)" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.gemini" + _WIN_TRIM + _SEP + r"commands"
+    r"|\.codex" + _WIN_TRIM + _SEP + r"prompts"
+    r"|\.opencode" + _WIN_TRIM + _SEP + r"(?:agents?|commands?)"
     r"|\.roo" + _WIN_TRIM + _SEP + r"rules[^\s'\"/\\]{0,40}"
     r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|chatmodes|agents))"
 )
@@ -1576,16 +1587,20 @@ FOREIGN_AGENT_DIR_FILE_RE = re.compile(
     _FA_ROOT + _FA_DIR_ALT + _WIN_TRIM + _SEP + r"[^\s'\"]", re.IGNORECASE)
 
 FOREIGN_AGENT_FIND_PREDICATE_RE = _find_predicate_re(
-    r"(?:GEMINI\.md\b|QWEN\.md\b|\.(?:cursor|windsurf|cline|roo|continue)rules\b"
+    r"(?:GEMINI\.md\b|QWEN\.md\b|CRUSH\.md\b|CONVENTIONS\.md\b"
+    r"|\.(?:cursor|windsurf|cline|roo|continue|aide)rules\b"
+    r"|\.(?:goosehints|roomodes)\b|opencode\.jsonc?\b"
     r"|copilot-instructions\b|\.junie\b|\.cursor\b|\.windsurf\b|\.continue\b"
-    r"|\.amazonq\b|\.kiro\b|\.augment\b|\.roo\b|\.github\b)")
+    r"|\.amazonq\b|\.kiro\b|\.augment\b|\.roo\b|\.github\b|\.kilocode\b"
+    r"|\.trae\b|\.zed\b|\.devin\b|\.gemini\b|\.codex\b|\.opencode\b)")
 
 
 def foreign_agent_path_hit(text: str) -> bool:
     """True when `text` (a file path or whole command) names another coding
     agent's instruction/rule file or rule directory."""
     return bool(FOREIGN_AGENT_FILE_RE.search(text)
-                or FOREIGN_AGENT_DIR_FILE_RE.search(text))
+                or FOREIGN_AGENT_DIR_FILE_RE.search(text)
+                or FOREIGN_AGENT_DIR_RE.search(text))
 
 
 def foreign_agent_find_hit(cmd: str) -> bool:
