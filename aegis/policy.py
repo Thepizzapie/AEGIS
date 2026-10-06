@@ -169,6 +169,11 @@ class Policy:
     # (mode=ask) apply. Covers CLAUDE.md/AGENTS.md and .claude/agents/*.md,
     # .claude/commands/*.md. See rules.rule_agent_def_protect.
     agent_def: dict = field(default_factory=dict)
+    # Other coding agents' instruction/rule files (GEMINI.md, .cursorrules,
+    # .cursor/rules/*, .github/copilot-instructions.md, .clinerules, ...):
+    # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. See rules.rule_foreign_agent_instructions_protect.
+    foreign_agent_instructions: dict = field(default_factory=dict)
     # Claude Code Skill-definition protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers .claude/skills/<name>/SKILL.md, project- or user-scoped — a
