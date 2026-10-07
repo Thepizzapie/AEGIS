@@ -2732,14 +2732,16 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # with the two characters `\n`, whose `n` would otherwise read as a word char.
 CARGO_EXEC_KEY_RE = re.compile(
     r"(?:(?<![\w-])|(?<=\\[nrt]))[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|rustc_wrapper|runner"
-    r"|linker|credential-process|credential-provider|global-credential-providers)"
+    r"|linker|rustc|rustdoc|credential-process|credential-provider|global-credential-providers"
+    r"|LD_PRELOAD)"
     r"[\"']?\s*=",
     re.IGNORECASE,
 )
 # `rustflags`/`RUSTFLAGS` stay legitimate in bulk (`-C target-cpu=native`), so
 # only the flag shapes that load or run foreign code are matched.
 CARGO_RUSTFLAGS_EXEC_RE = re.compile(
-    r"\brustflags\b[^\n]{0,500}?(?:link-arg|linker|codegen-backend|llvm-plugin|-Z\s*\w*plugin)",
+    r"\brustflags\b[^\n]{0,500}?(?:link-arg(?!s?=-fuse-ld=(?:lld|mold|gold|bfd|lld-link)[\"'\s,\]])"
+    r"|linker|codegen-backend|llvm-plugin|-Z\s*\w*plugin)",
     re.IGNORECASE,
 )
 # Cargo env-var spellings of the same keys, plus the `--config` CLI override.
@@ -2747,7 +2749,14 @@ CARGO_EXEC_ENV_RE = re.compile(
     r"(?<![\w])(?:RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER"
     r"|CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:RUNNER|LINKER)"
     r"|CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER"
-    r"|CARGO_REGISTRY_CREDENTIAL_PROVIDER)\s*=",
+    r"|CARGO_REGISTRY_CREDENTIAL_PROVIDER)\s*=(?![\s;&|]|$)",
+    re.IGNORECASE,
+)
+# RUSTFLAGS-family env vars carrying the same foreign-code flag shapes as the
+# config-file `rustflags` check above.
+CARGO_RUSTFLAGS_ENV_RE = re.compile(
+    r"(?<![\w])(?:CARGO_BUILD_RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|RUSTFLAGS|RUSTDOCFLAGS)\s*=[^\n]{0,500}?"
+    r"(?:link-arg(?!s?=-fuse-ld=(?:lld|mold|gold|bfd|lld-link)[\"'\s,\]])|linker|codegen-backend|llvm-plugin)",
     re.IGNORECASE,
 )
 CARGO_CLI_CONFIG_RE = re.compile(
@@ -2777,7 +2786,7 @@ CARGO_BUILD_RS_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 CARGO_BUILD_RS_EXEC_RE = re.compile(
-    r"\bCommand\s*::\s*new\b|\bprocess\s*::|\bstd\s*::\s*process\b|\blibc\s*::\s*(?:system|exec\w*|fork)\b"
+    r"\bCommand\s*::\s*new\b|\bprocess\s*::\s*(?!exit\b)|\bstd\s*::\s*process\b(?!\s*::\s*exit\b)|\blibc\s*::\s*(?:system|exec\w*|fork)\b"
     r"|\bdlopen\b|\blibloading\b|\.\s*(?:spawn|exec)\s*\(",
     re.IGNORECASE,
 )
@@ -2786,7 +2795,7 @@ CARGO_MANIFEST_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 CARGO_MANIFEST_BUILD_KEY_RE = re.compile(
-    r"(?m)^\s*build\s*=\s*[\"'](?!build\.rs[\"'])",
+    r"(?m)^\s*build\s*=\s*[\"'](?!(?:\./)?build\.rs[\"'])",
 )
 
 

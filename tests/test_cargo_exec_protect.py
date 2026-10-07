@@ -136,7 +136,7 @@ def test_build_rs_command_new():
 
 
 def test_build_rs_nested_crate():
-    assert _hit(evaluate(_write("crates/foo/build.rs", 'fn main(){ std::process::exit(0) }'), EMPTY))
+    assert _hit(evaluate(_write("crates/foo/build.rs", 'fn main(){ std::process::Command::new("sh"); }'), EMPTY))
 
 
 def test_build_rs_libloading():
@@ -269,3 +269,48 @@ def test_redos_resistance():
     evaluate(_write(".cargo/config.toml", big), EMPTY)
     evaluate(_shell("cargo " + "x " * 100000 + "--config "), EMPTY)
     assert time.time() - t < 5
+
+
+# ---- QA round 1 fixes ----
+def test_readonly_grep_with_devnull_allowed():
+    assert not _hit(evaluate(_shell("grep -n 'Command::new' build.rs 2>/dev/null"), EMPTY))
+    assert not _hit(evaluate(_shell("grep 'linker =' .cargo/config.toml 2>&1"), EMPTY))
+
+
+def test_empty_env_unset_allowed():
+    assert not _hit(evaluate(_shell("RUSTC_WRAPPER= cargo build"), EMPTY))
+
+
+def test_comment_line_allowed():
+    c = "# set the linker = lld later\n[build]\njobs = 2\n"
+    assert not _hit(evaluate(_write(".cargo/config.toml", c), EMPTY))
+
+
+def test_lld_mold_rustflags_allowed_but_path_gated():
+    ok = '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=lld"]\n'
+    assert not _hit(evaluate(_write(".cargo/config.toml", ok), EMPTY))
+    bad = '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=/tmp/evil"]\n'
+    assert _hit(evaluate(_write(".cargo/config.toml", bad), EMPTY))
+
+
+def test_build_rs_process_exit_allowed():
+    assert not _hit(evaluate(_write("build.rs", "fn main(){ std::process::exit(0) }"), EMPTY))
+
+
+def test_manifest_dot_slash_build_rs_allowed():
+    assert not _hit(evaluate(_write("Cargo.toml", '[package]\nbuild = "./build.rs"\n'), EMPTY))
+
+
+def test_rustc_key_and_ld_preload_env_table():
+    assert _hit(evaluate(_write(".cargo/config.toml", '[build]\nrustc = "/tmp/evil"\n'), EMPTY))
+    assert _hit(evaluate(_write(".cargo/config.toml", '[env]\nLD_PRELOAD = "/tmp/x.so"\n'), EMPTY))
+
+
+def test_rustflags_env_linker():
+    assert _hit(evaluate(_shell("RUSTFLAGS='-C linker=/tmp/x' cargo build"), EMPTY))
+    assert not _hit(evaluate(_shell("RUSTFLAGS='-C target-cpu=native' cargo build"), EMPTY))
+
+
+def test_cp_ln_into_config_path_gated():
+    assert _hit(evaluate(_shell("cp /tmp/evil.toml .cargo/config.toml"), EMPTY))
+    assert _hit(evaluate(_shell("ln -sf /tmp/evil .cargo/config.toml"), EMPTY))

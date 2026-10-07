@@ -4619,9 +4619,15 @@ def _edit_text(a: dict) -> str:
     return " ".join(_flatten_strings(a))
 
 
+_CARGO_COMMENT_LINE_RE = re.compile(r"(?m)^[ \t]*(?:#|//).*$")
+_BENIGN_REDIRECT_RE = re.compile(r"\d*>>?\s*/dev/null|\d*>&\d+|&>>?\s*/dev/null")
+
+
 def _cargo_file_hit(path_text: str, content: str, *, cd_context: bool = False) -> bool:
     """True when `path_text` names a Cargo exec surface AND `content` carries
     that surface's exec shape (see `rule_cargo_exec_protect`)."""
+    # whole-line comments (`# ...` TOML, `// ...` Rust) are inert
+    content = _CARGO_COMMENT_LINE_RE.sub("", content)
     cfg_path = bool(patterns.CARGO_CONFIG_PATH_RE.search(path_text)
                     or (cd_context and patterns.CARGO_CD_RE.search(path_text)
                         and patterns.CARGO_BARE_CONFIG_RE.search(path_text)))
@@ -4717,14 +4723,24 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         if not cmd:
             return None
         hit = bool(patterns.CARGO_EXEC_ENV_RE.search(cmd)
+                   or patterns.CARGO_RUSTFLAGS_ENV_RE.search(cmd)
                    or patterns.CARGO_CLI_CONFIG_RE.search(cmd))
         if not hit:
-            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
-                               or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                               or patterns.INPLACE_WRITE_RE.search(cmd)
-                               or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                               or patterns.COPY_WRITE_VERB_RE.search(cmd))
-            hit = write_verb and _cargo_file_hit(cmd, cmd, cd_context=True)
+            # `2>/dev/null` / `2>&1` are not writes to the Cargo file
+            wcmd = _BENIGN_REDIRECT_RE.sub(" ", cmd)
+            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(wcmd)
+                               or patterns.DELETE_OR_MOVE_VERB_RE.search(wcmd)
+                               or patterns.INPLACE_WRITE_RE.search(wcmd)
+                               or patterns.FORCED_LINK_WRITE_RE.search(wcmd)
+                               or patterns.COPY_WRITE_VERB_RE.search(wcmd))
+            hit = write_verb and _cargo_file_hit(wcmd, wcmd, cd_context=True)
+            # cp/mv/ln of a file INTO .cargo/config(.toml): the content is not
+            # in the command, so (like a tools-XML path-only gate) path alone
+            if not hit and (patterns.COPY_WRITE_VERB_RE.search(wcmd)
+                            or patterns.FORCED_LINK_WRITE_RE.search(wcmd)
+                            or patterns.DELETE_OR_MOVE_VERB_RE.search(wcmd)):
+                hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(wcmd)
+                           and re.search(r"\b(?:cp|mv|ln|install|rsync|ditto|copy|move)\b", wcmd, re.IGNORECASE))
         if not hit:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
