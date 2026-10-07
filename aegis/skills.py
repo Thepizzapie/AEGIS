@@ -47,6 +47,7 @@ _REMEDIES = """\
 | vscode-tasks-protect | wrote a VS Code automatic task (tasks.json runOn: "folderOpen") or silenced its confirmation prompt (settings.json task.allowAutomaticTasks: "on") | ask the human; they can set AEGIS_ALLOW_VSCODE_TASKS_EXEC=1 after review |
 | jetbrains-watcher-protect | wrote a JetBrains File Watcher task (.idea/watcherTasks.xml `program` option — runs automatically on the next matching file save in any JetBrains IDE, no Run/build/git/CI trigger needed) | ask the human; they can set AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC=1 after review |
 | jetbrains-run-config-protect | wired a run configuration to a "Before launch: run External Tool" step (.idea/runConfigurations/*.xml `ToolBeforeRunTask`) or defined/redefined that tool's own command (.idea/tools/*.xml `COMMAND` option) — runs automatically on the next Run/Debug of that configuration in any JetBrains IDE | ask the human; they can set AEGIS_ALLOW_JETBRAINS_RUN_CONFIG=1 after review |
+| cargo-exec-protect | planted a Cargo auto-exec hook: a `.cargo/config.toml` `rustc-wrapper`/`runner`/`linker`/`credential-process` key, a process-spawning `build.rs`, a `Cargo.toml` `build =` redirect, or the same as `RUSTC_WRAPPER=`/`CARGO_TARGET_*_RUNNER=`/`cargo --config` — runs on the next `cargo build`/`check`/`test`/`run` (incl. rust-analyzer in an IDE) | ask the human; they can set AEGIS_ALLOW_CARGO_EXEC=1 after review |
 | path-hijack-protect | planted/symlinked/chmod +x'd an executable over a trusted command name in a $PATH bin directory (shadows the next bare invocation of that command, by anyone) | ask the human; they can set AEGIS_ALLOW_PATH_HIJACK=1 after review |
 | claude-hooks-protect | planted a `hooks` entry in .claude/settings.local.json (runs as Claude Code's own subprocess on the next matching tool call, outside the tool-call loop Aegis evaluates) | ask the human; they can set AEGIS_ALLOW_CLAUDE_HOOKS=1 after review |
 | statusline-protect | planted a `statusLine` entry enabled for `type: "command"` in .claude/settings.local.json (Claude Code spawns it directly on essentially every turn, no tool-call trigger needed at all) | ask the human; they can set AEGIS_ALLOW_STATUSLINE=1 after review |
@@ -118,7 +119,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `cargo_exec`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -164,7 +165,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
      `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
-     `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `path_hijack`,
+     `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `cargo_exec`, `path_hijack`,
      `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.

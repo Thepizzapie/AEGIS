@@ -4594,6 +4594,154 @@ def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decisi
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _edit_text(a: dict) -> str:
+    """Content an Edit/Write/MCP write would put on disk: `content`/
+    `new_string` plus `old_string` (real on-disk context), falling back to
+    every string in the args (MultiEdit, nested MCP payloads)."""
+    raw = a.get("content")
+    if not isinstance(raw, str) or not raw:
+        raw = a.get("new_string")
+    old = a.get("old_string")
+    if isinstance(old, str) and old:
+        raw = f"{old} {raw}" if isinstance(raw, str) and raw else old
+    if isinstance(raw, str) and raw:
+        return raw
+    return " ".join(_flatten_strings(a))
+
+
+def _cargo_file_hit(path_text: str, content: str, *, cd_context: bool = False) -> bool:
+    """True when `path_text` names a Cargo exec surface AND `content` carries
+    that surface's exec shape (see `rule_cargo_exec_protect`)."""
+    cfg_path = bool(patterns.CARGO_CONFIG_PATH_RE.search(path_text)
+                    or (cd_context and patterns.CARGO_CD_RE.search(path_text)
+                        and patterns.CARGO_BARE_CONFIG_RE.search(path_text)))
+    if cfg_path and (patterns.CARGO_EXEC_KEY_RE.search(content)
+                     or patterns.CARGO_RUSTFLAGS_EXEC_RE.search(content)
+                     or patterns.CARGO_EXEC_ENV_RE.search(content)):
+        return True
+    if (patterns.CARGO_BUILD_RS_PATH_RE.search(path_text)
+            and patterns.CARGO_BUILD_RS_EXEC_RE.search(content)):
+        return True
+    if (patterns.CARGO_MANIFEST_PATH_RE.search(path_text)
+            and patterns.CARGO_MANIFEST_BUILD_KEY_RE.search(content)):
+        return True
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Cargo auto-exec hook: `.cargo/config(.toml)` keys that
+    make Cargo run a program (`build.rustc-wrapper`/`rustc-workspace-wrapper`,
+    `target.<triple>.runner`/`linker`, `credential-process`/
+    `credential-provider`/`global-credential-providers`, `rustflags` carrying
+    `link-arg`/`linker`/`codegen-backend`), a `build.rs` build script that
+    spawns a process or loads native code, a `Cargo.toml` `build = "<path>"`
+    redirect, the same keys as `RUSTC_WRAPPER=`/`CARGO_TARGET_*_RUNNER=`/...
+    environment assignments, or a `cargo --config <exec key>=...` override.
+
+    THREAT MODEL: `rule_package_manifest_protect` covers npm/composer
+    lifecycle scripts and registry redirects (including `.cargo/config.toml`
+    `replace-with`), but nothing covers Cargo's own code-execution keys. They
+    fire on the next ordinary `cargo build`/`check`/`test`/`run` — by this
+    agent, a teammate, CI, or rust-analyzer's background `cargo check` the
+    moment the folder opens in an IDE — before any project code is reviewed.
+    A `rustc-wrapper` or `runner` line, or a `Command::new` in `build.rs`,
+    reads as ordinary build tuning in a diff. `credential-process` receives
+    the registry token on `cargo publish`/`login`, the same exposure as git's
+    `credential.helper`. Cargo also merges `.cargo/config.toml` from every
+    ancestor directory and `$CARGO_HOME`, so the file can live outside the
+    repo under review.
+
+    Gating is content-based per file, since `.cargo/config.toml`, `build.rs`
+    and `Cargo.toml` are edited constantly for benign reasons: config files
+    need an exec key, `build.rs` needs a process-spawn/native-load shape,
+    `Cargo.toml` needs a `build = "<path other than build.rs>"` key. Edit/
+    Write/MultiEdit/MCP writes and shell write verbs (redirect, `cp`/`mv`,
+    `sed -i`, forced links; incl. a `cd .cargo` then bare `config.toml`) are
+    covered. Shell env assignments and `--config` overrides are gated
+    without a write verb, since they execute directly.
+
+    Default mode `ask`, human-escapable only (`# aegis-allow` or
+    `AEGIS_ALLOW_CARGO_EXEC=1`; a spawned agent cannot). Config:
+    `policy.cargo_exec` (`mode` deny|ask|monitor|off, `allow` regexes).
+
+    Honest scope (denylist): a build script whose spawn is assembled
+    indirectly (`include!` of a generated file, a proc-macro crate, a
+    dependency's own `build.rs` in `vendor/` or `~/.cargo/registry`) is not
+    seen; env vars planted in `.env`/Dockerfile/CI files are left to those
+    surfaces' guards; `cargo install`/`cargo run` of a hostile crate is
+    `rule_install_review`'s remit."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        content = _edit_text(ev.args or {})
+        if not content or not _cargo_file_hit(p, content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is planting a Cargo auto-exec hook "
+                         "(rustc-wrapper/runner/linker/credential-process "
+                         "config key, or a process-spawning build script) — "
+                         "it runs on the next 'cargo build'/'check'/'test'/"
+                         "'run', including rust-analyzer's background check "
+                         "in an IDE. Review the change, then confirm with "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not cmd:
+            return None
+        hit = bool(patterns.CARGO_EXEC_ENV_RE.search(cmd)
+                   or patterns.CARGO_CLI_CONFIG_RE.search(cmd))
+        if not hit:
+            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                               or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                               or patterns.INPLACE_WRITE_RE.search(cmd)
+                               or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                               or patterns.COPY_WRITE_VERB_RE.search(cmd))
+            hit = write_verb and _cargo_file_hit(cmd, cmd, cd_context=True)
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo auto-exec hook (rustc-wrapper/runner/"
+                         "linker/credential-process, or a process-spawning "
+                         "build script) is being planted from a shell — it "
+                         "runs on the next 'cargo build'/'check'/'test'/"
+                         "'run', including rust-analyzer's background check "
+                         "in an IDE. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7078,6 +7226,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
     (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
     (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tools definition"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo .cargo/config(.toml)"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -8508,6 +8657,7 @@ _CORE_RULES = (
     rule_vscode_tasks_protect,
     rule_jetbrains_watcher_protect,
     rule_jetbrains_run_config_protect,
+    rule_cargo_exec_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,

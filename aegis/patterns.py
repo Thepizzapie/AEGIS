@@ -2703,6 +2703,93 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 )
 
 
+# Cargo exec hijack — the surface `REGISTRY_CONFIG_PATH_RE`/`REGISTRY_HIJACK_RE`
+# above only half cover (they gate a `.cargo/config.toml` registry REDIRECT,
+# `replace-with`, and nothing else). The same file also carries keys that make
+# Cargo run an arbitrary program on the next ordinary `cargo build`/`check`/
+# `test`/`run`/`publish` — and, via rust-analyzer's own background `cargo
+# check`, on merely opening the project in an IDE:
+#   * `build.rustc-wrapper` / `build.rustc-workspace-wrapper` — Cargo prefixes
+#     EVERY rustc invocation with this program (sccache-style, but any binary);
+#   * `target.<triple>.runner` — `cargo run`/`cargo test` execute the built
+#     artifact THROUGH this program;
+#   * `target.<triple>.linker` — Cargo/rustc invoke it as the linker;
+#   * `credential-process` / `registry(ies).*.credential-provider` /
+#     `registry.global-credential-providers` — a helper Cargo hands the
+#     registry token to on `cargo publish`/`login` (the cargo analog of git's
+#     `credential.helper`).
+# Each is a plain `key = "value"` TOML line in a file normally read as routine
+# build-tuning config. Cargo also reads `.cargo/config(.toml)` from EVERY
+# ancestor directory of the cwd plus `$CARGO_HOME`, so a planted file need not
+# be inside the repo being built. Quoted-key spellings (`"runner" = ...`) are
+# valid TOML and tolerated.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# The lookbehind also admits a LITERAL backslash-n/r/t escape ahead of the key:
+# `printf '[build]\nrustc-wrapper=...' > .cargo/config.toml` reaches the guard
+# with the two characters `\n`, whose `n` would otherwise read as a word char.
+CARGO_EXEC_KEY_RE = re.compile(
+    r"(?:(?<![\w-])|(?<=\\[nrt]))[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|rustc_wrapper|runner"
+    r"|linker|credential-process|credential-provider|global-credential-providers)"
+    r"[\"']?\s*=",
+    re.IGNORECASE,
+)
+# `rustflags`/`RUSTFLAGS` stay legitimate in bulk (`-C target-cpu=native`), so
+# only the flag shapes that load or run foreign code are matched.
+CARGO_RUSTFLAGS_EXEC_RE = re.compile(
+    r"\brustflags\b[^\n]{0,500}?(?:link-arg|linker|codegen-backend|llvm-plugin|-Z\s*\w*plugin)",
+    re.IGNORECASE,
+)
+# Cargo env-var spellings of the same keys, plus the `--config` CLI override.
+CARGO_EXEC_ENV_RE = re.compile(
+    r"(?<![\w])(?:RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER"
+    r"|CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:RUNNER|LINKER)"
+    r"|CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER"
+    r"|CARGO_REGISTRY_CREDENTIAL_PROVIDER)\s*=",
+    re.IGNORECASE,
+)
+CARGO_CLI_CONFIG_RE = re.compile(
+    r"\bcargo\b[^|;&\n]{0,200}?--config(?:\s+|=)[\"']?\s*"
+    r"(?:build\.rustc-(?:workspace-)?wrapper|target\.[^\s=\"']{1,100}\.(?:runner|linker)"
+    r"|registr(?:y|ies)\.[^\s=\"']{0,100}credential|credential-process)",
+    re.IGNORECASE,
+)
+# `cd .cargo && echo ... > config.toml` two-step fallback.
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_BARE_CONFIG_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Build script: runs as arbitrary Rust at build time, on every `cargo
+# build`/`check`/`test` — including rust-analyzer's background check — before
+# any of the project's own code. A bare `build.rs` is edited for ordinary
+# reasons (codegen, `cargo:rerun-if-changed`), so content-gate on the shapes
+# that spawn a process or load native code. `Cargo.toml`'s `build = "<path>"`
+# key redirects WHICH file is the build script, with no `build.rs` write.
+CARGO_BUILD_RS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])build\.rs" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_BUILD_RS_EXEC_RE = re.compile(
+    r"\bCommand\s*::\s*new\b|\bprocess\s*::|\bstd\s*::\s*process\b|\blibc\s*::\s*(?:system|exec\w*|fork)\b"
+    r"|\bdlopen\b|\blibloading\b|\.\s*(?:spawn|exec)\s*\(",
+    re.IGNORECASE,
+)
+CARGO_MANIFEST_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])Cargo\.toml" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_MANIFEST_BUILD_KEY_RE = re.compile(
+    r"(?m)^\s*build\s*=\s*[\"'](?!build\.rs[\"'])",
+)
+
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the
