@@ -4620,6 +4620,11 @@ def _edit_text(a: dict) -> str:
 
 
 _CARGO_COMMENT_LINE_RE = re.compile(r"(?m)^[ \t]*(?:#|//).*$")
+# write verbs `_cargo_file_hit` callers' shared regexes don't know: scripting
+# interpreters opening the file, `git apply`/`patch`, .NET file APIs
+_CARGO_SCRIPT_WRITE_RE = re.compile(
+    r"\b(?:perl|python3?|ruby|node|php|patch)\b|\bgit\s+apply\b|WriteAll(?:Text|Bytes|Lines)"
+    r"|\.write\(|File\.open|fs\.write", re.IGNORECASE)
 _BENIGN_REDIRECT_RE = re.compile(r"\d*>>?\s*/dev/null|\d*>&\d+|&>>?\s*/dev/null")
 
 
@@ -4680,6 +4685,16 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     `AEGIS_ALLOW_CARGO_EXEC=1`; a spawned agent cannot). Config:
     `policy.cargo_exec` (`mode` deny|ask|monitor|off, `allow` regexes).
 
+    QA history: round 1 (false positives) -- `2>/dev/null`/`2>&1` no longer
+    count as writes, empty-value env unsets, comment lines, lld/mold link
+    args and `process::exit` are not flagged. Round 2 (bypass hunt) --
+    no-space redirects (`>>.cargo/config.toml`), `$CARGO_HOME`/`.../cargo/`
+    paths, multi-line `rustflags` arrays, perl/python-heredoc/`git apply`/
+    `[IO.File]` write verbs, `--config` in any spelling, old+new Edit key
+    splits, `rustc`/`rustdoc`/`browser` keys, and a quadratic `Cargo.toml`
+    `build =` regex (fixed with `[ \\t]`). cp/mv/ln into the config path is
+    gated on path alone (content is not in the command).
+
     Honest scope (denylist): a build script whose spawn is assembled
     indirectly (`include!` of a generated file, a proc-macro crate, a
     dependency's own `build.rs` in `vendor/` or `~/.cargo/registry`) is not
@@ -4704,7 +4719,13 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         if not p:
             return None
         content = _edit_text(ev.args or {})
-        if not content or not _cargo_file_hit(p, content):
+        a = ev.args or {}
+        joined = ""
+        if isinstance(a.get("old_string"), str) and isinstance(a.get("new_string"), str):
+            # a key split across old/new (`run` + `ner = ...`) only exists joined
+            joined = a["old_string"] + a["new_string"]
+        if not content or not (_cargo_file_hit(p, content)
+                               or (joined and _cargo_file_hit(p, joined))):
             return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)):
@@ -4724,7 +4745,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         hit = bool(patterns.CARGO_EXEC_ENV_RE.search(cmd)
                    or patterns.CARGO_RUSTFLAGS_ENV_RE.search(cmd)
-                   or patterns.CARGO_CLI_CONFIG_RE.search(cmd))
+                   or patterns.CARGO_CLI_CONFIG_RE.search(cmd)
+                   # `--config` in any spelling (inline table, `[build]`
+                   # header, cfg() with spaces, long flag runs first)
+                   or (re.search(r"\bcargo\b", cmd) and re.search(r"--config\b", cmd)
+                       and (patterns.CARGO_EXEC_KEY_RE.search(cmd)
+                            or patterns.CARGO_RUSTFLAGS_EXEC_RE.search(cmd))))
         if not hit:
             # `2>/dev/null` / `2>&1` are not writes to the Cargo file
             wcmd = _BENIGN_REDIRECT_RE.sub(" ", cmd)
@@ -4733,7 +4759,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                                or patterns.INPLACE_WRITE_RE.search(wcmd)
                                or patterns.FORCED_LINK_WRITE_RE.search(wcmd)
                                or patterns.COPY_WRITE_VERB_RE.search(wcmd))
-            hit = write_verb and _cargo_file_hit(wcmd, wcmd, cd_context=True)
+            script_write = bool(_CARGO_SCRIPT_WRITE_RE.search(wcmd))
+            hit = (write_verb or script_write) and _cargo_file_hit(wcmd, wcmd, cd_context=True)
             # cp/mv/ln of a file INTO .cargo/config(.toml): the content is not
             # in the command, so (like a tools-XML path-only gate) path alone
             if not hit and (patterns.COPY_WRITE_VERB_RE.search(wcmd)

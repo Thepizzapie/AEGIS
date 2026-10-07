@@ -314,3 +314,55 @@ def test_rustflags_env_linker():
 def test_cp_ln_into_config_path_gated():
     assert _hit(evaluate(_shell("cp /tmp/evil.toml .cargo/config.toml"), EMPTY))
     assert _hit(evaluate(_shell("ln -sf /tmp/evil .cargo/config.toml"), EMPTY))
+
+
+# ---- QA round 2 (bypass hunt) fixes ----
+def test_no_space_redirect():
+    for c in ("echo 'runner=\"sh\"'>>.cargo/config.toml", "echo 'runner=\"sh\"' >>.cargo/config.toml",
+              "echo 'runner=\"sh\"'>.cargo/config.toml"):
+        assert _hit(evaluate(_shell(c), EMPTY)), c
+
+
+def test_cargo_home_forms():
+    assert _hit(evaluate(_shell("echo 'runner=\"x\"' >> $CARGO_HOME/config.toml"), EMPTY))
+    assert _hit(evaluate(_shell("echo 'runner=1' >> ${CARGO_HOME}/config.toml"), EMPTY))
+    assert _hit(evaluate(_write("/usr/local/cargo/config.toml", 'runner = "x"'), EMPTY))
+    assert _hit(evaluate(_write("$CARGO_HOME/config.toml", 'runner = "x"'), EMPTY))
+
+
+def test_multiline_rustflags():
+    c = '[build]\nrustflags = [\n  "-Clink-arg=-fuse-ld=/tmp/x",\n]\n'
+    assert _hit(evaluate(_write(".cargo/config.toml", c), EMPTY))
+
+
+def test_manifest_regex_not_quadratic():
+    t = time.time()
+    evaluate(_write("Cargo.toml", "\n " * 30000), EMPTY)
+    assert time.time() - t < 3
+
+
+def test_script_write_verbs():
+    assert _hit(evaluate(_shell("perl -e 'open(F,\">.cargo/config.toml\");print F \"runner=1\"'"), EMPTY))
+    assert _hit(evaluate(_shell("python3 - <<'EOF'\nopen('.cargo/config.toml','w').write('rustc-wrapper=\"x\"')\nEOF"), EMPTY))
+    assert _hit(evaluate(_shell("[IO.File]::WriteAllText('.cargo/config.toml','runner=1')"), EMPTY))
+
+
+def test_extra_exec_keys_env():
+    assert _hit(evaluate(_write(".cargo/config.toml", '[doc]\nbrowser = "/tmp/x"'), EMPTY))
+    assert _hit(evaluate(_shell("RUSTDOC=/tmp/x cargo doc"), EMPTY))
+    assert _hit(evaluate(_shell("export CARGO_BUILD_RUSTC=/tmp/x"), EMPTY))
+
+
+def test_config_flag_spellings():
+    assert _hit(evaluate(_shell("cargo --config 'build={rustc-wrapper=\"x\"}' build"), EMPTY))
+    assert _hit(evaluate(_shell("cargo --config 'target={x={runner=\"sh\"}}' run"), EMPTY))
+    assert _hit(evaluate(_shell("cargo build " + "--features a " * 40 + "--config target.x.runner=y"), EMPTY))
+
+
+def test_edit_key_split_across_old_new():
+    assert _hit(evaluate(_edit(".cargo/config.toml", 'ner = "x"', old_string="[target.x]\nrun"), EMPTY))
+
+
+def test_cargo_new_regexes_no_false_hit_on_benign():
+    assert not _hit(evaluate(_shell("cargo build --config build.jobs=2"), EMPTY))
+    assert not _hit(evaluate(_write("Cargo.toml", '[package]\nname = "a"\n'), EMPTY))

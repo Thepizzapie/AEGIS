@@ -2723,8 +2723,15 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 # ancestor directory of the cwd plus `$CARGO_HOME`, so a planted file need not
 # be inside the repo being built. Quoted-key spellings (`"runner" = ...`) are
 # valid TOML and tolerated.
+# Preceding-boundary class also admits `<>(,:|&;` so a no-space redirect
+# (`echo x>>.cargo/config.toml`) is seen. `$CARGO_HOME/config.toml` and any
+# `.../cargo/config(.toml)` (the Docker rust image's CARGO_HOME is
+# /usr/local/cargo) are covered too.
+_CARGO_LB = r"(?:^|[\s'\"/\\=<>(,:|&;])"
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    _CARGO_LB + r"\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|CARGO_HOME\}?" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|[/\\]cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # The lookbehind also admits a LITERAL backslash-n/r/t escape ahead of the key:
@@ -2733,20 +2740,20 @@ CARGO_CONFIG_PATH_RE = re.compile(
 CARGO_EXEC_KEY_RE = re.compile(
     r"(?:(?<![\w-])|(?<=\\[nrt]))[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|rustc_wrapper|runner"
     r"|linker|rustc|rustdoc|credential-process|credential-provider|global-credential-providers"
-    r"|LD_PRELOAD)"
+    r"|LD_PRELOAD|browser)"
     r"[\"']?\s*=",
     re.IGNORECASE,
 )
 # `rustflags`/`RUSTFLAGS` stay legitimate in bulk (`-C target-cpu=native`), so
 # only the flag shapes that load or run foreign code are matched.
 CARGO_RUSTFLAGS_EXEC_RE = re.compile(
-    r"\brustflags\b[^\n]{0,500}?(?:link-arg(?!s?=-fuse-ld=(?:lld|mold|gold|bfd|lld-link)[\"'\s,\]])"
+    r"\brustflags\b[\s\S]{0,500}?(?:link-arg(?!s?=-fuse-ld=(?:lld|mold|gold|bfd|lld-link)[\"'\s,\]])"
     r"|linker|codegen-backend|llvm-plugin|-Z\s*\w*plugin)",
     re.IGNORECASE,
 )
 # Cargo env-var spellings of the same keys, plus the `--config` CLI override.
 CARGO_EXEC_ENV_RE = re.compile(
-    r"(?<![\w])(?:RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER"
+    r"(?<![\w])(?:RUSTC|RUSTDOC|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTDOC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER"
     r"|CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:RUNNER|LINKER)"
     r"|CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER"
     r"|CARGO_REGISTRY_CREDENTIAL_PROVIDER)\s*=(?![\s;&|]|$)",
@@ -2782,7 +2789,7 @@ CARGO_BARE_CONFIG_RE = re.compile(
 # that spawn a process or load native code. `Cargo.toml`'s `build = "<path>"`
 # key redirects WHICH file is the build script, with no `build.rs` write.
 CARGO_BUILD_RS_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])build\.rs" + _CI_END,
+    _CARGO_LB + r"build\.rs" + _CI_END,
     re.IGNORECASE,
 )
 CARGO_BUILD_RS_EXEC_RE = re.compile(
@@ -2791,11 +2798,12 @@ CARGO_BUILD_RS_EXEC_RE = re.compile(
     re.IGNORECASE,
 )
 CARGO_MANIFEST_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])Cargo\.toml" + _CI_END,
+    _CARGO_LB + r"Cargo\.toml" + _CI_END,
     re.IGNORECASE,
 )
 CARGO_MANIFEST_BUILD_KEY_RE = re.compile(
-    r"(?m)^\s*build\s*=\s*[\"'](?!(?:\./)?build\.rs[\"'])",
+    # `[ \t]` not `\s`: `\s*` spans newlines and went quadratic on newline runs
+    r"(?m)^[ \t]*(?:package\.)?build[ \t]*=[ \t]*[\"'](?!(?:\./)?build\.rs[\"'])",
 )
 
 
