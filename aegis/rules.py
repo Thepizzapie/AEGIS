@@ -6321,10 +6321,10 @@ def _claude_trust_switch_mcp_pair_hit(v, _depth: int = 0) -> bool:
     if _depth > 12:
         return False
     if isinstance(v, dict):
-        for kname in ("key", "name", "setting", "path"):
+        for kname in ("key", "name", "setting", "path", "jsonpath", "pointer"):
             kv = v.get(kname)
             if isinstance(kv, str):
-                name = kv.strip().lower().rsplit(".", 1)[-1]
+                name = re.split(r"[./]", kv.strip().lower().lstrip("$"))[-1]
                 if name in _CLAUDE_TRUST_SWITCH_KEY_NAMES and "value" in v \
                         and _claude_trust_switch_truthy(name, v["value"]):
                     return True
@@ -6355,7 +6355,10 @@ def rule_claude_trust_switch_protect(ev: Event, policy=None) -> Optional[Decisio
     default ask), ``allow`` (regex list on path/command). A human may append
     ``# aegis-allow`` (shell) or set ``AEGIS_ALLOW_CLAUDE_TRUST_SWITCH=1``.
 
-    Known limits: a value assembled indirectly, or a jq program whose key and
+    Known limits: an edit that flips an existing ``false``/``[]`` with the key
+    absent from the args (``old_string`` ``false`` -> ``true``), a path nested
+    below the top level of MCP args (shared ``_path()`` limit), and a value
+    assembled indirectly, or a jq program whose key and
     value are produced by a script, is only caught by the jq key-name check;
     a fetch-to-file write is closed by `rule_fetch_to_file_protect`."""
     cfg = getattr(policy, "claude_trust_switch", None) or {}

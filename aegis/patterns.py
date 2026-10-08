@@ -3409,8 +3409,8 @@ CLAUDE_TRUST_SWITCH_KEYS = (
     "disableAllHooks", "enableAllProjectMcpServers", "enabledMcpjsonServers",
 )
 CLAUDE_TRUST_SWITCH_KEY_RE = re.compile(
-    r"[\"'](?:disableAllHooks|enableAllProjectMcpServers)[\"']\s*:\s*(?:true|[\"']true[\"']|1)\b"
-    r"|[\"']enabledMcpjsonServers[\"']\s*:\s*\[\s*[\"']",
+    r"[\"'](?:disableAllHooks|enableAllProjectMcpServers)\\?[\"']\]?\s*[:=]\s*(?:true|\\?[\"']true\\?[\"']|1)\b"
+    r"|[\"']enabledMcpjsonServers\\?[\"']\]?\s*[:=]\s*\[\s*\\?[\"']",
     re.IGNORECASE,
 )
 _CLAUDE_TRUST_SWITCH_KEY_ALT = "|".join(CLAUDE_TRUST_SWITCH_KEYS)
@@ -3418,7 +3418,7 @@ _CLAUDE_TRUST_SWITCH_KEY_ALT = "|".join(CLAUDE_TRUST_SWITCH_KEYS)
 # of the key names within one `;`-delimited statement, unbounded (a fixed
 # window is itself the bypass; see CLAUDE_PERMISSION_BYPASS_JQ_RE's comment).
 CLAUDE_TRUST_SWITCH_JQ_RE = re.compile(
-    r"\b(?:(?:go)?jq|jaq)\b"
+    r"\b(?:(?:go)?jq|jaq|yq|mlr|dasel)\b"
     r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
     r"(?=[^;]*\b(?:" + _CLAUDE_TRUST_SWITCH_KEY_ALT + r")\b)",
     re.IGNORECASE,

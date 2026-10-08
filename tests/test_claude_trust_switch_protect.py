@@ -101,6 +101,23 @@ def test_shell_human_override():
     assert not _rule_hit(_shell("echo '{\"disableAllHooks\": true}' > .claude/settings.local.json # aegis-allow"))
 
 
+def test_mcp_patch_and_jsonpath_shapes():
+    for k in ("/disableAllHooks", "$.disableAllHooks", "disableAllHooks"):
+        assert _hit(_mcp({"path": PATH, "key": k, "value": True}))
+    assert _hit(_mcp({"path": PATH, "ops": [{"op": "add", "path": "/enableAllProjectMcpServers", "value": True}]}))
+    assert _hit(_mcp({"path": PATH, "jsonpath": "$.disableAllHooks", "value": True}))
+
+
+@pytest.mark.parametrize("cmd", [
+    "yq -i '.disableAllHooks = true' .claude/settings.local.json",
+    "yq -i -o=json '.enableAllProjectMcpServers = true' .claude/settings.local.json",
+    'echo "{\\"disableAllHooks\\": true}" > .claude/settings.local.json',
+    "python3 -c 'd[\"disableAllHooks\"]=True' > .claude/settings.local.json",
+])
+def test_shell_extra_forms(cmd):
+    assert _rule_hit(_shell(cmd)), cmd
+
+
 def test_mcp_shapes():
     assert _hit(_mcp({"path": PATH, "content": {"disableAllHooks": True}}))
     assert _hit(_mcp({"path": PATH, "key": "disableAllHooks", "value": True}))
