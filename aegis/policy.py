@@ -352,6 +352,13 @@ class Policy:
     # session, its output sent as the API auth header) with no tool-call
     # trigger at all. See rules.rule_claude_cred_helper_protect.
     claude_cred_helper: dict = field(default_factory=dict)
+    # Claude Code trust-switch protection: {mode: deny|ask|monitor|off, allow:
+    # [regex on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # `disableAllHooks: true` (turns off every hook, Aegis's included),
+    # `enableAllProjectMcpServers: true` and a non-empty `enabledMcpjsonServers`
+    # (pre-approve project .mcp.json servers) in .claude/settings.local.json.
+    # See rules.rule_claude_trust_switch_protect.
+    claude_trust_switch: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a

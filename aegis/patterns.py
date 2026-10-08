@@ -3390,6 +3390,40 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code trust-switch protection (.claude/settings.local.json) -------
+# A FIFTH surface in the file `CLAUDE_LOCAL_SETTINGS_PATH_RE` locates, and the
+# one that matters most to Aegis itself: three boolean/list "trust switches"
+# that don't plant a command, they REMOVE a checkpoint.
+#   - disableAllHooks: true -- Claude Code stops running EVERY hook, Aegis's
+#     own PreToolUse hook included. One line silently turns the whole policy
+#     layer off for the project; every other guard becomes moot.
+#   - enableAllProjectMcpServers: true -- auto-approves every server in the
+#     project's `.mcp.json`, skipping the per-server consent prompt that
+#     otherwise stands between a planted MCP server and its first launch.
+#   - enabledMcpjsonServers: [...] -- the same pre-approval, server by server.
+# Value-sensitive: `false` / `[]` are the safe direction and stay allowed.
+# Key and truthy value are matched together on a normalized copy (whitespace
+# collapsed, `\\uXXXX` decoded), with an optional `permissions.`-style dotted
+# prefix tolerated the way `PERMISSION_BYPASS_MODE_KEY_RE` does.
+CLAUDE_TRUST_SWITCH_KEYS = (
+    "disableAllHooks", "enableAllProjectMcpServers", "enabledMcpjsonServers",
+)
+CLAUDE_TRUST_SWITCH_KEY_RE = re.compile(
+    r"[\"'](?:disableAllHooks|enableAllProjectMcpServers)[\"']\s*:\s*(?:true|[\"']true[\"']|1)\b"
+    r"|[\"']enabledMcpjsonServers[\"']\s*:\s*\[\s*[\"']",
+    re.IGNORECASE,
+)
+_CLAUDE_TRUST_SWITCH_KEY_ALT = "|".join(CLAUDE_TRUST_SWITCH_KEYS)
+# Scripted jq edit (no `-i` flag): jq, an assignment-shaped operator and one
+# of the key names within one `;`-delimited statement, unbounded (a fixed
+# window is itself the bypass; see CLAUDE_PERMISSION_BYPASS_JQ_RE's comment).
+CLAUDE_TRUST_SWITCH_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\b(?:" + _CLAUDE_TRUST_SWITCH_KEY_ALT + r")\b)",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

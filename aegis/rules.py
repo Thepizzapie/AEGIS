@@ -6283,6 +6283,152 @@ def rule_claude_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     return None
 
 
+_CLAUDE_TRUST_SWITCH_KEY_NAMES = {k.lower() for k in patterns.CLAUDE_TRUST_SWITCH_KEYS}
+
+
+def _claude_trust_switch_truthy(key: str, val) -> bool:
+    """Is ``val`` the dangerous direction for trust-switch ``key``? Booleans
+    must be truthy (``true``/"true"/1); the server list must be non-empty."""
+    if key == "enabledmcpjsonservers":
+        return isinstance(val, (list, tuple)) and any(val)
+    if isinstance(val, str):
+        return val.strip().lower() == "true"
+    return val is True or (isinstance(val, int) and not isinstance(val, bool) and val == 1)
+
+
+def _claude_trust_switch_struct_hit(v, _depth: int = 0) -> bool:
+    """Walk parsed JSON / raw MCP args for a trust-switch DICT KEY set to its
+    dangerous value. Depth cap 12, like the sibling walkers."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str):
+                name = k.strip().lower().rsplit(".", 1)[-1]
+                if name in _CLAUDE_TRUST_SWITCH_KEY_NAMES and _claude_trust_switch_truthy(name, val):
+                    return True
+            if _claude_trust_switch_struct_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_trust_switch_struct_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_trust_switch_mcp_pair_hit(v, _depth: int = 0) -> bool:
+    """MCP "set config value" shape: ``{"key": "disableAllHooks", "value":
+    true}``. Key names the switch and a sibling ``value`` is dangerous."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for kname in ("key", "name", "setting", "path"):
+            kv = v.get(kname)
+            if isinstance(kv, str):
+                name = kv.strip().lower().rsplit(".", 1)[-1]
+                if name in _CLAUDE_TRUST_SWITCH_KEY_NAMES and "value" in v \
+                        and _claude_trust_switch_truthy(name, v["value"]):
+                    return True
+        return any(_claude_trust_switch_mcp_pair_hit(x, _depth + 1) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return any(_claude_trust_switch_mcp_pair_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _claude_trust_switch_json_hit(content: str) -> bool:
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _claude_trust_switch_struct_hit(obj)
+
+
+def rule_claude_trust_switch_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block setting a Claude Code trust switch in ``.claude/settings.local.json``:
+    ``disableAllHooks: true`` (silences every hook -- Aegis's own PreToolUse
+    hook included), ``enableAllProjectMcpServers: true`` or a non-empty
+    ``enabledMcpjsonServers`` (pre-approves project ``.mcp.json`` servers,
+    skipping the per-server consent prompt). Unlike the sibling settings
+    guards these don't plant a command, they remove a checkpoint. Value-
+    sensitive: ``false``/``[]`` stay allowed.
+
+    Config (``policy.claude_trust_switch``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regex list on path/command). A human may append
+    ``# aegis-allow`` (shell) or set ``AEGIS_ALLOW_CLAUDE_TRUST_SWITCH=1``.
+
+    Known limits: a value assembled indirectly, or a jq program whose key and
+    value are produced by a script, is only caught by the jq key-name check;
+    a fetch-to-file write is closed by `rule_fetch_to_file_protect`."""
+    cfg = getattr(policy, "claude_trust_switch", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-trust-switch-protect-monitor")
+            return None
+        return would
+
+    why = ("a Claude Code trust switch (disableAllHooks / "
+           "enableAllProjectMcpServers / enabledMcpjsonServers) is being "
+           "enabled in .claude/settings.local.json -- it removes a "
+           "checkpoint (disableAllHooks silences every hook, Aegis's "
+           "included; the MCP keys skip the per-server consent prompt) "
+           "rather than planting one command, and (gitignored by default) "
+           "with no diff or code review. ")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.CLAUDE_TRUST_SWITCH_KEY_RE.search(_claude_cred_helper_normalize(content))
+                   or _claude_trust_switch_json_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = bool(_claude_trust_switch_struct_hit(a) or _claude_trust_switch_mcp_pair_hit(a))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_TRUST_SWITCH")
+                or _claude_cred_helper_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-trust-switch-protect",
+                         f"'{p}': " + why + "Review the change, then confirm "
+                         "with AEGIS_ALLOW_CLAUDE_TRUST_SWITCH=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        normalized_cmd = _claude_cred_helper_normalize(cmd)
+        jq_hit = bool(patterns.CLAUDE_TRUST_SWITCH_JQ_RE.search(normalized_cmd))
+        write_hit = bool(write_verb and patterns.CLAUDE_TRUST_SWITCH_KEY_RE.search(normalized_cmd))
+        if not (jq_hit or write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_TRUST_SWITCH")
+                or _claude_cred_helper_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-trust-switch-protect",
+                         why.capitalize() + "A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_CLAUDE_TRUST_SWITCH=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -8514,6 +8660,7 @@ _CORE_RULES = (
     rule_permission_bypass_protect,
     rule_claude_env_protect,
     rule_claude_cred_helper_protect,
+    rule_claude_trust_switch_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
