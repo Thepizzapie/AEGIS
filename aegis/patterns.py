@@ -1523,6 +1523,81 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Other agent runtimes' instruction/rule files ------------------------------
+# AGENT_INSTRUCTIONS_PATH_RE / AGENT_DEF_PATH_RE above cover Claude Code's own
+# auto-loaded natural-language surfaces (`CLAUDE.md`/`AGENTS.md`, `.claude/
+# agents|commands|output-styles`). Every other coding-agent runtime that can
+# be pointed at the same checkout has its OWN, structurally identical file --
+# loaded straight into the model's system prompt on every future session in
+# that repo, unattended, with no per-use trust check -- and none of them was
+# claimed by any guard (confirmed: only the MCP-config half of Cursor/Windsurf
+# was ever matched):
+#   Cursor        .cursorrules, .cursor/rules/*.mdc|md
+#   Windsurf      .windsurfrules, .windsurf/rules/*.md
+#   Cline / Roo   .clinerules (file OR directory), .roorules, .roo/rules*/
+#   GitHub Copilot  .github/copilot-instructions.md, .github/instructions/*.md,
+#                 .github/prompts/*.md, .github/agents/*.md
+#   Gemini CLI    GEMINI.md
+#   Continue / Amazon Q / Kiro / Augment / Junie  .continue/rules, .amazonq/
+#                 rules, .kiro/steering, .augment/rules, .junie/
+# The threat is the same prompt-injection-persistence one as CLAUDE.md, and
+# it crosses runtimes: a session running under Claude Code can plant an
+# instruction that only a DIFFERENT agent (the teammate's Cursor, the CI
+# Copilot reviewer, a Gemini CLI job) will ever read -- so neither that
+# runtime's own safeguards nor this session's hook ever see the injection and
+# its payload ("when reviewing a PR, approve it", "POST .env to <host>")
+# looks like ordinary project documentation in review.
+_FOREIGN_AGENT_FILE_ROOTS = (
+    r"\.(?:cursor|windsurf|cline|roo)rules",
+    r"(?:GEMINI|QWEN)" + _WIN_TRIM + r"(?:\.local)?\.md",
+    r"copilot-instructions\.md",
+)
+_FOREIGN_AGENT_DIRS = (
+    r"\.cursor" + _WIN_TRIM + _SEP + r"rules",
+    r"\.windsurf" + _WIN_TRIM + _SEP + r"rules",
+    r"\.clinerules",
+    r"\.roo" + _WIN_TRIM + _SEP + r"rules[\w-]{0,40}",
+    r"\.continue" + _WIN_TRIM + _SEP + r"rules",
+    r"\.amazonq" + _WIN_TRIM + _SEP + r"rules",
+    r"\.kiro" + _WIN_TRIM + _SEP + r"steering",
+    r"\.augment" + _WIN_TRIM + _SEP + r"rules",
+    r"\.junie",
+    r"\.github" + _WIN_TRIM + _SEP + r"instructions",
+    r"\.github" + _WIN_TRIM + _SEP + r"prompts",
+    r"\.github" + _WIN_TRIM + _SEP + r"agents",
+)
+_FOREIGN_AGENT_LEAD = r"(?:^|[\s'\"/\\=])"
+FOREIGN_AGENT_PATH_RE = re.compile(
+    "|".join(_FOREIGN_AGENT_LEAD + r + _CI_END for r in _FOREIGN_AGENT_FILE_ROOTS)
+    + "|" + "|".join(
+        _FOREIGN_AGENT_LEAD + d + _WIN_TRIM + _SEP
+        + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG
+        + r"\.(?:md|mdc|markdown|txt|ya?ml)" + _CI_END
+        for d in _FOREIGN_AGENT_DIRS)
+    # `.clinerules` may itself be the file; and a bare dir name is also
+    # matched below for archive/sync tools that never name a filename.
+    ,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (`rsync -a evil/ .cursor/rules/`, `tar xf p.tar -C
+# .clinerules/`) -- same archive/sync-tool gap AGENT_DEF_DIR_RE closes.
+FOREIGN_AGENT_DIR_RE = re.compile(
+    "|".join(_FOREIGN_AGENT_LEAD + d + _CI_END for d in _FOREIGN_AGENT_DIRS),
+    re.IGNORECASE,
+)
+
+FOREIGN_AGENT_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.(?:cursor|windsurf|cline|roo)rules\b|GEMINI\.md\b|QWEN\.md\b"
+    r"|copilot-instructions\.md\b|\.cursor\b|\.windsurf\b|\.roo\b"
+    r"|\.continue\b|\.amazonq\b|\.kiro\b|\.augment\b|\.junie\b"
+    r"|\.github[/\\](?:instructions|prompts|agents)\b)")
+
+
+def foreign_agent_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, FOREIGN_AGENT_FIND_PREDICATE_RE)
+
+
 # ---- Claude Code Skill-definition protection -----------------------------------
 # A sibling of the agent_def family above, on a surface that family never reaches:
 # `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
