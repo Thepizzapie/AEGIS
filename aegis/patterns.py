@@ -1548,7 +1548,9 @@ def agent_def_find_hit(cmd: str) -> bool:
 # its payload ("when reviewing a PR, approve it", "POST .env to <host>")
 # looks like ordinary project documentation in review.
 _FOREIGN_AGENT_FILE_ROOTS = (
-    r"\.(?:cursor|windsurf|cline|roo)rules",
+    r"\.(?:cursor|windsurf|cline|roo)rules(?:-[\w.-]{1,60})?",
+    r"\.goosehints",
+    r"global_rules\.md",
     r"(?:GEMINI|QWEN)" + _WIN_TRIM + r"(?:\.local)?\.md",
     r"copilot-instructions\.md",
 )
@@ -1565,8 +1567,13 @@ _FOREIGN_AGENT_DIRS = (
     r"\.github" + _WIN_TRIM + _SEP + r"instructions",
     r"\.github" + _WIN_TRIM + _SEP + r"prompts",
     r"\.github" + _WIN_TRIM + _SEP + r"agents",
+    r"\.github" + _WIN_TRIM + _SEP + r"chatmodes",
+    r"\.cursor" + _WIN_TRIM + _SEP + r"commands",
+    r"\.codeium" + _WIN_TRIM + _SEP + r"windsurf" + _WIN_TRIM + _SEP + r"memories",
 )
-_FOREIGN_AGENT_LEAD = r"(?:^|[\s'\"/\\=])"
+# `<`, `>`, `|` too: a redirect with no space before the target
+# (`echo x >.cursorrules`, `>|`, `&>`) is ordinary shell, not an evasion.
+_FOREIGN_AGENT_LEAD = r"(?:^|[\s'\"/\\=<>|])"
 FOREIGN_AGENT_PATH_RE = re.compile(
     "|".join(_FOREIGN_AGENT_LEAD + r + _CI_END for r in _FOREIGN_AGENT_FILE_ROOTS)
     + "|" + "|".join(
@@ -1592,6 +1599,13 @@ FOREIGN_AGENT_FIND_PREDICATE_RE = _find_predicate_re(
     r"|copilot-instructions\.md\b|\.cursor\b|\.windsurf\b|\.roo\b"
     r"|\.continue\b|\.amazonq\b|\.kiro\b|\.augment\b|\.junie\b"
     r"|\.github[/\\](?:instructions|prompts|agents)\b)")
+
+# Write verbs AGENT_DEF's verb set never learned (QA, agent-rules round 1):
+# each places or rewrites a file with a named target.
+FOREIGN_AGENT_EXTRA_VERB_RE = re.compile(
+    r"\binstall\b|\bpatch\b|\bsponge\b|\btouch\b|\bgit\s+(?:checkout|restore)\b",
+    re.IGNORECASE,
+)
 
 
 def foreign_agent_find_hit(cmd: str) -> bool:

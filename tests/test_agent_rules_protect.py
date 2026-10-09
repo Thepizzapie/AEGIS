@@ -83,6 +83,14 @@ def test_unrelated_paths_not_gated(path):
     "find . -name GEMINI.md -delete",
     "find . -path '*.cursor/rules*' -exec rm {} +",
     "ln -sf /tmp/evil .cursorrules",
+    "echo x >.cursorrules", "echo x>.cursorrules", "echo x 1>.cursorrules",
+    "echo x &>.cursorrules", "echo x>|.cursorrules", "(echo x)>.cursorrules",
+    "install -m644 evil .cursorrules", "git checkout evil -- .cursorrules",
+    "git restore --source=evil GEMINI.md", "patch .cursorrules p.diff",
+    "echo x | sponge .cursorrules", "touch .clinerules-bugfix",
+    "echo x > .goosehints", "echo x > .cursor/commands/a.md",
+    "echo x > .github/chatmodes/a.chatmode.md",
+    "echo x > ~/.codeium/windsurf/memories/global_rules.md",
 ])
 def test_shell_writes_gated(cmd):
     d = _direct(_shell(cmd))
@@ -91,7 +99,7 @@ def test_shell_writes_gated(cmd):
 
 @pytest.mark.parametrize("cmd", [
     "cat .cursorrules", "grep -r foo .cursor/rules/", "ls .clinerules",
-    "wc -l GEMINI.md", "git diff .github/copilot-instructions.md",
+    "wc -l GEMINI.md", "git log -- .cursorrules", "git status GEMINI.md", "git diff .github/copilot-instructions.md",
     "echo hi > notes.txt", "rm src/rules.md",
 ])
 def test_shell_reads_not_gated(cmd):

@@ -1200,7 +1200,10 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     Edit/Write/MCP form.
 
     Honest scope: a path-string denylist like its siblings. Known residual
-    gaps: a runtime's instruction file outside the recognized set; nesting
+    gaps: a runtime's instruction file outside the recognized set (e.g. Aider's
+    ``CONVENTIONS.md``, Zed's ``.rules``, too generic to match by name);
+    ``cd <parent> && write <relative>``; MCP argument keys outside ``_path()``;
+    the shared ``# aegis-allow`` override matching anywhere in the command; nesting
     past 4 levels under a rules directory evading the filename form (the
     bare-directory backstop still catches archive/sync tools); an MCP
     filesystem tool naming its target outside ``_path()``'s recognized keys;
@@ -1243,7 +1246,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
             or patterns.INPLACE_WRITE_RE.search(cmd)
             or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+            or patterns.FOREIGN_AGENT_EXTRA_VERB_RE.search(cmd))
         if not touches_target:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_RULES")
