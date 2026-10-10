@@ -48,6 +48,7 @@ _REMEDIES = """\
 | jetbrains-watcher-protect | wrote a JetBrains File Watcher task (.idea/watcherTasks.xml `program` option — runs automatically on the next matching file save in any JetBrains IDE, no Run/build/git/CI trigger needed) | ask the human; they can set AEGIS_ALLOW_JETBRAINS_WATCHER_EXEC=1 after review |
 | jetbrains-run-config-protect | wired a run configuration to a "Before launch: run External Tool" step (.idea/runConfigurations/*.xml `ToolBeforeRunTask`) or defined/redefined that tool's own command (.idea/tools/*.xml `COMMAND` option) — runs automatically on the next Run/Debug of that configuration in any JetBrains IDE | ask the human; they can set AEGIS_ALLOW_JETBRAINS_RUN_CONFIG=1 after review |
 | path-hijack-protect | planted/symlinked/chmod +x'd an executable over a trusted command name in a $PATH bin directory (shadows the next bare invocation of that command, by anyone) | ask the human; they can set AEGIS_ALLOW_PATH_HIJACK=1 after review |
+| agent-rules-protect | wrote another coding agent's instruction/rule/prompt file (.cursorrules, .cursor/rules/*, .github/copilot-instructions.md, GEMINI.md, ...) auto-loaded into a future session | ask the human; they can set AEGIS_ALLOW_AGENT_RULES=1 after review |
 | claude-hooks-protect | planted a `hooks` entry in .claude/settings.local.json (runs as Claude Code's own subprocess on the next matching tool call, outside the tool-call loop Aegis evaluates) | ask the human; they can set AEGIS_ALLOW_CLAUDE_HOOKS=1 after review |
 | statusline-protect | planted a `statusLine` entry enabled for `type: "command"` in .claude/settings.local.json (Claude Code spawns it directly on essentially every turn, no tool-call trigger needed at all) | ask the human; they can set AEGIS_ALLOW_STATUSLINE=1 after review |
 | permission-bypass-protect | planted `permissions.defaultMode: "bypassPermissions"` in .claude/settings.local.json, or launched `claude --dangerously-skip-permissions`/`--permission-mode bypassPermissions` (silences Claude Code's own confirmation prompt for every future tool call, not one planted command) | ask the human; they can set AEGIS_ALLOW_PERMISSION_BYPASS=1 after review |
@@ -118,7 +119,7 @@ description: Show the active Aegis enforcement posture — policy validity, defa
 2. Read the policy YAML files it names (they are small) and summarize:
    `default_action`, `on_error`, workspace root, egress posture, and which
    opt-in knobs are on (`install_review`, `mcp_config`, `ci_workflow`,
-   `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
+   `git_hooks`, `hook_manager`, `agent_def`, `agent_rules`, `skills_protect`, `shell_persist`, `direnv`, `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`, `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `path_hijack`, `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`, `inject`, `failures`, `completion`,
    `team`, `compaction`, `permission`, `mcp`).
 3. `aegis adapters` — which runtimes are wired.
 4. Report the posture in a short table. Do NOT edit any of these files — use
@@ -162,7 +163,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
    - declarative rule: `rules: [{{name, action: allow|deny|ask, tools/actions/
      events/argument_patterns/regex, message, priority}}]`
    - knobs: `default_action`, `egress`, `workspace`, `install_review`,
-     `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
+     `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `agent_rules`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `path_hijack`,
      `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`,

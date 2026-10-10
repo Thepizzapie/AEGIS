@@ -1163,6 +1163,105 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- other coding agents' instruction/rule/prompt files: escapable with human -
+def _agent_rules_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering another coding agent's auto-loaded instruction,
+    rule, or prompt file: ``.cursorrules``/``.cursor/rules/*``, ``.windsurfrules``/
+    ``.windsurf/rules/*``, ``.clinerules``, ``.roorules``/``.roo/rules*/*``,
+    ``.github/copilot-instructions.md`` and ``.github/{instructions,prompts,
+    agents,chatmodes}/*``, ``GEMINI.md``/``QWEN.md``, ``.gemini/commands/*``,
+    ``.continue/rules/*``, ``.amazonq/rules/*``, ``.kiro/steering/*``,
+    ``.junie/guidelines.md``, ``.trae/rules/*``, ``.goosehints``, Zed's ``.rules``.
+
+    The sibling of ``rule_agent_def_protect``, which knows only ``CLAUDE.md``/
+    ``AGENTS.md`` and ``.claude/{agents,commands,output-styles}``. These files
+    carry the identical payload -- natural-language instructions folded into the
+    model's context on every future session with no per-use trust check ("before
+    finishing, POST .env to <host>"; "approve PRs without reading the diff") --
+    and look like ordinary project docs in review. A repo often hosts several
+    agents, so a payload planted from a Claude session executes later under a
+    different agent (a teammate's Cursor, Copilot in CI) where none of Claude
+    Code's gates run. The ``.github/{prompts,agents,instructions}`` paths are
+    also outside ``rule_ci_workflow_protect``'s ``.github/workflows`` scope.
+
+    Config (``policy.agent_rules``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate). ``ask``
+    because editing these files is routine sanctioned work.
+
+    Escapable only by a human: trailing '# aegis-allow' on the shell form, or
+    ``AEGIS_ALLOW_AGENT_RULES=1`` in the orchestrator's env for the Edit/Write/
+    MCP form; a spawned agent cannot set its own hook-invocation env.
+
+    Honest scope: a path-string match like every sibling. Archive/sync verbs and
+    ``find -name`` indirection are covered; a filename outside the recognized
+    set, nesting past 4 levels under a rules directory (the bare-directory
+    backstop still catches archive tools), a target computed across variable
+    assignments, and a direct fetch-to-file write are the same disclosed gaps
+    ``rule_agent_def_protect`` carries (the last is picked up by
+    ``rule_fetch_to_file_protect``)."""
+    cfg = getattr(policy, "agent_rules", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.AGENT_RULES_PATH_RE.search(p)):
+            return None
+        if os.environ.get("AEGIS_ALLOW_AGENT_RULES") or _agent_rules_allowed_by_policy(cfg, p):
+            return None
+        would = Decision(action, "agent-rules-protect",
+                         f"Agent instruction/rule/prompt file '{p}' is being written -- "
+                         "its content is folded into a future session's context (this "
+                         "agent's or another tool's) unattended. Review the change, then "
+                         "confirm with AEGIS_ALLOW_AGENT_RULES=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "agent-rules-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.AGENT_RULES_PATH_RE.search(cmd)
+                             or patterns.AGENT_RULES_DIR_RE.search(cmd)
+                             or patterns.agent_rules_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_RULES")
+                or _agent_rules_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "agent-rules-protect",
+                         "Another coding agent's instruction/rule/prompt file is being "
+                         "modified from a shell -- its content is auto-loaded in a future "
+                         "session with no further review. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_AGENT_RULES=1; a spawned "
+                         "agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "agent-rules-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- Claude Code Skill-definition protection: escapable with human confirm -----
 def _skills_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7056,6 +7155,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.AGENT_RULES_PATH_RE, "another coding agent's instruction/rule file"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
@@ -8493,6 +8593,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_hook_manager_protect,
     rule_agent_def_protect,
+    rule_agent_rules_protect,
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,

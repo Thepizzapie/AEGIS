@@ -1523,6 +1523,61 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Other coding agents' instruction / rule / prompt files -------------------
+# A sibling of the agent_def family above, on the surface that family never reaches:
+# every OTHER coding agent's auto-loaded instruction file. `AGENT_INSTRUCTIONS_PATH_RE`
+# knows only `CLAUDE.md`/`AGENTS.md`; the files below carry the identical payload
+# (natural-language instructions folded into the model's own context on every
+# future session, no per-use trust check, reads as ordinary project documentation
+# in a diff) for Cursor (`.cursorrules`, `.cursor/rules/*.mdc`), Windsurf, Cline,
+# Roo, GitHub Copilot (`.github/copilot-instructions.md`, `.github/instructions/`,
+# `.github/prompts/`, `.github/agents/`), Gemini CLI (`GEMINI.md`, `.gemini/commands/`),
+# Qwen Code, Continue, Amazon Q, Kiro steering, JetBrains Junie, Trae, and Zed
+# (`.rules`). A repo routinely hosts several agents, and a payload planted for one
+# is picked up whenever a teammate (or CI) runs it — Claude Code's own gates never
+# see that session. `.github/prompts|agents|instructions` also never match
+# CI_WORKFLOW_PATH_RE, which is scoped to `.github/workflows`.
+_RULES_ROOT = r"(?:^|[\s'\"/\\=])"
+_RULES_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+_RULES_DIRS = (
+    r"\.cursor" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.clinerules"
+    r"|\.roo" + _WIN_TRIM + _SEP + r"rules(?:-[A-Za-z0-9_-]{1,40})?"
+    r"|\.continue" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.kiro" + _WIN_TRIM + _SEP + r"steering"
+    r"|\.trae" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.gemini" + _WIN_TRIM + _SEP + r"commands"
+    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents|chatmodes)"
+)
+AGENT_RULES_PATH_RE = re.compile(
+    # single well-known files (any directory depth: nested copies are auto-loaded too)
+    _RULES_ROOT + r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|\.goosehints|\.rules"
+    r"|(?:GEMINI|QWEN)(?:\.local)?\.md"
+    r"|copilot-instructions\.md"
+    r"|\.junie" + _WIN_TRIM + _SEP + r"guidelines\.md)" + _CI_END
+    # files under an agent's rules/commands/prompts directory
+    + r"|" + _RULES_ROOT + r"(?:" + _RULES_DIRS + r")" + _WIN_TRIM + _SEP
+    + r"(?:" + _RULES_SEG + r"){0,4}" + _CI_SEG + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (archive/sync tool placing a file with no filename ever
+# named), same gap AGENT_DEF_DIR_RE closes for `.claude/agents` etc.
+AGENT_RULES_DIR_RE = re.compile(
+    _RULES_ROOT + r"(?:" + _RULES_DIRS + r")" + _CI_END, re.IGNORECASE)
+
+AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules\b|\.windsurfrules\b|\.clinerules\b|\.roorules\b|GEMINI\.md\b|QWEN\.md\b"
+    r"|copilot-instructions\b|\.cursor\b|\.windsurf\b|\.roo\b|\.continue\b|\.amazonq\b"
+    r"|\.kiro\b|\.trae\b|\.gemini\b|\.junie\b|\.github\b)")
+
+
+def agent_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, AGENT_RULES_FIND_PREDICATE_RE)
+
+
 # ---- Claude Code Skill-definition protection -----------------------------------
 # A sibling of the agent_def family above, on a surface that family never reaches:
 # `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
