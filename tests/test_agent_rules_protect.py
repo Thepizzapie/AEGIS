@@ -30,6 +30,9 @@ PATHS = [
     ".continue/rules/a.md", ".amazonq/rules/a.md", ".kiro/steering/product.md",
     ".junie/guidelines.md", ".trae/rules/a.md", ".goosehints", ".rules",
     "/home/u/.gemini/commands/x.toml", ".CursorRules", ".GitHub/Copilot-Instructions.md",
+    ".windsurf/workflows/a.md", ".cursor/commands/a.md", ".augment/rules/a.md", ".augment-guidelines",
+    ".kilocode/rules/a.md", ".roomodes", ".opencode/agent/a.md", ".github/skills/x/SKILL.md",
+    "AGENT.md", ".aiderrules",
     ".cursor\\rules\\a.mdc", ".cursor/rules./a.mdc", ".cursorrules ",
 ]
 BENIGN = [

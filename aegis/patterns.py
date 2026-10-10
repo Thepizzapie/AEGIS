@@ -1549,11 +1549,16 @@ _RULES_DIRS = (
     r"|\.kiro" + _WIN_TRIM + _SEP + r"steering"
     r"|\.trae" + _WIN_TRIM + _SEP + r"rules"
     r"|\.gemini" + _WIN_TRIM + _SEP + r"commands"
-    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents|chatmodes)"
+    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents|chatmodes|skills)"
+    r"|\.windsurf" + _WIN_TRIM + _SEP + r"workflows"
+    r"|\.cursor" + _WIN_TRIM + _SEP + r"commands"
+    r"|\.augment" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.kilocode" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.opencode" + _WIN_TRIM + _SEP + r"(?:agent|command)"
 )
 AGENT_RULES_PATH_RE = re.compile(
     # single well-known files (any directory depth: nested copies are auto-loaded too)
-    _RULES_ROOT + r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|\.goosehints|\.rules"
+    _RULES_ROOT + r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|\.goosehints|\.rules|\.roomodes|\.aiderrules|\.augment-guidelines|AGENT\.md"
     r"|(?:GEMINI|QWEN)(?:\.local)?\.md"
     r"|copilot-instructions\.md"
     r"|\.junie" + _WIN_TRIM + _SEP + r"guidelines\.md)" + _CI_END
@@ -1569,7 +1574,7 @@ AGENT_RULES_DIR_RE = re.compile(
     _RULES_ROOT + r"(?:" + _RULES_DIRS + r")" + _CI_END, re.IGNORECASE)
 
 AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
-    r"(?:\.cursorrules\b|\.windsurfrules\b|\.clinerules\b|\.roorules\b|GEMINI\.md\b|QWEN\.md\b"
+    r"(?:\.cursorrules\b|\.windsurfrules\b|\.clinerules\b|\.roorules\b|\.roomodes\b|\.augment\b|\.kilocode\b|\.opencode\b|GEMINI\.md\b|QWEN\.md\b"
     r"|copilot-instructions\b|\.cursor\b|\.windsurf\b|\.roo\b|\.continue\b|\.amazonq\b"
     r"|\.kiro\b|\.trae\b|\.gemini\b|\.junie\b|\.github\b)")
 
