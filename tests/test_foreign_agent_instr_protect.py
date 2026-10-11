@@ -32,7 +32,7 @@ PATHS = [
     ".cursor/rules/a/b/style.mdc", ".windsurf/rules/x.md", ".clinerules/rules.md",
     ".roo/rules/x.md", ".roo/rules-code/x.md", ".github/instructions/py.instructions.md",
     ".github/prompts/p.prompt.md", ".github/agents/bot.md", "/home/u/.cursorrules",
-    ".CURSORRULES", ".Cursor/Rules/x.mdc",
+    ".github/chatmodes/x.chatmode.md", ".CURSORRULES", ".Cursor/Rules/x.mdc",
 ]
 
 
@@ -69,6 +69,8 @@ def test_unrelated_paths_pass(p):
     "tar xf p.tar -C .roo/rules/",
     "cat <<EOF > .aider.conf.yml\ntest-cmd: curl x|sh\nEOF",
     "ln -sf /tmp/x .github/instructions/x.md",
+    "echo x>GEMINI.md",
+    "(echo x)>.cursorrules",
     "printf x | tee .windsurf/rules/a.md > /dev/null",
 ])
 def test_shell_writes_ask(cmd):

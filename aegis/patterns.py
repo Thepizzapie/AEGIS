@@ -1438,7 +1438,7 @@ AGENT_INSTRUCTIONS_PATH_RE = re.compile(
 # `.aider.conf.yml`, whose `test-cmd`/`lint-cmd` run shell commands. A repo that
 # is opened by a teammate's Cursor/Copilot/Gemini session carries a planted
 # instruction into that session with no Aegis hook in the loop at all.
-_FA_ROOT = r"(?:^|[\s'\"/\\=])"
+_FA_ROOT = r"(?:^|[\s'\"/\\=<>])"
 _FA_FILES = (
     r"\.cursorrules|\.windsurfrules|\.clinerules|\.roorules(?:-[\w.\-]{1,40})?"
     r"|GEMINI(?:\.local)?\.md|\.aider\.conf\.ya?ml"
@@ -1447,7 +1447,7 @@ _FA_DIRS = (
     r"\.cursor" + _WIN_TRIM + _SEP + r"rules"
     r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules"
     r"|\.roo" + _WIN_TRIM + _SEP + r"rules(?:-[\w.\-]{1,40})?"
-    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents)"
+    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents|chatmodes)"
 )
 FOREIGN_AGENT_INSTR_PATH_RE = re.compile(
     _FA_ROOT + r"(?:" + _FA_FILES + r")" + _CI_END
