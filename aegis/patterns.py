@@ -1428,6 +1428,40 @@ AGENT_INSTRUCTIONS_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Other agent runtimes' project-instruction surfaces — the CLAUDE.md/AGENTS.md
+# equivalents AGENT_INSTRUCTIONS_PATH_RE never reaches. Each is folded into that
+# runtime's model context on every future session, unattended: Cursor
+# (`.cursorrules`, `.cursor/rules/*`), Windsurf (`.windsurfrules`,
+# `.windsurf/rules/*`), Cline (`.clinerules` file or dir), Roo (`.roorules*`,
+# `.roo/rules*/`), GitHub Copilot (`.github/copilot-instructions.md`,
+# `.github/instructions|prompts|agents/*`), Gemini CLI (`GEMINI.md`), plus
+# `.aider.conf.yml`, whose `test-cmd`/`lint-cmd` run shell commands. A repo that
+# is opened by a teammate's Cursor/Copilot/Gemini session carries a planted
+# instruction into that session with no Aegis hook in the loop at all.
+_FA_ROOT = r"(?:^|[\s'\"/\\=])"
+_FA_FILES = (
+    r"\.cursorrules|\.windsurfrules|\.clinerules|\.roorules(?:-[\w.\-]{1,40})?"
+    r"|GEMINI(?:\.local)?\.md|\.aider\.conf\.ya?ml"
+)
+_FA_DIRS = (
+    r"\.cursor" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.roo" + _WIN_TRIM + _SEP + r"rules(?:-[\w.\-]{1,40})?"
+    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents)"
+)
+FOREIGN_AGENT_INSTR_PATH_RE = re.compile(
+    _FA_ROOT + r"(?:" + _FA_FILES + r")" + _CI_END
+    + r"|" + _FA_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions\.md" + _CI_END
+    + r"|" + _FA_ROOT + r"(?:" + _FA_DIRS + r")" + _WIN_TRIM + _SEP
+    + r"(?:" + _CI_SEG + _SEP + r"){0,4}" + _CI_SEG + _CI_END,
+    re.IGNORECASE,
+)
+# Bare-directory backstop for archive/sync tools (`rsync -a src/ .cursor/rules/`)
+# that name only the directory, mirroring AGENT_DEF_DIR_RE.
+FOREIGN_AGENT_INSTR_DIR_RE = re.compile(
+    _FA_ROOT + r"(?:" + _FA_DIRS + r")" + _CI_END, re.IGNORECASE,
+)
+
 # `.claude/agents/`, `.claude/commands/`, and `.claude/output-styles/` allow
 # one level of namespacing (Claude Code resolves `.claude/commands/foo/
 # bar.md` as `/foo:bar`) — the bounded `{0,4}` repeated segment mirrors

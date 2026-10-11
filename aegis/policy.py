@@ -177,6 +177,13 @@ class Policy:
     # explicit per-invocation approval, a surface rule_agent_def_protect
     # was never extended to reach. See rules.rule_skills_protect.
     skills_protect: dict = field(default_factory=dict)
+    # Other-runtime agent-instruction protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers Cursor/Windsurf/Cline/Roo rules, Copilot instructions/prompts/
+    # agents, GEMINI.md and .aider.conf.yml — the CLAUDE.md/AGENTS.md
+    # equivalents for runtimes rule_agent_def_protect never reaches.
+    # See rules.rule_foreign_agent_instr_protect.
+    foreign_agent_instr: dict = field(default_factory=dict)
     # Shell-startup / SSH persistence protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers ~/.bashrc/~/.zshrc/~/.profile/fish's config.fish/

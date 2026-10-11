@@ -1163,6 +1163,113 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- Other-runtime agent-instruction protection: escapable with human confirm ---
+def _foreign_agent_instr_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering another agent runtime's project-instruction file:
+    Cursor (``.cursorrules``, ``.cursor/rules/*``), Windsurf (``.windsurfrules``,
+    ``.windsurf/rules/*``), Cline (``.clinerules``), Roo (``.roorules*``,
+    ``.roo/rules*/``), GitHub Copilot (``.github/copilot-instructions.md``,
+    ``.github/instructions|prompts|agents/*``), Gemini CLI (``GEMINI.md``) and
+    ``.aider.conf.yml``.
+
+    THREAT MODEL: the exact ``CLAUDE.md``/``AGENTS.md`` injection
+    ``rule_agent_def_protect`` gates, one runtime over. Aegis's own sessions never
+    read these files, so the planter gets no immediate payoff here — the point is
+    persistence across a trust boundary: the file is committed, and the next
+    teammate/CI job who opens the repo in Cursor, Copilot, Gemini CLI, Cline or
+    Roo has the planted natural-language instruction folded into THEIR agent's
+    system context, unattended, where Aegis may not be installed at all (and the
+    instruction can steer that agent to exfiltrate secrets or weaken checks).
+    Cursor ``.mdc`` rules with ``alwaysApply: true`` and Copilot
+    ``.github/agents/*`` carry their own tool/auto-attach settings, a
+    privilege-escalation shape like ``.claude/agents``. ``.aider.conf.yml`` is
+    included because ``test-cmd``/``lint-cmd``/``auto-test`` make it a
+    shell-command execution config, not mere prose. In a repo this agent works on
+    it also looks like harmless "style guide" documentation in review — the same
+    trusted-name, unread-body blind spot as the sibling guards.
+
+    Config (``policy.foreign_agent_instr``): ``mode`` (deny|ask|monitor|off,
+    default ask — editing these is routine for teams that use those tools),
+    ``allow`` (regexes on path/command that skip the gate).
+
+    Escapable only by a human: ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1`` set before launch for the Edit/Write/
+    MCP form. Also backstopped for fetch-to-file writes by
+    ``rule_fetch_to_file_protect`` via ``_FETCH_HUMAN_ESCAPABLE``.
+
+    Honest scope: a path-string denylist, like every sibling guard. Known gaps,
+    shared with them: filenames for runtimes not listed, a path computed
+    indirectly across shell variable assignments, archive-tool destination flags
+    glued to the path (``tar -C.cursor/rules``), nesting deeper than 4 levels
+    under a rules directory, and global/user-scope files in the home directory
+    of the other runtime (``~/.gemini/GEMINI.md`` IS covered by the bare
+    ``GEMINI.md`` match; ``~/.codeium/windsurf/memories`` and similar are not)."""
+    cfg = getattr(policy, "foreign_agent_instr", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not (patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(p)
+                         or patterns.FOREIGN_AGENT_INSTR_DIR_RE.search(p)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
+                or _foreign_agent_instr_allowed_by_policy(cfg, p)):
+            return None
+        would = Decision(action, "foreign-agent-instr-protect",
+                         f"Agent-instruction file '{p}' (Cursor/Windsurf/Cline/Roo/"
+                         "Copilot/Gemini/Aider) is being written — it is folded into "
+                         "that runtime's context on every future session, unattended, "
+                         "possibly on a teammate's machine without Aegis. Review the "
+                         "change, then confirm with AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1; "
+                         "a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-instr-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(cmd)
+                             or patterns.FOREIGN_AGENT_INSTR_DIR_RE.search(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
+                or _foreign_agent_instr_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "foreign-agent-instr-protect",
+                         "Another agent runtime's instruction file (Cursor/Windsurf/"
+                         "Cline/Roo/Copilot/Gemini/Aider) is being modified from a "
+                         "shell — it is auto-loaded into that runtime's context in a "
+                         "future session. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-instr-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- Claude Code Skill-definition protection: escapable with human confirm -----
 def _skills_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7057,6 +7164,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
+    (patterns.FOREIGN_AGENT_INSTR_PATH_RE, "another agent runtime's instruction file"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
@@ -8494,6 +8602,7 @@ _CORE_RULES = (
     rule_hook_manager_protect,
     rule_agent_def_protect,
     rule_skills_protect,
+    rule_foreign_agent_instr_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
     rule_package_manifest_protect,
