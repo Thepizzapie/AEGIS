@@ -1548,16 +1548,20 @@ _AGENT_RULES_DIRS = (
     + r"|\.kiro" + _WIN_TRIM + _SEP + r"steering"
     + r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents|chatmodes)"
 )
-_AGENT_RULES_BOUND = r"(?:^|[\s'\"/\\=])"
+# `>`/`|` included so a redirect with no space (`echo x>.cursorrules`) matches.
+_AGENT_RULES_BOUND = r"(?:^|[\s'\"/\\=<>|&])"
+# Intermediate segment: never a bare `.`/`..` (QA: those overlapped _SEP's own
+# `./` repetition and gave ~n^5 backtracking on `.cursor/rules/./././...`).
+_AGENT_RULES_SEG = r"(?!\.{1,2}[/\\])[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
 FOREIGN_AGENT_INSTRUCTIONS_PATH_RE = re.compile(
-    _AGENT_RULES_BOUND + r"(?:GEMINI|QWEN|CRUSH|WARP)" + _WIN_TRIM + r"(?:\.local)?\.md" + _CI_END
+    _AGENT_RULES_BOUND + r"(?-i:GEMINI|QWEN|CRUSH|WARP)" + _WIN_TRIM + r"(?:\.local)?\.md" + _CI_END
     + r"|" + _AGENT_RULES_BOUND + r"\.(?:cursorrules|windsurfrules|clinerules|roorules)" + _CI_END
     + r"|" + _AGENT_RULES_BOUND + r"\.github" + _WIN_TRIM + _SEP
     + r"copilot-instructions" + _WIN_TRIM + r"\.md" + _CI_END
     + r"|" + _AGENT_RULES_BOUND + r"\.junie" + _WIN_TRIM + _SEP
     + r"guidelines" + _WIN_TRIM + r"\.md" + _CI_END
     + r"|" + _AGENT_RULES_BOUND + r"(?:" + _AGENT_RULES_DIRS + r")" + _WIN_TRIM + _SEP
-    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + r"\.(?:md|mdc|txt)" + _CI_END,
+    + r"(?:" + _AGENT_RULES_SEG + r"){0,4}" + _CI_SEG + r"\.(?:md|mdc|txt)" + _CI_END,
     re.IGNORECASE,
 )
 

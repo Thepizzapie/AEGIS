@@ -157,3 +157,27 @@ def test_find_path_predicate_blocked():
     # blocked by this guard or a broader one (find ... -exec rm) -- never allowed
     d = evaluate(_shell("find . -path '*.cursor*rules*' -exec rm {} +"), EMPTY)
     assert d.action in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x>.cursorrules", "echo x 1>.cursorrules", "echo x >|.cursorrules",
+    "echo x &>.cursorrules", "echo x>GEMINI.md",
+])
+def test_unspaced_redirect_gated(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE, cmd
+
+
+def test_lowercase_bare_doc_names_not_gated():
+    assert evaluate(_file("docs/gemini.md"), EMPTY).rule != RULE
+    assert evaluate(_file("src/warp.md"), EMPTY).rule != RULE
+
+
+def test_no_catastrophic_backtracking():
+    import time
+    from aegis import patterns
+    for s in (".cursor/rules" + "/." * 400, ".cursor/rules/" + "./" * 400,
+              ".github/instructions/" + "a/" * 300):
+        t = time.time()
+        patterns.FOREIGN_AGENT_INSTRUCTIONS_PATH_RE.search(s)
+        patterns.FOREIGN_AGENT_RULES_DIR_RE.search(s)
+        assert time.time() - t < 0.5
