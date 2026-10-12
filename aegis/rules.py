@@ -1163,6 +1163,100 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- other coding agents' instruction files: escapable with human confirm ----
+def _foreign_agent_rules_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_foreign_agent_instructions_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering the auto-loaded instruction or rules files of
+    OTHER coding agents: Cursor (``.cursorrules``, ``.cursor/rules/**``),
+    Copilot (``.github/copilot-instructions.md``, ``.github/instructions|
+    prompts|agents|chatmodes/**``), Gemini CLI/Qwen/Crush/Warp (``GEMINI.md``
+    etc.), Windsurf, Cline, Roo, Continue, Amazon Q, Kiro, Junie.
+
+    THREAT MODEL ("rules file backdoor"): these files are folded into the
+    model's context on every future session of that tool, unattended, and
+    read in review as harmless config. A prompt-injected agent working under
+    Claude Code can plant "always run X / exfiltrate Y / ignore the safety
+    checks" into ``.cursor/rules/x.mdc`` and have it execute under a
+    DIFFERENT agent, one this process's hooks do not watch, with the same
+    user's credentials. ``rule_agent_def_protect`` covers only
+    ``CLAUDE.md``/``AGENTS.md`` and ``.claude/*``; ``rule_self_protect``'s
+    ``CONFIG_DIR_RE`` only ``.claude``. Neither reaches these paths.
+
+    Config (``policy.foreign_agent_rules``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on path/command). ``ask`` rather than
+    ``deny``: authoring team rules for Cursor/Copilot is routine dev work.
+    Escapable only by a human: trailing '# aegis-allow' on the shell form,
+    or ``AEGIS_ALLOW_FOREIGN_AGENT_RULES=1`` in the launching environment.
+
+    Honest scope: path-string match, same denylist trade-offs as every
+    sibling guard. Not covered: tool-specific executable config (e.g.
+    ``.gemini/settings.json`` hooks/MCP, ``.cursor/hooks.json``), a filename
+    outside the recognized set, nesting past 4 levels (bare-directory form
+    still catches archive/sync tools), and computed/indirect target paths."""
+    cfg = getattr(policy, "foreign_agent_rules", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.FOREIGN_AGENT_INSTRUCTIONS_PATH_RE.search(p)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_RULES")
+                or _foreign_agent_rules_allowed_by_policy(cfg, p)):
+            return None
+        would = Decision(action, "foreign-agent-rules-protect",
+                         f"Another coding agent's instruction file '{p}' is being "
+                         "written -- it is folded into that agent's context on every "
+                         "future session, unattended, outside this agent's hooks. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_FOREIGN_AGENT_RULES=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-rules-protect-monitor")
+            return None
+        return would
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.FOREIGN_AGENT_INSTRUCTIONS_PATH_RE.search(cmd)
+                            or patterns.FOREIGN_AGENT_RULES_DIR_RE.search(cmd)
+                            or patterns.foreign_agent_instructions_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        if not touches_target:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_RULES")
+                or _foreign_agent_rules_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        would = Decision(action, "foreign-agent-rules-protect",
+                         "Another coding agent's instruction/rules file is being "
+                         "modified from a shell -- it is auto-loaded by that agent on "
+                         "every future session with no further review. A human may "
+                         "append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_FOREIGN_AGENT_RULES=1; a spawned agent cannot.")
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-rules-protect-monitor")
+            return None
+        return would
+    return None
+
+
 # ---- Claude Code Skill-definition protection: escapable with human confirm -----
 def _skills_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7056,6 +7150,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
+    (patterns.FOREIGN_AGENT_INSTRUCTIONS_PATH_RE, "another coding agent's instruction/rules file"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
@@ -8493,6 +8588,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_hook_manager_protect,
     rule_agent_def_protect,
+    rule_foreign_agent_instructions_protect,
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
