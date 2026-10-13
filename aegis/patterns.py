@@ -3390,6 +3390,49 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Non-Claude agent-runtime exec-config protection --------------------------
+# `MCP_CONFIG_PATH_RE` knows Claude Code, Claude Desktop, Cursor, VS Code and
+# Windsurf. Every OTHER agentic runtime keeps the same "command Aegis never
+# sees, run on the next session start" surface in its own config file, and
+# none of them is reached by any existing guard:
+#   DEDICATED (the file's only job is to declare servers/hooks -- any write
+#   is gated): Roo (`.roo/mcp.json`), Cline (`cline_mcp_settings.json`),
+#   Amazon Q (`.amazonq/mcp.json`, `.amazonq/default.json`), Kiro
+#   (`.kiro/settings/mcp.json`), Junie (`.junie/mcp/mcp.json`), Continue
+#   (`.continue/mcpServers/*`), Copilot CLI (`.copilot/mcp-config.json`),
+#   Cursor hooks (`.cursor/hooks.json`).
+#   SHARED (also holds theme/model/UI prefs, so gate on path AND an exec key):
+#   Gemini CLI (`.gemini/settings.json`: mcpServers/hooks), Codex
+#   (`.codex/config.toml`: mcp_servers / `notify`, which runs a program),
+#   Zed (`.zed/settings.json`: context_servers), opencode (`opencode.json[c]`:
+#   mcp), Crush (`crush.json`/`.crush.json`: mcp).
+_AGENT_RT_B = r"(?:^|[\s'\"/\\=])"
+AGENT_RUNTIME_DEDICATED_PATH_RE = re.compile(
+    _AGENT_RT_B + r"\.roo[/\\]mcp\.json\b"
+    r"|" + _AGENT_RT_B + r"cline_mcp_settings\.json\b"
+    r"|" + _AGENT_RT_B + r"\.amazonq[/\\](?:mcp|default)\.json\b"
+    r"|" + _AGENT_RT_B + r"\.kiro[/\\]settings[/\\]mcp\.json\b"
+    r"|" + _AGENT_RT_B + r"\.junie[/\\]mcp[/\\]mcp\.json\b"
+    r"|" + _AGENT_RT_B + r"\.continue[/\\]mcpServers[/\\][^\s'\"/\\]+"
+    r"|" + _AGENT_RT_B + r"\.copilot[/\\]mcp-config\.json\b"
+    r"|" + _AGENT_RT_B + r"\.cursor[/\\]hooks\.json\b",
+    re.IGNORECASE,
+)
+AGENT_RUNTIME_SHARED_PATH_RE = re.compile(
+    _AGENT_RT_B + r"\.gemini[/\\]settings\.json\b"
+    r"|" + _AGENT_RT_B + r"\.codex[/\\]config\.toml\b"
+    r"|" + _AGENT_RT_B + r"\.zed[/\\]settings\.json\b"
+    r"|" + _AGENT_RT_B + r"opencode\.jsonc?\b"
+    r"|" + _AGENT_RT_B + r"\.?crush\.json\b",
+    re.IGNORECASE,
+)
+AGENT_RUNTIME_EXEC_KEYS = ("mcpServers", "mcp_servers", "context_servers", "hooks", "notify", "mcp")  # struct-walk names
+AGENT_RUNTIME_EXEC_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:mcpServers|mcp_servers|context_servers|hooks|notify)(?![A-Za-z0-9_])"
+    r"|[\"']mcp[\"']\s*:",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards

@@ -352,6 +352,13 @@ class Policy:
     # session, its output sent as the API auth header) with no tool-call
     # trigger at all. See rules.rule_claude_cred_helper_protect.
     claude_cred_helper: dict = field(default_factory=dict)
+    # Non-Claude agent-runtime exec-config protection: {mode: deny|ask|monitor|
+    # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers MCP-server/hook/notify config files of Gemini CLI, Codex, Zed,
+    # Roo, Cline, Amazon Q, Kiro, Junie, Continue, Copilot CLI, Cursor hooks,
+    # opencode and Crush -- run on the next session start. See
+    # rules.rule_agent_runtime_config_protect.
+    agent_runtime_config: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a

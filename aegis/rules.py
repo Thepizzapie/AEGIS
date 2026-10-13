@@ -6283,6 +6283,159 @@ def rule_claude_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     return None
 
 
+def _agent_runtime_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_AGENT_RT_KEY_NAMES = {k.lower() for k in patterns.AGENT_RUNTIME_EXEC_KEYS}
+_AGENT_RT_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _agent_runtime_normalize(text: str) -> str:
+    """Decode JSON ``\\uXXXX`` escapes before the key regex sees the text (a
+    ``\\u006dcpServers`` key is the same key to the runtime's JSON parser)."""
+    def _decode(m):
+        return chr(int(m.group(1), 16))
+    return _AGENT_RT_UNICODE_ESCAPE_RE.sub(_decode, text)
+
+
+def _agent_runtime_struct_key_hit(v, _depth: int = 0) -> bool:
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str) and k.strip().lower() in _AGENT_RT_KEY_NAMES:
+                return True
+            if _agent_runtime_struct_key_hit(val, _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_agent_runtime_struct_key_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _agent_runtime_content_hit(content: str, a: dict, is_mcp: bool) -> bool:
+    if patterns.AGENT_RUNTIME_EXEC_KEY_RE.search(_agent_runtime_normalize(content)):
+        return True
+    try:
+        if _agent_runtime_struct_key_hit(json.loads(content)):
+            return True
+    except (ValueError, TypeError):
+        pass
+    if is_mcp:
+        if _agent_runtime_struct_key_hit(a):
+            return True
+        # "set config value"-style tool: {"key": "mcpServers", "value": ...}
+        return any(isinstance(s, str) and s.strip().lower() in _AGENT_RT_KEY_NAMES
+                   for s in _flatten_strings(a))
+    return False
+
+
+def rule_agent_runtime_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering the MCP-server / hook / ``notify`` config of an
+    agentic runtime OTHER than the four ``rule_mcp_config_protect`` knows
+    (Claude, Cursor, VS Code, Windsurf): Gemini CLI, Codex, Zed, opencode,
+    Crush, Roo, Cline, Amazon Q, Kiro, Junie, Continue, Copilot CLI, and
+    Cursor's ``.cursor/hooks.json``.
+
+    THREAT MODEL: each of these files names a ``command`` (or, for Codex,
+    ``notify``, a program run on agent events) that the runtime execs on its
+    own, unattended, on the next session start -- the same durable
+    cross-session backdoor ``rule_mcp_config_protect`` closes for Claude, on a
+    surface no existing guard reaches (``MCP_CONFIG_PATH_RE`` is a fixed list
+    of four runtimes). A repo checked out by a teammate who uses Gemini CLI or
+    Codex is compromised by a plant made while the agent was running under
+    Claude Code.
+
+    Two tiers. DEDICATED files exist only to declare servers/hooks, so any
+    write is gated. SHARED files also hold theme/model prefs, so a write is
+    gated only when the payload names an exec key (``mcpServers``/
+    ``mcp_servers``/``context_servers``/``hooks``/``notify``/``"mcp":``),
+    checked textually, after ``\\uXXXX`` decoding, structurally via JSON parse,
+    and (MCP tools) over raw args including bareword key/value leaves. Shell
+    writes to a shared file are gated on the write verb alone (the payload is
+    usually not visible in the command: ``cp evil .gemini/settings.json``).
+
+    Config (``policy.agent_runtime_config``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on path/command). Escapable only by a
+    human: ``# aegis-allow`` on the shell form or ``AEGIS_ALLOW_AGENT_RUNTIME_
+    CONFIG=1`` set before launch; a spawned agent cannot.
+
+    Honest scope (denylist): user-level files reached only by suffix match;
+    paths assembled indirectly; an exec key split across MCP args joined
+    server-side; a CLI ``mcp add`` for these runtimes other than the
+    ``gemini``/``codex`` forms ``MCP_CLI_ADD_RE`` already covers; a benign
+    shell ``cp`` backup of a shared file asks unnecessarily. Fetch-to-file
+    writes (``curl -o``) are closed by ``rule_fetch_to_file_protect``."""
+    cfg = getattr(policy, "agent_runtime_config", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "agent-runtime-config-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        dedicated = bool(patterns.AGENT_RUNTIME_DEDICATED_PATH_RE.search(p))
+        shared = bool(patterns.AGENT_RUNTIME_SHARED_PATH_RE.search(p))
+        if not (dedicated or shared):
+            return None
+        if shared and not dedicated:
+            a = ev.args or {}
+            literal = a.get("content") or a.get("new_string")
+            content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+            if not _agent_runtime_content_hit(content, a, ev.action == ActionClass.MCP):
+                return None
+        if (os.environ.get("AEGIS_ALLOW_AGENT_RUNTIME_CONFIG")
+                or _agent_runtime_config_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "agent-runtime-config-protect",
+                         f"'{p}' is an agent runtime's MCP-server/hook config and is "
+                         "being written -- an entry's command runs unattended on the "
+                         "next session start of that runtime (Gemini CLI, Codex, Zed, "
+                         "Roo, Cline, Amazon Q, Kiro, ...), a durable backdoor. Review "
+                         "the change, then confirm with AEGIS_ALLOW_AGENT_RUNTIME_"
+                         "CONFIG=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not (patterns.AGENT_RUNTIME_DEDICATED_PATH_RE.search(cmd)
+                or patterns.AGENT_RUNTIME_SHARED_PATH_RE.search(cmd)):
+            return None
+        if not (patterns.WRITE_REDIRECT_RE.search(cmd)
+                or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+                or patterns.INPLACE_WRITE_RE.search(cmd)
+                or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_RUNTIME_CONFIG")
+                or _agent_runtime_config_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "agent-runtime-config-protect",
+                         "An agent runtime's MCP-server/hook config (Gemini CLI, "
+                         "Codex, Zed, Roo, Cline, Amazon Q, Kiro, ...) is being "
+                         "modified from a shell -- an entry's command runs "
+                         "unattended on that runtime's next session start. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_AGENT_RUNTIME_CONFIG=1; a spawned agent cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7079,6 +7232,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
     (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tools definition"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
+    (patterns.AGENT_RUNTIME_DEDICATED_PATH_RE, "a non-Claude agent runtime's MCP/hook config"),
+    (patterns.AGENT_RUNTIME_SHARED_PATH_RE, "a non-Claude agent runtime's settings file"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
     (patterns.PYSITE_PTH_PATH_RE, "a site-packages .pth file"),
@@ -8514,6 +8669,7 @@ _CORE_RULES = (
     rule_permission_bypass_protect,
     rule_claude_env_protect,
     rule_claude_cred_helper_protect,
+    rule_agent_runtime_config_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
