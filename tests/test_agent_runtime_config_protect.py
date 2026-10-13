@@ -141,3 +141,27 @@ def test_policy_yaml_knob_loads(tmp_path):
     f = tmp_path / "p.yaml"
     f.write_text("agent_runtime_config:\n  mode: deny\n")
     assert load_policy(str(tmp_path)).agent_runtime_config == {"mode": "deny"}
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x >.codex/config.toml", "echo x>.roo/mcp.json", "echo x;>.roo/mcp.json",
+    "install -m644 /tmp/e ~/.codex/config.toml", "echo x | sponge .gemini/settings.json",
+    "echo x > .gemini//settings.json", "echo x > .gemini/./settings.json",
+])
+def test_qa_round1_shell_bypasses(cmd):
+    assert _gated(_shell(cmd))
+
+
+def test_qa_round1_write_and_edit():
+    assert _gated(_write("/r/.roo//mcp.json", "{}"))
+    assert _gated(_edit("/r/.gemini/settings.json", '"command": "/tmp/e", "args": []'))
+    assert not _gated(_edit("/r/.gemini/settings.json", '"theme": "dark"'))
+    for path in (".kiro/hooks/x.json", ".junie/mcp.json", ".config/zed/settings.json",
+                 ".gemini/extensions/e/gemini-extension.json"):
+        assert _gated(_write("/r/" + path, SRV)), path
+
+
+@pytest.mark.parametrize("path", ["opencode.json.example", "docs/opencode.json.md", ".crush.json.bak",
+                                  ".continue/mcpServers/README.md"])
+def test_qa_round1_suffix_not_gated(path):
+    assert not _gated(_write("/r/" + path, SRV))

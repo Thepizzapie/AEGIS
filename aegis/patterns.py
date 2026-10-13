@@ -3406,24 +3406,32 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
 #   (`.codex/config.toml`: mcp_servers / `notify`, which runs a program),
 #   Zed (`.zed/settings.json`: context_servers), opencode (`opencode.json[c]`:
 #   mcp), Crush (`crush.json`/`.crush.json`: mcp).
-_AGENT_RT_B = r"(?:^|[\s'\"/\\=])"
+_AGENT_RT_B = r"(?:^|[\s'\"/\\=<>|;&(`])"
 AGENT_RUNTIME_DEDICATED_PATH_RE = re.compile(
-    _AGENT_RT_B + r"\.roo[/\\]mcp\.json\b"
-    r"|" + _AGENT_RT_B + r"cline_mcp_settings\.json\b"
-    r"|" + _AGENT_RT_B + r"\.amazonq[/\\](?:mcp|default)\.json\b"
-    r"|" + _AGENT_RT_B + r"\.kiro[/\\]settings[/\\]mcp\.json\b"
-    r"|" + _AGENT_RT_B + r"\.junie[/\\]mcp[/\\]mcp\.json\b"
-    r"|" + _AGENT_RT_B + r"\.continue[/\\]mcpServers[/\\][^\s'\"/\\]+"
-    r"|" + _AGENT_RT_B + r"\.copilot[/\\]mcp-config\.json\b"
-    r"|" + _AGENT_RT_B + r"\.cursor[/\\]hooks\.json\b",
+    _AGENT_RT_B + r"\.roo[/\\]mcp\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"cline_mcp_settings\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.amazonq[/\\](?:mcp|default)\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.kiro[/\\]settings[/\\]mcp\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.junie[/\\]mcp[/\\]mcp\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.continue[/\\]mcpServers[/\\][^\s'\"/\\]+\.(?:ya?ml|json)(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.copilot[/\\]mcp-config\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.cursor[/\\]hooks\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.(?:junie|cline)[/\\]mcp\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.(?:windsurf|codex)[/\\]hooks\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.github[/\\]copilot[/\\]mcp\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.amazonq[/\\]agents[/\\][^\s'\"/\\]+\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.kiro[/\\]hooks[/\\][^\s'\"/\\]+"
+    r"|" + _AGENT_RT_B + r"\.gemini[/\\]extensions[/\\][^\s'\"/\\]+[/\\]gemini-extension\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.config[/\\]amazonq[/\\]mcp\.json(?![\w.-])",
     re.IGNORECASE,
 )
 AGENT_RUNTIME_SHARED_PATH_RE = re.compile(
-    _AGENT_RT_B + r"\.gemini[/\\]settings\.json\b"
-    r"|" + _AGENT_RT_B + r"\.codex[/\\]config\.toml\b"
-    r"|" + _AGENT_RT_B + r"\.zed[/\\]settings\.json\b"
-    r"|" + _AGENT_RT_B + r"opencode\.jsonc?\b"
-    r"|" + _AGENT_RT_B + r"\.?crush\.json\b",
+    _AGENT_RT_B + r"\.gemini[/\\]settings\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.codex[/\\]config\.toml(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.config[/\\]zed[/\\]settings\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.zed[/\\]settings\.json(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"opencode\.jsonc?(?![\w.-])"
+    r"|" + _AGENT_RT_B + r"\.?crush\.json(?![\w.-])",
     re.IGNORECASE,
 )
 AGENT_RUNTIME_EXEC_KEYS = ("mcpServers", "mcp_servers", "context_servers", "hooks", "notify", "mcp")  # struct-walk names
@@ -3432,6 +3440,16 @@ AGENT_RUNTIME_EXEC_KEY_RE = re.compile(
     r"|[\"']mcp[\"']\s*:",
     re.IGNORECASE,
 )
+# An Edit tool call typically rewrites one LEAF of an already-registered entry
+# (`"command": "/tmp/e"`), never naming the parent key -- in a shared file that
+# leaf IS the exec surface.
+AGENT_RUNTIME_EXEC_LEAF_RE = re.compile(
+    r"[\"']?(?:command|args|binary|program|formatter|lsp|agent_servers|plugin)[\"']?\s*[:=]",
+    re.IGNORECASE,
+)
+# `install` and `sponge` write a destination operand but are on no shared verb list.
+AGENT_RUNTIME_EXTRA_WRITE_VERB_RE = re.compile(
+    r"(?:^|[;&|(\n]\s*)(?:sudo\s+)?(?:install|sponge)\b", re.IGNORECASE)
 
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:

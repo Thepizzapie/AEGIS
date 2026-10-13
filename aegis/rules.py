@@ -6320,8 +6320,24 @@ def _agent_runtime_struct_key_hit(v, _depth: int = 0) -> bool:
     return False
 
 
-def _agent_runtime_content_hit(content: str, a: dict, is_mcp: bool) -> bool:
-    if patterns.AGENT_RUNTIME_EXEC_KEY_RE.search(_agent_runtime_normalize(content)):
+_AGENT_RT_SEP_RE = re.compile(r"(?:[/\\]+\.(?=[/\\]))|(?<=[^/\\])[/\\]{2,}")
+
+
+def _agent_runtime_squash(text: str) -> str:
+    """Collapse doubled separators and ``/./`` segments so ``.gemini//settings.json``
+    and ``.gemini/./settings.json`` match like the canonical path."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _AGENT_RT_SEP_RE.sub("/", text)
+    return text
+
+
+def _agent_runtime_content_hit(content: str, a: dict, is_mcp: bool, edit: bool = False) -> bool:
+    norm = _agent_runtime_normalize(content)
+    if patterns.AGENT_RUNTIME_EXEC_KEY_RE.search(norm):
+        return True
+    if edit and patterns.AGENT_RUNTIME_EXEC_LEAF_RE.search(norm):
         return True
     try:
         if _agent_runtime_struct_key_hit(json.loads(content)):
@@ -6372,7 +6388,17 @@ def rule_agent_runtime_config_protect(ev: Event, policy=None) -> Optional[Decisi
     server-side; a CLI ``mcp add`` for these runtimes other than the
     ``gemini``/``codex`` forms ``MCP_CLI_ADD_RE`` already covers; a benign
     shell ``cp`` backup of a shared file asks unnecessarily. Fetch-to-file
-    writes (``curl -o``) are closed by ``rule_fetch_to_file_protect``."""
+    writes (``curl -o``) are closed by ``rule_fetch_to_file_protect``.
+
+    QA round 1 (independent adversarial agent) closed: redirect with no space
+    before the path, ``install``/``sponge`` verbs, doubled/``/./`` separators,
+    leaf-only Edits (``"command": ...``) in shared files, ``.json.example``-style
+    suffix leaks, and added more runtime paths. Known, disclosed gaps: ``cd``
+    + bare filename, ``$CODEX_HOME``/glob paths, multi-file MCP tools
+    (``push_files``) and base64 payloads, ``git checkout -- <path>``/``patch``/
+    ``git apply``, other shared-file exec keys (lsp/formatter/permission
+    modes beyond ``command``), and shell false-positives where the path is
+    merely mentioned alongside an unrelated redirect."""
     cfg = getattr(policy, "agent_runtime_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -6387,7 +6413,7 @@ def rule_agent_runtime_config_protect(ev: Event, policy=None) -> Optional[Decisi
         return would
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
-        p = _path(ev)
+        p = _agent_runtime_squash(_path(ev))
         if not p:
             return None
         dedicated = bool(patterns.AGENT_RUNTIME_DEDICATED_PATH_RE.search(p))
@@ -6398,7 +6424,8 @@ def rule_agent_runtime_config_protect(ev: Event, policy=None) -> Optional[Decisi
             a = ev.args or {}
             literal = a.get("content") or a.get("new_string")
             content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
-            if not _agent_runtime_content_hit(content, a, ev.action == ActionClass.MCP):
+            if not _agent_runtime_content_hit(content, a, ev.action == ActionClass.MCP,
+                                              edit=ev.action != ActionClass.WRITE):
                 return None
         if (os.environ.get("AEGIS_ALLOW_AGENT_RUNTIME_CONFIG")
                 or _agent_runtime_config_allowed_by_policy(cfg, p)):
@@ -6412,7 +6439,7 @@ def rule_agent_runtime_config_protect(ev: Event, policy=None) -> Optional[Decisi
                          "CONFIG=1; a spawned agent cannot."))
 
     if _is_shell(ev):
-        cmd = _shell_scan(ev)
+        cmd = _agent_runtime_squash(_shell_scan(ev))
         if not (patterns.AGENT_RUNTIME_DEDICATED_PATH_RE.search(cmd)
                 or patterns.AGENT_RUNTIME_SHARED_PATH_RE.search(cmd)):
             return None
@@ -6421,7 +6448,8 @@ def rule_agent_runtime_config_protect(ev: Event, policy=None) -> Optional[Decisi
                 or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                 or patterns.INPLACE_WRITE_RE.search(cmd)
                 or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)):
+                or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+                or patterns.AGENT_RUNTIME_EXTRA_WRITE_VERB_RE.search(cmd)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_RUNTIME_CONFIG")
                 or _agent_runtime_config_allowed_by_policy(cfg, _cmd(ev))):
