@@ -1523,6 +1523,59 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Other coding agents' instruction/rules files --------------------------------
+# A sibling of AGENT_INSTRUCTIONS_PATH_RE/AGENT_DEF_PATH_RE above, on files
+# THEIR filename sets never name: the project-instruction surface of the OTHER
+# agent runtimes (Cursor `.cursorrules`/`.cursor/rules/*.mdc`, Windsurf
+# `.windsurfrules`/`.windsurf/rules/`, Cline `.clinerules`, Gemini CLI
+# `GEMINI.md`, GitHub Copilot `.github/copilot-instructions.md` +
+# `.github/instructions/*.instructions.md` + `.github/prompts/*.prompt.md`,
+# Roo, Kiro steering, Amazon Q rules, JetBrains Junie, Augment, Continue,
+# Goose, Qwen). Same payload as CLAUDE.md -- natural-language instructions
+# folded into the model's context on every future session, unattended -- but
+# the planting session is often a *Claude Code* session editing a repo that a
+# teammate (or this human, tomorrow) opens in a different agent, one with its
+# own tool access and possibly NO Aegis hook at all. Committed to the repo, a
+# planted rule reads in review as routine contributor-guideline prose.
+_OTHER_AGENT_ROOT = r"(?:^|[\s'\"/\\=])"
+_OTHER_AGENT_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
+OTHER_AGENT_INSTRUCTIONS_PATH_RE = re.compile(
+    # single-file forms (any nesting depth, incl. ~/ user scope)
+    _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|cline|continue)rules" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.goosehints" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"(?:GEMINI|QWEN)" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP
+    + r"copilot-instructions" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.junie" + _WIN_TRIM + _SEP
+    + r"guidelines" + _WIN_TRIM + r"\.md" + _CI_END
+    # directory forms: <root>/<dir>/<up to 4 nested segs>/<file>
+    + r"|" + _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP
+    + r"(?:instructions|prompts)" + _WIN_TRIM + _SEP
+    + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|augment|amazonq)" + _WIN_TRIM + _SEP
+    + r"rules" + _WIN_TRIM + _SEP
+    + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + r"\.mdc?" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cline|roo)rules?(?:-[\w.-]{1,40})?" + _WIN_TRIM + _SEP
+    + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.roo" + _WIN_TRIM + _SEP + r"rules(?:-[\w.-]{1,40})?" + _WIN_TRIM + _SEP
+    + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.kiro" + _WIN_TRIM + _SEP + r"steering" + _WIN_TRIM + _SEP
+    + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename), the archive/sync-tool backstop --
+# same role AGENT_DEF_DIR_RE plays for `.claude/agents`.
+OTHER_AGENT_INSTRUCTIONS_DIR_RE = re.compile(
+    _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts)" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|augment|amazonq)" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cline|roo)rules?(?:-[\w.-]{1,40})?" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.roo" + _WIN_TRIM + _SEP + r"rules(?:-[\w.-]{1,40})?" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.kiro" + _WIN_TRIM + _SEP + r"steering" + _CI_END,
+    re.IGNORECASE,
+)
+
+
 # ---- Claude Code Skill-definition protection -----------------------------------
 # A sibling of the agent_def family above, on a surface that family never reaches:
 # `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
