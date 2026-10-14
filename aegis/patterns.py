@@ -1542,17 +1542,20 @@ _OTHER_AGENT_SEG = r"[^\s'\"/\\]{1,200}" + _WIN_TRIM + _SEP
 OTHER_AGENT_INSTRUCTIONS_PATH_RE = re.compile(
     # single-file forms (any nesting depth, incl. ~/ user scope)
     _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|cline|continue)rules" + _CI_END
-    + r"|" + _OTHER_AGENT_ROOT + r"\.goosehints" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:goosehints|augment-guidelines|rules)" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"CRUSH" + _WIN_TRIM + r"\.md" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"(?:GEMINI|QWEN)" + _WIN_TRIM + r"\.md" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP
     + r"copilot-instructions" + _WIN_TRIM + r"\.md" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"\.junie" + _WIN_TRIM + _SEP
     + r"guidelines" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.junie" + _WIN_TRIM + _SEP + r"guidelines" + _WIN_TRIM + _SEP
+    + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
     # directory forms: <root>/<dir>/<up to 4 nested segs>/<file>
     + r"|" + _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP
-    + r"(?:instructions|prompts)" + _WIN_TRIM + _SEP
+    + r"(?:instructions|prompts|agents|chatmodes)" + _WIN_TRIM + _SEP
     + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + r"\.md" + _CI_END
-    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|augment|amazonq)" + _WIN_TRIM + _SEP
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|augment|amazonq|continue|trae)" + _WIN_TRIM + _SEP
     + r"rules" + _WIN_TRIM + _SEP
     + r"(?:" + _OTHER_AGENT_SEG + r"){0,4}" + _CI_SEG + r"\.mdc?" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cline|roo)rules?(?:-[\w.-]{1,40})?" + _WIN_TRIM + _SEP
@@ -1567,8 +1570,8 @@ OTHER_AGENT_INSTRUCTIONS_PATH_RE = re.compile(
 # Bare directory reference (no filename), the archive/sync-tool backstop --
 # same role AGENT_DEF_DIR_RE plays for `.claude/agents`.
 OTHER_AGENT_INSTRUCTIONS_DIR_RE = re.compile(
-    _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts)" + _CI_END
-    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|augment|amazonq)" + _WIN_TRIM + _SEP + r"rules" + _CI_END
+    _OTHER_AGENT_ROOT + r"\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents|chatmodes)" + _CI_END
+    + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cursor|windsurf|augment|amazonq|continue|trae)" + _WIN_TRIM + _SEP + r"rules" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"\.(?:cline|roo)rules?(?:-[\w.-]{1,40})?" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"\.roo" + _WIN_TRIM + _SEP + r"rules(?:-[\w.-]{1,40})?" + _CI_END
     + r"|" + _OTHER_AGENT_ROOT + r"\.kiro" + _WIN_TRIM + _SEP + r"steering" + _CI_END,

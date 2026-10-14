@@ -1247,8 +1247,10 @@ def rule_other_agent_instructions_protect(ev: Event, policy=None) -> Optional[De
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
             or patterns.INPLACE_WRITE_RE.search(cmd)
             or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-            or patterns.COPY_WRITE_VERB_RE.search(cmd)
-            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+            # `install`/`ln` only in command position -- as a bare word they
+            # appear in ordinary read-only lines (`grep install GEMINI.md`).
+            or re.search(r"(?:^|[;&|]\s*)(?:install|ln)\s", cmd))
         if not touches_target:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_OTHER_AGENT_INSTRUCTIONS")

