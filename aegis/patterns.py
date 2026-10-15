@@ -5476,3 +5476,81 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
     re.IGNORECASE,
 )
+
+
+# ---- Rust/Cargo toolchain exec hijack ---------------------------------------
+# Cargo reads `.cargo/config.toml` (or extensionless `.cargo/config`) from the
+# working directory AND every ancestor directory, plus `$CARGO_HOME`
+# (`~/.cargo/config.toml`), with no per-file trust prompt of any kind. Several
+# of its keys name an arbitrary EXTERNAL COMMAND that Cargo/rustc then runs on
+# routine `cargo build`/`check`/`test`/`run`/`clippy`, by this agent, a
+# teammate, an IDE's rust-analyzer (which runs `cargo check` on project open),
+# or CI: `build.rustc-wrapper` / `rustc-workspace-wrapper` (wraps EVERY rustc
+# invocation), `build.rustc` / `rustdoc` (replace the compiler itself),
+# `target.<triple>.linker` (run on every link), `target.<triple>.runner`
+# (run by `cargo run`/`test`/`bench`, with the freshly built binary as argv),
+# and `credential-provider` / `global-credential-providers` (handed the live
+# registry token on `cargo publish`/private-registry fetch, the cargo analog of
+# git's `credential.helper`). A `-C linker=`/`-Z codegen-backend=`/
+# `-Z llvm-plugins=` entry inside `rustflags` reaches the same primitives.
+# `rustup` is the same shape one layer up: a `rust-toolchain(.toml)` file's
+# `path = "..."` key points the project at an arbitrary local toolchain
+# directory whose `bin/rustc`/`bin/cargo` rustup then runs.
+#
+# `rule_package_manifest_protect` already covers this file's REGISTRY half
+# (`replace-with`); it never looks at any of the keys below.
+#
+# Gated on PATH *and* CONTENT, like `rule_package_manifest_protect`: a
+# `.cargo/config.toml` is edited constantly for routine reasons (target dir,
+# jobs, aliases). A real `sccache`/`clang`/`mold`/`wasmtime` setup trips this
+# too (ask, not deny) -- the intended trade-off; `allow:` exists for it.
+#
+# DISCLOSED GAPS (denylist trade-offs, as everywhere in this file): a
+# `CARGO_HOME` redirected to a directory not literally named `.cargo` is not
+# path-matched; env-var forms (`RUSTC_WRAPPER=...`, `CARGO_TARGET_*_LINKER=...`)
+# are NOT gated (inline use is a ubiquitous idiom and runs the agent's own
+# command -- no persistence boundary is crossed; persistence via a shell rc /
+# .envrc is gated by those files' own guards); `paths = [...]`/`[patch]`
+# overrides that pull dependency source from a local directory are not covered.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+RUST_TOOLCHAIN_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])rust-toolchain(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Bare filename after a scoped `cd .cargo` (`cd .cargo && echo ... > config.toml`).
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_BARE_CONFIG_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Exec-bearing TOML keys (bare, dotted `build.rustc-wrapper`, quoted, or the
+# split `"-C", "linker=..."` rustflags form -- the lookbehind only rejects a
+# longer identifier such as `my-linker`/`relinker`).
+CARGO_EXEC_KEY_RE = re.compile(
+    r"(?:(?<![\w-])(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
+    r"|linker|runner|credential-provider|global-credential-providers)"
+    r"|-C\s{0,3}linker"
+    r"|-Z\s{0,3}(?:codegen-backend|llvm-plugins))"
+    r"[\"']?\s{0,20}=",
+    re.IGNORECASE,
+)
+# rustup's `rust-toolchain(.toml)` custom-toolchain `path` key.
+RUST_TOOLCHAIN_PATH_KEY_RE = re.compile(r"(?<![\w-])path[\"']?\s{0,20}=", re.IGNORECASE)
+# CLI forms: `cargo --config 'build.rustc-wrapper="x"' build` (one-shot exec
+# primitive hidden behind an innocent verb, the git `-c` analog) and
+# `rustup toolchain link <name> <path>` (registers an arbitrary dir as a
+# toolchain, selectable by a later `rust-toolchain` file).
+CARGO_CONFIG_FLAG_RE = re.compile(
+    r"\bcargo(?:\.exe)?\b[^|;&\n]{0,200}?\s--config(?:\s{1,5}|=)[^|;&\n]{0,300}"
+    r"(?:rustc-wrapper|rustc-workspace-wrapper|rustdoc|linker|runner"
+    r"|credential-provider|global-credential-providers|\brustc)\b",
+    re.IGNORECASE,
+)
+RUSTUP_LINK_RE = re.compile(r"\brustup(?:\.exe)?\s+toolchain\s+link\b", re.IGNORECASE)

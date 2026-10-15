@@ -4594,6 +4594,156 @@ def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decisi
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a Cargo/rustup key that names an arbitrary external
+    command: in `.cargo/config.toml` (or `.cargo/config`) any of
+    `rustc-wrapper`, `rustc-workspace-wrapper`, `rustc`, `rustdoc`, a
+    target's `linker`/`runner`, `credential-provider`/
+    `global-credential-providers`, or a `rustflags` entry carrying
+    `-C linker=`/`-Z codegen-backend=`/`-Z llvm-plugins=`; in a
+    `rust-toolchain(.toml)` a `path = "..."` custom-toolchain key; or, from a
+    shell, `cargo --config '<exec key>=...'` / `rustup toolchain link`.
+
+    THREAT MODEL: the same "write now, auto-exec later" shape as git hooks and
+    direnv, on the Rust toolchain. Cargo loads `.cargo/config.toml` from the
+    working directory and EVERY ancestor with no trust prompt, and the keys
+    above run the named program on the most routine Rust actions: a rustc
+    wrapper wraps every compile, a linker runs on every link, a runner is
+    handed each freshly built test/binary under `cargo run`/`test`/`bench`,
+    and a credential provider receives the live registry token. The trigger
+    is not necessarily this session: a teammate's build, CI, or an IDE's
+    rust-analyzer (which runs `cargo check` merely on opening the project)
+    fires it. A `rust-toolchain.toml` `path` points rustup at an arbitrary
+    directory whose `bin/rustc`/`bin/cargo` it then executes. The registry
+    half of `.cargo/config.toml` is already gated by
+    `rule_package_manifest_protect`; none of these keys were reached by any
+    guard.
+
+    Gated on path AND content (the config file is edited for many ordinary
+    reasons; the exec keys essentially only appear for this purpose, or for
+    sccache/clang/mold/wasmtime setups -- which therefore ASK once and can be
+    permanently allowed with ``allow``). Full-line ``#`` comments are
+    stripped before matching.
+
+    Config (``policy.cargo_exec``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command/matching text that skip the
+    gate, e.g. ``["rustc-wrapper\\s*=\\s*\\"sccache\\""]``). Escapable only by
+    a human: trailing '# aegis-allow' on the shell form, or
+    ``AEGIS_ALLOW_CARGO_EXEC=1`` for the Edit/Write/MCP form; a spawned agent
+    cannot.
+
+    Honest scope: a value-only Edit diff that swaps just the command (no key
+    text anywhere in ``old_string``/``new_string``) is not caught -- the
+    Edit tool's unique-``old_string`` requirement usually drags the key line
+    in, but it is not guaranteed; a ``CARGO_HOME`` pointed at a directory not
+    named ``.cargo``, env-var forms (``RUSTC_WRAPPER=``,
+    ``CARGO_TARGET_*_LINKER=``; inline use is a ubiquitous idiom and crosses
+    no persistence boundary), ``paths``/``[patch]`` local-source overrides and
+    indirectly assembled values are not covered; an exec key merely
+    mentioned in a TOML string value false-asks (the safe direction)."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        cargo_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(p))
+        toolchain_hit = bool(patterns.RUST_TOOLCHAIN_PATH_RE.search(p))
+        if not (cargo_hit or toolchain_hit):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        raw_old = a.get("old_string")
+        if isinstance(raw_old, str) and raw_old:
+            raw_content = f"{raw_old}\n{raw_content}" if raw_content else raw_old
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = "\n".join(_flatten_strings(a))
+        content = patterns.strip_comment_lines(content)
+        if not content:
+            return None
+        key_re = (patterns.CARGO_EXEC_KEY_RE if cargo_hit
+                  else patterns.RUST_TOOLCHAIN_PATH_KEY_RE)
+        m = key_re.search(content)
+        if not m:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)
+                or _cargo_exec_allowed_by_policy(cfg, content)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is planting a Cargo/rustup key that names "
+                         "an external command (rustc wrapper, linker, "
+                         "runner, credential provider, or a custom "
+                         "toolchain path) — it runs on the next routine "
+                         "cargo build/test/run, by a teammate, CI, or an "
+                         "IDE's rust-analyzer, not just this session. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        # printf/echo -e write `\n`/`\t` as a literal backslash escape, which
+        # would otherwise sit flush against the key (`\nrunner=`) and defeat
+        # the key's word-boundary lookbehind -- expand them to real whitespace.
+        cmd = patterns.strip_comment_lines(
+            re.sub(r"\\[ntr]", " ", _shell_scan(ev)))
+        hit = bool(patterns.CARGO_CONFIG_FLAG_RE.search(cmd)
+                   or patterns.RUSTUP_LINK_RE.search(cmd))
+        if not hit:
+            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                               or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                               or patterns.INPLACE_WRITE_RE.search(cmd)
+                               or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+            if not write_verb:
+                return None
+            cargo_path = bool(patterns.CARGO_CONFIG_PATH_RE.search(cmd)
+                               or (patterns.CARGO_CD_RE.search(cmd)
+                                   and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
+            hit = ((cargo_path and patterns.CARGO_EXEC_KEY_RE.search(cmd))
+                   or (patterns.RUST_TOOLCHAIN_PATH_RE.search(cmd)
+                       and patterns.RUST_TOOLCHAIN_PATH_KEY_RE.search(cmd)))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo/rustup key that names an external command "
+                         "(rustc wrapper, linker, runner, credential "
+                         "provider, or a custom toolchain) is being "
+                         "planted from a shell — it runs on routine cargo "
+                         "builds/tests/runs, by a teammate, CI, or an IDE's "
+                         "rust-analyzer. A human may append '# aegis-allow',"
+                         " or set AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7087,6 +7237,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.RUST_TOOLCHAIN_PATH_RE, "a rust-toolchain file"),
 )
 
 
@@ -8520,6 +8671,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
