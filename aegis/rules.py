@@ -4645,7 +4645,11 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     Honest scope: shell cp/mv/ln onto the config is gated path-only (any such
     verb naming the file asks); `include = [...]`, `rustup override set <path>`,
-    `-C link-arg=-fuse-ld=<abs path>` are not covered; a value-only Edit diff that swaps just the command (no key
+    `-C link-arg=-fuse-ld=<abs path>`, `[env]`/`[alias]` tables, shell writes via
+    `git apply`/`patch`/`sponge`/python-or-perl heredocs, printf `\\x`-escaped key
+    text, TOML `\\u`-escaped keys, and MCP tools with non-standard path args are
+    not covered (QA rounds 1-2); trailing same-line `#` comments are not
+    stripped (false-ask direction); a value-only Edit diff that swaps just the command (no key
     text anywhere in ``old_string``/``new_string``) is not caught -- the
     Edit tool's unique-``old_string`` requirement usually drags the key line
     in, but it is not guaranteed; a ``CARGO_HOME`` pointed at a directory not

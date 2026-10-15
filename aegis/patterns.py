@@ -5513,11 +5513,11 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
 # .envrc is gated by those files' own guards); `paths = [...]`/`[patch]`
 # overrides that pull dependency source from a local directory are not covered.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>(){};|&])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 RUST_TOOLCHAIN_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])rust-toolchain(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>(){};|&])rust-toolchain(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # Bare filename after a scoped `cd .cargo` (`cd .cargo && echo ... > config.toml`).
@@ -5527,7 +5527,7 @@ CARGO_CD_RE = re.compile(
     re.IGNORECASE,
 )
 CARGO_BARE_CONFIG_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>(){};|&])config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # Exec-bearing TOML keys (bare, dotted `build.rustc-wrapper`, quoted, or the
@@ -5535,7 +5535,7 @@ CARGO_BARE_CONFIG_RE = re.compile(
 # longer identifier such as `my-linker`/`relinker`).
 CARGO_EXEC_KEY_RE = re.compile(
     r"(?:(?<![\w-])(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
-    r"|linker|runner|credential-provider|global-credential-providers|browser)"
+    r"|linker|runner|credential-provider|global-credential-providers|browser|include)"
     r"|-C[\"',\s]{0,6}linker"
     r"|-Z[\"',\s]{0,6}(?:codegen-backend|llvm-plugins))"
     r"[\"']?\s{0,20}=",
@@ -5553,9 +5553,11 @@ RUST_TOOLCHAIN_PATH_KEY_RE = re.compile(r"(?<![\w-])path[\"']?\s{0,20}=", re.IGN
 # `rustup toolchain link <name> <path>` (registers an arbitrary dir as a
 # toolchain, selectable by a later `rust-toolchain` file).
 CARGO_CONFIG_FLAG_RE = re.compile(
-    r"\bcargo(?:\.exe)?\b[^|;&\n]{0,200}?\s--config(?:\s{1,5}|=)[^|;&\n]{0,300}"
-    r"(?:rustc-wrapper|rustc-workspace-wrapper|rustdoc|linker|runner"
-    r"|credential-provider|global-credential-providers|\brustc)\b",
+    r"\bcargo(?:\.exe)?\b[^|;&\n]{0,200}?\s--config(?:\s{1,5}|=)[^|;&\n]{0,300}?"
+    r"(?:(?<![\w-])(?:rustc-wrapper|rustc-workspace-wrapper|rustdoc|linker|runner"
+    r"|credential-provider|global-credential-providers|rustc|include|browser)[\"']?\s{0,20}="
+    # `--config <file>.toml` loads a whole external config file we never inspect
+    r"|[\"']?[^\s='\"|;&]{1,200}\.toml\b)",
     re.IGNORECASE,
 )
 RUSTUP_LINK_RE = re.compile(r"\brustup(?:\.exe)?\s+toolchain\s+link\b", re.IGNORECASE)

@@ -259,3 +259,29 @@ def test_staged_copy_onto_target_asks(cmd):
 def test_shell_deny_mode():
     d = evaluate(_shell("cargo --config 'build.linker=\"x\"' build"), DENY)
     assert d.rule == RULE and d.action == Action.DENY
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'linker=\"x\"' >.cargo/config.toml",
+    "echo 'linker=\"x\"' >>.cargo/config.toml",
+    "(echo 'linker=\"x\"')>.cargo/config.toml",
+    "{ echo 'linker=\"x\"'; }>.cargo/config.toml",
+    "echo 'path=\"/x\"' >rust-toolchain.toml",
+    "cd .cargo && echo 'linker=\"x\"' >config.toml",
+    "cargo --config /tmp/evil.toml build",
+    "cargo --config=evil.toml check",
+])
+def test_round2_bypasses(cmd):
+    assert _hit(_shell(cmd))
+
+
+@pytest.mark.parametrize("cmd", [
+    "cargo --config 'term.color=\"always\"' build --release --linker-map",
+    "cargo --config build.jobs=2 rustc -- -C opt-level=3",
+])
+def test_round2_false_positives(cmd):
+    assert _quiet(_shell(cmd))
+
+
+def test_include_key():
+    assert _hit(_write(CFG, 'include = ["evil.toml"]'))
