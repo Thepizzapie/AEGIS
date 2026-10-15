@@ -72,6 +72,9 @@ EXEC_CONTENT = [
     'build.rustc-wrapper = "x"\n',
     '"rustc-wrapper" = "x"\n',
     "'linker' = 'x'\n",
+    '[doc]\nbrowser = ["/tmp/b"]\n',
+    '[credential-alias]\nfoo = "/tmp/c"\n',
+    '[build]\nrustflags = ["-Z", "codegen-backend=/x.so"]\n',
 ]
 
 
@@ -242,3 +245,17 @@ def test_redos_resistant():
         t = time.time()
         evaluate(ev, EMPTY)
         assert time.time() - t < 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp /tmp/staged.toml .cargo/config.toml",
+    "mv /tmp/s rust-toolchain.toml",
+    "ln -sf /tmp/s ~/.cargo/config.toml",
+])
+def test_staged_copy_onto_target_asks(cmd):
+    assert _hit(_shell(cmd))
+
+
+def test_shell_deny_mode():
+    d = evaluate(_shell("cargo --config 'build.linker=\"x\"' build"), DENY)
+    assert d.rule == RULE and d.action == Action.DENY

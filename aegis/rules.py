@@ -4610,7 +4610,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     `rustc-wrapper`, `rustc-workspace-wrapper`, `rustc`, `rustdoc`, a
     target's `linker`/`runner`, `credential-provider`/
     `global-credential-providers`, or a `rustflags` entry carrying
-    `-C linker=`/`-Z codegen-backend=`/`-Z llvm-plugins=`; in a
+    `-C linker=`/`-Z codegen-backend=`/`-Z llvm-plugins=`, `[doc] browser`, or a
+    `[credential-alias]` table; in a
     `rust-toolchain(.toml)` a `path = "..."` custom-toolchain key; or, from a
     shell, `cargo --config '<exec key>=...'` / `rustup toolchain link`.
 
@@ -4642,7 +4643,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``AEGIS_ALLOW_CARGO_EXEC=1`` for the Edit/Write/MCP form; a spawned agent
     cannot.
 
-    Honest scope: a value-only Edit diff that swaps just the command (no key
+    Honest scope: shell cp/mv/ln onto the config is gated path-only (any such
+    verb naming the file asks); `include = [...]`, `rustup override set <path>`,
+    `-C link-arg=-fuse-ld=<abs path>` are not covered; a value-only Edit diff that swaps just the command (no key
     text anywhere in ``old_string``/``new_string``) is not caught -- the
     Edit tool's unique-``old_string`` requirement usually drags the key line
     in, but it is not guaranteed; a ``CARGO_HOME`` pointed at a directory not
@@ -4688,8 +4691,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         key_re = (patterns.CARGO_EXEC_KEY_RE if cargo_hit
                   else patterns.RUST_TOOLCHAIN_PATH_KEY_RE)
-        m = key_re.search(content)
-        if not m:
+        if not (key_re.search(content)
+                or (cargo_hit and patterns.CARGO_CRED_ALIAS_RE.search(content))):
             return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)
@@ -4715,7 +4718,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         hit = bool(patterns.CARGO_CONFIG_FLAG_RE.search(cmd)
                    or patterns.RUSTUP_LINK_RE.search(cmd))
         if not hit:
-            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+            write_verb = bool(patterns.CARGO_COPY_VERB_RE.search(cmd)
+                               or patterns.WRITE_REDIRECT_RE.search(cmd)
                                or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                                or patterns.INPLACE_WRITE_RE.search(cmd)
                                or patterns.FORCED_LINK_WRITE_RE.search(cmd))
@@ -4724,9 +4728,13 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             cargo_path = bool(patterns.CARGO_CONFIG_PATH_RE.search(cmd)
                                or (patterns.CARGO_CD_RE.search(cmd)
                                    and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
-            hit = ((cargo_path and patterns.CARGO_EXEC_KEY_RE.search(cmd))
-                   or (patterns.RUST_TOOLCHAIN_PATH_RE.search(cmd)
-                       and patterns.RUST_TOOLCHAIN_PATH_KEY_RE.search(cmd)))
+            tc_path = bool(patterns.RUST_TOOLCHAIN_PATH_RE.search(cmd))
+            # cp/mv/ln of a pre-staged file onto the target carries no key
+            # text in the command at all -> path-only for those verbs.
+            staged = bool(patterns.CARGO_COPY_VERB_RE.search(cmd))
+            hit = ((cargo_path and (staged or patterns.CARGO_EXEC_KEY_RE.search(cmd)
+                                    or patterns.CARGO_CRED_ALIAS_RE.search(cmd)))
+                   or (tc_path and (staged or patterns.RUST_TOOLCHAIN_PATH_KEY_RE.search(cmd))))
         if not hit:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")

@@ -5535,12 +5535,17 @@ CARGO_BARE_CONFIG_RE = re.compile(
 # longer identifier such as `my-linker`/`relinker`).
 CARGO_EXEC_KEY_RE = re.compile(
     r"(?:(?<![\w-])(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
-    r"|linker|runner|credential-provider|global-credential-providers)"
-    r"|-C\s{0,3}linker"
-    r"|-Z\s{0,3}(?:codegen-backend|llvm-plugins))"
+    r"|linker|runner|credential-provider|global-credential-providers|browser)"
+    r"|-C[\"',\s]{0,6}linker"
+    r"|-Z[\"',\s]{0,6}(?:codegen-backend|llvm-plugins))"
     r"[\"']?\s{0,20}=",
     re.IGNORECASE,
 )
+# `[credential-alias]` maps an alias name to a provider command (no `=` key
+# shape of its own to match above).
+CARGO_CRED_ALIAS_RE = re.compile(r"\[\s{0,5}credential-alias\s{0,5}\]", re.IGNORECASE)
+CARGO_COPY_VERB_RE = re.compile(
+    r"\b(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|new-item)\b", re.IGNORECASE)
 # rustup's `rust-toolchain(.toml)` custom-toolchain `path` key.
 RUST_TOOLCHAIN_PATH_KEY_RE = re.compile(r"(?<![\w-])path[\"']?\s{0,20}=", re.IGNORECASE)
 # CLI forms: `cargo --config 'build.rustc-wrapper="x"' build` (one-shot exec
