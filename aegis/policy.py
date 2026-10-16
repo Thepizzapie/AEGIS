@@ -191,6 +191,11 @@ class Policy:
     # untrusted/changed .envrc with no file write of their own. See
     # rules.rule_direnv_protect.
     direnv: dict = field(default_factory=dict)
+    # mise config auto-exec-on-cd protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers mise.toml `[hooks]`/`_.source`/`exec()` templates and the
+    # `mise trust` / trusted_config_paths activation. See rules.rule_mise_protect.
+    mise: dict = field(default_factory=dict)
     # Package-manifest lifecycle-script / registry-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers package.json/composer.json lifecycle

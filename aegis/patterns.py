@@ -1816,6 +1816,61 @@ def direnv_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, DIRENV_FIND_RE)
 
 
+# ---- mise (mise-en-place) config auto-exec-on-cd protection ------------------
+# mise (https://mise.jdx.dev, the successor to asdf, routine in polyglot dev
+# setups) activates per-project tool versions and env vars when a shell
+# `cd`s into a directory. Its config file is NOT inert: it can run arbitrary
+# commands unattended on the next `cd` (after a one-time `mise trust` of the
+# file) via
+#   - `[hooks]` (`enter`/`leave`/`cd`/`preinstall`/`postinstall`) shell commands,
+#   - `[env]` `_.source = "script.sh"` (sourced as bash) / `_.file` loaders, and
+#   - Tera templates in any env value: `{{ exec(command="...") }}`.
+# The direnv guard covers `.envrc`; nothing covered this. mise's own defense is
+# the same one direnv has -- an untrusted/changed config is refused until a
+# human runs `mise trust` -- and an agent can run it itself right after planting
+# the payload, so the activation command is gated too, plus the
+# `trusted_config_paths` setting / `MISE_TRUSTED_CONFIG_PATHS` env var that
+# pre-trusts whole directory trees.
+# Plain tool-version edits (`[tools] node = "22"`) are routine, so for an
+# Edit/Write whose content is visible the file is gated only when that content
+# names one of the exec-capable constructs below.
+_MISE_END = _CI_END
+MISE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.?mise(?:\.[\w-]+)?\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])\.?mise" + _WIN_TRIM + _SEP + r"(?:config|conf\.d" + _SEP + r"[\w.-]+)\.toml" + _MISE_END
+    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"mise\.toml" + _MISE_END,
+    re.IGNORECASE,
+)
+
+MISE_EXEC_CONTENT_RE = re.compile(
+    r"\[\s*hooks\b"                                    # [hooks] table
+    r"|\bhooks\s*\.\s*\w+\s*="                          # hooks.enter = ...
+    r"|\b(?:enter|leave|cd|preinstall|postinstall)\s*=\s*[\[\"']"
+    r"|\b_\s*\.\s*(?:source|file|python|path)\b"       # env directives
+    r"|[\"']_[\"']\s*[.=]|\b_\s*=\s*[\{\[]"
+    r"|\{\{[^}]{0,200}\bexec\s*\("                      # tera exec() template
+    r"|\bexec\s*\(\s*command\b",
+    re.IGNORECASE,
+)
+
+# `mise trust` grants trust to an untrusted/changed config; `mise settings set
+# trusted_config_paths ...` / `mise settings add ...` and the env var of the
+# same name pre-trust whole trees. `mise trust --untrust`/`--show` are
+# harmless but rare; gate the verb uniformly like `direnv allow`.
+MISE_TRUST_RE = re.compile(
+    r"\bmise\b[^|;&\n]{0,200}?\btrust\b(?![^|;&\n]{0,200}?--(?:untrust|show|all-?untrusted)\b)"
+    r"|(?<![A-Za-z0-9])trusted[_-]config[_-]paths(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+_MISE_FIND_FRAGMENTS = r"mise[\w.-]*\.toml"
+MISE_FIND_RE = _find_predicate_re(r"(?:" + _MISE_FIND_FRAGMENTS + r")")
+
+
+def mise_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, MISE_FIND_RE)
+
+
 # ---- PATH binary-shadow (hijack) protection -----------------------------------
 # Every guard above this point protects a FILE that runs later, on some future
 # trigger (a git operation, a CI push, a new shell, a `cd`). This surface is

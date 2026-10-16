@@ -1741,6 +1741,111 @@ def rule_direnv_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- mise config auto-exec-on-cd protection: escapable with human confirm ----
+def _mise_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_mise_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an auto-exec construct in a mise config file
+    (``mise.toml``/``.mise.toml``/``mise.local.toml``/``mise.<env>.toml``/
+    ``.mise/config.toml``/``.config/mise.toml``/``.config/mise/config.toml``/
+    ``conf.d/*.toml``), and the commands that trust it.
+
+    THREAT MODEL: mise runs ``[hooks]`` commands, sources ``[env]``
+    ``_.source`` scripts and evaluates ``{{ exec(command=...) }}`` templates
+    automatically, unattended, on the next ``cd`` into the project by anyone
+    (this agent, a teammate, CI) -- the same "write now, auto-exec later"
+    shape as ``.envrc`` (``rule_direnv_protect``), which this guard does not
+    overlap with. mise refuses an untrusted/changed config until ``mise
+    trust`` is run, but an agent can run that itself in the same breath, so
+    ``mise trust`` and the ``trusted_config_paths`` setting/env var (which
+    pre-trust whole trees) are gated too.
+
+    Plain tool-version edits are routine, so for an Edit/Write whose content
+    is visible the file is gated only if that content (``old_string`` +
+    ``new_string`` for an Edit) names an exec-capable construct; with no
+    visible content the path alone gates. Shell writes gate on a write verb
+    plus the path (no content check -- the command line is the content).
+
+    Config (``policy.mise``): ``mode`` (deny|ask|monitor|off, default ask),
+    ``allow`` (regexes on the path/command). Escapable only by a human:
+    trailing '# aegis-allow' on the shell form, or ``AEGIS_ALLOW_MISE=1``.
+
+    Honest scope: a bare value-only edit to an existing exec construct
+    (e.g. changing only the script filename inside an existing
+    ``_.source = "..."`` line, with no keyword in the diff) is not
+    recognized; ``mise`` env/config relocation via ``MISE_CONFIG_FILE``/
+    ``MISE_GLOBAL_CONFIG_FILE`` is not covered."""
+    cfg = getattr(policy, "mise", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "mise-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.MISE_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        parts = [v for v in (a.get("old_string"), a.get("new_string"), a.get("content"))
+                 if isinstance(v, str) and v]
+        content = " ".join(parts) or " ".join(_flatten_strings(
+            {k: v for k, v in a.items() if k not in ("file_path", "path")}))
+        if content and not patterns.MISE_EXEC_CONTENT_RE.search(content):
+            return None
+        if os.environ.get("AEGIS_ALLOW_MISE") or _mise_allowed_by_policy(cfg, p):
+            return None
+        return _finish(Decision(action, "mise-protect",
+                         f"mise config '{p}' is being written with (or without "
+                         "visible) hook/env-source/exec-template content -- mise "
+                         "runs it automatically, unattended, the next time anyone "
+                         "`cd`s into this project. Review the change, then "
+                         "confirm with AEGIS_ALLOW_MISE=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        names_target = bool(patterns.MISE_PATH_RE.search(cmd)
+                             or patterns.mise_find_hit(cmd))
+        touches_target = names_target and (
+            patterns.WRITE_REDIRECT_RE.search(cmd)
+            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+            or patterns.INPLACE_WRITE_RE.search(cmd)
+            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        activates = bool(patterns.MISE_TRUST_RE.search(cmd))
+        if not (touches_target or activates):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MISE")
+                or _mise_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("A mise config file is being modified from a shell"
+                   if touches_target else
+                   "mise is being told to trust a config (or whole config "
+                   "tree), silencing its own untrusted-config refusal")
+        return _finish(Decision(action, "mise-protect",
+                         f"{reason} -- its hooks/env-sources run automatically, "
+                         "unattended, the next time anyone `cd`s into the "
+                         "project. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_MISE=1; a spawned agent cannot."))
+    return None
+
+
 # ---- package-manifest lifecycle-script / registry-hijack protection ----------
 def _package_manifest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7060,6 +7165,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
+    (patterns.MISE_PATH_RE, "a mise config file"),
     (patterns.PACKAGE_SCRIPTS_PATH_RE, "a package manifest (package.json/composer.json)"),
     (patterns.REGISTRY_CONFIG_PATH_RE, "a package-registry config"),
     (patterns.PNPMFILE_PATH_RE, "pnpm's hook file"),
@@ -8496,6 +8602,7 @@ _CORE_RULES = (
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
+    rule_mise_protect,
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
     rule_yarn_exec_protect,
