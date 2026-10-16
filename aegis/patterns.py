@@ -1835,31 +1835,35 @@ def direnv_find_hit(cmd: str) -> bool:
 # Edit/Write whose content is visible the file is gated only when that content
 # names one of the exec-capable constructs below.
 _MISE_END = _CI_END
+_MISE_LEAD = r"(?:^|[\s'\"/\\=<>|(&;])"      # also a redirect/pipe boundary (`>mise.toml`)
 MISE_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.?mise(?:\.[\w-]+)?\.toml" + _MISE_END
-    + r"|(?:^|[\s'\"/\\=])\.?mise" + _WIN_TRIM + _SEP + r"(?:config|conf\.d" + _SEP + r"[\w.-]+)\.toml" + _MISE_END
-    + r"|(?:^|[\s'\"/\\=])\.config" + _WIN_TRIM + _SEP + r"mise\.toml" + _MISE_END,
+    _MISE_LEAD + r"\.?mise(?:\.[\w-]+)*\.toml" + _MISE_END
+    + r"|" + _MISE_LEAD + r"\.?mise" + _WIN_TRIM + _SEP
+    + r"(?:config(?:\.[\w-]+)*|conf\.d" + _SEP + r"(?:[\w.-]+" + _SEP + r")*[\w.-]+)\.toml" + _MISE_END,
     re.IGNORECASE,
 )
 
 MISE_EXEC_CONTENT_RE = re.compile(
-    r"\[\s*hooks\b"                                    # [hooks] table
-    r"|\bhooks\s*\.\s*\w+\s*="                          # hooks.enter = ...
-    r"|\b(?:enter|leave|cd|preinstall|postinstall)\s*=\s*[\[\"']"
-    r"|\b_\s*\.\s*(?:source|file|python|path)\b"       # env directives
+    r"\[\s*hooks\s*\]"                                 # [hooks] table
+    r"|\bhooks\s*\.\s*[\w\"']+\s*="                     # hooks.enter = ...
+    r"|\b(?:enter|leave|preinstall|postinstall)\s*=\s*[\[\"']"
+    r"|\b_\s*\.\s*source\b"                            # env `_.source = script`
+    r"|\[\s*env\s*\.\s*[\"']?_[\"']?\s*\]"             # [env._] table form
     r"|[\"']_[\"']\s*[.=]|\b_\s*=\s*[\{\[]"
     r"|\{\{[^}]{0,200}\bexec\s*\("                      # tera exec() template
     r"|\bexec\s*\(\s*command\b",
     re.IGNORECASE,
 )
 
-# `mise trust` grants trust to an untrusted/changed config; `mise settings set
-# trusted_config_paths ...` / `mise settings add ...` and the env var of the
-# same name pre-trust whole trees. `mise trust --untrust`/`--show` are
-# harmless but rare; gate the verb uniformly like `direnv allow`.
+# `mise trust` grants trust to an untrusted/changed config; setting
+# `trusted_config_paths` (CLI `mise settings set|add`, the MISE_ env var, or a
+# `trusted_config_paths =` assignment) pre-trusts whole trees. Merely READING
+# the setting does not match.
 MISE_TRUST_RE = re.compile(
     r"\bmise\b[^|;&\n]{0,200}?\btrust\b(?![^|;&\n]{0,200}?--(?:untrust|show|all-?untrusted)\b)"
-    r"|(?<![A-Za-z0-9])trusted[_-]config[_-]paths(?![A-Za-z0-9])",
+    r"|\bmise\b[^|;&\n]{0,100}?\bsettings\b[^|;&\n]{0,100}?\b(?:set|add)\b[^|;&\n]{0,100}?"
+    r"trusted[_-]config[_-]paths"
+    r"|(?<![A-Za-z0-9])(?:MISE_)?trusted[_-]config[_-]paths\s*=",
     re.IGNORECASE,
 )
 

@@ -1782,7 +1782,19 @@ def rule_mise_protect(ev: Event, policy=None) -> Optional[Decision]:
     (e.g. changing only the script filename inside an existing
     ``_.source = "..."`` line, with no keyword in the diff) is not
     recognized; ``mise`` env/config relocation via ``MISE_CONFIG_FILE``/
-    ``MISE_GLOBAL_CONFIG_FILE`` is not covered."""
+    ``MISE_GLOBAL_CONFIG_FILE`` is not covered; shell write forms the shared
+    verb patterns don't recognize (``install``, ``yq -i``, ``git checkout``,
+    ``patch``, globs) and MCP path keys ``_path()`` doesn't read
+    (``filePath``/``destination``) are shared gaps with the sibling guards.
+    A shell command that merely mentions a mise file alongside an unrelated
+    write verb (``cat mise.toml > /tmp/x``) asks -- a deliberate bias toward
+    asking.
+
+    QA (independent adversarial review): closed no-space redirects
+    (``>mise.toml``), ``config.<env>``/``config.local``/multi-segment
+    ``mise.<env>.local.toml`` names, nested ``conf.d``, the ``[env._]``
+    table form, and ask-fatigue from ``_.path``/``_.file``/``_.python`` and
+    from merely reading ``trusted_config_paths``."""
     cfg = getattr(policy, "mise", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
