@@ -5380,13 +5380,20 @@ TF_EXEC_HIT_RE = re.compile(
 # inside a file already confirmed to be a Cargo config, so the false-positive
 # cost is bounded and fails toward ASK, the safe direction.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 CARGO_EXEC_KEY_RE = re.compile(
     r"(?:^|[\s.{,/;\"']|\\[nrt])(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
-    r"|runner|linker|credential-process|global-credential-providers)"
+    r"|runner|linker|credential-process|credential-providers?|global-credential-providers)"
     r"[\"']?[ \t]*=",
+    re.IGNORECASE,
+)
+# Interpreter-level file writes (python/perl/node/ruby heredocs: `open(p,'w')`,
+# `Path.write_text`, `writeFileSync`, ...) carry no shell write verb at all.
+CARGO_INTERP_WRITE_RE = re.compile(
+    r"\b(?:open|fopen|write|write_text|write_bytes|writeFile\w*|appendFile\w*"
+    r"|File\.write|Set-Content|Add-Content|Out-File)\b",
     re.IGNORECASE,
 )
 # `cd .cargo && echo ... > config.toml` -- a relative write whose path never

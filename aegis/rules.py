@@ -8004,7 +8004,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         write_verb = bool(patterns.WRITE_REDIRECT_RE.search(scan_cmd)
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(scan_cmd)
                            or patterns.INPLACE_WRITE_RE.search(scan_cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(scan_cmd))
+                           or patterns.FORCED_LINK_WRITE_RE.search(scan_cmd)
+                           or patterns.CARGO_INTERP_WRITE_RE.search(scan_cmd))
         if not write_verb:
             return None
         path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)

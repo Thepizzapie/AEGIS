@@ -180,3 +180,15 @@ def test_yaml_policy_roundtrip(tmp_path):
     (tmp_path / "p.yaml").write_text("cargo_exec:\n  mode: deny\n")
     pol = load_policy(str(tmp_path))
     assert pol.cargo_exec.get("mode") == "deny"
+
+
+def test_qa_interpreter_heredoc_writes():
+    for cmd in ("python3 - <<'E'\nopen('.cargo/config.toml','w').write('rustc-wrapper=1')\nE",
+                "python3 - <<'E'\nimport pathlib\npathlib.Path('.cargo/config.toml').write_text('[build]\\nrustc-wrapper=\"x\"')\nE",
+                "perl -e 'open F,\">.cargo/config.toml\";print F \"rustc-wrapper=1\"'"):
+        assert _hit(_shell(cmd))[0], cmd
+
+
+def test_qa_credential_provider_singular():
+    assert _hit(_write(CFG, '[registry]\ncredential-provider="cargo:token-from-stdout ./x"'))[0]
+    assert _hit(_write(CFG, '[registries.foo]\ncredential-provider=["./x"]'))[0]
