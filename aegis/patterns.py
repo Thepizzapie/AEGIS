@@ -5350,6 +5350,65 @@ TF_EXEC_HIT_RE = re.compile(
 # "local-exec"-shaped substring in another produces a same-command false
 # ASK, not a false ALLOW.
 
+# ---- Cargo exec-hijack: .cargo/config(.toml) rustc-wrapper/runner/linker -----
+#
+# Cargo reads `.cargo/config.toml` (or the legacy extensionless `.cargo/config`)
+# from the working directory and EVERY ancestor directory, plus `$CARGO_HOME`,
+# merging them all. Several of its keys name an external program that Cargo
+# itself executes, as documented behaviour, on the most routine commands there
+# are: `build.rustc-wrapper`/`build.rustc-workspace-wrapper` (a program Cargo
+# invokes IN FRONT OF rustc on every compile -- `cargo build`/`check`/`test`/
+# `clippy`/`doc`, and rust-analyzer's own background `cargo check`),
+# `build.rustc`/`build.rustdoc` (replaces the compiler binary itself),
+# `target.<triple>.runner`/`target.<cfg>.runner` (wraps EVERY `cargo run`/
+# `cargo test` binary execution), `target.<triple>.linker` (run on every link),
+# and `registry.credential-process`/`registry.global-credential-providers`
+# (a program handed the registry token on every authenticated publish/fetch).
+# None of this is a package-manifest lifecycle script, so
+# `rule_package_manifest_protect` (which only checks `package.json`/
+# `composer.json` for scripts and `.cargo/config.toml` for REGISTRY redirects
+# via `REGISTRY_HIJACK_RE`'s `replace-with`) never looks at it.
+#
+# Content check is key-shaped, not whole-file: `.cargo/config.toml` routinely
+# holds benign, frequently edited settings (`[alias]`, `[net]`, `[env]`,
+# `[build] jobs`), so gating every write would be far too noisy. The key name
+# is matched with a boundary on its left that admits a line start, whitespace,
+# `.` (dotted-key form `build.rustc-wrapper = ...`), `{`/`,` (inline table
+# `build = { rustc-wrapper = "x" }`) and a quote (quoted-key form), and an
+# optional closing quote then `=` on its right. `runner`/`linker`/`rustc`/
+# `rustdoc` are plain English words, but only when immediately followed by `=`
+# inside a file already confirmed to be a Cargo config, so the false-positive
+# cost is bounded and fails toward ASK, the safe direction.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_EXEC_KEY_RE = re.compile(
+    r"(?:^|[\s.{,/;\"']|\\[nrt])(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
+    r"|runner|linker|credential-process|global-credential-providers)"
+    r"[\"']?[ \t]*=",
+    re.IGNORECASE,
+)
+# `cd .cargo && echo ... > config.toml` -- a relative write whose path never
+# names `.cargo/config.toml` as one token. Same cd-then-bare-filename fallback
+# the JetBrains guards use.
+CARGO_CONFIG_CD_RE = re.compile(
+    r"\b(?:cd|pushd|Set-Location|sl)\s+[\"']?[^\s;&|\"']{0,200}\.cargo" + _WIN_TRIM + r"[\"']?(?=[\s;&|)]|$)",
+    re.IGNORECASE,
+)
+CARGO_CONFIG_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"=<>/\\])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Known, disclosed gaps (same denylist trade-offs every sibling guard accepts):
+# a value assembled indirectly (a generator script, a `cargo` wrapper, a
+# templating step) is not seen; `$CARGO_HOME/config.toml` is covered only when
+# the literal `.cargo/config` path appears (CARGO_HOME relocated elsewhere is
+# not); and the equivalent env vars (`RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_
+# WRAPPER`, `CARGO_TARGET_<TRIPLE>_RUNNER`) are NOT gated here when exported
+# in a one-shot command -- persisting them is already caught by the shell-
+# startup / direnv / `.env` guards that own those files.
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
