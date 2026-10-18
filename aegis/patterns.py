@@ -5350,6 +5350,60 @@ TF_EXEC_HIT_RE = re.compile(
 # "local-exec"-shaped substring in another produces a same-command false
 # ASK, not a false ALLOW.
 
+# ---- Cargo config exec-hijack protection -------------------------------------
+# Cargo reads `.cargo/config.toml` (legacy `.cargo/config`) from the working
+# directory and EVERY ancestor, plus `$CARGO_HOME` (`~/.cargo/config.toml`),
+# merging them with no trust prompt. Several keys name a program CARGO ITSELF
+# execs on ordinary commands: `build.rustc-wrapper`/`rustc-workspace-wrapper`
+# (wraps every compiler invocation of `cargo build`/`check`/`test`/`clippy`),
+# `build.rustc`/`rustdoc` (replaces the compiler), `target.<triple>.linker`
+# (or `-C linker=`/`-C link-arg=-fuse-ld=` inside `rustflags`), and
+# `target.<triple>.runner` (wraps the built binary on `cargo run`/`test`/
+# `bench`) -- plus `registry.credential-provider`/`global-credential-
+# providers`, a command handed the live registry token on `cargo publish`/
+# `login`. The existing package-manifest guard only covers `replace-with`
+# registry redirection in this same file, none of the exec keys.
+#
+# Path: `.cargo/config` or `.cargo/config.toml` at any depth.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# `cd .cargo && echo ... > config.toml` -- same two-step gap every sibling
+# `*_CD_RE` closes; only ever combined with the bare-filename check and the
+# content hit below, never used alone.
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_CONFIG_BARE_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Content: the exec-capable key being assigned. Generic words (`rustc`,
+# `linker`, `runner`) need the `=` assignment; bare `rustc` additionally needs
+# a quote/bracket after it so prose is not matched. Ordinary cargo config
+# (aliases, `[net]`, `[env]`, target-dir) is deliberately NOT gated.
+CARGO_EXEC_HIT_RE = re.compile(
+    # Hyphenated/distinctive keys need no left boundary (so a `printf`'s
+    # literal `\n` glued to the key, or any other glue, can't hide them).
+    r"(?:rustc-wrapper|rustc-workspace-wrapper|credential-provider"
+    r"|global-credential-providers)[\"']?\s*=\s*\S"
+    # Generic words: left boundary is a non-word char OR a literal `\n`/`\t`
+    # escape (printf/echo -e payloads).
+    r"|(?:^|[^\w-]|\\[nrt])(?:linker|runner|rustdoc)[\"']?\s*=\s*\S"
+    r"|(?:^|[^\w-]|\\[nrt])rustc[\"']?\s*=\s*[\"'\[]"
+    r"|-fuse-ld\s*=",
+    re.IGNORECASE,
+)
+# Disclosed gaps (same class as TF_EXEC_HIT_RE): env-var forms
+# (`RUSTC_WRAPPER`, `CARGO_TARGET_<TRIPLE>_RUNNER`) set in a shell/.env, a
+# config path built indirectly, `build.rs`/proc-macros (arbitrary code by
+# design), and a one-shot `cargo --config 'build.rustc-wrapper=...'` flag
+# (not persistent; the shell command itself is still evaluated by every other
+# shell guard).
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
