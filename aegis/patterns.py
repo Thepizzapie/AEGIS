@@ -5366,7 +5366,7 @@ TF_EXEC_HIT_RE = re.compile(
 #
 # Path: `.cargo/config` or `.cargo/config.toml` at any depth.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>(;&|`])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # `cd .cargo && echo ... > config.toml` -- same two-step gap every sibling
@@ -5378,7 +5378,7 @@ CARGO_CD_RE = re.compile(
     re.IGNORECASE,
 )
 CARGO_CONFIG_BARE_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>(;&|`])config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # Content: the exec-capable key being assigned. Generic words (`rustc`,
@@ -5388,15 +5388,30 @@ CARGO_CONFIG_BARE_RE = re.compile(
 CARGO_EXEC_HIT_RE = re.compile(
     # Hyphenated/distinctive keys need no left boundary (so a `printf`'s
     # literal `\n` glued to the key, or any other glue, can't hide them).
-    r"(?:rustc-wrapper|rustc-workspace-wrapper|credential-provider"
-    r"|global-credential-providers)[\"']?\s*=\s*\S"
+    r"(?:rustc-wrapper|rustc-workspace-wrapper|codegen-backend)[\"']?\s*=\s*\S"
+    r"|credential-alias"
+    # Credential providers: a value that is only built-in `cargo:` names
+    # (blanked by `cargo_exec_hit` below) is benign.
+    r"|(?:credential-provider|global-credential-providers)[\"']?\s*="
+    r"(?:[^\n]*?[^\s\"'\[\],=\n]|\s*\[[^\]]*?[^\s\"'\[\],])"
     # Generic words: left boundary is a non-word char OR a literal `\n`/`\t`
     # escape (printf/echo -e payloads).
-    r"|(?:^|[^\w-]|\\[nrt])(?:linker|runner|rustdoc)[\"']?\s*=\s*\S"
+    r"|(?:^|[^\w-]|\\[nrt])(?:linker|runner|rustdoc|browser)[\"']?\s*=\s*\S"
     r"|(?:^|[^\w-]|\\[nrt])rustc[\"']?\s*=\s*[\"'\[]"
-    r"|-fuse-ld\s*=",
+    r"|-C\s*linker\s*="
+    # `-fuse-ld=lld`/`mold` are common and benign; gate only a path value.
+    r"|-fuse-ld\s*=\s*[\"']?[^\s\"',\]]*[/\\]",
     re.IGNORECASE,
 )
+_CARGO_BUILTIN_PROVIDER_RE = re.compile(
+    r"([\"'])cargo:(?!token-from-stdout)[a-z-]+\1", re.IGNORECASE)
+
+
+def cargo_exec_hit(text: str) -> bool:
+    """True if ``text`` sets an exec-capable Cargo config key. Built-in
+    ``cargo:`` credential providers (except ``cargo:token-from-stdout``,
+    which runs a subprocess) are blanked first so they don't count."""
+    return bool(CARGO_EXEC_HIT_RE.search(_CARGO_BUILTIN_PROVIDER_RE.sub('""', text)))
 # Disclosed gaps (same class as TF_EXEC_HIT_RE): env-var forms
 # (`RUSTC_WRAPPER`, `CARGO_TARGET_<TRIPLE>_RUNNER`) set in a shell/.env, a
 # config path built indirectly, `build.rs`/proc-macros (arbitrary code by

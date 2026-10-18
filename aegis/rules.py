@@ -7931,7 +7931,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     Honest scope (same denylist trade-offs as sibling guards): env-var forms
     (`RUSTC_WRAPPER`, `CARGO_TARGET_<TRIPLE>_RUNNER`), `build.rs`/proc-macros
     (arbitrary code by design), and indirectly assembled content are not
-    covered. The shell branch is not clause-scoped (false ASK, never false
+    covered, nor is a value-only partial edit/`sed` of an already-present
+    key (the key never appears in the scanned text). The shell branch is not clause-scoped (false ASK, never false
     ALLOW). QA history is recorded in the commit log of this guard."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -7963,7 +7964,7 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
-        if not patterns.CARGO_EXEC_HIT_RE.search(patterns.strip_comment_lines(content)):
+        if not patterns.cargo_exec_hit(patterns.strip_comment_lines(content)):
             return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)):
@@ -7983,10 +7984,17 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
                         or (patterns.CARGO_CD_RE.search(scan_cmd)
                             and patterns.CARGO_CONFIG_BARE_RE.search(scan_cmd)))
-        if not (path_hit and patterns.CARGO_EXEC_HIT_RE.search(scan_cmd)):
+        if not (path_hit and patterns.cargo_exec_hit(scan_cmd)):
             return None
+        # `allow` is matched against the config path(s) named in the command,
+        # never the whole command text (an agent could otherwise append the
+        # allowed substring), and EVERY named path must be allowed.
+        paths = [m.group(0) for m in
+                 re.finditer(r"[^\s'\"=<>(;&|`]*(?:" + patterns.CARGO_CONFIG_PATH_RE.pattern + r")",
+                             scan_cmd, re.IGNORECASE)]
+        policy_ok = bool(paths) and all(_cargo_exec_allowed_by_policy(cfg, x) for x in paths)
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
-                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+                or policy_ok):
             return None
         return _finish(Decision(action, "cargo-exec-protect",
                          "A Cargo exec-capable key (rustc-wrapper/rustc/"

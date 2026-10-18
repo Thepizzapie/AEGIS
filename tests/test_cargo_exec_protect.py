@@ -159,3 +159,46 @@ def test_no_redos():
     evaluate(_write(".cargo/config.toml", big), EMPTY)
     evaluate(_shell("echo " + big[:200000] + " > .cargo/config.toml"), EMPTY)
     assert time.time() - t < 5
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo '[build]\nrustc-wrapper=\"/tmp/x\"'>.cargo/config.toml",
+    "echo 'linker=\"x\"'>>.cargo/config.toml;",
+    "cd .cargo && echo 'linker=\"x\"' >config.toml",
+    "cd .cargo; printf 'linker=\"x\"' 1>config.toml",
+])
+def test_glued_redirect_gated(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE, cmd
+
+
+@pytest.mark.parametrize("body", [
+    '[build]\nrustflags=["-Clinker=/tmp/x"]\n',
+    '[doc]\nbrowser = "/tmp/x"\n',
+    '[credential-alias]\nmine = "/tmp/x args"\n',
+    '[build]\nrustflags=["-Zcodegen-backend=/tmp/x.so"]\n',
+    '[registry]\ncredential-provider = "cargo:token-from-stdout /tmp/x"\n',
+    '[registry]\nglobal-credential-providers = ["cargo:token", "/tmp/evil"]\n',
+    '[registry]\ncredential-provider = [\n  "/tmp/evil"\n]\n',
+    '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=/tmp/ld"]\n',
+])
+def test_extra_keys_gated(body):
+    assert evaluate(_write(".cargo/config.toml", body), EMPTY).rule == RULE, body
+
+
+@pytest.mark.parametrize("body", [
+    '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=lld"]\n',
+    '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n',
+    '[registry]\ncredential-provider = "cargo:token"\n',
+    '[registry]\nglobal-credential-providers = ["cargo:token", "cargo:libsecret"]\n',
+])
+def test_benign_common_not_gated(body):
+    assert evaluate(_write(".cargo/config.toml", body), EMPTY).rule != RULE, body
+
+
+def test_shell_allow_matches_path_not_whole_command():
+    pol = Policy(cargo_exec={"allow": [r"cross/\.cargo/config"]})
+    ok = "echo 'runner=\"x\"' > cross/.cargo/config.toml"
+    assert evaluate(_shell(ok), pol).rule != RULE
+    for evil in ("echo 'runner=\"x\"' > .cargo/config.toml; echo cross/.cargo/config",
+                 "echo 'runner=\"x\"' > .cargo/config.toml  # cross/.cargo/config"):
+        assert evaluate(_shell(evil), pol).rule == RULE, evil
