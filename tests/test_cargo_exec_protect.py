@@ -257,3 +257,36 @@ def test_qa2_no_quadratic_blowup():
         t = time.time()
         evaluate(_shell("cargo --config x " + body), EMPTY)
         assert time.time() - t < 10, repr(body[:12])
+
+
+# ---- QA round 3 regressions ----
+@pytest.mark.parametrize("cmd", [
+    "cat >.cargo/config.toml<<EOF", "cat >.cargo/config.toml</tmp/x",
+    "echo x > $env:CARGO_HOME\\config.toml", "echo x > %CARGO_HOME%\\config.toml",
+    "'x'| sc .cargo\\config.toml", "Move-Item x .cargo\\config.toml",
+    "echo x > .c\\argo/config.toml", "git checkout origin/evil -- .cargo",
+    "scp x ~/.cargo/config.toml", "yq -i '.a=1' .cargo/config.toml",
+    "export CARGO_HOST_LINKER=/tmp/l", "export CARGO_ENCODED_RUSTFLAGS='-Clinker=/x'",
+])
+def test_qa3_bypasses_closed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE, cmd
+
+
+def test_qa3_unicode_escaped_key_in_write():
+    assert evaluate(_write(CFG, '[target.x]\n"\\u0072unner"="/x"\n'), EMPTY).rule == RULE
+
+
+@pytest.mark.parametrize("cmd", [
+    "cargo run -- --config app.toml", "cargo test -- --config foo.toml",
+    "my-tool --config build.toml; cargo b", "cp config.toml ~/.cargo-x/",
+])
+def test_qa3_false_positives_closed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+def test_qa3_sed_inplace_no_quadratic_blowup():
+    import time
+    t = time.time()
+    evaluate(_shell("sed -i " * 15000 + ".cargo/config.toml"), EMPTY)
+    evaluate(_shell("cd .cargo; " + "sed -i " * 15000 + "config"), EMPTY)
+    assert time.time() - t < 8

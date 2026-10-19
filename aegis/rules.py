@@ -4673,6 +4673,15 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     unrelated rule is slow (>100s) on a Bash command with ~20K newlines; not
     this guard's, left for its own fix.
 
+    Round 3 (verification, no HIGH): closed TOML ``\\uXXXX``-escaped keys in a
+    ``Write``, ``<`` directly after the path, ``$env:``/``%CARGO_HOME%``,
+    PowerShell/``scp``/``yq`` write verbs, ``.c\\argo`` escapes, whole-dir
+    ``git checkout/restore .cargo``, args after ``cargo run --``, a
+    per-text inline ``--config`` scan, and a quadratic ``sed -i`` branch.
+    Left open: read-only ``python open()`` of the config asks, and MCP tools
+    whose path argument is named ``filePath``/``target``/``dest`` are not seen
+    by the shared ``_path()`` helper (affects every ``*_protect`` guard).
+
     Honest scope (denylist trade-offs): a ``CARGO_HOME`` relocated by an
     earlier command, a ``cd .cargo`` followed by ``cp ../a .``, directory-
     glob names (``.carg?/config.toml``), ``git apply <patch>`` (path not on the command line),
@@ -4734,6 +4743,7 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = _cmd(ev)
         texts = {raw, cmd[len(raw):].strip()} if cmd.startswith(raw) else {raw, cmd}
         texts.discard("")
+        texts |= {re.sub(r"\\(?=[A-Za-z])", "", t) for t in texts}      # `.c\argo` escapes
         # Every file form needs a literal `cargo` (`.cargo`/`$CARGO_HOME`);
         # skipping the costlier destination regexes without it keeps large
         # unrelated commands cheap.
@@ -4743,9 +4753,11 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                            and patterns.CARGO_CONFIG_BARE_DEST_RE.search(t)))
                        for t in texts)
         env_hit = bool(patterns.CARGO_ENV_RE.search(cmd))
-        inline_hit = bool((patterns.CARGO_INLINE_CONFIG_RE.search(cmd)
-                            and patterns.CARGO_EXEC_KEY_RE.search(cmd))
-                           or patterns.CARGO_CONFIG_FILE_ARG_RE.search(cmd))
+        # Args after ` -- ` belong to the user's own program, not Cargo.
+        inline_hit = any((patterns.CARGO_INLINE_CONFIG_RE.search(u)
+                           and patterns.CARGO_EXEC_KEY_RE.search(u))
+                          or patterns.CARGO_CONFIG_FILE_ARG_RE.search(u)
+                          for u in (t.split(" -- ")[0] for t in texts))
         if not (file_hit or env_hit or inline_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")

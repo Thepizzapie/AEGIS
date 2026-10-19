@@ -2713,21 +2713,22 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 # registry token). `rustflags = ["-C", "linker=..."]`/`-fuse-ld=` reach the
 # same linker hook. `REGISTRY_CONFIG_PATH_RE` already matches this PATH but
 # its sibling guard only inspects registry/index redirects, never these keys.
+_CARGO_END = _WIN_TRIM + r"(?=[/\\;&|)<>]|\s|['\"]|$)"
 _CARGO_LB = r"(?:^|(?<=[\s'\"/\\=<>]))"   # lookbehind boundary (consumes nothing)
 _CARGO_CFG_FILE = (r"(?:config(?:\.toml)?|[a-z.]*[*?\[{][a-z.*?\[\]{},]*)")   # literal or globbed name
-_CARGO_HOME_VAR = r"(?:\$\{CARGO_HOME[^}\s]{0,100}\}|\$CARGO_HOME)"
+_CARGO_HOME_VAR = r"(?:\$\{(?:env:)?CARGO_HOME[^}\s]{0,100}\}|\$(?:env:)?CARGO_HOME|%CARGO_HOME%)"
 CARGO_CONFIG_PATH_RE = re.compile(
-    _CARGO_LB + r"\.cargo" + _WIN_TRIM + _SEP + _CARGO_CFG_FILE + _CI_END
-    + r"|" + _CARGO_HOME_VAR + _SEP + _CARGO_CFG_FILE + _CI_END,
+    _CARGO_LB + r"\.cargo" + _WIN_TRIM + _SEP + _CARGO_CFG_FILE + _CARGO_END
+    + r"|" + _CARGO_HOME_VAR + _SEP + _CARGO_CFG_FILE + _CARGO_END,
     re.IGNORECASE,
 )
 # `cd`/`pushd` into `.cargo` (or `$CARGO_HOME`), then a bare `config[.toml]`.
 CARGO_CONFIG_CD_RE = re.compile(
     r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
-    r"(?:(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo|" + _CARGO_HOME_VAR + r")" + _CI_END,
+    r"(?:(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo|" + _CARGO_HOME_VAR + r")" + _CARGO_END,
     re.IGNORECASE,
 )
-_CARGO_BARE_FILE = _CARGO_LB + _CARGO_CFG_FILE + _CI_END
+_CARGO_BARE_FILE = _CARGO_LB + _CARGO_CFG_FILE + _CARGO_END
 CARGO_CONFIG_BARE_FILENAME_RE = re.compile(_CARGO_BARE_FILE, re.IGNORECASE)
 
 
@@ -2742,17 +2743,19 @@ def _cargo_dest(target: str) -> str:
     cannot be told apart lexically."""
     pre = r"(?:[^\s;&|\"'\n]{0,200}[/\\])?"      # optional leading directory, e.g. `~/`
     seg = r"[^|;&\n]{0,300}?"
-    verbs = (r"cp|mv|install|ln|rsync|dd|curl|wget|patch|ed|xargs|find"
+    verbs = (r"cp|mv|install|ln|rsync|dd|curl|wget|patch|ed|xargs|find|scp|sponge|yq|tomlq|crudini"
+             r"|sc|ac|ni|mi|move|Move-Item|New-Item|robocopy|xcopy"
              r"|git\s+(?:-C\s+\S+\s+)?(?:apply|am|checkout|restore)")
     return (
         r">[>|&]?\s*[\"']?" + pre + target
         + r"|\btee\b" + seg + target
         + r"|\b(?:" + verbs + r")\b" + seg + target
         + r"|\b(?:cp|mv|install|ln|rsync)\b" + seg + r"(?:-t\s*|--target-directory[=\s]\s*)"
-        + r"[^\s;&|]{0,200}\.cargo\b"
-        + r"|\b(?:cp|mv|install|ln|rsync)\b" + seg + r"\bconfig(?:\.toml)?\b" + seg + r"\.cargo\b"
-        + r"|\b(?:sed|perl|ruby|awk)\b[^|;&\n]{0,200}?(?:\s-[a-zA-Z]*i|--in-place)" + seg + target
-        + r"|(?:\bopen\(|write|copy|rename|symlink|link|replace|Set-Content|Out-File|Add-Content)[^\n]{0,300}?" + target
+        + r"[^\s;&|]{0,200}\.cargo(?![-\w])"
+        + r"|\b(?:cp|mv|install|ln|rsync)\b" + seg + r"\bconfig(?:\.toml)?\b" + seg + r"\.cargo(?![-\w])"
+        + r"|\bgit\s+(?:-C\s+\S+\s+)?(?:apply|am|checkout|restore)\b" + seg + r"\.cargo(?![-\w])"
+        + r"|\b(?:sed|perl|ruby|awk)\b(?=[^|;&\n]{0,200}(?:\s-[a-zA-Z]*i|--in-place))" + seg + target
+        + r"|(?:\bopen\(|write|append|put_contents|copy|cp|rename|symlink|link|replace|Set-Content|Out-File|Add-Content)[^\n]{0,300}?" + target
     )
 
 
@@ -2778,22 +2781,23 @@ CARGO_EXEC_KEY_RE = re.compile(
     r"|linker(?:[-_]flavor)?[\"']?\s*="
     r"|fuse-ld\s*=|runtool|test-builder|codegen-backend|llvm-plugins"
     r"|pre-link-arg|-Wl,-plugin"
+    r"|\bbrowser[\"']?\s*=\s*\["                                   # `[doc] browser` (cargo doc --open)
     r"|\b(?:LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|BASH_ENV)[\"']?\s*="  # `[env]` table
-    r"|\\u00(?:2d|5f)",                                            # TOML-escaped `-`/`_` in a key
+    r"|\\[uU]0{2,6}[0-9a-f]{2}",                                            # TOML-escaped `-`/`_` in a key
     re.IGNORECASE,
 )
 # Env-var forms Cargo reads with the same authority as the config keys.
 _CARGO_ENV_NAMES = (
     r"(?:CARGO_BUILD_)?(?:RUSTC|RUSTDOC)_(?:WORKSPACE_)?WRAPPER|(?-i:CARGO_BUILD_RUSTC(?:DOC)?|RUSTC|RUSTDOC)"
     r"|CARGO_REGISTR(?:Y|IES_[A-Z0-9_]+)_CREDENTIAL_PROCESS"
-    r"|CARGO_TARGET_[A-Z0-9_]+_(?:RUNNER|LINKER)"
+    r"|CARGO_(?:TARGET_[A-Z0-9_]+|HOST)_(?:RUNNER|LINKER)"
     r"|CARGO_REGISTR(?:Y|IES_[A-Z0-9_]+)_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?"
 )
 CARGO_ENV_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:" + _CARGO_ENV_NAMES + r")\s*=(?!\s*" + _CARGO_SCCACHE_VALUE + r")(?!" + _CARGO_EMPTY_VALUE + r")"
     r"|\b(?:setx|setenv|set\s+-(?!e\b)[A-Za-z]+)\s+(?:" + _CARGO_ENV_NAMES + r")\b"
     r"(?!\s+" + _CARGO_SCCACHE_VALUE + r")"
-    r"|(?<![A-Za-z0-9_])(?:(?:CARGO_BUILD_|CARGO_TARGET_[A-Z0-9_]+_)?RUSTFLAGS|RUSTDOCFLAGS)\s*="
+    r"|(?<![A-Za-z0-9_])(?:(?:CARGO_BUILD_|CARGO_TARGET_[A-Z0-9_]+_)?RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|RUSTDOCFLAGS)\s*="
     r"[^|;&\n]{0,300}(?:(?:linker|fuse-ld|codegen-backend|llvm-plugins)\s*=|runtool)"
     r"|\[(?:Environment|System\.Environment)\]::SetEnvironmentVariable\([^)\n]{0,40}"
     r"(?:" + _CARGO_ENV_NAMES + r")",
