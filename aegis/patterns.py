@@ -2713,53 +2713,89 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 # registry token). `rustflags = ["-C", "linker=..."]`/`-fuse-ld=` reach the
 # same linker hook. `REGISTRY_CONFIG_PATH_RE` already matches this PATH but
 # its sibling guard only inspects registry/index redirects, never these keys.
+_CARGO_LB = r"(?:^|(?<=[\s'\"/\\=<>]))"   # lookbehind boundary (consumes nothing)
+_CARGO_CFG_FILE = (r"(?:config(?:\.toml)?|[a-z.]*[*?\[][a-z.*?\[\]]*)")   # literal or globbed name
+_CARGO_HOME_VAR = r"(?:\$\{CARGO_HOME[^}\s]{0,100}\}|\$CARGO_HOME)"
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
-    + r"|\$\{?CARGO_HOME\}?" + _SEP + r"config(?:\.toml)?" + _CI_END,
+    _CARGO_LB + r"\.cargo" + _WIN_TRIM + _SEP + _CARGO_CFG_FILE + _CI_END
+    + r"|" + _CARGO_HOME_VAR + _SEP + _CARGO_CFG_FILE + _CI_END,
     re.IGNORECASE,
 )
 # `cd`/`pushd` into `.cargo` (or `$CARGO_HOME`), then a bare `config[.toml]`.
 CARGO_CONFIG_CD_RE = re.compile(
     r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
-    r"(?:(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo|\$\{?CARGO_HOME\}?)" + _CI_END,
+    r"(?:(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo|" + _CARGO_HOME_VAR + r")" + _CI_END,
     re.IGNORECASE,
 )
-CARGO_CONFIG_BARE_FILENAME_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
-    re.IGNORECASE,
-)
+_CARGO_BARE_FILE = _CARGO_LB + _CARGO_CFG_FILE + _CI_END
+CARGO_CONFIG_BARE_FILENAME_RE = re.compile(_CARGO_BARE_FILE, re.IGNORECASE)
+
+
+def _cargo_dest(target: str) -> str:
+    """Shell forms where `target` is WRITTEN (redirect, tee, last arg of a
+    copy/move/link/install/fetch/git-restore, in-place edit target, or an
+    interpreter file write) -- NOT merely read (cat/diff/cp-source)."""
+    tail = r"[\"']?\s*(?:$|[;&|)])"
+    _pre = r"(?:[^\s;&|\"'\n]{0,200}[/\\])?"     # optional leading directory, e.g. `~/`
+    return (
+        r">>?\s*[\"']?" + _pre + target
+        + r"|\btee\b(?:\s+-[a-zA-Z]+)*\s+[\"']?" + _pre + target
+        + r"|\b(?:cp|mv|install|ln|rsync|dd|curl|wget|git\s+(?:checkout|restore))\b[^|;&\n]{0,300}?"
+        + target + tail
+        + r"|\b(?:sed|perl|ruby)\b[^|;&\n]{0,200}?\s-[a-zA-Z]*i[^|;&\n]{0,200}?" + target
+        + r"|(?:\bopen\(|write_text|WriteAll|Set-Content|Out-File|Add-Content)[^\n]{0,300}?" + target
+    )
+
+
+CARGO_CONFIG_DEST_RE = re.compile(_cargo_dest("(?:" + CARGO_CONFIG_PATH_RE.pattern + ")"), re.IGNORECASE)
+CARGO_CONFIG_BARE_DEST_RE = re.compile(_cargo_dest("(?:" + _CARGO_BARE_FILE + ")"), re.IGNORECASE)
 # A bare `sccache` wrapper is by far the most common legitimate use of
 # `rustc-wrapper` (build caching), so it alone is exempt; any path, flag, or
 # other program is not. The exemption is value-exact: a QUOTED value must
 # close right after `sccache` (`"sccache --x"` is not exempt); an unquoted
 # one (shell env form) may be followed only by whitespace/statement end.
 _CARGO_SCCACHE_VALUE = r"(?:\"sccache\"|'sccache'|sccache(?=[\s;&|)#]|$))"
+# An EMPTY value (`RUSTC_WRAPPER=`, `=""`) unsets rather than plants. (`scan_surface`
+# repeats the command, so an empty value may be followed by the repeat.)
+_CARGO_EMPTY_VALUE = r"(?:\"\"|'')?(?:[;&|)\n]|$|\s+(?:cargo|export|env|set)\b)"
 # TOML key (or dotted `build.rustc-wrapper="..."` for `cargo --config`).
 CARGO_EXEC_KEY_RE = re.compile(
     r"\brustc[-_]?(?:workspace[-_]?)?wrapper[\"']?\s*=(?!\s*" + _CARGO_SCCACHE_VALUE + r")"
+    r"|\brust(?:c|doc)[\"']?\s*="                                  # replaces the compiler outright
     r"|\b(?:runner|credential[-_]provider|global[-_]credential[-_]providers"
     r"|credential[-_]process)[\"']?\s*="
+    r"|\bcredential[-_]alias\b"
+    r"|(?m:^\s*\[?include[\"']?\s*=)"                              # config `include = [...]`
     r"|linker(?:[-_]flavor)?[\"']?\s*="
-    r"|fuse-ld\s*=",
+    r"|fuse-ld\s*=|runtool|test-builder|codegen-backend|llvm-plugins"
+    r"|pre-link-arg|-Wl,-plugin"
+    r"|\b(?:LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|BASH_ENV)[\"']?\s*="  # `[env]` table
+    r"|\\u00(?:2d|5f)",                                            # TOML-escaped `-`/`_` in a key
     re.IGNORECASE,
 )
 # Env-var forms Cargo reads with the same authority as the config keys.
 _CARGO_ENV_NAMES = (
-    r"(?:CARGO_BUILD_)?RUSTC_(?:WORKSPACE_)?WRAPPER"
+    r"(?:CARGO_BUILD_)?(?:RUSTC|RUSTDOC)(?:_(?:WORKSPACE_)?WRAPPER)?"
     r"|CARGO_TARGET_[A-Z0-9_]+_(?:RUNNER|LINKER)"
     r"|CARGO_REGISTR(?:Y|IES_[A-Z0-9_]+)_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?"
 )
 CARGO_ENV_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:" + _CARGO_ENV_NAMES + r")\s*=(?!\s*" + _CARGO_SCCACHE_VALUE + r")"
+    r"(?<![A-Za-z0-9_])(?:" + _CARGO_ENV_NAMES + r")\s*=(?!\s*" + _CARGO_SCCACHE_VALUE + r")(?!" + _CARGO_EMPTY_VALUE + r")"
     r"|\b(?:setx|setenv|set\s+-[A-Za-z]+)\s+(?:" + _CARGO_ENV_NAMES + r")\b"
     r"(?!\s+" + _CARGO_SCCACHE_VALUE + r")"
     r"|(?<![A-Za-z0-9_])(?:(?:CARGO_BUILD_|CARGO_TARGET_[A-Z0-9_]+_)?RUSTFLAGS|RUSTDOCFLAGS)\s*="
-    r"[^|;&\n]{0,300}(?:linker|fuse-ld)\s*=",
+    r"[^|;&\n]{0,300}(?:linker|fuse-ld|runtool|codegen-backend|llvm-plugins)\s*="
+    r"|\[(?:Environment|System\.Environment)\]::SetEnvironmentVariable\([^)\n]{0,40}"
+    r"(?:" + _CARGO_ENV_NAMES + r")",
     re.IGNORECASE,
 )
-# Inline `cargo --config '<key>=<value>'` (one command, same keys).
+# Inline `cargo --config '<key>=<value>'` (one command, same keys), or
+# `--config <file>.toml` loading an arbitrary config file.
 CARGO_INLINE_CONFIG_RE = re.compile(
     r"\bcargo\b[^|;&\n]{0,300}--config(?:\s+|=)", re.IGNORECASE,
+)
+CARGO_CONFIG_FILE_ARG_RE = re.compile(
+    r"\bcargo\b[^|;&\n]{0,300}--config(?:\s+|=)[\"']?[^\s\"'=]*\.toml\b", re.IGNORECASE,
 )
 
 

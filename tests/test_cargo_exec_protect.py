@@ -171,3 +171,41 @@ def test_no_regex_perf_cliff():
     t = time.time(); evaluate(_shell(big), EMPTY)
     evaluate(_shell("cargo " + "--x " * 20000 + "--config"), EMPTY)
     assert time.time() - t < 2
+
+
+# ---- QA round 1 regressions ----
+@pytest.mark.parametrize("cmd", [
+    "export CARGO_BUILD_RUSTC=/tmp/x", "RUSTC=/tmp/x cargo build", "export RUSTDOC=/tmp/x",
+    "ln -s /tmp/evil.toml .cargo/config.toml", "install -m644 /tmp/e .cargo/config.toml",
+    "pushd .cargo; echo x >config.toml", "echo x > .cargo/conf*", "echo x > .cargo/c*.toml",
+    "echo x > ${CARGO_HOME:-$HOME/.cargo}/config.toml",
+    "git checkout evil -- .cargo/config.toml", "cargo --config /tmp/evil.toml build",
+    "python3 -c \"open('.cargo/config.toml','w').write('x')\"",
+    "[Environment]::SetEnvironmentVariable('RUSTC_WRAPPER','C:\\x')",
+])
+def test_qa_bypasses_closed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE, cmd
+
+
+@pytest.mark.parametrize("content", [
+    '[build]\nrustc = "/tmp/x"\n', '[build]\nrustdoc = "/tmp/x"\n',
+    '[env]\nLD_PRELOAD = "/x.so"\n', '[credential-alias]\nfoo = "/tmp/p"\n',
+    'include = ["/tmp/evil.toml"]\n', '[build]\nrustdocflags = ["--runtool", "/x"]\n',
+    '[build]\nrustflags = ["-Zcodegen-backend=/x.so"]\n', '"rustc\\u002dwrapper" = "/x"\n',
+])
+def test_qa_config_keys_closed(content):
+    assert evaluate(_write(CFG, content), EMPTY).rule == RULE, content
+
+
+@pytest.mark.parametrize("cmd", [
+    "git diff .cargo/config.toml > /tmp/d.patch", "cp .cargo/config.toml /tmp/backup.toml",
+    "diff .cargo/config.toml other.toml > /tmp/d", "cat .cargo/config.toml | tee /tmp/x",
+    "sed -n 1,5p .cargo/config.toml > /tmp/h", "cd .cargo && cat config.toml > /tmp/c",
+    "export RUSTC_WRAPPER=", "RUSTC_WRAPPER= cargo build", "export RUSTC_WRAPPER=''",
+])
+def test_qa_false_positives_closed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+def test_comment_only_write_allowed():
+    assert evaluate(_write(CFG, "# set runner = later\n[build]\njobs = 2\n"), EMPTY).rule != RULE

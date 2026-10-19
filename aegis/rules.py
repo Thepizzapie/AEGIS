@@ -4647,8 +4647,22 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     A bare ``sccache`` ``rustc-wrapper`` (build caching, by far the most
     common legitimate use) is exempt in key/env/inline forms.
 
-    Honest scope (denylist trade-offs): ``cargo --config <file>`` loading an
-    arbitrary TOML path, a ``CARGO_HOME`` relocated by an earlier command,
+    Shell forms are gated on the config path being WRITTEN (redirect target,
+    ``tee``, last arg of cp/mv/ln/install/curl/git checkout, ``sed -i``
+    target, interpreter file write), not merely mentioned, so ``cat``/``diff``/
+    ``cp .cargo/config.toml /tmp/x`` pass. Also gated: ``[build] rustc``/
+    ``rustdoc`` (replace the compiler), ``credential-alias``, config
+    ``include``, an ``[env]`` ``LD_PRELOAD``-class entry, rustdoc ``--runtool``,
+    nightly ``codegen-backend``/``llvm-plugins``, and ``cargo --config
+    <file>.toml``. QA history: round 1 (independent adversarial agent) found
+    the compiler-replacement keys, ``ln -s``/``install``, ``>config.toml``
+    after ``cd``, glob filenames, ``${CARGO_HOME:-..}``, ``[env]``/
+    ``credential-alias``/``include`` and read-only-mention false positives.
+
+    Honest scope (denylist trade-offs): a ``CARGO_HOME`` relocated by an
+    earlier command, ``git apply <patch>`` (path not on the command line),
+    an ``[alias]`` resolving to a PATH ``cargo-<name>``, PowerShell
+    ``[IO.File]::WriteAllText`` forms,
     config assembled indirectly, and a malicious ``build.rs``/proc-macro/
     ``[patch]`` dependency (ordinary source, not config -- the territory of
     ``rule_install_review``) are not covered; env vars planted in a ``.env``/
@@ -4676,6 +4690,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         a = ev.args or {}
         if ev.tool == "Write":
             raw = a.get("content")
+            if isinstance(raw, str):
+                raw = re.sub(r"(?m)#.*$", "", raw)   # a TOML comment is inert
             # No readable full-file content -> cannot prove it benign.
             hit = (not isinstance(raw, str) or not raw
                    or bool(patterns.CARGO_EXEC_KEY_RE.search(raw)))
@@ -4698,17 +4714,13 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
-                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                           or patterns.INPLACE_WRITE_RE.search(cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
-        file_hit = write_verb and bool(
-            patterns.CARGO_CONFIG_PATH_RE.search(cmd)
-            or (patterns.CARGO_CONFIG_CD_RE.search(cmd)
-                and patterns.CARGO_CONFIG_BARE_FILENAME_RE.search(cmd)))
+        file_hit = bool(patterns.CARGO_CONFIG_DEST_RE.search(cmd)
+                         or (patterns.CARGO_CONFIG_CD_RE.search(cmd)
+                             and patterns.CARGO_CONFIG_BARE_DEST_RE.search(cmd)))
         env_hit = bool(patterns.CARGO_ENV_RE.search(cmd))
-        inline_hit = bool(patterns.CARGO_INLINE_CONFIG_RE.search(cmd)
-                           and patterns.CARGO_EXEC_KEY_RE.search(cmd))
+        inline_hit = bool((patterns.CARGO_INLINE_CONFIG_RE.search(cmd)
+                            and patterns.CARGO_EXEC_KEY_RE.search(cmd))
+                           or patterns.CARGO_CONFIG_FILE_ARG_RE.search(cmd))
         if not (file_hit or env_hit or inline_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
