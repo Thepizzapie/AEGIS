@@ -296,6 +296,13 @@ class Policy:
     # configuration in any JetBrains IDE that opens this project. See
     # rules.rule_jetbrains_run_config_protect.
     jetbrains_run_config: dict = field(default_factory=dict)
+    # Cargo exec-hijack protection: {mode: deny|ask|monitor|off, allow:
+    # [regex on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # .cargo/config.toml keys that name an external program Cargo runs on the
+    # next build/run/test (rustc-wrapper, runner, linker, credential-provider),
+    # their CARGO_*/RUSTC_WRAPPER env vars, and inline `cargo --config`. See
+    # rules.rule_cargo_exec_protect.
+    cargo_exec: dict = field(default_factory=dict)
     # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted

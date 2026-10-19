@@ -2702,6 +2702,66 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Cargo exec-hijack (`rule_cargo_exec_protect`) ----
+# Cargo's own config file (`.cargo/config.toml`, legacy `.cargo/config`, in
+# the project, any ancestor directory, or `$CARGO_HOME`) can name external
+# programs Cargo runs on the next ordinary `cargo build`/`run`/`test`:
+# `[build] rustc-wrapper`/`rustc-workspace-wrapper` (wraps EVERY rustc
+# invocation), `[target.<triple>] runner` (runs every `cargo run`/`test`
+# binary through it), `[target.<triple>] linker`, and a registry
+# `credential-provider`/`global-credential-providers` (handed the live
+# registry token). `rustflags = ["-C", "linker=..."]`/`-fuse-ld=` reach the
+# same linker hook. `REGISTRY_CONFIG_PATH_RE` already matches this PATH but
+# its sibling guard only inspects registry/index redirects, never these keys.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|\$\{?CARGO_HOME\}?" + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# `cd`/`pushd` into `.cargo` (or `$CARGO_HOME`), then a bare `config[.toml]`.
+CARGO_CONFIG_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo|\$\{?CARGO_HOME\}?)" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_CONFIG_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# A bare `sccache` wrapper is by far the most common legitimate use of
+# `rustc-wrapper` (build caching), so it alone is exempt; any path, flag, or
+# other program is not. The exemption is value-exact: a QUOTED value must
+# close right after `sccache` (`"sccache --x"` is not exempt); an unquoted
+# one (shell env form) may be followed only by whitespace/statement end.
+_CARGO_SCCACHE_VALUE = r"(?:\"sccache\"|'sccache'|sccache(?=[\s;&|)#]|$))"
+# TOML key (or dotted `build.rustc-wrapper="..."` for `cargo --config`).
+CARGO_EXEC_KEY_RE = re.compile(
+    r"\brustc[-_]?(?:workspace[-_]?)?wrapper[\"']?\s*=(?!\s*" + _CARGO_SCCACHE_VALUE + r")"
+    r"|\b(?:runner|credential[-_]provider|global[-_]credential[-_]providers"
+    r"|credential[-_]process)[\"']?\s*="
+    r"|linker(?:[-_]flavor)?[\"']?\s*="
+    r"|fuse-ld\s*=",
+    re.IGNORECASE,
+)
+# Env-var forms Cargo reads with the same authority as the config keys.
+_CARGO_ENV_NAMES = (
+    r"(?:CARGO_BUILD_)?RUSTC_(?:WORKSPACE_)?WRAPPER"
+    r"|CARGO_TARGET_[A-Z0-9_]+_(?:RUNNER|LINKER)"
+    r"|CARGO_REGISTR(?:Y|IES_[A-Z0-9_]+)_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?"
+)
+CARGO_ENV_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:" + _CARGO_ENV_NAMES + r")\s*=(?!\s*" + _CARGO_SCCACHE_VALUE + r")"
+    r"|\b(?:setx|setenv|set\s+-[A-Za-z]+)\s+(?:" + _CARGO_ENV_NAMES + r")\b"
+    r"(?!\s+" + _CARGO_SCCACHE_VALUE + r")"
+    r"|(?<![A-Za-z0-9_])(?:(?:CARGO_BUILD_|CARGO_TARGET_[A-Z0-9_]+_)?RUSTFLAGS|RUSTDOCFLAGS)\s*="
+    r"[^|;&\n]{0,300}(?:linker|fuse-ld)\s*=",
+    re.IGNORECASE,
+)
+# Inline `cargo --config '<key>=<value>'` (one command, same keys).
+CARGO_INLINE_CONFIG_RE = re.compile(
+    r"\bcargo\b[^|;&\n]{0,300}--config(?:\s+|=)", re.IGNORECASE,
+)
+
 
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this

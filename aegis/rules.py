@@ -4594,6 +4594,137 @@ def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decisi
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an external-program hook in Cargo's config:
+    ``.cargo/config.toml`` (or legacy ``.cargo/config``, in the project, an
+    ancestor, or ``$CARGO_HOME``) keys ``[build] rustc-wrapper``/
+    ``rustc-workspace-wrapper``, ``[target.<triple>] runner``/``linker``, a
+    registry ``credential-provider``/``global-credential-providers``, and
+    ``rustflags`` carrying ``linker=``/``-fuse-ld=``; the matching
+    ``RUSTC_WRAPPER``/``CARGO_TARGET_<TRIPLE>_RUNNER``/``..._LINKER``/
+    ``CARGO_REGISTRIES_<NAME>_CREDENTIAL_PROVIDER`` environment variables;
+    and the inline ``cargo --config '<key>=<value>'`` form.
+
+    THREAT MODEL: the Rust analog of the git-config/pnpmfile/Yarn exec
+    guards. ``rule_package_manifest_protect`` already gates this file for
+    registry/index REDIRECTS, but never these keys: a ``rustc-wrapper`` runs
+    on every rustc invocation of the next ordinary ``cargo build``/``check``/
+    ``test`` (including rust-analyzer's background ``cargo check`` in an
+    IDE), a ``runner`` wraps every ``cargo run``/``cargo test`` binary, a
+    ``linker`` runs at every link step, and a registry ``credential-provider``
+    is handed the live registry token. A ``.cargo/config.toml`` is usually a
+    tracked, routine-looking file, and a config in a PARENT directory or
+    ``$CARGO_HOME`` applies to every project beneath it with no change to the
+    repo at all. The trigger is a teammate's/CI's/the IDE's ordinary build,
+    not this session.
+
+    Config (``policy.cargo_exec``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command that skip the gate).
+    Defaults to ``ask`` like every sibling ``*_protect`` guard: a custom
+    runner/linker (cross-compilation, ``mold``/``lld``, QEMU) is real,
+    sanctioned tooling that needs a human to have looked at it.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or ``AEGIS_ALLOW_CARGO_EXEC=1`` set by the orchestrator/human before
+    launch for the Edit/Write/MCP-tool form. A spawned agent cannot.
+
+    Gating shape: a ``Write`` carries the whole file, so it is gated on the
+    exec keys (a config with only ``[alias]``/``jobs``/``target-dir`` passes).
+    ``Edit``/``MultiEdit``/MCP writes and shell write-verbs only expose a
+    FRAGMENT, and a value-only diff (``runner = "a"`` -> ``"b"``) never
+    repeats the key, the "value-only diff" class the ``.gitmodules`` and
+    JetBrains guards document -- so those forms are gated on the PATH alone.
+    A bare ``sccache`` ``rustc-wrapper`` (build caching, by far the most
+    common legitimate use) is exempt in key/env/inline forms.
+
+    Honest scope (denylist trade-offs): ``cargo --config <file>`` loading an
+    arbitrary TOML path, a ``CARGO_HOME`` relocated by an earlier command,
+    config assembled indirectly, and a malicious ``build.rs``/proc-macro/
+    ``[patch]`` dependency (ordinary source, not config -- the territory of
+    ``rule_install_review``) are not covered; env vars planted in a ``.env``/
+    Dockerfile carrier are not inspected here; a bare ``sccache`` resolves
+    via ``$PATH``, so its safety rests on ``rule_path_hijack_protect``. A
+    direct fetch-to-file write is closed by ``rule_fetch_to_file_protect``
+    reusing ``CARGO_CONFIG_PATH_RE``."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        if ev.tool == "Write":
+            raw = a.get("content")
+            # No readable full-file content -> cannot prove it benign.
+            hit = (not isinstance(raw, str) or not raw
+                   or bool(patterns.CARGO_EXEC_KEY_RE.search(raw)))
+        else:
+            hit = True
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is Cargo's config file and may be planting "
+                         "an external program (rustc-wrapper, runner, "
+                         "linker, credential-provider) that runs on the "
+                         "next ordinary cargo build/run/test -- by a "
+                         "teammate, CI, or the IDE, not just this session. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        file_hit = write_verb and bool(
+            patterns.CARGO_CONFIG_PATH_RE.search(cmd)
+            or (patterns.CARGO_CONFIG_CD_RE.search(cmd)
+                and patterns.CARGO_CONFIG_BARE_FILENAME_RE.search(cmd)))
+        env_hit = bool(patterns.CARGO_ENV_RE.search(cmd))
+        inline_hit = bool(patterns.CARGO_INLINE_CONFIG_RE.search(cmd)
+                           and patterns.CARGO_EXEC_KEY_RE.search(cmd))
+        if not (file_hit or env_hit or inline_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo exec hook (rustc-wrapper, runner, linker, "
+                         "credential-provider) is being planted from a "
+                         "shell -- it runs an external program on the next "
+                         "ordinary cargo build/run/test, by anyone. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7078,6 +7209,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
     (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
     (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tools definition"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
     (patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE, "Claude Code's local hook config"),
     (patterns.CONFTEST_PATH_RE, "a pytest conftest.py"),
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
@@ -8508,6 +8640,7 @@ _CORE_RULES = (
     rule_vscode_tasks_protect,
     rule_jetbrains_watcher_protect,
     rule_jetbrains_run_config_protect,
+    rule_cargo_exec_protect,
     rule_path_hijack_protect,
     rule_claude_hooks_protect,
     rule_statusline_protect,
