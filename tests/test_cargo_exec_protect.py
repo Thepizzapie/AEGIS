@@ -198,7 +198,7 @@ def test_qa_config_keys_closed(content):
 
 
 @pytest.mark.parametrize("cmd", [
-    "git diff .cargo/config.toml > /tmp/d.patch", "cp .cargo/config.toml /tmp/backup.toml",
+    "git diff .cargo/config.toml > /tmp/d.patch",
     "diff .cargo/config.toml other.toml > /tmp/d", "cat .cargo/config.toml | tee /tmp/x",
     "sed -n 1,5p .cargo/config.toml > /tmp/h", "cd .cargo && cat config.toml > /tmp/c",
     "export RUSTC_WRAPPER=", "RUSTC_WRAPPER= cargo build", "export RUSTC_WRAPPER=''",
@@ -209,3 +209,51 @@ def test_qa_false_positives_closed(cmd):
 
 def test_comment_only_write_allowed():
     assert evaluate(_write(CFG, "# set runner = later\n[build]\njobs = 2\n"), EMPTY).rule != RULE
+
+
+# ---- QA round 2 regressions ----
+@pytest.mark.parametrize("cmd", [
+    "cp evil/config.toml .cargo/", "cp config.toml .cargo", "cp -t .cargo config.toml",
+    "install -t .cargo a", "cp --target-directory=.cargo a",
+    "cp a .cargo/config.toml 2>/dev/null", "cp a .cargo/config.toml 2>&1",
+    "cp a .cargo/config.toml # note", "cd .cargo && cp ../a config.toml 2>&1",
+    "echo x | tee -a a.txt .cargo/config.toml", "tee /tmp/l .cargo/config.toml",
+    "dd of=.cargo/config.toml if=a bs=1", "sed --in-place s/a/b/ .cargo/config.toml",
+    "awk -i inplace '{print}' .cargo/config.toml", "echo x >| .cargo/config.toml",
+    r"find . -exec cp a .cargo/config.toml \;", "patch .cargo/config.toml < p",
+    "git -C . checkout HEAD -- .cargo/config.toml", "echo x > .cargo/config.{toml,bak}",
+    "python3 -c \"import shutil;shutil.copy('a','.cargo/config.toml')\"",
+    "export CARGO_REGISTRY_CREDENTIAL_PROCESS=/tmp/p", 'RUSTDOCFLAGS="--runtool x" cargo doc',
+    "cargo --config 'include=\"x.toml\"' build", "cargo --config /tmp/x build",
+    "cargo --config \"$C\" build", "cross --config 'build.rustc-wrapper=\"x\"' build",
+])
+def test_qa2_bypasses_closed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "RUSTC=rustc cargo build", "export RUSTC=rustc", "rustdoc=1",
+    "echo 'rustc = \"1.70\"' > rust-toolchain.toml", "set -e RUSTC_WRAPPER",
+    "git diff .cargo/config.toml > /tmp/d.patch", "cat .cargo/config.toml | tee /tmp/x",
+])
+def test_qa2_false_positives_closed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+def test_qa2_include_key_in_write():
+    assert evaluate(_write(CFG, 'include = ["/tmp/evil.toml"]\n'), EMPTY).rule == RULE
+
+
+def test_qa2_no_quadratic_blowup():
+    # Write path with huge blank/whitespace bodies; the shell path with
+    # whitespace/operator bodies (a newline-heavy BASH command is slow in a
+    # pre-existing rule independent of this guard, so it is not asserted here).
+    import time
+    for body in ("\n" * 100000, " " * 100000, ">" * 100000, "RUSTFLAGS= " * 10000, "sed -i" * 20000):
+        t = time.time()
+        evaluate(_write(CFG, body), EMPTY)
+        assert time.time() - t < 5, repr(body[:12])
+    for body in (" " * 100000, ">" * 100000, "RUSTFLAGS= " * 10000, "sed -i" * 20000):
+        t = time.time()
+        evaluate(_shell("cargo --config x " + body), EMPTY)
+        assert time.time() - t < 10, repr(body[:12])

@@ -2714,7 +2714,7 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 # same linker hook. `REGISTRY_CONFIG_PATH_RE` already matches this PATH but
 # its sibling guard only inspects registry/index redirects, never these keys.
 _CARGO_LB = r"(?:^|(?<=[\s'\"/\\=<>]))"   # lookbehind boundary (consumes nothing)
-_CARGO_CFG_FILE = (r"(?:config(?:\.toml)?|[a-z.]*[*?\[][a-z.*?\[\]]*)")   # literal or globbed name
+_CARGO_CFG_FILE = (r"(?:config(?:\.toml)?|[a-z.]*[*?\[{][a-z.*?\[\]{},]*)")   # literal or globbed name
 _CARGO_HOME_VAR = r"(?:\$\{CARGO_HOME[^}\s]{0,100}\}|\$CARGO_HOME)"
 CARGO_CONFIG_PATH_RE = re.compile(
     _CARGO_LB + r"\.cargo" + _WIN_TRIM + _SEP + _CARGO_CFG_FILE + _CI_END
@@ -2732,18 +2732,27 @@ CARGO_CONFIG_BARE_FILENAME_RE = re.compile(_CARGO_BARE_FILE, re.IGNORECASE)
 
 
 def _cargo_dest(target: str) -> str:
-    """Shell forms where `target` is WRITTEN (redirect, tee, last arg of a
-    copy/move/link/install/fetch/git-restore, in-place edit target, or an
-    interpreter file write) -- NOT merely read (cat/diff/cp-source)."""
-    tail = r"[\"']?\s*(?:$|[;&|)])"
-    _pre = r"(?:[^\s;&|\"'\n]{0,200}[/\\])?"     # optional leading directory, e.g. `~/`
+    """Shell forms that WRITE `target`. Redirects and `tee` are matched on
+    the written operand itself (so `cat <target> | tee /tmp/x` and
+    `diff <target> x > /tmp/d` stay allowed); every other mutating verb is
+    matched on `target` appearing anywhere later in its own command segment
+    (no end anchor: `2>&1`, `-- `, trailing comments and extra flags must
+    not defeat it), which also ASKs on `cp <target> /tmp/backup` -- the
+    accepted fail-toward-ASK direction, since a copy's source/destination
+    cannot be told apart lexically."""
+    pre = r"(?:[^\s;&|\"'\n]{0,200}[/\\])?"      # optional leading directory, e.g. `~/`
+    seg = r"[^|;&\n]{0,300}?"
+    verbs = (r"cp|mv|install|ln|rsync|dd|curl|wget|patch|ed|xargs|find"
+             r"|git\s+(?:-C\s+\S+\s+)?(?:apply|am|checkout|restore)")
     return (
-        r">>?\s*[\"']?" + _pre + target
-        + r"|\btee\b(?:\s+-[a-zA-Z]+)*\s+[\"']?" + _pre + target
-        + r"|\b(?:cp|mv|install|ln|rsync|dd|curl|wget|git\s+(?:checkout|restore))\b[^|;&\n]{0,300}?"
-        + target + tail
-        + r"|\b(?:sed|perl|ruby)\b[^|;&\n]{0,200}?\s-[a-zA-Z]*i[^|;&\n]{0,200}?" + target
-        + r"|(?:\bopen\(|write_text|WriteAll|Set-Content|Out-File|Add-Content)[^\n]{0,300}?" + target
+        r">[>|&]?\s*[\"']?" + pre + target
+        + r"|\btee\b" + seg + target
+        + r"|\b(?:" + verbs + r")\b" + seg + target
+        + r"|\b(?:cp|mv|install|ln|rsync)\b" + seg + r"(?:-t\s*|--target-directory[=\s]\s*)"
+        + r"[^\s;&|]{0,200}\.cargo\b"
+        + r"|\b(?:cp|mv|install|ln|rsync)\b" + seg + r"\bconfig(?:\.toml)?\b" + seg + r"\.cargo\b"
+        + r"|\b(?:sed|perl|ruby|awk)\b[^|;&\n]{0,200}?(?:\s-[a-zA-Z]*i|--in-place)" + seg + target
+        + r"|(?:\bopen\(|write|copy|rename|symlink|link|replace|Set-Content|Out-File|Add-Content)[^\n]{0,300}?" + target
     )
 
 
@@ -2754,7 +2763,7 @@ CARGO_CONFIG_BARE_DEST_RE = re.compile(_cargo_dest("(?:" + _CARGO_BARE_FILE + ")
 # other program is not. The exemption is value-exact: a QUOTED value must
 # close right after `sccache` (`"sccache --x"` is not exempt); an unquoted
 # one (shell env form) may be followed only by whitespace/statement end.
-_CARGO_SCCACHE_VALUE = r"(?:\"sccache\"|'sccache'|sccache(?=[\s;&|)#]|$))"
+_CARGO_SCCACHE_VALUE = r"(?:\"(?:sccache|rustc|rustdoc)\"|'(?:sccache|rustc|rustdoc)'|(?:sccache|rustc|rustdoc)(?=[\s;&|)#]|$))"
 # An EMPTY value (`RUSTC_WRAPPER=`, `=""`) unsets rather than plants. (`scan_surface`
 # repeats the command, so an empty value may be followed by the repeat.)
 _CARGO_EMPTY_VALUE = r"(?:\"\"|'')?(?:[;&|)\n]|$|\s+(?:cargo|export|env|set)\b)"
@@ -2765,7 +2774,7 @@ CARGO_EXEC_KEY_RE = re.compile(
     r"|\b(?:runner|credential[-_]provider|global[-_]credential[-_]providers"
     r"|credential[-_]process)[\"']?\s*="
     r"|\bcredential[-_]alias\b"
-    r"|(?m:^\s*\[?include[\"']?\s*=)"                              # config `include = [...]`
+    r"|\binclude[\"']?\s*=\s*[\[\"']"                              # config `include = [...]`
     r"|linker(?:[-_]flavor)?[\"']?\s*="
     r"|fuse-ld\s*=|runtool|test-builder|codegen-backend|llvm-plugins"
     r"|pre-link-arg|-Wl,-plugin"
@@ -2775,16 +2784,17 @@ CARGO_EXEC_KEY_RE = re.compile(
 )
 # Env-var forms Cargo reads with the same authority as the config keys.
 _CARGO_ENV_NAMES = (
-    r"(?:CARGO_BUILD_)?(?:RUSTC|RUSTDOC)(?:_(?:WORKSPACE_)?WRAPPER)?"
+    r"(?:CARGO_BUILD_)?(?:RUSTC|RUSTDOC)_(?:WORKSPACE_)?WRAPPER|(?-i:CARGO_BUILD_RUSTC(?:DOC)?|RUSTC|RUSTDOC)"
+    r"|CARGO_REGISTR(?:Y|IES_[A-Z0-9_]+)_CREDENTIAL_PROCESS"
     r"|CARGO_TARGET_[A-Z0-9_]+_(?:RUNNER|LINKER)"
     r"|CARGO_REGISTR(?:Y|IES_[A-Z0-9_]+)_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?"
 )
 CARGO_ENV_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:" + _CARGO_ENV_NAMES + r")\s*=(?!\s*" + _CARGO_SCCACHE_VALUE + r")(?!" + _CARGO_EMPTY_VALUE + r")"
-    r"|\b(?:setx|setenv|set\s+-[A-Za-z]+)\s+(?:" + _CARGO_ENV_NAMES + r")\b"
+    r"|\b(?:setx|setenv|set\s+-(?!e\b)[A-Za-z]+)\s+(?:" + _CARGO_ENV_NAMES + r")\b"
     r"(?!\s+" + _CARGO_SCCACHE_VALUE + r")"
     r"|(?<![A-Za-z0-9_])(?:(?:CARGO_BUILD_|CARGO_TARGET_[A-Z0-9_]+_)?RUSTFLAGS|RUSTDOCFLAGS)\s*="
-    r"[^|;&\n]{0,300}(?:linker|fuse-ld|runtool|codegen-backend|llvm-plugins)\s*="
+    r"[^|;&\n]{0,300}(?:(?:linker|fuse-ld|codegen-backend|llvm-plugins)\s*=|runtool)"
     r"|\[(?:Environment|System\.Environment)\]::SetEnvironmentVariable\([^)\n]{0,40}"
     r"(?:" + _CARGO_ENV_NAMES + r")",
     re.IGNORECASE,
@@ -2792,10 +2802,10 @@ CARGO_ENV_RE = re.compile(
 # Inline `cargo --config '<key>=<value>'` (one command, same keys), or
 # `--config <file>.toml` loading an arbitrary config file.
 CARGO_INLINE_CONFIG_RE = re.compile(
-    r"\bcargo\b[^|;&\n]{0,300}--config(?:\s+|=)", re.IGNORECASE,
+    r"\b(?:cargo|cross)\b[^|;&\n]{0,300}--config(?:\s+|=)", re.IGNORECASE,
 )
 CARGO_CONFIG_FILE_ARG_RE = re.compile(
-    r"\bcargo\b[^|;&\n]{0,300}--config(?:\s+|=)[\"']?[^\s\"'=]*\.toml\b", re.IGNORECASE,
+    r"\b(?:cargo|cross)\b[^|;&\n]{0,300}--config(?:\s+|=)[\"']?(?:[^\s\"'=]*(?:\.toml\b|[/\\])|\$)", re.IGNORECASE,
 )
 
 

@@ -4659,8 +4659,23 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     after ``cd``, glob filenames, ``${CARGO_HOME:-..}``, ``[env]``/
     ``credential-alias``/``include`` and read-only-mention false positives.
 
+    Round 2 (fresh agent) found the destination matcher too narrow
+    (dir-destination ``cp x .cargo/``/``-t``, trailing ``2>&1``/comments,
+    multi-file ``tee``, ``dd of=``, ``sed --in-place``, ``>|``, brace
+    names, ``patch``/``git apply``/``checkout`` forms, credential-process
+    env, ``cross --config``, ``--config $VAR``) and a quadratic
+    ``^\\s*include`` regex; the matcher now treats ``>``/``tee`` operands
+    exactly and every other mutating verb as a hit when the path appears
+    later in its segment (so ``cp .cargo/config.toml /tmp/x`` ASKs --
+    accepted fail-toward-ASK; ``cat``/``diff``/``git diff > /tmp/x`` pass),
+    scans the raw command and its decoded remainder separately, and bare
+    ``rustc``/``rustdoc`` values are exempt like ``sccache``. A pre-existing,
+    unrelated rule is slow (>100s) on a Bash command with ~20K newlines; not
+    this guard's, left for its own fix.
+
     Honest scope (denylist trade-offs): a ``CARGO_HOME`` relocated by an
-    earlier command, ``git apply <patch>`` (path not on the command line),
+    earlier command, a ``cd .cargo`` followed by ``cp ../a .``, directory-
+    glob names (``.carg?/config.toml``), ``git apply <patch>`` (path not on the command line),
     an ``[alias]`` resolving to a PATH ``cargo-<name>``, PowerShell
     ``[IO.File]::WriteAllText`` forms,
     config assembled indirectly, and a malicious ``build.rs``/proc-macro/
@@ -4714,9 +4729,19 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        file_hit = bool(patterns.CARGO_CONFIG_DEST_RE.search(cmd)
-                         or (patterns.CARGO_CONFIG_CD_RE.search(cmd)
-                             and patterns.CARGO_CONFIG_BARE_DEST_RE.search(cmd)))
+        # scan_surface repeats the raw command; test each distinct text on its
+        # own so a read in one copy and a write in the next never combine.
+        raw = _cmd(ev)
+        texts = {raw, cmd[len(raw):].strip()} if cmd.startswith(raw) else {raw, cmd}
+        texts.discard("")
+        # Every file form needs a literal `cargo` (`.cargo`/`$CARGO_HOME`);
+        # skipping the costlier destination regexes without it keeps large
+        # unrelated commands cheap.
+        file_hit = any("cargo" in t.lower()
+                       and (patterns.CARGO_CONFIG_DEST_RE.search(t)
+                       or (patterns.CARGO_CONFIG_CD_RE.search(t)
+                           and patterns.CARGO_CONFIG_BARE_DEST_RE.search(t)))
+                       for t in texts)
         env_hit = bool(patterns.CARGO_ENV_RE.search(cmd))
         inline_hit = bool((patterns.CARGO_INLINE_CONFIG_RE.search(cmd)
                             and patterns.CARGO_EXEC_KEY_RE.search(cmd))
