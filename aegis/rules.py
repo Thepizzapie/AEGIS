@@ -7934,7 +7934,22 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     planted earlier, `build.rs`/proc-macro crates (ordinary source), and
     values assembled indirectly are not covered; the shell branch is not
     clause-scoped, so an unrelated clause can cause a false ASK, never a
-    false ALLOW."""
+    false ALLOW. Also uncovered: `cargo_exec.allow` matches the file path
+    only for the write form, so it can whitelist whole paths, not
+    contents (same as `terraform_exec`); `-Z pre-link-arg`/`--sysroot`,
+    `[doc] browser`, `[credential-alias]`; a `cd .cargo && ... > config`
+    write that never names the `.cargo/config` path; and an inline
+    (non-full-line) TOML comment can cause a false ASK.
+
+    QA history: round 1 (independent adversarial review) found and this
+    guard closed: literal `\\n`/`\\t` escapes in `printf`/`echo -e` payloads
+    hiding the key from the word-boundary lookbehind; a typo'd
+    `CARGO_BUILD_RUSTDOC` env name; rustflags-family env vars
+    (`RUSTFLAGS`, `CARGO_TARGET_*_RUSTFLAGS`, ...) carrying
+    linker/link-arg/codegen-backend/runtool; split `"-C", "link-arg=.."`
+    TOML tokens; `CARGO_REGISTRIES_<NAME>_CREDENTIAL_PROVIDER`; and the
+    `-Clinker-plugin-lto` false ASK. No ReDoS; wiring matched
+    `terraform_exec`."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

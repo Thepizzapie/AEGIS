@@ -139,3 +139,38 @@ def test_loader_roundtrip(tmp_path):
     pol = load_policy(str(tmp_path))
     assert pol.cargo_exec == {"mode": "deny"}
     assert evaluate(_write(".cargo/config.toml", WRAP), pol).action == Action.DENY
+
+
+# ---- QA round 1 regressions ---------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "printf '[build]\\nrustc-wrapper=\"x\"\\n' > .cargo/config.toml",
+    "printf '[target.x]\\nrunner=\"x\"' >> .cargo/config.toml",
+    "echo -e '[build]\\nlinker=\"x\"' >> .cargo/config.toml",
+    "printf '[build]\\trustc-wrapper=1' >> .cargo/config.toml",
+    "CARGO_BUILD_RUSTDOC=/tmp/x cargo doc",
+    "CARGO_BUILD_RUSTFLAGS='-C linker=/tmp/x' cargo b",
+    "export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Clinker=/tmp/x'",
+    "export RUSTFLAGS='-C link-arg=-fuse-ld=/tmp/x'",
+    "export RUSTDOCFLAGS='--runtool /tmp/x'",
+    "export CARGO_REGISTRIES_MINE_CREDENTIAL_PROVIDER=/tmp/p",
+])
+def test_qa1_shell_bypasses_closed(cmd):
+    assert _hit(_shell(cmd))[0], cmd
+
+
+@pytest.mark.parametrize("content", [
+    '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=/tmp/x"]\n',
+    '[build]\nrustflags = ["-C","link-args=x"]\n',
+    '[build]\nrustflags = ["--codegen=link-arg=-B/x"]\n',
+    '[build]\nrustflags = ["-Zcodegen-backend=/tmp/x.so"]\n',
+])
+def test_qa1_rustflags_splits_closed(content):
+    assert _hit(_write(".cargo/config.toml", content))[0], content
+
+
+@pytest.mark.parametrize("ev", [
+    _write(".cargo/config.toml", '[build]\nrustflags = ["-Clinker-plugin-lto", "-C", "linker-flavor=ld.lld"]\n'),
+    _shell("export RUSTFLAGS=-Dwarnings"),
+])
+def test_qa1_boundary_false_positives_closed(ev):
+    assert not _hit(ev)[0]

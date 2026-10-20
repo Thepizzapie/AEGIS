@@ -5366,23 +5366,32 @@ CARGO_CONFIG_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
-_CARGO_KEY_START = r"(?<![\w-])[\"']?"
+# `(?<=\\[nrt])`: a literal backslash-n/r/t escape (`printf '[build]\nrunner=..'`)
+# ends with a word character, so it must count as a key boundary too.
+_CARGO_KEY_START = r"(?:(?<![\w-])|(?<=\\[nrt]))[\"']?"
 CARGO_EXEC_HIT_RE = re.compile(
     _CARGO_KEY_START + r"(?:rustc[-_](?:workspace[-_])?wrapper|runner|linker|rustc|rustdoc"
-    r"|global[-_]credential[-_]providers|credential[-_]provider)[\"']?\s*="
-    r"|-C\s*(?:linker|link-args?)\b",
+    r"|global[-_]credential[-_]providers|credential[-_]provider"
+    r"|link-args?|codegen-backend)[\"']?\s*="
+    r"|-Z[ \t]*codegen-backend\s*="
+    r"|(?:-C|--codegen)[\s=]*(?:linker|link-args?)(?![\w-])",
     re.IGNORECASE,
 )
 # Env-var form: same keys without touching any file.
 _CARGO_ENV_NAMES = (
     r"(?:RUSTC|RUSTDOC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER"
-    r"|CARGO_BUILD_RUSTC(?:DOC|_WRAPPER|_WORKSPACE_WRAPPER)?"
+    r"|CARGO_BUILD_(?:RUSTC|RUSTDOC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)"
     r"|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:RUNNER|LINKER)"
-    r"|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?)"
+    r"|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER)"
 )
 CARGO_EXEC_ENV_RE = re.compile(
     r"(?<![\w$])" + _CARGO_ENV_NAMES + r"[ \t]*=(?!=)"                  # NAME=val, $env:NAME = val
-    r"|\b(?:setx|setenv)[ \t]+" + _CARGO_ENV_NAMES + r"[ \t]+\S",        # setx NAME val
+    r"|\b(?:setx|setenv)[ \t]+" + _CARGO_ENV_NAMES + r"[ \t]+\S"         # setx NAME val
+    # rustflags-family vars carrying a linker/link-arg/codegen-backend/runtool flag
+    r"|(?<![\w$])(?:RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS"
+    r"|CARGO_BUILD_RUSTDOCFLAGS|CARGO_TARGET_[A-Z0-9_]{1,80}_RUSTFLAGS)[ \t]*=[^\n]{0,300}?"
+    r"(?:linker|link-args?|codegen-backend|runtool)",
+    re.IGNORECASE,
 )
 # `cargo --config 'build.rustc-wrapper="x"'` / `cargo --config=...`.
 CARGO_CLI_CONFIG_RE = re.compile(r"\bcargo\b[^\n]{0,400}?--config\b", re.IGNORECASE)
