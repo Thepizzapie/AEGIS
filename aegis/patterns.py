@@ -5350,6 +5350,46 @@ TF_EXEC_HIT_RE = re.compile(
 # "local-exec"-shaped substring in another produces a same-command false
 # ASK, not a false ALLOW.
 
+# ---- Cargo (Rust) exec-hijack protection (.cargo/config.toml) -----------------
+# Cargo's own config file can name a program CARGO ITSELF executes, with no
+# further hijack needed: `[build] rustc-wrapper`/`rustc-workspace-wrapper`
+# wrap EVERY rustc invocation (so the very next `cargo build`/`check`/`test`/
+# `clippy`, also rust-analyzer's background `cargo check` in an IDE);
+# `[target.<triple>] runner` is exec'd for every `cargo run`/`test`/`bench`;
+# `linker` runs on every link; `[build] rustc`/`rustdoc` replace the
+# compiler outright; `credential-provider` is handed the registry token
+# (the cargo analog of git's `credential.helper`). Existing
+# `REGISTRY_CONFIG_PATH_RE` gates only registry/index REDIRECTION in this
+# same file, not these exec-capable keys. `.cargo/config.toml` is routinely
+# TRACKED, so a planted wrapper reads as a one-line "build cache" tweak.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+_CARGO_KEY_START = r"(?<![\w-])[\"']?"
+CARGO_EXEC_HIT_RE = re.compile(
+    _CARGO_KEY_START + r"(?:rustc[-_](?:workspace[-_])?wrapper|runner|linker|rustc|rustdoc"
+    r"|global[-_]credential[-_]providers|credential[-_]provider)[\"']?\s*="
+    r"|-C\s*(?:linker|link-args?)\b",
+    re.IGNORECASE,
+)
+# Env-var form: same keys without touching any file.
+_CARGO_ENV_NAMES = (
+    r"(?:RUSTC|RUSTDOC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER"
+    r"|CARGO_BUILD_RUSTC(?:DOC|_WRAPPER|_WORKSPACE_WRAPPER)?"
+    r"|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:RUNNER|LINKER)"
+    r"|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_PROVIDERS?)"
+)
+CARGO_EXEC_ENV_RE = re.compile(
+    r"(?<![\w$])" + _CARGO_ENV_NAMES + r"[ \t]*=(?!=)"                  # NAME=val, $env:NAME = val
+    r"|\b(?:setx|setenv)[ \t]+" + _CARGO_ENV_NAMES + r"[ \t]+\S",        # setx NAME val
+)
+# `cargo --config 'build.rustc-wrapper="x"'` / `cargo --config=...`.
+CARGO_CLI_CONFIG_RE = re.compile(r"\bcargo\b[^\n]{0,400}?--config\b", re.IGNORECASE)
+# Known, disclosed gaps: CARGO_HOME-relocated config, `--config other.toml`
+# pointing at a file planted earlier, `build.rs`/proc-macro crates (ordinary
+# source, far too noisy to gate), and values built indirectly.
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
