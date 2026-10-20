@@ -174,3 +174,36 @@ def test_qa1_rustflags_splits_closed(content):
 ])
 def test_qa1_boundary_false_positives_closed(ev):
     assert not _hit(ev)[0]
+
+
+# ---- QA round 2 regressions ---------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cargo rustc -- -C linker=/tmp/x",
+    "cargo rustc -- -Clink-arg=-x",
+    "cargo rustc -- -Zcodegen-backend=/x.so",
+    "cargo rustdoc -- --runtool /x",
+    "printf '[build]\\x0arustc-wrapper=\"x\"' > .cargo/config.toml",
+    "printf '[build]\\012rustc-wrapper=\"x\"' > .cargo/config.toml",
+    "RUSTFLAGS='-C link_arg=-x' cargo b",
+    "RUSTFLAGS='-Zcodegen_backend=/x' cargo b",
+    "export CARGO_TARGET_X_RUSTDOCFLAGS='--runtool x'",
+    "export CARGO_REGISTRIES_MY-REG_CREDENTIAL_PROVIDER=x",
+    "RUSTFLAGS+=' -Clinker=x' cargo b",
+])
+def test_qa2_bypasses_closed(cmd):
+    assert _hit(_shell(cmd))[0], cmd
+
+
+def test_qa2_underscore_in_file():
+    assert _hit(_write(".cargo/config.toml", '[build]\nrustflags = ["-C", "link_arg=-x"]\n'))[0]
+
+
+@pytest.mark.parametrize("cmd", [
+    "RUSTFLAGS='-Clinker-plugin-lto' cargo build",
+    "export RUSTFLAGS='-C linker-plugin-lto -C target-cpu=native'",
+    "RUSTFLAGS=-Clinker-flavor=gcc cargo build",
+    "RUSTFLAGS=-Dwarnings cargo clippy; ld --version | grep linker",
+    "X=1 RUSTFLAGS=\"-Cdebuginfo=0\" cargo b; cat linker.log",
+])
+def test_qa2_false_asks_closed(cmd):
+    assert not _hit(_shell(cmd))[0], cmd

@@ -7949,7 +7949,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     linker/link-arg/codegen-backend/runtool; split `"-C", "link-arg=.."`
     TOML tokens; `CARGO_REGISTRIES_<NAME>_CREDENTIAL_PROVIDER`; and the
     `-Clinker-plugin-lto` false ASK. No ReDoS; wiring matched
-    `terraform_exec`."""
+    `terraform_exec`. Round 2 closed: `cargo rustc/rustdoc -- <flags>`
+    on the command line, `\\x0a`/`\\012`/`\\u000a` escapes, `_` spellings
+    (`link_arg`, `codegen_backend`), `CARGO_TARGET_*_RUSTDOCFLAGS`,
+    hyphenated registry env names, `RUSTFLAGS+=`, and false ASKs on
+    `-Clinker-plugin-lto`/`-Clinker-flavor` and on text after the env
+    assignment. Remaining: fish `set -x`, `SetEnvironmentVariable`."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -7997,7 +8002,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         hit = (
             (patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
              and patterns.CARGO_EXEC_HIT_RE.search(scan_cmd))
-            or (patterns.CARGO_CLI_CONFIG_RE.search(scan_cmd)
+            or ((patterns.CARGO_CLI_CONFIG_RE.search(scan_cmd)
+                 or patterns.CARGO_CLI_RUSTC_RE.search(scan_cmd))
                 and patterns.CARGO_EXEC_HIT_RE.search(scan_cmd))
             or patterns.CARGO_EXEC_ENV_RE.search(scan_cmd)
         )
