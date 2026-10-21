@@ -1540,19 +1540,24 @@ def agent_def_find_hit(cmd: str) -> bool:
 # CI agent's session on another tool picks a planted instruction up with zero
 # further agent action -- a prompt-injection payload that persists past this session
 # and past this agent's own guards.
-_RULES_ROOT = r"(?:^|[\s'\"/\\=])"
+_RULES_ROOT = r"(?:^|[\s'\"/\\=<>|;&(){}`])"
 _RULES_SEG = r"(?:" + _CI_SEG + _SEP + r"){0,4}"
 _RULES_LEAF = _CI_SEG + r"\.(?:mdc?|txt|toml|ya?ml)" + _CI_END
 AGENT_RULES_PATH_RE = re.compile(
     # single-file names (distinctive enough to match bare, any directory)
-    _RULES_ROOT + r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|GEMINI\.md|copilot-instructions\.md)"
+    _RULES_ROOT + r"(?:\.cursorrules|\.windsurfrules|\.clinerules[^\s'\"/\\]{0,40}|\.roorules|\.roomodes|\.goosehints"
+    + r"|(?:GEMINI|QWEN|CRUSH)\.md|copilot-instructions\.md|\.junie" + _WIN_TRIM + _SEP + r"guidelines\.md"
+    + r"|\.cursor" + _WIN_TRIM + _SEP + r"hooks\.json)"
     + _CI_END
     # directory-held rule/definition files
     + r"|" + _RULES_ROOT + r"(?:\.clinerules|\.cursor" + _WIN_TRIM + _SEP + r"rules"
     + r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules|\.roo" + _WIN_TRIM + _SEP + r"rules[^\s'\"/\\]{0,40}"
     + r"|\.continue" + _WIN_TRIM + _SEP + r"rules|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
     + r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|chatmodes|agents)"
-    + r"|\.gemini" + _WIN_TRIM + _SEP + r"commands|\.codex" + _WIN_TRIM + _SEP + r"prompts)"
+    + r"|\.gemini" + _WIN_TRIM + _SEP + r"commands|\.codex" + _WIN_TRIM + _SEP + r"prompts"
+    + r"|\.cursor" + _WIN_TRIM + _SEP + r"commands|\.windsurf" + _WIN_TRIM + _SEP + r"workflows"
+    + r"|\.continue" + _WIN_TRIM + _SEP + r"prompts|\.amazonq" + _WIN_TRIM + _SEP + r"prompts"
+    + r"|\.(?:augment|trae)" + _WIN_TRIM + _SEP + r"rules|\.kiro" + _WIN_TRIM + _SEP + r"steering)"
     + _WIN_TRIM + _SEP + _RULES_SEG + _RULES_LEAF
     # Windsurf's global rules file
     + r"|" + _RULES_ROOT + r"global_rules\.md" + _CI_END,
@@ -1566,7 +1571,10 @@ AGENT_RULES_DIR_RE = re.compile(
     + r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules|\.roo" + _WIN_TRIM + _SEP + r"rules[^\s'\"/\\]{0,40}"
     + r"|\.continue" + _WIN_TRIM + _SEP + r"rules|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
     + r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|chatmodes|agents)"
-    + r"|\.gemini" + _WIN_TRIM + _SEP + r"commands|\.codex" + _WIN_TRIM + _SEP + r"prompts)"
+    + r"|\.gemini" + _WIN_TRIM + _SEP + r"commands|\.codex" + _WIN_TRIM + _SEP + r"prompts"
+    + r"|\.cursor" + _WIN_TRIM + _SEP + r"commands|\.windsurf" + _WIN_TRIM + _SEP + r"workflows"
+    + r"|\.continue" + _WIN_TRIM + _SEP + r"prompts|\.amazonq" + _WIN_TRIM + _SEP + r"prompts"
+    + r"|\.(?:augment|trae)" + _WIN_TRIM + _SEP + r"rules|\.kiro" + _WIN_TRIM + _SEP + r"steering)"
     + _CI_END,
     re.IGNORECASE,
 )

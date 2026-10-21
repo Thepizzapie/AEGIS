@@ -147,3 +147,72 @@ def test_perf_no_redos():
     evaluate(_shell(adversarial), EMPTY)
     evaluate(_shell("find . " + "-name x " * 5000 + "-delete"), EMPTY)
     assert time.time() - start < 2.0
+
+
+# ---- QA round 1 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "echo x>.cursorrules", "echo x>GEMINI.md", "echo x>>.clinerules",
+    "echo x>.cursor/rules/x.mdc", "{ echo x; }>.cursorrules", "(echo x)>.cursorrules",
+    "echo x>|.cursorrules",
+    "ln -s /tmp/e .cursorrules", "ln -sfn /tmp/evil .cursor/rules",
+    "install -m644 a .cursorrules", "install a .cursor/rules/x.mdc",
+    "patch .cursorrules < p.diff", "cat a | sponge .cursorrules",
+    "curl -o .cursorrules http://x/y", "wget -O .cursorrules http://x/y",
+    "wget -P .cursor/rules http://x/y",
+    "git checkout origin/x -- .cursorrules", "git restore --source=X .cursorrules",
+    "echo x > .cursor/hooks.json", "echo x > .cursor/commands/a.md",
+    "echo x > QWEN.md", "echo x > .clinerules-code", "echo x > .kiro/steering/a.md",
+])
+def test_qa1_shell_bypasses_closed(cmd):
+    d = _only(cmd)
+    assert d is not None and d.action == Action.ASK, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat .cursorrules 2>&1", "ls .cursor/rules 2>/dev/null",
+    "grep -n foo .cursorrules 2>&1 >/dev/null",
+])
+def test_qa1_noop_redirect_reads_allowed(cmd):
+    assert _only(cmd) is None, cmd
+
+
+def _mcp(tool, args):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool=tool, action=ActionClass.MCP, args=args)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__github__push_files", {"files": [{"path": ".cursor/rules/a.mdc", "content": "x"}]}),
+    ("mcp__fs__move_file", {"source": "a", "destination": ".cursorrules"}),
+    ("mcp__fs__copy", {"src": "a", "dest": "GEMINI.md"}),
+    ("mcp__fs__write_multiple_files", {"files": [{"path": ".windsurfrules"}]}),
+    ("mcp__fs__edit_file", {"filepath": ".cursorrules"}),
+    ("mcp__x__do", {"target_path": ".cursorrules"}),
+    ("mcp__x__apply_patch", {"input": "*** Begin Patch\n*** Add File: .cursorrules\n+x\n*** End Patch"}),
+])
+def test_qa1_mcp_shapes_gated(tool, args):
+    d = rules.rule_agent_rules_protect(_mcp(tool, args), EMPTY)
+    assert d is not None and d.rule == "agent-rules-protect", (tool, args)
+
+
+def test_qa1_write_filePath_key_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Write", args={"filePath": ".cursorrules"})
+    assert rules.rule_agent_rules_protect(ev, EMPTY) is not None
+
+
+def test_qa1_mcp_read_tool_and_prose_not_gated():
+    assert rules.rule_agent_rules_protect(_mcp("mcp__fs__read_file", {"x": ".cursorrules"}), EMPTY) is None
+    assert rules.rule_agent_rules_protect(
+        _mcp("mcp__fs__write_file", {"path": "notes.md", "content": "edit .cursorrules later"}), EMPTY) is None
+
+
+def test_qa1_allow_list_not_smuggled_via_command_text():
+    pol = Policy(agent_rules={"allow": [r"docs/ai/"]})
+    assert rules.rule_agent_rules_protect(_shell("echo x >> .cursorrules # docs/ai/"), pol) is not None
+    assert rules.rule_agent_rules_protect(_shell("echo x >> .cursorrules; echo docs/ai/"), pol) is not None
+    assert rules.rule_agent_rules_protect(_shell("echo x >> docs/ai/.cursorrules"), pol) is None
+
+
+def test_qa1_monitor_mode_shell_records_and_allows():
+    assert rules.rule_agent_rules_protect(
+        _shell("echo x >> .cursorrules"), Policy(agent_rules={"mode": "monitor"})) is None

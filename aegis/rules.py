@@ -1164,6 +1164,46 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
 
 
 # ---- non-Claude coding-agent rule-file protection: escapable with human confirm --
+# Full path token ending at a match (the match itself starts at the token's last
+# separator, so the directory prefix an allow-list regex needs lives before it).
+_AGENT_RULES_TOKEN_RE = re.compile(r"[^\s'\"=<>|;&(){}`]*$")
+_AGENT_RULES_NOOP_REDIR_RE = re.compile(r"\d*>&\d+|\d*>>?\s*/dev/null\b")
+# Write shapes the shared verb patterns miss: plain `ln -s`, `install -m644`,
+# `patch`, `sponge`, `git checkout|restore` (restores attacker-chosen content),
+# and fetch-to-file flags.
+_AGENT_RULES_EXTRA_WRITE_RE = re.compile(
+    r"\bln\b|\binstall\b|\bpatch\b|\bsponge\b|\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore)\b"
+    r"|\bcurl\b[^|;&\n]*\s(?:-[a-zA-Z]*[oO]\b|--output)|\bwget\b[^|;&\n]*\s-[a-zA-Z]*[OP]\b",
+    re.IGNORECASE)
+_AGENT_RULES_READ_TOOL_RE = re.compile(r"(?:^|[_\-])(?:read|get|list|search|view|stat|find|grep)", re.IGNORECASE)
+_AGENT_RULES_PATCH_HDR_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _agent_rules_hit_path(ev: Event) -> str:
+    """The rule-file path an Edit/Write/MCP call targets, or ''. `_path()` knows
+    only a fixed key list; MCP tools name targets under arbitrary keys and
+    nesting (`files:[{path}]`, `destination`, `filePath`) or carry them in a
+    patch body (`*** Add File:`), so every short string leaf is checked too. A
+    read-only-looking MCP tool is skipped to avoid flagging a lookup."""
+    p = _path(ev)
+    if p and patterns.AGENT_RULES_PATH_RE.search(p):
+        return p
+    if ev.action != ActionClass.MCP and ev.tool not in ("Write", "Edit", "MultiEdit", "apply_patch"):
+        return ""
+    if ev.action == ActionClass.MCP and _AGENT_RULES_READ_TOOL_RE.search(ev.tool or ""):
+        return ""
+    for v in _flatten_strings(ev.args or {}):
+        if not isinstance(v, str):
+            continue
+        cands = _AGENT_RULES_PATCH_HDR_RE.findall(v) if "*** " in v else []
+        if len(v) <= 300 and not any(c.isspace() for c in v.strip()):
+            cands.append(v)
+        for c in cands:
+            if patterns.AGENT_RULES_PATH_RE.search(c):
+                return c
+    return ""
+
+
 def _agent_rules_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -1210,8 +1250,19 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     MCP-path handling it mirrors). Known residual gaps: a fetch-to-file write
     with no recognized write verb (see ``rule_fetch_to_file_protect``), a rule
     file for an agent not listed above, nesting past 4 levels in the filename
-    form (the bare-directory backstop covers archive/sync targets), and
-    indirect path construction across separate shell variables."""
+    form (the bare-directory backstop covers archive/sync targets), indirect
+    path construction across separate shell variables, replacing a PARENT
+    directory wholesale (`cp -r evil .cursor`, `cd .cursor && echo x > rules/a`),
+    `..` traversal in the shell form, and non-path-key MCP shapes whose target
+    is a multi-token string. A read that also names a target alongside a real
+    write verb still asks (coarse, same as agent_def); `2>&1`/`>/dev/null` do not.
+
+    QA history: round 1 (independent adversarial review) found and this guard
+    closed: no-space redirects (`echo x>.cursorrules`), MCP `push_files`/
+    `move`/`copy`/`files[]`/`filePath`/`apply_patch` target shapes, plain
+    `ln -s`/`install -m644`/`patch`/`sponge`/`git checkout|restore`/fetch-to-file
+    verbs, allow-list smuggling via comment text in the command, `2>&1`
+    false positives, and a wider rule-file set."""
     cfg = getattr(policy, "agent_rules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1226,8 +1277,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
         return would
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
-        p = _path(ev)
-        if not (p and patterns.AGENT_RULES_PATH_RE.search(p)):
+        p = _agent_rules_hit_path(ev)
+        if not p:
             return None
         if os.environ.get("AEGIS_ALLOW_AGENT_RULES") or _agent_rules_allowed_by_policy(cfg, p):
             return None
@@ -1240,11 +1291,15 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        names_target = bool(patterns.AGENT_RULES_PATH_RE.search(cmd)
-                             or patterns.AGENT_RULES_DIR_RE.search(cmd)
-                             or patterns.agent_rules_find_hit(cmd))
+        targets = [_AGENT_RULES_TOKEN_RE.search(cmd[:m.end()]).group(0)
+                   for rx in (patterns.AGENT_RULES_PATH_RE, patterns.AGENT_RULES_DIR_RE)
+                   for m in rx.finditer(cmd)]
+        names_target = bool(targets or patterns.agent_rules_find_hit(cmd))
+        # A harmless stderr/stdout redirect (`2>&1`, `>/dev/null`) is not a write.
+        wcmd = _AGENT_RULES_NOOP_REDIR_RE.sub(" ", cmd)
         touches_target = names_target and (
-            patterns.WRITE_REDIRECT_RE.search(cmd)
+            patterns.WRITE_REDIRECT_RE.search(wcmd)
+            or _AGENT_RULES_EXTRA_WRITE_RE.search(cmd)
             or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
             or patterns.INPLACE_WRITE_RE.search(cmd)
@@ -1252,8 +1307,10 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
             or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
         if not touches_target:
             return None
+        # The allow-list is matched against the targeted paths only, never the
+        # whole command text, which the agent controls (`... # docs/ai/`).
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_RULES")
-                or _agent_rules_allowed_by_policy(cfg, _cmd(ev))):
+                or (targets and all(_agent_rules_allowed_by_policy(cfg, t) for t in targets))):
             return None
         return _finish(Decision(action, "agent-rules-protect",
                          "A coding-agent rule/instruction file (Cursor, Windsurf, Cline, "
