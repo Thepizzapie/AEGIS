@@ -53,7 +53,7 @@ def load_policy(path) -> Policy:
         "rules": [], "default": Action.ALLOW, "on_error": Action.ALLOW,
         "egress": {}, "plugins": [], "workspace": {}, "project": None,
         "agent_label": None, "install_review": {}, "mcp_config": {}, "mcp_tool_integrity": {},
-        "ci_workflow": {}, "git_hooks": {}, "hook_manager": {}, "agent_def": {}, "skills_protect": {},
+        "ci_workflow": {}, "git_hooks": {}, "hook_manager": {}, "agent_def": {}, "agent_rules": {}, "skills_protect": {},
         "shell_persist": {},
         "direnv": {},
         "package_manifest": {}, "pnpmfile_exec": {}, "yarn_exec": {}, "git_config_exec": {}, "git_attributes_exec": {},
@@ -96,7 +96,7 @@ def load_policy(path) -> Policy:
                   mcp_tool_integrity=st["mcp_tool_integrity"],
                   ci_workflow=st["ci_workflow"], git_hooks=st["git_hooks"],
                   hook_manager=st["hook_manager"],
-                  agent_def=st["agent_def"], skills_protect=st["skills_protect"],
+                  agent_def=st["agent_def"], agent_rules=st["agent_rules"], skills_protect=st["skills_protect"],
                   shell_persist=st["shell_persist"],
                   direnv=st["direnv"],
                   package_manifest=st["package_manifest"],
@@ -153,7 +153,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
     # Guard-config knobs (install review, MCP-config protection, context
     # injection, failure-loop, completion verification) — small dicts.
     for key in ("install_review", "mcp_config", "mcp_tool_integrity", "ci_workflow", "git_hooks", "hook_manager",
-                "agent_def",
+                "agent_def", "agent_rules",
                 "skills_protect",
                 "shell_persist", "direnv", "package_manifest", "pnpmfile_exec", "yarn_exec", "git_config_exec",
                 "git_attributes_exec", "gitmodules", "service_persist", "ld_preload",

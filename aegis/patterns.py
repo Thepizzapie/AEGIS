@@ -1523,6 +1523,68 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# ---- Non-Claude coding-agent instruction/rule-file protection -------------------
+# A sibling of the agent_def family above, on a surface that family never reaches:
+# `AGENT_INSTRUCTIONS_PATH_RE`/`AGENT_DEF_PATH_RE` recognize only `CLAUDE.md`/
+# `AGENTS.md` and `.claude/{agents,commands,output-styles}`. Every OTHER coding
+# agent that opens the same repository reads its own auto-loaded, natural-language
+# rule file with the same "folded into every session's context, unattended"
+# property: Cursor (`.cursorrules`, `.cursor/rules/*.mdc`), Windsurf
+# (`.windsurfrules`, `.windsurf/rules/*`), Cline (`.clinerules`, file or directory),
+# Roo Code (`.roorules`, `.roo/rules*/`), GitHub Copilot
+# (`.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`,
+# `.github/prompts/*`, `.github/chatmodes/*`, `.github/agents/*`), Gemini CLI
+# (`GEMINI.md`, `.gemini/commands/*.toml`), Continue (`.continue/rules/*`), Amazon Q
+# (`.amazonq/rules/*`) and Codex CLI (`.codex/prompts/*`). These are ordinarily
+# TRACKED files that read as routine team convention in review, and a teammate's or
+# CI agent's session on another tool picks a planted instruction up with zero
+# further agent action -- a prompt-injection payload that persists past this session
+# and past this agent's own guards.
+_RULES_ROOT = r"(?:^|[\s'\"/\\=])"
+_RULES_SEG = r"(?:" + _CI_SEG + _SEP + r"){0,4}"
+_RULES_LEAF = _CI_SEG + r"\.(?:mdc?|txt|toml|ya?ml)" + _CI_END
+AGENT_RULES_PATH_RE = re.compile(
+    # single-file names (distinctive enough to match bare, any directory)
+    _RULES_ROOT + r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|GEMINI\.md|copilot-instructions\.md)"
+    + _CI_END
+    # directory-held rule/definition files
+    + r"|" + _RULES_ROOT + r"(?:\.clinerules|\.cursor" + _WIN_TRIM + _SEP + r"rules"
+    + r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules|\.roo" + _WIN_TRIM + _SEP + r"rules[^\s'\"/\\]{0,40}"
+    + r"|\.continue" + _WIN_TRIM + _SEP + r"rules|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
+    + r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|chatmodes|agents)"
+    + r"|\.gemini" + _WIN_TRIM + _SEP + r"commands|\.codex" + _WIN_TRIM + _SEP + r"prompts)"
+    + _WIN_TRIM + _SEP + _RULES_SEG + _RULES_LEAF
+    # Windsurf's global rules file
+    + r"|" + _RULES_ROOT + r"global_rules\.md" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Bare directory reference (no filename), for the archive/sync-tool bypass
+# (`rsync -a payload/ .cursor/rules/`) -- same reason AGENT_DEF_DIR_RE exists.
+AGENT_RULES_DIR_RE = re.compile(
+    _RULES_ROOT + r"(?:\.clinerules|\.cursor" + _WIN_TRIM + _SEP + r"rules"
+    + r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules|\.roo" + _WIN_TRIM + _SEP + r"rules[^\s'\"/\\]{0,40}"
+    + r"|\.continue" + _WIN_TRIM + _SEP + r"rules|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
+    + r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|chatmodes|agents)"
+    + r"|\.gemini" + _WIN_TRIM + _SEP + r"commands|\.codex" + _WIN_TRIM + _SEP + r"prompts)"
+    + _CI_END,
+    re.IGNORECASE,
+)
+
+# `find -path/-name/-regex` indirection (see AGENT_DEF_FIND_PREDICATE_RE): the
+# directory names are distinctive, and a `-regex` value separates components with
+# its own wildcard, so the dotted root names stand alone.
+AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|GEMINI\.md\b"
+    r"|copilot-instructions|\.cursor\b|\.windsurf\b|\.roo\b|\.continue\b"
+    r"|\.amazonq\b|\.gemini\b|\.codex\b|global_rules"
+    r"|\.github[/\\](?:instructions|prompts|chatmodes|agents)\b)")
+
+
+def agent_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, AGENT_RULES_FIND_PREDICATE_RE)
+
+
 # ---- Claude Code Skill-definition protection -----------------------------------
 # A sibling of the agent_def family above, on a surface that family never reaches:
 # `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
