@@ -1166,14 +1166,24 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
 # ---- non-Claude coding-agent rule-file protection: escapable with human confirm --
 # Full path token ending at a match (the match itself starts at the token's last
 # separator, so the directory prefix an allow-list regex needs lives before it).
-_AGENT_RULES_TOKEN_RE = re.compile(r"[^\s'\"=<>|;&(){}`]*$")
+_AGENT_RULES_TOKEN_SPLIT_RE = re.compile(r"[\s'\"=<>|;&(){}`]")
+
+
+def _agent_rules_token(cmd: str, end: int) -> str:
+    """The path token ending at ``end``. Linear (split, not an unanchored
+    ``...*$`` search, which is quadratic on a long whitespace-free run) and
+    capped, since a real path never needs more than a few hundred chars."""
+    return _AGENT_RULES_TOKEN_SPLIT_RE.split(cmd[max(0, end - 400):end])[-1]
 _AGENT_RULES_NOOP_REDIR_RE = re.compile(r"\d*>&\d+|\d*>>?\s*/dev/null\b")
 # Write shapes the shared verb patterns miss: plain `ln -s`, `install -m644`,
 # `patch`, `sponge`, `git checkout|restore` (restores attacker-chosen content),
 # and fetch-to-file flags.
+_AGENT_RULES_CMDPOS = r"(?:^|[;&|(\n]\s*)(?:sudo\s+|command\s+|env\s+)?"
 _AGENT_RULES_EXTRA_WRITE_RE = re.compile(
-    r"\bln\b|\binstall\b|\bpatch\b|\bsponge\b|\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore)\b"
-    r"|\bcurl\b[^|;&\n]*\s(?:-[a-zA-Z]*[oO]\b|--output)|\bwget\b[^|;&\n]*\s-[a-zA-Z]*[OP]\b",
+    _AGENT_RULES_CMDPOS + r"(?:ln|install|patch|sponge)\b"
+    r"|" + _AGENT_RULES_CMDPOS + r"git\s+(?:-C\s+\S+\s+)?(?:checkout|restore)\b"
+    r"|" + _AGENT_RULES_CMDPOS + r"curl\b[^|;&\n]*\s(?:-[a-zA-Z]*[oO]\b|--output)"
+    r"|" + _AGENT_RULES_CMDPOS + r"wget\b[^|;&\n]*\s-[a-zA-Z]*[OP]\b",
     re.IGNORECASE)
 _AGENT_RULES_READ_TOOL_RE = re.compile(r"(?:^|[_\-])(?:read|get|list|search|view|stat|find|grep)", re.IGNORECASE)
 _AGENT_RULES_PATCH_HDR_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$", re.MULTILINE)
@@ -1186,7 +1196,9 @@ def _agent_rules_hit_path(ev: Event) -> str:
     patch body (`*** Add File:`), so every short string leaf is checked too. A
     read-only-looking MCP tool is skipped to avoid flagging a lookup."""
     p = _path(ev)
-    if p and patterns.AGENT_RULES_PATH_RE.search(p):
+    # DIR_RE as well: a rule file may have spaces in its name (`my rule.mdc`),
+    # which the whitespace-free leaf of PATH_RE cannot match.
+    if p and (patterns.AGENT_RULES_PATH_RE.search(p) or patterns.AGENT_RULES_DIR_RE.search(p)):
         return p
     if ev.action != ActionClass.MCP and ev.tool not in ("Write", "Edit", "MultiEdit", "apply_patch"):
         return ""
@@ -1264,6 +1276,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     verbs, allow-list smuggling via comment text in the command, `2>&1`
     false positives, and a wider rule-file set."""
     cfg = getattr(policy, "agent_rules", None) or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
     if mode in ("off", "false") or raw_mode is False:
@@ -1276,7 +1290,7 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         return would
 
-    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP) or ev.tool == "apply_patch":
         p = _agent_rules_hit_path(ev)
         if not p:
             return None
@@ -1291,7 +1305,7 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        targets = [_AGENT_RULES_TOKEN_RE.search(cmd[:m.end()]).group(0)
+        targets = [_agent_rules_token(cmd, m.end())
                    for rx in (patterns.AGENT_RULES_PATH_RE, patterns.AGENT_RULES_DIR_RE)
                    for m in rx.finditer(cmd)]
         names_target = bool(targets or patterns.agent_rules_find_hit(cmd))

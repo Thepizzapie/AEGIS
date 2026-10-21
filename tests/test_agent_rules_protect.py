@@ -216,3 +216,57 @@ def test_qa1_allow_list_not_smuggled_via_command_text():
 def test_qa1_monitor_mode_shell_records_and_allows():
     assert rules.rule_agent_rules_protect(
         _shell("echo x >> .cursorrules"), Policy(agent_rules={"mode": "monitor"})) is None
+
+
+# ---- QA round 2 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    ".cursor/rules/my rule.mdc", "/r/.cursor/rules/my rule.mdc",
+    ".github/prompts/my prompt.prompt.md",
+])
+def test_qa2_space_in_filename_gated(path):
+    assert evaluate(_edit(path, "Write"), EMPTY).action == Action.ASK
+    assert evaluate(_edit(path), EMPTY).action == Action.ASK
+
+
+def test_qa2_mcp_space_in_filename_gated():
+    assert rules.rule_agent_rules_protect(_mcp("mcp__fs__write_file", {"path": ".cursor/rules/a b.mdc"}), EMPTY)
+
+
+def test_qa2_real_apply_patch_tool_gated():
+    patch = "*** Begin Patch\n*** Add File: .cursorrules\n+x\n*** End Patch"
+    for args in ({"input": patch}, {"command": ["apply_patch", patch]}):
+        ev = Event.make(HookEvent.PRE_TOOL_USE, tool="apply_patch", args=args)
+        assert rules.rule_agent_rules_protect(ev, EMPTY) is not None, args
+    ok = Event.make(HookEvent.PRE_TOOL_USE, tool="apply_patch",
+                    args={"input": "*** Begin Patch\n*** Add File: src/a.py\n+x\n*** End Patch"})
+    assert rules.rule_agent_rules_protect(ok, EMPTY) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat .cursor/rules/install.mdc", "ls .cursor/rules/ln.mdc",
+    "git log --patch -- GEMINI.md", "git diff --patch GEMINI.md",
+    "head -5 .cursorrules; npm install", "cat GEMINI.md && make install",
+    "grep -n install GEMINI.md",
+])
+def test_qa2_verb_words_in_args_not_writes(cmd):
+    assert _only(cmd) is None, cmd
+
+
+def test_qa2_verbs_still_detected_after_separators():
+    for cmd in ("cd x && ln -s /tmp/e .cursorrules", "true; sudo install a .cursorrules",
+                "cat a | sponge .cursorrules"):
+        assert _only(cmd) is not None, cmd
+
+
+def test_qa2_perf_token_extraction():
+    for cmd in ("echo " + "A" * 60000 + " > .cursor/rules/x.mdc",
+                "/.cursorrules" * 300 + " >o", "x/.cursorrules " * 3000 + " >o",
+                ".cursor/rules/" * 5000):
+        start = time.time()
+        _only(cmd)
+        assert time.time() - start < 1.0, cmd[:30]
+
+
+def test_qa2_non_dict_config_does_not_crash():
+    assert rules.rule_agent_rules_protect(_edit(".cursorrules"), Policy(agent_rules="ask")) is not None
