@@ -2589,6 +2589,46 @@ JETBRAINS_WATCHER_PROGRAM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cargo exec-hook hijack — `.cargo/config.toml` (any directory depth; cargo
+# merges every ancestor's, plus `$CARGO_HOME/config.toml`) can name programs
+# cargo itself spawns on the very next build/run/test: `build.rustc-wrapper`
+# and `build.rustc-workspace-wrapper` (wrap EVERY rustc invocation),
+# `target.<triple>.runner` (runs every `cargo run`/`test`/`bench` binary) and
+# `target.<triple>.linker`. `REGISTRY_CONFIG_PATH_RE` already matches this
+# path, but the registry guard only inspects registry-redirect keys, so these
+# exec keys were unguarded. The file is gated on PATH ALONE (no content
+# check) so a value-only Edit diff cannot slip past a key-adjacency check.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_BARE_CONFIG_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Shell-side forms that need no file write: the env vars cargo reads
+# (`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_*WRAPPER`,
+# `CARGO_TARGET_<TRIPLE>_RUNNER|LINKER`) and the inline `--config` flag.
+# Wrapper value of bare `sccache`/`ccache`/`cachepot` is the ubiquitous
+# legitimate use and is exempted by the rule, not the regex.
+CARGO_EXEC_ENV_RE = re.compile(
+    r"(?<![A-Za-z0-9_$])(?:CARGO_BUILD_RUSTC_(?:WORKSPACE_)?WRAPPER|RUSTC_(?:WORKSPACE_)?WRAPPER"
+    r"|CARGO_TARGET_[A-Za-z0-9_]{1,80}_(?:RUNNER|LINKER))"
+    r"[\"']?=\s*[\"']?(?P<val>[^\s\"';&|]*)",
+    re.IGNORECASE,
+)
+CARGO_EXEC_CONFIG_FLAG_RE = re.compile(
+    r"--config(?:\s+|=)[\"']?\s*(?:build\.rustc-(?:workspace-)?wrapper"
+    r"|target\.[^\s=\"']{1,100}\.(?:runner|linker))",
+    re.IGNORECASE,
+)
+CARGO_WRAPPER_BENIGN_RE = re.compile(r"^(?:.*[/\\])?(?:sccache|ccache|cachepot)(?:\.exe)?$", re.IGNORECASE)
+
 # JetBrains "Before launch: run External Tool" hijack — the sibling surface
 # `rule_jetbrains_watcher_protect`'s own docstring disclosed but did not
 # cover: a run/debug configuration's `<method>` block wires an External Tool
