@@ -4634,7 +4634,15 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     only by a human: trailing '# aegis-allow' (shell) or the env toggle
     ``AEGIS_ALLOW_CARGO_EXEC=1`` set before launch; a spawned agent cannot.
 
-    Honest scope (same denylist trade-offs as sibling guards): `build.rs`
+    Honest scope (same denylist trade-offs as sibling guards): a bare
+    `sccache` wrapper resolves via $PATH (rule_path_hijack_protect's job);
+    writes to `$CARGO_HOME/config.toml` via variable, directory-level
+    replacement (`cp -r x .cargo`), `RUSTFLAGS`/`-C linker=` forms (the
+    latter are only incidentally covered by install-review); the shell file-
+    write check pairs a write verb with a `.cargo/config` mention anywhere
+    in the command, so e.g. `cat .cargo/config.toml > out` asks (fails
+    toward ASK); `echo RUSTC_WRAPPER=x` likewise; nested-list MCP path args
+    are not seen; `build.rs`
     and proc-macro source execute at build time but are ordinary source
     files, not config — not covered; a value assembled indirectly (variable
     expansion, a script that writes the file) is not seen; a relative write
@@ -4658,6 +4666,10 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         p = _path(ev)
         if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
             return None
+        if ev.action == ActionClass.MCP and re.search(
+                r"(?:^|[_\-])(?:read|get|list|stat|search|find|view|cat|exists)(?:[_\-]|$)",
+                str(ev.tool or ""), re.IGNORECASE):
+            return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)):
             return None
@@ -4671,19 +4683,33 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        hit = bool(patterns.CARGO_EXEC_CONFIG_FLAG_RE.search(cmd))
+        hit = False
+        for fm in patterns.CARGO_EXEC_CONFIG_FLAG_RE.finditer(cmd):
+            fv = fm.group("fval")
+            if "wrapper" in fm.group(0).lower() and fv is not None and (
+                    not fv or patterns.CARGO_WRAPPER_BENIGN_RE.match(fv)):
+                continue
+            hit = True
+            break
         for m in patterns.CARGO_EXEC_ENV_RE.finditer(cmd):
             name = m.group(0)
             val = m.group("val") or ""
-            if "WRAPPER" in name.upper() and patterns.CARGO_WRAPPER_BENIGN_RE.match(val):
+            if not val or ("WRAPPER" in name.upper()
+                           and patterns.CARGO_WRAPPER_BENIGN_RE.match(val)):
                 continue
             hit = True
             break
         if not hit:
+            hit = bool(patterns.CARGO_HOME_ASSIGN_RE.search(cmd)
+                       or patterns.CARGO_EXEC_PS_RE.search(cmd))
+        if not hit:
             write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                               or re.search(r">[^\s>&]", cmd)
+                               or re.search(r"\bln\s|\brsync\s|\bscp\s|--in-place|\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore|apply)\b", cmd)
                                or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                                or patterns.INPLACE_WRITE_RE.search(cmd)
-                               or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+                               or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or re.search(r"\binstall\s|\bopen\s*\(", cmd))
             if write_verb:
                 hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(cmd)
                            or (patterns.CARGO_CD_RE.search(cmd)

