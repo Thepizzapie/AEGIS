@@ -7932,8 +7932,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     assembled indirectly (generator script, `cargo --config file.toml`
     pointing at a file written elsewhere); `build.rs` and proc-macro source,
     which execute by design and are not gated here; archive/sync tools placing
-    the file without naming it; unquoted `rustflags` linker overrides
-    (`-Clinker=`); a `$CARGO_HOME` pointing at a directory not named `.cargo`/`cargo`
+    the file without naming it; `-C link-arg=` overrides other than a path-valued `-fuse-ld=`
+    (`-C linker=` and path `-fuse-ld=` ARE gated, in files, `--config`, and
+    shell text); a `$CARGO_HOME` pointing at a directory not named `.cargo`/`cargo`
     (e.g. `/tmp/h/config.toml`); a shell command over 20000 characters
     (`normalize.scan_surface` truncates input for EVERY shell rule); over-gating of a `runner`/`linker` key
     in a non-target section (false ASK)."""

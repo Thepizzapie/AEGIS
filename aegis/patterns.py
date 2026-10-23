@@ -5418,7 +5418,7 @@ CARGO_EXEC_KEY_RE = re.compile(
 _CARGO_BENIGN_VAL_RE = re.compile(
     r"""\s*(?:(?P<q>["'])(?P<a>[^"'\s]{0,40})(?P=q)
             |\[\s*(?P<q2>["'])(?P<b>[^"'\s]{0,40})(?P=q2)\s*\]
-            |(?P<c>[A-Za-z0-9_\-]{1,40}))
+            |\[?(?P<c>[A-Za-z0-9_\-]{1,40})\]?)
         \s*[,}\]'"]*(?:\s.*|[;&|#].*)?$""",
     re.VERBOSE)
 # `cargo --config <arg>`: the arg may be any TOML fragment, so grab it and run
@@ -5443,6 +5443,8 @@ CARGO_EXEC_ENV_WIN_RE = re.compile(
 def _cargo_wrapper_benign(key: str, rest: str) -> bool:
     if key.lower() not in _CARGO_WRAPPER_KEYS:
         return False
+    if rest.lstrip()[:3] in ('"""', "'''"):
+        return False                       # multi-line string: value is on the next line
     m = _CARGO_BENIGN_VAL_RE.fullmatch(rest)
     if not m:
         return False
@@ -5469,9 +5471,16 @@ def _toml_unescape(m) -> str:
         return ""
 
 
+# A linker chosen through rustflags reaches the same exec as `target.*.linker`.
+# `-fuse-ld=lld` (a name) is routine; a path-valued one is not.
+CARGO_RUSTFLAGS_LINKER_RE = re.compile(
+    r"-C[ \t\"',]*linker[ \t]*=|-C[ \t\"',]*link-args?[ \t]*=[^\n]{0,80}?-fuse-ld=[/.~]"
+    r"|-fuse-ld=[/.~]|[\"']-C[\"'][ \t]*,[ \t]*[\"']linker\b", re.IGNORECASE)
+
+
 def _cargo_toml_hit(text: str) -> bool:
     text = _TOML_ESC_RE.sub(_toml_unescape, text)
-    if CARGO_CRED_ALIAS_RE.search(text):
+    if CARGO_CRED_ALIAS_RE.search(text) or CARGO_RUSTFLAGS_LINKER_RE.search(text):
         return True
     text = text.replace("\\n", "\n").replace("\\t", " ").replace("\\r", "")
     for m in CARGO_EXEC_KEY_RE.finditer(text):
@@ -5492,6 +5501,8 @@ def cargo_exec_file_hit(text: str) -> bool:
 def cargo_exec_shell_hit(text: str) -> bool:
     """True if a shell command sets a Cargo exec key via `--config` or a
     CARGO_*/RUSTC_* env var to anything but a bare compiler-cache wrapper."""
+    if CARGO_RUSTFLAGS_LINKER_RE.search(text):
+        return True
     for m in CARGO_CONFIG_FLAG_RE.finditer(text):
         if _cargo_toml_hit(m.group("arg")):
             return True

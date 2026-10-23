@@ -250,3 +250,29 @@ def test_qa_round2_file_closed(content):
 def test_qa_round2_still_benign():
     assert not _hit(_shell("RUSTC_WRAPPER=sccache cargo --config net.retry=3 build"))[0]
     assert not _hit(_shell("$env:RUSTC_WRAPPER = 'sccache'"))[0]
+
+
+@pytest.mark.parametrize("content", [
+    '[build]\nrustc-wrapper = """\n/tmp/evil"""\n',
+    "[build]\nrustc-wrapper = '''\n/tmp/evil'''\n",
+    '[build]\nrustc-workspace-wrapper = """\n/tmp/evil\n"""\n',
+    '[build]\nrustflags = ["-Clinker=/tmp/x"]\n',
+    '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=/x"]\n',
+    '[build]\nrustflags = ["-C", "linker=/tmp/x"]\n',
+])
+def test_qa_round3_file_closed(content):
+    assert _hit(_write(".cargo/config.toml", content))[0]
+
+
+@pytest.mark.parametrize("cmd", [
+    "printf '[build]\\nrustc-wrapper = \"\"\"\\n/tmp/evil\"\"\"\\n' > .cargo/config.toml",
+    "RUSTFLAGS='-C linker=/tmp/x' cargo build",
+    "cargo rustc -- -Clinker=/x",
+])
+def test_qa_round3_shell_closed(cmd):
+    assert _hit(_shell(cmd))[0]
+
+
+def test_qa_round3_benign():
+    assert not _hit(_shell("cargo build --config 'build.rustc-wrapper=[\"sccache\"]'"))[0]
+    assert not _hit(_shell("RUSTFLAGS='-C link-arg=-fuse-ld=lld' cargo build"))[0]
