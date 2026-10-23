@@ -5389,58 +5389,94 @@ def strip_comment_lines(text: str) -> str:
 # bare `sccache`/`ccache`/`cachepot` value on the two *-wrapper keys alone is
 # exempt (a path-qualified value is not: `/tmp/sccache` is attacker-chosen).
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    # $CARGO_HOME / ${CARGO_HOME...} references, and a bare `cargo/config`
+    # directory (e.g. /opt/cargo/config.toml).
+    + r"|CARGO_HOME[^\s'\"]{0,40}?[/\\]config(?:\.toml)?" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])cargo" + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
+# Staging verbs that place/rewrite a config WITHOUT the key text appearing in
+# the command (the path alone is then the signal).
+CARGO_STAGE_VERB_RE = re.compile(
+    r"\b(?:cp|mv|install|ln|rsync|tee|sed\s+-[a-zA-Z]*i[a-zA-Z]*)\b")
 _CARGO_BENIGN_WRAPPERS = frozenset({"sccache", "ccache", "cachepot"})
-# TOML key (bare, dotted-suffix, or quoted) = value. Bounded value capture.
+_CARGO_WRAPPER_KEYS = frozenset({
+    "rustc-wrapper", "rustc-workspace-wrapper", "rustc_wrapper",
+    "rustc_workspace_wrapper", "cargo_build_rustc_wrapper",
+    "cargo_build_rustc_workspace_wrapper"})
+_CARGO_KEYS = (r"rustc-workspace-wrapper|rustc-wrapper|rustdoc|rustc|linker|runner|"
+               r"global-credential-providers|credential-provider|credential-process|browser")
+# TOML key (bare, dotted-suffix, or quoted) = rest-of-line.
 CARGO_EXEC_KEY_RE = re.compile(
-    r"(?:^|[\s,{.\"'])(?P<key>rustc-workspace-wrapper|rustc-wrapper|rustdoc|rustc|"
-    r"linker|runner|credential-provider|credential-process)[\"']?[ \t]*=[ \t]*"
-    r"(?P<val>[^\n]{0,300})",
+    r"(?:^|[\s,{.\"'])(?P<key>" + _CARGO_KEYS + r")[\"']?[ \t]*=[ \t]*(?P<val>[^\n]{0,300})",
     re.IGNORECASE,
 )
-# Same keys expressed as `cargo --config '<key>=...'` or `[target.x]` is file
-# only; env-var and CLI forms below.
-CARGO_EXEC_SHELL_RE = re.compile(
-    r"--config(?:=|\s+)[\"']?(?:[\w.\-]+\.)?(?P<ckey>rustc-workspace-wrapper|rustc-wrapper|"
-    r"rustdoc|rustc|linker|runner|credential-provider|credential-process)\b"
-    r"[\"']?\s*=\s*[\"']*(?P<cval>[^\s\"']{0,200})"
-    r"|(?<![\w])(?P<ekey>RUSTC_WORKSPACE_WRAPPER|RUSTC_WRAPPER|"
+# The ENTIRE remaining value must be exactly one bare wrapper name (quoted, or
+# a one-element array), optionally followed by closers/comment -- so a value
+# with arguments, a two-element array, or a multi-line string all fail.
+_CARGO_BENIGN_VAL_RE = re.compile(
+    r"""\s*(?:(?P<q>["'])(?P<a>[^"'\s]{0,40})(?P=q)
+            |\[\s*(?P<q2>["'])(?P<b>[^"'\s]{0,40})(?P=q2)\s*\]
+            |(?P<c>[A-Za-z0-9_\-]{1,40}))
+        \s*[,}\]'"]*(?:\s.*|[;&|#].*)?$""",
+    re.VERBOSE)
+# `cargo --config <arg>`: the arg may be any TOML fragment, so grab it and run
+# the file-form key regex over it.
+CARGO_CONFIG_FLAG_RE = re.compile(r"--config(?:=|[ \t]+)(?P<arg>[^\n]{1,400})")
+# Env vars Cargo/rustc honor for the same programs. Value is the first
+# shell word (quoted whole, or bare up to whitespace/;&|).
+CARGO_EXEC_ENV_RE = re.compile(
+    r"(?<![\w])(?P<ekey>RUSTC_WORKSPACE_WRAPPER|RUSTC_WRAPPER|RUSTDOC|RUSTC|"
     r"CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC|"
-    r"CARGO_BUILD_RUSTDOC|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:LINKER|RUNNER)|"
-    r"CARGO_REGISTRY_CREDENTIAL_PROVIDER|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER)"
-    r"(?:\s+|\s*=\s*)[\"']*(?P<eval>[^\s\"']{0,200})",
+    r"CARGO_BUILD_RUSTDOC|CARGO_(?:TARGET_[A-Z0-9_]{1,80}|HOST)_(?:LINKER|RUNNER)|"
+    r"CARGO_DOC_BROWSER|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_(?:PROVIDERS?|PROCESS)|"
+    r"CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_(?:PROVIDER|PROCESS))"
+    r"=(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s;&|\"']*))",
 )
 
 
-def _cargo_val_benign(key: str, val: str) -> bool:
-    k = key.lower()
-    if k not in ("rustc-wrapper", "rustc-workspace-wrapper", "rustc_wrapper",
-                 "rustc_workspace_wrapper", "cargo_build_rustc_wrapper",
-                 "cargo_build_rustc_workspace_wrapper"):
+def _cargo_wrapper_benign(key: str, rest: str) -> bool:
+    if key.lower() not in _CARGO_WRAPPER_KEYS:
         return False
-    v = val.strip().strip("\"'[], \t")
-    return v.lower() in _CARGO_BENIGN_WRAPPERS
+    m = _CARGO_BENIGN_VAL_RE.fullmatch(rest)
+    if not m:
+        return False
+    name = next(g for g in (m.group("a"), m.group("b"), m.group("c")) if g is not None)
+    return name in _CARGO_BENIGN_WRAPPERS or name == ""
+
+
+def _cargo_toml_hit(text: str) -> bool:
+    text = text.replace("\\n", "\n").replace("\\t", " ").replace("\\r", "")
+    for m in CARGO_EXEC_KEY_RE.finditer(text):
+        rest = m.group("val")
+        if re.fullmatch(r"\s*(?:\"\"|'')?[\s'\"]*(?:[#].*|\s.*)?", rest):
+            continue                                   # clearing the key
+        if not _cargo_wrapper_benign(m.group("key"), rest):
+            return True
+    return False
 
 
 def cargo_exec_file_hit(text: str) -> bool:
     """True if `text` (a Cargo config body) sets a program-naming exec key to
-    anything but a bare compiler-cache wrapper."""
-    for m in CARGO_EXEC_KEY_RE.finditer(text):
-        if not _cargo_val_benign(m.group("key"), m.group("val").split("#", 1)[0]):
-            return True
-    return False
+    anything but a bare compiler-cache wrapper (or clears it)."""
+    return _cargo_toml_hit(text)
 
 
 def cargo_exec_shell_hit(text: str) -> bool:
     """True if a shell command sets a Cargo exec key via `--config` or a
     CARGO_*/RUSTC_* env var to anything but a bare compiler-cache wrapper."""
-    for m in CARGO_EXEC_SHELL_RE.finditer(text):
-        key = m.group("ckey") or m.group("ekey")
-        val = m.group("cval") if m.group("ckey") else m.group("eval")
-        if not _cargo_val_benign(key, val or ""):
+    for m in CARGO_CONFIG_FLAG_RE.finditer(text):
+        if _cargo_toml_hit(m.group("arg")):
             return True
+    for m in CARGO_EXEC_ENV_RE.finditer(text):
+        val = next((g for g in (m.group("dq"), m.group("sq"), m.group("bare"))
+                    if g is not None), "")
+        if val == "":
+            continue
+        if m.group("ekey").lower() in _CARGO_WRAPPER_KEYS and val in _CARGO_BENIGN_WRAPPERS:
+            continue
+        return True
     return False
 
 

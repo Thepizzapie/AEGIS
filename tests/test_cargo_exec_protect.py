@@ -142,3 +142,76 @@ def test_no_redos():
     _hit(_write(".cargo/config.toml", big))
     _hit(_shell("RUSTC_WRAPPER " * 20000))
     assert time.time() - t < 3
+
+
+@pytest.mark.parametrize("cmd", [
+    "RUSTC=/tmp/e cargo build", "export RUSTC=/tmp/e", "RUSTDOC=/tmp/e cargo doc",
+    "RUSTC_WRAPPER='sccache /tmp/e' cargo build",
+    'export RUSTC_WRAPPER="sccache /tmp/e"',
+    "CARGO_BUILD_RUSTC_WRAPPER='ccache /tmp/e' cargo b",
+    "cargo build --config 'build.rustc-wrapper=\"sccache /tmp/e\"'",
+    "CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=/tmp/e cargo publish",
+    "CARGO_REGISTRY_CREDENTIAL_PROCESS=/tmp/e cargo publish",
+    "CARGO_HOST_LINKER=/tmp/e cargo build",
+    "cargo build --config 'registry.global-credential-providers=[\"/tmp/e\"]'",
+    "cargo build --config 'target.\"cfg(unix)\".linker=\"/tmp/e\"'",
+    "cargo build --config 'build={rustc-wrapper=\"/tmp/e\"}'",
+    "cargo build --config 'target={x={linker=\"/tmp/e\"}}'",
+    "cargo doc --config 'doc.browser=\"/tmp/e\"'",
+    'printf "[build]\\nrustc-wrapper=\\"/tmp/e\\"\\n" > .cargo/config.toml',
+    "echo -e '[build]\\nrustc-wrapper=\"/tmp/e\"' >> .cargo/config.toml",
+    "echo 'build.rustc-wrapper=\"/tmp/e\"' > $CARGO_HOME/config.toml",
+    'echo \'runner="x"\' > "${CARGO_HOME:-$HOME/.cargo}/config.toml"',
+    "cp /tmp/x.toml .cargo/config.toml",
+    "sed -i 's#sccache#/tmp/e#' .cargo/config.toml",
+])
+def test_qa_round1_shell_bypasses_closed(cmd):
+    ok, d = _hit(_shell(cmd))
+    assert ok and d.action == Action.ASK
+
+
+@pytest.mark.parametrize("content", [
+    "[build]\nrustc-wrapper = '''sccache\nevil'''\n",
+    '[build]\nrustc-wrapper = """sccache\nevil"""\n',
+    '[build]\nrustc-wrapper = "sccache # x"\n',
+    '[build]\nrustc-wrapper = ["sccache", "evil"]\n',
+    '[registry]\nglobal-credential-providers = ["/tmp/e"]\n',
+    '[doc]\nbrowser = "/tmp/e"\n',
+    '[build]\nrustc-wrapper = "SCCACHE"\n',
+])
+def test_qa_round1_file_bypasses_closed(content):
+    assert _hit(_write(".cargo/config.toml", content))[0]
+
+
+@pytest.mark.parametrize("path", ["/opt/cargo/config.toml"])
+def test_cargo_dir_without_dot(path):
+    assert _hit(_write(path, '[build]\nrustc-wrapper="/x"\n'))[0]
+
+
+def test_value_only_edit_asks():
+    assert _hit(_edit(".cargo/config.toml", "/tmp/evil"))[0]
+    assert _hit(_edit(".cargo/config.toml", '"/tmp/evil"'))[0]
+    assert not _hit(_edit(".cargo/config.toml", "[build]\njobs = 4\n"))[0]
+
+
+@pytest.mark.parametrize("cmd", [
+    "export RUSTC_WRAPPER=sccache; cargo build",
+    "RUSTC_WRAPPER=sccache&& cargo build",
+    "unset RUSTC_WRAPPER", "echo $RUSTC_WRAPPER", "env -u RUSTC_WRAPPER cargo build",
+    "grep -rn RUSTC_WRAPPER .", "RUSTC_WRAPPER= cargo build",
+    'RUSTC_WRAPPER="" cargo build',
+    "cargo build --config 'build.rustc-wrapper=\"\"'",
+    "cargo build --config 'build.rustc-wrapper=\"sccache\"'",
+])
+def test_qa_round1_false_asks_closed(cmd):
+    assert not _hit(_shell(cmd))[0]
+
+
+@pytest.mark.parametrize("content", [
+    '[build]\nrustc-wrapper = ""\n',
+    'build = { rustc-wrapper = "sccache" }\n',
+    'build = { jobs = 2, rustc-wrapper = "sccache" }\n',
+    '[build]\nrustc-wrapper = ["sccache"]\n',
+])
+def test_qa_round1_benign_file_forms(content):
+    assert not _hit(_write(".cargo/config.toml", content))[0]

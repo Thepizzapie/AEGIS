@@ -7933,8 +7933,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     pointing at a file written elsewhere); `build.rs` and proc-macro source,
     which execute by design and are not gated here; archive/sync tools placing
     the file without naming it; unquoted `rustflags` linker overrides
-    (`-Clinker=`); a `$CARGO_HOME` outside a `.cargo` directory
-    (e.g. `/opt/cargo/config.toml`); over-gating of a `runner`/`linker` key
+    (`-Clinker=`); a `$CARGO_HOME` pointing at a directory not named `.cargo`/`cargo`
+    (e.g. `/tmp/h/config.toml`); over-gating of a `runner`/`linker` key
     in a non-target section (false ASK)."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -7963,8 +7963,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             content = " ".join(_flatten_strings(a))
         if not content:
             return None
-        if not patterns.cargo_exec_file_hit(patterns.strip_comment_lines(content)):
-            return None
+        scan = patterns.strip_comment_lines(content)
+        if not patterns.cargo_exec_file_hit(scan):
+            # A value-only edit ("sccache" -> "/tmp/e") carries no key text:
+            # any non-blank content with no `=` at all is asked about.
+            if "=" in scan or not scan.strip():
+                return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)):
             return None
@@ -7981,8 +7985,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         scan_cmd = patterns.strip_comment_lines(cmd)
-        file_form = (patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
-                     and patterns.cargo_exec_file_hit(scan_cmd))
+        on_cfg = patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+        file_form = on_cfg and (patterns.cargo_exec_file_hit(scan_cmd)
+                                or patterns.CARGO_STAGE_VERB_RE.search(scan_cmd))
         if not (file_form or patterns.cargo_exec_shell_hit(scan_cmd)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
