@@ -5367,6 +5367,82 @@ def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
 
 
+# ---- Cargo config / env exec-hijack protection --------------------------------
+# Cargo's own config (`.cargo/config.toml`, any ancestor directory, plus
+# `$CARGO_HOME/config.toml`) and a matching set of `CARGO_*`/`RUSTC_*` env vars
+# name programs CARGO ITSELF spawns on ordinary `cargo build`/`check`/`test`/
+# `run`/`doc` -- no build script, no dependency, no install step needed:
+#   - `build.rustc-wrapper` / `build.rustc-workspace-wrapper`: every rustc
+#     invocation is routed through the named program.
+#   - `build.rustc` / `build.rustdoc`: replaces the compiler/doc tool outright.
+#   - `target.<triple>.linker` / `target.<triple>.runner`: the linker for every
+#     link step, and the program `cargo run`/`cargo test` hands each built
+#     binary to.
+#   - `registry.credential-provider` / `registries.<n>.credential-provider` (and
+#     the older `credential-process`): spawned with the live registry token on
+#     every authenticated `cargo publish`/`login`/fetch.
+# `.cargo/config.toml` is ordinarily TRACKED, so it reads as routine build
+# tuning in a diff. `REGISTRY_CONFIG_PATH_RE` already gates this same file for
+# registry/source REDIRECTS only (`replace-with`); these exec keys were
+# uncovered. The only widely legitimate value is a compiler cache wrapper, so a
+# bare `sccache`/`ccache`/`cachepot` value on the two *-wrapper keys alone is
+# exempt (a path-qualified value is not: `/tmp/sccache` is attacker-chosen).
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+_CARGO_BENIGN_WRAPPERS = frozenset({"sccache", "ccache", "cachepot"})
+# TOML key (bare, dotted-suffix, or quoted) = value. Bounded value capture.
+CARGO_EXEC_KEY_RE = re.compile(
+    r"(?:^|[\s,{.\"'])(?P<key>rustc-workspace-wrapper|rustc-wrapper|rustdoc|rustc|"
+    r"linker|runner|credential-provider|credential-process)[\"']?[ \t]*=[ \t]*"
+    r"(?P<val>[^\n]{0,300})",
+    re.IGNORECASE,
+)
+# Same keys expressed as `cargo --config '<key>=...'` or `[target.x]` is file
+# only; env-var and CLI forms below.
+CARGO_EXEC_SHELL_RE = re.compile(
+    r"--config(?:=|\s+)[\"']?(?:[\w.\-]+\.)?(?P<ckey>rustc-workspace-wrapper|rustc-wrapper|"
+    r"rustdoc|rustc|linker|runner|credential-provider|credential-process)\b"
+    r"[\"']?\s*=\s*[\"']*(?P<cval>[^\s\"']{0,200})"
+    r"|(?<![\w])(?P<ekey>RUSTC_WORKSPACE_WRAPPER|RUSTC_WRAPPER|"
+    r"CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC|"
+    r"CARGO_BUILD_RUSTDOC|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:LINKER|RUNNER)|"
+    r"CARGO_REGISTRY_CREDENTIAL_PROVIDER|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER)"
+    r"(?:\s+|\s*=\s*)[\"']*(?P<eval>[^\s\"']{0,200})",
+)
+
+
+def _cargo_val_benign(key: str, val: str) -> bool:
+    k = key.lower()
+    if k not in ("rustc-wrapper", "rustc-workspace-wrapper", "rustc_wrapper",
+                 "rustc_workspace_wrapper", "cargo_build_rustc_wrapper",
+                 "cargo_build_rustc_workspace_wrapper"):
+        return False
+    v = val.strip().strip("\"'[], \t")
+    return v.lower() in _CARGO_BENIGN_WRAPPERS
+
+
+def cargo_exec_file_hit(text: str) -> bool:
+    """True if `text` (a Cargo config body) sets a program-naming exec key to
+    anything but a bare compiler-cache wrapper."""
+    for m in CARGO_EXEC_KEY_RE.finditer(text):
+        if not _cargo_val_benign(m.group("key"), m.group("val").split("#", 1)[0]):
+            return True
+    return False
+
+
+def cargo_exec_shell_hit(text: str) -> bool:
+    """True if a shell command sets a Cargo exec key via `--config` or a
+    CARGO_*/RUSTC_* env var to anything but a bare compiler-cache wrapper."""
+    for m in CARGO_EXEC_SHELL_RE.finditer(text):
+        key = m.group("ckey") or m.group("ekey")
+        val = m.group("cval") if m.group("ckey") else m.group("eval")
+        if not _cargo_val_benign(key, val or ""):
+            return True
+    return False
+
+
 # ---- MCP tool-catalog integrity: rug-pull / tool-poisoning heuristics --------
 #
 # Every guard above scans a shell command or a config file's own syntax for a

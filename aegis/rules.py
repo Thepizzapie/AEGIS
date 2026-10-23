@@ -7895,6 +7895,109 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a program-naming Cargo exec key (`build.rustc-wrapper`/
+    `rustc-workspace-wrapper`/`rustc`/`rustdoc`, `target.*.linker`/`runner`,
+    `credential-provider`/`credential-process`) in `.cargo/config(.toml)`, or
+    setting one via `cargo --config` or a `CARGO_*`/`RUSTC_*` env var.
+
+    THREAT MODEL: Cargo itself spawns these programs on ordinary `cargo
+    build`/`test`/`run`/`doc` -- no build script, dependency, or install step
+    required. A wrapper sits in front of every rustc call; a linker on every
+    link; a runner receives every built binary on `cargo run`/`test`; a
+    credential provider is handed the live registry token. `.cargo/config.toml`
+    is normally tracked, so the line reads as build tuning in review, and runs
+    for this session, a teammate, or CI. `rule_package_manifest_protect`'s
+    registry check only gates the same file for `replace-with` source
+    redirects; these exec keys were uncovered.
+
+    Config (`policy.cargo_exec`): `mode` (deny|ask|monitor|off, default ask),
+    `allow` (regexes on the path/command that skip the gate). A bare
+    `sccache`/`ccache`/`cachepot` wrapper value is exempt.
+
+    Escapable only by a human: trailing '# aegis-allow' (shell form) or
+    `AEGIS_ALLOW_CARGO_EXEC=1` set before launch.
+
+    Disclosed gaps (same denylist trade-offs as every sibling guard): values
+    assembled indirectly (generator script, `cargo --config file.toml`
+    pointing at a file written elsewhere); `build.rs` and proc-macro source,
+    which execute by design and are not gated here; archive/sync tools placing
+    the file without naming it; `rustflags` linker overrides (`-Clinker=`)."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        if not patterns.cargo_exec_file_hit(patterns.strip_comment_lines(content)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is setting a Cargo exec key (rustc-wrapper/"
+                         "rustc/linker/runner/credential-provider) — Cargo "
+                         "spawns that program on the next ordinary 'cargo "
+                         "build'/'test'/'run' (or, for a credential provider, "
+                         "hands it the live registry token), for this "
+                         "session, a teammate, or CI. Review the change, then "
+                         "confirm with AEGIS_ALLOW_CARGO_EXEC=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        file_form = (patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+                     and patterns.cargo_exec_file_hit(scan_cmd))
+        if not (file_form or patterns.cargo_exec_shell_hit(scan_cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo exec key (rustc-wrapper/rustc/linker/"
+                         "runner/credential-provider) is being set from a "
+                         "shell (.cargo/config, 'cargo --config', or a "
+                         "CARGO_*/RUSTC_* env var) — Cargo spawns that "
+                         "program on ordinary build/test/run (or hands a "
+                         "credential provider the registry token). A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -8520,6 +8623,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
