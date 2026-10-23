@@ -7934,7 +7934,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     which execute by design and are not gated here; archive/sync tools placing
     the file without naming it; unquoted `rustflags` linker overrides
     (`-Clinker=`); a `$CARGO_HOME` pointing at a directory not named `.cargo`/`cargo`
-    (e.g. `/tmp/h/config.toml`); over-gating of a `runner`/`linker` key
+    (e.g. `/tmp/h/config.toml`); a shell command over 20000 characters
+    (`normalize.scan_surface` truncates input for EVERY shell rule); over-gating of a `runner`/`linker` key
     in a non-target section (false ASK)."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -7985,7 +7986,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         scan_cmd = patterns.strip_comment_lines(cmd)
-        on_cfg = patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+        on_cfg = (patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+                  or (patterns.CARGO_DIR_RE.search(scan_cmd)
+                      and patterns.CARGO_BARE_CFG_RE.search(scan_cmd)))
         file_form = on_cfg and (patterns.cargo_exec_file_hit(scan_cmd)
                                 or patterns.CARGO_STAGE_VERB_RE.search(scan_cmd))
         if not (file_form or patterns.cargo_exec_shell_hit(scan_cmd)):

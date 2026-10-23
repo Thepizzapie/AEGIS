@@ -215,3 +215,38 @@ def test_qa_round1_false_asks_closed(cmd):
 ])
 def test_qa_round1_benign_file_forms(content):
     assert not _hit(_write(".cargo/config.toml", content))[0]
+
+
+@pytest.mark.parametrize("cmd", [
+    "cargo --config 'build.rustc-wrapper=\"sccache\"' --config 'build.rustc=\"/tmp/e\"' test",
+    "cargo --config build.rustc-wrapper=sccache --config build.rustc=/tmp/e build",
+    "cargo --config=build.rustc-wrapper=sccache --config=build.rustc=/tmp/e check",
+    "cargo --config 'build={rustc-wrapper=\"sccache\", rustc=\"/tmp/e\"}' test",
+    "cargo --config 'build.rustc-wrapper=\"sccache\"\nbuild.rustc=\"/tmp/e\"' build",
+    "cargo --config 'build.rustc-wrapper=\"sccache\"' \\\n --config 'build.rustc=\"/tmp/e\"' x",
+    "cat > .cargo/config.toml <<'X'\n[build]\nrustc = '''\n/tmp/e'''\nX",
+    "cd .cargo && echo 'rustc=\"/tmp/e\"' > config.toml",
+    "python3 -c \"open('.cargo/'+'config.toml','w').write('x')\" runner=1",
+    "setx RUSTC_WRAPPER C:\\e.exe",
+    '$env:RUSTC_WRAPPER = "C:\\e.exe"',
+])
+def test_qa_round2_shell_closed(cmd):
+    assert _hit(_shell(cmd))[0]
+
+
+@pytest.mark.parametrize("content", [
+    'build = { rustc-wrapper = "sccache", rustc = "/tmp/e" }\n',
+    'build = { rustc-wrapper = "sccache", linker = "/tmp/e" }\n',
+    "[build]\nrustc = '''\n/tmp/e'''\n",
+    '[build]\nrustc = """\n/tmp/e"""\n',
+    '[build]\n"rust\\u0063"="/tmp/e"\n',
+    '[build]\n"rustc-wr\\u0061pper"="/tmp/e"\n',
+    '[credential-alias]\nfoo = "/tmp/e"\n',
+])
+def test_qa_round2_file_closed(content):
+    assert _hit(_write(".cargo/config.toml", content))[0]
+
+
+def test_qa_round2_still_benign():
+    assert not _hit(_shell("RUSTC_WRAPPER=sccache cargo --config net.retry=3 build"))[0]
+    assert not _hit(_shell("$env:RUSTC_WRAPPER = 'sccache'"))[0]

@@ -5409,7 +5409,7 @@ _CARGO_KEYS = (r"rustc-workspace-wrapper|rustc-wrapper|rustdoc|rustc|linker|runn
                r"global-credential-providers|credential-provider|credential-process|browser")
 # TOML key (bare, dotted-suffix, or quoted) = rest-of-line.
 CARGO_EXEC_KEY_RE = re.compile(
-    r"(?:^|[\s,{.\"'])(?P<key>" + _CARGO_KEYS + r")[\"']?[ \t]*=[ \t]*(?P<val>[^\n]{0,300})",
+    r"(?:^|[\s,{.\"'])(?P<key>" + _CARGO_KEYS + r")[\"']?(?=[ \t]*=[ \t]*(?P<val>[^\n]{0,300}))",
     re.IGNORECASE,
 )
 # The ENTIRE remaining value must be exactly one bare wrapper name (quoted, or
@@ -5423,17 +5423,21 @@ _CARGO_BENIGN_VAL_RE = re.compile(
     re.VERBOSE)
 # `cargo --config <arg>`: the arg may be any TOML fragment, so grab it and run
 # the file-form key regex over it.
-CARGO_CONFIG_FLAG_RE = re.compile(r"--config(?:=|[ \t]+)(?P<arg>[^\n]{1,400})")
+CARGO_CONFIG_FLAG_RE = re.compile(r"--config(?:=|[ \t]+)(?=(?P<arg>[\s\S]{1,400}))")
 # Env vars Cargo/rustc honor for the same programs. Value is the first
 # shell word (quoted whole, or bare up to whitespace/;&|).
-CARGO_EXEC_ENV_RE = re.compile(
-    r"(?<![\w])(?P<ekey>RUSTC_WORKSPACE_WRAPPER|RUSTC_WRAPPER|RUSTDOC|RUSTC|"
+_CARGO_ENV_VAL = (r"(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s;&|\"']*))")
+_CARGO_ENV_KEYS = (
+    r"(?P<ekey>RUSTC_WORKSPACE_WRAPPER|RUSTC_WRAPPER|RUSTDOC|RUSTC|"
     r"CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC|"
     r"CARGO_BUILD_RUSTDOC|CARGO_(?:TARGET_[A-Z0-9_]{1,80}|HOST)_(?:LINKER|RUNNER)|"
     r"CARGO_DOC_BROWSER|CARGO_REGISTRY_(?:GLOBAL_)?CREDENTIAL_(?:PROVIDERS?|PROCESS)|"
-    r"CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_(?:PROVIDER|PROCESS))"
-    r"=(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s;&|\"']*))",
-)
+    r"CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_(?:PROVIDER|PROCESS))")
+CARGO_EXEC_ENV_RE = re.compile(r"(?<![\w])" + _CARGO_ENV_KEYS + r"=" + _CARGO_ENV_VAL)
+# PowerShell `$env:KEY = value` and Windows `setx KEY value`.
+CARGO_EXEC_ENV_WIN_RE = re.compile(
+    r"(?:\$env:|\bsetx[ \t]+)" + _CARGO_ENV_KEYS + r"[ \t]*=?[ \t]*" + _CARGO_ENV_VAL,
+    re.IGNORECASE)
 
 
 def _cargo_wrapper_benign(key: str, rest: str) -> bool:
@@ -5446,11 +5450,33 @@ def _cargo_wrapper_benign(key: str, rest: str) -> bool:
     return name in _CARGO_BENIGN_WRAPPERS or name == ""
 
 
+_TOML_ESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})|\\x([0-9a-fA-F]{2})")
+# `[credential-alias]` / `credential-alias.<n>` define named credential-provider
+# programs; the bare word has no other use.
+CARGO_CRED_ALIAS_RE = re.compile(r"credential-alias", re.IGNORECASE)
+# `cd .cargo && ... > config.toml`: the directory and the bare file name appear
+# separately in the command.
+CARGO_DIR_RE = re.compile(r"\.cargo\b", re.IGNORECASE)
+CARGO_BARE_CFG_RE = re.compile(
+    r"(?:^|[\s'\"/\\=>])config(?:\.toml)?(?=[\s'\";&|)]|$)", re.IGNORECASE)
+
+
+def _toml_unescape(m) -> str:
+    h = next(g for g in m.groups() if g is not None)
+    try:
+        return chr(int(h, 16))
+    except (ValueError, OverflowError):
+        return ""
+
+
 def _cargo_toml_hit(text: str) -> bool:
+    text = _TOML_ESC_RE.sub(_toml_unescape, text)
+    if CARGO_CRED_ALIAS_RE.search(text):
+        return True
     text = text.replace("\\n", "\n").replace("\\t", " ").replace("\\r", "")
     for m in CARGO_EXEC_KEY_RE.finditer(text):
         rest = m.group("val")
-        if re.fullmatch(r"\s*(?:\"\"|'')?[\s'\"]*(?:[#].*|\s.*)?", rest):
+        if re.fullmatch(r"\s*(?:(?:\"\"(?!\")|''(?!'))[\s'\"]*)?(?:[#].*|\s.*)?", rest):
             continue                                   # clearing the key
         if not _cargo_wrapper_benign(m.group("key"), rest):
             return True
@@ -5469,7 +5495,7 @@ def cargo_exec_shell_hit(text: str) -> bool:
     for m in CARGO_CONFIG_FLAG_RE.finditer(text):
         if _cargo_toml_hit(m.group("arg")):
             return True
-    for m in CARGO_EXEC_ENV_RE.finditer(text):
+    for m in (*CARGO_EXEC_ENV_RE.finditer(text), *CARGO_EXEC_ENV_WIN_RE.finditer(text)):
         val = next((g for g in (m.group("dq"), m.group("sq"), m.group("bare"))
                     if g is not None), "")
         if val == "":
