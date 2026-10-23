@@ -124,14 +124,15 @@ def test_policy_allow_and_off_and_monitor():
 
 def test_yaml_policy_round_trip(tmp_path):
     from aegis.loader import load_policy
+    w = _write("sub/.cargo/config.toml", '[build]\nrustc-wrapper="/x"\n')
     f = tmp_path / "p.yaml"
     f.write_text("cargo_exec:\n  mode: deny\n")
-    pol = load_policy(str(tmp_path)) if False else None
-    try:
-        pol = load_policy(str(f))
-    except Exception:
-        pytest.skip("loader signature differs")
-    assert pol.cargo_exec.get("mode") == "deny"
+    d = evaluate(w, load_policy(str(f)))
+    assert d.rule == RULE and d.action == Action.DENY
+    f.write_text("cargo_exec:\n  allow: ['sub/\\.cargo']\n")
+    assert evaluate(w, load_policy(str(f))).rule != RULE
+    f.write_text("cargo_exec:\n  mode: off\n")
+    assert evaluate(w, load_policy(str(f))).rule != RULE
 
 
 def test_no_redos():

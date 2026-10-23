@@ -7932,7 +7932,10 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     assembled indirectly (generator script, `cargo --config file.toml`
     pointing at a file written elsewhere); `build.rs` and proc-macro source,
     which execute by design and are not gated here; archive/sync tools placing
-    the file without naming it; `rustflags` linker overrides (`-Clinker=`)."""
+    the file without naming it; unquoted `rustflags` linker overrides
+    (`-Clinker=`); a `$CARGO_HOME` outside a `.cargo` directory
+    (e.g. `/opt/cargo/config.toml`); over-gating of a `runner`/`linker` key
+    in a non-target section (false ASK)."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

@@ -5368,8 +5368,9 @@ def strip_comment_lines(text: str) -> str:
 
 
 # ---- Cargo config / env exec-hijack protection --------------------------------
-# Cargo's own config (`.cargo/config.toml`, any ancestor directory, plus
-# `$CARGO_HOME/config.toml`) and a matching set of `CARGO_*`/`RUSTC_*` env vars
+# Cargo's own config (`.cargo/config.toml`, any ancestor directory, incl. the default
+# `~/.cargo/config.toml`; a `$CARGO_HOME` set OUTSIDE a `.cargo` directory is a
+# disclosed gap) and a matching set of `CARGO_*`/`RUSTC_*` env vars
 # name programs CARGO ITSELF spawns on ordinary `cargo build`/`check`/`test`/
 # `run`/`doc` -- no build script, no dependency, no install step needed:
 #   - `build.rustc-wrapper` / `build.rustc-workspace-wrapper`: every rustc
