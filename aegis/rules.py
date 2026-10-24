@@ -7948,13 +7948,20 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
             return None
         a = ev.args or {}
-        raw_content = a.get("content")
-        if not isinstance(raw_content, str) or not raw_content:
-            raw_content = a.get("new_string")
-        if isinstance(raw_content, str) and raw_content:
-            content = raw_content
+        # Scan only what is being WRITTEN: never old_string, so removing or
+        # replacing an exec key does not false-ASK.
+        edits = a.get("edits")
+        if isinstance(edits, list) and edits:
+            content = " ".join(str(e.get("new_string") or "") for e in edits
+                               if isinstance(e, dict))
+        elif "new_string" in a and "content" not in a:
+            content = a.get("new_string") if isinstance(a.get("new_string"), str) else ""
         else:
-            content = " ".join(_flatten_strings(a))
+            raw_content = a.get("content")
+            if isinstance(raw_content, str) and raw_content:
+                content = raw_content
+            else:
+                content = " ".join(_flatten_strings(a))
         if not content:
             return None
         scan_content = patterns.strip_comment_lines(content)

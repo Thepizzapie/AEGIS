@@ -5369,27 +5369,44 @@ TF_EXEC_HIT_RE = re.compile(
 # Path: any `.cargo/config` or `.cargo/config.toml` (Windows `.cargo\config`
 # too), at any depth.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>()|;&])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|\$\{?CARGO_HOME\b[^\s'\"]{0,40}?[/\\]config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # Content check: the exec-capable key itself, not the whole file (an ordinary
 # `[net]`/`[profile]` edit must not gate). Keys may be bare, quoted, or
 # dotted (`build.rustc-wrapper = ...`, `target.x86_64-unknown-linux-gnu.
 # linker = ...`), so they are anchored on a preceding start/space/dot/quote/
-# bracket and a following `=`. `linker`/`runner` are generic words but only
-# ever reach this regex when the file is already a cargo config.
+# bracket (or a sed/shell delimiter, or `=` for `--codegen=linker=`) and a
+# following `=`. `linker`/`runner`/`browser` are generic words but only ever
+# reach this regex when the file is already a cargo config. rustflags
+# spellings are matched in both the one-string (`"-C link-arg=x"`) and the
+# canonical split-array (`["-C", "link-arg=x"]`) forms, so `link-arg(s)`/
+# `pre-link-arg(s)`/`codegen-backend`/`runtool` are bare keys too. The
+# [env] variable group is case-SENSITIVE (`(?-i:...)`) so a lowercase
+# `path = "..."` dependency key never matches `PATH`.
+_CARGO_PFX = r"(?:^|\\[nt]|[\s.\[{,\"'=/|;(>])"
 CARGO_EXEC_HIT_RE = re.compile(
-    r"(?:^|\\[nt]|[\s.\[{,\"'])(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
-    r"|linker|runner|credential-provider|credential-process"
-    r"|global-credential-providers)[\"']?\s*="
-    r"|-C\s*linker\s*=|-C\s*link-args?\s*=|-Clink-args?\s*=|-Zcodegen-backend"
-    r"|(?:^|\\[nt]|[\s.\[{,\"'])(?:LD_PRELOAD|DYLD_INSERT_LIBRARIES|RUSTC_WRAPPER"
-    r"|RUSTC_WORKSPACE_WRAPPER|RUSTC|LD_LIBRARY_PATH)[\"']?\s*=",
+    _CARGO_PFX + r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
+    r"|linker|runner|browser|credential-provider|credential-process"
+    r"|global-credential-providers|link-args?|pre-link-args?|codegen-backend"
+    r"|runtool|test-runtool)[\"']?\s*="
+    r"|-C\s*linker\s*=|-C\s*link-args?\s*=|-Clink-args?\s*=|-Z\s*(?:codegen-backend|pre-link-args?\s*=)"
+    r"|--(?:test-)?runtool\b"
+    r"|" + _CARGO_PFX + r"(?-i:LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES"
+    r"|DYLD_FALLBACK_LIBRARY_PATH|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTC"
+    r"|CARGO_BUILD_RUSTC_WRAPPER|BASH_ENV|NODE_OPTIONS|PYTHONSTARTUP|PATH"
+    r"|CC|CXX|GIT_SSH_COMMAND)[\"']?\s*=",
     re.IGNORECASE | re.MULTILINE,
 )
 # Disclosed gaps (same shape every sibling guard accepts): a value assembled
 # indirectly (generator script), `CARGO_HOME` relocated to an attacker dir
-# holding its own config.toml, `CARGO_BUILD_RUSTC_WRAPPER`/`CARGO_TARGET_*_
+# holding its own config.toml (a literal `$CARGO_HOME/config.toml` is covered),
+# a relative write after `cd .cargo`, an Edit that changes only an existing
+# exec key's VALUE (old_string is deliberately not scanned, so removing a key
+# does not false-ASK), an MCP tool whose path argument is not one `_path`
+# recognises (shared with every sibling guard), read-only commands (`grep
+# 'linker =' .cargo/config.toml`) naming both halves (false ASK), `CARGO_BUILD_RUSTC_WRAPPER`/`CARGO_TARGET_*_
 # LINKER` set only in the process environment (not persisted to a file), and
 # `build.rs`/proc-macro code (ordinary source, not config) are not covered.
 # Shell branch is not clause-scoped: an unrelated clause naming a cargo

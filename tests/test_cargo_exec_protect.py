@@ -71,6 +71,16 @@ PAYLOADS = {
     "global-cred": 'registry.global-credential-providers = ["/tmp/evil"]\n',
     "env-ld-preload": '[env]\nLD_PRELOAD = "/tmp/evil.so"\n',
     "env-rustc-wrapper": '[env]\nRUSTC_WRAPPER = "/tmp/evil"\n',
+    "split-link-arg": '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=/tmp/e"]\n',
+    "split-link-args": '[build]\nrustflags = ["-C","link-args=-x"]\n',
+    "pre-link-args": '[build]\nrustflags = ["-Zpre-link-args=-x"]\n',
+    "split-codegen-backend": '[build]\nrustflags = ["-Z","codegen-backend=/tmp/e.so"]\n',
+    "codegen-eq-linker": '[build]\nrustflags = ["--codegen=linker=/tmp/e"]\n',
+    "rustdoc-runtool": '[build]\nrustdocflags = ["--runtool","/tmp/e"]\n',
+    "doc-browser": '[doc]\nbrowser = "/tmp/e"\n',
+    "env-ld-audit": '[env]\nLD_AUDIT = "/tmp/e.so"\n',
+    "env-bash-env": '[env]\nBASH_ENV = "/tmp/e.sh"\n',
+    "env-path": '[env]\nPATH = "/tmp/evil:/usr/bin"\n',
     "upper-case": '[BUILD]\nRUSTC-WRAPPER = "/tmp/evil"\n',
 }
 
@@ -166,6 +176,38 @@ def test_bad_allow_regex_does_not_crash():
 def test_shell_plant_gated(cmd):
     d = evaluate(_shell(cmd), EMPTY)
     assert _gated(d) and d.rule == RULE
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'linker=\"e\"'>>.cargo/config.toml",
+    "echo 'linker=\"e\"'>.cargo/config.toml",
+    "echo rustc-wrapper=e 1>.cargo/config.toml",
+    "(echo rustc-wrapper=e)>>.cargo/config.toml",
+    "sed -i 's/.*/linker = \"e\"/' .cargo/config.toml",
+    "sed -i \"s|^linker.*|linker = e|\" .cargo/config.toml",
+    "echo 'rustc-wrapper=e' >> $CARGO_HOME/config.toml",
+    "echo 'rustc-wrapper=e' >> ${CARGO_HOME}/config",
+])
+def test_shell_qa_round1_bypasses_gated(cmd):
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_edit_removing_exec_key_not_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                    args={"file_path": ".cargo/config.toml",
+                          "old_string": 'rustc-wrapper = "sccache"\n', "new_string": ""})
+    assert evaluate(ev, EMPTY).action == Action.ALLOW
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+                    args={"file_path": ".cargo/config.toml",
+                          "edits": [{"old_string": 'rustc-wrapper = "sccache"',
+                                     "new_string": "jobs = 4"}]})
+    assert evaluate(ev, EMPTY).action == Action.ALLOW
+
+
+def test_lowercase_path_dependency_not_gated():
+    c = '[patch.crates-io]\nfoo = { path = "../foo" }\n[paths]\npath = "x"\n'
+    assert evaluate(_write(".cargo/config.toml", c), EMPTY).action == Action.ALLOW
 
 
 def test_shell_benign_not_gated():
