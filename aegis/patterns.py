@@ -5350,6 +5350,52 @@ TF_EXEC_HIT_RE = re.compile(
 # "local-exec"-shaped substring in another produces a same-command false
 # ASK, not a false ALLOW.
 
+# ---- Cargo config exec-hijack protection ---------------------------------------
+# Cargo's `.cargo/config.toml` (project-level, any ancestor directory, or
+# `~/.cargo/config.toml`) names programs that CARGO ITSELF spawns:
+# `[build] rustc-wrapper`/`rustc-workspace-wrapper`/`rustc`/`rustdoc` wrap or
+# replace the compiler on every `cargo build`/`check`/`test`/`clippy`/`doc`
+# (even `cargo check` in an editor's rust-analyzer background run, no human
+# action at all); `[target.<triple>] linker`/`runner` run at link time and on
+# every `cargo run`/`test`/`bench`; `-C linker=`/`-C link-arg(s)=` inside a
+# `rustflags` value reach the same exec; and `credential-provider`/
+# `credential-process`/`global-credential-providers` are handed the registry
+# token on every authenticated fetch/publish. `[env]` can inject LD_PRELOAD-
+# class variables into every build script and rustc invocation. The existing
+# registry-config guard only covers `replace-with` source redirects; none of
+# these exec keys were gated. A `.cargo/config.toml` is routinely TRACKED and
+# reads as harmless build tuning (a faster linker, a cross-compile runner).
+#
+# Path: any `.cargo/config` or `.cargo/config.toml` (Windows `.cargo\config`
+# too), at any depth.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Content check: the exec-capable key itself, not the whole file (an ordinary
+# `[net]`/`[profile]` edit must not gate). Keys may be bare, quoted, or
+# dotted (`build.rustc-wrapper = ...`, `target.x86_64-unknown-linux-gnu.
+# linker = ...`), so they are anchored on a preceding start/space/dot/quote/
+# bracket and a following `=`. `linker`/`runner` are generic words but only
+# ever reach this regex when the file is already a cargo config.
+CARGO_EXEC_HIT_RE = re.compile(
+    r"(?:^|\\[nt]|[\s.\[{,\"'])(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
+    r"|linker|runner|credential-provider|credential-process"
+    r"|global-credential-providers)[\"']?\s*="
+    r"|-C\s*linker\s*=|-C\s*link-args?\s*=|-Clink-args?\s*=|-Zcodegen-backend"
+    r"|(?:^|\\[nt]|[\s.\[{,\"'])(?:LD_PRELOAD|DYLD_INSERT_LIBRARIES|RUSTC_WRAPPER"
+    r"|RUSTC_WORKSPACE_WRAPPER|RUSTC|LD_LIBRARY_PATH)[\"']?\s*=",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Disclosed gaps (same shape every sibling guard accepts): a value assembled
+# indirectly (generator script), `CARGO_HOME` relocated to an attacker dir
+# holding its own config.toml, `CARGO_BUILD_RUSTC_WRAPPER`/`CARGO_TARGET_*_
+# LINKER` set only in the process environment (not persisted to a file), and
+# `build.rs`/proc-macro code (ordinary source, not config) are not covered.
+# Shell branch is not clause-scoped: an unrelated clause naming a cargo
+# config plus an unrelated `x = ` shaped key yields a false ASK, not a false
+# ALLOW.
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/

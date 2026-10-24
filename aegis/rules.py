@@ -7087,6 +7087,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
 )
 
 
@@ -7895,6 +7896,103 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a program-spawning key in a Cargo config file
+    (`.cargo/config.toml` / `.cargo/config`).
+
+    PLAN / THREAT MODEL: Cargo itself spawns whatever a config names --
+    `[build] rustc-wrapper`/`rustc-workspace-wrapper`/`rustc`/`rustdoc` on
+    every build, check, test, clippy or doc run (including an IDE's
+    background `cargo check`), `[target.*] linker`/`runner` at link time and
+    on every `cargo run`/`test`, `-C linker=`/`link-arg` inside `rustflags`,
+    and `credential-provider`/`credential-process` (handed the live registry
+    token). `[env]` can inject `LD_PRELOAD`-class variables into every build
+    script. The config is routinely tracked and reads as build tuning, and
+    `rule_package_manifest_protect` only gates its registry `replace-with`
+    redirect, so this write-now/exec-later surface was ungated.
+
+    Config (`policy.cargo_exec`): `mode` (deny|ask|monitor|off, default ask),
+    `allow` (regexes on the path/command that skip the gate, e.g. a repo's
+    reviewed `linker = "mold"`). Escapable only by a human: a trailing
+    '# aegis-allow' on the shell form, or `AEGIS_ALLOW_CARGO_EXEC=1` set
+    before launch for the Edit/Write/MCP form.
+
+    Honest scope: indirectly assembled values, a relocated `CARGO_HOME`,
+    process-env-only `CARGO_*` overrides, and `build.rs` source are not
+    covered (see `CARGO_EXEC_HIT_RE`'s comment)."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        scan_content = patterns.strip_comment_lines(content)
+        if not patterns.CARGO_EXEC_HIT_RE.search(scan_content):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is planting a program-spawning key "
+                         "(rustc-wrapper/linker/runner/credential-provider/"
+                         "rustflags linker, or an LD_PRELOAD-class [env]) in "
+                         "a Cargo config — Cargo runs it on the next "
+                         "build/check/test/run, by this session, a teammate, "
+                         "an IDE or CI. Review the change, then confirm "
+                         "with AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        if not (patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+                and patterns.CARGO_EXEC_HIT_RE.search(scan_cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A program-spawning key (rustc-wrapper/linker/"
+                         "runner/credential-provider/rustflags linker, or an "
+                         "LD_PRELOAD-class [env]) is being planted in a "
+                         "Cargo config from a shell — Cargo runs it on the "
+                         "next build/check/test/run. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_CARGO_EXEC=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -8520,6 +8618,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
