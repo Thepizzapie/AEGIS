@@ -240,3 +240,50 @@ def test_adversarial_input_is_fast():
     evaluate(_write(".cargo/config.toml", blob), EMPTY)
     evaluate(_shell("echo " + blob[:200000] + " >> .cargo/config.toml"), EMPTY)
     assert time.time() - t < 5
+
+
+# ---- QA round 2 -------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cat >.cargo/config.toml<<'EOF'\n[build]\nrustc-wrapper=\"x\"\nEOF",
+    "cat > .cargo/config.toml<<EOF\nlinker='x'\nEOF",
+    "tee .cargo/config.toml<<<'linker=\"x\"'",
+    "sed -i '1irustc-wrapper=\"x\"' .cargo/config.toml",
+    "sed -i '$arunner=\"x\"' .cargo/config.toml",
+    "sed -i '/build/alinker=\"x\"' .cargo/config.toml",
+    "sed -i '/\\[build\\]/a\\rustc-wrapper=\"x\"' .cargo/config.toml",
+    "sed -i '1c\\linker=\"x\"' .cargo/config.toml",
+])
+def test_shell_round2_gated(cmd):
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d) and d.rule == RULE
+
+
+def test_mcp_edit_file_newtext_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__edit_file", action=ActionClass.MCP,
+                    args={"path": ".cargo/config.toml",
+                          "edits": [{"oldText": "a", "newText": "linker='x'"}]})
+    assert evaluate(ev, EMPTY).rule == RULE
+
+
+def test_mixed_content_and_new_string_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__x", action=ActionClass.MCP,
+                    args={"path": ".cargo/config.toml", "new_string": "linker='x'", "content": "jobs=1"})
+    assert evaluate(ev, EMPTY).rule == RULE
+
+
+@pytest.mark.parametrize("payload", [
+    '[build]\nrustflags = ["-C","link_arg=x"]\n',
+    '[build]\nrustflags = ["-Z","llvm-plugins=/x.so"]\n',
+    '[build]\nrustdocflags = ["--test-builder","/x"]\n',
+    '[env]\nTARGET_CC = "/x"\n', '[env]\nCC_x86_64_unknown_linux_gnu = "/x"\n',
+    '[env]\nAR = "/x"\n', '[env]\nGIT_ASKPASS = "/x"\n', '[env]\nPKG_CONFIG = "/x"\n',
+])
+def test_round2_payloads_gated(payload):
+    assert evaluate(_write(".cargo/config.toml", payload), EMPTY).rule == RULE
+
+
+def test_lowercase_ar_and_cc_keys_not_gated():
+    c = '[target.x]\nar = "x"\n[patch.crates-io]\ncc = { path = "../cc" }\n'
+    # `ar` is deliberately not a gated bare key; only the case-sensitive env name is
+    assert evaluate(_write(".cargo/config.toml", '[dependencies]\ncc = "1"\n'), EMPTY).action == Action.ALLOW

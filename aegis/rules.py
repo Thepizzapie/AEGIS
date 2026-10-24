@@ -7906,6 +7906,19 @@ def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
+_CARGO_OLD_KEYS = frozenset({"old_string", "oldstring", "old_str", "oldtext",
+                             "old_text", "old", "search", "find"})
+
+
+def _cargo_drop_old(o):
+    if isinstance(o, dict):
+        return {k: _cargo_drop_old(v) for k, v in o.items()
+                if str(k).lower() not in _CARGO_OLD_KEYS}
+    if isinstance(o, list):
+        return [_cargo_drop_old(v) for v in o]
+    return o
+
+
 def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting a program-spawning key in a Cargo config file
     (`.cargo/config.toml` / `.cargo/config`).
@@ -7948,20 +7961,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
             return None
         a = ev.args or {}
-        # Scan only what is being WRITTEN: never old_string, so removing or
-        # replacing an exec key does not false-ASK.
-        edits = a.get("edits")
-        if isinstance(edits, list) and edits:
-            content = " ".join(str(e.get("new_string") or "") for e in edits
-                               if isinstance(e, dict))
-        elif "new_string" in a and "content" not in a:
-            content = a.get("new_string") if isinstance(a.get("new_string"), str) else ""
-        else:
-            raw_content = a.get("content")
-            if isinstance(raw_content, str) and raw_content:
-                content = raw_content
-            else:
-                content = " ".join(_flatten_strings(a))
+        # Scan what is being WRITTEN, never the text being replaced: drop
+        # every old-text field (old_string/oldText/...), so removing an exec
+        # key does not false-ASK, and scan ALL remaining strings (content,
+        # new_string, newText, patch, nested edits[]) so no edit-tool shape
+        # hides the payload.
+        content = "\n".join(_flatten_strings(_cargo_drop_old(a)))
         if not content:
             return None
         scan_content = patterns.strip_comment_lines(content)

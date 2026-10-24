@@ -5368,9 +5368,11 @@ TF_EXEC_HIT_RE = re.compile(
 #
 # Path: any `.cargo/config` or `.cargo/config.toml` (Windows `.cargo\config`
 # too), at any depth.
+# like _CI_END, but also ends on `<` (a glued heredoc/herestring: `cat >f<<EOF`)
+_CARGO_END = _WIN_TRIM + r"(?=[/\\;&|)<>]|\s|['\"]|$)"
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=<>()|;&])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
-    + r"|\$\{?CARGO_HOME\b[^\s'\"]{0,40}?[/\\]config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>()|;&])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CARGO_END
+    + r"|\$\{?CARGO_HOME\b[^\s'\"]{0,40}?[/\\]config(?:\.toml)?" + _CARGO_END,
     re.IGNORECASE,
 )
 # Content check: the exec-capable key itself, not the whole file (an ordinary
@@ -5385,18 +5387,21 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # `pre-link-arg(s)`/`codegen-backend`/`runtool` are bare keys too. The
 # [env] variable group is case-SENSITIVE (`(?-i:...)`) so a lowercase
 # `path = "..."` dependency key never matches `PATH`.
-_CARGO_PFX = r"(?:^|\\[nt]|[\s.\[{,\"'=/|;(>])"
+# `(?<=[0-9$/\]][aic])\\?` also lets a key follow a sed one-line a/i/c
+# command letter directly (`1irustc-wrapper=...`, `/x/a\\linker=...`).
+_CARGO_PFX = r"(?:^|\\[nt]|(?<=[0-9$/\]][aic])\\?|[\s.\[{,\"'=/|;(>])"
 CARGO_EXEC_HIT_RE = re.compile(
     _CARGO_PFX + r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc"
     r"|linker|runner|browser|credential-provider|credential-process"
-    r"|global-credential-providers|link-args?|pre-link-args?|codegen-backend"
+    r"|global-credential-providers|link[-_]args?|pre-link-args?|codegen-backend|llvm-plugins"
     r"|runtool|test-runtool)[\"']?\s*="
-    r"|-C\s*linker\s*=|-C\s*link-args?\s*=|-Clink-args?\s*=|-Z\s*(?:codegen-backend|pre-link-args?\s*=)"
-    r"|--(?:test-)?runtool\b"
+    r"|-C\s*linker\s*=|-C\s*link[-_]args?\s*=|-Z\s*(?:codegen-backend|llvm-plugins|pre-link-args?\s*=)"
+    r"|--(?:test-)?(?:runtool|builder)\b"
     r"|" + _CARGO_PFX + r"(?-i:LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES"
     r"|DYLD_FALLBACK_LIBRARY_PATH|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTC"
     r"|CARGO_BUILD_RUSTC_WRAPPER|BASH_ENV|NODE_OPTIONS|PYTHONSTARTUP|PATH"
-    r"|CC|CXX|GIT_SSH_COMMAND)[\"']?\s*=",
+    r"|(?:(?:TARGET|HOST)_)?(?:CC|CXX|AR)(?:_\w+)?|PKG_CONFIG|RUSTC_LINKER|PYTHONPATH|PERL5OPT"
+    r"|GIT_ASKPASS|SSH_ASKPASS|GIT_SSH_COMMAND)[\"']?\s*=",
     re.IGNORECASE | re.MULTILINE,
 )
 # Disclosed gaps (same shape every sibling guard accepts): a value assembled
@@ -5406,7 +5411,10 @@ CARGO_EXEC_HIT_RE = re.compile(
 # exec key's VALUE (old_string is deliberately not scanned, so removing a key
 # does not false-ASK), an MCP tool whose path argument is not one `_path`
 # recognises (shared with every sibling guard), read-only commands (`grep
-# 'linker =' .cargo/config.toml`) naming both halves (false ASK), `CARGO_BUILD_RUSTC_WRAPPER`/`CARGO_TARGET_*_
+# 'linker =' .cargo/config.toml`) naming both halves (false ASK), a bare
+# `browser =` key in an unrelated section (false ASK), sed newline escapes
+# other than `\n` (`\x0a`), and `str_replace_based_edit_tool` (classified OTHER
+# engine-wide), `CARGO_BUILD_RUSTC_WRAPPER`/`CARGO_TARGET_*_
 # LINKER` set only in the process environment (not persisted to a file), and
 # `build.rs`/proc-macro code (ordinary source, not config) are not covered.
 # Shell branch is not clause-scoped: an unrelated clause naming a cargo
