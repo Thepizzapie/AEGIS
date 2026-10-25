@@ -1565,6 +1565,18 @@ FOREIGN_AGENT_RULES_PATH_RE = re.compile(
     + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + _CI_END,
     re.IGNORECASE,
 )
+# Windsurf's global rules file lives outside the project tree.
+FOREIGN_AGENT_RULES_GLOBAL_RE = re.compile(
+    _FOREIGN_RULES_ROOT + r"\.codeium" + _WIN_TRIM + _SEP + r"windsurf" + _WIN_TRIM + _SEP
+    + r"memories" + _WIN_TRIM + _SEP + r"global_rules\.md" + _CI_END, re.IGNORECASE)
+# `cd .github && echo x > copilot-instructions.md`: the parent is named in one
+# clause and the target relatively in the next, so neither matches the path RE.
+FOREIGN_AGENT_RULES_CD_RE = re.compile(
+    r"\bcd\s+['\"]?[^\s;&|'\"]{0,200}?\.(?:cursor|windsurf|roo|github|amazonq|continue|kiro|augment|claude)"
+    + _WIN_TRIM + r"[/\\]?['\"]?\s*(?:&&|;|\|\|)"
+    r"[^\n]{0,400}?(?:copilot-instructions\.md|\b(?:rules[a-z-]{0,20}|instructions|prompts|agents|chatmodes|steering)[/\\])",
+    re.IGNORECASE)
+FOREIGN_AGENT_RULES_VERB_RE = re.compile(r"(?<![\w-])(?:install|touch|patch|unzip)\s", re.IGNORECASE)
 FOREIGN_AGENT_RULES_DIR_RE = re.compile(
     _FOREIGN_RULES_ROOT + _FOREIGN_RULES_DIRS + _CI_END,
     re.IGNORECASE,

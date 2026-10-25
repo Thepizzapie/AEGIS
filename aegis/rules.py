@@ -1214,7 +1214,8 @@ def rule_foreign_agent_rules_protect(ev: Event, policy=None) -> Optional[Decisio
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
-        if not (p and patterns.FOREIGN_AGENT_RULES_PATH_RE.search(p)):
+        if not (p and (patterns.FOREIGN_AGENT_RULES_PATH_RE.search(p)
+                       or patterns.FOREIGN_AGENT_RULES_GLOBAL_RE.search(p))):
             return None
         if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_RULES")
                 or _foreign_rules_allowed_by_policy(cfg, p)):
@@ -1229,6 +1230,8 @@ def rule_foreign_agent_rules_protect(ev: Event, policy=None) -> Optional[Decisio
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         names_target = bool(patterns.FOREIGN_AGENT_RULES_PATH_RE.search(cmd)
+                             or patterns.FOREIGN_AGENT_RULES_GLOBAL_RE.search(cmd)
+                             or patterns.FOREIGN_AGENT_RULES_CD_RE.search(cmd)
                              or patterns.FOREIGN_AGENT_RULES_DIR_RE.search(cmd)
                              or patterns.foreign_agent_rules_find_hit(cmd))
         touches_target = names_target and (
@@ -1237,7 +1240,8 @@ def rule_foreign_agent_rules_protect(ev: Event, policy=None) -> Optional[Decisio
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
             or patterns.INPLACE_WRITE_RE.search(cmd)
             or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+            or patterns.FOREIGN_AGENT_RULES_VERB_RE.search(cmd))
         if not touches_target:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_RULES")

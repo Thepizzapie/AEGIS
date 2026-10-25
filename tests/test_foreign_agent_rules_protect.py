@@ -181,3 +181,27 @@ def test_loader_parses_knob(tmp_path):
     f = tmp_path / "p.yaml"
     f.write_text("foreign_agent_rules:\n  mode: deny\n")
     assert load_policy(f).foreign_agent_rules == {"mode": "deny"}
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd .github && echo x > copilot-instructions.md",
+    "cd .github && cp /tmp/a copilot-instructions.md",
+    "cd .cursor && echo x > rules/a.mdc",
+    "install -m644 /tmp/x .cursorrules",
+    "install -D /tmp/x .cursor/rules/a.mdc",
+    "touch .cursorrules",
+    "patch .cursorrules < p",
+    "unzip a.zip -d .cursor/rules",
+])
+def test_qa_round1_bypasses_gated(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE, cmd
+
+
+def test_windsurf_global_rules():
+    assert evaluate(_write("/home/u/.codeium/windsurf/memories/global_rules.md"), EMPTY).rule == RULE
+    assert evaluate(_shell("echo x > ~/.codeium/windsurf/memories/global_rules.md"), EMPTY).rule == RULE
+
+
+@pytest.mark.parametrize("cmd", ["cd .github && ls", "cd src && echo x > rules.txt", "cd .git && git status"])
+def test_qa_round1_benign_cd(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE
