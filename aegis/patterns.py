@@ -1523,6 +1523,62 @@ def agent_def_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, AGENT_DEF_FIND_PREDICATE_RE)
 
 
+# Foreign-runtime agent-instruction files. `AGENT_INSTRUCTIONS_PATH_RE`/
+# `AGENT_DEF_PATH_RE` above cover Claude Code's and the AGENTS.md convention's
+# own files only. Every other coding agent auto-loads an equivalent
+# natural-language rules file straight into its system prompt on the next
+# session start — Cursor (`.cursorrules`, `.cursor/rules/*.mdc`), Windsurf
+# (`.windsurfrules`, `.windsurf/rules/*`), Cline (`.clinerules`, a file or a
+# directory), Roo (`.roorules`, `.roo/rules*/`), GitHub Copilot
+# (`.github/copilot-instructions.md`, `.github/instructions/*`,
+# `.github/prompts/*`, `.github/agents/*`, `.github/chatmodes/*`), Gemini CLI
+# (`GEMINI.md`), JetBrains Junie (`.junie/guidelines.md`), Amazon Q
+# (`.amazonq/rules/*`), Continue (`.continue/rules/*`), Kiro
+# (`.kiro/steering/*`), Augment (`.augment/rules/*`) — plus Claude Code's own
+# `.claude/rules/*.md`, which `AGENT_DEF_PATH_RE`'s agents/commands/
+# output-styles alternation never lists. A teammate (or CI agent) running any
+# of those tools inherits whatever the planting agent wrote, with no tool call
+# for this session's hook to ever see on their side. Same bounded `{0,4}`
+# nesting and bare-directory backstop as AGENT_DEF_PATH_RE/AGENT_DEF_DIR_RE,
+# for the same reasons.
+_FOREIGN_RULES_ROOT = r"(?:^|[\s'\"/\\=>|;&(])"  # `echo x>.cursorrules` has no space
+_FOREIGN_RULES_DIRS = (
+    r"(?:\.cursor" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.roo" + _WIN_TRIM + _SEP + r"rules[a-z-]{0,20}"
+    r"|\.clinerules"
+    r"|\.claude" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.continue" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.kiro" + _WIN_TRIM + _SEP + r"steering"
+    r"|\.augment" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|agents|chatmodes))"
+)
+FOREIGN_AGENT_RULES_PATH_RE = re.compile(
+    _FOREIGN_RULES_ROOT + r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules"
+    r"|GEMINI(?:\.local)?\.md)" + _CI_END
+    + r"|" + _FOREIGN_RULES_ROOT + r"\.github" + _WIN_TRIM + _SEP
+    + r"copilot-instructions\.md" + _CI_END
+    + r"|" + _FOREIGN_RULES_ROOT + r"\.junie" + _WIN_TRIM + _SEP
+    + r"guidelines\.md" + _CI_END
+    + r"|" + _FOREIGN_RULES_ROOT + _FOREIGN_RULES_DIRS + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + _CI_END,
+    re.IGNORECASE,
+)
+FOREIGN_AGENT_RULES_DIR_RE = re.compile(
+    _FOREIGN_RULES_ROOT + _FOREIGN_RULES_DIRS + _CI_END,
+    re.IGNORECASE,
+)
+FOREIGN_AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|GEMINI\.md\b"
+    r"|copilot-instructions|guidelines\.md\b|\.cursor\b|\.windsurf\b|\.roo\b"
+    r"|\.amazonq\b|\.continue\b|\.kiro\b|\.augment\b|\.github\b|\.claude\b)")
+
+
+def foreign_agent_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, FOREIGN_AGENT_RULES_FIND_PREDICATE_RE)
+
+
 # ---- Claude Code Skill-definition protection -----------------------------------
 # A sibling of the agent_def family above, on a surface that family never reaches:
 # `.claude/skills/<name>/SKILL.md` (project- or user-scoped). Every SKILL.md's YAML
