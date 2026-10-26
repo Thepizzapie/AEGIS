@@ -296,6 +296,11 @@ class Policy:
     # configuration in any JetBrains IDE that opens this project. See
     # rules.rule_jetbrains_run_config_protect.
     jetbrains_run_config: dict = field(default_factory=dict)
+    # Other AI agents' instruction/rule file protection (.cursorrules,
+    # copilot-instructions.md, GEMINI.md, .clinerules, ...): {mode: deny|ask|
+    # monitor|off, allow: [regex on path/command]}. Empty -> mode=ask. See
+    # rules.rule_agent_rules_protect.
+    agent_rules: dict = field(default_factory=dict)
     # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted

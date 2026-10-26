@@ -53,7 +53,7 @@ def load_policy(path) -> Policy:
         "rules": [], "default": Action.ALLOW, "on_error": Action.ALLOW,
         "egress": {}, "plugins": [], "workspace": {}, "project": None,
         "agent_label": None, "install_review": {}, "mcp_config": {}, "mcp_tool_integrity": {},
-        "ci_workflow": {}, "git_hooks": {}, "hook_manager": {}, "agent_def": {}, "skills_protect": {},
+        "ci_workflow": {}, "git_hooks": {}, "hook_manager": {}, "agent_def": {}, "agent_rules": {}, "skills_protect": {},
         "shell_persist": {},
         "direnv": {},
         "package_manifest": {}, "pnpmfile_exec": {}, "yarn_exec": {}, "git_config_exec": {}, "git_attributes_exec": {},
@@ -111,6 +111,7 @@ def load_policy(path) -> Policy:
                   vscode_tasks_exec=st["vscode_tasks_exec"],
                   jetbrains_watcher_exec=st["jetbrains_watcher_exec"],
                   jetbrains_run_config=st["jetbrains_run_config"],
+                  agent_rules=st["agent_rules"],
                   path_hijack=st["path_hijack"],
                   claude_hooks=st["claude_hooks"],
                   statusline=st["statusline"],
@@ -153,7 +154,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
     # Guard-config knobs (install review, MCP-config protection, context
     # injection, failure-loop, completion verification) — small dicts.
     for key in ("install_review", "mcp_config", "mcp_tool_integrity", "ci_workflow", "git_hooks", "hook_manager",
-                "agent_def",
+                "agent_def", "agent_rules",
                 "skills_protect",
                 "shell_persist", "direnv", "package_manifest", "pnpmfile_exec", "yarn_exec", "git_config_exec",
                 "git_attributes_exec", "gitmodules", "service_persist", "ld_preload",
