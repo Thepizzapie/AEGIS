@@ -130,3 +130,62 @@ def test_no_catastrophic_backtracking():
         patterns.AI_RULES_PATH_RE.search(s)
         patterns.AI_RULES_DIR_RE.search(s)
     assert time.time() - t < 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x>.cursorrules", "echo x >.cursorrules", "echo x>>GEMINI.md",
+    "true;rm .windsurfrules", "echo x|tee .cursor/rules/a.mdc",
+    "echo x>.github/copilot-instructions.md",
+])
+def test_no_space_redirect_and_separators_gated(cmd):
+    assert _hit(evaluate(_shell(cmd), EMPTY))
+
+
+def test_case_and_trailing_dot_variants():
+    assert _hit(evaluate(_file("gemini.MD"), EMPTY))
+    assert _hit(evaluate(_file(".cursorrules. "), EMPTY))
+
+
+def test_monitor_records_audit_and_allows(tmp_path, monkeypatch):
+    monkeypatch.setenv("AEGIS_AUDIT", str(tmp_path / "audit.jsonl"))
+    d = evaluate(_file(".cursorrules"), Policy(agent_rules={"mode": "monitor"}))
+    assert d.action == Action.ALLOW
+    log = (tmp_path / "audit.jsonl")
+    assert log.exists() and "agent-rules-protect-monitor" in log.read_text()
+
+
+def test_invalid_allow_regex_skipped_and_shell_allow():
+    p = Policy(agent_rules={"allow": ["(", r"team-rules"]})
+    assert _hit(evaluate(_file(".cursorrules"), p))
+    assert not _hit(evaluate(_shell("echo x > .cursor/rules/team-rules.mdc"), p))
+
+
+def test_yaml_roundtrip(tmp_path, monkeypatch):
+    from aegis.loader import load_policy
+    d = tmp_path / "pol"; d.mkdir()
+    (d / "p.yaml").write_text("agent_rules:\n  mode: deny\n")
+    monkeypatch.setenv("AEGIS_POLICIES", str(d))
+    pol = load_policy() if load_policy.__code__.co_argcount == 0 else load_policy(str(d))
+    assert pol.agent_rules.get("mode") == "deny"
+    assert evaluate(_file(".cursorrules"), pol).action == Action.DENY
+
+
+@pytest.mark.parametrize("path", ["QWEN.md", ".goosehints", ".augment/rules/a.md", ".trae/rules/a.md"])
+def test_additional_agents(path):
+    assert _hit(evaluate(_file(path), EMPTY))
+
+
+@pytest.mark.parametrize("path", [".roo/rules/a", ".roo/rules-code/instructions", ".windsurf/rules/a",
+                                  ".junie/x", ".kiro/steering/a.mdx", ".cursor/rules/a.cursorrules"])
+def test_any_extension_under_rules_dir(path):
+    assert _hit(evaluate(_file(path), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", ["cat GEMINI.md 2>/dev/null", "cat .cursorrules 2>&1 | head",
+                                 "grep x GEMINI.md &>/dev/null", "ls .github/prompts 2>/dev/null"])
+def test_read_with_noise_redirects_not_gated(cmd):
+    assert not _hit(evaluate(_shell(cmd), EMPTY))
+
+
+def test_real_write_with_noise_redirect_still_gated():
+    assert _hit(evaluate(_shell("echo x > GEMINI.md 2>/dev/null"), EMPTY))

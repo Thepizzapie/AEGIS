@@ -1243,12 +1243,16 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
                              or patterns.AI_RULES_DIR_RE.search(cmd))
         if not names_target:
             return None
-        touches = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
-                        or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                        or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
-                        or patterns.INPLACE_WRITE_RE.search(cmd)
-                        or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                        or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+        # fd-duplication and /dev/null redirects (`2>&1`, `2>/dev/null`) are
+        # not writes to a target; strip them so a read like `cat GEMINI.md
+        # 2>/dev/null` doesn't ask.
+        wcmd = re.sub(r"(?:&|\d*)>>?\s*(?:/dev/null\b|&\d+-?)", " ", cmd)
+        touches = bool(patterns.WRITE_REDIRECT_RE.search(wcmd)
+                        or patterns.DELETE_OR_MOVE_VERB_RE.search(wcmd)
+                        or patterns.DESTRUCTIVE_DELETE_RE.search(wcmd)
+                        or patterns.INPLACE_WRITE_RE.search(wcmd)
+                        or patterns.FORCED_LINK_WRITE_RE.search(wcmd)
+                        or patterns.ARCHIVE_SYNC_VERB_RE.search(wcmd))
         if not touches:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_RULES")

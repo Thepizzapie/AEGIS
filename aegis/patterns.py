@@ -1487,10 +1487,10 @@ AGENT_DEF_DIR_RE = re.compile(
 # reads it -- including agents that run with no Aegis at all.
 _AI_RULES_FILES = (
     r"\.cursorrules|\.windsurfrules|\.clinerules|\.roorules"
-    r"|GEMINI(?:\.local)?\.md|copilot-instructions\.md"
+    r"|GEMINI(?:\.local)?\.md|QWEN\.md|\.goosehints|copilot-instructions\.md"
 )
 AI_RULES_FILE_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])(?:" + _AI_RULES_FILES + r")" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>;|&(])(?:" + _AI_RULES_FILES + r")" + _CI_END,
     re.IGNORECASE,
 )
 _AI_RULES_DIRS = (
@@ -1502,14 +1502,15 @@ _AI_RULES_DIRS = (
     r"|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
     r"|\.kiro" + _WIN_TRIM + _SEP + r"(?:steering|specs)"
     r"|\.junie"
+    r"|\.augment" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.trae" + _WIN_TRIM + _SEP + r"rules"
     r"|\.gemini" + _WIN_TRIM + _SEP + r"commands"
     r"|\.codex" + _WIN_TRIM + _SEP + r"prompts"
     r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|agents|prompts|chatmodes)"
 )
 AI_RULES_DIR_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])(?:" + _AI_RULES_DIRS + r")" + _WIN_TRIM + _SEP
-    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG
-    + r"\.(?:md|mdc|toml|ya?ml|txt|json)" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>;|&(])(?:" + _AI_RULES_DIRS + r")" + _WIN_TRIM + _SEP
+    + r"(?:" + _AGENT_DEF_SEG + r"){0,4}" + _CI_SEG + _CI_END,
     re.IGNORECASE,
 )
 # Combined single-file/dir-file matcher, plus a bare-directory backstop for
@@ -1517,7 +1518,7 @@ AI_RULES_DIR_PATH_RE = re.compile(
 AI_RULES_PATH_RE = re.compile(
     AI_RULES_FILE_RE.pattern + r"|" + AI_RULES_DIR_PATH_RE.pattern, re.IGNORECASE)
 AI_RULES_DIR_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])(?:" + _AI_RULES_DIRS + r")" + _CI_END, re.IGNORECASE)
+    r"(?:^|[\s'\"/\\=<>;|&(])(?:" + _AI_RULES_DIRS + r")" + _CI_END, re.IGNORECASE)
 
 # Archive/sync verbs that place a file WITHOUT any of WRITE_REDIRECT_RE /
 # DELETE_OR_MOVE_VERB_RE / DESTRUCTIVE_DELETE_RE / INPLACE_WRITE_RE /
