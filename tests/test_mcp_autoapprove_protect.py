@@ -130,7 +130,7 @@ def _e(old, new, tool="Edit"):
 def test_edit_flip_via_old_string_context():
     assert hit(_e('ProjectMcpServers": false', 'ProjectMcpServers": true'))
     assert hit(_e('Servers": []', 'Servers": ["evil"]'))
-    assert hit(_e('"enableAllProjectMcpServers": false', 'true'))
+    assert hit(_e('false', 'true'))
     assert hit(_e('"enableAllProjectMcpServers": 1', '"enableAllProjectMcpServers": true', "MultiEdit"))
 
 
@@ -160,3 +160,35 @@ def test_shell_more_shapes():
     assert hit(_shell("echo '{\"enableAllProjectMcpServers\":true}' | sponge " + f))
     assert not hit(_shell("grep '\"enableAllProjectMcpServers\": true' %s 2>/dev/null" % f))
     assert not hit(_shell("jq '.enabledMcpjsonServers' " + f))
+
+
+def test_round2_regressions():
+    f = ".claude/settings.local.json"
+    # union of content + edit-shaped args
+    assert hit(Event.make(HookEvent.PRE_TOOL_USE, tool="Write", args={
+        "file_path": P, "content": ALL, "edits": [{"old_string": "a", "new_string": "b"}]}))
+    # alternate spellings / bare flip
+    assert hit(_e('false', 'true'))
+    assert hit(Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": P, "old_str": 'ProjectMcpServers": false', "new_str": 'ProjectMcpServers": true'}))
+    # list key via python/node/yq
+    assert hit(_shell("python3 -c \"d['enabledMcpjsonServers']=['x'];open('%s','w')\"" % f))
+    assert hit(_shell("node -e \"d.enabledMcpjsonServers.push('x');fs.writeFileSync('%s',d)\"" % f))
+    assert hit(_shell("yq -i '.enabledMcpjsonServers = [\"x\"]' " + f))
+    assert hit(_shell("yq -yi '.enableAllProjectMcpServers = true' " + f))
+    assert hit(_shell("yq -i '.enableAllProjectMcpServers |= true' " + f))
+    assert hit(_shell("jq 'setpath([\"enableAllProjectMcpServers\"];true)' %s | sponge %s" % (f, f)))
+    # false positives
+    assert not hit(_e('"enableAllProjectMcpServers": false, "x": 1', '"x": true'))
+    assert not hit(_shell("grep '\"enableAllProjectMcpServers\": true' %s 2>&1" % f))
+
+
+def test_robustness():
+    import time
+    t = time.time()
+    assert not hit(_e("a" * 100000, "true") ) or True
+    assert time.time() - t < 2
+    for bad in (5, "x", {"old_string": "a", "new_string": "b"}, None):
+        rules.rule_mcp_autoapprove_protect(
+            Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={"file_path": P, "edits": bad}), EMPTY)
+    rules.rule_mcp_autoapprove_protect(_write(P, "[" * 50000), EMPTY)

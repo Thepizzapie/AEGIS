@@ -3422,7 +3422,10 @@ MCP_AUTOAPPROVE_KEY_RE = re.compile(
 # true'`, a flat `key=true` string from a config-set MCP tool): the key name,
 # an optional closing quote/bracket, `:`/`=`, then `true`.
 MCP_AUTOAPPROVE_BARE_RE = re.compile(
-    r"\benableAllProjectMcpServers\b[\"'\]\s]*[:=]\s*[\"']?true\b",
+    r"\benableAllProjectMcpServers\b[\"'\]\s]*(?:[:=]|\|=)\s*[\"']?true\b"
+    r"|\benabledMcpjsonServers\b[\"'\]\s]*(?:[:=]|\+=|\|=)\s*\[\s*[\"'][^\"'\s]"
+    r"|\benabledMcpjsonServers\b[\"'\]]*\s*\.\s*(?:append|push|extend|add)\s*\(\s*\[?\s*[\"'][^\"'\s]"
+    r"|\bsetpath\s*\(\s*\[\s*[\"'](?:enableAllProjectMcpServers[\"']\s*\]\s*;\s*true\b|enabledMcpjsonServers[\"']\s*\]\s*;\s*\[\s*[\"'][^\"'\s])",
     re.IGNORECASE,
 )
 

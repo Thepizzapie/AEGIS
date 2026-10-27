@@ -6310,12 +6310,22 @@ def _mcp_autoapprove_edit_pairs(a: dict) -> list:
     pairs = []
     def _add(d):
         if isinstance(d, dict):
-            o = d.get("old_string", d.get("oldText", d.get("old_text")))
-            n = d.get("new_string", d.get("newText", d.get("new_text")))
+            o = n = None
+            for ok in ("old_string", "oldText", "old_text", "old_str", "oldString", "find"):
+                if isinstance(d.get(ok), str):
+                    o = d[ok]
+                    break
+            for nk in ("new_string", "newText", "new_text", "new_str", "newString", "replace", "new_source"):
+                if isinstance(d.get(nk), str):
+                    n = d[nk]
+                    break
             if isinstance(n, str):
                 pairs.append((o if isinstance(o, str) else "", n))
     _add(a)
-    for e in (a.get("edits") or []):
+    edits = a.get("edits")
+    if isinstance(edits, dict):
+        edits = [edits]
+    for e in (edits if isinstance(edits, (list, tuple)) else []):
         _add(e)
     return pairs
 
@@ -6324,7 +6334,7 @@ def _mcp_autoapprove_names_key(old: str) -> bool:
     """Does ``old`` (an Edit's old_string) name -- possibly only as a trailing
     fragment, e.g. ``ProjectMcpServers": false`` -- one of the two keys?
     ``disabledMcpjsonServers`` and unrelated ``...Servers`` keys don't count."""
-    for m in re.finditer(r"[A-Za-z]*Servers\b", old):
+    for m in re.finditer(r"(?<![A-Za-z])[A-Za-z]{0,40}Servers\b", old[:20000]):
         tok = m.group(0).lower()
         if tok.startswith("disabled"):
             continue
@@ -6337,14 +6347,24 @@ def _mcp_autoapprove_edit_hit(a: dict) -> bool:
     """Edit-shaped args: judge what each edit ADDS (new text), using the old
     text only as key context -- so a `false`->`true` flip (key only in
     old_string) is caught, and a removal/narrowing (empty or non-enabling new
-    text) is not a false positive."""
+    text) is not a false positive. The old-context rule requires the key to
+    be IMMEDIATELY before the old value (i.e. the old text ends at/after the
+    key and `new` carries the value), not merely present somewhere in `old`;
+    a bare `false`/`[]` old value with an enabling new value also counts (the
+    key is outside the edit, a unique `false` is enough for Edit)."""
     for old, new in _mcp_autoapprove_edit_pairs(a):
         if not new.strip():
             continue
         n, o = _mcp_autoapprove_normalize(new), _mcp_autoapprove_normalize(old)
-        if (patterns.MCP_AUTOAPPROVE_KEY_RE.search(n) or patterns.MCP_AUTOAPPROVE_BARE_RE.search(n)
-                or (_mcp_autoapprove_names_key(o)
-                    and patterns.MCP_AUTOAPPROVE_VALUE_RE.search(n))):
+        if patterns.MCP_AUTOAPPROVE_KEY_RE.search(n) or patterns.MCP_AUTOAPPROVE_BARE_RE.search(n):
+            return True
+        if not patterns.MCP_AUTOAPPROVE_VALUE_RE.search(n):
+            continue
+        # key context in old: the LAST key-ish token in old must not be
+        # followed in `new` by the key again (new restates/removes it)
+        if _mcp_autoapprove_names_key(o) and _mcp_autoapprove_names_key(n):
+            return True
+        if o.strip().strip("\"'").lower() in ("false", "[]", "null", "0", "") and len(n) < 200:
             return True
     return False
 
@@ -6398,7 +6418,7 @@ def _mcp_autoapprove_struct_hit(v, _depth: int = 0) -> bool:
 def _mcp_autoapprove_json_hit(content: str) -> bool:
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return False
     return _mcp_autoapprove_struct_hit(obj)
 
@@ -6480,15 +6500,19 @@ def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
         a = ev.args or {}
         if not p or not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
+        hit = False
         if _mcp_autoapprove_edit_pairs(a):
             # edit-shaped: judge the added text only (removals/narrowing pass)
             hit = _mcp_autoapprove_edit_hit(a)
-        else:
+        if not hit:
             literal = a.get("content")
-            content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
-            if not content:
-                return None
-            norm = _mcp_autoapprove_normalize(content)
+            if isinstance(literal, str) and literal:
+                content = literal
+            elif _mcp_autoapprove_edit_pairs(a):
+                content = ""      # edit-shaped: old_string text must not count as written content
+            else:
+                content = " ".join(_flatten_strings(a))
+            norm = _mcp_autoapprove_normalize(content) if content else ""
             hit = bool(patterns.MCP_AUTOAPPROVE_KEY_RE.search(norm)
                        or patterns.MCP_AUTOAPPROVE_BARE_RE.search(norm)
                        or _mcp_autoapprove_json_hit(content))
@@ -6511,12 +6535,12 @@ def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        wcmd = re.sub(r"\d?>>?\s*/dev/null|&>\s*/dev/null", " ", cmd)  # a discarded stream is not a write
+        wcmd = re.sub(r"\d?>>?\s*/dev/null|&>\s*/dev/null|\d?>&\d", " ", cmd)  # a discarded stream is not a write
         write_verb = bool(patterns.WRITE_REDIRECT_RE.search(wcmd)
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(wcmd)
                            or patterns.INPLACE_WRITE_RE.search(wcmd)
                            or patterns.FORCED_LINK_WRITE_RE.search(wcmd)
-                           or re.search(r"\bsponge\b|\byq\b[^;|&\n]*\s-i\b|\bpython3?\b|\bnode\b|\bruby\b", wcmd))
+                           or re.search(r"\bsponge\b|\byq\b[^;|&\n]*\s(?:-[a-z]*i|--inplace)\b|\bpython3?\b|\bnode\b|\bruby\b", wcmd))
         cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
         path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
                          or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
