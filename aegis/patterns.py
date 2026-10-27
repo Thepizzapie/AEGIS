@@ -3417,6 +3417,22 @@ MCP_AUTOAPPROVE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Non-JSON assignment spellings of the same enabling value (a python/node
+# `d['enableAllProjectMcpServers']=True`, `yq -i '.enableAllProjectMcpServers =
+# true'`, a flat `key=true` string from a config-set MCP tool): the key name,
+# an optional closing quote/bracket, `:`/`=`, then `true`.
+MCP_AUTOAPPROVE_BARE_RE = re.compile(
+    r"\benableAllProjectMcpServers\b[\"'\]\s]*[:=]\s*[\"']?true\b",
+    re.IGNORECASE,
+)
+
+# An Edit's replacement text that ADDS an enabling value without naming the key
+# (the key sits in `old_string`): a bare `true`, or a non-empty string list.
+MCP_AUTOAPPROVE_VALUE_RE = re.compile(
+    r"\btrue\b|\[\s*[\"'][^\"'\s]", re.IGNORECASE)
+MCP_AUTOAPPROVE_NAME_RE = re.compile(
+    r"enableAllProjectMcpServers|enabledMcpjsonServers", re.IGNORECASE)
+
 # jq/gojq/jaq scripted edit (piped through `sponge`, no write verb of its own):
 # an assignment-shaped operator plus either key as a bare substring --
 # `enableAllProjectMcpServers` must co-occur with `true` in the same `;`-scoped
@@ -3426,7 +3442,7 @@ MCP_AUTOAPPROVE_KEY_RE = re.compile(
 # `PERMISSION_BYPASS_JQ_RE` documents.
 MCP_AUTOAPPROVE_JQ_RE = re.compile(
     r"\b(?:(?:go)?jq|jaq)\b"
-    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*(?:" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r"|[*+]\s*\{))"
     r"(?=[^;]*(?:\benableAllProjectMcpServers\b[^;]*\btrue\b|\benabledMcpjsonServers\b))",
     re.IGNORECASE,
 )

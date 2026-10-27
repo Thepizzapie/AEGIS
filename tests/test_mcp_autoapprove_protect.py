@@ -120,3 +120,43 @@ def test_loader_wires_knob(tmp_path):
     f = tmp_path / "p.yaml"
     f.write_text("mcp_autoapprove:\n  mode: deny\n")
     assert load_policy(f).mcp_autoapprove == {"mode": "deny"}
+
+
+def _e(old, new, tool="Edit"):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool=tool,
+                      args={"file_path": P, "old_string": old, "new_string": new})
+
+
+def test_edit_flip_via_old_string_context():
+    assert hit(_e('ProjectMcpServers": false', 'ProjectMcpServers": true'))
+    assert hit(_e('Servers": []', 'Servers": ["evil"]'))
+    assert hit(_e('"enableAllProjectMcpServers": false', 'true'))
+    assert hit(_e('"enableAllProjectMcpServers": 1', '"enableAllProjectMcpServers": true', "MultiEdit"))
+
+
+def test_edit_removal_and_narrowing_pass():
+    assert not hit(_e('"enabledMcpjsonServers": ["a"],\n', ""))
+    assert not hit(_e('"enableAllProjectMcpServers": true', '"enableAllProjectMcpServers": false'))
+    assert not hit(_e('"enabledMcpjsonServers": ["a"]', '"enabledMcpjsonServers": []'))
+    assert not hit(_e('"model": "a"', '"model": "b"'))
+
+
+def test_mcp_more_shapes():
+    assert hit(_mcp(P, patch=[{"op": "add", "path": "/enableAllProjectMcpServers", "value": True}]))
+    assert hit(_mcp(P, setting="enabledMcpjsonServers", newText=["evil"]))
+    assert hit(_mcp(P, pairs=[["enableAllProjectMcpServers", True]]))
+    assert hit(_mcp(P, line="enableAllProjectMcpServers=true"))
+    assert hit(_mcp(P, edits=[{"oldText": 'Servers": false', "newText": 'Servers": true'}]))
+    assert not hit(_mcp(P, key="model", value="enabledMcpjsonServers"))
+
+
+def test_shell_more_shapes():
+    f = ".claude/settings.local.json"
+    assert hit(_shell(r'''echo "{\"enableAllProjectMcpServers\":true}" > ''' + f))
+    assert hit(_shell("python3 -c \"import json;d=json.load(open('%s'));d['enableAllProjectMcpServers']=True\"" % f))
+    assert hit(_shell("jq '. * {\"enabledMcpjsonServers\":[\"x\"]}' %s | sponge %s" % (f, f)))
+    assert hit(_shell("jq '. + {enableAllProjectMcpServers: true}' %s > t && mv t %s" % (f, f)))
+    assert hit(_shell("yq -i '.enableAllProjectMcpServers = true' " + f))
+    assert hit(_shell("echo '{\"enableAllProjectMcpServers\":true}' | sponge " + f))
+    assert not hit(_shell("grep '\"enableAllProjectMcpServers\": true' %s 2>/dev/null" % f))
+    assert not hit(_shell("jq '.enabledMcpjsonServers' " + f))

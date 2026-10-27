@@ -6297,6 +6297,58 @@ _MCP_AUTOAPPROVE_ALL = "enableallprojectmcpservers"
 _MCP_AUTOAPPROVE_LIST = "enabledmcpjsonservers"
 
 
+_MCP_AUTOAPPROVE_VALUE_FIELDS = ("val", "text", "data", "content")
+
+
+def _mcp_autoapprove_leaf(k: str) -> str:
+    """Last segment of a dotted / slash (JSON-Pointer) key, lowercased."""
+    return re.split(r"[./]", k.strip().lower())[-1]
+
+
+def _mcp_autoapprove_edit_pairs(a: dict) -> list:
+    """(old, new) text pairs from Edit / MultiEdit / MCP edit-style args."""
+    pairs = []
+    def _add(d):
+        if isinstance(d, dict):
+            o = d.get("old_string", d.get("oldText", d.get("old_text")))
+            n = d.get("new_string", d.get("newText", d.get("new_text")))
+            if isinstance(n, str):
+                pairs.append((o if isinstance(o, str) else "", n))
+    _add(a)
+    for e in (a.get("edits") or []):
+        _add(e)
+    return pairs
+
+
+def _mcp_autoapprove_names_key(old: str) -> bool:
+    """Does ``old`` (an Edit's old_string) name -- possibly only as a trailing
+    fragment, e.g. ``ProjectMcpServers": false`` -- one of the two keys?
+    ``disabledMcpjsonServers`` and unrelated ``...Servers`` keys don't count."""
+    for m in re.finditer(r"[A-Za-z]*Servers\b", old):
+        tok = m.group(0).lower()
+        if tok.startswith("disabled"):
+            continue
+        if any(n.endswith(tok) for n in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST)):
+            return True
+    return False
+
+
+def _mcp_autoapprove_edit_hit(a: dict) -> bool:
+    """Edit-shaped args: judge what each edit ADDS (new text), using the old
+    text only as key context -- so a `false`->`true` flip (key only in
+    old_string) is caught, and a removal/narrowing (empty or non-enabling new
+    text) is not a false positive."""
+    for old, new in _mcp_autoapprove_edit_pairs(a):
+        if not new.strip():
+            continue
+        n, o = _mcp_autoapprove_normalize(new), _mcp_autoapprove_normalize(old)
+        if (patterns.MCP_AUTOAPPROVE_KEY_RE.search(n) or patterns.MCP_AUTOAPPROVE_BARE_RE.search(n)
+                or (_mcp_autoapprove_names_key(o)
+                    and patterns.MCP_AUTOAPPROVE_VALUE_RE.search(n))):
+            return True
+    return False
+
+
 def _mcp_autoapprove_truthy(name: str, val) -> bool:
     """Is ``val`` an enabling value for ``name``? Only ``true`` (bool or the
     string) for the enable-all flag, and only a non-empty list/string for the
@@ -6317,24 +6369,28 @@ def _mcp_autoapprove_struct_hit(v, _depth: int = 0) -> bool:
     if isinstance(v, dict):
         for k, val in v.items():
             if isinstance(k, str):
-                nk = k.strip().lower().rsplit(".", 1)[-1]
+                nk = _mcp_autoapprove_leaf(k)
                 if nk in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST) and _mcp_autoapprove_truthy(nk, val):
                     return True
             if _mcp_autoapprove_struct_hit(val, _depth + 1):
                 return True
-        # flat key/value tool shape: one field names the setting, another carries the value
-        for val in v.values():
-            if isinstance(val, str):
-                nk = val.strip().lower().rsplit(".", 1)[-1]
+        # flat key/value tool shape: one field names the setting, a sibling
+        # value-ish field (value/newValue/text/data/...) carries the value
+        for fk, val in v.items():
+            if isinstance(val, str) and not any(t in str(fk).lower() for t in _MCP_AUTOAPPROVE_VALUE_FIELDS):
+                nk = _mcp_autoapprove_leaf(val)
                 if nk in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST):
-                    # only fields named like a value (value/newValue/val...),
-                    # never a sibling `path`/`key` string
-                    if any(isinstance(ok, str) and "val" in ok.lower()
+                    if any(isinstance(ok, str) and any(t in ok.lower() for t in _MCP_AUTOAPPROVE_VALUE_FIELDS)
                            and _mcp_autoapprove_truthy(nk, o)
                            for ok, o in v.items()):
                         return True
         return False
     if isinstance(v, (list, tuple)):
+        # pair array: ["enableAllProjectMcpServers", true]
+        if (len(v) == 2 and isinstance(v[0], str)
+                and _mcp_autoapprove_leaf(v[0]) in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST)
+                and _mcp_autoapprove_truthy(_mcp_autoapprove_leaf(v[0]), v[1])):
+            return True
         return any(_mcp_autoapprove_struct_hit(x, _depth + 1) for x in v)
     return False
 
@@ -6387,6 +6443,18 @@ def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
     human: trailing '# aegis-allow' on the shell form, or
     ``AEGIS_ALLOW_MCP_AUTOAPPROVE=1`` set before launch for the file-write form.
 
+    QA history: round 1 (design + bypass-hunt, independent agents) closed:
+    Edit flips/removals judged on the ADDED text with old_string as key context
+    (a ``false``->``true`` flip no longer evades; removals/narrowing no longer
+    false-positive), JSON-Pointer/pair-array/flat-string/``newText`` MCP shapes,
+    backslash-escaped quotes, python/node/yq/jq-merge/``sponge`` shell writes,
+    and ``2>/dev/null`` counted as a write. Known, disclosed gaps: a two-step
+    split insert (key in one Edit, value in a later one, neither naming both);
+    ``CLAUDE_LOCAL_SETTINGS_PATH_RE`` needs a delimiter before ``.claude`` so
+    ``>.claude/...`` with no space is missed (shared with every sibling guard);
+    sed substitutions with no literal key; and ``# aegis-allow`` on shell
+    writes to this file is pre-empted by self-protect (shared with siblings).
+
     Honest scope (denylist, like its siblings): a value assembled indirectly
     (template, build script) is not caught; ``~/.claude.json`` per-project
     approval state and ``.claude/settings.json`` (already self-protected) are
@@ -6410,14 +6478,20 @@ def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        literal = a.get("content") or a.get("new_string")
-        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
-        if not p or not content:
+        if not p or not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
-        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
-            return None
-        hit = bool(patterns.MCP_AUTOAPPROVE_KEY_RE.search(_mcp_autoapprove_normalize(content))
-                   or _mcp_autoapprove_json_hit(content))
+        if _mcp_autoapprove_edit_pairs(a):
+            # edit-shaped: judge the added text only (removals/narrowing pass)
+            hit = _mcp_autoapprove_edit_hit(a)
+        else:
+            literal = a.get("content")
+            content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+            if not content:
+                return None
+            norm = _mcp_autoapprove_normalize(content)
+            hit = bool(patterns.MCP_AUTOAPPROVE_KEY_RE.search(norm)
+                       or patterns.MCP_AUTOAPPROVE_BARE_RE.search(norm)
+                       or _mcp_autoapprove_json_hit(content))
         if not hit and ev.action == ActionClass.MCP:
             hit = _mcp_autoapprove_struct_hit(a)
         if not hit:
@@ -6437,18 +6511,21 @@ def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
-                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                           or patterns.INPLACE_WRITE_RE.search(cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        wcmd = re.sub(r"\d?>>?\s*/dev/null|&>\s*/dev/null", " ", cmd)  # a discarded stream is not a write
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(wcmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(wcmd)
+                           or patterns.INPLACE_WRITE_RE.search(wcmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(wcmd)
+                           or re.search(r"\bsponge\b|\byq\b[^;|&\n]*\s-i\b|\bpython3?\b|\bnode\b|\bruby\b", wcmd))
         cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
         path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
                          or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
         if not path_hit:
             return None
-        normalized_cmd = _mcp_autoapprove_normalize(cmd)
+        normalized_cmd = _mcp_autoapprove_normalize(cmd).replace('\\"', '"').replace("\\'", "'")
         jq_hit = bool(patterns.MCP_AUTOAPPROVE_JQ_RE.search(normalized_cmd))
-        write_hit = bool(write_verb and patterns.MCP_AUTOAPPROVE_KEY_RE.search(normalized_cmd))
+        write_hit = bool(write_verb and (patterns.MCP_AUTOAPPROVE_KEY_RE.search(normalized_cmd)
+                                          or patterns.MCP_AUTOAPPROVE_BARE_RE.search(normalized_cmd)))
         if not (jq_hit or write_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MCP_AUTOAPPROVE")
