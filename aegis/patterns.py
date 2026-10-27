@@ -3413,7 +3413,7 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
 # key/colon/value (no bound to outrun, as for `defaultMode`).
 MCP_AUTOAPPROVE_KEY_RE = re.compile(
     r"[\"']enableAllProjectMcpServers[\"']\s*:\s*(?:true\b|[\"']true[\"'])"
-    r"|[\"']enabledMcpjsonServers[\"']\s*:\s*\[\s*[\"']",
+    r"|[\"']enabledMcpjsonServers[\"']\s*:\s*\[\s*[\"'][^\"'\s]",
     re.IGNORECASE,
 )
 

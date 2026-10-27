@@ -71,8 +71,11 @@ def test_other_file_ignored():
 
 
 def test_unicode_escape_fragment():
-    assert hit(_edit(P, '"enableAllProjectMcpServers": tr\\u0075e'.replace("tr\\u0075e", "true")
-                     .replace("enableAll", "\\u0065nableAll")))
+    assert hit(_edit(P, '"\\u0065nableAllProjectMcpServers": true'))
+
+
+def test_empty_string_list_benign():
+    assert not hit(_write(P, '{"enabledMcpjsonServers": [""]}'))
 
 
 def test_string_true_and_whitespace():
