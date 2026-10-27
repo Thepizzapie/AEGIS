@@ -6283,6 +6283,189 @@ def rule_claude_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     return None
 
 
+def _mcp_autoapprove_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_MCP_AUTOAPPROVE_ALL = "enableallprojectmcpservers"
+_MCP_AUTOAPPROVE_LIST = "enabledmcpjsonservers"
+
+
+def _mcp_autoapprove_truthy(name: str, val) -> bool:
+    """Is ``val`` an enabling value for ``name``? Only ``true`` (bool or the
+    string) for the enable-all flag, and only a non-empty list/string for the
+    server-name list -- ``false``/``[]`` narrow trust and stay benign."""
+    if name == _MCP_AUTOAPPROVE_ALL:
+        return val is True or (isinstance(val, str) and val.strip().lower() == "true")
+    if isinstance(val, (list, tuple)):
+        return any(isinstance(x, str) and x.strip() for x in val)
+    return isinstance(val, str) and bool(val.strip())
+
+
+def _mcp_autoapprove_struct_hit(v, _depth: int = 0) -> bool:
+    """Walk raw (possibly nested) MCP args for an enabling DICT KEY/value pair,
+    and for the flat ``{"key": "<name>", "value": <v>}`` convention some
+    config-set tools use. Depth capped (12) like its sibling walkers."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            if isinstance(k, str):
+                nk = k.strip().lower().rsplit(".", 1)[-1]
+                if nk in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST) and _mcp_autoapprove_truthy(nk, val):
+                    return True
+            if _mcp_autoapprove_struct_hit(val, _depth + 1):
+                return True
+        # flat key/value tool shape: one field names the setting, another carries the value
+        for val in v.values():
+            if isinstance(val, str):
+                nk = val.strip().lower().rsplit(".", 1)[-1]
+                if nk in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST):
+                    # only fields named like a value (value/newValue/val...),
+                    # never a sibling `path`/`key` string
+                    if any(isinstance(ok, str) and "val" in ok.lower()
+                           and _mcp_autoapprove_truthy(nk, o)
+                           for ok, o in v.items()):
+                        return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_mcp_autoapprove_struct_hit(x, _depth + 1) for x in v)
+    return False
+
+
+def _mcp_autoapprove_json_hit(content: str) -> bool:
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    return _mcp_autoapprove_struct_hit(obj)
+
+
+_MCP_AUTOAPPROVE_WS_RUN_RE = re.compile(r"\s+")
+_MCP_AUTOAPPROVE_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _mcp_autoapprove_normalize(text: str) -> str:
+    """Decode JSON ``\\uXXXX`` escapes and collapse whitespace before the key
+    regex runs -- the same fragment-escape closure every sibling
+    ``settings.local.json`` guard applies (a standalone-JSON parse alone misses
+    an Edit's ``new_string`` fragment)."""
+    def _decode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    return _MCP_AUTOAPPROVE_WS_RUN_RE.sub(
+        " ", _MCP_AUTOAPPROVE_UNICODE_ESCAPE_RE.sub(_decode, text))
+
+
+def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting ``"enableAllProjectMcpServers": true`` or a non-empty
+    ``"enabledMcpjsonServers"`` list in ``.claude/settings.local.json``.
+
+    THREAT MODEL: `rule_mcp_config_protect` gates writes to ``.mcp.json``, but
+    Claude Code does not trust a project ``.mcp.json`` server by default -- it
+    asks the human once before spawning it. These two documented keys answer
+    that prompt in advance: the first approves every server any project
+    ``.mcp.json`` ever defines (including ones a later ``git pull`` or a
+    teammate's commit introduces), the second approves the named ones. A
+    pre-approved server runs as an unsandboxed subprocess with the user's full
+    privileges at the next session start, and its tools join the model's
+    toolset (prompt-injection reach). The file is gitignored by default, so
+    there is no diff or review. Same "self-approve the trust prompt" shape as
+    `rule_direnv_protect`'s ``direnv allow`` gate; value-gated like
+    `rule_permission_bypass_protect` (``false``/``[]`` narrow trust and pass).
+
+    Config (``policy.mcp_autoapprove``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command). Escapable only by a
+    human: trailing '# aegis-allow' on the shell form, or
+    ``AEGIS_ALLOW_MCP_AUTOAPPROVE=1`` set before launch for the file-write form.
+
+    Honest scope (denylist, like its siblings): a value assembled indirectly
+    (template, build script) is not caught; ``~/.claude.json`` per-project
+    approval state and ``.claude/settings.json`` (already self-protected) are
+    out of this guard's path match; a direct fetch-to-file write is closed by
+    `rule_fetch_to_file_protect` (which shares `CLAUDE_LOCAL_SETTINGS_PATH_RE`);
+    filler before the signal beyond ``normalize.scan_surface``'s shared
+    20,000-char cap is truncated for every guard alike."""
+    cfg = getattr(policy, "mcp_autoapprove", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "mcp-autoapprove-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.MCP_AUTOAPPROVE_KEY_RE.search(_mcp_autoapprove_normalize(content))
+                   or _mcp_autoapprove_json_hit(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = _mcp_autoapprove_struct_hit(a)
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_MCP_AUTOAPPROVE")
+                or _mcp_autoapprove_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "mcp-autoapprove-protect",
+                         f"'{p}' is being written with `enableAllProjectMcpServers: "
+                         "true` or a non-empty `enabledMcpjsonServers` — this "
+                         "pre-answers Claude Code's one-time approval prompt, so "
+                         "project .mcp.json servers launch as unsandboxed "
+                         "subprocesses next session with no human checkpoint, and "
+                         "(being gitignored by default) no diff or code review. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_MCP_AUTOAPPROVE=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        normalized_cmd = _mcp_autoapprove_normalize(cmd)
+        jq_hit = bool(patterns.MCP_AUTOAPPROVE_JQ_RE.search(normalized_cmd))
+        write_hit = bool(write_verb and patterns.MCP_AUTOAPPROVE_KEY_RE.search(normalized_cmd))
+        if not (jq_hit or write_hit):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MCP_AUTOAPPROVE")
+                or _mcp_autoapprove_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "mcp-autoapprove-protect",
+                         "Project-MCP auto-approval (`enableAllProjectMcpServers: "
+                         "true` / non-empty `enabledMcpjsonServers`) is being "
+                         "planted in .claude/settings.local.json from a shell — "
+                         "it pre-answers Claude Code's approval prompt so "
+                         ".mcp.json servers auto-launch next session, with no "
+                         "diff or code review. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_MCP_AUTOAPPROVE=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -8514,6 +8697,7 @@ _CORE_RULES = (
     rule_permission_bypass_protect,
     rule_claude_env_protect,
     rule_claude_cred_helper_protect,
+    rule_mcp_autoapprove_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,

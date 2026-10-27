@@ -3390,6 +3390,47 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code project-MCP auto-approval (.claude/settings.local.json) ----
+# The MCP-config guard (`rule_mcp_config_protect`) gates WRITES to `.mcp.json`,
+# but a project-scoped `.mcp.json` server is not trusted by default: Claude Code
+# shows the human a one-time approval prompt before launching it. Two documented
+# settings keys in `.claude/settings.local.json` (the project-local, gitignored-
+# by-default sibling of settings.json) silently answer that prompt in advance:
+# `"enableAllProjectMcpServers": true` approves EVERY server any `.mcp.json` in
+# the project ever defines, and `"enabledMcpjsonServers": ["name", ...]`
+# approves the listed ones. An agent that cannot write `.mcp.json` past the
+# guard can still pre-approve a server a teammate's/attacker's commit (or a
+# later pull) introduces, and an agent that CAN get a server entry in (e.g. via
+# the human's own approved edit) uses these keys to remove the one human
+# checkpoint standing before it spawns as an unsandboxed subprocess on the next
+# session start -- the same "self-approve the trust prompt" shape as `direnv
+# allow` or `task.allowAutomaticTasks`.
+#
+# The VALUE is the enabling switch, not the key: `"enableAllProjectMcpServers":
+# false` and `"enabledMcpjsonServers": []` are benign (they narrow trust), so
+# only a true value / a non-empty list matches, mirroring `permissions.
+# defaultMode`'s value-gated check. `\s*` absorbs any whitespace between
+# key/colon/value (no bound to outrun, as for `defaultMode`).
+MCP_AUTOAPPROVE_KEY_RE = re.compile(
+    r"[\"']enableAllProjectMcpServers[\"']\s*:\s*(?:true\b|[\"']true[\"'])"
+    r"|[\"']enabledMcpjsonServers[\"']\s*:\s*\[\s*[\"']",
+    re.IGNORECASE,
+)
+
+# jq/gojq/jaq scripted edit (piped through `sponge`, no write verb of its own):
+# an assignment-shaped operator plus either key as a bare substring --
+# `enableAllProjectMcpServers` must co-occur with `true` in the same `;`-scoped
+# statement, `enabledMcpjsonServers` alone suffices (an empty-list assignment
+# is a narrow, accepted false positive: this file's usual direction). Unbounded
+# `;`-scoped lookaheads for the same jq-`#`-comment-padding reason
+# `PERMISSION_BYPASS_JQ_RE` documents.
+MCP_AUTOAPPROVE_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*(?:\benableAllProjectMcpServers\b[^;]*\btrue\b|\benabledMcpjsonServers\b))",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards
