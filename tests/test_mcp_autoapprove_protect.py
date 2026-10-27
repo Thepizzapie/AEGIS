@@ -192,3 +192,19 @@ def test_robustness():
         rules.rule_mcp_autoapprove_protect(
             Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={"file_path": P, "edits": bad}), EMPTY)
     rules.rule_mcp_autoapprove_protect(_write(P, "[" * 50000), EMPTY)
+
+
+def test_round3():
+    import time
+    assert not hit(_e('"enableAllProjectMcpServers": false, "foo": 1',
+                      '"enableAllProjectMcpServers": false, "foo": true'))
+    assert hit(_e('Servers": false', 'Servers": true'))
+    t = time.time()
+    rules.rule_mcp_autoapprove_protect(
+        _mcp(P, **{f"k{i}": "enableAllProjectMcpServers" for i in range(5000)}), EMPTY)
+    rules.rule_mcp_autoapprove_protect(
+        _shell(".claude/settings.local.json " + "jq " * 10000), EMPTY)
+    rules.rule_mcp_autoapprove_protect(
+        _shell(".claude/settings.local.json " + "yq " * 10000), EMPTY)
+    assert time.time() - t < 3
+    assert hit(_shell("yq -Pi '.enableAllProjectMcpServers = true' .claude/settings.local.json"))

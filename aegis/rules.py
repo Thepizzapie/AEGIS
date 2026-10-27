@@ -6343,6 +6343,15 @@ def _mcp_autoapprove_names_key(old: str) -> bool:
     return False
 
 
+def _mcp_autoapprove_frag_value(n: str) -> bool:
+    """Does ``n`` carry an enabling value DIRECTLY after a key fragment
+    (``...Servers": true`` / ``...Servers": ["x"``)? Tying the value to the
+    fragment keeps `"foo": true` next to an untouched key from matching."""
+    return bool(re.search(
+        r"(?<![A-Za-z])[A-Za-z]{0,40}Servers[\"']?\s*[:=]\s*(?:true\b|[\"']true[\"']|\[\s*[\"'][^\"'\s])",
+        n[:20000], re.IGNORECASE))
+
+
 def _mcp_autoapprove_edit_hit(a: dict) -> bool:
     """Edit-shaped args: judge what each edit ADDS (new text), using the old
     text only as key context -- so a `false`->`true` flip (key only in
@@ -6362,7 +6371,7 @@ def _mcp_autoapprove_edit_hit(a: dict) -> bool:
             continue
         # key context in old: the LAST key-ish token in old must not be
         # followed in `new` by the key again (new restates/removes it)
-        if _mcp_autoapprove_names_key(o) and _mcp_autoapprove_names_key(n):
+        if _mcp_autoapprove_names_key(o) and _mcp_autoapprove_frag_value(n):
             return True
         if o.strip().strip("\"'").lower() in ("false", "[]", "null", "0", "") and len(n) < 200:
             return True
@@ -6396,13 +6405,14 @@ def _mcp_autoapprove_struct_hit(v, _depth: int = 0) -> bool:
                 return True
         # flat key/value tool shape: one field names the setting, a sibling
         # value-ish field (value/newValue/text/data/...) carries the value
-        for fk, val in v.items():
-            if isinstance(val, str) and not any(t in str(fk).lower() for t in _MCP_AUTOAPPROVE_VALUE_FIELDS):
-                nk = _mcp_autoapprove_leaf(val)
-                if nk in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST):
-                    if any(isinstance(ok, str) and any(t in ok.lower() for t in _MCP_AUTOAPPROVE_VALUE_FIELDS)
-                           and _mcp_autoapprove_truthy(nk, o)
-                           for ok, o in v.items()):
+        value_items = [o for ok, o in v.items()
+                       if isinstance(ok, str) and any(t in ok.lower() for t in _MCP_AUTOAPPROVE_VALUE_FIELDS)]
+        if value_items:
+            for fk, val in v.items():
+                if isinstance(val, str) and not any(t in str(fk).lower() for t in _MCP_AUTOAPPROVE_VALUE_FIELDS):
+                    nk = _mcp_autoapprove_leaf(val)
+                    if nk in (_MCP_AUTOAPPROVE_ALL, _MCP_AUTOAPPROVE_LIST) \
+                            and any(_mcp_autoapprove_truthy(nk, o) for o in value_items):
                         return True
         return False
     if isinstance(v, (list, tuple)):
@@ -6441,6 +6451,26 @@ def _mcp_autoapprove_normalize(text: str) -> str:
         " ", _MCP_AUTOAPPROVE_UNICODE_ESCAPE_RE.sub(_decode, text))
 
 
+def _mcp_autoapprove_jq_hit(cmd: str) -> bool:
+    """`MCP_AUTOAPPROVE_JQ_RE` evaluated once per ``;``-statement from its
+    FIRST jq token (its lookaheads already span the rest of the statement), so
+    a command stuffed with thousands of ``jq`` tokens costs linear, not
+    quadratic, time."""
+    for stmt in cmd.split(";"):
+        m = re.search(r"\b(?:(?:go)?jq|jaq)\b", stmt, re.IGNORECASE)
+        if m and patterns.MCP_AUTOAPPROVE_JQ_RE.match(stmt, m.start()):
+            return True
+    return False
+
+
+def _mcp_autoapprove_yq_inplace(cmd: str) -> bool:
+    for seg in re.split(r"[;|&\n]", cmd):
+        m = re.search(r"\byq\b", seg)
+        if m and re.search(r"\s(?:-[A-Za-z]*[iI]|--inplace)\b", seg[m.end():]):
+            return True
+    return False
+
+
 def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting ``"enableAllProjectMcpServers": true`` or a non-empty
     ``"enabledMcpjsonServers"`` list in ``.claude/settings.local.json``.
@@ -6474,6 +6504,14 @@ def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``>.claude/...`` with no space is missed (shared with every sibling guard);
     sed substitutions with no literal key; and ``# aegis-allow`` on shell
     writes to this file is pre-empted by self-protect (shared with siblings).
+
+    Rounds 2-3 closed: content+edit union, alternate old/new arg spellings,
+    ``enabledMcpjsonServers`` via python/node/yq/setpath, quadratic regex/
+    walker costs, crashes on odd ``edits``/deep JSON, and key-dropping or
+    neighbouring-key false positives; round 3 found no HIGH issues. Open LOW
+    gaps: ``setdefault(...)``, ``jq -f prog``, ``install``/``ln`` onto the
+    file, ``filePath``-only MCP path args (shared ``_path()``), parallel
+    keys/values arrays.
 
     Honest scope (denylist, like its siblings): a value assembled indirectly
     (template, build script) is not caught; ``~/.claude.json`` per-project
@@ -6540,14 +6578,15 @@ def rule_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(wcmd)
                            or patterns.INPLACE_WRITE_RE.search(wcmd)
                            or patterns.FORCED_LINK_WRITE_RE.search(wcmd)
-                           or re.search(r"\bsponge\b|\byq\b[^;|&\n]*\s(?:-[a-z]*i|--inplace)\b|\bpython3?\b|\bnode\b|\bruby\b", wcmd))
+                           or re.search(r"\bsponge\b|\bpython3?\b|\bnode\b|\bruby\b", wcmd)
+                           or _mcp_autoapprove_yq_inplace(wcmd))
         cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
         path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
                          or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
         if not path_hit:
             return None
         normalized_cmd = _mcp_autoapprove_normalize(cmd).replace('\\"', '"').replace("\\'", "'")
-        jq_hit = bool(patterns.MCP_AUTOAPPROVE_JQ_RE.search(normalized_cmd))
+        jq_hit = _mcp_autoapprove_jq_hit(normalized_cmd)
         write_hit = bool(write_verb and (patterns.MCP_AUTOAPPROVE_KEY_RE.search(normalized_cmd)
                                           or patterns.MCP_AUTOAPPROVE_BARE_RE.search(normalized_cmd)))
         if not (jq_hit or write_hit):
