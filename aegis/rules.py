@@ -7915,8 +7915,11 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     `rustdoc` wrap every compiler invocation, `target.<triple>.linker` runs at
     link time, `target.<triple>.runner` runs every `cargo run`/`cargo test`
     binary, and `registry.credential-process` / `global-credential-providers`
-    are handed registry tokens. All fire on an ordinary `cargo build`/`test`/
-    `run` by this session, a teammate, or CI -- the "write now, auto-exec
+    are handed registry tokens. Each fires when its operation runs (compile,
+    link, `cargo run`/`test`, or a registry op needing auth) -- by this
+    session, a teammate, or CI. The list is illustrative, not exhaustive
+    (`rustflags` `-C linker`, `[env]`, `registries.*.credential-process`,
+    `doc.browser` are also covered by the path gate) -- the "write now, auto-exec
     later" shape of a git hook, in a tracked file that reads as routine build
     config in review. `rule_package_manifest_protect` only gates this file's
     registry-redirect keys (`replace-with`); the exec keys were uncovered.
@@ -7930,7 +7933,12 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     default ask), ``allow`` (regexes on the path/command). Escapable only by a
     human: trailing '# aegis-allow' (shell) or ``AEGIS_ALLOW_CARGO_CONFIG_EXEC=1``.
 
-    Honest scope: not covered -- `build.rs` / proc-macros (full Rust code run
+    Honest scope: not covered -- MCP tools whose target-path arg key is not in
+    `_path()`'s list (`destination`, `dest`, ...; shared with every sibling),
+    globs / variable-assembled paths, `cd .cargo && ... config.toml`. Also a
+    false ASK whenever the path and any write verb co-occur in one command
+    (e.g. `cp .cargo/config.toml /tmp/b`), the accepted sibling trade-off.
+    Not covered either -- `build.rs` / proc-macros (full Rust code run
     by every build; far too routine to gate), `CARGO_HOME` relocated via an
     env var to a path without `.cargo/`, a config reached only through a
     symlink or a bare filename after an unscoped `cd`, and exec env vars
@@ -7974,7 +7982,8 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
         write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                            or patterns.INPLACE_WRITE_RE.search(cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.CARGO_CONFIG_EXTRA_WRITE_RE.search(cmd))
         if not (write_verb and patterns.CARGO_CONFIG_PATH_RE.search(cmd)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_CONFIG_EXEC")

