@@ -5333,6 +5333,21 @@ TF_EXEC_HIT_RE = re.compile(
     r"|[\"']data[\"']\s*:\s*\{\s*[\"']external[\"']",
     re.IGNORECASE,
 )
+# Cargo config exec-hijack: `.cargo/config.toml` (or legacy extensionless
+# `.cargo/config`), project-local at any ancestor depth or `$CARGO_HOME`
+# (`~/.cargo/`). Cargo runs the programs named by `build.rustc-wrapper`,
+# `build.rustc-workspace-wrapper`, `build.rustc`/`rustdoc`, `target.<triple>.
+# linker`/`runner`, and the credential providers (`registry.global-credential-
+# providers`, `registry.credential-process`) as arbitrary executables on the
+# next `cargo build`/`check`/`test`/`run`/`publish` -- by this session, a
+# teammate, or CI. PATH-ONLY gating (no key-adjacency content check): a
+# value-only Edit diff (`"/usr/bin/sccache"` -> `"/tmp/x"`) never repeats the
+# key text, the bypass class `rule_jetbrains_run_config_protect`'s QA history
+# documents; this file is rarely edited, so a path-level ASK is low-noise.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
 # Known, disclosed gaps (same shape every sibling `*_protect` guard in this
 # file already accepts): a destination assembled indirectly (a Terraform
 # `templatefile()`/variable interpolation building the block text, a
