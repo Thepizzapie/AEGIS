@@ -5273,6 +5273,42 @@ def docker_cred_helper_strong_hit(text: str) -> bool:
                 return True
     return False
 
+# ---- Cargo config exec-hijack protection -------------------------------------
+# `.cargo/config.toml` (project-level, any ancestor directory, or `$CARGO_HOME`)
+# names programs Cargo itself runs: `build.rustc-wrapper` /
+# `build.rustc-workspace-wrapper` wrap EVERY compiler invocation of a `cargo
+# build`/`check`/`test`/`run`; `target.<triple>.runner` is exec'd to launch
+# every built binary under `cargo run`/`test`/`bench`; `target.<triple>.linker`
+# / `build.rustc` / `build.rustdoc` replace the toolchain binaries; and
+# `registry.credential-provider` / `registry.global-credential-providers`
+# name a process handed registry tokens. All of it runs with the invoking
+# user's/CI's full privileges on the next ordinary cargo command. The
+# registry-redirect half of this file is already gated by the package-manifest
+# guard (REGISTRY_CONFIG_PATH_RE); this is the exec half, which that guard
+# never looks at.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# The key may follow a literal backslash-n/t (`printf '[build]\\nrustc-wrapper=...'`).
+# A quoted-string or array value (empty string disables the key, so it is not
+# a hit). Allows the key to be bare, quoted, or dotted (`build.rustc-wrapper`).
+_CARGO_VALUE = r"""\s*=\s*(?:["'][^"'\r\n]|\[)"""
+# Distinctive keys: hyphenated cargo-only vocabulary, safe to treat as
+# path-independent (content staged under another name, then moved into place).
+CARGO_EXEC_STRONG_RE = re.compile(
+    r"""(?:^|[\s.{,"']|\\[nrt])(?:rustc-wrapper|rustc-workspace-wrapper"""
+    r"""|credential-provider|global-credential-providers)["']?""" + _CARGO_VALUE,
+    re.IGNORECASE | re.MULTILINE,
+)
+# Generic keys, only meaningful once the path confirms this is a cargo config.
+CARGO_EXEC_WEAK_RE = re.compile(
+    r"""(?:^|[\s.{,"']|\\[nrt])(?:runner|linker|rustc|rustdoc)["']?""" + _CARGO_VALUE
+    + r"""|-C\s*linker\s*=|-C\s*link-arg|-Clink-arg""",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
 # `external` provider's `data "external"` data source all name an arbitrary

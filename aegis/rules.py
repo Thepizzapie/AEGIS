@@ -7087,6 +7087,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
 )
 
 
@@ -7699,6 +7700,120 @@ def rule_docker_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
                          "may append '# aegis-allow', or set "
                          "AEGIS_ALLOW_DOCKER_CRED_HELPER=1; a spawned agent "
                          "cannot."))
+    return None
+
+
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an exec-capable key in a Cargo config (`.cargo/config.toml`).
+
+    THREAT MODEL: Cargo runs the programs named by `build.rustc-wrapper`/
+    `build.rustc-workspace-wrapper` (around every compiler call),
+    `target.<triple>.runner` (to launch every built binary under `cargo run`/
+    `test`/`bench`), `target.<triple>.linker`/`build.rustc`/`build.rustdoc`
+    (toolchain replacement), and `registry.credential-provider`/
+    `registry.global-credential-providers` (handed registry tokens) -- on the
+    very next ordinary `cargo build`/`test`/`run`, by this session, a
+    teammate, or CI, with the invoker's full privileges. The file is a small
+    dotfile that is often committed and reads as routine build config. The
+    registry-REDIRECT half of `.cargo/config.toml` is gated by
+    `rule_package_manifest_protect`; this is the exec half it never inspects.
+
+    Config (`policy.cargo_exec`): `mode` (deny|ask|monitor|off, default ask),
+    `allow` (regexes on the path/command that skip the gate -- e.g. a reviewed
+    `sccache` wrapper). Default `ask`: `rustc-wrapper = "sccache"` and
+    cross-compile `linker`/`runner` entries are legitimate; a human just needs
+    to have looked at this one.
+
+    Escapable only by a human: trailing '# aegis-allow' on the shell form, or
+    `AEGIS_ALLOW_CARGO_EXEC=1` set before launch for the Edit/Write/MCP form.
+
+    Detection: the distinctive hyphenated keys (`rustc-wrapper`, ...) are
+    path-independent (catches content staged elsewhere then moved); the
+    generic keys (`runner`, `linker`, `rustc`, `rustdoc`, `-C linker=`/
+    `link-arg` in rustflags) count only once the path is a `.cargo/config[.toml]`.
+    An empty-string value (which disables the key) is not a hit. Full-line `#`
+    comments are stripped first. Edit/Write/MCP content falls through to the
+    flattened-string sweep for MultiEdit/NotebookEdit shapes, as siblings do.
+
+    Honest scope (denylist, like its siblings): env-var forms
+    (`RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`, `CARGO_TARGET_<T>_RUNNER`),
+    one-shot `cargo --config 'build.rustc-wrapper=...'` (runs only that single
+    command the agent itself issues), `CARGO_HOME` relocation to a path with no
+    `.cargo` segment, `build.rs`/proc-macros (ordinary source code), and values
+    assembled indirectly are not covered."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    def _hit(text: str, path_confirmed: bool) -> bool:
+        return bool(patterns.CARGO_EXEC_STRONG_RE.search(text)
+                    or (path_confirmed and patterns.CARGO_EXEC_WEAK_RE.search(text)))
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            path_text = p + " " + " ".join(_flatten_strings(a))
+        confirmed = bool(path_text and patterns.CARGO_CONFIG_PATH_RE.search(path_text))
+        if not _hit(patterns.strip_comment_lines(content), confirmed):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is being written with a Cargo exec key "
+                         "(rustc-wrapper/runner/linker/credential-provider) — "
+                         "Cargo runs the named program with the invoking "
+                         "user's/CI's privileges on the next ordinary 'cargo "
+                         "build'/'test'/'run', by anyone, with no further "
+                         "confirmation. Review the change, then confirm with "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        if not _hit(scan_cmd, bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd))):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo exec key (rustc-wrapper/runner/linker/"
+                         "credential-provider) is being set from a shell — "
+                         "Cargo runs the named program with the invoking "
+                         "user's/CI's privileges on the next ordinary 'cargo "
+                         "build'/'test'/'run'. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_CARGO_EXEC=1; "
+                         "a spawned agent cannot."))
     return None
 
 
@@ -8520,6 +8635,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
