@@ -5293,7 +5293,7 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # The key may follow a literal backslash-n/t (`printf '[build]\\nrustc-wrapper=...'`).
 # A quoted-string or array value (empty string disables the key, so it is not
 # a hit). Allows the key to be bare, quoted, or dotted (`build.rustc-wrapper`).
-_CARGO_VALUE = r"""\s*=\s*(?:["'][^"'\r\n]|\[)"""
+_CARGO_VALUE = r"""\s*=\s*(?:\[|\"\"\"|'''|["'][^"'\r\n])"""
 # Distinctive keys: hyphenated cargo-only vocabulary, safe to treat as
 # path-independent (content staged under another name, then moved into place).
 CARGO_EXEC_STRONG_RE = re.compile(
@@ -5301,13 +5301,23 @@ CARGO_EXEC_STRONG_RE = re.compile(
     r"""|credential-provider|global-credential-providers)["']?""" + _CARGO_VALUE,
     re.IGNORECASE | re.MULTILINE,
 )
+# (Also: rustflags `-C linker=`/`link-arg`, split across array elements or not;
+# nightly `-Z codegen-backend` (loads a dylib); `[doc] browser`; `[credential-alias]`.)
 # Generic keys, only meaningful once the path confirms this is a cargo config.
 CARGO_EXEC_WEAK_RE = re.compile(
     r"""(?:^|[\s.{,"']|\\[nrt])(?:runner|linker|rustc|rustdoc)["']?""" + _CARGO_VALUE
-    + r"""|-C\s*linker\s*=|-C\s*link-arg|-Clink-arg""",
+    + r"""|(?:-C|--codegen)["',\s]*(?:linker|link-args?)\b"""
+    + r"""|-Z["',\s]*codegen-backend\b|^\s*\[credential-alias\]"""
+    + r"""|(?:^|[\s.{,"']|\\[nrt])browser["']?""" + _CARGO_VALUE,
     re.IGNORECASE | re.MULTILINE,
 )
 
+
+# Shell: `cd .cargo && echo ... >> config.toml` names the dir and file apart.
+CARGO_SHELL_SPLIT_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo\b[\s\S]{0,300}?(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
 
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the

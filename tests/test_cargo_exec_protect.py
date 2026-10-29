@@ -127,3 +127,39 @@ def test_perf_large_input():
     t = time.time()
     _hit(_write(".cargo/config.toml", big))
     assert time.time() - t < 2
+
+
+def test_qa_round1_triple_quoted_values():
+    for v in ('"""/tmp/x"""', "'''/tmp/x'''", '"""\n/tmp/x"""'):
+        assert _hit(_write(".cargo/config.toml", f"[build]\nrustc-wrapper = {v}\n"))[0]
+
+
+def test_qa_round1_split_rustflags():
+    for body in ('["-C", "linker=/tmp/x"]', '["-C", "link-arg=-fuse-ld=/tmp/x"]',
+                 '["--codegen","linker=/tmp/x"]', '["-Zcodegen-backend=/tmp/x.so"]'):
+        assert _hit(_write(".cargo/config.toml", f"[build]\nrustflags = {body}\n"))[0]
+    assert not _hit(_write(".cargo/config.toml", '[build]\nrustflags = ["-C", "opt-level=3"]\n'))[0]
+
+
+def test_qa_round1_value_only_edit():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                    args={"file_path": ".cargo/config.toml", "old_string": '"sccache"',
+                          "new_string": '"/tmp/evil.sh"'})
+    assert _hit(ev)[0]
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                    args={"file_path": ".cargo/config.toml", "old_string": "4", "new_string": "8"})
+    assert not _hit(ev)[0]
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                    args={"file_path": "notes.md", "old_string": '"a"', "new_string": '"/tmp/b"'})
+    assert not _hit(ev)[0]
+
+
+def test_qa_round1_cd_then_relative_config():
+    assert _hit(_shell("cd .cargo && echo 'runner = \"/tmp/x\"' >> config.toml"))[0]
+    assert _hit(_shell("cd .cargo && printf '[target.x]\\nlinker=\"/tmp/x\"' > config.toml"))[0]
+    assert not _hit(_shell("cd .cargo && ls && echo 'runner = \"x\"' > notes.txt"))[0]
+
+
+def test_qa_round1_doc_browser_and_credential_alias():
+    assert _hit(_write(".cargo/config.toml", '[doc]\nbrowser = "/tmp/x"\n'))[0]
+    assert _hit(_write(".cargo/config.toml", '[credential-alias]\nfoo = "/tmp/x"\n'))[0]

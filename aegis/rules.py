@@ -7750,7 +7750,13 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     one-shot `cargo --config 'build.rustc-wrapper=...'` (runs only that single
     command the agent itself issues), `CARGO_HOME` relocation to a path with no
     `.cargo` segment, `build.rs`/proc-macros (ordinary source code), and values
-    assembled indirectly are not covered."""
+    assembled indirectly (`sed -i`, `cp`, scripted TOML writers) are not covered.
+
+    QA round 1 (independent adversarial review) found and this version closes:
+    triple-quoted TOML values, rustflags split across array elements
+    (`["-C", "linker=..."]`) and `-Z codegen-backend`, value-only Edits
+    (`"sccache"` -> `"/tmp/evil"`), `cd .cargo && ... > config.toml`, and the
+    `[doc] browser` / `[credential-alias]` keys. No ReDoS or wiring findings."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -7784,7 +7790,14 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         if ev.action == ActionClass.MCP:
             path_text = p + " " + " ".join(_flatten_strings(a))
         confirmed = bool(path_text and patterns.CARGO_CONFIG_PATH_RE.search(path_text))
-        if not _hit(patterns.strip_comment_lines(content), confirmed):
+        scan = patterns.strip_comment_lines(content)
+        # Edit that swaps only the VALUE of an existing key (`"sccache"` ->
+        # `"/tmp/evil.sh"`): new_string carries no key, so on a confirmed
+        # cargo config treat a lone quoted/array path-like value as a hit.
+        value_only = bool(confirmed and ev.action == ActionClass.EDIT
+                          and re.fullmatch(r"""\s*(?:["'\[][^\r\n]*)""", scan)
+                          and ("/" in scan or "\\" in scan))
+        if not (value_only or _hit(scan, confirmed)):
             return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)):
@@ -7801,7 +7814,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         scan_cmd = patterns.strip_comment_lines(cmd)
-        if not _hit(scan_cmd, bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd))):
+        confirmed = bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+                         or patterns.CARGO_SHELL_SPLIT_PATH_RE.search(scan_cmd))
+        if not _hit(scan_cmd, confirmed):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
