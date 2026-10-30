@@ -6364,8 +6364,8 @@ def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]
     Honest scope (same denylist trade-offs as the sibling guards): reaches
     ``.claude/settings.local.json`` only (``.claude/settings.json`` is covered
     by self-protect); values assembled indirectly are missed; ``defaultMode:
-    acceptEdits`` and a wide-but-not-blanket allow such as ``Bash(git:*)`` are
-    deliberately not gated; ``claude --allowedTools`` CLI flags are not
+    acceptEdits`` and a wide-but-not-blanket allow such as ``Bash(git:*)``/
+    ``Bash(rm:*)``/``Bash(node -e:*)`` are deliberately not gated; ``claude --allowedTools`` CLI flags are not
     covered; a ``curl -o`` write is closed by ``rule_fetch_to_file_protect``,
     which reuses ``CLAUDE_LOCAL_SETTINGS_PATH_RE``."""
     cfg = getattr(policy, "claude_preapprove", None) or {}

