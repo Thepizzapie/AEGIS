@@ -268,3 +268,60 @@ def test_no_quadratic_blowup():
         rule_claude_preapprove_protect(_shell(cmd), EMPTY)
         rule_claude_preapprove_protect(_write(LOCAL, cmd), EMPTY)
         assert time.time() - t < 1.0
+
+
+# ---- round-2 bypass-QA regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("filt", [
+    ".enableAllProjectMcpServers |= true", '.["enableAllProjectMcpServers"]=true',
+    ".permissions.allow|=.+[\"Bash\"]", ".enableAllProjectMcpServers=(true)",
+    ".enableAllProjectMcpServers=1",
+])
+def test_jq_forms_gated(filt):
+    cmd = f"jq '{filt}' {LOCAL} | sponge {LOCAL}"
+    assert _hit(evaluate(_shell(cmd), EMPTY)), filt
+
+
+@pytest.mark.parametrize("kw", [
+    dict(patch=[{"op": "add", "path": "/enableAllProjectMcpServers", "value": True}]),
+    dict(patch=[{"op": "add", "path": "/enabledMcpjsonServers/-", "value": "evil"}]),
+    dict(key="permissions.allow", value='["Bash"]'),
+    dict(key="permissions.allow.0", value="Bash"),
+    dict(key="permissions.allow[]", value="Bash"),
+])
+def test_mcp_round2_shapes_gated(kw):
+    assert _hit(evaluate(_mcp(LOCAL, **kw), EMPTY)), kw
+
+
+@pytest.mark.parametrize("kw", [
+    dict(key="permissions.deny", value=["Bash(*)"]),
+    dict(pointer="/permissions/deny/-", value="Bash(*)"),
+    dict(key="permissions.ask", value=["Bash(*)"]),
+    dict(key="enableAllProjectMcpServers", value=False),
+    dict(key="enabledMcpjsonServers", value=[]),
+])
+def test_mcp_round2_benign_not_gated(kw):
+    assert not _hit(evaluate(_mcp(LOCAL, **kw), EMPTY)), kw
+
+
+def test_edit_round2_fragments():
+    def e(o, n):
+        return Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                          args={"file_path": LOCAL, "old_string": o, "new_string": n})
+    assert _hit(evaluate(e('"enabledMcpjsonServers": []', '["evil"]'), EMPTY))
+    assert _hit(evaluate(e('"enableAllProjectMcpServers": 0', "1"), EMPTY))
+
+
+@pytest.mark.parametrize("entry", ["Edit(~/**)", "mcp__*__*", "Bash(*python*)", "Bash(lua:*)",
+                                   "Bash(uv run:*)", "Bash(npm run:*)", "Bash(make:*)",
+                                   "Bash(rsync:*)", "Bash(ln:*)"])
+def test_round2_wildcards_gated(entry):
+    c = json.dumps({"permissions": {"allow": [entry]}})
+    assert _hit(evaluate(_write(LOCAL, c), EMPTY)), entry
+
+
+def test_bare_regex_not_quadratic():
+    import time
+    t = time.time()
+    rule_claude_preapprove_protect(_write(LOCAL, "allow=[," * 12000), EMPTY)
+    assert time.time() - t < 1.0

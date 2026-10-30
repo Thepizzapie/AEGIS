@@ -3407,7 +3407,8 @@ _PREAPPROVE_INTERP = (
     r"(?:/\S*/)?(?:bash|sh|zsh|dash|ksh|fish|python[0-9.]*|node|deno|bun|perl|ruby|php|"
     r"eval|exec|sudo|env|xargs|curl|wget|nc|ncat|ssh|scp|npx|pnpx|uvx|pipx|"
     r"osascript|powershell|pwsh|cmd|nohup|timeout|source|find|awk|sed|tee|"
-    r"rm|chmod|chown|mv|cp|dd)"
+    r"rm|chmod|chown|mv|cp|dd|lua|tclsh|busybox|make|ln|install|rsync|truncate|"
+    r"(?:uv|npm|pnpm|yarn|bun)\s+run)"
 )
 # A complete allow-list ENTRY that is blanket on its own (no surrounding
 # `allow` context needed): `Tool(*)`/`Tool(**)`/`Tool(:*)`/`Tool()`, a
@@ -3415,9 +3416,9 @@ _PREAPPROVE_INTERP = (
 # a bare `*`/`mcp__*`/`mcp__<server>__*`, or `Bash(<interpreter/fetcher/
 # write-primitive>[ :]*)` incl. a path prefix and one `-c`/`-e` style flag.
 PREAPPROVE_ENTRY_BODY = (
-    r"(?:(?:" + _PREAPPROVE_TOOLS + r"|Read)\(\s*(?:domain:)?[*/.:]{0,4}\*[*/.:]{0,4}\s*\)"
+    r"(?:(?:" + _PREAPPROVE_TOOLS + r"|Read)\(\s*(?:domain:)?[*/.:~]{0,4}\*[*/.:~]{0,4}\s*\)"
     r"|(?:" + _PREAPPROVE_TOOLS + r")\(\s*\)"
-    r"|\*|mcp__\*|mcp__[\w.-]+__\*"
+    r"|\*|mcp__\*|mcp__[\w.*-]+__\*|Bash\(\s*\*[^()]*\)"
     r"|Bash\(\s*" + _PREAPPROVE_INTERP + r"(?:\s+-\w+)?(?::|\s+)\*{1,2}\s*\))"
 )
 # A bare tool name is only blanket inside an `allow` list (a `deny`/`ask` list
@@ -3426,10 +3427,10 @@ PREAPPROVE_BARE_BODY = r"(?:" + _PREAPPROVE_TOOLS + r")"
 CLAUDE_PREAPPROVE_ENTRY_RE = re.compile(
     _PREAPPROVE_Q + PREAPPROVE_ENTRY_BODY + _PREAPPROVE_Q, re.IGNORECASE)
 CLAUDE_PREAPPROVE_BARE_RE = re.compile(
-    r"\ballow\b" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*\[(?:[^\]]*,)?\s*"
+    r"\ballow\b" + _PREAPPROVE_Q + r"?\s*(?::|[|+]?=)\s*(?:\.\+)?\s*\[[^\]]{0,1000}?\s*"
     + _PREAPPROVE_Q + PREAPPROVE_BARE_BODY + _PREAPPROVE_Q, re.IGNORECASE)
 CLAUDE_PREAPPROVE_MCP_RE = re.compile(
-    r"enableAllProjectMcpServers" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*(?:true|" + _PREAPPROVE_Q + r"true" + _PREAPPROVE_Q + r")"
+    r"enableAllProjectMcpServers[\"'\]\s]{0,6}(?::|[|+]?=)\s*\(?\s*(?:true|1|" + _PREAPPROVE_Q + r"(?:true|1)" + _PREAPPROVE_Q + r")"
     r"|enabledMcpjsonServers" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*\[\s*" + _PREAPPROVE_Q,
     re.IGNORECASE)
 CLAUDE_PREAPPROVE_KEY_NAMES = ("enableAllProjectMcpServers", "enabledMcpjsonServers")

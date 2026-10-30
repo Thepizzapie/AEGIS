@@ -6292,8 +6292,9 @@ _CLAUDE_PREAPPROVE_BARE_FULL_RE = re.compile(
     r"\s*" + patterns.PREAPPROVE_BARE_BODY + r"\s*", re.IGNORECASE)
 
 
-_CLAUDE_PREAPPROVE_ALLOW_LEAF_RE = re.compile(r"allow(?:/[-\d]+)?$", re.IGNORECASE)
-_CLAUDE_PREAPPROVE_TRUE_RE = re.compile(r"\s*[\"']?\s*true\s*[\"']?\s*[,}]?\s*", re.IGNORECASE)
+_CLAUDE_PREAPPROVE_DENY_LEAF_RE = re.compile(r"(?:deny|ask)(?:/[-\d]+|\.\d+|\[\d*\])?$", re.IGNORECASE)
+_CLAUDE_PREAPPROVE_ALLOW_LEAF_RE = re.compile(r"allow(?:/[-\d]+|\.\d+|\[\d*\])?$", re.IGNORECASE)
+_CLAUDE_PREAPPROVE_TRUE_RE = re.compile(r"\s*[\"']?\s*(?:true|1)\s*[\"']?\s*[,}]?\s*", re.IGNORECASE)
 
 
 def _claude_preapprove_text_hit(text: str) -> bool:
@@ -6310,8 +6311,12 @@ def _claude_preapprove_struct_hit(v, in_allow: bool = False, _depth: int = 0) ->
     if _depth > 12:
         return False
     if isinstance(v, dict):
+        restrict = any(isinstance(x, str) and _CLAUDE_PREAPPROVE_DENY_LEAF_RE.search(x)
+                       for x in v.values())
         for k, val in v.items():
             kl = k.strip().lower() if isinstance(k, str) else ""
+            if restrict and isinstance(val, str):
+                continue
             if kl == "enableallprojectmcpservers" and (val is True or str(val).strip().lower() == "true"):
                 return True
             if kl == "enabledmcpjsonservers" and isinstance(val, (list, tuple)) and val:
@@ -6329,20 +6334,47 @@ def _claude_preapprove_struct_hit(v, in_allow: bool = False, _depth: int = 0) ->
     return False
 
 
+def _claude_preapprove_values(v, _depth: int = 0) -> list:
+    """Every value stored under a ``value`` key anywhere in raw MCP args."""
+    out: list = []
+    if _depth > 12:
+        return out
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if isinstance(k, str) and k.lower() == "value":
+                out.append(x)
+            out += _claude_preapprove_values(x, _depth + 1)
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            out += _claude_preapprove_values(x, _depth + 1)
+    return out
+
+
 def _claude_preapprove_mcp_flat_hit(a: dict) -> bool:
     """MCP "set config value"-style shape (``{"key": "permissions.allow",
     "value": ["Bash"]}`` / ``{"key": "enableAllProjectMcpServers", ...}``):
     a flattened leaf equals a key name, or a blanket entry leaf appears
     alongside an ``allow``-suffixed leaf."""
     leaves = [s.strip() for s in _flatten_strings(a) if isinstance(s, str)]
-    if any(s.lower() in _CLAUDE_PREAPPROVE_KEYS for s in leaves):
+    vals = _claude_preapprove_values(a)
+    falsy = bool(vals) and all(x in (False, 0, "", [], {}) or str(x).strip().lower() in ("false", "0")
+                               for x in vals)
+    if not falsy and any(re.sub(r"^/|(?:/-|/\d+|\.\d+|\[\d*\])$", "", s).lower()
+                         in _CLAUDE_PREAPPROVE_KEYS for s in leaves):
         return True
     # Nested-dict args are the struct walk's job (it knows deny/ask context);
     # a flat key/value shape naming a deny/ask key is a restricting list.
     if any(isinstance(x, dict) for x in a.values()) or any(
-            re.search(r"(?:deny|ask)(?:/[-\d]+)?$", s, re.IGNORECASE) for s in leaves):
+            _CLAUDE_PREAPPROVE_DENY_LEAF_RE.search(s) for s in leaves):
         return False
     has_allow = any(_CLAUDE_PREAPPROVE_ALLOW_LEAF_RE.search(s) for s in leaves)
+    for s in leaves:  # JSON-encoded string value: '["Bash"]'
+        if s[:1] in "[{":
+            try:
+                if _claude_preapprove_struct_hit(json.loads(s), has_allow):
+                    return True
+            except (ValueError, TypeError):
+                pass
     return any(_CLAUDE_PREAPPROVE_ENTRY_FULL_RE.fullmatch(s)
                or (has_allow and _CLAUDE_PREAPPROVE_BARE_FULL_RE.fullmatch(s)) for s in leaves)
 
@@ -6403,6 +6435,10 @@ def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]
             return None
         if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
+        if (ev.action == ActionClass.MCP and not (isinstance(literal, str) and literal)
+                and any(isinstance(x, str) and _CLAUDE_PREAPPROVE_DENY_LEAF_RE.search(x.strip())
+                        for x in _flatten_strings(a))):
+            return None  # flat key/pointer naming a deny/ask list: a restricting write
         hit = _claude_preapprove_text_hit(content)
         if not hit and ev.action == ActionClass.EDIT:
             # Fragment edits: a value flipped in place (`false` -> `true`) or a
@@ -6414,6 +6450,9 @@ def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]
             ctx = _claude_preapprove_normalize(old + " " + new)
             if (re.search("enableAllProjectMcpServers", old, re.IGNORECASE)
                     and _CLAUDE_PREAPPROVE_TRUE_RE.fullmatch(new)):
+                hit = True
+            elif (re.search("enabledMcpjsonServers", old, re.IGNORECASE)
+                  and re.match(r"\s*\[\s*[\"']", new)):
                 hit = True
             elif (not re.search(r"\b(?:deny|ask)\b", ctx, re.IGNORECASE)
                   and re.search(patterns._PREAPPROVE_Q + patterns.PREAPPROVE_BARE_BODY
@@ -6456,7 +6495,12 @@ def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]
         normalized_cmd = _claude_preapprove_normalize(cmd)
         text_hit = _claude_preapprove_text_hit(cmd)
         jq_hit = bool(patterns.CLAUDE_PREAPPROVE_JQ_WORD_RE.search(normalized_cmd)
-                      and patterns.CLAUDE_PREAPPROVE_JQ_ASSIGN_RE.search(normalized_cmd) and text_hit)
+                      and patterns.CLAUDE_PREAPPROVE_JQ_ASSIGN_RE.search(normalized_cmd)
+                      and (text_hit
+                           or re.search("enableAllProjectMcpServers|enabledMcpjsonServers", normalized_cmd)
+                           or (re.search(r"\ballow\b", normalized_cmd) and re.search(
+                               patterns._PREAPPROVE_Q + patterns.PREAPPROVE_BARE_BODY + patterns._PREAPPROVE_Q,
+                               normalized_cmd, re.IGNORECASE))))
         if not (jq_hit or (write_verb and text_hit)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PREAPPROVE")
