@@ -6283,6 +6283,168 @@ def rule_claude_cred_helper_protect(ev: Event, policy=None) -> Optional[Decision
     return None
 
 
+# ---- Claude Code trust pre-approval protection: escapable with human confirm --
+_claude_preapprove_normalize = _claude_cred_helper_normalize
+_CLAUDE_PREAPPROVE_KEYS = {k.lower() for k in patterns.CLAUDE_PREAPPROVE_KEY_NAMES}
+_CLAUDE_PREAPPROVE_ENTRY_FULL_RE = re.compile(
+    r"\s*" + patterns.PREAPPROVE_ENTRY_BODY + r"\s*", re.IGNORECASE)
+_CLAUDE_PREAPPROVE_BARE_FULL_RE = re.compile(
+    r"\s*" + patterns.PREAPPROVE_BARE_BODY + r"\s*", re.IGNORECASE)
+
+
+def _claude_preapprove_text_hit(text: str) -> bool:
+    n = _claude_preapprove_normalize(text)
+    return bool(patterns.CLAUDE_PREAPPROVE_MCP_RE.search(n)
+                or patterns.CLAUDE_PREAPPROVE_ENTRY_RE.search(n)
+                or patterns.CLAUDE_PREAPPROVE_BARE_RE.search(n))
+
+
+def _claude_preapprove_struct_hit(v, in_allow: bool = False, _depth: int = 0) -> bool:
+    """Semantic walk of parsed JSON / raw MCP args: ``enableAllProjectMcpServers``
+    truthy, ``enabledMcpjsonServers`` a non-empty list, or a blanket entry
+    inside an ``allow`` list (a bare tool name counts only there). Depth cap 12."""
+    if _depth > 12:
+        return False
+    if isinstance(v, dict):
+        for k, val in v.items():
+            kl = k.strip().lower() if isinstance(k, str) else ""
+            if kl == "enableallprojectmcpservers" and (val is True or str(val).strip().lower() == "true"):
+                return True
+            if kl == "enabledmcpjsonservers" and isinstance(val, (list, tuple)) and val:
+                return True
+            if _claude_preapprove_struct_hit(val, kl.endswith("allow"), _depth + 1):
+                return True
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_claude_preapprove_struct_hit(x, in_allow, _depth + 1) for x in v)
+    if isinstance(v, str):
+        return bool(_CLAUDE_PREAPPROVE_ENTRY_FULL_RE.fullmatch(v)
+                    or (in_allow and _CLAUDE_PREAPPROVE_BARE_FULL_RE.fullmatch(v)))
+    return False
+
+
+def _claude_preapprove_mcp_flat_hit(a: dict) -> bool:
+    """MCP "set config value"-style shape (``{"key": "permissions.allow",
+    "value": ["Bash"]}`` / ``{"key": "enableAllProjectMcpServers", ...}``):
+    a flattened leaf equals a key name, or a blanket entry leaf appears
+    alongside an ``allow``-suffixed leaf."""
+    leaves = [s.strip() for s in _flatten_strings(a) if isinstance(s, str)]
+    if any(s.lower() in _CLAUDE_PREAPPROVE_KEYS for s in leaves):
+        return True
+    has_allow = any(s.lower().endswith("allow") for s in leaves)
+    return any(_CLAUDE_PREAPPROVE_ENTRY_FULL_RE.fullmatch(s)
+               or (has_allow and _CLAUDE_PREAPPROVE_BARE_FULL_RE.fullmatch(s)) for s in leaves)
+
+
+def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block pre-answering Claude Code's own trust prompts from
+    ``.claude/settings.local.json`` (the gitignored sibling the other
+    ``claude_*`` guards watch): ``enableAllProjectMcpServers: true`` or a
+    non-empty ``enabledMcpjsonServers`` (auto-approve project ``.mcp.json``
+    servers), and blanket ``permissions.allow`` entries (bare ``Bash``/
+    ``Edit``/``Write``/..., ``Tool(*)``, ``*``/``mcp__*``, or an interpreter/
+    fetcher wildcard like ``Bash(python:*)``/``Bash(curl:*)``).
+
+    THREAT MODEL: ``rule_mcp_config_protect`` gates WRITING an MCP server
+    definition, ``rule_permission_bypass_protect`` gates the single
+    ``bypassPermissions`` mode value. Neither reaches the approval layer in
+    between: a project ``.mcp.json`` server (planted earlier, arrived via
+    ``git pull``, or a teammate's) only runs after the human approves it, and
+    ``enableAllProjectMcpServers`` removes that approval for every server,
+    present and future; a blanket allow entry removes the confirmation
+    prompt for a whole class of calls (any shell command, any edit) without
+    ever setting ``defaultMode``. Being gitignored, neither leaves a diff.
+
+    Config (``policy.claude_preapprove``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on path/command). Escapable only by a
+    human: trailing ``# aegis-allow`` (shell) or ``AEGIS_ALLOW_CLAUDE_
+    PREAPPROVE=1`` set before launch (Edit/Write/MCP). Narrow ``allow``
+    entries like ``Bash(git status:*)`` or ``Bash(npm test)`` never fire.
+
+    Honest scope (same denylist trade-offs as the sibling guards): reaches
+    ``.claude/settings.local.json`` only (``.claude/settings.json`` is covered
+    by self-protect); values assembled indirectly are missed; ``defaultMode:
+    acceptEdits`` and a wide-but-not-blanket allow such as ``Bash(git:*)`` are
+    deliberately not gated; ``claude --allowedTools`` CLI flags are not
+    covered; a ``curl -o`` write is closed by ``rule_fetch_to_file_protect``,
+    which reuses ``CLAUDE_LOCAL_SETTINGS_PATH_RE``."""
+    cfg = getattr(policy, "claude_preapprove", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-preapprove-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = _claude_preapprove_text_hit(content)
+        if not hit:
+            try:
+                hit = _claude_preapprove_struct_hit(json.loads(content))
+            except (ValueError, TypeError):
+                hit = False
+        if not hit and ev.action == ActionClass.MCP:
+            hit = _claude_preapprove_struct_hit(a) or _claude_preapprove_mcp_flat_hit(a)
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CLAUDE_PREAPPROVE")
+                or _claude_cred_helper_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "claude-preapprove-protect",
+                         f"'{p}' is being written with a trust pre-approval "
+                         "(enableAllProjectMcpServers / enabledMcpjsonServers / "
+                         "a blanket permissions.allow entry) — Claude Code "
+                         "would stop asking the human before launching project "
+                         "MCP servers or running a whole class of tool calls, "
+                         "and (being gitignored by default) with no diff and no "
+                         "code review. Review the change, then confirm with "
+                         "AEGIS_ALLOW_CLAUDE_PREAPPROVE=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+        path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
+                         or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        normalized_cmd = _claude_preapprove_normalize(cmd)
+        text_hit = _claude_preapprove_text_hit(cmd)
+        jq_hit = bool(patterns.CLAUDE_PREAPPROVE_JQ_RE.search(normalized_cmd) and text_hit)
+        if not (jq_hit or (write_verb and text_hit)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PREAPPROVE")
+                or _claude_cred_helper_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "claude-preapprove-protect",
+                         "A Claude Code trust pre-approval (enableAllProjectMcpServers/"
+                         "enabledMcpjsonServers/a blanket permissions.allow entry) is "
+                         "being planted in .claude/settings.local.json from a shell — "
+                         "Claude Code would stop asking the human before launching "
+                         "project MCP servers or running a whole class of tool calls, "
+                         "with no diff and no code review. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_CLAUDE_PREAPPROVE=1; a "
+                         "spawned agent cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -8514,6 +8676,7 @@ _CORE_RULES = (
     rule_permission_bypass_protect,
     rule_claude_env_protect,
     rule_claude_cred_helper_protect,
+    rule_claude_preapprove_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,

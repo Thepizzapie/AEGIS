@@ -3390,6 +3390,53 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code trust pre-approval (settings.local.json) ---------------------
+# Keys that pre-answer Claude Code's own "do you trust this?" prompts so they
+# never reach the human: `enableAllProjectMcpServers: true` and a non-empty
+# `enabledMcpjsonServers` auto-approve every/each server in a project
+# `.mcp.json` (which rule_mcp_config_protect guards the WRITING of, but not the
+# approval that makes a planted or pre-existing entry actually launch), and a
+# blanket `permissions.allow` entry (bare `Bash`/`Edit`/`Write`/..., a
+# `Tool(*)` wildcard, or an interpreter/network-fetch prefix wildcard such as
+# `Bash(python:*)`, `Bash(curl:*)`) answers the per-call confirmation prompt
+# "yes" in advance for a whole class of calls. Quotes are matched with an
+# optional leading backslash run so a jq/shell-escaped `\"Bash(*)\"` still hits.
+_PREAPPROVE_Q = r"\\*[\"']"
+_PREAPPROVE_TOOLS = r"Bash|Edit|Write|MultiEdit|NotebookEdit|WebFetch|Task|Agent|PowerShell"
+_PREAPPROVE_WILD = r"(?:\*{1,2}|:\*{1,2}|\*:\*)?"
+_PREAPPROVE_INTERP = (
+    r"(?:bash|sh|zsh|dash|ksh|fish|python[0-9.]*|node|deno|bun|perl|ruby|php|"
+    r"eval|exec|sudo|env|xargs|curl|wget|nc|ncat|ssh|scp|npx|pnpx|uvx|pipx|"
+    r"osascript|powershell|pwsh|cmd)"
+)
+# A complete allow-list ENTRY that is blanket on its own (no surrounding
+# `allow` context needed): `Tool(*)`/`Tool(**)`/`Tool(:*)`/`Tool()`, a bare
+# `*`/`mcp__*`, or `Bash(<interpreter-or-fetcher>[ :]*)`.
+PREAPPROVE_ENTRY_BODY = (
+    r"(?:(?:" + _PREAPPROVE_TOOLS + r")\(\s*" + _PREAPPROVE_WILD + r"\s*\)"
+    r"|\*|mcp__\*"
+    r"|Bash\(\s*" + _PREAPPROVE_INTERP + r"(?::|\s+)\*{1,2}\s*\))"
+)
+# A bare tool name is only blanket inside an `allow` list (a `deny`/`ask` list
+# naming `Bash` is the opposite of the attack).
+PREAPPROVE_BARE_BODY = r"(?:" + _PREAPPROVE_TOOLS + r")"
+CLAUDE_PREAPPROVE_ENTRY_RE = re.compile(
+    _PREAPPROVE_Q + PREAPPROVE_ENTRY_BODY + _PREAPPROVE_Q, re.IGNORECASE)
+CLAUDE_PREAPPROVE_BARE_RE = re.compile(
+    r"\ballow\b" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*\[(?:[^\]]*,)?\s*"
+    + _PREAPPROVE_Q + PREAPPROVE_BARE_BODY + _PREAPPROVE_Q, re.IGNORECASE)
+CLAUDE_PREAPPROVE_MCP_RE = re.compile(
+    r"enableAllProjectMcpServers" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*(?:true|" + _PREAPPROVE_Q + r"true" + _PREAPPROVE_Q + r")"
+    r"|enabledMcpjsonServers" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*\[\s*" + _PREAPPROVE_Q,
+    re.IGNORECASE)
+CLAUDE_PREAPPROVE_KEY_NAMES = ("enableAllProjectMcpServers", "enabledMcpjsonServers")
+CLAUDE_PREAPPROVE_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*(?:enableAllProjectMcpServers|enabledMcpjsonServers|\ballow\b))",
+    re.IGNORECASE,
+)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards
