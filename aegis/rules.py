@@ -6292,8 +6292,12 @@ _CLAUDE_PREAPPROVE_BARE_FULL_RE = re.compile(
     r"\s*" + patterns.PREAPPROVE_BARE_BODY + r"\s*", re.IGNORECASE)
 
 
+_CLAUDE_PREAPPROVE_ALLOW_LEAF_RE = re.compile(r"allow(?:/[-\d]+)?$", re.IGNORECASE)
+_CLAUDE_PREAPPROVE_TRUE_RE = re.compile(r"\s*[\"']?\s*true\s*[\"']?\s*[,}]?\s*", re.IGNORECASE)
+
+
 def _claude_preapprove_text_hit(text: str) -> bool:
-    n = _claude_preapprove_normalize(text)
+    n = patterns.CLAUDE_PREAPPROVE_RESTRICT_RE.sub(" ", _claude_preapprove_normalize(text))
     return bool(patterns.CLAUDE_PREAPPROVE_MCP_RE.search(n)
                 or patterns.CLAUDE_PREAPPROVE_ENTRY_RE.search(n)
                 or patterns.CLAUDE_PREAPPROVE_BARE_RE.search(n))
@@ -6312,6 +6316,8 @@ def _claude_preapprove_struct_hit(v, in_allow: bool = False, _depth: int = 0) ->
                 return True
             if kl == "enabledmcpjsonservers" and isinstance(val, (list, tuple)) and val:
                 return True
+            if kl in ("deny", "ask"):
+                continue
             if _claude_preapprove_struct_hit(val, kl.endswith("allow"), _depth + 1):
                 return True
         return False
@@ -6331,7 +6337,12 @@ def _claude_preapprove_mcp_flat_hit(a: dict) -> bool:
     leaves = [s.strip() for s in _flatten_strings(a) if isinstance(s, str)]
     if any(s.lower() in _CLAUDE_PREAPPROVE_KEYS for s in leaves):
         return True
-    has_allow = any(s.lower().endswith("allow") for s in leaves)
+    # Nested-dict args are the struct walk's job (it knows deny/ask context);
+    # a flat key/value shape naming a deny/ask key is a restricting list.
+    if any(isinstance(x, dict) for x in a.values()) or any(
+            re.search(r"(?:deny|ask)(?:/[-\d]+)?$", s, re.IGNORECASE) for s in leaves):
+        return False
+    has_allow = any(_CLAUDE_PREAPPROVE_ALLOW_LEAF_RE.search(s) for s in leaves)
     return any(_CLAUDE_PREAPPROVE_ENTRY_FULL_RE.fullmatch(s)
                or (has_allow and _CLAUDE_PREAPPROVE_BARE_FULL_RE.fullmatch(s)) for s in leaves)
 
@@ -6364,8 +6375,8 @@ def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]
     Honest scope (same denylist trade-offs as the sibling guards): reaches
     ``.claude/settings.local.json`` only (``.claude/settings.json`` is covered
     by self-protect); values assembled indirectly are missed; ``defaultMode:
-    acceptEdits`` and a wide-but-not-blanket allow such as ``Bash(git:*)``/
-    ``Bash(rm:*)``/``Bash(node -e:*)`` are deliberately not gated; ``claude --allowedTools`` CLI flags are not
+    acceptEdits`` and a wide-but-not-blanket allow such as ``Bash(git:*)`` are deliberately not gated; a no-path ``claude config set``
+    CLI form is not covered; ``claude --allowedTools`` CLI flags are not
     covered; a ``curl -o`` write is closed by ``rule_fetch_to_file_protect``,
     which reuses ``CLAUDE_LOCAL_SETTINGS_PATH_RE``."""
     cfg = getattr(policy, "claude_preapprove", None) or {}
@@ -6385,12 +6396,29 @@ def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]
         p = _path(ev)
         a = ev.args or {}
         literal = a.get("content") or a.get("new_string")
-        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        # Serialize (not flatten) non-literal args so list context
+        # (`deny`/`ask` vs `allow`) survives for the text check.
+        content = literal if isinstance(literal, str) and literal else json.dumps(a, default=str)
         if not p or not content:
             return None
         if not patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(p):
             return None
         hit = _claude_preapprove_text_hit(content)
+        if not hit and ev.action == ActionClass.EDIT:
+            # Fragment edits: a value flipped in place (`false` -> `true`) or a
+            # bare tool name added to a list carry no key/`allow` context in
+            # new_string alone, so consult old_string and treat a standalone
+            # quoted bare tool name as a hit unless the fragment is a deny/ask.
+            old = str(a.get("old_string") or "")
+            new = str(a.get("new_string") or "")
+            ctx = _claude_preapprove_normalize(old + " " + new)
+            if (re.search("enableAllProjectMcpServers", old, re.IGNORECASE)
+                    and _CLAUDE_PREAPPROVE_TRUE_RE.fullmatch(new)):
+                hit = True
+            elif (not re.search(r"\b(?:deny|ask)\b", ctx, re.IGNORECASE)
+                  and re.search(patterns._PREAPPROVE_Q + patterns.PREAPPROVE_BARE_BODY
+                                + patterns._PREAPPROVE_Q, _claude_preapprove_normalize(new), re.IGNORECASE)):
+                hit = True
         if not hit:
             try:
                 hit = _claude_preapprove_struct_hit(json.loads(content))
@@ -6427,7 +6455,8 @@ def rule_claude_preapprove_protect(ev: Event, policy=None) -> Optional[Decision]
                            or patterns.FORCED_LINK_WRITE_RE.search(cmd))
         normalized_cmd = _claude_preapprove_normalize(cmd)
         text_hit = _claude_preapprove_text_hit(cmd)
-        jq_hit = bool(patterns.CLAUDE_PREAPPROVE_JQ_RE.search(normalized_cmd) and text_hit)
+        jq_hit = bool(patterns.CLAUDE_PREAPPROVE_JQ_WORD_RE.search(normalized_cmd)
+                      and patterns.CLAUDE_PREAPPROVE_JQ_ASSIGN_RE.search(normalized_cmd) and text_hit)
         if not (jq_hit or (write_verb and text_hit)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PREAPPROVE")
