@@ -7925,7 +7925,11 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     `allow` regexes (matched on the path / command). Human escape: trailing
     `# aegis-allow` or `AEGIS_ALLOW_CARGO_EXEC=1`; a spawned agent cannot.
 
-    Honest scope: a `build.rs`/proc-macro (arbitrary code by design, no config
+    Honest scope: an Edit that only changes an existing key's VALUE (the
+    fragment shows no key), a relative-path write after `cd .cargo`, a
+    `$CARGO_HOME`/variable-built path, a `cp`/`mv`/`ln` of a staged file, and
+    `rustflags` `-Clinker=` are not covered; read-only commands that mention
+    the path and a `key =` string also ask. A `build.rs`/proc-macro (arbitrary code by design, no config
     key), an `[alias]` to a PATH `cargo-<x>` subcommand, and a value assembled
     indirectly are not covered; a bare `RUSTC_WRAPPER=sccache` is gated (ask)
     rather than distinguished from a hostile value."""
@@ -7950,10 +7954,10 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw_content = a.get("content")
         if not isinstance(raw_content, str) or not raw_content:
             raw_content = a.get("new_string")
-        if isinstance(raw_content, str) and raw_content:
-            content = raw_content
-        else:
-            content = " ".join(_flatten_strings(a))
+        # Scan EVERY string leaf, newline-joined (so each is line-anchored):
+        # MultiEdit/MCP edit lists carry the payload in nested leaves, and a
+        # benign `content` must not mask an evil `new_string`.
+        content = "\n".join(_flatten_strings(a))
         if not content:
             return None
         if not patterns.CARGO_EXEC_KEY_RE.search(patterns.strip_comment_lines(content)):

