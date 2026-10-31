@@ -5476,3 +5476,50 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
     re.IGNORECASE,
 )
+
+
+# ---------------------------------------------------------------------------
+# Cargo config exec hijack (rule_cargo_exec_protect).
+#
+# `.cargo/config.toml` (legacy extensionless `.cargo/config`) is read by cargo
+# from the project dir, every ancestor dir, and `$CARGO_HOME`. Several keys
+# name an arbitrary program that cargo runs on EVERY build/test/run with the
+# invoking user's/CI's environment, before any source is compiled:
+#   build.rustc-wrapper / build.rustc-workspace-wrapper / build.rustc /
+#   build.rustdoc, target.<triple>.linker, target.<triple>.runner (every
+#   `cargo run`/`test`/`bench`), and the registry credential providers
+#   (`registry.credential-provider`, `registry.global-credential-providers`),
+#   which are handed the live registry token. None is a `[scripts]`-style
+#   entry any manifest guard sees; the file reads as routine build config.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+_CARGO_EXEC_KEYS = (
+    r"rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|linker|runner"
+    r"|credential-provider|global-credential-providers"
+)
+# A TOML key assignment: bare, dotted (`build.rustc-wrapper =`,
+# `target.x86_64-unknown-linux-gnu.runner =`, `target.'cfg(unix)'.linker =`)
+# or quoted. Line-anchored so a value/URL merely containing the word is inert.
+CARGO_EXEC_KEY_RE = re.compile(
+    r"(?:^|[\n;{,])[ \t]*(?:[\w.\-]+\.|[\"'][^\"'\n]{1,80}[\"']\.)*[\"']?(?:"
+    + _CARGO_EXEC_KEYS + r")[\"']?[ \t]*=",
+    re.IGNORECASE,
+)
+# Shell-embedded variant (the key sits mid-line after `echo '`/`printf "[build]\n`
+# rather than at a line start); only ever applied alongside the path check.
+CARGO_EXEC_SHELL_KEY_RE = re.compile(
+    r"(?:(?<![\w.\-])|(?<=\\n)|(?<=\\t))(?:[\w.\-]+\.)*[\"']?(?:"
+    + _CARGO_EXEC_KEYS + r")[\"']?[ \t]*=",
+    re.IGNORECASE,
+)
+# CLI/env forms that inject the same keys for one (or every, if exported) cargo
+# run: `cargo --config 'build.rustc-wrapper="x"'`, `cargo config`-less env.
+CARGO_EXEC_CLI_RE = re.compile(
+    r"--config[= ]+[\"']?[\w.\-'\"()]*?(?:" + _CARGO_EXEC_KEYS + r")[\"']?\s*="
+    r"|\b(?:RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC(?:_WORKSPACE)?_WRAPPER"
+    r"|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTDOC|CARGO_TARGET_[A-Z0-9_]+_(?:RUNNER|LINKER)"
+    r"|CARGO_REGISTRIES_[A-Z0-9_]+_CREDENTIAL_PROVIDER)=\S",
+    re.IGNORECASE,
+)

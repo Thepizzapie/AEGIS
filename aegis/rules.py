@@ -7087,6 +7087,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
 )
 
 
@@ -7895,6 +7896,104 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate planting a program-naming key in Cargo's `.cargo/config.toml`
+    (`rustc-wrapper`, `rustc-workspace-wrapper`, `rustc`, `rustdoc`,
+    `linker`, `runner`, `credential-provider`, `global-credential-providers`).
+
+    THREAT MODEL: cargo execs the named program on every build/test/run (the
+    credential providers on every registry auth, handed the live token), with
+    the invoking user's or CI's environment, before any source is compiled.
+    The file lives outside `package.json`/`composer.json`, so
+    `rule_package_manifest_protect` never sees it, and it reads as ordinary
+    build config in review. Also gates the same keys injected by
+    `cargo --config 'k=v'` and the `RUSTC_WRAPPER`/`CARGO_TARGET_*_RUNNER`/...
+    env forms.
+
+    Default `ask` (legit uses exist: `sccache`, cross-compile linkers, `qemu`
+    runners). Config (`policy.cargo_exec`): `mode` deny|ask|monitor|off,
+    `allow` regexes (matched on the path / command). Human escape: trailing
+    `# aegis-allow` or `AEGIS_ALLOW_CARGO_EXEC=1`; a spawned agent cannot.
+
+    Honest scope: a `build.rs`/proc-macro (arbitrary code by design, no config
+    key), an `[alias]` to a PATH `cargo-<x>` subcommand, and a value assembled
+    indirectly are not covered; a bare `RUSTC_WRAPPER=sccache` is gated (ask)
+    rather than distinguished from a hostile value."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        if not patterns.CARGO_EXEC_KEY_RE.search(patterns.strip_comment_lines(content)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is setting a Cargo program-exec key "
+                         "(rustc-wrapper/linker/runner/credential-provider/"
+                         "...) — cargo runs the named program on every "
+                         "build/test/run (credential providers on every "
+                         "registry auth, with the live token), before any "
+                         "source compiles. Review the change, then confirm "
+                         "with AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        # Strip full-line comments BEFORE normalizing (scan_surface flattens
+        # newlines, after which a comment line is no longer line-anchored).
+        scan_cmd = normalize.scan_surface(patterns.strip_comment_lines(_cmd(ev)))
+        hit = ((patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+                and patterns.CARGO_EXEC_SHELL_KEY_RE.search(scan_cmd))
+               or patterns.CARGO_EXEC_CLI_RE.search(scan_cmd))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo program-exec key (rustc-wrapper/linker/"
+                         "runner/credential-provider/...) is being set from "
+                         "a shell — cargo runs the named program on every "
+                         "build/test/run, before any source compiles. A "
+                         "human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -8520,6 +8619,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
