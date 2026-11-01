@@ -4128,6 +4128,106 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _vscode_settings_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block redirecting a binary VS Code (or a first-party extension)
+    spawns on its own, via ``.vscode/settings.json``: ``git.path``,
+    ``python.defaultInterpreterPath`` (and the other python tool paths),
+    ``terminal.integrated.automationProfile.*``/``profiles.*``/``shell.*``,
+    ``php.executablePath``, ``eslint.nodePath``, ``typescript.tsdk``,
+    ``rust-analyzer.server.path``, ``go.alternateTools``, and friends.
+
+    THREAT MODEL: ``rule_vscode_tasks_protect`` gates the same file but only
+    for ``task.allowAutomaticTasks: "on"``. An agent that points ``git.path``
+    at a script it just wrote gets arbitrary code execution the moment the
+    human reopens the folder (the git extension runs it immediately and on
+    every refresh) — no task, no confirmation prompt, nothing in ``git
+    diff`` that reads as more than editor config. Gated on the KEY, not a
+    value: unlike ``runOn`` these keys have no attacker-safe value.
+
+    Config (``policy.vscode_settings_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate).
+    Human-only escape: trailing ``# aegis-allow`` (shell) or env
+    ``AEGIS_ALLOW_VSCODE_SETTINGS_EXEC=1``.
+
+    Honest scope: ``*.code-workspace`` files embed the same ``settings``
+    object and user-scope settings live outside the repo — neither is
+    covered; values assembled indirectly (template step, build script) are
+    not seen; a heredoc/``-f script.jq`` jq program is not seen.
+    """
+    cfg = getattr(policy, "vscode_settings_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "vscode-settings-exec-protect-monitor")
+            return None
+        return would
+
+    msg = ("redirects an executable VS Code runs by itself (git.path / "
+           "python interpreter / terminal profile / language-server path) in "
+           ".vscode/settings.json — it runs, unattended, the next time this "
+           "folder is opened, with no task and no confirmation prompt.")
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if not p or not content or not patterns.VSCODE_SETTINGS_PATH_RE.search(p):
+            return None
+        hit = bool(patterns.VSCODE_EXEC_KEY_RE.search(content))
+        if not hit and ev.action == ActionClass.MCP:
+            hit = any(patterns.VSCODE_EXEC_KEY_BARE_RE.fullmatch(s.strip())
+                      for s in _flatten_strings(a) if isinstance(s, str))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_VSCODE_SETTINGS_EXEC")
+                or _vscode_settings_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "vscode-settings-exec-protect",
+                         f"'{p}' " + msg + " Review, then confirm with "
+                         "AEGIS_ALLOW_VSCODE_SETTINGS_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or re.search(r"\b(?:tee|sponge)\b", cmd))
+        path_hit = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(cmd)
+                         or (patterns.VSCODE_CD_RE.search(cmd)
+                             and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+        if not path_hit:
+            return None
+        hit = bool(patterns.VSCODE_EXEC_KEY_ASSIGN_RE.search(cmd)
+                   or (write_verb and (patterns.VSCODE_EXEC_KEY_RE.search(cmd)
+                                       or patterns.VSCODE_EXEC_KEY_BARE_RE.search(cmd))))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_VSCODE_SETTINGS_EXEC")
+                or _vscode_settings_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "vscode-settings-exec-protect",
+                         "A shell command " + msg + " A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_VSCODE_SETTINGS_EXEC=1; "
+                         "a spawned agent cannot."))
+    return None
+
+
 def _jetbrains_watcher_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -8506,6 +8606,7 @@ _CORE_RULES = (
     rule_ld_preload_protect,
     rule_devcontainer_exec_protect,
     rule_vscode_tasks_protect,
+    rule_vscode_settings_exec_protect,
     rule_jetbrains_watcher_protect,
     rule_jetbrains_run_config_protect,
     rule_path_hijack_protect,

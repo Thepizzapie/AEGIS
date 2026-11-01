@@ -2703,6 +2703,59 @@ JETBRAINS_RUNCONFIG_ACTIONID_BARE_RE = re.compile(
 )
 
 
+# VS Code workspace-settings EXECUTABLE-PATH hijack. `.vscode/settings.json`
+# (already path-matched by `VSCODE_SETTINGS_PATH_RE`, which only gates the
+# `task.allowAutomaticTasks` prompt-silencer) also carries a family of
+# settings that name a BINARY VS Code or one of its first-party extensions
+# spawns by itself, with no tool call and no task: `git.path` (the git
+# extension runs it on folder open, then on every status refresh),
+# `python.defaultInterpreterPath`/`python.pythonPath`/`python.condaPath`/
+# `python.poetryPath`/`python.pipenvPath` (interpreter discovery runs them
+# on open), `terminal.integrated.automationProfile.*` (the shell every
+# task/debug-session terminal starts in), `terminal.integrated.profiles.*`
+# and the legacy `terminal.integrated.shell.*`/`shellArgs.*` (a profile
+# whose `path`/`args` run when the user opens a terminal), `php.validate.
+# executablePath`/`php.executablePath`, `eslint.nodePath`, `typescript.tsdk`/
+# `typescript.tsserver.pluginPaths`, `rust-analyzer.server.path`,
+# `go.alternateTools`/`go.goroot`, `java.jdt.ls.java.home`. Unlike a
+# planted task there is no "Allow Automatic Tasks" prompt in front of
+# these; the only gate is VS Code's one-time Workspace Trust click, which
+# the human has already given for their own repo. Gated on the KEY: none of
+# these has a value that is safe to set from an untrusted source (a
+# redirected `git.path` of "/usr/bin/git" is the only benign case and is
+# handled by the policy `allow` list), unlike `runOn`/`allowAutomaticTasks`.
+_VSCODE_EXEC_KEYS = (
+    r"git\.path"
+    r"|python\.(?:defaultInterpreterPath|pythonPath|condaPath|poetryPath|pipenvPath)"
+    r"|terminal\.integrated\.(?:automationProfile|profiles|shell|shellArgs)(?:\.[\w.\-]{1,80})?"
+    r"|php\.(?:validate\.)?executablePath"
+    r"|eslint\.nodePath"
+    r"|typescript\.(?:tsdk|tsserver\.pluginPaths)"
+    r"|rust-analyzer\.server\.path"
+    r"|go\.(?:alternateTools|goroot)"
+    r"|java\.jdt\.ls\.java\.home"
+)
+# JSON form (`"git.path": ...`), also matches the backslash-escaped quotes
+# of a JSON string embedded in a shell argument.
+VSCODE_EXEC_KEY_RE = re.compile(
+    r"[\"']\s*(?:" + _VSCODE_EXEC_KEYS + r")\s*\\?[\"']\s*:",
+    re.IGNORECASE,
+)
+# jq / shell-assignment form: `.["git.path"] = "x"`, `."git.path"="x"`,
+# `.git.path`-style dotted paths do not exist in settings.json (keys are
+# flat dotted strings), so only the quoted/bracketed forms are real.
+VSCODE_EXEC_KEY_ASSIGN_RE = re.compile(
+    r"(?:\\?[\"'])(?:" + _VSCODE_EXEC_KEYS + r")(?:\\?[\"'])\]?\s*(?:\|=|\+=|(?<![!<>=])=(?!=))",
+    re.IGNORECASE,
+)
+# Bare key name anywhere (MCP structural fallback / unquoted `echo`
+# forms): used only together with a settings.json path match.
+VSCODE_EXEC_KEY_BARE_RE = re.compile(
+    r"(?<![\w.\-])(?:" + _VSCODE_EXEC_KEYS + r")(?![\w\-])",
+    re.IGNORECASE,
+)
+
+
 # No-execute *fetch* forms — pull artifacts WITHOUT installing/placing or running any
 # package code. These don't trip the gate (a download is not an install). NOTE: this
 # deliberately excludes ``npm install --ignore-scripts`` — that still PLACES the

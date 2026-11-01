@@ -296,6 +296,11 @@ class Policy:
     # configuration in any JetBrains IDE that opens this project. See
     # rules.rule_jetbrains_run_config_protect.
     jetbrains_run_config: dict = field(default_factory=dict)
+    # VS Code settings.json executable-path hijack (git.path, python
+    # interpreter, terminal profiles, ...): {mode: deny|ask|monitor|off,
+    # allow: [regex]}. Empty -> defaults (mode=ask). See
+    # rules.rule_vscode_settings_exec_protect.
+    vscode_settings_exec: dict = field(default_factory=dict)
     # PATH binary-shadow (hijack) protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers planting/symlinking/`chmod +x`-ing an executable over a trusted
