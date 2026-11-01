@@ -141,3 +141,16 @@ def test_redos_linear():
     _hit(_write(S, big))
     _hit(_shell("echo " + big + " > .vscode/settings.json"))
     assert time.time() - t < 3
+
+
+def test_qa_round1_fixes():
+    for cmd in ["cp /tmp/evil.json .vscode/settings.json", "mv /tmp/e.json .vscode/settings.json",
+                "ln -sf /tmp/e.json .vscode/settings.json", "install -m644 e.json .vscode/settings.json"]:
+        assert _hit(_shell(cmd)), cmd
+    assert _hit(_write(S, '{"git\\u002epath": "x"}'))
+    assert _hit(_write(S, '{"git.path" /*c*/ : "x"}'))
+    for cmd in ["cp .vscode/settings.json /tmp/b", "cp .vscode/settings.json .vscode/settings.json.bak",
+                "python3 -c \"import json;print(json.load(open('.vscode/settings.json'))['git.path'])\"",
+                "cat .vscode/settings.json; echo git.path > notes.txt",
+                "cd .vscode && ls; echo 'python.defaultInterpreterPath' > /tmp/n; cat settings.json"]:
+        assert not _hit(_shell(cmd)), cmd

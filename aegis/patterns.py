@@ -2738,7 +2738,7 @@ _VSCODE_EXEC_KEYS = (
 # JSON form (`"git.path": ...`), also matches the backslash-escaped quotes
 # of a JSON string embedded in a shell argument.
 VSCODE_EXEC_KEY_RE = re.compile(
-    r"[\"']\s*(?:" + _VSCODE_EXEC_KEYS + r")\s*\\?[\"']\s*:",
+    r"[\"']\s*(?:" + _VSCODE_EXEC_KEYS + r")\s*\\?[\"']\s*(?:/\*[^*]{0,80}\*/\s*)*:",
     re.IGNORECASE,
 )
 # jq / shell-assignment form: `.["git.path"] = "x"`, `."git.path"="x"`,
@@ -5527,5 +5527,13 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"gcloud/[\w./-]*credentials[\w./-]*|\.env\b"
     r")[\s\S]{0,120}?(?:\b(?:parameter|field|argument|response|reply|message|"
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
+    re.IGNORECASE,
+)
+
+# cp/mv/ln/install/rsync whose DESTINATION is settings.json: the planted key
+# lives in the source file, so no key is visible in the command at all.
+VSCODE_SETTINGS_XFER_RE = re.compile(
+    r"\b(?:cp|mv|ln|install|rsync|ditto|copy|copy-item|move-item|cpi|mi)\b[^;&|\n]{0,400}"
+    r"(?:^|[\s'\"/\\=])\.vscode" + _WIN_TRIM + _SEP + r"settings\.json" + _CI_END + r"\s*$",
     re.IGNORECASE,
 )

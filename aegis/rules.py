@@ -4188,6 +4188,8 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
         content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
         if not p or not content or not patterns.VSCODE_SETTINGS_PATH_RE.search(p):
             return None
+        # JSONC decodes \uXXXX inside keys, so "git\u002epath" is live.
+        content = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), content)
         hit = bool(patterns.VSCODE_EXEC_KEY_RE.search(content))
         if not hit and ev.action == ActionClass.MCP:
             hit = any(patterns.VSCODE_EXEC_KEY_BARE_RE.fullmatch(s.strip())
@@ -4203,19 +4205,37 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
-                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                           or patterns.INPLACE_WRITE_RE.search(cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                           or re.search(r"\b(?:tee|sponge)\b", cmd))
-        path_hit = bool(patterns.VSCODE_SETTINGS_PATH_RE.search(cmd)
-                         or (patterns.VSCODE_CD_RE.search(cmd)
-                             and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd)))
-        if not path_hit:
-            return None
-        hit = bool(patterns.VSCODE_EXEC_KEY_ASSIGN_RE.search(cmd)
-                   or (write_verb and (patterns.VSCODE_EXEC_KEY_RE.search(cmd)
-                                       or patterns.VSCODE_EXEC_KEY_BARE_RE.search(cmd))))
+        cd_hit = bool(patterns.VSCODE_CD_RE.search(cmd))
+        hit = False
+        # Clause-scoped (split on ; && || newline, NOT on pipes): a read of
+        # settings.json in one clause plus an unrelated redirect elsewhere
+        # must not combine into a hit.
+        # Scan text is "raw + de-obfuscated" joined by spaces; re-derive the
+        # variants so a clause never straddles two of them. A heredoc keeps
+        # its body in the clause of the command that opens it.
+        raw = _cmd(ev)
+        variants = [raw]
+        if cmd != raw:
+            variants.append(cmd[len(raw):] if cmd.startswith(raw) else cmd)
+        splitter = r";|&&|\|\|" if "<<" in raw else r";|&&|\|\||\n"
+        clauses = [c for v in variants for c in re.split(splitter, v)]
+        for clause in clauses:
+            if not (patterns.VSCODE_SETTINGS_PATH_RE.search(clause)
+                    or (cd_hit and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(clause))):
+                continue
+            if patterns.VSCODE_SETTINGS_XFER_RE.search(clause):
+                hit = True
+                break
+            strong = bool(patterns.WRITE_REDIRECT_RE.search(clause)
+                          or patterns.DELETE_OR_MOVE_VERB_RE.search(clause)
+                          or patterns.FORCED_LINK_WRITE_RE.search(clause)
+                          or re.search(r"\b(?:tee|sponge)\b", clause))
+            weak = strong or bool(patterns.INPLACE_WRITE_RE.search(clause))
+            if (patterns.VSCODE_EXEC_KEY_ASSIGN_RE.search(clause)
+                    or (weak and patterns.VSCODE_EXEC_KEY_RE.search(clause))
+                    or (strong and patterns.VSCODE_EXEC_KEY_BARE_RE.search(clause))):
+                hit = True
+                break
         if not hit:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_VSCODE_SETTINGS_EXEC")
