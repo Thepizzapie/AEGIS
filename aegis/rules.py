@@ -7712,10 +7712,12 @@ def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
-def _cargo_exec_hit(text: str, path_confirmed: bool) -> bool:
-    if patterns.CARGO_EXEC_CLI_RE.search(text):
+def _cargo_exec_hit(text: str, path_confirmed: bool, shell: bool = False) -> bool:
+    if patterns.CARGO_EXEC_CLI_RE.search(text) or patterns.CARGO_EXEC_STRONG_RE.search(text):
         return True
     if not path_confirmed:
+        return False
+    if shell and not patterns.CARGO_SHELL_WRITE_RE.search(text):
         return False
     return bool(patterns.CARGO_EXEC_CONTENT_RE.search(text)
                 or patterns.CARGO_CRED_ALIAS_TABLE_RE.search(text))
@@ -7763,8 +7765,24 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     (arbitrary code by design), `[patch]`/`[source]` redirects (partly
     `rule_package_manifest_protect`), `cargo-<name>` binaries planted on
     $PATH (`rule_path_hijack_protect`), and `rust-toolchain.toml` are out of
-    scope. A bare value-only edit with the old key also off-diff has no
+    scope. Also undisclosed-by-keys: `[env] LD_PRELOAD`, nightly
+    `rustflags = ["-Zcodegen-backend=..."]` / `-C link-arg=-fuse-ld=...`, a
+    config `include = [...]` of an un-gated file, and `cargo --config
+    <file.toml>` (a config file path, not a key). Staged content (written to a
+    differently-named file, then cp/mv'd with a key-free command) is caught
+    at the staging write via path-independent, line-anchored strong forms
+    (`CARGO_EXEC_STRONG_RE`); a staging file produced by a tool Aegis can't
+    see is not. The shell path+key branch requires a write-capable verb
+    (redirect/tee/sed -i/cp/mv/...) so `grep runner .cargo/config.toml` and
+    commit messages mentioning a key don't ask; the `--config` CLI form is
+    legitimate for sccache (`--config 'build.rustc-wrapper="sccache"'`) and
+    asks by design. A bare value-only edit with the old key also off-diff has no
     lexical marker (same bounded residual as the JetBrains run-config guard).
+
+    QA history: independent adversarial review found (1) the staged-then-
+    copied bypass, (2) read-only/prose false positives in the shell branch,
+    (3) value-shape bypasses (`= " /tmp/x"`, triple-quoted strings), and (5)
+    inline-table / spaced-dot `--config` forms; all four closed above.
     """
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -7816,7 +7834,7 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         cmd = _shell_scan(ev)
         scan_cmd = patterns.strip_comment_lines(cmd)
         path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd))
-        if not _cargo_exec_hit(scan_cmd, path_hit):
+        if not _cargo_exec_hit(scan_cmd, path_hit, shell=True):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, cmd)):

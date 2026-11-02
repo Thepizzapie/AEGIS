@@ -5398,7 +5398,7 @@ _CARGO_EXEC_KEYS = (
 # `.`/`,`/`{`/quote so `my_runner =` or `runner_x =` don't match. Requires a
 # non-empty value (not just the key mentioned in prose).
 CARGO_EXEC_CONTENT_RE = re.compile(
-    r"(?:^|[\s.,{\[\"']|\\[nrt])(?:" + _CARGO_EXEC_KEYS + r")[\"']?[ \t]*=[ \t]*[\"'\[{]?[^\s\"'\]}]",
+    r"(?:^|[\s.,{\[\"']|\\[nrt])(?:" + _CARGO_EXEC_KEYS + r")[\"']?[ \t]*=[ \t]*(?!(?:\"\"|'')(?![\"'])|\[\s*\]|\{\s*\})\S",
     re.IGNORECASE | re.MULTILINE,
 )
 # `[credential-alias]` table header (aliases then name a program).
@@ -5407,10 +5407,32 @@ CARGO_CRED_ALIAS_TABLE_RE = re.compile(r"^[ \t]*\[\s*credential-alias\s*\]", re.
 # CLI form: `cargo --config 'build.rustc-wrapper="x"' build`,
 # `--config target.x86_64-unknown-linux-gnu.runner=...`. Bounded gaps (ReDoS).
 CARGO_EXEC_CLI_RE = re.compile(
-    r"--config(?:\s+|=)[\"']?(?:build\.(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc)"
-    r"|target\.[^\s=\"']{1,120}\.(?:runner|linker)"
-    r"|doc\.browser|registry\.(?:global-)?credential-providers?"
+    r"--config(?:\s+|=)[\"']?(?:build\s*(?:\.\s*(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc)(?![\w-])|=\s*\{)"
+    r"|target\.[^\s=\"']{1,120}(?:\s*\.\s*(?:runner|linker)(?![\w-])|\s*=\s*\{)"
+    r"|doc\s*\.\s*browser|registry\s*\.\s*(?:global-)?credential-providers?"
     r"|registries\.[^\s=\"']{1,80}\.credential-provider|credential-alias\.)",
+    re.IGNORECASE,
+)
+
+# Path-INDEPENDENT strong forms, for content staged in a differently-named file
+# (`Write /tmp/e.toml` then `cp /tmp/e.toml .cargo/config.toml`, where the copy
+# command carries no key text at all). Line-anchored and limited to vocabulary
+# distinctive to Cargo: the wrapper/credential-provider keys, a
+# `[credential-alias]` table, or `runner`/`linker` under a `[target.<x>]`
+# header. Bounded gaps (ReDoS).
+CARGO_EXEC_STRONG_RE = re.compile(
+    r"^[ \t]*(?:build\s*\.\s*)?[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|global-credential-providers)[\"']?[ \t]*=[ \t]*[^\s#]"
+    r"|^[ \t]*\[\s*credential-alias\s*\]"
+    r"|^[ \t]*\[\s*target\.[^\]\n]{1,120}\][^\[]{0,400}?^[ \t]*[\"']?(?:runner|linker)[\"']?[ \t]*=[ \t]*[^\s#]",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# A write-capable verb somewhere in a shell command; the path+key content check
+# only fires with one, so `grep runner .cargo/config.toml` / a commit message
+# mentioning the key don't ask.
+CARGO_SHELL_WRITE_RE = re.compile(
+    r">|\btee\b|\bsed\b[^|;&\n]{0,200}\s-\w*i|\b(?:cp|mv|install|dd|ln|rsync|truncate|perl|ruby|node|python3?)\b"
+    r"|\b(?:Set|Add|Out)-(?:Content|File)\b",
     re.IGNORECASE,
 )
 

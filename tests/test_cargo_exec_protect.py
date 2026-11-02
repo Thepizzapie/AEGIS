@@ -162,3 +162,45 @@ def test_redos_resistance():
     evaluate(_write(".cargo/config.toml", big), EMPTY)
     evaluate(_bash("cargo --config " + "target." * 50000), EMPTY)
     assert time.time() - t < 5
+
+
+# ---- QA round 1 fixes -------------------------------------------------------
+
+@pytest.mark.parametrize("content", [
+    WRAP, '[target.x86_64-unknown-linux-gnu]\nrunner = "sh"\n',
+    '[credential-alias]\nm = "/tmp/p"\n',
+])
+def test_staged_file_then_copy_caught_at_staging_write(content):
+    assert _hit(evaluate(_write("/tmp/e.toml", content), EMPTY))
+
+
+@pytest.mark.parametrize("value", [
+    '" /tmp/x"', '"""\nsh"""', "'''\nsh'''", "['a']",
+])
+def test_value_shapes(value):
+    assert _hit(evaluate(_write(".cargo/config.toml", f"[build]\nrustc-wrapper = {value}\n"), EMPTY))
+    assert _hit(evaluate(_write(".cargo/config.toml", f"[x]\nrunner = {value}\n"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "cargo --config build={rustc-wrapper=\"x\"} build",
+    "cargo --config 'target.x86_64-unknown-linux-gnu={runner=\"x\"}' run",
+    "cargo --config 'build . rustc-wrapper=\"x\"' build",
+])
+def test_cli_inline_table_and_spaced(cmd):
+    assert _hit(evaluate(_bash(cmd), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -n 'runner =' .cargo/config.toml",
+    "git diff .cargo/config.toml | grep linker=",
+    "echo 'see .cargo/config.toml for runner = foo'",
+    "git commit -m 'add rustc-wrapper = sccache to .cargo/config.toml'",
+    "cargo --config build.rustcfoo=1 build",
+])
+def test_read_only_and_prose_not_flagged(cmd):
+    assert not _hit(evaluate(_bash(cmd), EMPTY))
+
+
+def test_empty_values_not_flagged():
+    assert not _hit(evaluate(_write(".cargo/config.toml", '[x]\nrunner = ""\nlinker = []\n'), EMPTY))
