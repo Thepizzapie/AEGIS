@@ -5367,6 +5367,54 @@ def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
 
 
+# ---- Cargo config exec-hijack (rule_cargo_exec_protect) ----------------------
+#
+# `.cargo/config.toml` (project, any ancestor dir, or `$CARGO_HOME`) holds keys
+# Cargo itself EXECUTES as a documented feature: `build.rustc-wrapper` /
+# `build.rustc-workspace-wrapper` (a program Cargo puts in front of EVERY rustc
+# invocation -- the next `cargo build`/`check`/`test`/`clippy`, incl. rust-
+# analyzer in an IDE), `target.<triple>.runner` (runs every built binary, i.e.
+# `cargo run`/`cargo test`/`cargo bench`), `target.<triple>.linker` and
+# `build.rustc`/`build.rustdoc` (swap the toolchain binary), `doc.browser`
+# (spawned by `cargo doc --open`), and the credential-provider keys
+# (`registry.credential-provider`, `registry.global-credential-providers`,
+# `[credential-alias]`) which name a program handed the registry token on every
+# publish/login. `REGISTRY_CONFIG_PATH_RE` already gates this same file for a
+# registry/`replace-with` redirect only; none of the exec keys were covered.
+# Same "write now, auto-exec on someone else's later invocation" shape as every
+# sibling *_protect guard, with a very low trigger bar (any `cargo build`).
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+
+_CARGO_EXEC_KEYS = (
+    r"rustc-wrapper|rustc-workspace-wrapper|runner|linker|rustc|rustdoc|browser"
+    r"|credential-provider|global-credential-providers|credential-alias"
+)
+
+# A TOML assignment of one of the exec keys: bare, dotted (`build.rustc-wrapper`,
+# `target.'cfg(unix)'.runner`) or quoted-key form, preceded by start/whitespace/
+# `.`/`,`/`{`/quote so `my_runner =` or `runner_x =` don't match. Requires a
+# non-empty value (not just the key mentioned in prose).
+CARGO_EXEC_CONTENT_RE = re.compile(
+    r"(?:^|[\s.,{\[\"']|\\[nrt])(?:" + _CARGO_EXEC_KEYS + r")[\"']?[ \t]*=[ \t]*[\"'\[{]?[^\s\"'\]}]",
+    re.IGNORECASE | re.MULTILINE,
+)
+# `[credential-alias]` table header (aliases then name a program).
+CARGO_CRED_ALIAS_TABLE_RE = re.compile(r"^[ \t]*\[\s*credential-alias\s*\]", re.IGNORECASE | re.MULTILINE)
+
+# CLI form: `cargo --config 'build.rustc-wrapper="x"' build`,
+# `--config target.x86_64-unknown-linux-gnu.runner=...`. Bounded gaps (ReDoS).
+CARGO_EXEC_CLI_RE = re.compile(
+    r"--config(?:\s+|=)[\"']?(?:build\.(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc)"
+    r"|target\.[^\s=\"']{1,120}\.(?:runner|linker)"
+    r"|doc\.browser|registry\.(?:global-)?credential-providers?"
+    r"|registries\.[^\s=\"']{1,80}\.credential-provider|credential-alias\.)",
+    re.IGNORECASE,
+)
+
+
 # ---- MCP tool-catalog integrity: rug-pull / tool-poisoning heuristics --------
 #
 # Every guard above scans a shell command or a config file's own syntax for a
