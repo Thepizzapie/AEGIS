@@ -352,6 +352,11 @@ class Policy:
     # session, its output sent as the API auth header) with no tool-call
     # trigger at all. See rules.rule_claude_cred_helper_protect.
     claude_cred_helper: dict = field(default_factory=dict)
+    # Claude Code MCP trust-prompt bypass protection: {mode: deny|ask|monitor|
+    # off, allow: [regex]}. Default mode=ask. Covers `enableAllProjectMcpServers:
+    # true` / non-empty `enabledMcpjsonServers` in `.claude/settings.local.json`.
+    # See rules.rule_claude_mcp_approve_protect.
+    claude_mcp_approve: dict = field(default_factory=dict)
     # pytest conftest.py auto-exec-on-collection protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a conftest.py carrying a

@@ -3390,6 +3390,47 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code MCP-server trust-prompt bypass (.claude/settings.local.json) ---
+# A FIFTH surface in the same file `CLAUDE_LOCAL_SETTINGS_PATH_RE` locates.
+# `rule_mcp_config_protect` gates WRITING an MCP server definition
+# (`.mcp.json`), but a project-scoped `.mcp.json` can also arrive through
+# `git pull`/a cloned repo/a teammate's commit, where Claude Code's ONLY
+# defence is its one-time per-server "trust this MCP server?" prompt. Two
+# documented settings keys silence that prompt:
+#   - enableAllProjectMcpServers: true -- auto-approves EVERY server in
+#     `.mcp.json`, present and future.
+#   - enabledMcpjsonServers: [...]    -- pre-approves the named servers.
+# Written into the gitignored settings.local.json, either one converts "a
+# human must click Trust on an unreviewed, auto-spawned stdio command" into
+# silent execution at the next session start, with no diff and no review.
+# Value-gated: `enableAllProjectMcpServers: false` is the SAFE setting, and
+# an EMPTY `enabledMcpjsonServers: []` approves nothing, so neither asks.
+CLAUDE_MCP_APPROVE_KEYS = ("enableAllProjectMcpServers", "enabledMcpjsonServers")
+CLAUDE_MCP_APPROVE_RE = re.compile(
+    r"[\"']enableAllProjectMcpServers[\"']\s*:\s*[\"']?true\b"
+    r"|[\"']enabledMcpjsonServers[\"']\s*:\s*\[\s*[\"']",
+    re.IGNORECASE,
+)
+# jq/sponge scripted edit: jq, an assignment-shaped operator, and a key name,
+# `;`-scoped unbounded lookahead (see `CLAUDE_ENV_JQ_RE` for why).
+CLAUDE_MCP_APPROVE_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*" + _CLAUDE_HOOKS_JQ_ASSIGN_OP + r")"
+    r"(?=[^;]*\b(?:enableAllProjectMcpServers|enabledMcpjsonServers)\b)",
+    re.IGNORECASE,
+)
+# Edit-fragment completions for value-gating: an Edit's new_string is only a
+# fragment, so a plant can be split across edits (write `false`, later Edit
+# `false`->`true`; or key and value in separate edits). Ask on a fragment that
+# is a bare true / opens a non-empty string list / ends on a bare key-colon.
+CLAUDE_MCP_APPROVE_EDIT_FRAGMENT_RE = re.compile(
+    r"^\s*[\"']?true[\"']?\s*[,}\]]*\s*$"
+    r"|^\s*\[\s*[\"']"
+    r"|[\"'](?:enableAllProjectMcpServers|enabledMcpjsonServers)[\"']\s*:\s*$",
+    re.IGNORECASE,
+)
+
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards
