@@ -118,16 +118,39 @@ def test_echo_into_sponge_gated():
     assert gated(evaluate(_sh(f"echo '{ALL}' | sponge {P}"), EMPTY))
 
 
-def test_split_edit_plant_gated():
-    for s in ("true", '"true"', '["evil"]', '{"enableAllProjectMcpServers": '):
+def test_split_edit_plant_gated(tmp_path, monkeypatch):
+    # key already on disk with a safe value -> value-flip fragments ask
+    d = tmp_path / ".claude"
+    d.mkdir()
+    (d / "settings.local.json").write_text('{"enableAllProjectMcpServers": false}')
+    f = str(d / "settings.local.json")
+    for s in ("true", ": true", ":true", '"true"', '["evil"]', ': ["a"]', "[",
+              '"enableAllProjectMcpServers"', '{"enableAllProjectMcpServers": '):
+        assert gated(evaluate(_edit(f, s), EMPTY)), s
+    assert not gated(evaluate(_edit(f, "false"), EMPTY))
+    assert not gated(evaluate(_edit(f, "[]"), EMPTY))
+
+
+def test_split_key_edit_without_disk_gated():
+    for s in ('"enableAllProjectMcpServers"', '"enabledMcpjsonServers":'):
         assert gated(evaluate(_edit(P, s), EMPTY)), s
-    assert not gated(evaluate(_edit(P, "false"), EMPTY))
-    assert not gated(evaluate(_edit(P, "[]"), EMPTY))
+
+
+def test_old_string_naming_key_makes_value_fragment_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": P, "old_string": '"enableAllProjectMcpServers": false', "new_string": "true"})
+    assert gated(evaluate(ev, EMPTY))
+
+
+def test_permissions_allow_array_fill_not_gated():
+    for s in ('["Bash(git status)"]', '["Bash(ls:*)", "Read(*)"]', "true", "[ \"a\" ]"):
+        assert not gated(evaluate(_edit(P, s), EMPTY)), s
 
 
 def test_multiedit_split_plant_gated():
     ev = Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
-                    args={"file_path": P, "edits": [{"old_string": "false", "new_string": "true"}]})
+                    args={"file_path": P, "edits": [
+                        {"old_string": '"enableAllProjectMcpServers": false', "new_string": "true"}]})
     assert gated(evaluate(ev, EMPTY))
 
 

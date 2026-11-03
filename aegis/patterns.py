@@ -3424,11 +3424,18 @@ CLAUDE_MCP_APPROVE_JQ_RE = re.compile(
 # `false`->`true`; or key and value in separate edits). Ask on a fragment that
 # is a bare true / opens a non-empty string list / ends on a bare key-colon.
 CLAUDE_MCP_APPROVE_EDIT_FRAGMENT_RE = re.compile(
-    r"^\s*[\"']?true[\"']?\s*[,}\]]*\s*$"
-    r"|^\s*\[\s*[\"']"
+    r"^\s*:?\s*[\"']?true[\"']?\s*[,}\]]*\s*$"
+    r"|^\s*:?\s*\[\s*(?:[\"']|$)"
+    r"|^\s*(?:[\"'](?:enableAllProjectMcpServers|enabledMcpjsonServers)[\"']\s*:?\s*)$"
     r"|[\"'](?:enableAllProjectMcpServers|enabledMcpjsonServers)[\"']\s*:\s*$",
     re.IGNORECASE,
 )
+# The value-shaped branches (bare true / list opener) are only meaningful when
+# the edit lands next to one of the keys; callers gate them on the on-disk file
+# or old_string naming a key, so an ordinary `permissions.allow` array fill
+# does not ask.
+CLAUDE_MCP_APPROVE_KEY_MENTION_RE = re.compile(
+    r"enableAllProjectMcpServers|enabledMcpjsonServers", re.IGNORECASE)
 
 
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------

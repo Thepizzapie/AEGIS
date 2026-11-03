@@ -6416,10 +6416,26 @@ def rule_claude_mcp_approve_protect(ev: Event, policy=None) -> Optional[Decision
         if not hit and ev.action == ActionClass.MCP:
             hit = bool(_claude_mcp_approve_struct_hit(a) or _claude_mcp_approve_bareword_hit(a))
         if not hit and ev.action == ActionClass.EDIT:
-            frags = [a.get("new_string")] + [e.get("new_string") for e in (a.get("edits") or [])
-                                              if isinstance(e, dict)]
-            hit = any(isinstance(f, str) and patterns.CLAUDE_MCP_APPROVE_EDIT_FRAGMENT_RE.search(
-                _claude_mcp_approve_normalize(f)) for f in frags)
+            edits = [a] + [e for e in (a.get("edits") or []) if isinstance(e, dict)]
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    disk = fh.read(2_000_000)
+            except OSError:
+                disk = ""
+            near_key = bool(patterns.CLAUDE_MCP_APPROVE_KEY_MENTION_RE.search(
+                _claude_mcp_approve_normalize(disk)))
+            for e in edits:
+                new = e.get("new_string")
+                if not isinstance(new, str):
+                    continue
+                n = _claude_mcp_approve_normalize(new)
+                old = e.get("old_string")
+                ctx = near_key or (isinstance(old, str)
+                                   and bool(patterns.CLAUDE_MCP_APPROVE_KEY_MENTION_RE.search(old)))
+                m = patterns.CLAUDE_MCP_APPROVE_EDIT_FRAGMENT_RE.search(n)
+                if m and (ctx or patterns.CLAUDE_MCP_APPROVE_KEY_MENTION_RE.search(n)):
+                    hit = True
+                    break
         if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_CLAUDE_MCP_APPROVE")
