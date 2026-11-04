@@ -5492,7 +5492,7 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
 # separator, so `.cursor/rules` matches both the bare directory and any file under
 # it, at any depth. Known, disclosed limit (same denylist trade-off as every guard
 # here): a vendor path not listed below is not seen.
-_FAI_ROOT = r"(?:^|[\s'\"/\\=])"
+_FAI_ROOT = r"(?:^|[\s'\"/\\=<>|{,(])"
 _FAI_NAMES = (
     r"\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|\.continuerules"
     r"|\.goosehints|GEMINI" + _WIN_TRIM + r"\.md|QWEN" + _WIN_TRIM + r"\.md"
@@ -5511,5 +5511,25 @@ _FAI_DIRS = (
 )
 FOREIGN_AGENT_INSTR_PATH_RE = re.compile(
     _FAI_ROOT + r"(?:" + _FAI_NAMES + r"|" + _FAI_DIRS + r")" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Extra write verbs this guard treats as a write (QA round 1): symlink/create/patch/
+# restore forms the shared verb regexes do not recognise.
+FAI_EXTRA_WRITE_VERB_RE = re.compile(
+    r"\bln\b|\btouch\b|\bpatch\b|\bsponge\b|\bgit\s+(?:checkout|restore|apply|am)\b",
+    re.IGNORECASE,
+)
+# `cd .github && echo x > copilot-instructions.md`: parent dir entered, then a
+# relative filename written. Matches only a cd/pushd/git -C INTO a vendor parent.
+FAI_PARENT_CD_RE = re.compile(
+    r"(?:\bcd|\bpushd|\bgit\s+-C)\s+['\"]?[^\s;&|'\"]*\.(?:github|cursor|windsurf|roo|gemini"
+    r"|amazonq|kiro|continue|junie)[/\\]*['\"]?(?=[\s;&|)]|$)",
+    re.IGNORECASE,
+)
+FAI_PARENT_RELATIVE_RE = re.compile(
+    r"(?:^|[\s'\"/\\=<>|{,(])(?:copilot-instructions\.md|rules|steering|instructions"
+    r"|prompts|chatmodes|agents|GEMINI\.md|[^\s'\"/\\]+\.(?:mdc|instructions\.md|prompt\.md"
+    r"|chatmode\.md|agent\.md))(?=[/\\;&|)\s'\"]|$)",
     re.IGNORECASE,
 )

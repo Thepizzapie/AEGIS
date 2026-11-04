@@ -156,3 +156,39 @@ def test_regex_no_redos():
     patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(" ".join([".cursor/"] * 5000) + "a" * 50000)
     patterns.FOREIGN_AGENT_INSTR_PATH_RE.search("." * 20000 + " " * 20000)
     assert time.time() - t < 2
+
+
+def _mcp_args(tool, args):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool=tool, action=ActionClass.MCP, args=args)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd .github && echo x > copilot-instructions.md",
+    "pushd .github; cp x copilot-instructions.md",
+    "cd .cursor && echo x > rules/a.mdc",
+    "git -C .github mv x copilot-instructions.md",
+    "echo x >.cursorrules", "echo x>>GEMINI.md", "(echo x)>.cursorrules",
+    "ln -s evil .cursorrules", "touch .cursorrules", "patch .cursorrules < p",
+    "git checkout -- .cursorrules", "git restore .windsurfrules",
+])
+def test_qa_round1_shell_bypasses(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule == RULE, cmd
+
+
+def test_qa_round1_mcp_nested_and_dest():
+    d = evaluate(_mcp_args("mcp__github__push_files",
+                           {"files": [{"path": ".cursorrules", "content": "x"}]}), EMPTY)
+    assert d.rule == RULE
+    assert evaluate(_mcp_args("mcp__fs__move_file",
+                              {"source": "a", "destination": ".cursorrules"}), EMPTY).rule == RULE
+
+
+@pytest.mark.parametrize("tool", ["mcp__fs__read_file", "mcp__fs__list_directory",
+                                  "mcp__github__get_file_contents"])
+def test_qa_round1_mcp_reads_not_gated(tool):
+    assert evaluate(_mcp_args(tool, {"path": ".cursor/rules"}), EMPTY).rule != RULE
+
+
+def test_qa_round1_cd_benign():
+    assert evaluate(_shell("cd .github && cat copilot-instructions.md"), EMPTY).rule != RULE
+    assert evaluate(_shell("cd .github && ls workflows"), EMPTY).rule != RULE

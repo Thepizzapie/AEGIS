@@ -4631,6 +4631,14 @@ def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decisio
     Honest scope: path-string denylist like its siblings -- a vendor path not
     in ``FOREIGN_AGENT_INSTR_PATH_RE``, an MCP tool naming its target outside
     ``_path()``'s key list, and shell-computed path indirection are not seen.
+    QA round 1 (independent adversarial review) fixed: no-space redirects
+    (``>.cursorrules``), ``ln``/``touch``/``patch``/``git checkout|restore|apply``
+    verbs, ``cd .github && ... copilot-instructions.md`` parent-dir splits, MCP
+    ``files[].path``/destination-key targets (e.g. github ``push_files``), and
+    prompts on read-only MCP tools. Accepted residual gaps (shared with sibling
+    guards): globs/computed paths, ``find -exec`` writes, vendor paths not listed
+    (``.augment``, ``.trae``, ``AGENT.md``, ``.aider.conf.yml``, ...), Windows
+    alternate data streams/8.3 names.
     The shell branch is deliberately conservative: any write/delete/redirect/
     archive verb in a command that names a listed path asks."""
     cfg = getattr(policy, "foreign_agent_instr", None) or {}
@@ -4648,7 +4656,30 @@ def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decisio
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
-        if not (p and patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(p)):
+        hit_paths = [p] if p else []
+        # Multi-file MCP writers (e.g. github push_files {"files":[{"path":..}]}).
+        for key in ("files", "paths", "edits"):
+            v = (ev.args or {}).get(key)
+            if isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict):
+                        q = it.get("path") or it.get("file_path") or it.get("filename")
+                        if q:
+                            hit_paths.append(str(q))
+                    elif isinstance(it, str):
+                        hit_paths.append(it)
+        for key in ("destination", "dest", "dst", "target", "to", "new_path", "output_path"):
+            v = (ev.args or {}).get(key)
+            if isinstance(v, str):
+                hit_paths.append(v)
+        # Read-only MCP tools are not a write (QA: avoids prompting on reads).
+        if ev.action == ActionClass.MCP and re.search(
+                r"(?:^|[_\-])(?:read|get|list|search|view|stat|info|find)(?:[_\-]|$)",
+                ev.tool or "", re.IGNORECASE) and not re.search(
+                r"write|edit|push|create|update|move|delete|put|set|upload", ev.tool or "", re.IGNORECASE):
+            return None
+        p = next((q for q in hit_paths if patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(q)), "")
+        if not p:
             return None
         if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
                 or _foreign_agent_instr_allowed_by_policy(cfg, p)):
@@ -4662,9 +4693,13 @@ def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decisio
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        if not patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(cmd):
+        named = bool(patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(cmd))
+        via_cd = bool(patterns.FAI_PARENT_CD_RE.search(cmd)
+                      and patterns.FAI_PARENT_RELATIVE_RE.search(cmd))
+        if not (named or via_cd):
             return None
-        if not (patterns.WRITE_REDIRECT_RE.search(cmd)
+        if not (patterns.FAI_EXTRA_WRITE_VERB_RE.search(cmd)
+                or patterns.WRITE_REDIRECT_RE.search(cmd)
                 or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                 or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
                 or patterns.INPLACE_WRITE_RE.search(cmd)
