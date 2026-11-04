@@ -5476,3 +5476,40 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
     re.IGNORECASE,
 )
+
+
+# ---- Third-party coding-agent instruction/rules files ----------------------------
+# Cross-vendor sibling of AGENT_INSTRUCTIONS_PATH_RE (which only knows CLAUDE.md /
+# AGENTS.md). Every other AI coding assistant that may open this same checkout
+# (Cursor, Windsurf, Cline, Roo, GitHub Copilot, Gemini CLI, Qwen Code, Junie,
+# Amazon Q, Kiro, Continue, goose) auto-loads its OWN rules/instructions file into
+# the model's context on every future session, unattended -- the identical
+# "write now, obeyed later" prompt-injection persistence, on filenames the Claude-
+# only guard never matches. A teammate (or CI) running a different agent on the
+# same repo inherits a planted instruction the original session never touched.
+#
+# One regex covers file AND directory forms: _CI_END's lookahead accepts a path
+# separator, so `.cursor/rules` matches both the bare directory and any file under
+# it, at any depth. Known, disclosed limit (same denylist trade-off as every guard
+# here): a vendor path not listed below is not seen.
+_FAI_ROOT = r"(?:^|[\s'\"/\\=])"
+_FAI_NAMES = (
+    r"\.cursorrules|\.windsurfrules|\.clinerules|\.roorules|\.continuerules"
+    r"|\.goosehints|GEMINI" + _WIN_TRIM + r"\.md|QWEN" + _WIN_TRIM + r"\.md"
+)
+_FAI_DIRS = (
+    r"\.cursor" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.windsurf" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.roo" + _WIN_TRIM + _SEP + r"rules[^\s'\"/\\]{0,40}"
+    r"|\.junie"
+    r"|\.amazonq" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.kiro" + _WIN_TRIM + _SEP + r"steering"
+    r"|\.continue" + _WIN_TRIM + _SEP + r"rules"
+    r"|\.gemini" + _WIN_TRIM + _SEP + r"GEMINI" + _WIN_TRIM + r"\.md"
+    r"|\.github" + _WIN_TRIM + _SEP + r"copilot-instructions" + _WIN_TRIM + r"\.md"
+    r"|\.github" + _WIN_TRIM + _SEP + r"(?:instructions|prompts|chatmodes|agents)"
+)
+FOREIGN_AGENT_INSTR_PATH_RE = re.compile(
+    _FAI_ROOT + r"(?:" + _FAI_NAMES + r"|" + _FAI_DIRS + r")" + _CI_END,
+    re.IGNORECASE,
+)

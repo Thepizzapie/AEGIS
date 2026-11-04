@@ -4594,6 +4594,95 @@ def rule_jetbrains_run_config_protect(ev: Event, policy=None) -> Optional[Decisi
     return None
 
 
+def _foreign_agent_instr_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_foreign_agent_instr_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering ANOTHER coding agent's instruction/rules file
+    (``.cursorrules``, ``.cursor/rules/*``, ``.windsurfrules``, ``.clinerules``,
+    ``.roo/rules*``, ``.github/copilot-instructions.md``,
+    ``.github/{instructions,prompts,chatmodes,agents}/*``, ``GEMINI.md``,
+    ``QWEN.md``, ``.junie/*``, ``.amazonq/rules/*``, ``.kiro/steering/*``, ...).
+
+    THREAT MODEL: ``rule_agent_def_protect`` gates ``CLAUDE.md``/``AGENTS.md``
+    only. Every other assistant that opens the same checkout auto-loads its own
+    rules file into the model's context on every future session, unattended, so
+    a prompt-injected agent can persist a hidden instruction ("always add this
+    dependency", "send env to ...") that fires for a teammate or CI job running
+    Cursor/Copilot/Gemini CLI/etc., long after this session ended. The payload is
+    natural language, reads as routine config in review, and previously had no
+    guard at all.
+
+    Config (``policy.foreign_agent_instr``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate).
+    Default ``ask``: maintaining team rules files is routine, sanctioned work.
+    Escapable only by a human: trailing '# aegis-allow' on the shell form, or
+    ``AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1`` set before launch; a spawned agent
+    cannot escape. Also backstopped in the fetch-to-file guard
+    (``_FETCH_HUMAN_ESCAPABLE``).
+
+    Honest scope: path-string denylist like its siblings -- a vendor path not
+    in ``FOREIGN_AGENT_INSTR_PATH_RE``, an MCP tool naming its target outside
+    ``_path()``'s key list, and shell-computed path indirection are not seen.
+    The shell branch is deliberately conservative: any write/delete/redirect/
+    archive verb in a command that names a listed path asks."""
+    cfg = getattr(policy, "foreign_agent_instr", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-instr-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(p)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
+                or _foreign_agent_instr_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "foreign-agent-instr-protect",
+                         f"'{p}' is another coding agent's instruction/rules file -- "
+                         "its content is auto-loaded into that assistant's context on "
+                         "every future session, unattended (a teammate's or CI's, not "
+                         "just this one). Review the change, then confirm with "
+                         "AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not patterns.FOREIGN_AGENT_INSTR_PATH_RE.search(cmd):
+            return None
+        if not (patterns.WRITE_REDIRECT_RE.search(cmd)
+                or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+                or patterns.INPLACE_WRITE_RE.search(cmd)
+                or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT_INSTR")
+                or _foreign_agent_instr_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "foreign-agent-instr-protect",
+                         "Another coding agent's instruction/rules file is being "
+                         "modified from a shell -- its content is auto-loaded into that "
+                         "assistant's context on every future session, unattended. A "
+                         "human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_FOREIGN_AGENT_INSTR=1; a spawned agent cannot."))
+    return None
+
+
 # ---- PATH binary-shadow (hijack) protection: escapable with human confirm ----
 def _path_hijack_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
@@ -7057,6 +7146,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
     (patterns.AGENT_INSTRUCTIONS_PATH_RE, "CLAUDE.md/AGENTS.md"),
     (patterns.SKILL_PATH_RE, "a Claude Code Skill definition"),
+    (patterns.FOREIGN_AGENT_INSTR_PATH_RE, "another coding agent's instruction/rules file"),
     (patterns.SHELL_RC_PATH_RE, "a shell startup/profile file"),
     (patterns.SSH_PERSIST_PATH_RE, "an SSH persistence target"),
     (patterns.DIRENV_PATH_RE, "a direnv .envrc/direnvrc"),
@@ -8493,6 +8583,7 @@ _CORE_RULES = (
     rule_git_hooks_protect,
     rule_hook_manager_protect,
     rule_agent_def_protect,
+    rule_foreign_agent_instr_protect,
     rule_skills_protect,
     rule_shell_persist_protect,
     rule_direnv_protect,
