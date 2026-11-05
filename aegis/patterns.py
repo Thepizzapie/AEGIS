@@ -1597,6 +1597,56 @@ def skill_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, SKILL_FIND_PREDICATE_RE)
 
 
+# ---- Other coding agents' auto-loaded instruction/rules files -----------------
+# Sibling of the agent_def family: CLAUDE.md/AGENTS.md and .claude/{agents,commands,
+# output-styles,skills} are gated, but every OTHER agentic runtime that opens the
+# same repo auto-loads its own natural-language rules file into the model's system
+# context with no per-file approval: Cursor (.cursorrules, .cursor/rules/*), Windsurf
+# (.windsurfrules, .windsurf/rules/*), Cline (.clinerules file or dir), Roo
+# (.roorules, .roo/rules/*), Continue (.continue/rules/*), Amazon Q (.amazonq/rules/*),
+# JetBrains Junie (.junie/guidelines.md), GitHub Copilot (.github/copilot-instructions.md,
+# .github/instructions/*.instructions.md, .github/prompts/*, .github/agents/*) and
+# Gemini CLI (GEMINI.md). A line planted there is prompt injection that persists in
+# the repo, rides every teammate's/CI agent's session, and reads as docs in review.
+_AR_B = r"(?:^|[\s'\"/\\=])"
+_AR_FILE = _CI_SEG + _CI_END
+_AR_SEGS = r"(?:" + _AGENT_DEF_SEG + r"){0,4}"
+_AR_DIRS = (r"\.cursor" + _WIN_TRIM + _SEP + r"rules",
+            r"\.windsurf" + _WIN_TRIM + _SEP + r"rules",
+            r"\.roo" + _WIN_TRIM + _SEP + r"rules",
+            r"\.continue" + _WIN_TRIM + _SEP + r"rules",
+            r"\.amazonq" + _WIN_TRIM + _SEP + r"rules",
+            r"\.github" + _WIN_TRIM + _SEP + r"instructions",
+            r"\.github" + _WIN_TRIM + _SEP + r"prompts",
+            r"\.github" + _WIN_TRIM + _SEP + r"agents")
+AGENT_RULES_PATH_RE = re.compile(
+    _AR_B + r"\.(?:cursorrules|windsurfrules|roorules)" + _CI_END
+    + r"|" + _AR_B + r"\.clinerules" + _CI_END
+    + r"|" + _AR_B + r"\.clinerules" + _WIN_TRIM + _SEP + _AR_SEGS + _AR_FILE
+    + r"|" + _AR_B + r"GEMINI" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _AR_B + r"\.junie" + _WIN_TRIM + _SEP + r"guidelines" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _AR_B + r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions" + _WIN_TRIM + r"\.md" + _CI_END
+    + "".join(r"|" + _AR_B + d + _WIN_TRIM + _SEP + _AR_SEGS + _AR_FILE for d in _AR_DIRS),
+    re.IGNORECASE,
+)
+
+# Bare directory reference (archive/sync placement never names a file).
+AGENT_RULES_DIR_RE = re.compile(
+    "|".join(_AR_B + d + _CI_END for d in _AR_DIRS)
+    + r"|" + _AR_B + r"\.clinerules" + _CI_END,
+    re.IGNORECASE,
+)
+
+AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:\.cursorrules\b|\.windsurfrules\b|\.roorules\b|\.clinerules\b|GEMINI\.md\b"
+    r"|copilot-instructions\.md\b|\.(?:cursor|windsurf|roo|continue|amazonq)[/\\]rules\b"
+    r"|\.github[/\\](?:instructions|prompts|agents)\b|\.junie\b)")
+
+
+def agent_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, AGENT_RULES_FIND_PREDICATE_RE)
+
+
 # ---- Shell-startup / SSH persistence protection --------------------------------
 # Two more "runs later, unattended, with the human's full privileges" triggers
 # that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,
