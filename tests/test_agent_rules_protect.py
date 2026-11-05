@@ -149,3 +149,20 @@ def test_no_redos_on_long_input():
     t = time.time()
     rules.rule_agent_rules_protect(_sh("echo " + s + " > f"), EMPTY)
     assert time.time() - t < 1.0
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x>.cursorrules", "echo x>|.cursorrules", "echo x 1>.cursorrules",
+    "touch .cursorrules", "ln -s /tmp/e .cursorrules", "patch .cursorrules < p",
+    "git checkout -- .cursorrules", "git restore GEMINI.md",
+    "echo x > .kiro/steering/a.md", "echo x > QWEN.md", "echo x > .goosehints",
+])
+def test_round1_shell_gaps_closed(cmd):
+    d = rules.rule_agent_rules_protect(_sh(cmd), EMPTY)
+    assert d and d.action == Action.ASK, cmd
+
+
+def test_spawned_agent_cannot_self_escape(monkeypatch):
+    monkeypatch.setenv("AEGIS_AGENT_NAME", "sub1")
+    d = rules.rule_agent_rules_protect(_sh("echo x > .cursorrules # aegis-allow"), EMPTY)
+    assert d and d.action == Action.ASK

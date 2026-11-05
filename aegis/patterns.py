@@ -1608,7 +1608,7 @@ def skill_find_hit(cmd: str) -> bool:
 # .github/instructions/*.instructions.md, .github/prompts/*, .github/agents/*) and
 # Gemini CLI (GEMINI.md). A line planted there is prompt injection that persists in
 # the repo, rides every teammate's/CI agent's session, and reads as docs in review.
-_AR_B = r"(?:^|[\s'\"/\\=])"
+_AR_B = r"(?:^|[\s'\"/\\=>|])"
 _AR_FILE = _CI_SEG + _CI_END
 _AR_SEGS = r"(?:" + _AGENT_DEF_SEG + r"){0,4}"
 _AR_DIRS = (r"\.cursor" + _WIN_TRIM + _SEP + r"rules",
@@ -1616,6 +1616,10 @@ _AR_DIRS = (r"\.cursor" + _WIN_TRIM + _SEP + r"rules",
             r"\.roo" + _WIN_TRIM + _SEP + r"rules",
             r"\.continue" + _WIN_TRIM + _SEP + r"rules",
             r"\.amazonq" + _WIN_TRIM + _SEP + r"rules",
+            r"\.kiro" + _WIN_TRIM + _SEP + r"steering",
+            r"\.zed" + _WIN_TRIM + _SEP + r"rules",
+            r"\.trae" + _WIN_TRIM + _SEP + r"rules",
+            r"\.augment" + _WIN_TRIM + _SEP + r"rules",
             r"\.github" + _WIN_TRIM + _SEP + r"instructions",
             r"\.github" + _WIN_TRIM + _SEP + r"prompts",
             r"\.github" + _WIN_TRIM + _SEP + r"agents")
@@ -1624,6 +1628,8 @@ AGENT_RULES_PATH_RE = re.compile(
     + r"|" + _AR_B + r"\.clinerules" + _CI_END
     + r"|" + _AR_B + r"\.clinerules" + _WIN_TRIM + _SEP + _AR_SEGS + _AR_FILE
     + r"|" + _AR_B + r"GEMINI" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _AR_B + r"(?:QWEN|CRUSH|JULES)" + _WIN_TRIM + r"\.md" + _CI_END
+    + r"|" + _AR_B + r"\.(?:aiderrules|goosehints)" + _CI_END
     + r"|" + _AR_B + r"\.junie" + _WIN_TRIM + _SEP + r"guidelines" + _WIN_TRIM + r"\.md" + _CI_END
     + r"|" + _AR_B + r"\.github" + _WIN_TRIM + _SEP + r"copilot-instructions" + _WIN_TRIM + r"\.md" + _CI_END
     + "".join(r"|" + _AR_B + d + _WIN_TRIM + _SEP + _AR_SEGS + _AR_FILE for d in _AR_DIRS),
@@ -1636,6 +1642,13 @@ AGENT_RULES_DIR_RE = re.compile(
     + r"|" + _AR_B + r"\.clinerules" + _CI_END,
     re.IGNORECASE,
 )
+
+# Extra write verbs the shared verb set lacks (QA round 1): touch, patch, and a
+# git checkout/restore that overwrites the file from another revision.
+AGENT_RULES_EXTRA_VERB_RE = re.compile(
+    r">\|"
+    r"|\btouch\b|\bpatch\b|\bgit\s+(?:checkout|restore)\b|\bln\s+-[a-zA-Z]*s",
+    re.IGNORECASE)
 
 AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
     r"(?:\.cursorrules\b|\.windsurfrules\b|\.roorules\b|\.clinerules\b|GEMINI\.md\b"

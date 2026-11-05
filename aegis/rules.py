@@ -1367,8 +1367,16 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``# aegis-allow`` (shell) or ``AEGIS_ALLOW_AGENT_RULES=1`` (Edit/Write/MCP).
 
     Honest scope: path-string match, same denylist trade-offs as sibling guards;
-    glued archive-destination flags (``tar -C.cursor/rules``) and computed paths
-    are inherited gaps (see ``rule_skills_protect``)."""
+    glued archive-destination flags (``tar -C.cursor/rules``), computed paths,
+    ``cd`` + relative-path splits, Windows alternate data streams/8.3 names,
+    ``install -m644`` glued modes, and MCP tools whose path arg key is not one
+    ``_path()`` knows (``destination``, ``target_path``, ``edits[].path``) are
+    inherited gaps shared with ``rule_skills_protect``. Shell detection is
+    "names target AND any write verb in the command", so a read-only
+    ``cp .cursorrules /tmp/`` also asks (nuisance only). QA round 1 (independent
+    adversarial review): no bug introduced here; closed glued ``>`` redirects,
+    ``touch``/``patch``/``git checkout|restore``/``ln -s`` and added Kiro/Zed/
+    Trae/Augment/Qwen/Crush/Jules/aider/goose files."""
     cfg = getattr(policy, "agent_rules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1417,7 +1425,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
             or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
             or patterns.INPLACE_WRITE_RE.search(cmd)
             or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd))
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(cmd)
+            or patterns.AGENT_RULES_EXTRA_VERB_RE.search(cmd))
         if not touches:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_RULES")
