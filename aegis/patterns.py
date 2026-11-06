@@ -5500,12 +5500,15 @@ _JVM_D = _WIN_TRIM + _SEP   # directory separator, trailing-dot/space tolerant
 JVM_BUILD_PATH_RE = re.compile(
     _JVM_BP + "(?:" + "|".join([
         r"\.mvn" + _JVM_D + r"(?:jvm\.config|extensions\.xml|maven\.config"
-        r"|wrapper" + _JVM_D + r"maven-wrapper\.(?:properties|jar))",
+        r"|wrapper" + _JVM_D + r"(?:maven-wrapper\.(?:properties|jar)|MavenWrapperDownloader\.java))",
         r"gradle" + _JVM_D + r"wrapper" + _JVM_D
         + r"gradle-wrapper(?:-shared)?\.(?:properties|jar)",
-        r"(?:\.gradle" + _JVM_D + r")?init\.gradle(?:\.kts)?",
-        r"\.gradle" + _JVM_D + r"init\.d" + _JVM_D + r"[^\"'\n]{1,200}\.gradle(?:\.kts)?",
+        r"\.gradle" + _JVM_D + r"init\.gradle(?:\.kts)?",
+        # init.d under ~/.gradle OR any $GRADLE_USER_HOME / Gradle install dir
+        r"init\.d" + _JVM_D + r"[^\"'\n/\\]{1,200}\.gradle(?:\.kts)?",
         r"\.m2" + _JVM_D + r"(?:settings|settings-security|toolchains)\.xml",
+        # ~/.mavenrc, /etc/mavenrc: sourced as shell by the `mvn` script
+        r"\.?mavenrc",
     ]) + ")" + _CI_END,
     re.IGNORECASE,
 )
@@ -5522,19 +5525,22 @@ JVM_BUILD_CD_RE = re.compile(
     re.IGNORECASE,
 )
 JVM_BUILD_BARE_FILENAME_RE = re.compile(
-    _JVM_BP + r"(?:jvm\.config|extensions\.xml|maven\.config"
-    r"|maven-wrapper\.(?:properties|jar)|gradle-wrapper(?:-shared)?\.(?:properties|jar)"
+    _JVM_BP + r"(?:jvm\.config|extensions\.xml|maven\.config|\.?mavenrc"
+    r"|maven-wrapper\.(?:properties|jar)|MavenWrapperDownloader\.java"
+    r"|gradle-wrapper(?:-shared)?\.(?:properties|jar)"
     r"|init\.gradle(?:\.kts)?|[^\s'\"/\\]{1,200}\.gradle(?:\.kts)?"
     r"|settings(?:-security)?\.xml|toolchains\.xml)" + _CI_END,
     re.IGNORECASE,
 )
 # JVM-injection flags inside `gradle.properties` (`org.gradle.jvmargs`,
-# `org.gradle.java.home`, `systemProp.*`). Distinctive bare tokens, so no
-# key-adjacency requirement (a value-only diff still carries the flag).
+# `org.gradle.java.home`). Distinctive bare tokens, so no key-adjacency
+# requirement (a value-only diff still carries the flag). `-XX:OnError`/
+# `OnOutOfMemoryError` require `=` so benign `-XX:+HeapDumpOnOutOfMemoryError`
+# does not match.
 JVM_BUILD_PROPS_JVMFLAG_RE = re.compile(
     r"-\s*javaagent\b|-\s*agentlib\b|-\s*agentpath\b|-\s*Xbootclasspath\b"
-    r"|-XX:(?:\+?\w*)?(?:OnError|OnOutOfMemoryError)\b|-XX:Flags=|-XX:VMOptionsFile"
+    r"|-XX:(?:OnError|OnOutOfMemoryError)\s*=|-XX:Flags=|-XX:VMOptionsFile"
     r"|\borg\.gradle\.java\.home\b|\borg\.gradle\.java\.installations\.paths\b"
-    r"|\bJAVA_TOOL_OPTIONS\b|\b_JAVA_OPTIONS\b|\bJDK_JAVA_OPTIONS\b",
+    r"|org\.gradle\.jvmargs\s*[=:][^\n]*@[^\s=]",   # JVM @argfile indirection
     re.IGNORECASE,
 )

