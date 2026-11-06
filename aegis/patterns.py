@@ -5476,3 +5476,65 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
     re.IGNORECASE,
 )
+
+
+# ---- JVM build-tool (Maven/Gradle) auto-exec protection -----------------------
+# Maven and Gradle read several small per-project/per-user files that run code
+# or fetch a build runtime on the next ordinary `./mvnw`/`./gradlew`/`mvn`/
+# `gradle` invocation (or an IDE import / CI build), none covered by another
+# guard: `.mvn/jvm.config` (JVM flags for the Maven JVM -- `-javaagent:` is
+# arbitrary code), `.mvn/extensions.xml` (core extensions Maven downloads and
+# loads into its own classloader), `.mvn/maven.config` (CLI flags incl. `-s`
+# alternate settings), the wrapper `*.properties` (`distributionUrl` -- the
+# wrapper script downloads and runs whatever that URL serves) and wrapper
+# `*.jar`, Gradle init scripts (`~/.gradle/init.gradle`, `init.d/*.gradle[.kts]`
+# -- full Groovy/Kotlin run in EVERY build for that user), and `~/.m2/
+# settings.xml`/`toolchains.xml` (mirrors redirecting dependency resolution;
+# `jdkHome` pointing at an attacker JVM). All of these are PATH-ONLY gated: each
+# file's whole purpose is build-time config, and a path-only gate has no
+# value-only-diff bypass (the lesson of the JetBrains run-config guard's QA).
+# `gradle.properties` is the exception -- routinely edited for benign reasons --
+# so it is CONTENT-gated on JVM-injection flags (JVM_BUILD_PROPS_JVMFLAG_RE).
+_JVM_BP = r"(?:^|[\s'\"/\\=])"
+_JVM_D = _WIN_TRIM + _SEP   # directory separator, trailing-dot/space tolerant
+JVM_BUILD_PATH_RE = re.compile(
+    _JVM_BP + "(?:" + "|".join([
+        r"\.mvn" + _JVM_D + r"(?:jvm\.config|extensions\.xml|maven\.config"
+        r"|wrapper" + _JVM_D + r"maven-wrapper\.(?:properties|jar))",
+        r"gradle" + _JVM_D + r"wrapper" + _JVM_D
+        + r"gradle-wrapper(?:-shared)?\.(?:properties|jar)",
+        r"(?:\.gradle" + _JVM_D + r")?init\.gradle(?:\.kts)?",
+        r"\.gradle" + _JVM_D + r"init\.d" + _JVM_D + r"[^\"'\n]{1,200}\.gradle(?:\.kts)?",
+        r"\.m2" + _JVM_D + r"(?:settings|settings-security|toolchains)\.xml",
+    ]) + ")" + _CI_END,
+    re.IGNORECASE,
+)
+JVM_BUILD_PROPS_PATH_RE = re.compile(
+    _JVM_BP + r"(?:[^\s'\"]{0,200}[/\\])?gradle\.properties" + _CI_END,
+    re.IGNORECASE,
+)
+# `cd`/`pushd` into one of the directories above, then a bare filename.
+JVM_BUILD_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?"
+    r"(?:\.mvn(?:" + _SEP + r"wrapper)?|gradle" + _SEP + r"wrapper|\.gradle(?:" + _SEP
+    + r"init\.d)?|init\.d|\.m2)" + _CI_END,
+    re.IGNORECASE,
+)
+JVM_BUILD_BARE_FILENAME_RE = re.compile(
+    _JVM_BP + r"(?:jvm\.config|extensions\.xml|maven\.config"
+    r"|maven-wrapper\.(?:properties|jar)|gradle-wrapper(?:-shared)?\.(?:properties|jar)"
+    r"|init\.gradle(?:\.kts)?|[^\s'\"/\\]{1,200}\.gradle(?:\.kts)?"
+    r"|settings(?:-security)?\.xml|toolchains\.xml)" + _CI_END,
+    re.IGNORECASE,
+)
+# JVM-injection flags inside `gradle.properties` (`org.gradle.jvmargs`,
+# `org.gradle.java.home`, `systemProp.*`). Distinctive bare tokens, so no
+# key-adjacency requirement (a value-only diff still carries the flag).
+JVM_BUILD_PROPS_JVMFLAG_RE = re.compile(
+    r"-\s*javaagent\b|-\s*agentlib\b|-\s*agentpath\b|-\s*Xbootclasspath\b"
+    r"|-XX:(?:\+?\w*)?(?:OnError|OnOutOfMemoryError)\b|-XX:Flags=|-XX:VMOptionsFile"
+    r"|\borg\.gradle\.java\.home\b|\borg\.gradle\.java\.installations\.paths\b"
+    r"|\bJAVA_TOOL_OPTIONS\b|\b_JAVA_OPTIONS\b|\bJDK_JAVA_OPTIONS\b",
+    re.IGNORECASE,
+)

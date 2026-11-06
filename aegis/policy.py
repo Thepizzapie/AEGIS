@@ -411,6 +411,11 @@ class Policy:
     # Terraform process is already authenticated with. See
     # rules.rule_terraform_exec_protect.
     terraform_exec: dict = field(default_factory=dict)
+    # Maven/Gradle build-runtime exec protection: .mvn/jvm.config,
+    # extensions.xml, wrapper distributionUrl, Gradle init scripts,
+    # ~/.m2/settings.xml, and JVM-agent flags in gradle.properties. See
+    # rules.rule_jvm_build_exec_protect.
+    jvm_build_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing

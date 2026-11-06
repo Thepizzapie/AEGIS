@@ -7087,6 +7087,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.JVM_BUILD_PATH_RE, "a Maven/Gradle build-runtime config"),
 )
 
 
@@ -7895,6 +7896,133 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _jvm_build_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting/altering Maven or Gradle build-runtime config that
+    executes code or swaps the build runtime on the next ordinary build.
+
+    THREAT MODEL: `./mvnw`, `./gradlew`, `mvn`, `gradle`, an IDE project
+    import and CI all read a handful of small config files before any user
+    code runs, and several of them are code-execution or supply-chain
+    primitives: `.mvn/jvm.config` (`-javaagent:` runs an arbitrary agent jar
+    inside Maven's JVM), `.mvn/extensions.xml` (core extensions are
+    downloaded and loaded into Maven's classloader), `.mvn/maven.config`
+    (`-s` alternate settings), the wrapper `maven-wrapper.properties`/
+    `gradle-wrapper.properties` (`distributionUrl` — the wrapper downloads
+    and runs whatever that URL serves) and the wrapper jars, Gradle init
+    scripts (`~/.gradle/init.gradle`, `init.d/*.gradle[.kts]`: full
+    Groovy/Kotlin executed in every build for that user), and
+    `~/.m2/settings.xml`/`toolchains.xml` (mirrors redirecting dependency
+    resolution; `jdkHome` at an attacker JVM). `.mvn/` and `gradle/wrapper/`
+    are ordinarily TRACKED, but reviewers read source diffs, not wrapper
+    properties. A prompt-injected agent that edits one of these gets code
+    execution on the next build by the human or CI, with no further agent
+    action. No other guard in this file covers any of them.
+
+    Gating: the files above are PATH-ONLY gated (their whole purpose is
+    build-runtime config, so there is no value-only-diff bypass to leave
+    open). `gradle.properties` is routinely edited for benign reasons, so it
+    is CONTENT-gated on JVM-injection flags (`-javaagent`/`-agentlib`/
+    `-agentpath`/`-Xbootclasspath`/`-XX:OnError`/`org.gradle.java.home`/
+    `JAVA_TOOL_OPTIONS`...). A bare-token match is enough, so a value-only
+    Edit diff still trips it.
+
+    Config (``policy.jvm_build_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate).
+    Escapable only by a human: '# aegis-allow' on the shell form, or
+    AEGIS_ALLOW_JVM_BUILD_EXEC=1 set before launch for Edit/Write/MCP.
+
+    Honest scope (same denylist trade-offs as sibling guards): paths built
+    indirectly are not seen; project build scripts themselves (`pom.xml`
+    plugins, `build.gradle`, `settings.gradle`, `buildSrc/`) are ordinary
+    source code and deliberately NOT gated here (the install-review and CI
+    guards are the layer for those); shell-exported `MAVEN_OPTS`/
+    `JAVA_TOOL_OPTIONS` env-var injection is a separate surface not covered;
+    fetch-to-file writes of the path-only files are closed by
+    `rule_fetch_to_file_protect`, but not for `gradle.properties` (content
+    unknowable at hook time)."""
+    cfg = getattr(policy, "jvm_build_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "jvm-build-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        path_hit = bool(patterns.JVM_BUILD_PATH_RE.search(p))
+        props_hit = bool(patterns.JVM_BUILD_PROPS_PATH_RE.search(p))
+        if not (path_hit or props_hit):
+            return None
+        hit = path_hit
+        if not hit:
+            a = ev.args or {}
+            parts = [v for v in (a.get("content"), a.get("new_string"), a.get("old_string"))
+                     if isinstance(v, str) and v]
+            if not parts:
+                parts = _flatten_strings(a)
+            hit = bool(patterns.JVM_BUILD_PROPS_JVMFLAG_RE.search(" ".join(parts)))
+        if not hit:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_JVM_BUILD_EXEC")
+                or _jvm_build_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "jvm-build-exec-protect",
+                         f"'{p}' is Maven/Gradle build-runtime config — it "
+                         "can load a -javaagent, extension, init script, "
+                         "alternate distribution or JVM and runs it on the "
+                         "next ordinary build by anyone (or CI). Review the "
+                         "change, then confirm with "
+                         "AEGIS_ALLOW_JVM_BUILD_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+        if not write_verb:
+            return None
+        hit = bool(patterns.JVM_BUILD_PATH_RE.search(cmd)
+                   or (patterns.JVM_BUILD_CD_RE.search(cmd)
+                       and patterns.JVM_BUILD_BARE_FILENAME_RE.search(cmd))
+                   or (patterns.JVM_BUILD_PROPS_PATH_RE.search(cmd)
+                       and patterns.JVM_BUILD_PROPS_JVMFLAG_RE.search(cmd)))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_JVM_BUILD_EXEC")
+                or _jvm_build_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "jvm-build-exec-protect",
+                         "Maven/Gradle build-runtime config (.mvn/jvm.config, "
+                         "extensions, wrapper distributionUrl, Gradle init "
+                         "script, ~/.m2/settings.xml, or a JVM-agent flag in "
+                         "gradle.properties) is being written from a shell — "
+                         "it runs code on the next ordinary build. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_JVM_BUILD_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -8520,6 +8648,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_jvm_build_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
