@@ -5495,7 +5495,7 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
 # value-only-diff bypass (the lesson of the JetBrains run-config guard's QA).
 # `gradle.properties` is the exception -- routinely edited for benign reasons --
 # so it is CONTENT-gated on JVM-injection flags (JVM_BUILD_PROPS_JVMFLAG_RE).
-_JVM_BP = r"(?:^|[\s'\"/\\=])"
+_JVM_BP = r"(?:^|[\s'\"/\\=<>|&;(])"   # incl. unspaced redirect/separator before a relative path
 _JVM_D = _WIN_TRIM + _SEP   # directory separator, trailing-dot/space tolerant
 JVM_BUILD_PATH_RE = re.compile(
     _JVM_BP + "(?:" + "|".join([
@@ -5512,6 +5512,9 @@ JVM_BUILD_PATH_RE = re.compile(
     ]) + ")" + _CI_END,
     re.IGNORECASE,
 )
+# Write verbs the shared sets miss: sponge, rsync, long-form sed --in-place.
+JVM_BUILD_EXTRA_WRITE_VERB_RE = re.compile(
+    r"\b(?:sponge|rsync)\b|--in-place\b", re.IGNORECASE)
 JVM_BUILD_PROPS_PATH_RE = re.compile(
     _JVM_BP + r"(?:[^\s'\"]{0,200}[/\\])?gradle\.properties" + _CI_END,
     re.IGNORECASE,
@@ -5539,6 +5542,8 @@ JVM_BUILD_BARE_FILENAME_RE = re.compile(
 # does not match.
 JVM_BUILD_PROPS_JVMFLAG_RE = re.compile(
     r"-\s*javaagent\b|-\s*agentlib\b|-\s*agentpath\b|-\s*Xbootclasspath\b"
+    r"|-\s*Xrunjdwp\b|-\s*Xrun\w+|--patch-module\b|-XX:SharedArchiveFile"
+    r"|-Djava\.system\.class\.loader\b|-Djava\.security\.(?:manager|properties|policy)\b"
     r"|-XX:(?:OnError|OnOutOfMemoryError)\s*=|-XX:Flags=|-XX:VMOptionsFile"
     r"|\borg\.gradle\.java\.home\b|\borg\.gradle\.java\.installations\.paths\b"
     r"|org\.gradle\.jvmargs\s*[=:][^\n]*@[^\s=]",   # JVM @argfile indirection

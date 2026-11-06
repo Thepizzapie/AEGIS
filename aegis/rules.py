@@ -7947,7 +7947,10 @@ def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     indirectly are not seen; the `mvnw`/`gradlew` scripts and
     `<maven.home>/conf/settings.xml` are not gated; JVM flags hidden behind
     unicode escapes or a `cp` of a whole file into `gradle.properties` are
-    not seen; the shell branch is "write verb anywhere AND protected path
+    not seen; directory-level symlinks (`ln -s /tmp/x .mvn`), archive
+    extraction (`tar -C .mvn`), `git checkout -- <path>`, chained/computed
+    `cd`s and `wget -qO` are not seen (same denylist class as siblings);
+    the shell branch is "write verb anywhere AND protected path
     anywhere" like its siblings, so a read whose output is redirected
     elsewhere (`cp ~/.m2/settings.xml /tmp/bak`, `mvn -s ~/.m2/settings.xml
     verify > build.log`) false-positives to ASK (fails toward ASK, never
@@ -8007,7 +8010,9 @@ def rule_jvm_build_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                            or patterns.INPLACE_WRITE_RE.search(cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                           or patterns.JVM_BUILD_EXTRA_WRITE_VERB_RE.search(cmd))
         if not write_verb:
             return None
         hit = bool(patterns.JVM_BUILD_PATH_RE.search(cmd)

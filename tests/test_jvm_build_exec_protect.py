@@ -88,6 +88,8 @@ def test_value_only_edit_still_caught():
     "org.gradle.java.home=/tmp/evil-jdk",
     "-javaagent:/tmp/a.jar",                      # value-only diff
     "org.gradle.jvmargs=@/tmp/args.txt",
+    "org.gradle.jvmargs=-Xrunjdwp:transport=dt_socket",
+    "org.gradle.jvmargs=-Djava.system.class.loader=x.Evil",
 ])
 def test_gradle_properties_jvm_flags(content):
     for p in ("/r/gradle.properties", "/h/.gradle/gradle.properties"):
@@ -131,6 +133,14 @@ def test_unrelated_files_not_gated(path):
     "cd ~/.gradle/init.d && echo 'x' > a.gradle",
     "echo 'org.gradle.jvmargs=-javaagent:/x.jar' >> gradle.properties",
     "echo 'org.gradle.jvmargs=-javaagent:/x.jar' >> ~/.gradle/gradle.properties",
+    "echo x >.mvn/jvm.config", "echo x>.mvn/jvm.config", "echo x >>.mvn/maven.config",
+    "echo x 1>.mvn/jvm.config", "echo x &>.mvn/jvm.config", "echo x >|.mvn/jvm.config",
+    "echo x >gradle/wrapper/gradle-wrapper.properties", "echo x >.gradle/init.d/a.gradle",
+    "cd .mvn&&echo x>jvm.config", "cd .mvn;echo x>jvm.config",
+    "echo 'org.gradle.jvmargs=-javaagent:/x.jar' >gradle.properties",
+    "install -m644 /tmp/j .mvn/jvm.config", "cd .mvn && install /tmp/j jvm.config",
+    "echo x | sponge .mvn/jvm.config", "sed --in-place s/a/b/ .mvn/jvm.config",
+    "rsync /tmp/j .mvn/jvm.config",
 ])
 def test_shell_writes_asked(cmd):
     hit, d = _hit(_shell(cmd))
