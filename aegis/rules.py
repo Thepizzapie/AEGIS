@@ -7927,13 +7927,25 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     trailing '# aegis-allow' on a shell form, or `AEGIS_ALLOW_CARGO_EXEC=1`.
 
     Honest scope: known-benign BARE tool names (sccache, ccache, clang, gcc,
-    lld, mold, wasmtime, `<triple>-gcc`, ...) are exempt -- a path-qualified
-    value (`./clang`) is not. Not covered: `[alias]` (cargo aliases cannot
-    shell out), `--config <file>` pointing at a separately-written TOML file,
-    `build.rs`/proc-macro source (ordinary code), a copy/move of a prebuilt
-    config (content invisible), and values assembled indirectly. A value-only
-    Edit diff that never repeats the key is caught only when `old_string`
-    carries it (the `old_string` is scanned too)."""
+    lld, mold, wasmtime, qemu-*, `<triple>-gcc`, Cargo's built-in `cargo:token`
+    providers, ...) and an empty value (clearing the option) are exempt; only
+    the first token is inspected, so a benign tool's extra args are not
+    vetted, and a path-qualified value (`./clang`) is not exempt. Custom
+    CARGO_HOME is matched via the `CARGO_HOME` variable or a directory named
+    `cargo`/`cargohome`; an arbitrary other directory is not. Not covered:
+    `[alias]`, `--config <file>`, `cargo config set` (unstable), `-Z
+    codegen-backend`, `build.rs`/proc-macro source, copy/move/`install` of a
+    prebuilt config (content invisible), nested-`files` MCP writes (shared
+    `_path()` limit that every sibling guard has), and values assembled
+    indirectly. A value-only Edit diff that never repeats the key is caught
+    only when `old_string` carries it.
+
+    QA history: round 1 (independent adversarial reviewer) found a quadratic
+    ReDoS in the `--config` regex (fixed), RUSTFLAGS-env / `--config
+    rustflags` linker hooks, array-form `link-arg`, `--config` inline tables,
+    custom-CARGO_HOME paths, lone `[credential-alias]` (all closed), and
+    false-ASKs on empty values / built-in credential providers /
+    `-fuse-ld=lld` (exempted)."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

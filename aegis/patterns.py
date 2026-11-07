@@ -5389,7 +5389,11 @@ def strip_comment_lines(text: str) -> str:
 # 'build.rustc-wrapper="x"'`, or the `RUSTC_WRAPPER`/`CARGO_TARGET_<T>_RUNNER`/
 # ... environment variables exported into a shell or CI step.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    # custom CARGO_HOME: the variable itself, or the official rust image's
+    # /usr/local/cargo (any dir literally named `cargo`/`cargohome`)
+    + r"|CARGO_HOME[^\s'\"]{0,40}" + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|(?:^|[/\\])(?:cargo|cargo[-_]?home)" + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 CARGO_CONFIG_CD_RE = re.compile(
@@ -5407,7 +5411,7 @@ _CARGO_TOML_KEY = (
     r"|runner"
     r"|linker"
     r"|(?:global[-_])?credential[-_]providers?"
-    r"|credential[-_]alias"
+    r"|credential[-_]alias(?:\.[^\s=\"']{1,80})?"
 )
 _CARGO_TOML_ASSIGN_RE = re.compile(
     r"(?<![\w-])(?:" + _CARGO_TOML_KEY + r")[\"']?\s*=\s*"
@@ -5416,10 +5420,15 @@ _CARGO_TOML_ASSIGN_RE = re.compile(
 )
 # `-C linker=...` / `-Clinker=...` / `-C link-arg=-fuse-ld=...` in rustflags.
 _CARGO_RUSTFLAGS_LINK_RE = re.compile(
-    r"-C\s*(?:linker|link-arg|link-args)\s*=|-Z\s*pre-link-args?\s*=", re.IGNORECASE)
+    r"-C[\s\"',]*(?:linker|link-args?)\s*=(?!\s*-fuse-ld=(?:lld|mold|gold|bfd|lld-link)\b)"
+    r"|-Z[\s\"',]*pre-link-args?\s*=", re.IGNORECASE)
+_CARGO_CREDALIAS_HEADER_RE = re.compile(r"\[\s*credential-alias\s*\]", re.IGNORECASE)
+_CARGO_RUSTFLAGS_ENV_RE = re.compile(
+    r"(?<![\w$-])(?:RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_RUSTFLAGS"
+    r"|CARGO_TARGET_[A-Z0-9_]{1,80}_RUSTFLAGS)\s*=|\brustflags\b", re.IGNORECASE)
 # `--config` CLI form: dotted key path required (cuts generic `--config` noise).
 _CARGO_CLI_CONFIG_RE = re.compile(
-    r"--config\b[\s=]*[\"']?\s*(?:"
+    r"--config\b[\s=]*[\"']?(?:"
     r"build\.rustc[-_](?:workspace[-_])?wrapper"
     r"|target\.[^\s=\"']{1,120}\.(?:runner|linker)"
     r"|registr(?:y|ies(?:\.[^\s=\"'.]{1,80})?)\.credential[-_]providers?"
@@ -5453,13 +5462,20 @@ _CARGO_ENV_SET_RE = re.compile(
 )
 # Known-benign BARE tool names (no path separator, so `./clang` is NOT exempt).
 _CARGO_BENIGN_VALUE_RE = re.compile(
-    r"^(?:sccache|ccache|cachepot|clang(?:\+\+)?|gcc|g\+\+|cc|c\+\+|lld|rust-lld|mold|ld|link"
+    r"^(?:sccache|ccache|cachepot|clang(?:\+\+)?|gcc|g\+\+|cc|c\+\+|lld|rust-lld|mold|ld|link|ld\.lld|wasm-ld"
+    r"|qemu-[a-z0-9_-]+|cargo:(?:token|macos-keychain|libsecret|wincred)"
     r"|lld-link|wasmtime|wasm-bindgen-test-runner|[a-z0-9_]+(?:-[a-z0-9_]+)*-(?:gcc|clang|g\+\+))"
     r"(?:\.exe)?$", re.IGNORECASE)
 
 
 def _cargo_value_benign(val) -> bool:
-    return bool(val) and bool(_CARGO_BENIGN_VALUE_RE.match(val.strip()))
+    """None (unparsed value) is NOT benign; an empty string (clearing the
+    option) is; otherwise the first whitespace token must be a known bare tool
+    name (its extra args are not inspected)."""
+    if val is None:
+        return False
+    toks = val.split()
+    return not toks or bool(_CARGO_BENIGN_VALUE_RE.match(toks[0]))
 
 
 def cargo_exec_toml_hit(text: str) -> bool:
@@ -5478,7 +5494,7 @@ def cargo_exec_toml_hit(text: str) -> bool:
         # open to a hit; only a cleanly parsed benign bare name is exempt.
         if not _cargo_value_benign(m.group("val")):
             return True
-    return bool(_CARGO_RUSTFLAGS_LINK_RE.search(text))
+    return bool(_CARGO_CREDALIAS_HEADER_RE.search(text) or _CARGO_RUSTFLAGS_LINK_RE.search(text))
 
 
 def cargo_exec_shell_hit(text: str) -> bool:
@@ -5487,6 +5503,12 @@ def cargo_exec_shell_hit(text: str) -> bool:
     if not text:
         return False
     text = strip_comment_lines(text)
+    for m in re.finditer(r"--config\b", text):
+        # inline-table / non-dotted forms: reuse the TOML check on the argument
+        if cargo_exec_toml_hit(text[m.end():m.end() + 400].replace("\\\"", '"')):
+            return True
+    if _CARGO_RUSTFLAGS_ENV_RE.search(text) and _CARGO_RUSTFLAGS_LINK_RE.search(text):
+        return True
     if _CARGO_CLI_CONFIG_RE.search(text):
         for m in _CARGO_CLI_CONFIG_RE.finditer(text):
             seg = text[m.end():m.end() + 320]

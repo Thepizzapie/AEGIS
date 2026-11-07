@@ -60,7 +60,7 @@ def test_deny_mode_and_edit_and_multiedit():
 
 
 def test_value_only_edit_caught_via_old_string():
-    assert hit(ed(".cargo/config.toml", '"./evil"', old='runner = "qemu-arm"'))[0]
+    assert hit(ed(".cargo/config.toml", '"./evil"', old='runner = "./old-runner"'))[0]
 
 
 @pytest.mark.parametrize("content", [
@@ -159,3 +159,51 @@ def test_yaml_loader_roundtrip(tmp_path):
     (tmp_path / "p.yaml").write_text("cargo_exec:\n  mode: deny\n")
     pol = load_policy(str(tmp_path))
     assert pol.cargo_exec.get("mode") == "deny"
+
+
+# ---- QA round 1 regressions -------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "RUSTFLAGS='-C linker=/tmp/e' cargo build",
+    "CARGO_ENCODED_RUSTFLAGS=-Clinker=/tmp/e cargo build",
+    "cargo build --config 'build.rustflags=[\"-C\",\"linker=/tmp/e\"]'",
+    "cargo build --config 'build = {rustc-wrapper=\"/tmp/e\"}'",
+    "echo 'runner=\"/tmp/e\"' > /usr/local/cargo/config.toml",
+    "echo 'runner=\"/tmp/e\"' > $CARGO_HOME/config.toml",
+])
+def test_qa1_shell_bypasses_closed(cmd):
+    assert hit(sh(cmd))[0], cmd
+
+
+@pytest.mark.parametrize("path,content", [
+    (".cargo/config.toml", 'rustflags = ["-C", "link-arg=-fuse-ld=/tmp/e"]'),
+    (".cargo/config.toml", '[credential-alias]\nmine = "/tmp/e"'),
+    (".cargo/config.toml", 'credential-alias.foo = "/tmp/e"'),
+    ("/opt/cargohome/config.toml", '[build]\nrustc-wrapper = "/tmp/e"'),
+    ("/usr/local/cargo/config.toml", '[build]\nrustc-wrapper = "/tmp/e"'),
+])
+def test_qa1_file_bypasses_closed(path, content):
+    assert hit(wr(path, content))[0]
+
+
+@pytest.mark.parametrize("cmd", [
+    'RUSTC_WRAPPER="" cargo build', "export RUSTC_WRAPPER=''",
+    "RUSTFLAGS='-C target-cpu=native' cargo build",
+    "RUSTFLAGS='-Clink-arg=-fuse-ld=lld' cargo build",
+])
+def test_qa1_false_asks_exempt(cmd):
+    assert not hit(sh(cmd))[0], cmd
+
+
+@pytest.mark.parametrize("content", [
+    'rustc-wrapper = ""', 'credential-provider = "cargo:token"',
+    'rustflags = ["-Clink-arg=-fuse-ld=lld"]', 'runner = "qemu-aarch64"',
+])
+def test_qa1_false_asks_exempt_file(content):
+    assert not hit(wr(".cargo/config.toml", content))[0]
+
+
+def test_qa1_config_flag_redos():
+    import time
+    t = time.time()
+    evaluate(sh("echo hi --config" + " " * 40000), EMPTY)
+    assert time.time() - t < 2
