@@ -7945,7 +7945,18 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     rustflags` linker hooks, array-form `link-arg`, `--config` inline tables,
     custom-CARGO_HOME paths, lone `[credential-alias]` (all closed), and
     false-ASKs on empty values / built-in credential providers /
-    `-fuse-ld=lld` (exempted)."""
+    `-fuse-ld=lld` (exempted).
+
+    Round 2 found and this closes: a TOML triple-quote / empty-first-element
+    bypass of the empty-value exemption, the `--codegen` long form of `-C`,
+    a loose `-fuse-ld=lld` suffix match, list-valued credential providers
+    (every element is spawned, so all must be benign), the dead `--config`
+    benign exemption (shell-scan's de-quoted copy), `--config` false-ASKs on
+    non-cargo tools (now requires `cargo` in the command), and `cargo/config/`
+    module directories. Disclosed residual: `-C link-arg=<anything>` asks
+    (embedded `-Tlink.x` idiom is noisy; use `cargo_exec.allow`), PowerShell
+    `Set-Item Env:`/`SetEnvironmentVariable` setters, and a benign tool's
+    extra args."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

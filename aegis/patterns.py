@@ -5388,12 +5388,15 @@ def strip_comment_lines(text: str) -> str:
 # The same keys are also reachable with no file write at all: `cargo --config
 # 'build.rustc-wrapper="x"'`, or the `RUSTC_WRAPPER`/`CARGO_TARGET_<T>_RUNNER`/
 # ... environment variables exported into a shell or CI step.
+# end of the FILE name itself: unlike _CI_END, a trailing `/` (a directory
+# named `cargo/config/`, e.g. a Rust module) does not count.
+_CARGO_FILE_END = r"(?=[;&|)\s'\"]|$)"
 CARGO_CONFIG_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
     # custom CARGO_HOME: the variable itself, or the official rust image's
     # /usr/local/cargo (any dir literally named `cargo`/`cargohome`)
-    + r"|CARGO_HOME[^\s'\"]{0,40}" + _SEP + r"config(?:\.toml)?" + _CI_END
-    + r"|(?:^|[/\\])(?:cargo|cargo[-_]?home)" + _SEP + r"config(?:\.toml)?" + _CI_END,
+    + r"|CARGO_HOME[^\s'\"]{0,40}" + _SEP + r"config(?:\.toml)?" + _WIN_TRIM + _CARGO_FILE_END
+    + r"|(?:^|[/\\])(?:cargo|cargo[-_]?home)" + _SEP + r"config(?:\.toml)?" + _WIN_TRIM + _CARGO_FILE_END,
     re.IGNORECASE,
 )
 CARGO_CONFIG_CD_RE = re.compile(
@@ -5415,12 +5418,12 @@ _CARGO_TOML_KEY = (
 )
 _CARGO_TOML_ASSIGN_RE = re.compile(
     r"(?<![\w-])(?:" + _CARGO_TOML_KEY + r")[\"']?\s*=\s*"
-    r"(?:\[\s*)?(?:(?P<q>[\"'])(?P<val>[^\"'\n]{0,300})(?P=q))?",
+    r"(?:\[\s*)?(?:(?P<q>[\"'])(?P<val>[^\"'\n]{0,300})(?P=q)(?!(?P=q)))?",
     re.IGNORECASE,
 )
 # `-C linker=...` / `-Clinker=...` / `-C link-arg=-fuse-ld=...` in rustflags.
 _CARGO_RUSTFLAGS_LINK_RE = re.compile(
-    r"-C[\s\"',]*(?:linker|link-args?)\s*=(?!\s*-fuse-ld=(?:lld|mold|gold|bfd|lld-link)\b)"
+    r"(?:-C|--codegen)[\s\"',=]*(?:linker|link-args?)\s*=(?!\s*-fuse-ld=(?:lld|mold|gold|bfd|lld-link)(?=[\s\"',\]]|$))"
     r"|-Z[\s\"',]*pre-link-args?\s*=", re.IGNORECASE)
 _CARGO_CREDALIAS_HEADER_RE = re.compile(r"\[\s*credential-alias\s*\]", re.IGNORECASE)
 _CARGO_RUSTFLAGS_ENV_RE = re.compile(
@@ -5468,14 +5471,46 @@ _CARGO_BENIGN_VALUE_RE = re.compile(
     r"(?:\.exe)?$", re.IGNORECASE)
 
 
-def _cargo_value_benign(val) -> bool:
+def _cargo_value_benign(val, whole: bool = False) -> bool:
     """None (unparsed value) is NOT benign; an empty string (clearing the
     option) is; otherwise the first whitespace token must be a known bare tool
     name (its extra args are not inspected)."""
     if val is None:
         return False
     toks = val.split()
+    if whole and len(toks) > 1:
+        return False
     return not toks or bool(_CARGO_BENIGN_VALUE_RE.match(toks[0]))
+
+
+_CARGO_CRED_KEY_RE = re.compile(r"(?:global[-_])?credential[-_]", re.IGNORECASE)
+_CARGO_QSTR_RE = re.compile(r'"([^"\n]*)"|\'([^\'\n]*)\'')
+
+
+def _cargo_assign_benign(text: str, m) -> bool:
+    """Is the value of TOML assignment match `m` safely benign? Handles the
+    array form (every element of a credential-provider list is a separate
+    spawned provider; an empty first program element with more elements after
+    it is NOT benign) and rejects multi-line triple-quoted strings."""
+    eq = text.index("=", m.start())
+    seg = text[eq + 1:eq + 700].lstrip()
+    if seg.startswith('"""') or seg.startswith("\'\'\'"):
+        return False
+    cred = bool(_CARGO_CRED_KEY_RE.match(m.group(0)))
+    if seg.startswith("["):
+        end = seg.find("]")
+        if end < 0:
+            return False
+        elems = [a or b for a, b in _CARGO_QSTR_RE.findall(seg[1:end])]
+        stripped = re.sub(r'"[^"\n]*"|\'[^\'\n]*\'|[\s,]', "", seg[1:end])
+        if stripped:                      # non-string content (table, number)
+            return False
+        if not elems:
+            return True
+        if cred:
+            return all(e.strip() and _cargo_value_benign(e, whole=True) for e in elems)
+        return bool(elems[0].strip() or len(elems) == 1) and _cargo_value_benign(elems[0])
+    return _cargo_value_benign(m.group("val"), whole=cred)
 
 
 def cargo_exec_toml_hit(text: str) -> bool:
@@ -5492,9 +5527,40 @@ def cargo_exec_toml_hit(text: str) -> bool:
             break
         # An unparseable/non-string value (inline table, interpolation) fails
         # open to a hit; only a cleanly parsed benign bare name is exempt.
-        if not _cargo_value_benign(m.group("val")):
+        if not _cargo_assign_benign(text, m):
             return True
     return bool(_CARGO_CREDALIAS_HEADER_RE.search(text) or _CARGO_RUSTFLAGS_LINK_RE.search(text))
+
+
+_CARGO_CLI_KEY_RE = re.compile(
+    r"(?<![\w-])(?:" + _CARGO_TOML_KEY + r")[\"'\\]*\s*=\s*(?P<rest>.{0,320})", re.IGNORECASE | re.DOTALL)
+
+
+def _cargo_cli_config_hit(arg: str) -> bool:
+    """Lenient parse of a `--config` argument window (quotes may be escaped
+    or stripped by the shell-scan's de-quoted copy)."""
+    for i, m in enumerate(_CARGO_CLI_KEY_RE.finditer(arg)):
+        if i >= 50:
+            break
+        rest = m.group("rest")
+        if rest.lstrip().startswith(("\"\"\"", "\'\'\'")):
+            return True
+        vm = re.match(r"\s*(?:\[\s*)?[\\\"']*(?P<v>[^\s\"'\\\]},]*)(?P<after>.?)", rest)
+        v = vm.group("v") if vm else None
+        if v is None:
+            return True
+        if v == "":
+            # empty is benign only if nothing else follows it in the list
+            tail = rest[vm.end() - len(vm.group("after")):].lstrip("\\\"' ")
+            if tail[:1] == ",":
+                return True
+            continue
+        if _CARGO_CRED_KEY_RE.match(m.group(0)) and re.match(
+                r"\s*\[[^\]]*,", rest.replace("\\", "").replace('"', "").replace("'", "")):
+            return True               # list of providers: each one is spawned
+        if not _cargo_value_benign(v):
+            return True
+    return False
 
 
 def cargo_exec_shell_hit(text: str) -> bool:
@@ -5503,24 +5569,20 @@ def cargo_exec_shell_hit(text: str) -> bool:
     if not text:
         return False
     text = strip_comment_lines(text)
-    for m in re.finditer(r"--config\b", text):
-        # inline-table / non-dotted forms: reuse the TOML check on the argument
-        if cargo_exec_toml_hit(text[m.end():m.end() + 400].replace("\\\"", '"')):
-            return True
+    if re.search(r"\bcargo\b", text, re.IGNORECASE):
+        for m in re.finditer(r"--config\b", text):
+            if _cargo_cli_config_hit(text[m.end():m.end() + 400]):
+                return True
     if _CARGO_RUSTFLAGS_ENV_RE.search(text) and _CARGO_RUSTFLAGS_LINK_RE.search(text):
         return True
-    if _CARGO_CLI_CONFIG_RE.search(text):
-        for m in _CARGO_CLI_CONFIG_RE.finditer(text):
-            seg = text[m.end():m.end() + 320]
-            vm = re.match(r"\s*(?:\[\s*)?\\?[\"']?([^\"'\\\s]{0,300})", seg)
-            if not (vm and _cargo_value_benign(vm.group(1))):
-                return True
+    if re.search(r"(?<![\w$-])(?:" + _CARGO_ENV_NAME + r")=\s*[\"']?\s*\[", text):
+        return True                   # list-valued env (e.g. providers list)
     for rx in _CARGO_ENV_ASSIGN_RES:
         for i, m in enumerate(rx.finditer(text)):
             if i >= 1000:
                 break
             val = m.group("val") if m.group("val") is not None else m.group("bare")
-            if not _cargo_value_benign(val):
+            if not _cargo_value_benign(val) or (val or "").lstrip().startswith("["):
                 return True
     for m in _CARGO_ENV_SET_RE.finditer(text):
         if not _cargo_value_benign(m.group("val").strip("\"'")):

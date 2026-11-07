@@ -207,3 +207,45 @@ def test_qa1_config_flag_redos():
     t = time.time()
     evaluate(sh("echo hi --config" + " " * 40000), EMPTY)
     assert time.time() - t < 2
+
+
+# ---- QA round 2 regressions -------------------------------------------------
+@pytest.mark.parametrize("content", [
+    '[build]\nrustc-wrapper = """/tmp/e"""',
+    "[build]\nrustc-wrapper = '''/tmp/e'''",
+    'runner = ["", "/tmp/e"]',
+    'global-credential-providers = ["cargo:token", "/tmp/e"]',
+])
+def test_qa2_file_bypasses_closed(content):
+    assert hit(wr(".cargo/config.toml", content))[0], content
+
+
+@pytest.mark.parametrize("cmd", [
+    "export RUSTFLAGS='--codegen linker=/tmp/evil'",
+    "export RUSTFLAGS='--codegen=linker=/tmp/evil'",
+    "RUSTFLAGS='-C link-arg=-fuse-ld=lld/../../tmp/x' cargo build",
+    "cargo b --config 'registry.credential-provider=[\"cargo:token\",\"/tmp/e\"]'",
+    "CARGO_GLOBAL_CREDENTIAL_PROVIDERS='[\"cargo:token\",\"/tmp/e\"]' cargo b",
+    "cargo b --config 'target.x.runner=[\"\",\"/tmp/e\"]'",
+])
+def test_qa2_shell_bypasses_closed(cmd):
+    assert hit(sh(cmd))[0], cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cargo build --config 'build.rustc-wrapper=\"sccache\"'",
+    "cargo build --config 'target.x.linker=\"clang\"'",
+    "cargo b --config 'target.x.runner=\"\"'",
+    "cargo b --config 'registry.credential-provider=\"cargo:token\"'",
+    "cargo b --config build.rustc-wrapper=sccache",
+    "webpack --config webpack.config.js --env linker=static",
+    "helm install x --config x.yaml --set image.runner=foo",
+])
+def test_qa2_false_asks_gone(cmd):
+    assert not hit(sh(cmd))[0], cmd
+
+
+@pytest.mark.parametrize("path", ["src/cargo/config/mod.rs", "vendor/cargo/config/target.rs"])
+def test_qa2_cargo_config_module_dir_allowed(path):
+    assert not hit(wr(path, "let runner = 1;"))[0]
+    assert not hit(sh(f"echo 'let linker = 1;' > {path}"))[0]
