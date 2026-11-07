@@ -249,3 +249,25 @@ def test_qa2_false_asks_gone(cmd):
 def test_qa2_cargo_config_module_dir_allowed(path):
     assert not hit(wr(path, "let runner = 1;"))[0]
     assert not hit(sh(f"echo 'let linker = 1;' > {path}"))[0]
+
+
+# ---- QA round 3 regressions -------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "export CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=/e",
+    "export CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS='[\"/e\"]'",
+    "export RUSTC=/tmp/evil", "RUSTDOC=/tmp/evil true",
+    "export CARGO_BUILD_RUSTC=/e",
+    "RUSTFLAGS='-C link_arg=-fuse-ld=/e' true",
+])
+def test_qa3_shell_bypasses_closed(cmd):
+    assert hit(sh(cmd))[0], cmd
+
+
+@pytest.mark.parametrize("content", ['[build]\nrustc = "/tmp/evil"', '[build]\nrustdoc = "/tmp/evil"'])
+def test_qa3_file_bypasses_closed(content):
+    assert hit(wr(".cargo/config.toml", content))[0]
+
+
+def test_qa3_plain_rustc_benign():
+    assert not hit(sh("export RUSTC=rustc"))[0]
+    assert not hit(wr(".cargo/config.toml", '[build]\nrustc = "rustc"'))[0]

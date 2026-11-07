@@ -5411,6 +5411,7 @@ CARGO_CONFIG_BARE_FILENAME_RE = re.compile(
 # bare tool name can be exempted.
 _CARGO_TOML_KEY = (
     r"rustc[-_](?:workspace[-_])?wrapper"
+    r"|rustc|rustdoc"                 # build.rustc / build.rustdoc replace the compiler itself
     r"|runner"
     r"|linker"
     r"|(?:global[-_])?credential[-_]providers?"
@@ -5423,7 +5424,7 @@ _CARGO_TOML_ASSIGN_RE = re.compile(
 )
 # `-C linker=...` / `-Clinker=...` / `-C link-arg=-fuse-ld=...` in rustflags.
 _CARGO_RUSTFLAGS_LINK_RE = re.compile(
-    r"(?:-C|--codegen)[\s\"',=]*(?:linker|link-args?)\s*=(?!\s*-fuse-ld=(?:lld|mold|gold|bfd|lld-link)(?=[\s\"',\]]|$))"
+    r"(?:-C|--codegen)[\s\"',=]*(?:linker|link[-_]args?)\s*=(?!\s*-fuse-ld=(?:lld|mold|gold|bfd|lld-link)(?=[\s\"',\]]|$))"
     r"|-Z[\s\"',]*pre-link-args?\s*=", re.IGNORECASE)
 _CARGO_CREDALIAS_HEADER_RE = re.compile(r"\[\s*credential-alias\s*\]", re.IGNORECASE)
 _CARGO_RUSTFLAGS_ENV_RE = re.compile(
@@ -5446,10 +5447,11 @@ _CARGO_CLI_CONFIG_RE = re.compile(
 _CARGO_ENV_NAME = (
     r"RUSTC_(?:WORKSPACE_)?WRAPPER"
     r"|CARGO_BUILD_RUSTC_(?:WORKSPACE_)?WRAPPER"
+    r"|RUSTC|RUSTDOC|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTDOC"
     r"|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:RUNNER|LINKER)"
     r"|CARGO_REGISTRY_CREDENTIAL_PROVIDER"
     r"|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER"
-    r"|CARGO_GLOBAL_CREDENTIAL_PROVIDERS"
+    r"|CARGO_GLOBAL_CREDENTIAL_PROVIDERS|CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS"
 )
 _CARGO_ENV_VALUE = (r"(?:(?P<q>[\"'])(?P<val>[^\"'\n]{0,300})(?P=q)"
                     r"|(?P<bare>[^\s;&|\"')]{1,300}))")
@@ -5465,7 +5467,7 @@ _CARGO_ENV_SET_RE = re.compile(
 )
 # Known-benign BARE tool names (no path separator, so `./clang` is NOT exempt).
 _CARGO_BENIGN_VALUE_RE = re.compile(
-    r"^(?:sccache|ccache|cachepot|clang(?:\+\+)?|gcc|g\+\+|cc|c\+\+|lld|rust-lld|mold|ld|link|ld\.lld|wasm-ld"
+    r"^(?:rustc|rustdoc|sccache|ccache|cachepot|clang(?:\+\+)?|gcc|g\+\+|cc|c\+\+|lld|rust-lld|mold|ld|link|ld\.lld|wasm-ld"
     r"|qemu-[a-z0-9_-]+|cargo:(?:token|macos-keychain|libsecret|wincred)"
     r"|lld-link|wasmtime|wasm-bindgen-test-runner|[a-z0-9_]+(?:-[a-z0-9_]+)*-(?:gcc|clang|g\+\+))"
     r"(?:\.exe)?$", re.IGNORECASE)

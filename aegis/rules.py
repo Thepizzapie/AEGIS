@@ -7956,7 +7956,15 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     module directories. Disclosed residual: `-C link-arg=<anything>` asks
     (embedded `-Tlink.x` idiom is noisy; use `cargo_exec.allow`), PowerShell
     `Set-Item Env:`/`SetEnvironmentVariable` setters, and a benign tool's
-    extra args."""
+    extra args.
+
+    Round 3 closed `build.rustc`/`build.rustdoc` (+ `RUSTC`/`RUSTDOC`/
+    `CARGO_BUILD_RUSTC*` env: they replace the compiler itself), the
+    `CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS` env name, and the
+    underscore `link_arg` spelling. Disclosed residual: `[doc] browser`
+    (only runs on `cargo doc --open`), hyphenated registry names in env var
+    names, and a benign-shaped name (`evil-gcc`) that would need to already
+    sit on PATH (see the PATH-hijack guard)."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
