@@ -5367,6 +5367,145 @@ def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
 
 
+# ---- Cargo config exec-hijack protection --------------------------------------
+# Cargo's own config (`.cargo/config.toml`, project-level at any ancestor
+# directory, or user-level under `$CARGO_HOME`) has several keys that each name
+# an arbitrary program Cargo itself spawns, unattended, on routine commands:
+#   - `build.rustc-wrapper` / `build.rustc-workspace-wrapper`: every `rustc`
+#     invocation is run as `<wrapper> rustc ...` -- every `cargo build`/`check`/
+#     `test`/`clippy`, and rust-analyzer's background `cargo check` in any IDE.
+#   - `target.<triple|cfg>.runner`: run in front of every `cargo run`/`test`/
+#     `bench` binary.
+#   - `target.<triple|cfg>.linker` (and `-C linker=` in `rustflags`): run as
+#     the final link step of every build.
+#   - `registry.credential-provider` / `registries.<n>.credential-provider` /
+#     `credential-alias` / `global-credential-providers`: executed with the
+#     registry token on stdin/stdout for every authenticated registry call
+#     (`cargo publish`/`login`/private-registry fetch) -- the Cargo analog of
+#     `credential.helper`/Docker's `credsStore`.
+# `rule_package_manifest_protect` only gates this file's REGISTRY-redirect keys
+# (`replace-with`, index URLs); none of the keys above are covered by it.
+# The same keys are also reachable with no file write at all: `cargo --config
+# 'build.rustc-wrapper="x"'`, or the `RUSTC_WRAPPER`/`CARGO_TARGET_<T>_RUNNER`/
+# ... environment variables exported into a shell or CI step.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_CONFIG_CD_RE = re.compile(
+    r"\b(?:cd|pushd|set-location|sl)\s+[^|;&\n]{0,200}?\.cargo" + _WIN_TRIM + r"(?=[/\\;&|)]|\s|['\"]|$)",
+    re.IGNORECASE,
+)
+CARGO_CONFIG_BARE_FILENAME_RE = re.compile(
+    r"(?:^|[\s'\"=])config(?:\.toml)?" + _CI_END, re.IGNORECASE)
+
+# `key = <value>` inside a TOML file (or an inline `--config 'key=value'`).
+# The value (first array element or the string) is captured so a known-benign
+# bare tool name can be exempted.
+_CARGO_TOML_KEY = (
+    r"rustc[-_](?:workspace[-_])?wrapper"
+    r"|runner"
+    r"|linker"
+    r"|(?:global[-_])?credential[-_]providers?"
+    r"|credential[-_]alias"
+)
+_CARGO_TOML_ASSIGN_RE = re.compile(
+    r"(?<![\w-])(?:" + _CARGO_TOML_KEY + r")[\"']?\s*=\s*"
+    r"(?:\[\s*)?(?:(?P<q>[\"'])(?P<val>[^\"'\n]{0,300})(?P=q))?",
+    re.IGNORECASE,
+)
+# `-C linker=...` / `-Clinker=...` / `-C link-arg=-fuse-ld=...` in rustflags.
+_CARGO_RUSTFLAGS_LINK_RE = re.compile(
+    r"-C\s*(?:linker|link-arg|link-args)\s*=|-Z\s*pre-link-args?\s*=", re.IGNORECASE)
+# `--config` CLI form: dotted key path required (cuts generic `--config` noise).
+_CARGO_CLI_CONFIG_RE = re.compile(
+    r"--config\b[\s=]*[\"']?\s*(?:"
+    r"build\.rustc[-_](?:workspace[-_])?wrapper"
+    r"|target\.[^\s=\"']{1,120}\.(?:runner|linker)"
+    r"|registr(?:y|ies(?:\.[^\s=\"'.]{1,80})?)\.credential[-_]providers?"
+    r"|credential[-_]alias\.[^\s=\"']{1,80}"
+    r"|(?:global[-_])?credential[-_]providers?"
+    r")\s*=",
+    re.IGNORECASE,
+)
+# Environment-variable forms (shell export / inline prefix / PowerShell / fish /
+# setx). Value must be adjacent for `=` forms so `X= cargo build` (clearing) and
+# `unset X` / `echo $X` do not hit.
+_CARGO_ENV_NAME = (
+    r"RUSTC_(?:WORKSPACE_)?WRAPPER"
+    r"|CARGO_BUILD_RUSTC_(?:WORKSPACE_)?WRAPPER"
+    r"|CARGO_TARGET_[A-Z0-9_]{1,80}_(?:RUNNER|LINKER)"
+    r"|CARGO_REGISTRY_CREDENTIAL_PROVIDER"
+    r"|CARGO_REGISTRIES_[A-Z0-9_]{1,80}_CREDENTIAL_PROVIDER"
+    r"|CARGO_GLOBAL_CREDENTIAL_PROVIDERS"
+)
+_CARGO_ENV_VALUE = (r"(?:(?P<q>[\"'])(?P<val>[^\"'\n]{0,300})(?P=q)"
+                    r"|(?P<bare>[^\s;&|\"')]{1,300}))")
+_CARGO_ENV_ASSIGN_RES = (
+    re.compile(r"\$env:(?:" + _CARGO_ENV_NAME + r")\s*=\s*" + _CARGO_ENV_VALUE, re.IGNORECASE),
+    re.compile(r"(?<![\w$-])(?:" + _CARGO_ENV_NAME + r")=" + _CARGO_ENV_VALUE, re.IGNORECASE),
+)
+# fish `set -x NAME value` / cmd `setx NAME value` (space-separated value).
+_CARGO_ENV_SET_RE = re.compile(
+    r"\bset(?:x)?\s+(?:-\w+\s+)*(?:" + _CARGO_ENV_NAME + r")\s+"
+    r"(?P<val>[\"']?[^\s;&|\"'=-][^\s;&|\"']{0,300})",
+    re.IGNORECASE,
+)
+# Known-benign BARE tool names (no path separator, so `./clang` is NOT exempt).
+_CARGO_BENIGN_VALUE_RE = re.compile(
+    r"^(?:sccache|ccache|cachepot|clang(?:\+\+)?|gcc|g\+\+|cc|c\+\+|lld|rust-lld|mold|ld|link"
+    r"|lld-link|wasmtime|wasm-bindgen-test-runner|[a-z0-9_]+(?:-[a-z0-9_]+)*-(?:gcc|clang|g\+\+))"
+    r"(?:\.exe)?$", re.IGNORECASE)
+
+
+def _cargo_value_benign(val) -> bool:
+    return bool(val) and bool(_CARGO_BENIGN_VALUE_RE.match(val.strip()))
+
+
+def cargo_exec_toml_hit(text: str) -> bool:
+    """True if TOML-ish `text` assigns an exec-capable Cargo key to something
+    other than a known-benign bare tool name (see module comment above)."""
+    if not text:
+        return False
+    text = strip_comment_lines(text)
+    # `printf 'a\nrunner="x"'` / `echo -e`: the shell turns a LITERAL backslash-n
+    # into a line break, so the key is not really glued to the preceding word.
+    text = text.replace("\\n", "\n").replace("\\t", "\t")
+    for i, m in enumerate(_CARGO_TOML_ASSIGN_RE.finditer(text)):
+        if i >= 1000:
+            break
+        # An unparseable/non-string value (inline table, interpolation) fails
+        # open to a hit; only a cleanly parsed benign bare name is exempt.
+        if not _cargo_value_benign(m.group("val")):
+            return True
+    return bool(_CARGO_RUSTFLAGS_LINK_RE.search(text))
+
+
+def cargo_exec_shell_hit(text: str) -> bool:
+    """True if a shell command sets an exec-capable Cargo option through the
+    `--config` CLI form or an environment variable, to a non-benign value."""
+    if not text:
+        return False
+    text = strip_comment_lines(text)
+    if _CARGO_CLI_CONFIG_RE.search(text):
+        for m in _CARGO_CLI_CONFIG_RE.finditer(text):
+            seg = text[m.end():m.end() + 320]
+            vm = re.match(r"\s*(?:\[\s*)?\\?[\"']?([^\"'\\\s]{0,300})", seg)
+            if not (vm and _cargo_value_benign(vm.group(1))):
+                return True
+    for rx in _CARGO_ENV_ASSIGN_RES:
+        for i, m in enumerate(rx.finditer(text)):
+            if i >= 1000:
+                break
+            val = m.group("val") if m.group("val") is not None else m.group("bare")
+            if not _cargo_value_benign(val):
+                return True
+    for m in _CARGO_ENV_SET_RE.finditer(text):
+        if not _cargo_value_benign(m.group("val").strip("\"'")):
+            return True
+    return False
+
+
 # ---- MCP tool-catalog integrity: rug-pull / tool-poisoning heuristics --------
 #
 # Every guard above scans a shell command or a config file's own syntax for a
