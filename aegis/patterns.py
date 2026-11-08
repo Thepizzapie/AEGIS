@@ -5375,7 +5375,7 @@ TF_EXEC_HIT_RE = re.compile(
 # config that is routinely committed, so a planted wrapper rides in on a
 # clone or a PR and fires on the next build with no hook or CI file involved.
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    r"(?:^|[\s'\"/\\=<>(;|:,&])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
     + r"|(?:\$\{?CARGO_HOME\}?|%CARGO_HOME%)" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
@@ -5386,20 +5386,30 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # match. Compiler-flag forms are matched anywhere in the text.
 CARGO_EXEC_HIT_RE = re.compile(
     r"(?:^|[\s.\[{,/]|\\[nrt])[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker|"
-    r"credential-provider|credential-alias)[\"']?\s*="
+    r"(?:global-)?credential-providers?|credential-alias|codegen-backend|browser)[\"']?\s*="
     r"|\[\s*credential-alias\s*\]"
     r"|-C[\s\"',]*linker\s*="
+    r"|-C[\s\"',]*link-args?\b[^\n]{0,80}-fuse-ld"
+    r"|--codegen[\s\"',=]*linker\s*="
     r"|-Z[\s\"',]*(?:codegen-backend|llvm-plugins|pre-link-args?)\b",
     re.IGNORECASE | re.MULTILINE,
 )
 # Known, disclosed gaps (same shape every sibling content guard accepts): a
+# shell write that carries no key text (`cp /tmp/x.toml .cargo/config.toml`,
+# `mv`/`ln`/`rsync`/`tar`/`git checkout -- <path>`), path indirection
+# (`cd .cargo && ... > config.toml`, globs, variables, a custom absolute
+# CARGO_HOME), keys split or built at run time, TOML `\\uXXXX`-escaped key
+# names, GitHub MCP tools that nest the path in a `files` array, and
+# value-only edits when the file can't be read from disk; also a
 # config assembled indirectly (generator script, `cargo --config` read from a
 # file via `include = [..]` pointing at an UNGATED path), `[env]` entries that
 # plant `LD_PRELOAD`/`PATH` for build scripts, `[alias]` tricks that resolve
 # to an attacker-named `cargo-<sub>` binary on PATH, and `build.rs`/proc-macro
 # source (arbitrary code by design, far too common to gate) are not covered.
 # The shell branch is NOT clause-scoped, like its siblings: an unrelated
-# `&&`-joined clause can produce a same-command false ASK, never a false ALLOW.
+# `&&`-joined clause (or a read-only `grep runner .cargo/config.toml`) can
+# produce a same-command false ASK. Key names match in any table (e.g.
+# `[alias] runner = ..`), another deliberate false-ASK trade-off.
 
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-

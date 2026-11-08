@@ -7952,8 +7952,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     (`package_manifest`); none of the exec keys were.
 
     Config (`policy.cargo_exec`): `mode` (deny|ask|monitor|off, default
-    ask), `allow` (regexes on the path/command that skip the gate -- e.g. a
-    reviewed `rustc-wrapper = "sccache"` repo). Default `ask`: wrappers like
+    ask), `allow` (regexes that skip the gate, matched against the file PATH
+    for Edit/Write/MCP and the whole command for the shell form -- content is
+    never matched, so exempt a reviewed repo by path, e.g. `/work/trusted/`). Default `ask`: wrappers like
     sccache/mold/cross runners are legitimate, but a human must have looked.
 
     Escapable only by a human: trailing '# aegis-allow' on the shell form, or
