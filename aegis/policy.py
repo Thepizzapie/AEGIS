@@ -411,6 +411,12 @@ class Policy:
     # Terraform process is already authenticated with. See
     # rules.rule_terraform_exec_protect.
     terraform_exec: dict = field(default_factory=dict)
+    # Cargo config exec-key guard: {mode: deny|ask|monitor|off, allow: [regex
+    # on path/command]}. Empty -> defaults (mode=ask) apply. Covers
+    # rustc-wrapper/runner/linker/credential-provider (and -C linker=/-Z
+    # codegen-backend flags) set in .cargo/config(.toml). See
+    # rules.rule_cargo_exec_protect.
+    cargo_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing

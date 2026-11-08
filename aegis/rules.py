@@ -7087,6 +7087,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
 )
 
 
@@ -7895,6 +7896,110 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an exec-capable key in a Cargo config
+    (`.cargo/config.toml`, `.cargo/config`, `$CARGO_HOME/config.toml`).
+
+    PLAN / THREAT MODEL: cargo reads this file on every `cargo
+    build/check/test/run` (and rust-analyzer reads it on project open), and
+    several documented keys name a PROGRAM cargo then runs with the user's
+    full environment and no prompt: `build.rustc-wrapper` /
+    `build.rustc-workspace-wrapper` (in front of every rustc call, so even a
+    plain `cargo check`), `target.<triple>.runner` (every `cargo run/test/
+    bench`), `target.<triple>.linker` (final link of any build),
+    `*.credential-provider` / `[credential-alias]` (an external program handed
+    the live registry token), and the compiler-flag spellings `-C linker=`,
+    `-Z codegen-backend=` (dlopens a shared library) and `-Z pre-link-arg`.
+    The file is a small dotfile-dir config that is routinely committed, so a
+    wrapper planted by a prompt-injected agent (or arriving via a PR) fires on
+    the next build, by this session, a teammate, an IDE, or CI. Only the
+    registry-REDIRECT half of this file was gated before
+    (`package_manifest`); none of the exec keys were.
+
+    Config (`policy.cargo_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate -- e.g. a
+    reviewed `rustc-wrapper = "sccache"` repo). Default `ask`: wrappers like
+    sccache/mold/cross runners are legitimate, but a human must have looked.
+
+    Escapable only by a human: trailing '# aegis-allow' on the shell form, or
+    `AEGIS_ALLOW_CARGO_EXEC=1` set by the orchestrator before launch. A
+    spawned agent controls neither, the invariant every sibling holds.
+
+    Honest scope: see the disclosed-gaps comment on `CARGO_EXEC_HIT_RE`
+    (indirectly assembled config, `[env]`/`[alias]` tricks, `build.rs`).
+    Full-line `#` comments are stripped before matching so a TOML comment that
+    merely mentions a key doesn't trigger it."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not (p and patterns.CARGO_CONFIG_PATH_RE.search(p)):
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        if not content:
+            return None
+        if not patterns.CARGO_EXEC_HIT_RE.search(patterns.strip_comment_lines(content)):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' is setting a Cargo exec key (rustc-wrapper/"
+                         "runner/linker/credential-provider, or a -C linker=/"
+                         "-Z codegen-backend flag) — cargo runs that program "
+                         "automatically, with your environment, on the next "
+                         "build/test/run (or when an IDE opens the project). "
+                         "Review it, then confirm with AEGIS_ALLOW_CARGO_EXEC=1; "
+                         "a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        if not (patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd)
+                and patterns.CARGO_EXEC_HIT_RE.search(scan_cmd)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-exec-protect",
+                         "A Cargo config file is being given an exec key "
+                         "(rustc-wrapper/runner/linker/credential-provider, or "
+                         "a -C linker=/-Z codegen-backend flag) from a shell — "
+                         "cargo runs that program automatically, with your "
+                         "environment, on the next build/test/run. A human may "
+                         "append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -8520,6 +8625,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,

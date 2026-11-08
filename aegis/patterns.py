@@ -5350,6 +5350,57 @@ TF_EXEC_HIT_RE = re.compile(
 # "local-exec"-shaped substring in another produces a same-command false
 # ASK, not a false ALLOW.
 
+# ---- Cargo config exec hijack ------------------------------------------------
+#
+# `.cargo/config.toml` (project-level, any ancestor directory, or
+# `$CARGO_HOME/config.toml`) is read by every `cargo build/check/test/run`
+# AND by rust-analyzer in an IDE. Several documented keys name a PROGRAM that
+# cargo then executes, with the invoking user's full environment, with no
+# further prompt:
+#   * `build.rustc-wrapper` / `build.rustc-workspace-wrapper` -- the wrapper
+#     is run in front of EVERY rustc invocation (so on a plain `cargo check`);
+#   * `target.<triple>.runner` / `target.'cfg(..)'.runner` -- run on every
+#     `cargo run`/`cargo test`/`cargo bench`;
+#   * `target.<triple>.linker` -- run as the final link step of any build;
+#   * `registry.credential-provider` / `registries.<n>.credential-provider` /
+#     `credential-alias` -- an external program handed the live registry
+#     token on `cargo publish`/auth (sibling of the docker/cloud credential
+#     helper guards);
+#   * `rustflags` / `RUSTFLAGS`-style `-C linker=`, `-Z codegen-backend=`,
+#     `-Z pre-link-arg` -- the same thing spelled as a compiler flag
+#     (`-Z codegen-backend=<path>` dlopens an arbitrary shared library).
+# The registry-redirect half of this file is already gated by
+# `REGISTRY_CONFIG_PATH_RE`/`REGISTRY_HIJACK_*`; none of the exec keys above
+# were covered. `.cargo/config.toml` is a small, rarely-reviewed dotfile-dir
+# config that is routinely committed, so a planted wrapper rides in on a
+# clone or a PR and fires on the next build with no hook or CI file involved.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|(?:\$\{?CARGO_HOME\}?|%CARGO_HOME%)" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Content check, run on comment-stripped text. Key names are matched as a
+# TOML bare or quoted key followed by `=` (also catches dotted forms such as
+# `build.rustc-wrapper = ".."` and `[target.x] runner = ".."`). `linker` is
+# followed by `\s*=` directly so `linker-flavor`/`linker-plugin-lto` don't
+# match. Compiler-flag forms are matched anywhere in the text.
+CARGO_EXEC_HIT_RE = re.compile(
+    r"(?:^|[\s.\[{,/]|\\[nrt])[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|runner|linker|"
+    r"credential-provider|credential-alias)[\"']?\s*="
+    r"|\[\s*credential-alias\s*\]"
+    r"|-C[\s\"',]*linker\s*="
+    r"|-Z[\s\"',]*(?:codegen-backend|pre-link-args?)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Known, disclosed gaps (same shape every sibling content guard accepts): a
+# config assembled indirectly (generator script, `cargo --config` read from a
+# file via `include = [..]` pointing at an UNGATED path), `[env]` entries that
+# plant `LD_PRELOAD`/`PATH` for build scripts, `[alias]` tricks that resolve
+# to an attacker-named `cargo-<sub>` binary on PATH, and `build.rs`/proc-macro
+# source (arbitrary code by design, far too common to gate) are not covered.
+# The shell branch is NOT clause-scoped, like its siblings: an unrelated
+# `&&`-joined clause can produce a same-command false ASK, never a false ALLOW.
+
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-
 # hunting round) found the comment-blind AWS_CRED_PROCESS_INI_RE/
