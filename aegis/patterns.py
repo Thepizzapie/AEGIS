@@ -5385,11 +5385,11 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # followed by `\s*=` directly so `linker-flavor`/`linker-plugin-lto` don't
 # match. Compiler-flag forms are matched anywhere in the text.
 CARGO_EXEC_HIT_RE = re.compile(
-    r"(?:^|[\s.\[{,/]|\\[nrt])[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|runner|linker|"
+    r"(?:^|[\s.\[{,/]|\\[nrt])[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker|"
     r"credential-provider|credential-alias)[\"']?\s*="
     r"|\[\s*credential-alias\s*\]"
     r"|-C[\s\"',]*linker\s*="
-    r"|-Z[\s\"',]*(?:codegen-backend|pre-link-args?)\b",
+    r"|-Z[\s\"',]*(?:codegen-backend|llvm-plugins|pre-link-args?)\b",
     re.IGNORECASE | re.MULTILINE,
 )
 # Known, disclosed gaps (same shape every sibling content guard accepts): a

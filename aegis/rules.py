@@ -7896,8 +7896,33 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cargo_edit_changes_exec_line(path: str, a: dict) -> bool:
+    """Edit-tool fragment check: apply the edit to the file on disk and report
+    whether the result carries an exec-key line that the file did not already
+    have. Catches a value-only swap (`"sccache"` -> `"/tmp/evil"`) whose
+    new_string never names the key. Any I/O problem -> False (the fragment
+    check still runs)."""
+    old, new = a.get("old_string"), a.get("new_string")
+    if not (isinstance(old, str) and isinstance(new, str) and old):
+        return False
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as fh:
+            before = fh.read(2_000_000)
+    except OSError:
+        return False
+    after = before.replace(old, new) if a.get("replace_all") else before.replace(old, new, 1)
+
+    def _hits(t):
+        return {ln.strip() for ln in patterns.strip_comment_lines(t).splitlines()
+                if patterns.CARGO_EXEC_HIT_RE.search(ln)}
+    return bool(_hits(after) - _hits(before))
+
+
 def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
-    for pat in (cfg.get("allow") or []):
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):
+        allow = [allow]
+    for pat in allow:
         try:
             if re.search(str(pat), text, re.IGNORECASE):
                 return True
@@ -7935,6 +7960,13 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     `AEGIS_ALLOW_CARGO_EXEC=1` set by the orchestrator before launch. A
     spawned agent controls neither, the invariant every sibling holds.
 
+    Edit tool: only the fragment is visible, so a value-only swap
+    (`"sccache"` -> `"/tmp/evil"`) is caught by applying the edit to the file
+    on disk and comparing exec-key lines before/after; if the file can't be
+    read (new/remote file) only the fragment is checked. Pure deletions are
+    not gated. Whole-file Write/MultiEdit re-asks on every rewrite that
+    contains an exec key (no diff available); use `allow:` for reviewed repos.
+
     Honest scope: see the disclosed-gaps comment on `CARGO_EXEC_HIT_RE`
     (indirectly assembled config, `[env]`/`[alias]` tricks, `build.rs`).
     Full-line `#` comments are stripped before matching so a TOML comment that
@@ -7962,11 +7994,15 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             raw_content = a.get("new_string")
         if isinstance(raw_content, str) and raw_content:
             content = raw_content
+        elif "old_string" in a and "new_string" in a:
+            content = ""        # pure deletion edit: nothing is being planted
         else:
             content = " ".join(_flatten_strings(a))
-        if not content:
-            return None
-        if not patterns.CARGO_EXEC_HIT_RE.search(patterns.strip_comment_lines(content)):
+        hit = bool(content) and bool(
+            patterns.CARGO_EXEC_HIT_RE.search(patterns.strip_comment_lines(content)))
+        if not hit and ev.action == ActionClass.EDIT:
+            hit = _cargo_edit_changes_exec_line(p, a)
+        if not hit:
             return None
         if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, p)):

