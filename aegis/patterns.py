@@ -5273,6 +5273,49 @@ def docker_cred_helper_strong_hit(text: str) -> bool:
                 return True
     return False
 
+# ---- Cargo config exec-hijack protection --------------------------------------
+# `.cargo/config.toml` (any ancestor directory of the project, plus
+# `$CARGO_HOME/config.toml`) is merged by Cargo on EVERY invocation, and
+# several of its keys name an external program Cargo -- or the Rust tooling
+# built on it -- spawns itself: `build.rustc-wrapper` /
+# `build.rustc-workspace-wrapper` (the wrapper is exec'd in front of EVERY
+# rustc call, i.e. every `cargo build/check/test/clippy`, and rust-analyzer /
+# IDE "cargo check on save" runs it with no human typing anything),
+# `target.<triple>.linker` (run on every link step), `target.<triple>.runner`
+# (run on every `cargo run`/`cargo test`), and `registry.credential-provider` /
+# `registries.<name>.credential-provider` / `registry.global-credential-
+# providers` (an arbitrary command handed the registry token on every
+# `cargo publish`/authenticated fetch). The registry-REDIRECT half of this
+# file is already covered by REGISTRY_HIJACK_RE; this covers the EXEC half it
+# does not look at. Legitimate uses exist (sccache, mold/lld, qemu runners,
+# `cargo:token-from-stdout`), so the guard asks rather than denies.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# A TOML key (bare, dotted-suffix, quoted, or inline-table member) assigned a
+# non-empty string / non-empty array value. The `["'\[]` + one real char
+# requirement keeps `rustc-wrapper = ""` / `runner = []` (explicit clears)
+# from firing. No unbounded or nested quantifiers.
+_CARGO_VAL = r"""\s*=\s*(?:["'][^"'\s]|\[\s*["'])"""
+# `\\[nt]` = a literal backslash-n/t escape as written by printf/sed/echo -e.
+_CARGO_KEY_PRE = r"""(?:^|[\s.{,]|\\[nt])["']?"""
+# Distinctive enough to be path-independent (a staged copy under another
+# name, then moved into place): nothing else uses these key names.
+CARGO_EXEC_STRONG_RE = re.compile(
+    _CARGO_KEY_PRE + r"(?:rustc-workspace-wrapper|rustc-wrapper|"
+    r"global-credential-providers|credential-provider)[\"']?" + _CARGO_VAL,
+    re.IGNORECASE | re.MULTILINE,
+)
+# Generic names (`runner`, `linker`, `rustc`) -- only meaningful once the
+# path is confirmed as a cargo config.
+CARGO_EXEC_CONTENT_RE = re.compile(
+    _CARGO_KEY_PRE + r"(?:runner|linker|rustc|rustdoc|rustc-wrapper|"
+    r"rustc-workspace-wrapper|credential-provider|global-credential-providers)"
+    r"[\"']?" + _CARGO_VAL,
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # ---- Terraform provisioner / external-data-source exec-hijack protection ------
 # Terraform's `provisioner "local-exec"`/`"remote-exec"` blocks and the
 # `external` provider's `data "external"` data source all name an arbitrary
