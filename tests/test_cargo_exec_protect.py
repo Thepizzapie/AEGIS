@@ -52,6 +52,13 @@ def _blocked(d):
     '[registry]\ncredential-provider = "cargo:token-from-stdout /tmp/x"\n',
     '[registry]\nglobal-credential-providers = ["/tmp/x"]\n',
     '[build]\nrustc = "/tmp/fake-rustc"\n',
+    '[build]\nrustc-wrapper = """/tmp/w.sh"""\n',
+    "[target.x]\nrunner = '''evil'''\n",
+    '[build]\nrustflags = ["-C","linker=/tmp/w.sh"]\n',
+    '[target.x]\nrustflags = ["-Clink-args=-fuse-ld=/tmp/e"]\n',
+    '[doc]\nbrowser = "/tmp/w.sh"\n',
+    '[target.x]\nrunner = [ # c\n "evil"]\n',
+    '[target.x]\nrunner = [ # x\r\n"e"]\n',
 ])
 def test_write_to_config_toml_is_gated(content):
     d = _ev(_w(".cargo/config.toml", content))
@@ -97,6 +104,9 @@ def test_staged_under_other_name_strong_only():
     "cat > .cargo/config.toml <<'EOF'\n[target.x]\nrunner = \"evil\"\nEOF",
     "sed -i 's/^\\[build\\]/[build]\\nrustc-wrapper = \"evil\"/' .cargo/config.toml",
     "echo 'rustc-wrapper = \"evil\"' | tee -a .cargo/config",
+    "echo \"[build]\\nrustc-wrapper = \\\"e\\\"\" >> .cargo/config.toml",
+    "printf '[build]\\x0arustc-wrapper = \"e\"' > .cargo/config.toml",
+    "printf '[build]\\012rustc-wrapper = \"e\"' > .cargo/config.toml",
     "sed -i 's/^#rustc-wrapper.*/rustc-wrapper = \"x\"/' .cargo/config.toml",
     "sed -i 's|^runner.*|runner = \"/tmp/x\"|' .cargo/config.toml",
     "sed -i 's/foo/linker=\"x\"/' .cargo/config.toml",
@@ -126,6 +136,9 @@ def test_env_toggle(monkeypatch):
     '# rustc-wrapper = "sccache"\n[build]\njobs = 2\n',
     '[net]\ngit-fetch-with-cli = true\n',
     '[registry]\ndefault = "crates-io"\n',
+    '[build]\nrustc-wrapper = """"""\n',
+    "[build]\\nrustflags = ['-C', 'opt-level=3']\\n",
+    '[doc]\\nbrowser = ""\\n',
 ])
 def test_benign_config_not_gated(content):
     assert not _blocked(_ev(_w(".cargo/config.toml", content)))

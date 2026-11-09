@@ -7744,7 +7744,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     Honest scope: `rustc-wrapper`/`credential-provider` assignments are
     treated as path-independent (distinctive names, catches content staged
-    under another filename); `runner`/`linker`/`rustc`/`rustdoc` need the
+    under another filename); `runner`/`linker`/`rustc`/`rustdoc`/`browser`
+    and `rustflags` carrying a linker need the
     path confirmed since those words are common. NOT covered: the
     `RUSTC_WRAPPER`/`CARGO_TARGET_<T>_RUNNER`/`CARGO_TARGET_<T>_LINKER`
     environment variables and `RUSTFLAGS=-C linker=...` (env-var channel,
@@ -7754,7 +7755,13 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     matches, which is harmless), `CARGO_HOME` relocation, `build.rs` and
     proc-macro code (ordinary source, indistinguishable from legit work),
     and values assembled indirectly (shell variable concatenation, `toml`
-    edit tooling)."""
+    edit tooling). Also NOT covered, same limits siblings disclose: an Edit
+    whose `new_string` is only a value (the key sits in unchanged text), a
+    stage-then-`cp`/`mv`/`ln` of generic `runner`/`linker` content, `cd
+    .cargo` followed by a bare `config.toml` write, and `AEGIS_ALLOW_*=0`
+    counting as set. Known false positives (ask-level cost): the strong
+    keys in prose/read-only `grep` commands, and `[alias]`/`[env]` tables
+    reusing the word `runner`."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -7771,7 +7778,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     def _hit(text: str, path_confirmed: bool) -> bool:
         scan = patterns.strip_comment_lines(text)
         return bool(patterns.CARGO_EXEC_STRONG_RE.search(scan)
-                    or (path_confirmed and patterns.CARGO_EXEC_CONTENT_RE.search(scan)))
+                    or (path_confirmed and (patterns.CARGO_EXEC_CONTENT_RE.search(scan)
+                                            or patterns.CARGO_RUSTFLAGS_EXEC_RE.search(scan))))
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)

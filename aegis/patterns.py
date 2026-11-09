@@ -5297,13 +5297,11 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # non-empty string / non-empty array value. The `["'\[]` + one real char
 # requirement keeps `rustc-wrapper = ""` / `runner = []` (explicit clears)
 # from firing. No unbounded or nested quantifiers.
-_CARGO_VAL = r"""\s*=\s*(?:["'][^"'\s]|\[\s*["'])"""
-# `\\[nt]` = a literal backslash-n/t escape as written by printf/sed/echo -e.
-# Also `/ | ; : (` and quotes: the key right after a sed `s/x/KEY=..` or
-# `s|x|KEY=..` replacement delimiter, or a `;`-joined statement.
-_CARGO_KEY_PRE = r"""(?:^|[\s.{,/|;:('"]|\\[nt])["']?"""
-# Distinctive enough to be path-independent (a staged copy under another
-# name, then moved into place): nothing else uses these key names.
+_CARGO_VAL = (r"""\s*=\s*\\*(?:(?:\"\"\"|\'\'\')\s*[^"'\s]"""
+              r"""|["'][^"'\s]|\[(?:\s|#[^\n]*)*\\*["'])""")
+# `\\*` tolerates shell-escaped quotes (`echo "k = \\"v\\""`); triple-quoted
+# TOML strings and a `# comment` after `[` are valid Cargo and were bypasses.
+_CARGO_KEY_PRE = r"""(?:^|[\s.{,/|;:(\'"]|\\(?:[nrt]|x0a|0?12))["']?"""
 CARGO_EXEC_STRONG_RE = re.compile(
     _CARGO_KEY_PRE + r"(?:rustc-workspace-wrapper|rustc-wrapper|"
     r"global-credential-providers|credential-provider)[\"']?" + _CARGO_VAL,
@@ -5311,8 +5309,16 @@ CARGO_EXEC_STRONG_RE = re.compile(
 )
 # Generic names (`runner`, `linker`, `rustc`) -- only meaningful once the
 # path is confirmed as a cargo config.
+# rustflags/rustdocflags can smuggle a linker or codegen plugin (`-C linker=`,
+# `-Clink-args=-fuse-ld=`, `-Zcodegen-backend`) -- the same exec primitive as
+# `target.*.linker`. Path-confirmed only; one bounded lazy gap.
+CARGO_RUSTFLAGS_EXEC_RE = re.compile(
+    r"rust(?:doc)?flags[\"']?\s*=[^\n]{0,300}?"
+    r"(?:linker\s*=|link-args?\b|Zpre-link|Zcodegen-backend|Zllvm-plugins)",
+    re.IGNORECASE,
+)
 CARGO_EXEC_CONTENT_RE = re.compile(
-    _CARGO_KEY_PRE + r"(?:runner|linker|rustc|rustdoc|rustc-wrapper|"
+    _CARGO_KEY_PRE + r"(?:runner|linker|rustc|rustdoc|browser|rustc-wrapper|"
     r"rustc-workspace-wrapper|credential-provider|global-credential-providers)"
     r"[\"']?" + _CARGO_VAL,
     re.IGNORECASE | re.MULTILINE,
