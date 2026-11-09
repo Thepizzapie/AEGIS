@@ -97,6 +97,10 @@ def test_staged_under_other_name_strong_only():
     "cat > .cargo/config.toml <<'EOF'\n[target.x]\nrunner = \"evil\"\nEOF",
     "sed -i 's/^\\[build\\]/[build]\\nrustc-wrapper = \"evil\"/' .cargo/config.toml",
     "echo 'rustc-wrapper = \"evil\"' | tee -a .cargo/config",
+    "sed -i 's/^#rustc-wrapper.*/rustc-wrapper = \"x\"/' .cargo/config.toml",
+    "sed -i 's|^runner.*|runner = \"/tmp/x\"|' .cargo/config.toml",
+    "sed -i 's/foo/linker=\"x\"/' .cargo/config.toml",
+    "sed -i 's/foo/;linker=\"x\"/' .cargo/config.toml",
 ])
 def test_shell_forms_gated(cmd):
     assert _blocked(_ev(_sh(cmd)))

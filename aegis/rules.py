@@ -7750,7 +7750,8 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     environment variables and `RUSTFLAGS=-C linker=...` (env-var channel,
     persisted only via files other guards own, e.g. `.env`/`.envrc`/shell
     profiles), `cargo --config 'k=v'` one-shot flags (run by the invoking
-    agent itself, not persisted), `CARGO_HOME` relocation, `build.rs` and
+    agent itself, not persisted; incidentally flagged when the key text
+    matches, which is harmless), `CARGO_HOME` relocation, `build.rs` and
     proc-macro code (ordinary source, indistinguishable from legit work),
     and values assembled indirectly (shell variable concatenation, `toml`
     edit tooling)."""

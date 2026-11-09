@@ -5299,7 +5299,9 @@ CARGO_CONFIG_PATH_RE = re.compile(
 # from firing. No unbounded or nested quantifiers.
 _CARGO_VAL = r"""\s*=\s*(?:["'][^"'\s]|\[\s*["'])"""
 # `\\[nt]` = a literal backslash-n/t escape as written by printf/sed/echo -e.
-_CARGO_KEY_PRE = r"""(?:^|[\s.{,]|\\[nt])["']?"""
+# Also `/ | ; : (` and quotes: the key right after a sed `s/x/KEY=..` or
+# `s|x|KEY=..` replacement delimiter, or a `;`-joined statement.
+_CARGO_KEY_PRE = r"""(?:^|[\s.{,/|;:('"]|\\[nt])["']?"""
 # Distinctive enough to be path-independent (a staged copy under another
 # name, then moved into place): nothing else uses these key names.
 CARGO_EXEC_STRONG_RE = re.compile(
