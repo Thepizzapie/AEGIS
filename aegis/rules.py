@@ -2343,51 +2343,79 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
 
 _CARGO_SEG_SPLIT = re.compile(r"&&|\|\||[;|\n]")
-_CARGO_COPY_VERBS = ("cp", "mv", "install", "ln", "rsync", "scp")
-_CARGO_ANY_PATH_VERBS = ("patch", "tee", "dd", "tar", "unzip", "bsdtar", "7z")
+_CARGO_COPY_VERBS = ("cp", "mv", "install", "ln", "rsync", "scp", "copy", "xcopy",
+                     "move", "copy-item", "move-item", "cpi", "mi", "robocopy")
+_CARGO_ANY_PATH_VERBS = ("patch", "tee", "dd", "unzip", "7z")
+_CARGO_OWN_DIR = re.compile(r"^(?:\.[/\\]|~[/\\]|\$\{?HOME\}?[/\\])?\.cargo[/\\]*$", re.IGNORECASE)
 
 
 def _cargo_shell_dest_hit(cmd: str) -> bool:
     """True when a shell command writes INTO .cargo/config[.toml] with content
-    coming from elsewhere (cp/mv/ln/rsync/tee/dd/patch/tar/unzip/git
-    checkout|restore, `>`/`of=` redirect), judged per `;`/`&&`/`|` segment on
-    the DESTINATION only, so reading/backing-up the config stays quiet."""
+    coming from elsewhere (cp/mv/ln/rsync/tee/dd/patch/tar -x/unzip/git
+    checkout|restore, PowerShell/cmd copy verbs, or a `>`/`>>`/`>|`/`of=`
+    redirect from a non-echo/printf command), judged per `;`/`&&`/`|`
+    segment on the DESTINATION operand only, so reading, backing up or
+    moving the config away stays quiet. Run on the raw command text."""
     cd_in = False
+    cmd = cmd.replace(">|", ">")
     for seg in _CARGO_SEG_SPLIT.split(cmd):
         if patterns.CARGO_CD_RE.search(seg):
             cd_in = True
+        seg = re.sub(r"\s#.*$", "", seg)
 
-        def is_cfg(tok: str) -> bool:
-            tok = tok.strip("\"'")
+        def cfg(tok: str, bare: bool = True) -> bool:
+            tok = tok.strip("\"'(){}")
             return bool(patterns.CARGO_CONFIG_PATH_RE.search(" " + tok)
-                        or (cd_in and re.fullmatch(r"(?:\./)?config(?:\.toml)?", tok)))
+                        or (bare and cd_in and re.fullmatch(r"(?:\./)?config(?:\.toml)?", tok)))
 
         def is_dir(tok: str) -> bool:
-            return bool(re.search(r"(?:^|[/\\])\.cargo[/\\]*$", tok.strip("\"'"), re.IGNORECASE))
+            return bool(re.search(r"(?:^|[/\\])\.cargo[/\\]*$", tok.strip("\"'(){}"), re.IGNORECASE))
 
-        # A bare `>` redirect carries inline content the key check already
-        # sees; only gate it when the data comes from elsewhere (cat/`<`).
-        from_elsewhere = bool(re.search(r"\bcat\b|<(?!<)", seg))
-        for m in re.finditer(r">>?\s*(\S+)|\bof=(\S+)", seg):
-            if (m.group(2) or from_elsewhere) and is_cfg(m.group(1) or m.group(2)):
-                return True
-        toks = seg.split()
+        toks = [t for t in seg.split() if t]
         if not toks:
             continue
-        verb = ""
-        for t in toks:
-            b = t.rsplit("/", 1)[-1]
-            if b in _CARGO_COPY_VERBS or b in _CARGO_ANY_PATH_VERBS:
-                verb = b
-                break
-        args = [t for t in toks[toks.index(t) + 1:] if not t.startswith("-")] if verb else []
-        if verb in _CARGO_COPY_VERBS and args:
-            if is_cfg(args[-1]) or is_dir(args[-1]) or any(is_dir(a) for a in args[:-1]):
+        first = toks[0].lstrip("(").rsplit("/", 1)[-1].lower()
+        pure_echo = first in ("echo", "printf")
+        for m in re.finditer(r">[>|]?\s*([^\s&]+)|\bof=(\S+)", seg):
+            if (m.group(2) or not pure_echo) and cfg(m.group(1) or m.group(2)):
                 return True
-        elif verb in _CARGO_ANY_PATH_VERBS and any(is_cfg(a) for a in args):
+        # operands: drop options, redirections, `&`, `\;`, `{}`-find placeholders
+        verb, vi = "", 0
+        for k, t in enumerate(toks):
+            b = t.strip("(").rsplit("/", 1)[-1].lower()
+            if b in _CARGO_COPY_VERBS or b in _CARGO_ANY_PATH_VERBS or b in ("tar", "bsdtar"):
+                if b == "install" and k and toks[k - 1].lower().endswith("cargo"):
+                    continue
+                verb, vi = b, k
+                break
+        rest = toks[vi + 1:] if verb else []
+        tdir = ""
+        for k, t in enumerate(rest):
+            if t in ("-t",) and k + 1 < len(rest):
+                tdir = rest[k + 1]
+            elif t.startswith("--target-directory"):
+                tdir = t.partition("=")[2] or (rest[k + 1] if k + 1 < len(rest) else "")
+        args = [t for t in rest
+                if not (t.startswith("-") or re.match(r"^\d*[<>]", t) or t in ("&", "\\", "\\;", "+")
+                        or re.fullmatch(r"/[A-Za-z]", t))]
+        if verb in _CARGO_COPY_VERBS and args:
+            if tdir and (cfg(tdir) or is_dir(tdir)):
+                return True
+            if cfg(args[-1]) or is_dir(args[-1]):
+                return True
+            if any(is_dir(a) and not _CARGO_OWN_DIR.match(a.strip("\"'")) for a in args[:-1]):
+                return True
+        elif verb in _CARGO_ANY_PATH_VERBS and any(cfg(a) for a in args):
             return True
-        if re.search(r"\bgit\b[^;&|]*\b(?:checkout|restore)\b", seg) and any(is_cfg(a) for a in toks):
-            return True
+        elif verb in ("tar", "bsdtar"):
+            extract = any(re.fullmatch(r"-?[A-Za-z]*x[A-Za-z]*", t) or t == "--extract" for t in rest[:2])
+            if extract and any(cfg(a) or is_dir(a) for a in args):
+                return True
+        if re.search(r"\bgit\b[^;&|]*\b(?:checkout|restore)\b", seg):
+            staged_only = "--staged" in toks and "--worktree" not in toks and "-W" not in toks
+            if not staged_only and any(cfg(a, bare=True) or is_dir(a) for a in toks[1:]
+                                       if not a.startswith("-")):
+                return True
     return False
 
 
@@ -2487,7 +2515,7 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                             and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
         keyed = bool(write_verb and path_hit
                      and patterns.CARGO_EXEC_KEY_RE.search(cmd))
-        if not (keyed or _cargo_shell_dest_hit(cmd)):
+        if not (keyed or _cargo_shell_dest_hit(_cmd(ev))):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
