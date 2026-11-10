@@ -3736,10 +3736,33 @@ CARGO_CONFIG_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
+# Leading boundary tolerates a shell-literal `\\n`/`\\r`/`\\t` escape (printf/echo -e/sed
+# write the config as one line, so `\\nrunner=` has no `\\b` before `runner`).
+_CARGO_KEY_START = r"(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))"
 CARGO_EXEC_KEY_RE = re.compile(
-    r"[\"']?\b(?:rustc-wrapper|rustc-workspace-wrapper|runner|linker|rustc|rustdoc"
-    r"|credential-providers?|global-credential-providers)[\"']?\s*=\s*[\"'\[]?\s*\S"
-    r"|-C\s*(?:linker|link-args?)\s*=",
+    _CARGO_KEY_START + r"[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|runner|linker|rustc|rustdoc"
+    r"|include)[\"']?\s*=\s*[\"'\[]?\s*\S"
+    # credential providers: built-in `cargo:*` values are benign; any other element is a program
+    r"|" + _CARGO_KEY_START + r"[\"']?(?:global-)?credential-providers?[\"']?\s*="
+    r"\s*(?=[\[\s]*[\"'](?!cargo:)\S|[^\]=]{0,300}?,\s*[\"'](?!cargo:)\S)"
+    r"|-C[\"',\s]*linker\s*="
+    r"|-C[\"',\s]*link-args?\s*=\s*[^\s\"']*-fuse-ld="
+    r"|--(?:test-)?runtool\b"
+    r"|-Z[\"',\s]*(?:codegen-backend|llvm-plugins|pre-link-args?)\b",
+    re.IGNORECASE,
+)
+# `cd`/`pushd` into a `.cargo` directory, then a bare `config[.toml]` target.
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_BARE_CONFIG_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])config(?:\.toml)?" + _CI_END, re.IGNORECASE)
+# Shell forms whose CONTENT comes from elsewhere (key text never in the command).
+CARGO_SOURCE_WRITE_RE = re.compile(
+    r"\b(?:cp|mv|install|ln|rsync|scp)\b|<\s*[^\s<]|\bcat\s+[^|;&\n<>]*>"
+    r"|\bgit\s+(?:checkout|restore)\b",
     re.IGNORECASE,
 )
 

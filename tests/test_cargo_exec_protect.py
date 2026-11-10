@@ -119,3 +119,47 @@ def test_loader_roundtrip(tmp_path):
     from aegis.loader import load_policy
     (tmp_path / "p.yaml").write_text("cargo_exec:\n  mode: deny\n")
     assert load_policy(str(tmp_path)).cargo_exec == {"mode": "deny"}
+
+
+def test_qa_shell_escape_newlines():
+    for cmd in [
+        r"printf '[build]\nrustc-wrapper=\"/tmp/e\"\n' >> .cargo/config.toml",
+        r"printf '[target.x]\nrunner=\"/tmp/e\"\n' > ~/.cargo/config.toml",
+        r"echo -e '[build]\nrustc-wrapper=\"/tmp/e\"' >> .cargo/config.toml",
+        r"printf '\trunner=\"/tmp/e\"' >> .cargo/config.toml",
+    ]:
+        assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_qa_source_forms():
+    for cmd in ["cp /tmp/e.toml .cargo/config.toml", "mv /tmp/e.toml .cargo/config.toml",
+                "install -m644 /tmp/e.toml .cargo/config.toml",
+                "ln -sf /tmp/e.toml ~/.cargo/config.toml",
+                "cat /tmp/e.toml > .cargo/config.toml",
+                "tee .cargo/config.toml < /tmp/e.toml",
+                "rsync /tmp/e.toml .cargo/config.toml"]:
+        assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_qa_cd_form():
+    for cmd in ["cd .cargo && echo 'runner=\"x\"' > config.toml",
+                "cd ~/.cargo && printf 'runner=\"x\"' >> config.toml",
+                "pushd .cargo; echo 'linker=\"x\"' >> config.toml"]:
+        assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_qa_flag_arrays_and_include():
+    for c in ['[build]\nrustflags=["-C","link-arg=-fuse-ld=/tmp/e"]\n',
+              '[build]\nrustdocflags=["--test-runtool=/tmp/e"]\n',
+              '[build]\nrustdocflags=["--runtool","/x"]\n',
+              '[build]\nrustflags=["-Zcodegen-backend=/tmp/e.so"]\n',
+              'include = ["/tmp/e.toml"]\n',
+              '[registry]\nglobal-credential-providers=["cargo:token", "/tmp/steal"]\n']:
+        assert _hit(evaluate(_write(".cargo/config.toml", c), EMPTY)), c
+
+
+def test_qa_false_positives_closed():
+    for c in ['[registry]\nglobal-credential-providers=["cargo:token"]\n',
+              '[registry]\ncredential-provider = "cargo:macos-keychain"\n\n[build]\njobs = 2\n',
+              '[build]\nrustflags = "-C link-arg=-Wl,--gc-sections"\n']:
+        assert not _hit(evaluate(_write(".cargo/config.toml", c), EMPTY)), c

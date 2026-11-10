@@ -2372,7 +2372,17 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     Escapable only by a human: '# aegis-allow' on the shell form, or
     AEGIS_ALLOW_CARGO_EXEC=1 set before launch.
 
-    Honest scope: a `CARGO_HOME` pointing outside a `.cargo/` directory, a
+    Shell copy/move/link/`<`/`cat >`/`git checkout` forms into the path are
+    gated without needing the key in the command (content comes from another
+    file); a `cd .cargo && ... > config.toml` two-step is matched too.
+    `include = [...]` (cargo config-include) is gated. Built-in
+    `cargo:*` credential providers stay ALLOW.
+
+    Honest scope: a multi-file MCP tool (`push_files` with `files:[{path,
+    content}]`) is not read by the shared `_path()` helper (same gap as the
+    sibling guards); the shell write/path/key need only co-occur somewhere in
+    one command, so a read-only command redirecting elsewhere that also
+    mentions a key can over-fire ASK; a `CARGO_HOME` pointing outside a `.cargo/` directory, a
     `CARGO_BUILD_RUSTC_WRAPPER`/`RUSTC_WRAPPER`/`CARGO_TARGET_*_RUNNER` env
     var, a one-shot `cargo --config 'build.rustc-wrapper=...'`, and a hostile
     `build.rs`/proc-macro (ordinary code, not config) are not covered; a
@@ -2423,8 +2433,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                            or patterns.FORCED_LINK_WRITE_RE.search(cmd)
                            or patterns.COPY_WRITE_VERB_RE.search(cmd)
                            or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd))
-        if not (write_verb and patterns.CARGO_CONFIG_PATH_RE.search(cmd)
-                and patterns.CARGO_EXEC_KEY_RE.search(cmd)):
+        path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(cmd)
+                        or (patterns.CARGO_CD_RE.search(cmd)
+                            and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
+        if not (write_verb and path_hit
+                and (patterns.CARGO_EXEC_KEY_RE.search(cmd)
+                     or patterns.CARGO_SOURCE_WRITE_RE.search(cmd))):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
