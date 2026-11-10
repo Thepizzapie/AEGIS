@@ -3718,6 +3718,31 @@ YARN_EXEC_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Cargo config exec hijack protection ---------------------------------------
+# `.cargo/config.toml` (project, any ancestor directory, or `$CARGO_HOME`/
+# `~/.cargo/`) carries several keys that name a PROGRAM cargo itself spawns on
+# the very next `cargo build`/`check`/`test`/`run`/`publish`, unattended, with
+# no `package.json`-style `scripts` entry for `rule_package_manifest_protect`
+# to see: `build.rustc-wrapper` / `build.rustc-workspace-wrapper` (wraps EVERY
+# rustc invocation), `build.rustc` / `build.rustdoc` (replaces the compiler),
+# `target.<triple>.runner` (executes every built binary/test through it),
+# `target.<triple>.linker` (a linker is arbitrary code run at link time), and
+# `registry.credential-provider` / `registry.global-credential-providers`
+# (a program handed the registry token). The existing REGISTRY_CONFIG_PATH_RE
+# covers only `replace-with` source redirection in this same file. Content-
+# gated, since `.cargo/config.toml` also carries ordinary keys (`[alias]`,
+# `jobs`, `[net]`, ...) that must stay quiet.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_EXEC_KEY_RE = re.compile(
+    r"[\"']?\b(?:rustc-wrapper|rustc-workspace-wrapper|runner|linker|rustc|rustdoc"
+    r"|credential-providers?|global-credential-providers)[\"']?\s*=\s*[\"'\[]?\s*\S"
+    r"|-C\s*(?:linker|link-args?)\s*=",
+    re.IGNORECASE,
+)
+
 # ---- Git-config credential/exec hijack protection ------------------------------
 # Two git-config-driven persistence/exfiltration primitives `git_hooks_protect`
 # doesn't reach (it only watches `core.hooksPath`): `credential.helper` and a

@@ -219,6 +219,10 @@ class Policy:
     # that rewrite either (`yarn set version ...`, `yarn plugin import ...`).
     # See rules.rule_yarn_exec_protect.
     yarn_exec: dict = field(default_factory=dict)
+    # Cargo exec-key protection (.cargo/config.toml rustc-wrapper/runner/
+    # linker/rustc/credential-provider): {mode, allow}. See
+    # rules.rule_cargo_exec_protect.
+    cargo_exec: dict = field(default_factory=dict)
     # Git-config credential/exec-hijack protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers `credential.helper` redirection and any git-config key
