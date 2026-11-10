@@ -163,3 +163,35 @@ def test_qa_false_positives_closed():
               '[registry]\ncredential-provider = "cargo:macos-keychain"\n\n[build]\njobs = 2\n',
               '[build]\nrustflags = "-C link-arg=-Wl,--gc-sections"\n']:
         assert not _hit(evaluate(_write(".cargo/config.toml", c), EMPTY)), c
+
+
+def test_r2_more_source_forms():
+    for cmd in ["cat /tmp/e | tee .cargo/config.toml", "cat /tmp/e | tee -a ~/.cargo/config.toml",
+                "dd if=/tmp/e of=.cargo/config.toml", "patch .cargo/config.toml e.patch",
+                "tar xf e.tar -C . .cargo/config.toml", "unzip e.zip .cargo/config.toml",
+                "git checkout evil -- .cargo/config.toml",
+                "git restore --source=evil .cargo/config.toml",
+                "cp -r /tmp/evil/.cargo ~/", "cp -r /tmp/e/.cargo .", "mv /tmp/e/.cargo ./.cargo",
+                "cd $CARGO_HOME && cp /tmp/e config.toml",
+                "git -C .cargo checkout evil -- config.toml"]:
+        assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r2_more_keys():
+    for c in ['[build]\nrustflags=["-C","link-arg=-B/tmp/e"]\n',
+              '[build]\nrustflags=["-C","link-arg=-Wl,-dynamic-linker,/tmp/e"]\n',
+              '[credential-alias]\nmine = ["/tmp/e"]\n', '[[include]]\npath="x"\n']:
+        assert _hit(evaluate(_write(".cargo/config.toml", c), EMPTY)), c
+
+
+def test_r2_false_positives_closed():
+    for cmd in ["cp .cargo/config.toml /tmp/backup.toml", "cp .cargo/config.toml .cargo/config.toml.bak",
+                "cat .cargo/config.toml > /tmp/c.copy", "sort < .cargo/config.toml > /tmp/sorted",
+                "rsync -a .cargo/config.toml host:/b/", "mv .cargo/config.toml /tmp/x",
+                "cp /tmp/a /tmp/b; ls .cargo/config.toml", "ln -s a b; cat ~/.cargo/config.toml",
+                "cd ~/.cargo/registry && cp a config.toml"]:
+        assert not _hit(evaluate(_shell(cmd), EMPTY)), cmd
+    for c in ['[env]\nINCLUDE="x"\n',
+              '[build]\nrustflags=["-C","link-arg=-fuse-ld=mold"]\n',
+              '[build]\nrustflags=["-C","link-arg=-fuse-ld=lld"]\n']:
+        assert not _hit(evaluate(_write(".cargo/config.toml", c), EMPTY)), c

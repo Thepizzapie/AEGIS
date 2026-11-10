@@ -2342,6 +2342,55 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+_CARGO_SEG_SPLIT = re.compile(r"&&|\|\||[;|\n]")
+_CARGO_COPY_VERBS = ("cp", "mv", "install", "ln", "rsync", "scp")
+_CARGO_ANY_PATH_VERBS = ("patch", "tee", "dd", "tar", "unzip", "bsdtar", "7z")
+
+
+def _cargo_shell_dest_hit(cmd: str) -> bool:
+    """True when a shell command writes INTO .cargo/config[.toml] with content
+    coming from elsewhere (cp/mv/ln/rsync/tee/dd/patch/tar/unzip/git
+    checkout|restore, `>`/`of=` redirect), judged per `;`/`&&`/`|` segment on
+    the DESTINATION only, so reading/backing-up the config stays quiet."""
+    cd_in = False
+    for seg in _CARGO_SEG_SPLIT.split(cmd):
+        if patterns.CARGO_CD_RE.search(seg):
+            cd_in = True
+
+        def is_cfg(tok: str) -> bool:
+            tok = tok.strip("\"'")
+            return bool(patterns.CARGO_CONFIG_PATH_RE.search(" " + tok)
+                        or (cd_in and re.fullmatch(r"(?:\./)?config(?:\.toml)?", tok)))
+
+        def is_dir(tok: str) -> bool:
+            return bool(re.search(r"(?:^|[/\\])\.cargo[/\\]*$", tok.strip("\"'"), re.IGNORECASE))
+
+        # A bare `>` redirect carries inline content the key check already
+        # sees; only gate it when the data comes from elsewhere (cat/`<`).
+        from_elsewhere = bool(re.search(r"\bcat\b|<(?!<)", seg))
+        for m in re.finditer(r">>?\s*(\S+)|\bof=(\S+)", seg):
+            if (m.group(2) or from_elsewhere) and is_cfg(m.group(1) or m.group(2)):
+                return True
+        toks = seg.split()
+        if not toks:
+            continue
+        verb = ""
+        for t in toks:
+            b = t.rsplit("/", 1)[-1]
+            if b in _CARGO_COPY_VERBS or b in _CARGO_ANY_PATH_VERBS:
+                verb = b
+                break
+        args = [t for t in toks[toks.index(t) + 1:] if not t.startswith("-")] if verb else []
+        if verb in _CARGO_COPY_VERBS and args:
+            if is_cfg(args[-1]) or is_dir(args[-1]) or any(is_dir(a) for a in args[:-1]):
+                return True
+        elif verb in _CARGO_ANY_PATH_VERBS and any(is_cfg(a) for a in args):
+            return True
+        if re.search(r"\bgit\b[^;&|]*\b(?:checkout|restore)\b", seg) and any(is_cfg(a) for a in toks):
+            return True
+    return False
+
+
 def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -2436,9 +2485,9 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         path_hit = bool(patterns.CARGO_CONFIG_PATH_RE.search(cmd)
                         or (patterns.CARGO_CD_RE.search(cmd)
                             and patterns.CARGO_BARE_CONFIG_RE.search(cmd)))
-        if not (write_verb and path_hit
-                and (patterns.CARGO_EXEC_KEY_RE.search(cmd)
-                     or patterns.CARGO_SOURCE_WRITE_RE.search(cmd))):
+        keyed = bool(write_verb and path_hit
+                     and patterns.CARGO_EXEC_KEY_RE.search(cmd))
+        if not (keyed or _cargo_shell_dest_hit(cmd)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
                 or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):

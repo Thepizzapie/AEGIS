@@ -3741,20 +3741,22 @@ CARGO_CONFIG_PATH_RE = re.compile(
 _CARGO_KEY_START = r"(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))"
 CARGO_EXEC_KEY_RE = re.compile(
     _CARGO_KEY_START + r"[\"']?(?:rustc-wrapper|rustc-workspace-wrapper|runner|linker|rustc|rustdoc"
-    r"|include)[\"']?\s*=\s*[\"'\[]?\s*\S"
+    r"|(?-i:include))[\"']?\s*=\s*[\"'\[]?\s*\S"
+    r"|\[\[include\]\]|\[credential-alias\]"
     # credential providers: built-in `cargo:*` values are benign; any other element is a program
     r"|" + _CARGO_KEY_START + r"[\"']?(?:global-)?credential-providers?[\"']?\s*="
     r"\s*(?=[\[\s]*[\"'](?!cargo:)\S|[^\]=]{0,300}?,\s*[\"'](?!cargo:)\S)"
     r"|-C[\"',\s]*linker\s*="
-    r"|-C[\"',\s]*link-args?\s*=\s*[^\s\"']*-fuse-ld="
+    r"|-C[\"',\s]*link-args?\s*=\s*[^\s\"']*(?:-fuse-ld=(?!(?:mold|lld|gold|bfd|lld-link)\b)|-B|-dynamic-linker)"
     r"|--(?:test-)?runtool\b"
     r"|-Z[\"',\s]*(?:codegen-backend|llvm-plugins|pre-link-args?)\b",
     re.IGNORECASE,
 )
 # `cd`/`pushd` into a `.cargo` directory, then a bare `config[.toml]` target.
 CARGO_CD_RE = re.compile(
-    r"\b(?:cd|pushd|chdir|sl|set-location)\s+[\"']?"
-    r"(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo" + _CI_END,
+    r"(?:\b(?:cd|pushd|chdir|sl|set-location)\s+|\s-C\s*)[\"']?"
+    r"(?:\$\{?CARGO_HOME\}?|(?:[^\s;&|\"'\n]{0,200}[/\\])?\.cargo)"
+    r"[/\\]*(?=[\s;&|)\"']|$)",
     re.IGNORECASE,
 )
 CARGO_BARE_CONFIG_RE = re.compile(
