@@ -2375,7 +2375,7 @@ def _cargo_shell_dest_hit(cmd: str) -> bool:
         if not toks:
             continue
         first = toks[0].lstrip("(").rsplit("/", 1)[-1].lower()
-        pure_echo = first in ("echo", "printf")
+        pure_echo = first in ("echo", "printf") and not re.search(r"\$|`", seg)
         for m in re.finditer(r">[>|]?\s*([^\s&]+)|\bof=(\S+)", seg):
             if (m.group(2) or not pure_echo) and cfg(m.group(1) or m.group(2)):
                 return True

