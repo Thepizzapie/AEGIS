@@ -6733,6 +6733,12 @@ _CLAUDE_MCP_AA_EXTRA_WRITER_RE = re.compile(
     re.IGNORECASE)
 
 
+_CLAUDE_MCP_AA_INTERP_RE = re.compile(
+    r"\b(?:python(?:\d+(?:\.\d+)?)?|pypy\d*|node|nodejs|bun|deno|tsx|ts-node|ruby|perl|php|"
+    r"lua|luajit|Rscript|pwsh|powershell|osascript|groovy|jshell)\b", re.IGNORECASE)
+_CLAUDE_MCP_AA_PATH_PART_RE = re.compile(r"\.claude\b|settings\.local\b", re.IGNORECASE)
+
+
 def _claude_mcp_aa_shell_write_hit(raw: str, norm: str) -> bool:
     """A shell command already known to touch AND write settings.local.json."""
     unesc = norm.replace('\\"', '"')
@@ -6887,7 +6893,11 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     ``cat <<EOF | node``) or run by bun/deno -- no ``-c``/``-e`` flag for
     the write-verb lists -- now covered by treating any scripting-runtime
     invocation as a potential writer, with the key-fragment check deciding.
-    Round 7 verified the fix.
+    Round 7 found the same scripts usually BUILD the path from parts
+    (``os.path.join('.claude', 'settings.local.json')``, ``Path(...) /
+    ...``, ``path.join(cwd, '.claude', ...)``), escaping the joined-path
+    regex -- fixed: for a scripting-runtime command, either path part is
+    enough. Round 8 verified the fix.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key
@@ -6910,6 +6920,11 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     a script FILE written earlier and then run (``python3 edit.py``) --
     the key text lives in the file, not the command -- is not caught, the
     same split-across-calls bound every sibling guard accepts;
+    an interpreter script that only READS or DELETES a key
+    (``d.get('enableAllProjectMcpServers')``, ``d.pop(...)``) asks -- the
+    safe-use stripping knows jq/JSON shapes only; a script whose path is
+    split finer than ``.claude`` / ``settings.local`` (``'settings' +
+    '.local.json'`` with no ``.claude`` anywhere) is not caught;
     a partial anchor on the shared ``...McpjsonServers`` suffix asks
     even when the file's key is actually ``disabledMcpjsonServers``;
     ``claude --settings <file>`` pointing at a separately-written JSON file
@@ -6980,6 +6995,14 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
                             or patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(raw)
                             or (cd_hit and (patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)
                                             or patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(raw))))
+            # An interpreter script usually BUILDS the path from parts
+            # (`os.path.join('.claude', 'settings.local.json')`, `Path(d) /
+            # 'settings.local.json'`, `path.join(cwd, '.claude', ...)`), so
+            # for a scripting-runtime command either half is enough; the
+            # key-fragment check below still decides (QA round 7).
+            if (not path_hit and _CLAUDE_MCP_AA_INTERP_RE.search(raw)
+                    and _CLAUDE_MCP_AA_PATH_PART_RE.search(raw)):
+                path_hit = True
             if path_hit:
                 # Something has to WRITE the result: a read-only `jq` that
                 # merely projects the key to stdout is not gated (QA round 1).

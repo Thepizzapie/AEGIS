@@ -766,3 +766,27 @@ def test_r6_interpreter_touching_other_keys_not_gated():
     assert not _gated(evaluate(_shell(f"python3 - <<'EOF'\n{body}EOF"), EMPTY))
     body2 = _PY_BODY.replace("=True", "=False")
     assert not _ours(evaluate(_shell(f"python3 - <<'EOF'\n{body2}EOF"), EMPTY))
+
+
+# ---- QA round 7 regressions -----------------------------------------------------
+
+def test_r7_interpreter_script_with_built_path_gated():
+    tail = "d=json.load(open(p))\nd['enableAllProjectMcpServers']=True\njson.dump(d,open(p,'w'))\n"
+    for pline in ("p=os.path.join('.claude','settings.local.json')",
+                  "p=Path('.claude','settings.local.json')",
+                  "p='.claude/'+'settings.local.json'",
+                  "p=Path('.claude') / 'settings.local.json'",
+                  "d0='.claude'\np=f'{d0}/settings.local.json'"):
+        cmd = f"python3 - <<'EOF'\nimport json,os\nfrom pathlib import Path\n{pline}\n{tail}EOF"
+        assert _ours(evaluate(_shell(cmd), EMPTY)), pline
+    node = ("node <<'EOF'\nconst fs=require('fs'),path=require('path');"
+            "const p=path.join(process.cwd(),'.claude','settings.local.json');"
+            "const s=JSON.parse(fs.readFileSync(p));s.enableAllProjectMcpServers=true;"
+            "fs.writeFileSync(p,JSON.stringify(s));\nEOF")
+    assert _ours(evaluate(_shell(node), EMPTY))
+
+
+def test_r7_interpreter_with_built_path_other_key_not_gated():
+    cmd = ("python3 - <<'EOF'\nimport json,os\np=os.path.join('.claude','settings.local.json')\n"
+           "d=json.load(open(p))\nd['model']='opus'\njson.dump(d,open(p,'w'))\nEOF")
+    assert not _gated(evaluate(_shell(cmd), EMPTY))
