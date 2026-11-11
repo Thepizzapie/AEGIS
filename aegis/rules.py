@@ -14,6 +14,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import subprocess
 from typing import Optional
 
@@ -6296,6 +6297,11 @@ def _claude_mcp_autoapprove_allowed_by_policy(cfg: dict, text: str) -> bool:
 _CLAUDE_MCP_AA_KEY_NAMES = {k.lower() for k in patterns.CLAUDE_MCP_AUTOAPPROVE_KEYS}
 _CLAUDE_MCP_AA_KEY_MENTION_RE = re.compile(
     r"\b(?:" + patterns._CLAUDE_MCP_AUTOAPPROVE_KEY_ALT + r")\b", re.IGNORECASE)
+# A mention in KEY position (after a quote, `{` or `,`), not prose or a
+# permission rule such as `Bash(grep enableAllProjectMcpServers:*)` (QA
+# round 2 false positive on the Edit path).
+_CLAUDE_MCP_AA_KEYPOS_MENTION_RE = re.compile(
+    patterns._MCP_AA_KEYPOS + r"(?:" + patterns._CLAUDE_MCP_AUTOAPPROVE_KEY_ALT + r")\b", re.IGNORECASE)
 def _claude_mcp_aa_unsafe_value(key: str, val) -> bool:
     kl = key.strip().lower()
     if kl == "enableallprojectmcpservers":
@@ -6329,7 +6335,7 @@ def _claude_mcp_aa_struct_hit(v, _depth: int = 0) -> bool:
 def _claude_mcp_aa_json_hit(content: str) -> bool:
     try:
         obj = json.loads(content)
-    except (ValueError, TypeError):
+    except Exception:  # incl. RecursionError on deeply nested input (QA round 2)
         return False
     return _claude_mcp_aa_struct_hit(obj)
 
@@ -6348,7 +6354,7 @@ def _claude_mcp_aa_mcp_bareword_hit(a: dict) -> bool:
                     if isinstance(val, str):
                         try:
                             val = json.loads(val)
-                        except (ValueError, TypeError):
+                        except Exception:  # incl. RecursionError on deeply nested input (QA round 2)
                             pass
                     return _claude_mcp_aa_unsafe_value(v, val)
             return True
@@ -6443,7 +6449,7 @@ def _claude_mcp_aa_fragment_hit(new: str) -> bool:
     if _claude_mcp_aa_text_hit(new):
         return True
     new_n = _claude_cred_helper_normalize(new or "").replace('\\"', '"')
-    mentions = len(_CLAUDE_MCP_AA_KEY_MENTION_RE.findall(new_n))
+    mentions = len(_CLAUDE_MCP_AA_KEYPOS_MENTION_RE.findall(new_n))
     if mentions and len(_CLAUDE_MCP_AA_SAFE_MENTION_RE.findall(new_n)) < mentions:
         return True
     return _claude_mcp_aa_partial_hit(new_n)
@@ -6496,18 +6502,87 @@ def _claude_mcp_aa_cli_hit(norm: str) -> bool:
             elif (patterns.CLAUDE_MCP_AA_CLI_SET_BOOL_RE.search(rest)
                   or patterns.CLAUDE_MCP_AA_CLI_SET_LIST_RE.search(rest)):
                 return True
-    # --settings may carry `|`/`;` inside its quoted JSON, so match it on the
-    # whole command, after the first `claude` token.
-    c = patterns.CLAUDE_CLI_TOKEN_RE.search(norm)
-    if c:
-        for m in patterns.CLAUDE_SETTINGS_ARG_RE.finditer(norm, c.end()):
-            arg = next(g for g in m.groups() if g is not None).replace('\\"', '"')
-            if _CLAUDE_MCP_AA_DYNAMIC_RE.search(arg):
-                if patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(norm.replace('\\"', '"')):
-                    return True
-            elif patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(arg):
-                return True
     return False
+
+
+def _claude_mcp_aa_settings_args(cmd: str, _depth: int = 0) -> list:
+    """Every ``--settings`` argument of every ``claude`` invocation in
+    ``cmd``, shell-unquoted with `shlex` (so a quote-split key such as
+    ``"{\\"enableAll""ProjectMcpServers\\":true}"`` comes back whole --
+    QA round 2). A token that itself names ``claude`` and ``--settings``
+    (``bash -c "claude --settings ..."``) is parsed recursively. Returns
+    ``None`` when the command cannot be tokenized (unbalanced quotes)."""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return None
+    out, in_claude, want = [], False, False
+    for t in toks:
+        if t and set(t) <= set(";|&()\n"):
+            in_claude = want = False
+            continue
+        if want:
+            out.append(t)
+            want = False
+            continue
+        if patterns.CLAUDE_CLI_TOKEN_RE.search(t) and "--settings" in t and " " in t and _depth < 3:
+            inner = _claude_mcp_aa_settings_args(t, _depth + 1)
+            out.extend(inner or [])
+        if re.search(r"(?:^|[/\\])(?:claude|claude-code)$", t, re.IGNORECASE):
+            in_claude = True
+        elif in_claude and t == "--settings":
+            want = True
+        elif in_claude and t.startswith("--settings="):
+            out.append(t[len("--settings="):])
+    return out
+
+
+def _claude_mcp_aa_settings_hit(raw: str, norm: str) -> bool:
+    """Inline-JSON ``claude --settings``. Linear: each argument is matched
+    once, and the whole-command fallback (for a dynamically built
+    argument, or a ``--settings`` that only appears in `scan_surface`'s
+    decoded forms) runs at most once (QA round 2 found it re-run per
+    argument, quadratic)."""
+    if "--settings" not in norm or not patterns.CLAUDE_CLI_TOKEN_RE.search(norm):
+        return False
+    args = _claude_mcp_aa_settings_args(raw)
+    # `scan_surface` = raw + quote-stripped copy (+ decoded forms): more
+    # `--settings` than those two copies account for means a decoded or
+    # quote-split one this tokenizer never saw.
+    fallback = args is None or norm.count("--settings") > 2 * raw.count("--settings")
+    for arg in args or []:
+        if _CLAUDE_MCP_AA_DYNAMIC_RE.search(arg):
+            fallback = True
+        elif patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(_claude_cred_helper_normalize(arg)):
+            return True
+    if fallback:
+        return bool(patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(norm.replace('\\"', '"')))
+    return False
+
+
+# jq key-construction shapes no single regex enumerates (QA round 2):
+# `.k? = true`, `{("k"): true}`, `--arg k <key> '.[$k]=true'`,
+# `.["enableAll"+"ProjectMcpServers"]`, `"enableAll\("Project")..."`. In a
+# jq segment that WRITES the settings file, every recognised SAFE use of a
+# key is removed first; any key FRAGMENT left over is gated.
+_K_B = r"enableAllProjectMcpServers"
+_K_L = r"enabledMcpjsonServers"
+_JQ_IDX2 = r"[\"'\]\?]*\s*"
+_CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE = re.compile(
+    r"disabledMcpjsonServers"
+    r"|" + _K_B + _JQ_IDX2 + r"(?:\|=|(?<![!<>=])=(?!=))" + patterns._MCP_AA_BOOL_SAFE
+    + r"|" + _K_L + _JQ_IDX2 + r"(?:\|=|(?<![!<>=])=(?!=))" + patterns._MCP_AA_LIST_SAFE
+    + r"|" + _K_B + r"[\"']?\s*:" + patterns._MCP_AA_BOOL_SAFE
+    + r"|" + _K_L + r"[\"']?\s*:" + patterns._MCP_AA_LIST_SAFE
+    + r"|\bdel\s*\(\s*\.?\[?\s*[\"']?(?:" + _K_B + r"|" + _K_L + r")[\"']?\s*\]?\s*\)"
+    + r"|(?:" + _K_B + r"|" + _K_L + r")" + _JQ_IDX2 + r"[=!]="
+    # a plain read: `.k`, `.k | ...`, `.k)` -- not `.k?`/`.k =`/`.k:`
+    + r"|\.(?:" + _K_B + r"|" + _K_L + r")(?=\s*(?:\|(?!=)|\)|,|;|['\"](?:\s|$)|$)|\s+[^\s=|:?+*/%<>!-])",
+    re.IGNORECASE)
+_CLAUDE_MCP_AA_JQ_FRAGMENT_RE = re.compile(
+    r"enableAll|ProjectMcp|enabledMcp|McpjsonServers|McpServers", re.IGNORECASE)
 
 
 def _claude_mcp_aa_jq_hit(norm: str) -> bool:
@@ -6517,7 +6592,9 @@ def _claude_mcp_aa_jq_hit(norm: str) -> bool:
     for seg in norm.split(";"):
         if patterns.JQ_TOKEN_RE.search(seg) and (
                 patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_ASSIGN_RE.search(seg)
-                or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(seg)):
+                or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(seg)
+                or _CLAUDE_MCP_AA_JQ_FRAGMENT_RE.search(
+                    _CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE.sub(" ", seg))):
             return True
     return False
 
@@ -6606,8 +6683,18 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     null``; a MultiEdit split-key assembly; and the MCP ``filePath`` arg
     (added to the shared `_path`) -- all fixed, along with four false
     positives (read-only jq projection, a permission rule naming the key,
-    an Edit deleting the key beside another change). Round 2 verified the
-    fixes.
+    an Edit deleting the key beside another change). Round 2 (a fresh
+    reviewer) failed the guard on: a ``--settings`` fallback re-run per
+    dynamic argument (quadratic, 9s at 20KB), now run at most once; a
+    shell-quote-split key inside a double-quoted ``--settings`` argument,
+    now tokenized with `shlex` (recursing into ``bash -c "..."``); jq key
+    construction (``.k? =``, ``{("k"): ...}``, ``--arg k <key> '.[$k]='``,
+    ``"enableAll"+"..."``, ``\\(...)`` interpolation), now closed by
+    stripping every recognised SAFE key use from a settings-writing jq
+    segment and gating any key fragment left over; a RecursionError on
+    deeply nested JSON; and false positives on explicit safe ``--settings``/
+    ``config set ... '[]'`` values and on an Edit adding a permission rule
+    that names the key -- all fixed. Round 3 verified the fixes.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key
@@ -6617,7 +6704,11 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     an anchor such as ``old: '["a"]'``) and a prefix anchor shorter than 3
     chars are not caught -- no cross-call/on-disk state, the same bound
     `rule_jetbrains_run_config_protect` discloses for its ``enabled="false"``
-    flip; a partial anchor on the shared ``...McpjsonServers`` suffix asks
+    flip; an INFIX anchor (plant ``"enQQers": true``, then Edit ``QQ`` ->
+    ``ableAllProjectMcpServ``), which likewise needs a planted near-key;
+    any Edit whose ``new_string`` merely starts with ``s": true``-style
+    text asks unnecessarily (the short-suffix check's accepted cost);
+    a partial anchor on the shared ``...McpjsonServers`` suffix asks
     even when the file's key is actually ``disabledMcpjsonServers``;
     ``claude --settings <file>`` pointing at a separately-written JSON file
     is not caught (only inline or dynamically-built arguments are
@@ -6675,7 +6766,7 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         norm = _claude_cred_helper_normalize(cmd)
-        cli_hit = _claude_mcp_aa_cli_hit(norm)
+        cli_hit = _claude_mcp_aa_cli_hit(norm) or _claude_mcp_aa_settings_hit(_cmd(ev), norm)
         file_hit = False
         if not cli_hit:
             cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))

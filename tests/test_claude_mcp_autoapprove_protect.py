@@ -576,3 +576,60 @@ def test_value_regex_ignores_safe_and_benign():
               '"enabledMcpjsonServers":null', '"disabledMcpjsonServers": ["a"]',
               '"enableAllProjectMcpServersX": true'):
         assert not patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(t), t
+
+
+# ---- QA round 2 regressions -----------------------------------------------------
+
+def test_r2_settings_quote_split_key_gated():
+    for cmd in ('claude --settings "{\\"enableAll""ProjectMcpServers\\":true}"',
+                'claude --settings="{\\"enabledMcp""jsonServers\\":[\\"x\\"]}"'):
+        assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r2_settings_inside_bash_c_gated():
+    d = evaluate(_shell("bash -c \"claude --settings '{\\\"enableAllProjectMcpServers\\\":true}'\""), EMPTY)
+    assert _ours(d)
+
+
+def test_r2_settings_explicit_safe_values_not_gated():
+    for cmd in ("claude --settings '{\"enableAllProjectMcpServers\": false}' -p x",
+                "claude --settings '{\"enabledMcpjsonServers\": []}' -p x",
+                "claude config set enabledMcpjsonServers '[]'"):
+        assert not _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r2_perf_many_dynamic_settings_args():
+    ev = _shell("claude" + " --settings $x" * 1400)
+    t = time.time()
+    rules.rule_claude_mcp_autoapprove_protect(ev, EMPTY)
+    assert time.time() - t < 0.5
+
+
+def test_r2_jq_key_construction_gated():
+    for prog in (".enableAllProjectMcpServers? = true",
+                 '. + {("enableAllProjectMcpServers"): true}',
+                 '.["enableAll"+"ProjectMcpServers"]=true',
+                 '.["enableAll\\("Project")McpServers"]=true'):
+        d = evaluate(_shell(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), EMPTY)
+        assert _ours(d), prog
+    d = evaluate(_shell(f"jq --arg k enableAllProjectMcpServers '.[$k]=true' {LOCAL} | sponge {LOCAL}"),
+                 EMPTY)
+    assert _ours(d)
+
+
+def test_r2_jq_unrelated_write_not_gated():
+    for prog in ('.model = "x"', '.disabledMcpjsonServers += ["x"]'):
+        d = evaluate(_shell(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), EMPTY)
+        assert not _gated(d), prog
+
+
+def test_r2_deeply_nested_json_does_not_crash():
+    content = '{"a":' + '[' * 3000 + ']' * 3000 + '}'
+    for ev in (_write(LOCAL, content), _edit(LOCAL, content),
+               _mcp("mcp__fs__write_file", {"path": LOCAL, "content": content})):
+        rules.rule_claude_mcp_autoapprove_protect(ev, EMPTY)  # must not raise
+
+
+def test_r2_edit_adding_permission_rule_naming_key_not_gated():
+    d = evaluate(_edit(LOCAL, '["Bash(grep enableAllProjectMcpServers:*)",', old_string="["), EMPTY)
+    assert not _gated(d)

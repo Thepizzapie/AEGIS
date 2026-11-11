@@ -3433,10 +3433,10 @@ _MCP_AA_LIST_SAFE = r"\s*(?:\[\s*\]|null\b)" + _MCP_AA_NO_OP
 # unescaped), or after `{`/`,` (jq bareword object key). NOT after a space or
 # `(` -- so a permission rule such as `Bash(grep enableAllProjectMcpServers:*)`
 # is not read as the key (QA round 1 false positive).
-_MCP_AA_KEYPOS = r"(?:(?<=[\"'{,])|(?<=[{,]\s))"
+_MCP_AA_KEYPOS = r"(?:(?<=[\"'{,(])|(?<=[{,(]\s))"
 CLAUDE_MCP_AUTOAPPROVE_VALUE_RE = re.compile(
-    _MCP_AA_KEYPOS + r"enableAllProjectMcpServers[\"']?\s*:(?!" + _MCP_AA_BOOL_SAFE + r")"
-    r"|" + _MCP_AA_KEYPOS + r"enabledMcpjsonServers[\"']?\s*:(?!" + _MCP_AA_LIST_SAFE + r")",
+    _MCP_AA_KEYPOS + r"enableAllProjectMcpServers[\"']?\)?\s*:(?!" + _MCP_AA_BOOL_SAFE + r")"
+    r"|" + _MCP_AA_KEYPOS + r"enabledMcpjsonServers[\"']?\)?\s*:(?!" + _MCP_AA_LIST_SAFE + r")",
     re.IGNORECASE,
 )
 
@@ -3446,7 +3446,7 @@ CLAUDE_MCP_AUTOAPPROVE_VALUE_RE = re.compile(
 # Applied ONE `;`-separated shell segment at a time by the rule (a plain
 # `search`, no lookahead from every `jq` token), which keeps it linear --
 # the stacked-lookahead form was quadratic (QA round 1).
-_MCP_AA_JQ_IDX = r"(?:[\"'\]]|\[\s*-?\d*\s*\])*\s*"
+_MCP_AA_JQ_IDX = r"(?:[\"'\])?]|\[\s*-?\d*\s*\])*\s*"
 _MCP_AA_JQ_OP = r"(?:\|=|//=|[+\-*/%]=|(?<![!<>=])=(?!=))"
 CLAUDE_MCP_AUTOAPPROVE_JQ_ASSIGN_RE = re.compile(
     r"\benableAllProjectMcpServers" + _MCP_AA_JQ_IDX + _MCP_AA_JQ_OP + r"(?!" + _MCP_AA_BOOL_SAFE + r")"
@@ -3467,9 +3467,9 @@ SPONGE_RE = re.compile(r"\bsponge\b", re.IGNORECASE)
 CLAUDE_CLI_TOKEN_RE = re.compile(r"\bclaude\b", re.IGNORECASE)
 CLAUDE_CONFIG_VERB_RE = re.compile(r"\bconfig\s+(set|add)\b", re.IGNORECASE)
 CLAUDE_MCP_AA_CLI_SET_BOOL_RE = re.compile(
-    r"\benableAllProjectMcpServers\b(?![\"']?" + _MCP_AA_BOOL_SAFE + r")", re.IGNORECASE)
+    r"\benableAllProjectMcpServers\b(?!\s*[\"']?" + _MCP_AA_BOOL_SAFE + r")", re.IGNORECASE)
 CLAUDE_MCP_AA_CLI_SET_LIST_RE = re.compile(
-    r"\benabledMcpjsonServers\b(?![\"']?" + _MCP_AA_LIST_SAFE + r")", re.IGNORECASE)
+    r"\benabledMcpjsonServers\b(?!\s*[\"']?" + _MCP_AA_LIST_SAFE + r")", re.IGNORECASE)
 CLAUDE_MCP_AA_CLI_ADD_LIST_RE = re.compile(r"\benabledMcpjsonServers\b", re.IGNORECASE)
 CLAUDE_SETTINGS_ARG_RE = re.compile(
     r"\s--settings(?:=|\s+)(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\"|(\S+))",
