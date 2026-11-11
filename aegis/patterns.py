@@ -3426,7 +3426,7 @@ _CLAUDE_MCP_AUTOAPPROVE_KEY_ALT = "|".join(CLAUDE_MCP_AUTOAPPROVE_KEYS)
 # (`,`/`}`/a quote, or -- after `scan_surface` strips quoting -- the next
 # shell word).
 _MCP_AA_NO_OP = (r"(?!\s*(?:or\b|//|[=!]=|[<>]=?\s*(?:true|false|null|\d|\[|[\"'.])"
-                 r"|[+*%]))")
+                 r"|[+*%]|\|(?!=)))")  # `false | not` (QA round 3)
 _MCP_AA_BOOL_SAFE = r"\s*(?:false|null)\b" + _MCP_AA_NO_OP
 _MCP_AA_LIST_SAFE = r"\s*(?:\[\s*\]|null\b)" + _MCP_AA_NO_OP
 # Key position: right after a quote (JSON, incl. a `\"`-escaped one once
@@ -3463,7 +3463,8 @@ SPONGE_RE = re.compile(r"\bsponge\b", re.IGNORECASE)
 #   claude ... config set [-g] enabledMcpjsonServers <not []/null>
 #   claude ... config add [-g] enabledMcpjsonServers <ANY value> (`add`
 #     appends a string, so even `null` names a server to approve)
-#   claude ... --settings <inline JSON carrying either key>
+#   claude ... --settings <inline JSON carrying either key> (tokenized with
+#     shlex in the rule itself, `_claude_mcp_aa_settings_args`)
 CLAUDE_CLI_TOKEN_RE = re.compile(r"\bclaude\b", re.IGNORECASE)
 CLAUDE_CONFIG_VERB_RE = re.compile(r"\bconfig\s+(set|add)\b", re.IGNORECASE)
 CLAUDE_MCP_AA_CLI_SET_BOOL_RE = re.compile(
@@ -3471,10 +3472,6 @@ CLAUDE_MCP_AA_CLI_SET_BOOL_RE = re.compile(
 CLAUDE_MCP_AA_CLI_SET_LIST_RE = re.compile(
     r"\benabledMcpjsonServers\b(?!\s*[\"']?" + _MCP_AA_LIST_SAFE + r")", re.IGNORECASE)
 CLAUDE_MCP_AA_CLI_ADD_LIST_RE = re.compile(r"\benabledMcpjsonServers\b", re.IGNORECASE)
-CLAUDE_SETTINGS_ARG_RE = re.compile(
-    r"\s--settings(?:=|\s+)(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\"|(\S+))",
-    re.IGNORECASE,
-)
 
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:

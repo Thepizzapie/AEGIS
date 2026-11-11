@@ -6530,7 +6530,7 @@ def _claude_mcp_aa_settings_args(cmd: str, _depth: int = 0) -> list:
         if patterns.CLAUDE_CLI_TOKEN_RE.search(t) and "--settings" in t and " " in t and _depth < 3:
             inner = _claude_mcp_aa_settings_args(t, _depth + 1)
             out.extend(inner or [])
-        if re.search(r"(?:^|[/\\])(?:claude|claude-code)$", t, re.IGNORECASE):
+        if patterns.CLAUDE_CLI_TOKEN_RE.search(t):
             in_claude = True
         elif in_claude and t == "--settings":
             want = True
@@ -6551,7 +6551,11 @@ def _claude_mcp_aa_settings_hit(raw: str, norm: str) -> bool:
     # `scan_surface` = raw + quote-stripped copy (+ decoded forms): more
     # `--settings` than those two copies account for means a decoded or
     # quote-split one this tokenizer never saw.
-    fallback = args is None or norm.count("--settings") > 2 * raw.count("--settings")
+    # ... or fewer arguments collected than `--settings` flags in the raw
+    # command: a claude binary the tokenizer didn't recognise (`$(which
+    # claude)`, `$c`, `node .../cli.js` -- QA round 3 regression).
+    fallback = (args is None or norm.count("--settings") > 2 * raw.count("--settings")
+                or len(args) < raw.count("--settings"))
     for arg in args or []:
         if _CLAUDE_MCP_AA_DYNAMIC_RE.search(arg):
             fallback = True
@@ -6577,12 +6581,28 @@ _CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE = re.compile(
     + r"|" + _K_B + r"[\"']?\s*:" + patterns._MCP_AA_BOOL_SAFE
     + r"|" + _K_L + r"[\"']?\s*:" + patterns._MCP_AA_LIST_SAFE
     + r"|\bdel\s*\(\s*\.?\[?\s*[\"']?(?:" + _K_B + r"|" + _K_L + r")[\"']?\s*\]?\s*\)"
-    + r"|(?:" + _K_B + r"|" + _K_L + r")" + _JQ_IDX2 + r"[=!]="
-    # a plain read: `.k`, `.k | ...`, `.k)` -- not `.k?`/`.k =`/`.k:`
-    + r"|\.(?:" + _K_B + r"|" + _K_L + r")(?=\s*(?:\|(?!=)|\)|,|;|['\"](?:\s|$)|$)|\s+[^\s=|:?+*/%<>!-])",
+    + r"|(?:" + _K_B + r"|" + _K_L + r")" + _JQ_IDX2 + r"[=!]=",
     re.IGNORECASE)
-_CLAUDE_MCP_AA_JQ_FRAGMENT_RE = re.compile(
-    r"enableAll|ProjectMcp|enabledMcp|McpjsonServers|McpServers", re.IGNORECASE)
+# A plain read (`.k`, `.["k"]`, `.k?`) is safe ONLY in a segment with no
+# assignment and no path-manipulating builtin: `(.k, .foo) |= true` and
+# `path(.k) as $p | setpath($p; true)` use the same text as a PATH (QA
+# round 3).
+_CLAUDE_MCP_AA_JQ_READ_SPAN_RE = re.compile(
+    r"\.\s*\[?\s*[\"']?(?:" + _K_B + r"|" + _K_L + r")[\"']?\s*\]?\??", re.IGNORECASE)
+_CLAUDE_MCP_AA_JQ_PATHY_RE = re.compile(
+    patterns._MCP_AA_JQ_OP + r"|\b(?:setpath|getpath|path|paths|leaf_paths|with_entries|"
+    r"from_entries|to_entries|reduce|foreach|walk|input|inputs)\b", re.IGNORECASE)
+# Case-SENSITIVE camelCase fragments of the two keys (the setting names are
+# case-sensitive JSON keys): a bare `McpServers`/`mcpServers` -- `.mcp.json`'s
+# own top-level key -- is not one (QA round 3 false positive).
+_CLAUDE_MCP_AA_JQ_FRAGMENT_RE = re.compile(r"enableAll|ProjectMcp|enabledMcp|McpjsonServers")
+
+
+def _claude_mcp_aa_jq_fragment_left(seg: str) -> bool:
+    rest = _CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE.sub(" ", seg)
+    if not _CLAUDE_MCP_AA_JQ_PATHY_RE.search(rest):
+        rest = _CLAUDE_MCP_AA_JQ_READ_SPAN_RE.sub(" ", rest)
+    return bool(_CLAUDE_MCP_AA_JQ_FRAGMENT_RE.search(rest))
 
 
 def _claude_mcp_aa_jq_hit(norm: str) -> bool:
@@ -6593,8 +6613,7 @@ def _claude_mcp_aa_jq_hit(norm: str) -> bool:
         if patterns.JQ_TOKEN_RE.search(seg) and (
                 patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_ASSIGN_RE.search(seg)
                 or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(seg)
-                or _CLAUDE_MCP_AA_JQ_FRAGMENT_RE.search(
-                    _CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE.sub(" ", seg))):
+                or _claude_mcp_aa_jq_fragment_left(seg)):
             return True
     return False
 
@@ -6694,7 +6713,17 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     segment and gating any key fragment left over; a RecursionError on
     deeply nested JSON; and false positives on explicit safe ``--settings``/
     ``config set ... '[]'`` values and on an Edit adding a permission rule
-    that names the key -- all fixed. Round 3 verified the fixes.
+    that names the key -- all fixed. Round 3 failed it on a regression from
+    the round-2 tokenizer (a claude binary spelled ``claude.exe``, ``$(which
+    claude)``, ``$c``, ``node .../cli.js`` was never recognised, so its
+    ``--settings`` went unchecked), now closed by falling back to the
+    whole-command scan whenever fewer arguments were collected than
+    ``--settings`` flags exist; jq path expressions hidden by the plain-read
+    exemption (``(.k, .x) |= true``, ``path(.k) as $p | setpath($p; ...)``),
+    now exempt only in a segment with no assignment/path builtin; ``false |
+    not`` read as a safe literal; and a case-insensitive ``McpServers``
+    fragment that flagged ordinary ``.mcp.json`` reads -- all fixed. Round 4
+    verified the fixes.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key

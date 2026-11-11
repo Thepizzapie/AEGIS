@@ -633,3 +633,29 @@ def test_r2_deeply_nested_json_does_not_crash():
 def test_r2_edit_adding_permission_rule_naming_key_not_gated():
     d = evaluate(_edit(LOCAL, '["Bash(grep enableAllProjectMcpServers:*)",', old_string="["), EMPTY)
     assert not _gated(d)
+
+
+# ---- QA round 3 regressions -----------------------------------------------------
+
+_J = "'{\"enableAllProjectMcpServers\":true}'"
+
+
+def test_r3_settings_unrecognised_claude_binary_gated():
+    for pre in ("`which claude`", "$(which claude)", "claude.exe",
+                "node node_modules/@anthropic-ai/claude-code/cli.js", "c=claude; $c"):
+        assert _ours(evaluate(_shell(f"{pre} --settings {_J}"), EMPTY)), pre
+
+
+def test_r3_jq_path_expression_and_not_value_gated():
+    for prog in ("(.enableAllProjectMcpServers, .foo) |= true",
+                 "path(.enableAllProjectMcpServers) as $p | setpath($p; true)",
+                 '. + {"enableAllProjectMcpServers": false | not}',
+                 ". + {enableAllProjectMcpServers: null | not}"):
+        d = evaluate(_shell(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), EMPTY)
+        assert _ours(d), prog
+
+
+def test_r3_mcp_servers_read_and_alt_read_not_this_guard():
+    for cmd in (f"jq -r '.mcpServers | keys[]' .mcp.json > servers.txt && cat {LOCAL}",
+                f"jq '.enableAllProjectMcpServers // false' {LOCAL} > /tmp/x"):
+        assert rules.rule_claude_mcp_autoapprove_protect(_shell(cmd), EMPTY) is None, cmd
