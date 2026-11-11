@@ -6718,9 +6718,18 @@ def _claude_mcp_aa_jq_prog_hit(prog: str, extra: str) -> bool:
 # In-place structured-data editors that write the file themselves, with no
 # redirect/sponge for the shared write-verb lists to see (QA round 5).
 # Single `[^...]*` gap, segment-bounded: linear.
+#
+# Plus ANY scripting-runtime invocation in a command that names the settings
+# file: a script fed by heredoc or stdin (`python3 - <<'EOF'`, `cat <<EOF |
+# node`, `echo ... | ruby`) or run by bun/deno has no `-c`/`-e` flag for
+# `INPLACE_WRITE_RE` to see, yet is the most common way an agent edits JSON
+# (QA round 6). The key-fragment check that follows keeps this from asking on
+# a script that never touches either key.
 _CLAUDE_MCP_AA_EXTRA_WRITER_RE = re.compile(
     r"\byq\b[^|;&\n]*\s(?:-i|--inplace)\b|\byq\b[^|;&\n]*\s-\w*i\b"
-    r"|\bdasel\b[^|;&\n]*\bput\b|\bjson\b[^|;&\n]*\s-I\b",
+    r"|\bdasel\b[^|;&\n]*\bput\b|\bjson\b[^|;&\n]*\s-I\b"
+    r"|\b(?:python(?:\d+(?:\.\d+)?)?|pypy\d*|node|nodejs|bun|deno|tsx|ts-node|ruby|perl|php|"
+    r"lua|luajit|Rscript|pwsh|powershell|osascript|groovy|jshell)\b",
     re.IGNORECASE)
 
 
@@ -6872,7 +6881,13 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     fixed (the path/writer checks now also read the raw command; over 20KB
     the shlex extractor is skipped for the conservative whole-command
     fragment check). The truncation itself is shared by every shell rule in
-    this file and is not this guard's to fix. Round 6 verified the fixes.
+    this file and is not this guard's to fix. Round 6 (asked to judge
+    solidity against realistic agent behaviour) found one high-plausibility
+    gap: an interpreter script fed by heredoc/stdin (``python3 - <<'EOF'``,
+    ``cat <<EOF | node``) or run by bun/deno -- no ``-c``/``-e`` flag for
+    the write-verb lists -- now covered by treating any scripting-runtime
+    invocation as a potential writer, with the key-fragment check deciding.
+    Round 7 verified the fix.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key
@@ -6892,6 +6907,9 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     neither key -- the deliberate cost of the allowlist posture; a value-
     only text substitution that never names the key (``sed 's/: false/:
     true/' ... | sponge``) is not caught;
+    a script FILE written earlier and then run (``python3 edit.py``) --
+    the key text lives in the file, not the command -- is not caught, the
+    same split-across-calls bound every sibling guard accepts;
     a partial anchor on the shared ``...McpjsonServers`` suffix asks
     even when the file's key is actually ``disabledMcpjsonServers``;
     ``claude --settings <file>`` pointing at a separately-written JSON file

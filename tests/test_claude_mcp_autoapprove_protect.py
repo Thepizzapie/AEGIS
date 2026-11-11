@@ -739,3 +739,30 @@ def test_r5_front_padding_past_scan_surface_limit_gated():
     t = time.time()
     assert _rule(cmd)
     assert time.time() - t < 0.5
+
+
+# ---- QA round 6 regressions -----------------------------------------------------
+
+_PY_BODY = ("import json\np='.claude/settings.local.json'\nd=json.load(open(p))\n"
+            "d['enableAllProjectMcpServers']=True\nopen(p,'w').write(json.dumps(d))\n")
+
+
+def test_r6_interpreter_heredoc_and_stdin_gated():
+    for cmd in (f"python3 - <<'EOF'\n{_PY_BODY}EOF",
+                f"python3 <<'EOF'\n{_PY_BODY}EOF",
+                f"cat <<'EOF' | python3\n{_PY_BODY}EOF",
+                "node <<'EOF'\nconst fs=require('fs');const p='.claude/settings.local.json';"
+                "const d=JSON.parse(fs.readFileSync(p));d.enableAllProjectMcpServers=true;"
+                "fs.writeFileSync(p,JSON.stringify(d));\nEOF",
+                "bun -e \"const p='.claude/settings.local.json';const d=await Bun.file(p).json();"
+                "d.enabledMcpjsonServers=['evil'];await Bun.write(p,JSON.stringify(d))\"",
+                "deno eval \"const p='.claude/settings.local.json';const d=JSON.parse(Deno.readTextFileSync(p));"
+                "d.enableAllProjectMcpServers=true;Deno.writeTextFileSync(p,JSON.stringify(d))\""):
+        assert _ours(evaluate(_shell(cmd), EMPTY)), cmd[:40]
+
+
+def test_r6_interpreter_touching_other_keys_not_gated():
+    body = _PY_BODY.replace("d['enableAllProjectMcpServers']=True", "d['model']='opus'")
+    assert not _gated(evaluate(_shell(f"python3 - <<'EOF'\n{body}EOF"), EMPTY))
+    body2 = _PY_BODY.replace("=True", "=False")
+    assert not _ours(evaluate(_shell(f"python3 - <<'EOF'\n{body2}EOF"), EMPTY))
