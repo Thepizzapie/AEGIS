@@ -659,3 +659,50 @@ def test_r3_mcp_servers_read_and_alt_read_not_this_guard():
     for cmd in (f"jq -r '.mcpServers | keys[]' .mcp.json > servers.txt && cat {LOCAL}",
                 f"jq '.enableAllProjectMcpServers // false' {LOCAL} > /tmp/x"):
         assert rules.rule_claude_mcp_autoapprove_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 4 regressions (structural jq judgement) ---------------------------
+
+def _rule(cmd):
+    return rules.rule_claude_mcp_autoapprove_protect(_shell(cmd), EMPTY)
+
+
+def test_r4_jq_truthy_operand_forms_gated():
+    for prog in ('.enabledMcpjsonServers = [] - [] + ["evil"]',
+                 ".enableAllProjectMcpServers = false as $x | true",
+                 ".enableAllProjectMcpServers = false and false or true"):
+        assert _rule(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), prog
+    assert _ours(evaluate(_shell(
+        f"jq '.enabledMcpjsonServers = null as $n | [\"evil\"]' {LOCAL} > t && mv t {LOCAL}"), EMPTY))
+
+
+def test_r4_jq_dynamic_key_construction_gated():
+    for prog in ('.["enable"+"AllProject"+"McpServers"] = true',
+                 '.["en"+"ableAllPro"+"jectMcpSer"+"vers"] = true',
+                 '.["enabled"+"Mcpjson"+"Servers"] = ["evil"]',
+                 '. + ("eyJ4IjoxfQ=="|@base64d|fromjson)',
+                 '. + ([["enableAllProjectMcpServers", true]] | map({key: .[0], value: .[1]}) | from_entries)'):
+        assert _rule(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), prog
+    assert _rule(f"jq --arg a enable --arg b AllProject '.[$a+$b+\"McpServers\"]=true' {LOCAL} | sponge {LOCAL}")
+
+
+def test_r4_settings_binary_never_spelling_claude_gated():
+    for pre in ("~/.local/bin/cl?ude", "/usr/local/bin/cla*"):
+        assert _rule(f"{pre} --settings '{{\"enableAllProjectMcpServers\":true}}' -p hi"), pre
+
+
+def test_r4_non_jq_writers_gated():
+    for cmd in (f"python3 -c 'import json;d=json.load(open(\"{LOCAL}\"));"
+                f"d[\"enableAll\"+\"ProjectMcpServers\"]=True;print(json.dumps(d))' | sponge {LOCAL}",
+                f"sed 's/\"model\"/\"enableAllProjectMcpServers\"/' {LOCAL} | sponge {LOCAL}"):
+        assert _rule(cmd), cmd
+
+
+def test_r4_ordinary_settings_writes_not_gated():
+    for cmd in (f"n=$(jq '.enabledMcpjsonServers|length' {LOCAL}); echo $n > /tmp/out",
+                f"jq --arg m opus '.model = $m' {LOCAL} | sponge {LOCAL}",
+                f"jq '.permissions.allow += [\"Bash(ls)\", \"Bash(cat)\"]' {LOCAL} | sponge {LOCAL}",
+                f"jq '.disabledMcpjsonServers += [\"x\"]' {LOCAL} | sponge {LOCAL}",
+                f"echo '{{\"enableAllProjectMcpServers\": false}}' | sponge {LOCAL}",
+                f"cat {LOCAL} | sponge {LOCAL}"):
+        assert _rule(cmd) is None, cmd

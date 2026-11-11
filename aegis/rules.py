@@ -6545,7 +6545,7 @@ def _claude_mcp_aa_settings_hit(raw: str, norm: str) -> bool:
     argument, or a ``--settings`` that only appears in `scan_surface`'s
     decoded forms) runs at most once (QA round 2 found it re-run per
     argument, quadratic)."""
-    if "--settings" not in norm or not patterns.CLAUDE_CLI_TOKEN_RE.search(norm):
+    if "--settings" not in norm:
         return False
     args = _claude_mcp_aa_settings_args(raw)
     # `scan_surface` = raw + quote-stripped copy (+ decoded forms): more
@@ -6598,24 +6598,133 @@ _CLAUDE_MCP_AA_JQ_PATHY_RE = re.compile(
 _CLAUDE_MCP_AA_JQ_FRAGMENT_RE = re.compile(r"enableAll|ProjectMcp|enabledMcp|McpjsonServers")
 
 
-def _claude_mcp_aa_jq_fragment_left(seg: str) -> bool:
-    rest = _CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE.sub(" ", seg)
+# ---- jq / other shell writers of settings.local.json -----------------------
+# Rounds 1-4 of QA showed that a DENYLIST of unsafe jq value expressions
+# never converges (`false or true`, `false | not`, `[] - [] + [...]`,
+# `false as $x | true`, `and ... or`, ...) nor does a list of key-
+# construction tricks (`"a"+"b"`, `--arg`, `\(...)`, `@base64d`, `path()`
+# + `setpath`, ...). So each jq PROGRAM is extracted with shlex and judged
+# structurally, allowlist-style: a settings-writing jq program passes only
+# if (1) it uses no dynamic key construction or path builtin at all, and
+# (2) after removing every recognised SAFE use of a key -- an explicit
+# `false`/`null`/`[]` followed by a STRICT terminator (`)`, `,`, `}`, `]`,
+# `;`, end), `del(.k)`, a comparison, or (in a program with no assignment)
+# a plain read -- no fragment of either key name is left.
+_MCP_AA_STRICT_END = r"(?=\s*(?:$|[),}\];]))"
+_MCP_AA_BOOL_STRICT = r"\s*(?:false|null)" + _MCP_AA_STRICT_END
+_MCP_AA_LIST_STRICT = r"\s*(?:\[\s*\]|null)" + _MCP_AA_STRICT_END
+_CLAUDE_MCP_AA_JQ_STRICT_SAFE_RE = re.compile(
+    r"disabledMcpjsonServers"
+    r"|\.?\[?\s*[\"']?" + _K_B + r"[\"']?\s*\]?\s*(?:\|=|(?<![!<>=])=(?!=))" + _MCP_AA_BOOL_STRICT
+    + r"|\.?\[?\s*[\"']?" + _K_L + r"[\"']?\s*\]?\s*(?:\|=|(?<![!<>=])=(?!=))" + _MCP_AA_LIST_STRICT
+    + r"|[\"']?" + _K_B + r"[\"']?\s*:" + _MCP_AA_BOOL_STRICT
+    + r"|[\"']?" + _K_L + r"[\"']?\s*:" + _MCP_AA_LIST_STRICT
+    + r"|\bdel\s*\(\s*\.?\[?\s*[\"']?(?:" + _K_B + r"|" + _K_L + r")[\"']?\s*\]?\s*\)"
+    + r"|\.?\[?\s*[\"']?(?:" + _K_B + r"|" + _K_L + r")[\"']?\s*\]?\s*[=!]=",
+    re.IGNORECASE)
+# Constructs that can PRODUCE a key name the text never spells out, or set
+# a path computed at runtime: an index that is not a plain literal
+# (`.[$k]`, `.["a"+"b"]`), a computed object key (`{(expr): ...}`), string
+# interpolation (`"enableAll\\(...)"`), decoders that turn data into a
+# string/object (`@base64d`, `implode`, `fromjson`), and path/entry
+# builtins. A plain `$var` used as a VALUE (`--arg m opus '.model = $m'`)
+# is not one of them and passes.
+_CLAUDE_MCP_AA_JQ_DYNAMIC_RE = re.compile(
+    r"(?<=[.\]\w?])\[(?!\s*(?:\"[^\"\\]*\"|'[^']*'|-?\d+)?\s*\])"
+    r"|[{,]\s*\("
+    r"|\\\("
+    r"|@base64d|\b(?:implode|fromjson|setpath|getpath|path|paths|leaf_paths|delpaths|"
+    r"with_entries|from_entries|to_entries|reduce|foreach|walk|add|input|inputs|pick|"
+    r"import|include|def)\b",
+    re.IGNORECASE)
+_CLAUDE_MCP_AA_JQ_FRAG_RE = re.compile(
+    r"enableAll|ProjectMcp|enabledMcp|McpjsonServers|(?<![\w.])McpServers")
+_CLAUDE_MCP_AA_JQ_BIN_RE = re.compile(r"(?:^|[^\w-])(?:(?:go)?jq|jaq)\)*$", re.IGNORECASE)
+_JQ_OPTS_2 = {"--arg", "--argjson", "--slurpfile", "--rawfile"}
+_JQ_OPTS_1 = {"--indent", "-L", "--seq-sep"}
+_JQ_OPTS_DYN = {"-f", "--from-file", "--args", "--jsonargs"}
+
+
+def _claude_mcp_aa_jq_programs(raw: str, _depth: int = 0):
+    """(programs, complete) for every jq invocation in ``raw``. Each program
+    is (text, extra) -- ``extra`` holds ``--arg`` values, scanned for key
+    fragments too. ``complete`` is False when tokenizing failed, a program
+    file (``-f``) is used, or fewer invocations were parsed than ``jq``
+    tokens appear (an unrecognised spelling), so the caller falls back to a
+    conservative whole-command fragment check."""
+    try:
+        lex = shlex.shlex(raw, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return [], False
+    progs, complete, n = [], True, 0
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if _depth < 3 and " " in t and patterns.JQ_TOKEN_RE.search(t):
+            inner, ok = _claude_mcp_aa_jq_programs(t, _depth + 1)
+            progs.extend(inner)
+            complete = complete and ok
+        if _CLAUDE_MCP_AA_JQ_BIN_RE.search(t):
+            n += 1
+            extra, j, prog = [], i + 1, None
+            while j < len(toks) and not set(toks[j]) <= set(";|&()\n"):
+                o = toks[j]
+                if o in _JQ_OPTS_2:
+                    extra.extend(toks[j + 1:j + 3]); j += 3; continue
+                if o in _JQ_OPTS_1:
+                    j += 2; continue
+                if o in _JQ_OPTS_DYN or (o.startswith("-") and not o.startswith("--") and "f" in o):
+                    complete = False; j += 1; continue
+                if o.startswith("-") and o != "-":
+                    j += 1; continue
+                prog = o
+                break
+            if prog is None:
+                complete = False
+            else:
+                progs.append((prog, " ".join(extra)))
+            i = j
+        i += 1
+    if n < len(patterns.JQ_TOKEN_RE.findall(raw)):
+        complete = False
+    return progs, complete
+
+
+def _claude_mcp_aa_jq_prog_hit(prog: str, extra: str) -> bool:
+    text = _claude_cred_helper_normalize(prog)
+    if _CLAUDE_MCP_AA_JQ_DYNAMIC_RE.search(text):
+        return True
+    if (patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_ASSIGN_RE.search(text)
+            or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(text)):
+        return True
+    rest = _CLAUDE_MCP_AA_JQ_STRICT_SAFE_RE.sub(" ", text)
     if not _CLAUDE_MCP_AA_JQ_PATHY_RE.search(rest):
         rest = _CLAUDE_MCP_AA_JQ_READ_SPAN_RE.sub(" ", rest)
-    return bool(_CLAUDE_MCP_AA_JQ_FRAGMENT_RE.search(rest))
+    return bool(_CLAUDE_MCP_AA_JQ_FRAG_RE.search(rest) or _CLAUDE_MCP_AA_JQ_FRAG_RE.search(extra))
 
 
-def _claude_mcp_aa_jq_hit(norm: str) -> bool:
-    """One plain search per `;`-separated segment that contains a jq token:
-    an unsafe jq assignment, or an unsafe key/value literal (jq object-merge
-    form). Linear, unlike a lookahead anchored at every `jq` token."""
-    for seg in norm.split(";"):
-        if patterns.JQ_TOKEN_RE.search(seg) and (
-                patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_ASSIGN_RE.search(seg)
-                or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(seg)
-                or _claude_mcp_aa_jq_fragment_left(seg)):
-            return True
-    return False
+def _claude_mcp_aa_shell_write_hit(raw: str, norm: str) -> bool:
+    """A shell command already known to touch AND write settings.local.json."""
+    unesc = norm.replace('\\"', '"')
+    if patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(unesc):
+        return True
+    progs, complete = _claude_mcp_aa_jq_programs(raw)
+    if any(_claude_mcp_aa_jq_prog_hit(p, x) for p, x in progs):
+        return True
+    if complete:
+        rest = raw
+        for p, _ in progs:
+            rest = rest.replace(p, " ")
+        # quote-split / encoded forms of what is left (non-jq writers:
+        # python, sed | sponge, echo | sponge, ...)
+        rest = normalize.scan_surface(rest)
+    else:
+        rest = unesc
+    rest = _CLAUDE_MCP_AA_JQ_STRICT_SAFE_RE.sub(" ", _claude_cred_helper_normalize(rest))
+    rest = _CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE.sub(" ", rest)
+    return bool(_CLAUDE_MCP_AA_JQ_FRAG_RE.search(rest))
 
 
 def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -6723,7 +6832,18 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     now exempt only in a segment with no assignment/path builtin; ``false |
     not`` read as a safe literal; and a case-insensitive ``McpServers``
     fragment that flagged ordinary ``.mcp.json`` reads -- all fixed. Round 4
-    verified the fixes.
+    failed it again on yet more jq value expressions (``[] - [] + [...]``,
+    ``false as $x | true``, ``and ... or``) and key construction from three
+    or more string pieces, plus a ``--settings`` whose binary never spells
+    "claude" (``cl?ude``). That showed the jq DENYLIST would not converge,
+    so the jq path was redesigned allowlist-style: every jq program is
+    extracted with `shlex` and passes only if it uses no dynamic key/path
+    construction at all and, after removing every recognised safe key use
+    (an explicit ``false``/``null``/``[]`` followed by a STRICT terminator,
+    ``del``, a comparison, or a plain read in an assignment-free program),
+    no fragment of either key name remains; non-jq writers (``python -c``,
+    ``sed | sponge``, ``echo | sponge``) get the same fragment check on the
+    rest of the command. Round 5 verified the redesign.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key
@@ -6737,6 +6857,12 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     ``ableAllProjectMcpServ``), which likewise needs a planted near-key;
     any Edit whose ``new_string`` merely starts with ``s": true``-style
     text asks unnecessarily (the short-suffix check's accepted cost);
+    a settings-writing jq program using ANY dynamic construct (a non-
+    literal index, ``{(expr): ...}``, string interpolation, ``@base64d``,
+    ``setpath``/``with_entries``/``reduce``/...) asks even when it touches
+    neither key -- the deliberate cost of the allowlist posture; a value-
+    only text substitution that never names the key (``sed 's/: false/:
+    true/' ... | sponge``) is not caught;
     a partial anchor on the shared ``...McpjsonServers`` suffix asks
     even when the file's key is actually ``disabledMcpjsonServers``;
     ``claude --settings <file>`` pointing at a separately-written JSON file
@@ -6810,9 +6936,7 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
                                   or patterns.FORCED_LINK_WRITE_RE.search(cmd)
                                   or patterns.SPONGE_RE.search(cmd))
                 if write_verb:
-                    unesc = norm.replace('\\"', '"')
-                    file_hit = bool(_claude_mcp_aa_jq_hit(unesc)
-                                    or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(unesc))
+                    file_hit = _claude_mcp_aa_shell_write_hit(_cmd(ev), norm)
         if not (cli_hit or file_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_MCP_AUTOAPPROVE")

@@ -3426,7 +3426,7 @@ _CLAUDE_MCP_AUTOAPPROVE_KEY_ALT = "|".join(CLAUDE_MCP_AUTOAPPROVE_KEYS)
 # (`,`/`}`/a quote, or -- after `scan_surface` strips quoting -- the next
 # shell word).
 _MCP_AA_NO_OP = (r"(?!\s*(?:or\b|//|[=!]=|[<>]=?\s*(?:true|false|null|\d|\[|[\"'.])"
-                 r"|[+*%]|\|(?!=)))")  # `false | not` (QA round 3)
+                 r"|[+*%-]|\|(?!=)|as\b|and\b))")  # `| not` (r3); `-`, `as`, `and` (r4)
 _MCP_AA_BOOL_SAFE = r"\s*(?:false|null)\b" + _MCP_AA_NO_OP
 _MCP_AA_LIST_SAFE = r"\s*(?:\[\s*\]|null\b)" + _MCP_AA_NO_OP
 # Key position: right after a quote (JSON, incl. a `\"`-escaped one once
