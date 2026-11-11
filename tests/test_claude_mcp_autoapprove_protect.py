@@ -809,3 +809,12 @@ def test_r8_patch_apply_from_heredoc_gated():
 def test_r8_patch_apply_other_key_not_gated():
     diff = _DIFF.replace('"enableAllProjectMcpServers": true', '"model": "opus"')
     assert not _gated(evaluate(_shell(f"git apply <<'EOF'\n{diff}EOF"), EMPTY))
+
+
+# ---- QA round 9 (low) -----------------------------------------------------------
+
+def test_r9_settings_file_written_in_same_command_gated():
+    for cmd in ("echo '{\"enableAllProjectMcpServers\":true}' > /tmp/s.json && claude --settings /tmp/s.json -p go",
+                "cat > /tmp/s.json <<'EOF'\n{\"enabledMcpjsonServers\": [\"evil\"]}\nEOF\nclaude --settings /tmp/s.json -p go"):
+        assert _rule(cmd), cmd[:40]
+    assert _rule("echo '{\"model\":\"x\"}' > /tmp/s.json && claude --settings /tmp/s.json -p go") is None

@@ -6562,6 +6562,12 @@ def _claude_mcp_aa_settings_hit(raw: str, norm: str) -> bool:
     for arg in args or []:
         if _CLAUDE_MCP_AA_DYNAMIC_RE.search(arg):
             fallback = True
+        elif (not arg.lstrip().startswith("{") and len(arg) > 2
+              and raw.count(arg) > 1):
+            # a settings FILE written in this same command and then passed
+            # (`echo '{...}' > /tmp/s.json && claude --settings /tmp/s.json`,
+            # QA round 9): scan what was written.
+            fallback = True
         elif patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(_claude_cred_helper_normalize(arg)):
             return True
     if fallback:
@@ -6900,7 +6906,12 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     regex -- fixed: for a scripting-runtime command, either path part is
     enough. Round 8 found a unified diff applied from a heredoc (``git
     apply``/``patch``/``apply_patch``) was on no write-verb list -- now
-    one, with the diff body's key/value deciding. Round 9 verified the fix.
+    one, with the diff body's key/value deciding. Round 9 passed (no
+    high/medium findings); its one cheap low finding -- a ``--settings``
+    file written in the SAME command -- was closed, and its other low
+    finding (a path assembled from a shell variable, or a bare filename
+    after a ``cd`` in an EARLIER Bash call) is shared with every sibling
+    guard for this file and is disclosed below.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key
@@ -6928,6 +6939,10 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     safe-use stripping knows jq/JSON shapes only; a script whose path is
     split finer than ``.claude`` / ``settings.local`` (``'settings' +
     '.local.json'`` with no ``.claude`` anywhere) is not caught;
+    a path assembled from a shell variable (``D=.claude; ... > $D/settings
+    .local.json``) or a bare ``settings.local.json`` write after a ``cd``
+    made in an EARLIER Bash call (the shell's cwd persists) -- shared with
+    every sibling guard for this file;
     a partial anchor on the shared ``...McpjsonServers`` suffix asks
     even when the file's key is actually ``disabledMcpjsonServers``;
     ``claude --settings <file>`` pointing at a separately-written JSON file
