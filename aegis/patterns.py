@@ -3390,6 +3390,77 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- Claude Code project-MCP auto-approval protection (.claude/settings.local.json) ---
+# A FIFTH distinct surface in the same file `CLAUDE_LOCAL_SETTINGS_PATH_RE`
+# locates, alongside `hooks`/`statusLine`/`permissions.defaultMode`/`env`/the
+# credential-helper keys -- but a different SHAPE from all of them: these two
+# keys don't name a command at all, they switch off the human checkpoint
+# standing in front of commands someone ELSE already named. Claude Code reads
+# project-scoped MCP servers from a committed `.mcp.json` and, before spawning
+# any of them, shows a one-time "this project wants to use these MCP servers --
+# approve?" prompt. Two documented settings answer that prompt in advance:
+#   - enableAllProjectMcpServers: true  -- auto-approve EVERY server in
+#     `.mcp.json`, including ones added to it later (by a teammate's PR, an
+#     upstream compromise, a cloned malicious repo);
+#   - enabledMcpjsonServers: ["name", ...] -- auto-approve the named ones.
+# Each approved stdio server's `command`/`args` is spawned by Claude Code
+# itself at the next session start, outside the tool-call loop Aegis's own
+# PreToolUse hook evaluates -- the Claude-Code analog of VS Code's
+# `task.allowAutomaticTasks: "on"` (`VSCODE_TASKS_ALLOW_AUTO_RE`), one runtime
+# over. `rule_mcp_config_protect` gates writes to `.mcp.json` itself, but a
+# `.mcp.json` that arrived with the repo was never written by this agent at all.
+#
+# VALUE-gated, not key-gated: `false`/`null` for the boolean and `[]`/`null`
+# for the list are the safe, explicit "keep prompting" shapes and stay allowed;
+# any other value (including a value cut off at the end of an Edit fragment)
+# is treated as an approval. Optional quotes around the key so the same regex
+# also catches jq's bareword object-merge form (`. + {enableAllProjectMcpServers:
+# true}`), the exact gap `rule_claude_cred_helper_protect`'s QA history
+# disclosed for its own key set.
+CLAUDE_MCP_AUTOAPPROVE_KEYS = ("enableAllProjectMcpServers", "enabledMcpjsonServers")
+_CLAUDE_MCP_AUTOAPPROVE_KEY_ALT = "|".join(CLAUDE_MCP_AUTOAPPROVE_KEYS)
+_MCP_AA_BOOL_SAFE = r"(?:false|null)\b"
+_MCP_AA_LIST_SAFE = r"(?:\[\s*\]|null\b)"
+CLAUDE_MCP_AUTOAPPROVE_VALUE_RE = re.compile(
+    r"(?<![\w$])[\"']?enableAllProjectMcpServers[\"']?\s*:(?!\s*" + _MCP_AA_BOOL_SAFE + r")"
+    r"|(?<![\w$])[\"']?enabledMcpjsonServers[\"']?\s*:(?!\s*" + _MCP_AA_LIST_SAFE + r")",
+    re.IGNORECASE,
+)
+
+# jq assignment to either key with an unsafe right-hand side: `.k = true`,
+# `.["k"] |= not`, `.k += ["evil"]`, `.k[0] = "evil"`; plus `setpath(["k"]; ...)`
+# (no assignment operator at all). `del(.k)`, `.k == true`, `.k = false`,
+# `.k = []` stay allowed. `;`-scoped, unbounded lookahead from the jq token --
+# the same shape `CLAUDE_CRED_HELPER_JQ_RE` ships (see its comment for the
+# jq-`#`-comment-padding reason a fixed window is wrong here).
+_MCP_AA_JQ_IDX = r"(?:[\"'\]]|\[\s*-?\d*\s*\])*\s*"
+_MCP_AA_JQ_UNSAFE = (
+    r"\benableAllProjectMcpServers" + _MCP_AA_JQ_IDX
+    + r"(?:\|=|\+=|(?<![!<>=])=(?!=))(?!\s*" + _MCP_AA_BOOL_SAFE + r")"
+    r"|\benabledMcpjsonServers" + _MCP_AA_JQ_IDX
+    + r"(?:\|=|\+=|(?<![!<>=])=(?!=))(?!\s*" + _MCP_AA_LIST_SAFE + r")"
+    r"|\bsetpath\s*\(\s*\[\s*[\"'](?:" + _CLAUDE_MCP_AUTOAPPROVE_KEY_ALT + r")[\"']"
+)
+CLAUDE_MCP_AUTOAPPROVE_JQ_RE = re.compile(
+    r"\b(?:(?:go)?jq|jaq)\b"
+    r"(?=[^;]*(?:" + _MCP_AA_JQ_UNSAFE + r"|"
+    + CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.pattern + r"))",
+    re.IGNORECASE,
+)
+
+# CLI forms that set either key without any file write the Edit/Write hook
+# sees: `claude config set [-g] enableAllProjectMcpServers true`, `claude
+# config add enabledMcpjsonServers evil`, and an inline-JSON `claude
+# --settings '{"enableAllProjectMcpServers": true}'` launch of a nested
+# session (that nested session spawns every `.mcp.json` server unprompted).
+CLAUDE_MCP_AUTOAPPROVE_CLI_RE = re.compile(
+    r"\bclaude\b[^|;&\n]*\bconfig\s+(?:set|add)\b[^|;&\n]*"
+    r"(?:\benableAllProjectMcpServers\b(?!\s+[\"']?" + _MCP_AA_BOOL_SAFE + r")"
+    r"|\benabledMcpjsonServers\b(?!\s+[\"']?" + _MCP_AA_LIST_SAFE + r"))",
+    re.IGNORECASE,
+)
+CLAUDE_SETTINGS_FLAG_RE = re.compile(r"\bclaude\b[^|;&\n]*\s--settings\b", re.IGNORECASE)
+
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:
 # install_review forces a READ of a manifest before an install proceeds (guards
