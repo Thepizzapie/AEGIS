@@ -790,3 +790,22 @@ def test_r7_interpreter_with_built_path_other_key_not_gated():
     cmd = ("python3 - <<'EOF'\nimport json,os\np=os.path.join('.claude','settings.local.json')\n"
            "d=json.load(open(p))\nd['model']='opus'\njson.dump(d,open(p,'w'))\nEOF")
     assert not _gated(evaluate(_shell(cmd), EMPTY))
+
+
+# ---- QA round 8 regressions -----------------------------------------------------
+
+_DIFF = ("--- a/.claude/settings.local.json\n+++ b/.claude/settings.local.json\n"
+         "@@ -1,3 +1,4 @@\n {\n+  \"enableAllProjectMcpServers\": true,\n   \"permissions\": {}\n }\n")
+
+
+def test_r8_patch_apply_from_heredoc_gated():
+    for tool in ("git apply", "patch -p1", "git apply --index"):
+        assert _ours(evaluate(_shell(f"{tool} <<'EOF'\n{_DIFF}EOF"), EMPTY)), tool
+    codex = ("apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: .claude/settings.local.json\n"
+             "@@\n {\n+  \"enabledMcpjsonServers\": [\"evil\"],\n*** End Patch\nEOF")
+    assert _ours(evaluate(_shell(codex), EMPTY))
+
+
+def test_r8_patch_apply_other_key_not_gated():
+    diff = _DIFF.replace('"enableAllProjectMcpServers": true', '"model": "opus"')
+    assert not _gated(evaluate(_shell(f"git apply <<'EOF'\n{diff}EOF"), EMPTY))

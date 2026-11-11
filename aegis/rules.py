@@ -6733,6 +6733,7 @@ _CLAUDE_MCP_AA_EXTRA_WRITER_RE = re.compile(
     re.IGNORECASE)
 
 
+_CLAUDE_MCP_AA_APPLY_PATCH_RE = re.compile(r"\bapply_patch\b", re.IGNORECASE)
 _CLAUDE_MCP_AA_INTERP_RE = re.compile(
     r"\b(?:python(?:\d+(?:\.\d+)?)?|pypy\d*|node|nodejs|bun|deno|tsx|ts-node|ruby|perl|php|"
     r"lua|luajit|Rscript|pwsh|powershell|osascript|groovy|jshell)\b", re.IGNORECASE)
@@ -6897,7 +6898,9 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     (``os.path.join('.claude', 'settings.local.json')``, ``Path(...) /
     ...``, ``path.join(cwd, '.claude', ...)``), escaping the joined-path
     regex -- fixed: for a scripting-runtime command, either path part is
-    enough. Round 8 verified the fix.
+    enough. Round 8 found a unified diff applied from a heredoc (``git
+    apply``/``patch``/``apply_patch``) was on no write-verb list -- now
+    one, with the diff body's key/value deciding. Round 9 verified the fix.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key
@@ -7006,7 +7009,12 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
             if path_hit:
                 # Something has to WRITE the result: a read-only `jq` that
                 # merely projects the key to stdout is not gated (QA round 1).
-                write_verb = bool(_CLAUDE_MCP_AA_EXTRA_WRITER_RE.search(cmd)
+                # `git apply`/`patch`/`apply_patch` write the file themselves
+                # from a diff body (QA round 8).
+                write_verb = bool(patterns.GITMODULES_PATCH_APPLY_RE.search(cmd)
+                                  or patterns.GITMODULES_PATCH_APPLY_RE.search(raw)
+                                  or _CLAUDE_MCP_AA_APPLY_PATCH_RE.search(raw)
+                                  or _CLAUDE_MCP_AA_EXTRA_WRITER_RE.search(cmd)
                                   or _CLAUDE_MCP_AA_EXTRA_WRITER_RE.search(raw)
                                   or patterns.WRITE_REDIRECT_RE.search(cmd)
                                   or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
