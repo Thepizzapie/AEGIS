@@ -3419,52 +3419,60 @@ CLAUDE_CRED_HELPER_JQ_RE = re.compile(
 # disclosed for its own key set.
 CLAUDE_MCP_AUTOAPPROVE_KEYS = ("enableAllProjectMcpServers", "enabledMcpjsonServers")
 _CLAUDE_MCP_AUTOAPPROVE_KEY_ALT = "|".join(CLAUDE_MCP_AUTOAPPROVE_KEYS)
-_MCP_AA_BOOL_SAFE = r"(?:false|null)\b"
-_MCP_AA_LIST_SAFE = r"(?:\[\s*\]|null\b)"
+# A "keep prompting" value counts as safe only when it is not the left
+# operand of a jq operator that turns it truthy: `false or true`, `false //
+# true`, `false == false`, `false < true`, `null + 1`, `[] + ["evil"]` are
+# all NOT safe (QA round 1, bypass-hunting). Anything else may follow
+# (`,`/`}`/a quote, or -- after `scan_surface` strips quoting -- the next
+# shell word).
+_MCP_AA_NO_OP = (r"(?!\s*(?:or\b|//|[=!]=|[<>]=?\s*(?:true|false|null|\d|\[|[\"'.])"
+                 r"|[+*%]))")
+_MCP_AA_BOOL_SAFE = r"\s*(?:false|null)\b" + _MCP_AA_NO_OP
+_MCP_AA_LIST_SAFE = r"\s*(?:\[\s*\]|null\b)" + _MCP_AA_NO_OP
+# Key position: right after a quote (JSON, incl. a `\"`-escaped one once
+# unescaped), or after `{`/`,` (jq bareword object key). NOT after a space or
+# `(` -- so a permission rule such as `Bash(grep enableAllProjectMcpServers:*)`
+# is not read as the key (QA round 1 false positive).
+_MCP_AA_KEYPOS = r"(?:(?<=[\"'{,])|(?<=[{,]\s))"
 CLAUDE_MCP_AUTOAPPROVE_VALUE_RE = re.compile(
-    r"(?<![\w$])[\"']?enableAllProjectMcpServers[\"']?\s*:(?!\s*" + _MCP_AA_BOOL_SAFE + r")"
-    r"|(?<![\w$])[\"']?enabledMcpjsonServers[\"']?\s*:(?!\s*" + _MCP_AA_LIST_SAFE + r")",
+    _MCP_AA_KEYPOS + r"enableAllProjectMcpServers[\"']?\s*:(?!" + _MCP_AA_BOOL_SAFE + r")"
+    r"|" + _MCP_AA_KEYPOS + r"enabledMcpjsonServers[\"']?\s*:(?!" + _MCP_AA_LIST_SAFE + r")",
     re.IGNORECASE,
 )
 
-# jq assignment to either key with an unsafe right-hand side: `.k = true`,
-# `.["k"] |= not`, `.k += ["evil"]`, `.k[0] = "evil"`; plus `setpath(["k"]; ...)`
-# (no assignment operator at all). `del(.k)`, `.k == true`, `.k = false`,
-# `.k = []` stay allowed. `;`-scoped, unbounded lookahead from the jq token --
-# the same shape `CLAUDE_CRED_HELPER_JQ_RE` ships (see its comment for the
-# jq-`#`-comment-padding reason a fixed window is wrong here).
+# jq assignment to either key with an unsafe right-hand side: `=`, `|=`,
+# `+=`, `-=`, `*=`, `/=`, `%=`, `//=` (`.k //= true` sets a `false` key), and
+# `setpath(["k"]; ...)`. `==`/`!=`/`<=`/`>=` comparisons are not assignments.
+# Applied ONE `;`-separated shell segment at a time by the rule (a plain
+# `search`, no lookahead from every `jq` token), which keeps it linear --
+# the stacked-lookahead form was quadratic (QA round 1).
 _MCP_AA_JQ_IDX = r"(?:[\"'\]]|\[\s*-?\d*\s*\])*\s*"
-_MCP_AA_JQ_UNSAFE = (
-    r"\benableAllProjectMcpServers" + _MCP_AA_JQ_IDX
-    + r"(?:\|=|\+=|(?<![!<>=])=(?!=))(?!\s*" + _MCP_AA_BOOL_SAFE + r")"
-    r"|\benabledMcpjsonServers" + _MCP_AA_JQ_IDX
-    + r"(?:\|=|\+=|(?<![!<>=])=(?!=))(?!\s*" + _MCP_AA_LIST_SAFE + r")"
-    r"|\bsetpath\s*\(\s*\[\s*[\"'](?:" + _CLAUDE_MCP_AUTOAPPROVE_KEY_ALT + r")[\"']"
-)
-CLAUDE_MCP_AUTOAPPROVE_JQ_RE = re.compile(
-    r"\b(?:(?:go)?jq|jaq)\b"
-    r"(?=[^;]*(?:" + _MCP_AA_JQ_UNSAFE + r"|"
-    + CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.pattern + r"))",
+_MCP_AA_JQ_OP = r"(?:\|=|//=|[+\-*/%]=|(?<![!<>=])=(?!=))"
+CLAUDE_MCP_AUTOAPPROVE_JQ_ASSIGN_RE = re.compile(
+    r"\benableAllProjectMcpServers" + _MCP_AA_JQ_IDX + _MCP_AA_JQ_OP + r"(?!" + _MCP_AA_BOOL_SAFE + r")"
+    r"|\benabledMcpjsonServers" + _MCP_AA_JQ_IDX + _MCP_AA_JQ_OP + r"(?!" + _MCP_AA_LIST_SAFE + r")"
+    r"|\bsetpath\s*\(\s*\[\s*[\"'](?:" + _CLAUDE_MCP_AUTOAPPROVE_KEY_ALT + r")[\"']",
     re.IGNORECASE,
 )
+JQ_TOKEN_RE = re.compile(r"\b(?:(?:go)?jq|jaq)\b", re.IGNORECASE)
+SPONGE_RE = re.compile(r"\bsponge\b", re.IGNORECASE)
 
-# CLI forms that set either key without any file write the Edit/Write hook
-# sees: `claude config set [-g] enableAllProjectMcpServers true`, `claude
-# config add enabledMcpjsonServers evil`, and an inline-JSON `claude
-# --settings '{"enableAllProjectMcpServers": true}'` launch of a nested
-# session (that nested session spawns every `.mcp.json` server unprompted).
-CLAUDE_MCP_AUTOAPPROVE_CLI_RE = re.compile(
-    r"\bclaude\b[^|;&\n]*\bconfig\s+(?:set|add)\b[^|;&\n]*"
-    r"(?:\benableAllProjectMcpServers\b(?!\s+[\"']?" + _MCP_AA_BOOL_SAFE + r")"
-    r"|\benabledMcpjsonServers\b(?!\s+[\"']?" + _MCP_AA_LIST_SAFE + r"))",
-    re.IGNORECASE,
-)
-# The `--settings` argument itself (single-quoted, double-quoted, or bare),
-# so the inline-JSON check is applied to that argument only, never to an
-# unrelated later clause of the same command line.
+# CLI pieces, applied per `|;&`/newline segment by the rule (never one
+# regex with stacked `[^...]*` gaps -- that form was cubic, QA round 1):
+#   claude ... config set [-g] enableAllProjectMcpServers <not false/null>
+#   claude ... config set [-g] enabledMcpjsonServers <not []/null>
+#   claude ... config add [-g] enabledMcpjsonServers <ANY value> (`add`
+#     appends a string, so even `null` names a server to approve)
+#   claude ... --settings <inline JSON carrying either key>
+CLAUDE_CLI_TOKEN_RE = re.compile(r"\bclaude\b", re.IGNORECASE)
+CLAUDE_CONFIG_VERB_RE = re.compile(r"\bconfig\s+(set|add)\b", re.IGNORECASE)
+CLAUDE_MCP_AA_CLI_SET_BOOL_RE = re.compile(
+    r"\benableAllProjectMcpServers\b(?![\"']?" + _MCP_AA_BOOL_SAFE + r")", re.IGNORECASE)
+CLAUDE_MCP_AA_CLI_SET_LIST_RE = re.compile(
+    r"\benabledMcpjsonServers\b(?![\"']?" + _MCP_AA_LIST_SAFE + r")", re.IGNORECASE)
+CLAUDE_MCP_AA_CLI_ADD_LIST_RE = re.compile(r"\benabledMcpjsonServers\b", re.IGNORECASE)
 CLAUDE_SETTINGS_ARG_RE = re.compile(
-    r"\bclaude\b[^|;&\n]*?\s--settings(?:=|\s+)"
-    r"(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\"|(\S+))",
+    r"\s--settings(?:=|\s+)(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\"|(\S+))",
     re.IGNORECASE,
 )
 

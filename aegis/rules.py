@@ -36,7 +36,7 @@ def _path(ev: Event) -> str:
     # not just Edit/Write. Purely additive: widens detection, never narrows it.
     return str(a.get("file_path") or a.get("path") or a.get("notebook_path")
                or a.get("target_file") or a.get("targetFile") or a.get("filename")
-               or a.get("file") or a.get("uri") or "")
+               or a.get("file") or a.get("uri") or a.get("filePath") or "")
 
 
 def _is_shell(ev: Event) -> bool:
@@ -6296,16 +6296,6 @@ def _claude_mcp_autoapprove_allowed_by_policy(cfg: dict, text: str) -> bool:
 _CLAUDE_MCP_AA_KEY_NAMES = {k.lower() for k in patterns.CLAUDE_MCP_AUTOAPPROVE_KEYS}
 _CLAUDE_MCP_AA_KEY_MENTION_RE = re.compile(
     r"\b(?:" + patterns._CLAUDE_MCP_AUTOAPPROVE_KEY_ALT + r")\b", re.IGNORECASE)
-# What an Edit's `new_string` may contain, when its `old_string` named one of
-# the two keys but the `new_string` does not, and still be read as harmless:
-# punctuation/whitespace only (the key being deleted), optionally around a
-# single `false`/`null`. Anything else -- `true`, a quoted server name, a
-# number -- is a value-only flip of an approval key whose name sits only in
-# the on-disk context `old_string` quotes.
-_CLAUDE_MCP_AA_SAFE_FRAGMENT_RE = re.compile(
-    r"^[\s,{}\[\]:]*(?:(?:false|null)[\s,{}\[\]:]*)?$", re.IGNORECASE)
-
-
 def _claude_mcp_aa_unsafe_value(key: str, val) -> bool:
     kl = key.strip().lower()
     if kl == "enableallprojectmcpservers":
@@ -6406,56 +6396,129 @@ _CLAUDE_MCP_AA_SAFE_MENTION_RE = re.compile(
     re.IGNORECASE)
 
 
-def _claude_mcp_aa_suffix_alt(key: str) -> str:
-    return "|".join(re.escape(key[i:]) for i in range(len(key) - 3))
+def _claude_mcp_aa_affix_alt(key: str, prefixes: bool, minlen: int) -> str:
+    n = len(key)
+    parts = ([key[:i] for i in range(n - 1, minlen - 1, -1)] if prefixes
+             else [key[i:] for i in range(1, n - minlen + 1)])
+    return "|".join(re.escape(x) for x in parts)
 
 
-# Partial-anchor value flips: an Edit anchored on a SUFFIX of the key
-# (`old='Servers": false'` -> `new='Servers": true'`) never names the full
-# key. A `new_string` that STARTS with a >=4-char suffix of either key,
-# followed by a closing quote, a colon and an unsafe value, is treated as
-# the key itself (anchored with `.match`, see `_claude_mcp_aa_suffix_hit`).
+# Partial-anchor edits never spell the full key, because the rest of the name
+# stays in the untouched on-disk text around old_string:
+#  - SUFFIX at the start of new_string: `old='Servers": false'` ->
+#    `new='Servers": true'` (down to a single character, `s": true`, QA
+#    round 1). Requires the closing quote + colon + an unsafe value, so the
+#    context is specific even for very short suffixes.
+#  - PREFIX at the end of new_string: `old='"zz'` -> `new='"enableAllProj'`
+#    where the file already continues with `ectMcpServers": true`. >=3 chars,
+#    right after a quote.
 _CLAUDE_MCP_AA_SUFFIX_BOOL_RE = re.compile(
-    r"(?:" + _claude_mcp_aa_suffix_alt("enableAllProjectMcpServers") + r")"
-    r"[\"']\s*:(?!\s*(?:false|null)\b)", re.IGNORECASE)
+    r"(?:" + _claude_mcp_aa_affix_alt("enableAllProjectMcpServers", False, 1) + r")"
+    r"[\"']\s*:(?!" + patterns._MCP_AA_BOOL_SAFE + r")", re.IGNORECASE)
 _CLAUDE_MCP_AA_SUFFIX_LIST_RE = re.compile(
-    r"(?:" + _claude_mcp_aa_suffix_alt("enabledMcpjsonServers") + r")"
-    r"[\"']\s*:(?!\s*(?:\[\s*\]|null\b))", re.IGNORECASE)
+    r"(?:" + _claude_mcp_aa_affix_alt("enabledMcpjsonServers", False, 1) + r")"
+    r"[\"']\s*:(?!" + patterns._MCP_AA_LIST_SAFE + r")", re.IGNORECASE)
+_CLAUDE_MCP_AA_PREFIX_END_RE = re.compile(
+    r"[\"'](?:" + _claude_mcp_aa_affix_alt("enableAllProjectMcpServers", True, 3)
+    + r"|" + _claude_mcp_aa_affix_alt("enabledMcpjsonServers", True, 3) + r")\s*$",
+    re.IGNORECASE)
 
 
-def _claude_mcp_aa_suffix_hit(text: str) -> bool:
-    """True when ``text`` (an Edit's ``new_string``) BEGINS mid-identifier
-    with a proper suffix of one of the two keys -- a partial anchor -- and
-    that suffix carries an unsafe value. A suffix match inside some other,
-    complete identifier (``disabledMcpjsonServers``, the other key, an
-    unrelated ``fooServers``) is ignored: only a fragment that starts partway
-    through the key name can be the key without spelling it."""
-    for key, rx in (("enableallprojectmcpservers", _CLAUDE_MCP_AA_SUFFIX_BOOL_RE),
-                    ("enabledmcpjsonservers", _CLAUDE_MCP_AA_SUFFIX_LIST_RE)):
-        m = rx.match(text)
-        if m and key.endswith(re.match(r"[A-Za-z0-9_$]*", m.group(0)).group(0).lower()):
+def _claude_mcp_aa_partial_hit(text: str) -> bool:
+    """``text`` (an Edit's ``new_string``) begins mid-identifier with a
+    proper suffix of a key carrying an unsafe value, or ends with a quoted
+    proper prefix of a key. A suffix inside some other complete identifier
+    (``disabledMcpjsonServers``, ``fooServers``) is never at position 0 of a
+    fragment that spells that identifier, so ``.match`` ignores it."""
+    for rx in (_CLAUDE_MCP_AA_SUFFIX_BOOL_RE, _CLAUDE_MCP_AA_SUFFIX_LIST_RE):
+        if rx.match(text):
             return True
-    return False
+    return bool(_CLAUDE_MCP_AA_PREFIX_END_RE.search(text))
 
 
-def _claude_mcp_aa_pair_hit(old: str, new: str) -> bool:
+def _claude_mcp_aa_fragment_hit(new: str) -> bool:
+    """One Edit ``new_string`` (or a simulated MultiEdit result): an unsafe
+    key/value pair, a bare key mention without an explicit safe value (a
+    RENAME of an existing harmless key -- QA round 1), or a partial anchor."""
     if _claude_mcp_aa_text_hit(new):
         return True
-    old_n = _claude_cred_helper_normalize(old or "")
-    new_n = _claude_cred_helper_normalize(new or "")
-    # Rename / bare mention: every key mention in new_string must carry an
-    # explicit safe value.
+    new_n = _claude_cred_helper_normalize(new or "").replace('\\"', '"')
     mentions = len(_CLAUDE_MCP_AA_KEY_MENTION_RE.findall(new_n))
     if mentions and len(_CLAUDE_MCP_AA_SAFE_MENTION_RE.findall(new_n)) < mentions:
         return True
-    # Partial (suffix) anchor on the key.
-    if _claude_mcp_aa_suffix_hit(new_n):
+    return _claude_mcp_aa_partial_hit(new_n)
+
+
+def _claude_mcp_aa_pairs_hit(pairs: list) -> bool:
+    """Each (old, new) pair on its own, then the whole sequence simulated
+    against a synthetic buffer: a later edit whose ``old`` falls inside an
+    earlier edit's ``new`` is applied there, so a key assembled across two
+    edits of ONE MultiEdit (``"enableAllXX"`` then ``XX"`` ->
+    ``ProjectMcpServers"``) is seen whole (QA round 1).
+
+    An ``old`` that names the key with a ``new`` that doesn't is NOT gated:
+    Edit replaces ``old`` wholesale, so the key leaves the file (a deletion),
+    and the only way to rebuild it from untouched surrounding text is the
+    partial-anchor shape `_claude_mcp_aa_partial_hit` covers."""
+    if any(_claude_mcp_aa_fragment_hit(n) for _, n in pairs):
         return True
-    # Key-anchored value-only diff: old names the key, new doesn't.
-    if (_CLAUDE_MCP_AA_KEY_MENTION_RE.search(old_n)
-            and not mentions
-            and not _CLAUDE_MCP_AA_SAFE_FRAGMENT_RE.match(new_n)):
-        return True
+    if len(pairs) > 1:
+        buf = ""
+        for o, n in pairs:
+            if o and o in buf:
+                buf = buf.replace(o, n, 1)
+            else:
+                buf = f"{buf}\n{n}" if buf else n
+        return _claude_mcp_aa_fragment_hit(buf)
+    return False
+
+
+_CLAUDE_MCP_AA_SEG_SPLIT_RE = re.compile(r"[|;&\n]")
+_CLAUDE_MCP_AA_DYNAMIC_RE = re.compile(r"\$|`|<\(")
+
+
+def _claude_mcp_aa_cli_hit(norm: str) -> bool:
+    """`claude config set|add` and `claude --settings` forms, evaluated one
+    shell segment at a time with plain searches (linear -- QA round 1 found
+    the single stacked-gap regex cubic). A ``--settings`` argument built
+    dynamically (``"$S"``, ``"$(... | base64 -d)"``, a heredoc) falls back to
+    scanning the whole de-obfuscated command, which already carries
+    `normalize.scan_surface`'s decoded forms."""
+    for seg in _CLAUDE_MCP_AA_SEG_SPLIT_RE.split(norm):
+        if not patterns.CLAUDE_CLI_TOKEN_RE.search(seg):
+            continue
+        m = patterns.CLAUDE_CONFIG_VERB_RE.search(seg)
+        if m:
+            rest = seg[m.end():]
+            if m.group(1).lower() == "add":
+                if patterns.CLAUDE_MCP_AA_CLI_ADD_LIST_RE.search(rest):
+                    return True
+            elif (patterns.CLAUDE_MCP_AA_CLI_SET_BOOL_RE.search(rest)
+                  or patterns.CLAUDE_MCP_AA_CLI_SET_LIST_RE.search(rest)):
+                return True
+    # --settings may carry `|`/`;` inside its quoted JSON, so match it on the
+    # whole command, after the first `claude` token.
+    c = patterns.CLAUDE_CLI_TOKEN_RE.search(norm)
+    if c:
+        for m in patterns.CLAUDE_SETTINGS_ARG_RE.finditer(norm, c.end()):
+            arg = next(g for g in m.groups() if g is not None).replace('\\"', '"')
+            if _CLAUDE_MCP_AA_DYNAMIC_RE.search(arg):
+                if patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(norm.replace('\\"', '"')):
+                    return True
+            elif patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(arg):
+                return True
+    return False
+
+
+def _claude_mcp_aa_jq_hit(norm: str) -> bool:
+    """One plain search per `;`-separated segment that contains a jq token:
+    an unsafe jq assignment, or an unsafe key/value literal (jq object-merge
+    form). Linear, unlike a lookahead anchored at every `jq` token."""
+    for seg in norm.split(";"):
+        if patterns.JQ_TOKEN_RE.search(seg) and (
+                patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_ASSIGN_RE.search(seg)
+                or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(seg)):
+            return True
     return False
 
 
@@ -6503,16 +6566,16 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     never gated.
 
     Edit handling: a plain Edit's ``new_string`` and each MultiEdit/MCP
-    ``edits`` entry are evaluated per (old, new) pair. When the pair's
-    ``old_string`` names one of the two keys but its ``new_string`` doesn't
-    -- a value-only diff anchored on the key (``old: '"enableAllProjectMcp
-    Servers": false'`` -> ``new: 'true'`` would drop the key, but ``old:
-    'enableAllProjectMcpServers": false'`` -> ``new: 'enableAll..": true'``
-    keeps it; ``old: 'Servers": false'`` partial anchors do not) -- the
-    ``new_string`` is gated unless it is punctuation/whitespace, optionally
-    around one ``false``/``null`` (a deletion or a no-op). The pair check
-    deliberately ignores what ``old_string`` contained otherwise, so an
-    edit that turns an approval OFF (``true`` -> ``false``) is not asked.
+    ``edits`` entry are checked on their own, then the whole edit sequence
+    is replayed against a synthetic buffer, so a key assembled across two
+    entries of one MultiEdit is seen whole. A ``new_string`` is gated when
+    it carries an unsafe key/value pair, mentions a key with no explicit
+    safe value (a RENAME of an already-present harmless key), begins with a
+    proper suffix of a key followed by ``":`` and an unsafe value (a
+    partial-anchor value flip, ``old='s": false'`` -> ``new='s": true'``),
+    or ends with a quoted >=3-char prefix of a key. An ``old_string`` that
+    names the key paired with a ``new_string`` that doesn't is NOT gated:
+    Edit replaces ``old_string`` wholesale, so that is a deletion.
 
     Config (``policy.claude_mcp_autoapprove``): ``mode`` (deny|ask|monitor|
     off, default ask), ``allow`` (regexes on the path/command that skip the
@@ -6525,23 +6588,46 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     before launch. A spawned agent cannot set its own env for a hook
     invocation it doesn't control.
 
+    QA history (two independent agents, design/consistency and bypass-
+    hunting, run in parallel per this file's convention). Design review
+    confirmed wiring/naming/YAML round-trip and found a key-RENAME bypass
+    (plant ``"zz": true``, then rename ``"zz"``; also in a single
+    MultiEdit), a garbled Edit-semantics paragraph and two tests built on an
+    impossible value-only diff, a ``--settings`` false positive from
+    scanning the whole command, and test-strength gaps -- all fixed. Bypass
+    review found: a cubic-time CLI regex reachable from ANY shell command
+    (7.5s at 5KB -- long enough to trip the hook timeout, which fails open,
+    disabling every rule), fixed by evaluating per shell segment with plain
+    searches; a ``--settings`` regression for dynamic args (``"$S"``,
+    ``"$(... | base64 -d)"``) and a second ``--settings`` flag never
+    inspected; jq value expressions that read as safe literals (``//=``,
+    ``false or true``, ``null or 1``, ``[] + [...]``) and an escaped-quote
+    merge; 1-3 char suffix anchors; ``config add enabledMcpjsonServers
+    null``; a MultiEdit split-key assembly; and the MCP ``filePath`` arg
+    (added to the shared `_path`) -- all fixed, along with four false
+    positives (read-only jq projection, a permission rule naming the key,
+    an Edit deleting the key beside another change). Round 2 verified the
+    fixes.
+
     Honest scope, the same denylist trade-offs every sibling guard
-    discloses: a value-only Edit whose ``old_string`` AND ``new_string`` both
-    omit the key name entirely (``old: 'false'``, ``new: 'true'`` -- only
-    possible when that ``false`` is unique in the whole file, since the Edit
-    tool requires a unique ``old_string``; or appending a name to an
-    existing non-empty ``enabledMcpjsonServers`` list with an anchor that
-    never names the key) is not caught -- no cross-call/on-disk state, the
-    same architectural bound `rule_jetbrains_run_config_protect` discloses
-    for its own ``enabled="false"`` flip; ``claude --settings <file>``
-    pointing at a separately-written JSON file is not caught (only inline
-    JSON is inspected; the file is not one of the paths this guard
-    watches); the MCP struct walk's depth cap (12); a value assembled
-    indirectly (templating, a build script) or split across MCP args a
-    server concatenates; a jq ``;``-separated program (``reduce``/
-    ``setpath`` with the key AFTER a ``;``); and a direct fetch-to-file
-    write (``curl -o .claude/settings.local.json``), closed separately by
-    `rule_fetch_to_file_protect`."""
+    discloses: a value-only Edit whose ``new_string`` neither names the key
+    nor starts with a suffix of it (``old: 'false'`` -> ``new: 'true'``,
+    only possible when that ``false`` is unique in the whole file; or
+    appending a name inside an existing ``enabledMcpjsonServers`` list with
+    an anchor such as ``old: '["a"]'``) and a prefix anchor shorter than 3
+    chars are not caught -- no cross-call/on-disk state, the same bound
+    `rule_jetbrains_run_config_protect` discloses for its ``enabled="false"``
+    flip; a partial anchor on the shared ``...McpjsonServers`` suffix asks
+    even when the file's key is actually ``disabledMcpjsonServers``;
+    ``claude --settings <file>`` pointing at a separately-written JSON file
+    is not caught (only inline or dynamically-built arguments are
+    inspected); a ``paths: [...]`` list-valued MCP arg (the shared `_path`
+    reads one path); the MCP struct walk's depth cap (12); a value assembled
+    indirectly (templating, a build script); a jq program whose assignment
+    sits after a ``;`` inside the program; ``claude config set`` text inside
+    an unrelated string (a commit message) asks unnecessarily; and a direct
+    fetch-to-file write (``curl -o .claude/settings.local.json``), closed
+    separately by `rule_fetch_to_file_protect`."""
     cfg = getattr(policy, "claude_mcp_autoapprove", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -6565,7 +6651,7 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
         if isinstance(literal, str) and literal:
             hit = _claude_mcp_aa_text_hit(literal)
         elif pairs:
-            hit = any(_claude_mcp_aa_pair_hit(o, n) for o, n in pairs)
+            hit = _claude_mcp_aa_pairs_hit(pairs)
         else:
             hit = _claude_mcp_aa_text_hit(" ".join(_flatten_strings(a)))
         if not hit and ev.action == ActionClass.MCP:
@@ -6589,22 +6675,24 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         norm = _claude_cred_helper_normalize(cmd)
-        cli_hit = bool(patterns.CLAUDE_MCP_AUTOAPPROVE_CLI_RE.search(norm)
-                       or any(patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(
-                                  next(g for g in m.groups() if g is not None).replace('\\"', '"'))
-                              for m in patterns.CLAUDE_SETTINGS_ARG_RE.finditer(norm)))
+        cli_hit = _claude_mcp_aa_cli_hit(norm)
         file_hit = False
         if not cli_hit:
             cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
             path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
                             or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
             if path_hit:
+                # Something has to WRITE the result: a read-only `jq` that
+                # merely projects the key to stdout is not gated (QA round 1).
                 write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                                   or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                                   or patterns.INPLACE_WRITE_RE.search(cmd)
-                                  or patterns.FORCED_LINK_WRITE_RE.search(cmd))
-                file_hit = bool(patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_RE.search(norm)
-                                or (write_verb and patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(norm)))
+                                  or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                                  or patterns.SPONGE_RE.search(cmd))
+                if write_verb:
+                    unesc = norm.replace('\\"', '"')
+                    file_hit = bool(_claude_mcp_aa_jq_hit(unesc)
+                                    or patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(unesc))
         if not (cli_hit or file_hit):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_MCP_AUTOAPPROVE")

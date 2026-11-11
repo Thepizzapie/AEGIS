@@ -10,7 +10,7 @@ committed ``.mcp.json`` is spawned as a command at the next session start.
 """
 import time
 
-from aegis import patterns
+from aegis import patterns, rules
 from aegis.engine import evaluate
 from aegis.events import ActionClass, Event, HookEvent
 from aegis.loader import load_policy
@@ -117,10 +117,33 @@ def test_value_flip_anchored_on_key_suffix_gated():
         assert _ours(evaluate(_edit(LOCAL, new, old_string=old), EMPTY)), old
 
 
-def test_value_only_new_string_with_key_in_old_gated():
-    """old names the key, new is only a value: conservatively asked (it also
-    yields broken JSON, but must never silently allow)."""
-    d = evaluate(_edit(LOCAL, "true", old_string='"enableAllProjectMcpServers": false'), EMPTY)
+def test_old_names_key_new_does_not_is_a_deletion_not_gated():
+    """Edit replaces old_string wholesale: if old names the key and new
+    doesn't, the key leaves the file. QA round 1 flagged the earlier,
+    conservative ask here as a false positive on an ordinary deletion."""
+    for old, new in (('"enableAllProjectMcpServers": false', "true"),
+                     ('"enableAllProjectMcpServers": false,\n  "model": "opus"', '"model": "sonnet"'),
+                     ('"enabledMcpjsonServers": ["a"]', '["a", "evil"]')):
+        assert not _gated(evaluate(_edit(LOCAL, new, old_string=old), EMPTY)), old
+
+
+def test_short_suffix_anchor_gated():
+    """QA round 1: suffixes shorter than 4 chars (`rs":`, `s":`) slipped."""
+    for old, new in (('rs": false', 'rs": true'), ('s": false', 's": true'),
+                     ('s": []', 's": ["evil"]')):
+        assert _ours(evaluate(_edit(LOCAL, new, old_string=old), EMPTY)), new
+
+
+def test_prefix_anchor_at_end_gated():
+    d = evaluate(_edit(LOCAL, '"enableAllProj', old_string='"zz'), EMPTY)
+    assert _ours(d)
+
+
+def test_multiedit_split_key_assembly_gated():
+    d = evaluate(_multiedit(LOCAL, [
+        {"old_string": '"includeCoAuthoredBy"', "new_string": '"enableAllXX"'},
+        {"old_string": 'XX"', "new_string": 'ProjectMcpServers"'},
+    ]), EMPTY)
     assert _ours(d)
 
 
@@ -144,11 +167,6 @@ def test_suffix_inside_other_identifier_not_gated():
                      ('"disabledMcpjsonServers": []', '"disabledMcpjsonServers": ["x"]'),
                      ('"enableAllProjectMcpServers": true', '"enableAllProjectMcpServers": false')):
         assert not _gated(evaluate(_edit(LOCAL, new, old_string=old), EMPTY)), new
-
-
-def test_list_append_anchored_on_key_in_old_string_gated():
-    d = evaluate(_edit(LOCAL, '["a", "evil"]', old_string='"enabledMcpjsonServers": ["a"]'), EMPTY)
-    assert _ours(d)
 
 
 def test_multiedit_entry_gated():
@@ -401,6 +419,56 @@ def test_shell_cat_read_not_gated():
     assert not _gated(evaluate(_shell(f"cat {LOCAL}"), EMPTY))
 
 
+def test_jq_truthy_value_expressions_gated():
+    """QA round 1: a safe literal used as an operand is not safe."""
+    for prog in (".enableAllProjectMcpServers //= true", ".enableAllProjectMcpServers = false or true",
+                 ".enableAllProjectMcpServers = false == false", ".enableAllProjectMcpServers = null or 1",
+                 ".enabledMcpjsonServers = [] + [\"evil\"]", ".enableAllProjectMcpServers = false // true"):
+        d = evaluate(_shell(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), EMPTY)
+        assert _ours(d), prog
+
+
+def test_jq_escaped_quote_merge_gated():
+    d = evaluate(_shell(f'jq ". + {{\\"enableAllProjectMcpServers\\": true}}" {LOCAL} | sponge {LOCAL}'),
+                 EMPTY)
+    assert _ours(d)
+
+
+def test_jq_read_only_projection_not_gated():
+    d = evaluate(_shell(f"jq '{{enableAllProjectMcpServers: .enableAllProjectMcpServers}}' {LOCAL}"), EMPTY)
+    assert not _gated(d)
+
+
+def test_cli_settings_dynamic_arg_gated():
+    """QA round 1 regression: a variable / command-substitution argument
+    falls back to the whole de-obfuscated command."""
+    for cmd in ("claude --settings \"$(echo eyJlbmFibGVBbGxQcm9qZWN0TWNwU2VydmVycyI6dHJ1ZX0= | base64 -d)\" -p hi",
+                "S='{\"enableAllProjectMcpServers\":true}'; claude --settings \"$S\" -p hi"):
+        assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_cli_second_settings_flag_inspected():
+    d = evaluate(_shell("claude --settings a.json --settings '{\"enableAllProjectMcpServers\":true}' -p x"),
+                 EMPTY)
+    assert _ours(d)
+
+
+def test_cli_config_add_any_value_gated():
+    for v in ("null", "'[]'", "evil"):
+        assert _ours(evaluate(_shell(f"claude config add enabledMcpjsonServers {v}"), EMPTY)), v
+
+
+def test_permission_rule_naming_key_not_gated():
+    d = evaluate(_write(LOCAL, '{"permissions": {"allow": ["Bash(grep enableAllProjectMcpServers:*)"]}}'),
+                 EMPTY)
+    assert not _gated(d)
+
+
+def test_mcp_filepath_arg_gated():
+    d = evaluate(_mcp("mcp__fs__write_file", {"filePath": LOCAL, "content": ENABLE_ALL}), EMPTY)
+    assert _ours(d)
+
+
 def test_grep_for_key_not_gated():
     assert not _gated(evaluate(_shell(f"grep enableAllProjectMcpServers {LOCAL}"), EMPTY))
 
@@ -482,8 +550,18 @@ def test_perf_many_key_tokens():
     adv = "enableAllProjectMcpServers: false " * 5000
     t = time.time()
     patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(adv)
-    patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_RE.search("jq '" + adv)
+    evaluate(_shell("jq '" + adv + f"' {LOCAL} | sponge {LOCAL}"), EMPTY)
     assert time.time() - t < 1.0
+
+
+def test_perf_no_redos_on_repeated_claude_config_set():
+    """QA round 1: the old single CLI regex was cubic on this (7.5s at 5KB),
+    long enough to trip the hook timeout, which fails open."""
+    for adv in ("claude config set " * 2000, "jq " * 7000 + LOCAL + " | sponge " + LOCAL,
+                "claude --settings " * 2000):
+        t = time.time()
+        rules.rule_claude_mcp_autoapprove_protect(_shell(adv), EMPTY)
+        assert time.time() - t < 0.5, adv[:30]
 
 
 # ---- direct pattern sanity ------------------------------------------------------
