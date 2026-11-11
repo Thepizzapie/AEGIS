@@ -3459,7 +3459,14 @@ CLAUDE_MCP_AUTOAPPROVE_CLI_RE = re.compile(
     r"|\benabledMcpjsonServers\b(?!\s+[\"']?" + _MCP_AA_LIST_SAFE + r"))",
     re.IGNORECASE,
 )
-CLAUDE_SETTINGS_FLAG_RE = re.compile(r"\bclaude\b[^|;&\n]*\s--settings\b", re.IGNORECASE)
+# The `--settings` argument itself (single-quoted, double-quoted, or bare),
+# so the inline-JSON check is applied to that argument only, never to an
+# unrelated later clause of the same command line.
+CLAUDE_SETTINGS_ARG_RE = re.compile(
+    r"\bclaude\b[^|;&\n]*?\s--settings(?:=|\s+)"
+    r"(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\"|(\S+))",
+    re.IGNORECASE,
+)
 
 # ---- Package-manifest lifecycle-script / registry-hijack protection -----------
 # Two auto-exec-on-a-FUTURE-install surfaces no existing guard reaches:

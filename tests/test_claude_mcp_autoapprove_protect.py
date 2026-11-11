@@ -95,15 +95,55 @@ def test_unicode_escaped_key_in_partial_fragment_gated():
     assert _ours(evaluate(_edit(LOCAL, '"enabledMcpjson\\u0053ervers": ["x"]'), EMPTY))
 
 
+def test_user_scope_path_gated():
+    assert _ours(evaluate(_write("~/.claude/settings.local.json"), EMPTY))
+    assert _ours(evaluate(_write("/home/u/.claude/settings.local.json"), EMPTY))
+
+
+def test_single_quoted_key_gated():
+    assert _ours(evaluate(_edit(LOCAL, "'enableAllProjectMcpServers': true"), EMPTY))
+
+
 def test_case_insensitive_key_gated():
     assert _ours(evaluate(_write(LOCAL, '{"ENABLEALLPROJECTMCPSERVERS": true}'), EMPTY))
 
 
-def test_value_flip_anchored_on_key_in_old_string_gated():
-    # old_string anchors on the key (and the following space); new_string is
-    # only the replacement value -- the key name never appears in it.
+def test_value_flip_anchored_on_key_suffix_gated():
+    """Edit replaces old_string wholesale, so the realistic value-only flip
+    re-anchors on a SUFFIX of the key name and never spells it in full."""
+    for old, new in (('Servers": false', 'Servers": true'),
+                     ('ProjectMcpServers": false', 'ProjectMcpServers": true'),
+                     ('jsonServers": []', 'jsonServers": ["evil"]')):
+        assert _ours(evaluate(_edit(LOCAL, new, old_string=old), EMPTY)), old
+
+
+def test_value_only_new_string_with_key_in_old_gated():
+    """old names the key, new is only a value: conservatively asked (it also
+    yields broken JSON, but must never silently allow)."""
     d = evaluate(_edit(LOCAL, "true", old_string='"enableAllProjectMcpServers": false'), EMPTY)
     assert _ours(d)
+
+
+def test_key_rename_gated():
+    """QA round 1: plant a harmless key, then rename it into an approval key
+    -- new_string names the key with no colon/value at all."""
+    d = evaluate(_edit(LOCAL, '"enableAllProjectMcpServers"', old_string='"zz"'), EMPTY)
+    assert _ours(d)
+
+
+def test_key_rename_in_single_multiedit_gated():
+    d = evaluate(_multiedit(LOCAL, [
+        {"old_string": "{", "new_string": '{"zz": true,'},
+        {"old_string": '"zz"', "new_string": '"enabledMcpjsonServers"'},
+    ]), EMPTY)
+    assert _ours(d)
+
+
+def test_suffix_inside_other_identifier_not_gated():
+    for old, new in (('"fooServers": 1', '"fooServers": 2'),
+                     ('"disabledMcpjsonServers": []', '"disabledMcpjsonServers": ["x"]'),
+                     ('"enableAllProjectMcpServers": true', '"enableAllProjectMcpServers": false')):
+        assert not _gated(evaluate(_edit(LOCAL, new, old_string=old), EMPTY)), new
 
 
 def test_list_append_anchored_on_key_in_old_string_gated():
@@ -206,6 +246,21 @@ def test_mcp_key_value_shape_gated_and_safe_value_allowed():
     assert not _gated(evaluate(off_str, EMPTY))
 
 
+def test_mcp_struct_depth_capped():
+    obj = {"enableAllProjectMcpServers": True}
+    for _ in range(20):
+        obj = {"n": obj}
+    d = evaluate(_mcp("mcp__fs__write_json", {"path": LOCAL, "json": obj}), EMPTY)
+    assert not _ours(d)  # depth cap (12) is a disclosed bound, pinned here
+
+
+def test_env_toggle_allows_mcp(monkeypatch):
+    monkeypatch.setenv("AEGIS_ALLOW_CLAUDE_MCP_AUTOAPPROVE", "1")
+    d = evaluate(_mcp("mcp__fs__write_json", {"path": LOCAL,
+                                              "json": {"enableAllProjectMcpServers": True}}), EMPTY)
+    assert not _gated(d)
+
+
 def test_mcp_decoy_content_does_not_suppress_struct_fallback():
     d = evaluate(_mcp("mcp__fs__write_json", {"path": LOCAL, "content": '{"model": "x"}',
                                               "json": {"enabledMcpjsonServers": ["evil"]}}), EMPTY)
@@ -216,9 +271,9 @@ def test_mcp_decoy_content_does_not_suppress_struct_fallback():
 # Redirect/heredoc/mv shapes into .claude/ are preempted by self-protect
 # (first-deny-wins); this guard's own coverage is jq|sponge and the CLI.
 
-def test_shell_redirect_blocked_by_someone():
+def test_shell_redirect_already_blocked_by_self_protect():
     d = evaluate(_shell(f"echo '{ENABLE_ALL}' > {LOCAL}"), EMPTY)
-    assert d.blocked
+    assert d.blocked and d.rule == "self-protect"
 
 
 def test_shell_jq_sponge_assign_gated():
@@ -257,10 +312,16 @@ def test_shell_jq_cd_then_bare_filename_gated():
 
 def test_shell_jq_safe_values_not_gated():
     for prog in (".enableAllProjectMcpServers = false", ".enabledMcpjsonServers = []",
-                 "del(.enableAllProjectMcpServers)", "select(.enableAllProjectMcpServers == true)",
+                 "select(.enableAllProjectMcpServers == true)",
                  ".enableAllProjectMcpServers"):
         d = evaluate(_shell(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), EMPTY)
-        assert not _ours(d), prog
+        assert not _gated(d), prog
+
+
+def test_shell_jq_del_not_this_guard():
+    # `del` is caught by self-protect's delete-verb check, not this rule.
+    d = evaluate(_shell(f"jq 'del(.enableAllProjectMcpServers)' {LOCAL} | sponge {LOCAL}"), EMPTY)
+    assert not _ours(d)
 
 
 def test_shell_jq_on_unrelated_file_not_gated():
@@ -293,6 +354,51 @@ def test_cli_inline_settings_gated():
 def test_cli_inline_settings_safe_not_gated():
     d = evaluate(_shell("claude --settings '{\"model\": \"opus\"}' -p hi"), EMPTY)
     assert not _ours(d)
+
+
+def test_cli_settings_equals_and_double_quoted_gated():
+    assert _ours(evaluate(_shell("claude --settings='{\"enabledMcpjsonServers\": [\"e\"]}' -p x"),
+                          EMPTY))
+    assert _ours(evaluate(_shell('claude --settings "{\\"enableAllProjectMcpServers\\": true}" -p x'),
+                          EMPTY))
+
+
+def test_cli_settings_file_then_unrelated_clause_not_gated():
+    """QA round 1: the inline-JSON check is scoped to the --settings arg."""
+    d = evaluate(_shell("claude --settings f.json -p x; grep '\"enableAllProjectMcpServers\": true' notes"),
+                 EMPTY)
+    assert not _ours(d)
+
+
+def test_cli_settings_file_path_not_gated_documented_gap():
+    assert not _ours(evaluate(_shell("claude --settings /tmp/s.json -p hi"), EMPTY))
+
+
+def test_shell_jq_update_assign_true_gated():
+    d = evaluate(_shell(f"jq '.enableAllProjectMcpServers |= true' {LOCAL} | sponge {LOCAL}"), EMPTY)
+    assert _ours(d)
+
+
+def test_shell_pushd_and_set_location_then_bare_filename_gated():
+    for pre in ("pushd .claude;", "Set-Location .claude;"):
+        d = evaluate(_shell(pre + " jq '.enableAllProjectMcpServers = true' "
+                            "settings.local.json | sponge settings.local.json"), EMPTY)
+        assert _ours(d), pre
+
+
+def test_shell_cd_elsewhere_then_bare_filename_not_gated():
+    d = evaluate(_shell("cd /tmp && jq '.enableAllProjectMcpServers = true' "
+                        "settings.local.json | sponge settings.local.json"), EMPTY)
+    assert not _gated(d)
+
+
+def test_shell_write_verb_required():
+    d = evaluate(_shell(f"echo '\"enableAllProjectMcpServers\": true' ; cat {LOCAL}"), EMPTY)
+    assert not _gated(d)
+
+
+def test_shell_cat_read_not_gated():
+    assert not _gated(evaluate(_shell(f"cat {LOCAL}"), EMPTY))
 
 
 def test_grep_for_key_not_gated():
@@ -338,7 +444,7 @@ def test_deny_mode_hard_blocks():
 
 
 def test_monitor_and_off_modes_allow():
-    for m in ("monitor", "off"):
+    for m in ("monitor", "off", False):
         assert not _gated(evaluate(_write(LOCAL), Policy(claude_mcp_autoapprove={"mode": m})))
 
 
@@ -359,6 +465,12 @@ def test_perf_no_redos_on_jq_padding():
     assert time.time() - t < 1.0
 
 
+def test_shell_jq_comment_padding_gated():
+    d = evaluate(_shell("jq '#" + "x" * 450 + "\n.enableAllProjectMcpServers = true' "
+                        f"{LOCAL} | sponge {LOCAL}"), EMPTY)
+    assert _ours(d)
+
+
 def test_perf_long_content():
     content = '{"x": "' + "y" * 50000 + '", "enableAllProjectMcpServers": true}'
     t = time.time()
@@ -372,3 +484,17 @@ def test_perf_many_key_tokens():
     patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(adv)
     patterns.CLAUDE_MCP_AUTOAPPROVE_JQ_RE.search("jq '" + adv)
     assert time.time() - t < 1.0
+
+
+# ---- direct pattern sanity ------------------------------------------------------
+
+def test_value_regex_matches_each_key_unsafe():
+    assert patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search('"enableAllProjectMcpServers": true')
+    assert patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search('"enabledMcpjsonServers": ["a"]')
+
+
+def test_value_regex_ignores_safe_and_benign():
+    for t in ('"enableAllProjectMcpServers": false', '"enabledMcpjsonServers": []',
+              '"enabledMcpjsonServers":null', '"disabledMcpjsonServers": ["a"]',
+              '"enableAllProjectMcpServersX": true'):
+        assert not patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(t), t

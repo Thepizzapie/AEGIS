@@ -6393,13 +6393,67 @@ def _claude_mcp_aa_edit_pairs(a: dict) -> list:
     return pairs
 
 
+# A key mention in an Edit's `new_string` counts as SAFE only when it is
+# immediately followed by a colon and an explicit "keep prompting" value. A
+# bare mention (no colon -- a key RENAME such as `"zz"` -> `"enableAll..."`
+# turning an already-present harmless `"zz": true` into an approval) is
+# unsafe. Scoped to Edit pairs only: a full Write's literal content still
+# goes through `CLAUDE_MCP_AUTOAPPROVE_VALUE_RE` alone, so a comment that
+# merely names the key in a whole-file write is not asked.
+_CLAUDE_MCP_AA_SAFE_MENTION_RE = re.compile(
+    r"enableAllProjectMcpServers[\"']?\s*:\s*(?:false|null)\b"
+    r"|enabledMcpjsonServers[\"']?\s*:\s*(?:\[\s*\]|null\b)",
+    re.IGNORECASE)
+
+
+def _claude_mcp_aa_suffix_alt(key: str) -> str:
+    return "|".join(re.escape(key[i:]) for i in range(len(key) - 3))
+
+
+# Partial-anchor value flips: an Edit anchored on a SUFFIX of the key
+# (`old='Servers": false'` -> `new='Servers": true'`) never names the full
+# key. A `new_string` that STARTS with a >=4-char suffix of either key,
+# followed by a closing quote, a colon and an unsafe value, is treated as
+# the key itself (anchored with `.match`, see `_claude_mcp_aa_suffix_hit`).
+_CLAUDE_MCP_AA_SUFFIX_BOOL_RE = re.compile(
+    r"(?:" + _claude_mcp_aa_suffix_alt("enableAllProjectMcpServers") + r")"
+    r"[\"']\s*:(?!\s*(?:false|null)\b)", re.IGNORECASE)
+_CLAUDE_MCP_AA_SUFFIX_LIST_RE = re.compile(
+    r"(?:" + _claude_mcp_aa_suffix_alt("enabledMcpjsonServers") + r")"
+    r"[\"']\s*:(?!\s*(?:\[\s*\]|null\b))", re.IGNORECASE)
+
+
+def _claude_mcp_aa_suffix_hit(text: str) -> bool:
+    """True when ``text`` (an Edit's ``new_string``) BEGINS mid-identifier
+    with a proper suffix of one of the two keys -- a partial anchor -- and
+    that suffix carries an unsafe value. A suffix match inside some other,
+    complete identifier (``disabledMcpjsonServers``, the other key, an
+    unrelated ``fooServers``) is ignored: only a fragment that starts partway
+    through the key name can be the key without spelling it."""
+    for key, rx in (("enableallprojectmcpservers", _CLAUDE_MCP_AA_SUFFIX_BOOL_RE),
+                    ("enabledmcpjsonservers", _CLAUDE_MCP_AA_SUFFIX_LIST_RE)):
+        m = rx.match(text)
+        if m and key.endswith(re.match(r"[A-Za-z0-9_$]*", m.group(0)).group(0).lower()):
+            return True
+    return False
+
+
 def _claude_mcp_aa_pair_hit(old: str, new: str) -> bool:
     if _claude_mcp_aa_text_hit(new):
         return True
     old_n = _claude_cred_helper_normalize(old or "")
     new_n = _claude_cred_helper_normalize(new or "")
+    # Rename / bare mention: every key mention in new_string must carry an
+    # explicit safe value.
+    mentions = len(_CLAUDE_MCP_AA_KEY_MENTION_RE.findall(new_n))
+    if mentions and len(_CLAUDE_MCP_AA_SAFE_MENTION_RE.findall(new_n)) < mentions:
+        return True
+    # Partial (suffix) anchor on the key.
+    if _claude_mcp_aa_suffix_hit(new_n):
+        return True
+    # Key-anchored value-only diff: old names the key, new doesn't.
     if (_CLAUDE_MCP_AA_KEY_MENTION_RE.search(old_n)
-            and not _CLAUDE_MCP_AA_KEY_MENTION_RE.search(new_n)
+            and not mentions
             and not _CLAUDE_MCP_AA_SAFE_FRAGMENT_RE.match(new_n)):
         return True
     return False
@@ -6536,8 +6590,9 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
         cmd = _shell_scan(ev)
         norm = _claude_cred_helper_normalize(cmd)
         cli_hit = bool(patterns.CLAUDE_MCP_AUTOAPPROVE_CLI_RE.search(norm)
-                       or (patterns.CLAUDE_SETTINGS_FLAG_RE.search(norm)
-                           and patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(norm)))
+                       or any(patterns.CLAUDE_MCP_AUTOAPPROVE_VALUE_RE.search(
+                                  next(g for g in m.groups() if g is not None).replace('\\"', '"'))
+                              for m in patterns.CLAUDE_SETTINGS_ARG_RE.finditer(norm)))
         file_hit = False
         if not cli_hit:
             cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
