@@ -707,3 +707,35 @@ def test_r4_ordinary_settings_writes_not_gated():
                 f"echo '{{\"enableAllProjectMcpServers\": false}}' | sponge {LOCAL}",
                 f"cat {LOCAL} | sponge {LOCAL}"):
         assert _rule(cmd) is None, cmd
+
+
+# ---- QA round 5 regressions -----------------------------------------------------
+
+def test_r5_variable_object_key_and_fromstream_gated():
+    for prog in ('("enab"+"leAllProj"+"ectMcpServers") as $k | . + {$k: true}',
+                 '("enab"+"ledMcpj"+"sonServers") as $k | . + {$k: ["evil"]}',
+                 '("a"+"b") as $k | . * fromstream([[$k],true], [[$k]])'):
+        assert _rule(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), prog
+    assert _rule(f"jq --rawfile k /tmp/kn '($k|rtrimstr(\"x\")) as $j | . + {{$j: true}}' {LOCAL} | sponge {LOCAL}")
+
+
+def test_r5_inplace_structured_editors_gated():
+    for cmd in (f"yq -i '.enableAllProjectMcpServers = true' {LOCAL}",
+                f"yq e -i '.enabledMcpjsonServers = [\"evil\"]' {LOCAL}",
+                f"yq --inplace '.enableAllProjectMcpServers = true' {LOCAL}"):
+        assert _rule(cmd), cmd
+    assert _rule(f"yq '.model' {LOCAL}") is None
+
+
+def test_r5_pipe_to_next_path_after_safe_value_not_gated():
+    for prog in ('.enableAllProjectMcpServers = false | .model = "x"',
+                 ".enableAllProjectMcpServers = false | .enabledMcpjsonServers = []"):
+        assert _rule(f"jq '{prog}' {LOCAL} | sponge {LOCAL}") is None, prog
+    assert _rule(f"jq '. + {{\"enableAllProjectMcpServers\": false | not}}' {LOCAL} | sponge {LOCAL}")
+
+
+def test_r5_front_padding_past_scan_surface_limit_gated():
+    cmd = "echo " + "a" * 20500 + f"; jq '.enableAllProjectMcpServers = true' {LOCAL} | sponge {LOCAL}"
+    t = time.time()
+    assert _rule(cmd)
+    assert time.time() - t < 0.5

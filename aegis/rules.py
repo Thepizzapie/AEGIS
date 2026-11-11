@@ -6511,7 +6511,10 @@ def _claude_mcp_aa_settings_args(cmd: str, _depth: int = 0) -> list:
     ``"{\\"enableAll""ProjectMcpServers\\":true}"`` comes back whole --
     QA round 2). A token that itself names ``claude`` and ``--settings``
     (``bash -c "claude --settings ..."``) is parsed recursively. Returns
-    ``None`` when the command cannot be tokenized (unbalanced quotes)."""
+    ``None`` when the command cannot be tokenized (unbalanced quotes) or is
+    over 20KB (the caller then falls back to the whole-command scan)."""
+    if len(cmd) > 20000:
+        return None
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
@@ -6610,7 +6613,9 @@ _CLAUDE_MCP_AA_JQ_FRAGMENT_RE = re.compile(r"enableAll|ProjectMcp|enabledMcp|Mcp
 # `false`/`null`/`[]` followed by a STRICT terminator (`)`, `,`, `}`, `]`,
 # `;`, end), `del(.k)`, a comparison, or (in a program with no assignment)
 # a plain read -- no fragment of either key name is left.
-_MCP_AA_STRICT_END = r"(?=\s*(?:$|[),}\];]))"
+# `|` followed by a new path filter (`.k = false | .model = "x"`) also
+# ends the value; `| not` / `| .` alone / `| $x` do not (QA round 5).
+_MCP_AA_STRICT_END = r"(?=\s*(?:$|[),}\];]|\|(?!=)\s*\.(?=[A-Za-z_\"\[])))"
 _MCP_AA_BOOL_STRICT = r"\s*(?:false|null)" + _MCP_AA_STRICT_END
 _MCP_AA_LIST_STRICT = r"\s*(?:\[\s*\]|null)" + _MCP_AA_STRICT_END
 _CLAUDE_MCP_AA_JQ_STRICT_SAFE_RE = re.compile(
@@ -6632,8 +6637,9 @@ _CLAUDE_MCP_AA_JQ_STRICT_SAFE_RE = re.compile(
 _CLAUDE_MCP_AA_JQ_DYNAMIC_RE = re.compile(
     r"(?<=[.\]\w?])\[(?!\s*(?:\"[^\"\\]*\"|'[^']*'|-?\d+)?\s*\])"
     r"|[{,]\s*\("
+    r"|[{,]\s*\$"          # `{$k: v}` / `{$k}` -- variable as object key (r5)
     r"|\\\("
-    r"|@base64d|\b(?:implode|fromjson|setpath|getpath|path|paths|leaf_paths|delpaths|"
+    r"|@base(?:64|32)d|\b(?:implode|fromjson|fromstream|tostream|capture|scan|splits|setpath|getpath|path|paths|leaf_paths|delpaths|"
     r"with_entries|from_entries|to_entries|reduce|foreach|walk|add|input|inputs|pick|"
     r"import|include|def)\b",
     re.IGNORECASE)
@@ -6651,7 +6657,11 @@ def _claude_mcp_aa_jq_programs(raw: str, _depth: int = 0):
     fragments too. ``complete`` is False when tokenizing failed, a program
     file (``-f``) is used, or fewer invocations were parsed than ``jq``
     tokens appear (an unrecognised spelling), so the caller falls back to a
-    conservative whole-command fragment check."""
+    conservative whole-command fragment check. Inputs over 20KB are not
+    tokenized at all (pure-Python `shlex` is ~3us/char) and take that
+    conservative path."""
+    if len(raw) > 20000:
+        return [], False
     try:
         lex = shlex.shlex(raw, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
@@ -6705,6 +6715,15 @@ def _claude_mcp_aa_jq_prog_hit(prog: str, extra: str) -> bool:
     return bool(_CLAUDE_MCP_AA_JQ_FRAG_RE.search(rest) or _CLAUDE_MCP_AA_JQ_FRAG_RE.search(extra))
 
 
+# In-place structured-data editors that write the file themselves, with no
+# redirect/sponge for the shared write-verb lists to see (QA round 5).
+# Single `[^...]*` gap, segment-bounded: linear.
+_CLAUDE_MCP_AA_EXTRA_WRITER_RE = re.compile(
+    r"\byq\b[^|;&\n]*\s(?:-i|--inplace)\b|\byq\b[^|;&\n]*\s-\w*i\b"
+    r"|\bdasel\b[^|;&\n]*\bput\b|\bjson\b[^|;&\n]*\s-I\b",
+    re.IGNORECASE)
+
+
 def _claude_mcp_aa_shell_write_hit(raw: str, norm: str) -> bool:
     """A shell command already known to touch AND write settings.local.json."""
     unesc = norm.replace('\\"', '"')
@@ -6722,6 +6741,8 @@ def _claude_mcp_aa_shell_write_hit(raw: str, norm: str) -> bool:
         rest = normalize.scan_surface(rest)
     else:
         rest = unesc
+    if len(raw) > 20000:
+        rest = f"{rest} {raw}"   # beyond scan_surface's truncation
     rest = _CLAUDE_MCP_AA_JQ_STRICT_SAFE_RE.sub(" ", _claude_cred_helper_normalize(rest))
     rest = _CLAUDE_MCP_AA_JQ_SAFE_SPANS_RE.sub(" ", rest)
     return bool(_CLAUDE_MCP_AA_JQ_FRAG_RE.search(rest))
@@ -6843,7 +6864,15 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     ``del``, a comparison, or a plain read in an assignment-free program),
     no fragment of either key name remains; non-jq writers (``python -c``,
     ``sed | sponge``, ``echo | sponge``) get the same fragment check on the
-    rest of the command. Round 5 verified the redesign.
+    rest of the command. Round 5 found the redesign's dynamic-construct list
+    incomplete (``{$k: v}`` variable object keys, ``fromstream``), in-place
+    editors no write-verb list knew (``yq -i``, ``dasel put``, ``json
+    -I``), a ``.k = false | .model = ...`` false positive, and front-padding
+    past `normalize.scan_surface`'s 20KB truncation hiding the path -- all
+    fixed (the path/writer checks now also read the raw command; over 20KB
+    the shlex extractor is skipped for the conservative whole-command
+    fragment check). The truncation itself is shared by every shell rule in
+    this file and is not this guard's to fix. Round 6 verified the fixes.
 
     Honest scope, the same denylist trade-offs every sibling guard
     discloses: a value-only Edit whose ``new_string`` neither names the key
@@ -6924,17 +6953,26 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
         cli_hit = _claude_mcp_aa_cli_hit(norm) or _claude_mcp_aa_settings_hit(_cmd(ev), norm)
         file_hit = False
         if not cli_hit:
-            cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd))
+            # `scan_surface` truncates at 20KB; also look at the raw command
+            # so front-padding cannot push the path out of view (QA round 5).
+            raw = _cmd(ev)
+            cd_hit = bool(patterns.CLAUDE_SETTINGS_CD_RE.search(cmd)
+                          or patterns.CLAUDE_SETTINGS_CD_RE.search(raw))
             path_hit = bool(patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(cmd)
-                            or (cd_hit and patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+                            or patterns.CLAUDE_LOCAL_SETTINGS_PATH_RE.search(raw)
+                            or (cd_hit and (patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(cmd)
+                                            or patterns.CLAUDE_LOCAL_SETTINGS_BARE_FILENAME_RE.search(raw))))
             if path_hit:
                 # Something has to WRITE the result: a read-only `jq` that
                 # merely projects the key to stdout is not gated (QA round 1).
-                write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                write_verb = bool(_CLAUDE_MCP_AA_EXTRA_WRITER_RE.search(cmd)
+                                  or _CLAUDE_MCP_AA_EXTRA_WRITER_RE.search(raw)
+                                  or patterns.WRITE_REDIRECT_RE.search(cmd)
                                   or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                                   or patterns.INPLACE_WRITE_RE.search(cmd)
                                   or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                                  or patterns.SPONGE_RE.search(cmd))
+                                  or patterns.SPONGE_RE.search(cmd)
+                                  or patterns.SPONGE_RE.search(raw))
                 if write_verb:
                     file_hit = _claude_mcp_aa_shell_write_hit(_cmd(ev), norm)
         if not (cli_hit or file_hit):
