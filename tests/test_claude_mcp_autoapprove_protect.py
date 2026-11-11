@@ -672,8 +672,9 @@ def test_r4_jq_truthy_operand_forms_gated():
                  ".enableAllProjectMcpServers = false as $x | true",
                  ".enableAllProjectMcpServers = false and false or true"):
         assert _rule(f"jq '{prog}' {LOCAL} | sponge {LOCAL}"), prog
-    assert _ours(evaluate(_shell(
-        f"jq '.enabledMcpjsonServers = null as $n | [\"evil\"]' {LOCAL} > t && mv t {LOCAL}"), EMPTY))
+    # mv into .claude/ is denied first by self-protect; this rule must
+    # independently gate it too.
+    assert _rule(f"jq '.enabledMcpjsonServers = null as $n | [\"evil\"]' {LOCAL} > t && mv t {LOCAL}")
 
 
 def test_r4_jq_dynamic_key_construction_gated():
