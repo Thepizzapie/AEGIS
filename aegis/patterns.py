@@ -3,6 +3,7 @@
 Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
+import functools
 import re
 
 # Explicit, recorded override: append '# aegis-allow' (or --aegis-allow) to an
@@ -5435,109 +5436,170 @@ TF_EXEC_HIT_RE = re.compile(
 
 # ---- Cargo / rustup toolchain exec-hijack protection ---------------------------
 # Cargo reads `.cargo/config.toml` (or legacy `.cargo/config`) from the current
-# directory AND EVERY PARENT up to `/`, plus `$CARGO_HOME/config.toml`, and
+# directory AND EVERY PARENT up to `/`, plus `$CARGO_HOME/config.toml`
+# (`~/.cargo`, or e.g. `/usr/local/cargo` in the official rust image), and
 # several of its keys name a program CARGO ITSELF execs: `build.rustc`/
 # `rustc-wrapper`/`rustc-workspace-wrapper`/`rustdoc` replace or wrap the
-# compiler on every `cargo build`/`check`/`test`/`clippy`; `target.<triple>.
-# runner` wraps every `cargo run`/`test`/`bench` binary; `target.*.linker`/
-# `host.linker` (and `-C linker=`/`-fuse-ld=`/`--ld-path=`/`-Z codegen-
-# backend=`/`-C llvm-args=-load=`/an ld `-plugin` smuggled through `rustflags`)
-# swaps the linker or loads a shared object into the compiler; `registry.
-# credential-provider`/`global-credential-providers`/`[credential-alias]` run a
-# command on every authenticated registry operation and hand it the token;
-# `doc.browser` runs on `cargo doc --open`; `[env]` injects env vars (an
-# `LD_PRELOAD`, say) into every build script and rustc process; `paths` and
-# `include` pull in crate sources / further config the content check never
-# sees. `rust-toolchain.toml`'s `[toolchain] path = "..."` makes rustup run
-# `cargo`/`rustc` from an arbitrary directory for every invocation under that
-# tree, and `rustup toolchain link` + `~/.rustup/settings.toml` overrides do
-# the same machine-wide. None of these needs the human to type anything
-# unusual: rust-analyzer (the default Rust language server in VS Code, Zed,
-# Helix, Neovim, JetBrains RustRover's equivalent) runs `cargo check` -- and so
-# the wrapper/linker/build scripts -- automatically on folder open.
-#
-# Path: the cargo config at any depth (Cargo's own parent-walk means a planted
-# `../.cargo/config.toml` or `~/.cargo/config.toml` is just as live), rustup's
-# per-tree toolchain file, and rustup's own on-disk state.
+# compiler on every `cargo build`/`check`/`test`/`clippy` (the wrapper even
+# runs for the `rustc -vV` probe `cargo metadata` makes); `target.<triple>.
+# runner` wraps every `cargo run`/`test`/`bench` binary; `target.*.linker`
+# (and `-C linker=`/`-fuse-ld=`/`--ld-path=`/`-B<dir>`/`-Z codegen-backend=`/
+# `-Z llvm-plugins=`/an ld `-plugin` smuggled through `rustflags`) swaps the
+# linker or loads a shared object into the compiler; `registry.credential-
+# provider`/`global-credential-providers`/`[credential-alias]` (and the
+# pre-1.74 `credential-process`) run a command on every authenticated
+# registry operation and hand it the token; `doc.browser` runs on `cargo doc
+# --open`; `[env]` injects env vars into every build script and rustc process
+# -- `PATH` with `force = true` re-resolves the linker (QA-verified with a
+# real `cargo build`), `CC`/`CXX`/`AR`/`PKG_CONFIG`/`CMAKE`/`PROTOC` are the
+# programs the cc/cmake/pkg-config/prost build-script crates run, and an
+# `LD_PRELOAD` is a loader hijack; `paths`, `include` and a config-level
+# `[patch]` pull in crate sources (whose build.rs then runs) or further config
+# the content check never sees. `rust-toolchain.toml`'s `[toolchain] path =`
+# (and a legacy extensionless `rust-toolchain` holding a bare directory path,
+# QA-verified on rustup 1.28) makes rustup run `cargo`/`rustc` from an
+# arbitrary directory for every invocation under that tree; `rustup toolchain
+# link` + `~/.rustup/settings.toml` (`default_toolchain` machine-wide,
+# `overrides` per directory) do the same. None of these needs the human to
+# type anything unusual: rust-analyzer runs `cargo check` on folder open.
+
+_CARGO_HOME_TOKEN = r"\$(?:CARGO_HOME\b|\{CARGO_HOME[^}\n]{0,100}\})"
+_CARGO_HOME_DIRS = r"(?:\.cargo|usr" + _SEP + r"local" + _SEP + r"cargo)"
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    r"(?:(?:^|[\s'\"/\\=])" + _CARGO_HOME_DIRS + r"|" + _CARGO_HOME_TOKEN + r")"
+    + r"[\"']?" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
-# Split-path shell form (QA bypass round 1): `cd .cargo && ... > config.toml`,
-# `pushd .cargo; ...`, or `D=.cargo; ... > $D/config.toml` name the directory
-# and the file in separate tokens, so the contiguous CARGO_CONFIG_PATH_RE never
-# matches although Cargo reads the result. Shell branch only: a `.cargo`
-# directory token AND a bare `config`/`config.toml` token anywhere in the
-# command count as the path (a false ASK on an unrelated `config` word next
-# to a `.cargo` mention is the accepted safe direction).
+RUST_TOOLCHAIN_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])rust-toolchain(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# The legacy, extensionless toolchain file -- its content may be a bare path.
+RUST_TOOLCHAIN_LEGACY_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])rust-toolchain" + _CI_END,
+    re.IGNORECASE,
+)
+_PATH_END = r"(?=[/\\;&|)]|\s|['\"]|$)"
+RUSTUP_STATE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.rustup" + _WIN_TRIM + _SEP
+    + r"(?:settings\.toml" + _CI_END + r"|toolchains" + _WIN_TRIM + _PATH_END + r")",
+    re.IGNORECASE,
+)
+
+# Split-path shell forms (QA bypass rounds 1-2): `cd .cargo && ... > config.
+# toml`, `pushd .cargo; ...`, `D=.cargo; ... > $D/config.toml`, `cd
+# $CARGO_HOME && ...`, `cd .car* && ...` name the directory and the file in
+# separate tokens, so the contiguous CARGO_CONFIG_PATH_RE never matches
+# although Cargo reads the result. A directory token must END its path
+# (`~/.cargo` / `.cargo/`, never `~/.cargo/bin/rg`) and a bare `config` token
+# must not be a `git config`/`npm config`/... subcommand (round-2 false-
+# positive fix).
+_GLOB_TAIL = r"[*?\[][^\s'\"/\\;&|)]{0,50}"
+_CARGO_DIR_CORE = (
+    r"(?:\.cargo|\.c(?:a(?:r(?:go?)?)?)?" + _GLOB_TAIL
+    + r"|usr" + _SEP + r"local" + _SEP + r"cargo)"
+)
+_DIR_END = r"[ .]*(?:[/\\]+\.?)?[\"']?(?=[\s'\"\\;&|)}]|$)"
 CARGO_DIR_TOKEN_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.cargo" + _CI_END,
+    r"(?:^|[\s'\"/\\=])" + _CARGO_DIR_CORE + _DIR_END
+    + r"|" + _CARGO_HOME_TOKEN,
+    re.IGNORECASE,
+)
+RUSTUP_DIR_TOKEN_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.rustup" + _DIR_END
+    + r"|\$(?:RUSTUP_HOME\b|\{RUSTUP_HOME[^}\n]{0,100}\})",
     re.IGNORECASE,
 )
 CARGO_BARE_CONFIG_TOKEN_RE = re.compile(
-    r"(?:^|[\s'\"/\\=>}])config(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=>}])(?:config(?:\.toml)?|c(?:o(?:n(?:f(?:ig?)?)?)?)?" + _GLOB_TAIL + r")"
+    + _CI_END,
+    re.IGNORECASE,
+)
+_CONFIG_SUBCOMMAND_RE = re.compile(
+    r"\b(?:git|npm|pnpm|yarn|pip[0-9.]*|poetry|gh|kubectl|docker|podman|conda|composer"
+    r"|bundle|go|dotnet|cargo|rustup|aws|gcloud|az|helm|mise|asdf|nuget|uv|pdm)"
+    r"(?:\s+-{1,2}[\w-]+(?:=\S+)?){0,5}\s+config\b",
     re.IGNORECASE,
 )
 
 
 def cargo_config_shell_path_hit(cmd: str) -> bool:
-    return bool(CARGO_CONFIG_PATH_RE.search(cmd)
-                or (CARGO_DIR_TOKEN_RE.search(cmd)
-                    and CARGO_BARE_CONFIG_TOKEN_RE.search(cmd)))
+    if CARGO_CONFIG_PATH_RE.search(cmd):
+        return True
+    if not CARGO_DIR_TOKEN_RE.search(cmd):
+        return False
+    return bool(CARGO_BARE_CONFIG_TOKEN_RE.search(_CONFIG_SUBCOMMAND_RE.sub(" ", cmd)))
 
 
-RUST_TOOLCHAIN_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])rust-toolchain(?:\.toml)?" + _CI_END,
-    re.IGNORECASE,
-)
-RUSTUP_STATE_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.rustup" + _WIN_TRIM + _SEP
-    + r"(?:settings\.toml" + _CI_END + r"|toolchains(?:" + _WIN_TRIM + r"(?=[/\;&|)]|\s|['\"]|$)))",
-    re.IGNORECASE,
-)
-# Content check for a CONFIRMED cargo-config path. Tokens, not `key =`
-# assignments: the same distinctive word also appears as a dotted key
-# (`build.rustc-wrapper = ...`), an inline table (`build = { rustc-wrapper =
-# ... }`), a quoted key, a `-C linker=` rustflags element, or the
-# `CARGO_TARGET_<TRIPLE>_LINKER`/`RUSTC_WRAPPER` env-var spelling inside
-# `[env]`, and every one of those is equally live. `[-_]` because Cargo maps
-# kebab-case keys to `_` in env vars and an `[env]`-section name uses `_`.
+# Content check for a CONFIRMED cargo-config path. Exec-only words (wrapper,
+# credential provider, loader env vars, codegen backend, ...) match bare --
+# they also appear as dotted keys (`build.rustc-wrapper = ...`), inline
+# tables, quoted keys, a `-C` rustflags element, or the `CARGO_TARGET_<T>_
+# LINKER`/`RUSTC_WRAPPER` env spelling inside `[env]`, all equally live. Words
+# with ordinary other meanings in a cargo config (`runner`, `linker`,
+# `browser`, `path`, `cc`, ... -- an `[alias] run-plugin`, a `RUST_LOG =
+# "my_plugin=debug"`, a `target-dir = "target/runner-cache"`) must be
+# followed by `=` (a key, or a `-Clinker=` flag) -- QA coverage round false-
+# positive fix. `[-_]` because Cargo maps kebab-case keys to `_` in env vars.
 # Boundaries are `(?<![a-z0-9])`/`(?![a-z0-9])`, NOT `\b`, so `_` counts as a
-# separator (`CARGO_TARGET_X_RUNNER` must hit `runner`). `linker-flavor`
-# (selects a linker family, never names a binary) is excluded. `rustc`/
-# `rustdoc`/`paths`/`include` are generic enough to need key position
-# (`rustc =`, `"rustc" =`, `build.rustc=`); the rest are distinctive bare.
-# A rustc codegen flag is commonly glued to its option (`-Clinker=`,
-# `-Zcodegen-backend=`, `-Cllvm-args=`), so `-C`/`-Z` immediately before a
-# token also counts as a boundary.
+# separator (`CARGO_TARGET_X_RUNNER` must hit `runner`); a rustc codegen flag
+# glued to its option (`-Clinker=`, `-Zcodegen-backend=`) counts too.
 _CARGO_TOKEN_START = r"(?:(?<![a-z0-9])|(?<=-[cz]))"
 _CARGO_TOKEN_END = r"(?![a-z0-9])"
 _CARGO_KEY_POS = r"(?:^|(?<=[\s{,.\"']))"
+_CARGO_KEYEQ = r"[\"']?[ \t]*="
 CARGO_EXEC_HIT_RE = re.compile(
     _CARGO_TOKEN_START + r"(?:"
     r"rustc[-_](?:workspace[-_])?wrapper"
-    r"|runner"
-    r"|linker(?![-_]flavor)"
-    r"|(?:global[-_])?credential[-_]providers?"
+    r"|cargo[-_]build[-_]rust(?:c|doc)"
+    r"|(?:runner|linker(?![-_]flavor))(?=" + _CARGO_KEYEQ + r")"
+    r"|(?:global[-_])?credential[-_](?:providers?|process)"
     r"|credential[-_]alias"
     r"|fuse[-_]ld|ld[-_]path"
     r"|codegen[-_]backend"
-    r"|llvm[-_]args"
-    r"|plugin(?:[-_]opt)?"
-    r"|browser"
+    r"|llvm[-_]plugins?"
     r"|ld[-_]preload|ld[-_]library[-_]path|ld[-_]audit"
     r"|dyld[-_]insert[-_]libraries|dyld[-_]library[-_]path"
     r"|bash[-_]env|node[-_]options|perl5opt|rubyopt|pythonstartup|pythonpath"
-    r"|git[-_]ssh[-_]command"
+    r"|git[-_]ssh(?:[-_]command)?"
     r")" + _CARGO_TOKEN_END
-    + r"|" + _CARGO_KEY_POS + r"(?:rustc|rustdoc|paths|include)[\"']?[ \t]*=",
+    # ld `-plugin`/`-plugin-opt` only as a dash flag (`-Wl,-plugin=`).
+    + r"|(?<=[\s,\"'=]-)plugin(?:[-_]opt)?" + _CARGO_TOKEN_END
+    # gcc `-B<dir>` inside link-arg(s): gcc then runs <dir>/collect2/ld.
+    + r"|link[-_]args?[ \t]*=[ \t]*[\"']?(?:[^\"'\n\]]{0,200}?\s)?(?-i:-B)"
+    + r"|" + _CARGO_KEY_POS + r"(?:rustc|rustdoc|paths|include|browser|path|patch"
+      r"|(?:(?:target|host)[-_])?(?:cc|cxx|ar|ranlib)(?:[-_][a-z0-9_]+)?"
+      r"|pkg[-_]config|protoc|cmake)" + _CARGO_KEYEQ
+    + r"|^[ \t]*\[[ \t]*[\"']?patch\b",
     re.IGNORECASE | re.MULTILINE,
 )
+# `global-credential-providers = ["cargo:token", "cargo:libsecret"]` (and a
+# single `credential-provider = "cargo:..."`) name only Cargo's BUILT-IN
+# providers, never an external program -- removed before matching (QA
+# coverage round false-positive fix). Any non-`cargo:` entry keeps it live.
+_CARGO_BUILTIN_CRED_RE = re.compile(
+    r"(?:global[-_])?credential[-_]providers?[\"']?[ \t]*=[ \t]*"
+    r"(?:\[(?:\s*[\"']cargo:[\w-]{1,40}[\"']\s*,?){0,10}\s*\]|[\"']cargo:[\w-]{1,40}[\"'])"
+    r"(?=[ \t]*(?:#[^\n]*)?$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def cargo_exec_hit(scan: str) -> bool:
+    return bool(CARGO_EXEC_HIT_RE.search(_CARGO_BUILTIN_CRED_RE.sub("", scan)))
+
+
 # rust-toolchain(.toml): the only exec-capable key is `path` (a custom
-# toolchain directory rustup runs cargo/rustc out of). `channel`/
-# `components`/`targets`/`profile` only name rustup-managed toolchains.
+# toolchain directory rustup runs cargo/rustc out of).
 RUST_TOOLCHAIN_EXEC_HIT_RE = re.compile(
-    _CARGO_KEY_POS + r"path[\"']?[ \t]*=",
+    _CARGO_KEY_POS + r"path" + _CARGO_KEYEQ,
+    re.IGNORECASE | re.MULTILINE,
+)
+# Legacy extensionless rust-toolchain: a non-comment line that looks like a
+# filesystem path rather than a channel name (`stable`, `nightly-2024-06-01`,
+# `1.82.0`) -- QA design round, verified live on rustup 1.28.
+RUST_TOOLCHAIN_LEGACY_EXEC_RE = re.compile(
+    r"^[ \t]*(?:[/~.\\]|[a-z]:[/\\]|[^\s#=]*[/\\])",
     re.IGNORECASE | re.MULTILINE,
 )
 # `rustup toolchain link <name> <dir>` registers an arbitrary directory as a
@@ -5547,52 +5609,116 @@ RUSTUP_LINK_CLI_RE = re.compile(
     r"\brustup\b[^|;&\n]{0,200}\btoolchain\s+link\b",
     re.IGNORECASE,
 )
-# Opaque shell writes: a copy/move/link/archive that places a prepared file
-# at the target path never shows the file's CONTENT in the command, so the
-# content check above can't see it. Cargo config is rarely written at all,
-# so a copy-shaped verb naming the path is enough. `rm`/`del` are excluded
-# (deleting the config removes exec surface, never adds it).
+# Opaque shell writes: a copy/move/link/archive/fetch/git-checkout that places
+# a prepared file at the target path never shows the file's CONTENT in the
+# command, so the content check can't see it. Cargo config is rarely written
+# at all, so an opaque verb naming the path is enough (not direction-aware:
+# `cp .cargo/config.toml /tmp/backup` is a disclosed false ASK). `rm`/`del`
+# are excluded (deleting the config removes exec surface, never adds it).
 CARGO_OPAQUE_WRITE_RE = re.compile(
     r"\b(?:cp|mv|ln|dd|install|copy|move|ren|copy-item|cpi|move-item|mi"
-    r"|rename-item|new-item|ni|rsync|unzip|unrar|cpio|xcopy|robocopy|expand-archive)\b"
-    r"|\btar\b[^|;&\n]{0,200}(?:\s-{0,2}[a-zA-Z]{0,5}x[a-zA-Z]{0,5}\b|--extract\b)",
+    r"|rename-item|new-item|ni|rsync|unzip|unrar|cpio|xcopy|robocopy|expand-archive"
+    r"|curl|wget|invoke-webrequest|iwr|invoke-restmethod|irm|start-bitstransfer|certutil)\b"
+    # token-bounded (at most 8 args before the extract flag), not a {0,200}
+    # char window: the window form ran ~1s on 400KB of repeated `tar `.
+    r"|\btar(?:\s+[^\s|;&]{1,300}){0,8}?\s+(?:-{0,2}[a-zA-Z]{0,5}x[a-zA-Z]{0,5}|--extract)(?![\w-])"
+    r"|\bgit\b[^|;&\n]{0,200}\b(?:checkout|restore|show|apply|am)\b",
     re.IGNORECASE,
 )
-# TOML lets a quoted key carry `\uXXXX`/`\UXXXXXXXX` escapes (`"rustc-
-# wrapper" = ...` is the key `rustc-wrapper`), which a literal token regex
-# never sees. Decoded before every content check above.
-_TOML_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+# A redirect fed from a file reader (`cat /tmp/p > .cargo/config.toml`,
+# `... | tee`) is opaque the same way -- unless the clause carries a heredoc,
+# whose body IS in the command for the content check.
+_CARGO_READER_RE = re.compile(
+    r"\b(?:cat|type|get-content|gc|head|tail|envsubst|xxd|base64|openssl"
+    r"|zcat|gunzip|bzcat|xzcat|git)\b|(?<![<0-9])<(?![<(&])\s*\S",
+    re.IGNORECASE,
+)
+_SHELL_CLAUSE_SPLIT_RE = re.compile(r"&&|\|\||[;\n&]")
 
 
-# A shell `printf '...\\nkey = ...'`/`echo -e` payload carries a literal
-# backslash-n where the file will get a newline; without this the key would
-# sit glued to an `n` and miss both the token boundary and key position.
-_LITERAL_WS_ESCAPE_RE = re.compile(r"\\[nrt]")
+def cargo_reader_redirect_hit(cmd: str) -> bool:
+    for clause in _SHELL_CLAUSE_SPLIT_RE.split(cmd):
+        if "<<" in clause:
+            continue
+        if _CARGO_READER_RE.search(clause) and WRITE_REDIRECT_RE.search(clause):
+            return True
+    return False
+
+
+# Whole-directory placement (QA bypass round 2): `cp -r /tmp/staged .cargo`,
+# `mv /tmp/s ~/.cargo`, `ln -s /tmp/s .cargo`, `tar -C .cargo -xf p.tar`,
+# `unzip p.zip -d .cargo`, or `cd .cargo && tar xf p.tar` never names
+# `config` at all. A clause whose opaque verb's LAST argument (or `-C`/`-d`/
+# `-t`/`--directory`/`-Destination` value) is the directory, or any opaque
+# verb after a `cd`/`pushd` into it, counts.
+@functools.lru_cache(maxsize=4)
+def _dir_placement_res(core: str, home_token: str):
+    tok = r"(?:(?:^|(?<=[\s'\"/\\=]))" + core + _DIR_END + r"|" + home_token + r"[\"']?(?=[\s'\"/\\;&|)]|$))"
+    last_re = re.compile(r"(?:^|\s)[\"']?(?:[^\s'\"]{0,200}?)" + tok + r"[\"']?\s*\)*\s*$", re.IGNORECASE)
+    flag_re = re.compile(
+        r"(?:\s-[Cdt]|\s--(?:directory|target-directory)|\s-Destination(?:Path)?)(?:=|\s+)[\"']?[^\s'\"]{0,200}?" + tok,
+        re.IGNORECASE)
+    cd_re = re.compile(r"(?:^|[;&|(\n])\s*(?:cd|pushd|chdir|set-location|sl)\s+[\"']?[^\s'\";&|]{0,200}?" + tok, re.IGNORECASE)
+    return last_re, flag_re, cd_re
+
+
+def _dir_placement_hit(cmd: str, core: str, home_token: str) -> bool:
+    last_re, flag_re, cd_re = _dir_placement_res(core, home_token)
+    if cd_re.search(cmd) and CARGO_OPAQUE_WRITE_RE.search(cmd):
+        return True
+    for clause in _SHELL_CLAUSE_SPLIT_RE.split(cmd):
+        if not CARGO_OPAQUE_WRITE_RE.search(clause):
+            continue
+        if last_re.search(clause) or flag_re.search(clause):
+            return True
+    return False
+
+
+def cargo_dir_placement_hit(cmd: str) -> bool:
+    return _dir_placement_hit(cmd, _CARGO_DIR_CORE, _CARGO_HOME_TOKEN)
+
+
+def rustup_dir_placement_hit(cmd: str) -> bool:
+    return _dir_placement_hit(cmd, r"\.rustup", r"\$(?:RUSTUP_HOME\b|\{RUSTUP_HOME[^}\n]{0,100}\})")
+
+
+# Escape decoding for the content checks: TOML `\uXXXX`/`\UXXXXXXXX` (and TOML
+# 1.1 `\xHH`) quoted-key escapes, plus the shell's own ways of writing a
+# newline into a payload -- `printf '\n'`, `\x0a`, octal `\012`, PowerShell
+# `` `n `` -- which otherwise leave the key glued to an `n`/`a`/`2` and miss
+# both the token boundary and key position (QA design round).
+_TOML_UNICODE_ESCAPE_RE = re.compile(
+    r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})|\\x([0-9a-fA-F]{2})|\\(0?[0-7]{3})")
+_LITERAL_WS_ESCAPE_RE = re.compile(r"\\[nrt]|`[nrt]")
 
 
 def toml_unescape(text: str) -> str:
-    """Decode TOML `\\uXXXX`/`\\UXXXXXXXX` escapes and literal `\\n`/`\\r`/
-    `\\t` sequences (as a newline) for the cargo/rustup content checks."""
-    text = _LITERAL_WS_ESCAPE_RE.sub("\n", text)
-
+    """Decode TOML/shell escapes (see `_TOML_UNICODE_ESCAPE_RE`) and literal
+    `\\n`/`\\r`/`\\t`/`` `n `` sequences (as a newline) for the cargo/rustup
+    content checks."""
     def _dec(m):
         try:
-            return chr(int(m.group(1) or m.group(2), 16))
+            if m.group(4):
+                return chr(int(m.group(4), 8))
+            return chr(int(m.group(1) or m.group(2) or m.group(3), 16))
         except (ValueError, OverflowError):
             return m.group(0)
-    return _TOML_UNICODE_ESCAPE_RE.sub(_dec, text)
+    text = _TOML_UNICODE_ESCAPE_RE.sub(_dec, text)
+    return _LITERAL_WS_ESCAPE_RE.sub("\n", text)
 # Known, disclosed gaps: a path or key assembled indirectly (an interpreter
-# building `'.car' + 'go/config.toml'`, a generator script) defeats the
-# literal match, the same "computed indirectly" class every sibling accepts;
-# an Edit that swaps only the VALUE of an already-present exec key, with the
-# key name in neither old_string nor new_string, isn't seen (no disk read --
-# the same split-across-calls limitation `rule_package_manifest_protect`
-# discloses); `build.rs`/proc-macro crates (ordinary, reviewed source) and
-# `rustflags` `-L`/`-l`/`link-arg` linking an attacker object into the output
-# binary are out of scope; `CARGO_HOME`/`RUSTUP_HOME`/`RUSTC_WRAPPER` exported
-# from a shell rc / `.envrc` is `rule_shell_persist_protect`'s/
-# `rule_direnv_protect`'s surface; `Cargo.toml` `[patch]`/`[replace]` source
-# overrides are a supply-chain surface, not a direct exec key.
+# building `'.car' + 'go/config.toml'`, a generator script's output
+# redirected into place) defeats the literal match, the same "computed
+# indirectly" class every sibling accepts; a `$CARGO_HOME` at a path not
+# named `.cargo`/`/usr/local/cargo` and not spelled via the variable; an
+# Edit that swaps only the VALUE of an already-present exec key, with the
+# key name in neither old_string nor new_string (no disk read -- the same
+# split-across-calls limitation `rule_package_manifest_protect` discloses);
+# `build.rs`/proc-macro crates (ordinary, reviewed source) and `rustflags`
+# `-L`/`-l`/`link-arg` linking an attacker object into the output binary;
+# `CARGO_HOME`/`RUSTUP_HOME`/`RUSTC_WRAPPER` exported from a shell rc /
+# `.envrc` (`rule_shell_persist_protect`'s/`rule_direnv_protect`'s surface);
+# `Cargo.toml` `[patch]`/`[replace]` source overrides (supply-chain, not a
+# direct exec key); and the opaque-write check is not direction-aware.
 
 # Full-line `#` comments -- both AWS's own config-file format and YAML treat
 # a line whose first non-whitespace character is `#` as inert. QA (bypass-

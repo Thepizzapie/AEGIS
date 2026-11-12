@@ -8684,9 +8684,15 @@ def _cargo_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
 
 
 def _cargo_scan(text: str) -> str:
-    """Comment-stripped, TOML-unescaped scan surface for the cargo/rustup
-    content checks."""
-    return patterns.toml_unescape(patterns.strip_comment_lines(text))
+    """Escape-decoded, then comment-stripped scan surface for the cargo/rustup
+    content checks. Decoding FIRST matters: `printf '# c\\nrustc-wrapper=..'`
+    is one physical `#` line until the `\\n` is decoded (QA coverage round)."""
+    return patterns.strip_comment_lines(patterns.toml_unescape(text))
+
+
+_RUST_TOOLCHAIN_TOKEN_RE = re.compile(r"\S*rust-toolchain\S*", re.IGNORECASE)
+_SHELL_PATHLIKE_TOKEN_RE = re.compile(
+    r"(?:^|[\s'\"=])(?:[/~\\]|\.{1,2}[/\\]|[a-z]:[/\\]|\$\{?\w+\}?[/\\])\S", re.IGNORECASE)
 
 
 def _cargo_content_hit(path_text: str, content: str, shell: bool = False) -> str:
@@ -8697,12 +8703,37 @@ def _cargo_content_hit(path_text: str, content: str, shell: bool = False) -> str
     scan = _cargo_scan(content)
     cargo_path = (patterns.cargo_config_shell_path_hit(path_text) if shell
                   else patterns.CARGO_CONFIG_PATH_RE.search(path_text))
-    if cargo_path and patterns.CARGO_EXEC_HIT_RE.search(scan):
+    if cargo_path and patterns.cargo_exec_hit(scan):
         return "cargo"
     if (patterns.RUST_TOOLCHAIN_PATH_RE.search(path_text)
             and patterns.RUST_TOOLCHAIN_EXEC_HIT_RE.search(scan)):
         return "toolchain"
+    if patterns.RUST_TOOLCHAIN_LEGACY_PATH_RE.search(path_text):
+        if shell:
+            # The legacy file's whole content is one bare toolchain name or
+            # path; from a shell, any path-looking token besides the target
+            # itself is the payload (`echo /tmp/tc > rust-toolchain`).
+            rest = _RUST_TOOLCHAIN_TOKEN_RE.sub(" ", scan)
+            if (patterns.WRITE_REDIRECT_RE.search(rest) or patterns.INPLACE_WRITE_RE.search(rest)) \
+                    and _SHELL_PATHLIKE_TOKEN_RE.search(rest):
+                return "toolchain"
+        elif patterns.RUST_TOOLCHAIN_LEGACY_EXEC_RE.search(scan):
+            return "toolchain"
     return ""
+
+
+_CARGO_SHELL_PREFILTER_RE = re.compile(r"cargo|rust|\.c[a-z]{0,4}[*?\[]", re.IGNORECASE)
+
+
+# An MCP call's path may sit under any key; only path-SHAPED leaves (no
+# whitespace, bounded length) count, so an issue body or a note that merely
+# MENTIONS `.cargo/config.toml` is not a write to it (QA design round).
+_MCP_PATHLIKE_LEAF_RE = re.compile(r"^[^\s]{1,1024}$")
+# MCP tools that only read (`read_file`, `get_file_info`, `list_directory`,
+# `search_files`, ...) never place content.
+_MCP_READ_TOOL_RE = re.compile(
+    r"(?:^|[_\-.])(?:read|get|list|search|find|stat|view|info|tree|head|tail|cat)(?:[_\-.]|$)",
+    re.IGNORECASE)
 
 
 _CARGO_LABELS = {
@@ -8717,29 +8748,36 @@ _CARGO_LABELS = {
 
 def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting a program-exec key in a Cargo config file
-    (``.cargo/config.toml``/``.cargo/config``), a custom-toolchain ``path``
-    in ``rust-toolchain(.toml)``, or a rustup toolchain link/override.
+    (``.cargo/config.toml``/``.cargo/config``, any depth, or under
+    ``$CARGO_HOME``), a custom-toolchain path in ``rust-toolchain(.toml)``,
+    or a rustup toolchain link/override.
 
     THREAT MODEL: Cargo merges ``.cargo/config.toml`` from the working
     directory and EVERY parent up to the filesystem root, plus
     ``$CARGO_HOME/config.toml``, and several keys name a program Cargo
     itself spawns: ``build.rustc``/``rustc-wrapper``/``rustc-workspace-
-    wrapper``/``rustdoc`` (every build/check/test/clippy/doc),
-    ``target.<triple>.runner`` (every ``cargo run``/``test``/``bench``),
-    ``target.*.linker``/``host.linker`` and linker/plugin flags smuggled
-    through ``rustflags`` (every link), ``registry.credential-provider``/
-    ``global-credential-providers``/``[credential-alias]`` (every
-    authenticated registry call, handed the token), ``doc.browser``
-    (``cargo doc --open``), and ``[env]`` (injected into every build script
-    and rustc process -- an ``LD_PRELOAD`` there is a loader hijack);
-    ``paths``/``include`` pull in crate sources or more config this check
-    never reads. rustup's ``rust-toolchain.toml`` ``path = "..."`` runs
-    ``cargo``/``rustc`` themselves from an arbitrary directory for every
-    invocation under that tree, and ``rustup toolchain link`` plus
-    ``~/.rustup/settings.toml`` overrides do the same machine-wide. The
-    trigger needs no human action at all: rust-analyzer, the default Rust
-    language server in every mainstream editor, runs ``cargo check`` on
-    folder open, which runs the wrapper/linker/build scripts. A
+    wrapper``/``rustdoc`` (every build/check/test/clippy/doc -- the wrapper
+    even runs for the ``rustc -vV`` probe), ``target.<triple>.runner``
+    (every ``cargo run``/``test``/``bench``), ``target.*.linker`` and
+    linker/plugin flags smuggled through ``rustflags`` (``-C linker=``,
+    ``-fuse-ld=``, ``--ld-path=``, gcc ``-B<dir>``, ``-Z codegen-backend``,
+    ``-Z llvm-plugins``, an ld ``-plugin``), ``registry.credential-
+    provider``/``global-credential-providers``/``[credential-alias]``/
+    ``credential-process`` (every authenticated registry call, handed the
+    token), ``doc.browser`` (``cargo doc --open``), and ``[env]`` (injected
+    into every build script and rustc process: ``PATH`` with ``force =
+    true`` re-resolves the linker, ``CC``/``CXX``/``AR``/``PKG_CONFIG``/
+    ``CMAKE``/``PROTOC`` are what the cc/cmake/pkg-config/prost build-script
+    crates run, ``LD_PRELOAD`` is a loader hijack); ``paths``/``include``/a
+    config-level ``[patch]`` pull in crate sources or more config this check
+    never reads. (``host.linker`` is only honored with ``-Zhost-config`` on
+    nightly; it is still gated.) rustup's ``rust-toolchain.toml`` ``path =``
+    -- or a legacy extensionless ``rust-toolchain`` holding a bare
+    directory path -- runs ``cargo``/``rustc`` themselves from an arbitrary
+    directory for every invocation under that tree; ``rustup toolchain
+    link`` plus ``~/.rustup/settings.toml`` (``default_toolchain`` machine-
+    wide, ``overrides`` per directory) do the same. The trigger needs no
+    human action: rust-analyzer runs ``cargo check`` on folder open. A
     ``.cargo/config.toml`` is usually TRACKED, so the plant also ships to
     every teammate and CI runner that builds the repo -- the same "write
     today, auto-exec on someone else's routine trigger" shape
@@ -8747,35 +8785,37 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     ``rule_package_manifest_protect`` already gates this file's registry
     ``replace-with`` redirect; it does not look at any exec key.
 
-    Detection: Edit/Write/MCP -- path is a cargo config (any depth) and the
-    written text (``content``/``new_string``, else every string leaf of the
-    args, so MultiEdit's ``edits`` and an MCP server's nested shapes are
-    covered, and an Edit's ``old_string`` too, so rewriting an existing
-    exec line's value is seen when the key is in the edited span) carries
-    an exec token (``CARGO_EXEC_HIT_RE``, after stripping ``#`` comment
-    lines and decoding TOML ``\\u`` escapes); a rust-toolchain file with
-    a ``path =`` key; or ANY write to rustup's ``settings.toml``/
-    ``toolchains/`` (rustup itself writes these; an agent tool never needs
-    to). Shell -- ``rustup toolchain link``; a cargo-config/rust-toolchain
-    path co-occurring with the exec token in the command text (heredoc,
-    echo/printf redirect, ``sed -i``, an interpreter one-liner); a copy/
-    move/link/archive verb naming a cargo-config, rust-toolchain, or
-    rustup-state path (``CARGO_OPAQUE_WRITE_RE`` -- the placed file's
-    content is invisible to the command, and these files are rarely written
-    at all); or a write redirect/in-place edit naming rustup state.
-    On the shell branch a cargo-config path also counts when the directory
-    and file are separate tokens (``cd .cargo && ... > config.toml``,
-    ``D=.cargo; ... > $D/config.toml``) -- QA bypass round 1, reproduced
-    and closed via ``patterns.cargo_config_shell_path_hit``.
-    ``fetch_to_file`` already covers ``curl -o .cargo/config.toml`` via
-    ``REGISTRY_CONFIG_PATH_RE``; the toolchain/rustup paths are added to its
-    ``_FETCH_HUMAN_ESCAPABLE`` table here.
+    Detection, Edit/Write/MCP: the target is a cargo config / rust-toolchain
+    file and the written text (``content``/``new_string``; an Edit's
+    ``old_string`` unless the edit is a pure removal; every string leaf for
+    MultiEdit ``edits`` and MCP shapes) carries an exec token
+    (``patterns.cargo_exec_hit``, after decoding TOML/shell escapes, THEN
+    stripping ``#`` comment lines; built-in ``cargo:`` credential providers
+    are exempt); or the target is rustup's ``settings.toml``/
+    ``toolchains/``. MCP targets are the known path key plus path-SHAPED
+    leaves only, read-only MCP tools are skipped, and the policy ``allow``
+    regex sees only the matched target path, never content.
+
+    Detection, shell: ``rustup toolchain link``; a write naming rustup
+    state or placing a whole ``.rustup`` dir; a cargo-config/rust-toolchain
+    path (contiguous, or split across tokens -- ``cd .cargo && ... >
+    config.toml``, ``D=.cargo; > $D/config.toml``, ``$CARGO_HOME``,
+    ``.car*`` globs, with ``git config``/``npm config`` subcommands
+    ignored) co-occurring with the exec token; an opaque write naming such a
+    path (copy/move/link/archive/fetch/``git checkout|restore|show|apply``,
+    or a ``cat``/``<``-fed redirect without a heredoc) since the placed
+    content is invisible; or a whole-``.cargo``-directory placement
+    (``cp -r staged .cargo``, ``tar -C .cargo -x``, ``cd .cargo && tar x``).
+    ``rule_fetch_to_file_protect``'s ``_FETCH_HUMAN_ESCAPABLE`` lists the
+    cargo-config (now incl. ``$CARGO_HOME``/``/usr/local/cargo``),
+    rust-toolchain and rustup-state paths as a backstop; this rule runs
+    first and claims ``curl -o .cargo/config.toml`` itself.
 
     Config (``policy.cargo_config_exec``): ``mode`` (deny|ask|monitor|off,
-    default ask), ``allow`` (regexes on the path/command that skip the gate
-    -- an embedded project's reviewed ``runner = "probe-rs run"``, say).
-    ``ask`` by default, matching every sibling: ``linker = "clang"``/
-    ``runner = "probe-rs run"``/``rustc-wrapper = "sccache"`` are all
+    default ask), ``allow`` (regexes on the target path / shell command that
+    skip the gate -- an embedded project's reviewed ``runner = "probe-rs
+    run"``, say). ``ask`` by default, matching every sibling: ``linker =
+    "clang"``/``runner = "probe-rs run"``/``rustc-wrapper = "sccache"`` are
     ordinary in real projects, so a human looks rather than a hard block.
 
     Escapable only by a human: a trailing '# aegis-allow' on the shell form,
@@ -8783,14 +8823,34 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     can do neither (``_override_allowed`` refuses its own marker; it can't set
     the hook process's env).
 
-    Honest scope: see ``CARGO_EXEC_HIT_RE``'s trailing comment in
-    patterns.py -- indirectly built paths/keys, a value-only Edit with the key
-    outside both strings, ``build.rs``/proc macros, ``-L``/``link-arg``
-    object injection, env-var exports from shell rc files, and ``Cargo.toml``
-    ``[patch]`` overrides are not covered here. Like every whole-command
-    content guard, the shell branch is not clause-scoped: a read of a cargo
-    config sharing a command with an unrelated exec-token word (``grep
-    linker .cargo/config.toml``) is a false ASK, never a false ALLOW."""
+    Honest scope: see the trailing "Known, disclosed gaps" comment above
+    ``toml_unescape`` in patterns.py. The shell branch is not clause-scoped
+    or direction-aware: ``cp .cargo/config.toml /tmp/backup`` and ``grep
+    'linker =' .cargo/config.toml`` are false ASKs, never false ALLOWs.
+
+    QA history (three independent reviews, same convention as siblings):
+    design/wiring review confirmed registration and YAML round-trip for every
+    mode, and verified live (cargo 1.97 / rustup 1.28) that ``include``,
+    ``rust-toolchain.toml`` ``path``, and the wrapper on ``rustc -vV`` all
+    exec. Its findings, all closed here: ``[env] PATH``/``CC``/... (live-
+    verified linker hijack), legacy bare-path ``rust-toolchain`` (live-
+    verified), ``-B``/``llvm-plugins`` rustflags, ``\\x0a``/octal/
+    PowerShell-backtick newlines, the MCP ``allow`` regex matching content,
+    a Windows ``.rustup\\toolchains`` lookahead bug, MCP read/mention and
+    pure-removal false ASKs, and a false ``-Cllvm-args=-load`` claim (stable
+    rustc rejects it; dropped). Bypass review round 1: split-path ``cd
+    .cargo && ...`` writes (closed); round 2: ``$CARGO_HOME`` spellings,
+    whole-directory placement/extraction, fetch-after-cd, git-sourced
+    content, globs (all closed) and a ``~/.cargo/bin`` + ``git config``
+    false ASK (closed by end-anchoring the dir token and ignoring
+    ``<tool> config`` subcommands). Coverage review: the ``[env]``/
+    ``[patch]``/``credential-process``/``GIT_SSH``/``CARGO_BUILD_RUSTC``/
+    ``\\x`` gaps, comment-stripping-before-decoding on printf payloads,
+    reader-redirect copies (all closed), and five false ASKs from bare
+    ``runner``/``linker``/``browser``/``plugin`` words (closed by
+    requiring key position or a dash flag) plus built-in ``cargo:``
+    providers (exempted); a ~1s ``tar`` window scan was made token-bounded.
+    """
     cfg = getattr(policy, "cargo_config_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -8807,33 +8867,54 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        path_text = p
         if ev.action == ActionClass.MCP:
-            # An MCP server may name its target under a key `_path` doesn't
-            # know (`destination`, `target`, a nested object) -- widen the
-            # path check to every string leaf, the same move
-            # `rule_docker_cred_helper_protect` makes.
-            path_text = (p + " " + " ".join(_flatten_strings(a))).strip()
-        if not path_text:
+            tool_tail = str(ev.tool or "").rsplit("__", 1)[-1]
+            if _MCP_READ_TOOL_RE.search(tool_tail):
+                return None
+        # Candidate target paths: the known path key, plus (MCP only) every
+        # path-shaped string leaf, for a server naming its target under a
+        # key `_path` doesn't know (`destination`, a nested object).
+        cands = [p] if p else []
+        if ev.action == ActionClass.MCP:
+            cands += [s for s in _flatten_strings(a)
+                      if isinstance(s, str) and s != p and _MCP_PATHLIKE_LEAF_RE.match(s)]
+        if not cands:
             return None
-        if patterns.RUSTUP_STATE_PATH_RE.search(path_text):
-            kind = "rustup"
-        else:
-            parts = []
-            for k in ("content", "new_string", "old_string"):
-                v = a.get(k)
-                if isinstance(v, str) and v:
-                    parts.append(v)
-            if not parts or ev.action == ActionClass.MCP or a.get("edits"):
-                parts.append(" ".join(_flatten_strings(a)))
-            kind = _cargo_content_hit(path_text, "\n".join(parts))
+        parts = []
+        new = a.get("new_string")
+        for k in ("content", "new_string"):
+            v = a.get(k)
+            if isinstance(v, str) and v:
+                parts.append(v)
+        # An Edit's old_string counts too (rewriting an exec line's value is
+        # seen when the key is in the edited span), but not for a pure
+        # removal (empty new_string) -- deleting `rustc-wrapper = "sccache"`
+        # removes exec surface (QA design round false-positive fix).
+        old = a.get("old_string")
+        if isinstance(old, str) and old and isinstance(new, str) and new.strip():
+            parts.append(old)
+        if ((not parts and ev.action != ActionClass.EDIT)
+                or ev.action == ActionClass.MCP or a.get("edits")):
+            parts.append(" ".join(_flatten_strings(a)))
+        content = "\n".join(parts)
+        kind, target = "", ""
+        for c in cands:
+            if patterns.RUSTUP_STATE_PATH_RE.search(c):
+                kind, target = "rustup", c
+            else:
+                kind, target = _cargo_content_hit(c, content), c
+            if kind:
+                break
         if not kind:
             return None
+        # The allow regex sees only the matched TARGET path, never content
+        # (QA design round: an MCP body carrying `# firmware/` must not
+        # satisfy `allow: ['firmware/']`).
         if (os.environ.get("AEGIS_ALLOW_CARGO_CONFIG_EXEC")
-                or _cargo_config_exec_allowed_by_policy(cfg, p or path_text)):
+                or _cargo_config_exec_allowed_by_policy(cfg, target)):
             return None
         return _finish(Decision(action, "cargo-config-exec-protect",
-                         f"'{p or path_text[:200]}' is being written with "
+                         f"'{target[:300]}' is being written with "
                          f"{_CARGO_LABELS[kind]} — Cargo/rustup execs it "
                          "automatically on the next cargo build/check/test/"
                          "run (rust-analyzer runs `cargo check` on folder "
@@ -8845,22 +8926,39 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        scan_cmd = patterns.strip_comment_lines(cmd)
+        # Cheap prefilter: every path/CLI this branch matches contains
+        # "cargo"/"rust" (incl. CARGO_HOME, rust-toolchain, .rustup) or a
+        # `.c*`-style glob -- skip the full scan for everything else.
+        if not _CARGO_SHELL_PREFILTER_RE.search(cmd):
+            return None
+        # Path checks on the comment-stripped raw text (decoding `\t` would
+        # break a Windows `.rustup\toolchains` path); content checks on the
+        # decoded-then-stripped text (`_cargo_scan`).
+        path_cmd = patterns.strip_comment_lines(cmd)
+        dec_cmd = _cargo_scan(cmd)
+        both = path_cmd + "\n" + dec_cmd
+        rustup_path = bool(patterns.RUSTUP_STATE_PATH_RE.search(path_cmd))
         kind = ""
-        if patterns.RUSTUP_LINK_CLI_RE.search(scan_cmd):
+        if patterns.RUSTUP_LINK_CLI_RE.search(path_cmd):
             kind = "rustup"
-        elif patterns.RUSTUP_STATE_PATH_RE.search(scan_cmd) and (
-                patterns.CARGO_OPAQUE_WRITE_RE.search(scan_cmd)
-                or patterns.WRITE_REDIRECT_RE.search(scan_cmd)
-                or patterns.INPLACE_WRITE_RE.search(scan_cmd)):
+        elif rustup_path and (
+                patterns.CARGO_OPAQUE_WRITE_RE.search(path_cmd)
+                or patterns.WRITE_REDIRECT_RE.search(path_cmd)
+                or patterns.INPLACE_WRITE_RE.search(path_cmd)):
+            kind = "rustup"
+        elif patterns.rustup_dir_placement_hit(path_cmd):
             kind = "rustup"
         else:
-            kind = _cargo_content_hit(scan_cmd, scan_cmd, shell=True)
-            if not kind and patterns.CARGO_OPAQUE_WRITE_RE.search(scan_cmd):
-                if patterns.cargo_config_shell_path_hit(scan_cmd):
+            kind = _cargo_content_hit(both, cmd, shell=True)
+            if not kind:
+                opaque = bool(patterns.CARGO_OPAQUE_WRITE_RE.search(path_cmd)
+                              or patterns.cargo_reader_redirect_hit(path_cmd))
+                if opaque and patterns.cargo_config_shell_path_hit(path_cmd):
                     kind = "cargo"
-                elif patterns.RUST_TOOLCHAIN_PATH_RE.search(scan_cmd):
+                elif opaque and patterns.RUST_TOOLCHAIN_PATH_RE.search(path_cmd):
                     kind = "toolchain"
+                elif patterns.cargo_dir_placement_hit(path_cmd):
+                    kind = "cargo"
         if not kind:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_CONFIG_EXEC")
