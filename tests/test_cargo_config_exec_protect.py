@@ -222,6 +222,9 @@ SHELL_HITS = [
     "cp /tmp/tc.toml rust-toolchain.toml",
     "printf '[toolchain]\\npath = \"/tmp/tc\"\\n' > rust-toolchain.toml",
     "rustup toolchain link evil /tmp/evil-tc && rustup default evil",
+    "rustup default /tmp/evil-tc",
+    "rustup override set ~/evil-tc",
+    "rustup override set --path . ./evil-tc",
     "echo x >> ~/.rustup/settings.toml",
     "cp -r /tmp/tc ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu",
     "echo W2J1aWxkXQpydXN0Yy13cmFwcGVyID0gIi4vdyIK | base64 -d > .cargo/config.toml",
@@ -358,6 +361,8 @@ ROUND2_EXEC_BODIES = [
     '[env]\nAR = "/tmp/x"\n',
     '[env]\nTARGET_CC = "/tmp/x"\n',
     '[env]\nCC_x86_64_unknown_linux_gnu = "/tmp/x"\n',
+    '[env]\nCC_aarch64-unknown-linux-gnu = "/tmp/x"\n',
+    '[env]\nAR_wasm32_unknown_unknown = "/tmp/x"\n',
     '[env]\nPKG_CONFIG = "/tmp/x"\n',
     '[env]\nPROTOC = "/tmp/x"\n',
     '[env]\nCMAKE = "/tmp/x"\n',
@@ -382,6 +387,8 @@ ROUND2_BENIGN_BODIES = [
     '[alias]\ntest-browser = "test --features browser"\n',
     '[build]\ntarget-dir = "target/runner-cache"\n',
     '[build]\njobs = 8  # fewer jobs, the linker eats RAM\n',
+    '[env]\nCC_ENABLE_DEBUG_OUTPUT = "1"\n',
+    '[env]\nAR_FLAGS_NOTE = "x"\nCXXFLAGS = "-O2"\nCFLAGS = "-O2"\n',
     '[registry]\nglobal-credential-providers = ["cargo:token", "cargo:libsecret"]\n',
     '[registries.corp]\ncredential-provider = "cargo:token"\n',
     '[build]\nrustflags = ["-C", "link-arg=-Tlink.x", "-C", "link-arg=-Wl,-Bstatic"]\n',
@@ -402,6 +409,9 @@ def test_round2_legacy_rust_toolchain_bare_path():
     assert _hits(_write("rust-toolchain", "/tmp/evil-tc\n"))
     assert _hits(_write("rust-toolchain", "C:\\tc\\evil\n"))
     assert _hits(_write("rust-toolchain", "../tc\n"))
+    assert _hits(_write("rust-toolchain", "C:\\tools\\tc\n"))
+    assert _hits(_write("rust-toolchain", "D:\\rust\\tc\n"))
+    assert _hits(_write("rust-toolchain", "C:\\nightly-tc\n"))
     assert _rule(evaluate(_write("rust-toolchain", "stable\n"), EMPTY)) is None
     assert _rule(evaluate(_write("rust-toolchain", "nightly-2024-06-01\n"), EMPTY)) is None
     assert _rule(evaluate(_write("rust-toolchain", "1.82.0\n"), EMPTY)) is None
@@ -476,6 +486,7 @@ ROUND2_SHELL_HITS = [
     "printf '[build]\n# cache\\nrustc-wrapper = \"x\"\n' > .cargo/config.toml",
     # legacy toolchain file
     "echo /tmp/evil-tc > rust-toolchain",
+    "echo C:\\tools\\tc > rust-toolchain",
     # windows rustup toolchains
     "copy C:\\tc C:\\Users\\u\\.rustup\\toolchains\\evil",
 ]
@@ -494,6 +505,9 @@ ROUND2_SHELL_BENIGN = [
     "echo stable > rust-toolchain",
     "cargo install ripgrep && ls ~/.cargo/bin",
     "rustup component add clippy",
+    "rustup default stable",
+    "rustup override set nightly-2024-06-01",
+    "rustup override set --path ./sub nightly",
 ]
 
 

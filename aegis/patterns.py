@@ -5568,7 +5568,13 @@ CARGO_EXEC_HIT_RE = re.compile(
     # gcc `-B<dir>` inside link-arg(s): gcc then runs <dir>/collect2/ld.
     + r"|link[-_]args?[ \t]*=[ \t]*[\"']?(?:[^\"'\n\]]{0,200}?\s)?(?-i:-B)"
     + r"|" + _CARGO_KEY_POS + r"(?:rustc|rustdoc|paths|include|browser|path|patch"
-      r"|(?:(?:target|host)[-_])?(?:cc|cxx|ar|ranlib)(?:[-_][a-z0-9_]+)?"
+      # `CC`/`TARGET_CC`/`CC_<target-triple>` -- the suffix must look like
+      # a triple (QA design round 3: `CC_ENABLE_DEBUG_OUTPUT` is cc-rs's
+      # own debug flag, not a compiler).
+      r"|(?:(?:target|host)[-_])?(?:cc|cxx|ar|ranlib)"
+      r"(?:[-_](?:x86_64|i[3-6]86|aarch64|arm\w{0,20}|thumb\w{0,20}|riscv\w{0,20}|wasm\w{0,20}"
+      r"|mips\w{0,20}|powerpc\w{0,20}|s390x|sparc\w{0,20}|loongarch\w{0,20}|avr|bpf\w{0,10})"
+      r"[-_][\w-]{0,100})?"
       r"|pkg[-_]config|protoc|cmake)" + _CARGO_KEYEQ
     + r"|^[ \t]*\[[ \t]*[\"']?patch\b",
     re.IGNORECASE | re.MULTILINE,
@@ -5605,8 +5611,14 @@ RUST_TOOLCHAIN_LEGACY_EXEC_RE = re.compile(
 # `rustup toolchain link <name> <dir>` registers an arbitrary directory as a
 # toolchain -- the CLI form of a `path =` toolchain. Bounded span, same ReDoS
 # reasoning as every other bounded gap in this file.
+# Also `rustup default <path>` / `rustup override set <path>`: recent rustup
+# resolves a path-shaped toolchain name as a custom toolchain directory
+# (QA coverage round 2 note), persisting it in settings.toml.
 RUSTUP_LINK_CLI_RE = re.compile(
-    r"\brustup\b[^|;&\n]{0,200}\btoolchain\s+link\b",
+    r"\brustup\b[^|;&\n]{0,200}\btoolchain\s+link\b"
+    r"|\brustup\b[^|;&\n]{0,200}\b(?:default|override\s+set)"
+    r"(?:\s+(?:--path(?:=|\s+)[^\s|;&]{1,300}|-(?!-?path\b)-?[\w-]+)){0,4}"
+    r"\s+[\"']?(?:[/~\\]|\.{1,2}[/\\]|[a-z]:[/\\]|\$)",
     re.IGNORECASE,
 )
 # Opaque shell writes: a copy/move/link/archive/fetch/git-checkout that places

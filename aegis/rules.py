@@ -8709,15 +8709,21 @@ def _cargo_content_hit(path_text: str, content: str, shell: bool = False) -> str
             and patterns.RUST_TOOLCHAIN_EXEC_HIT_RE.search(scan)):
         return "toolchain"
     if patterns.RUST_TOOLCHAIN_LEGACY_PATH_RE.search(path_text):
+        # The legacy file is NOT TOML: check the raw (comment-stripped) text
+        # too, since escape-decoding turns `C:\tools\tc` into `C:<NL>ools..`
+        # (QA design round 3).
+        raw = patterns.strip_comment_lines(content)
         if shell:
             # The legacy file's whole content is one bare toolchain name or
             # path; from a shell, any path-looking token besides the target
             # itself is the payload (`echo /tmp/tc > rust-toolchain`).
-            rest = _RUST_TOOLCHAIN_TOKEN_RE.sub(" ", scan)
-            if (patterns.WRITE_REDIRECT_RE.search(rest) or patterns.INPLACE_WRITE_RE.search(rest)) \
-                    and _SHELL_PATHLIKE_TOKEN_RE.search(rest):
-                return "toolchain"
-        elif patterns.RUST_TOOLCHAIN_LEGACY_EXEC_RE.search(scan):
+            for t in (scan, raw):
+                rest = _RUST_TOOLCHAIN_TOKEN_RE.sub(" ", t)
+                if (patterns.WRITE_REDIRECT_RE.search(rest) or patterns.INPLACE_WRITE_RE.search(rest)) \
+                        and _SHELL_PATHLIKE_TOKEN_RE.search(rest):
+                    return "toolchain"
+        elif (patterns.RUST_TOOLCHAIN_LEGACY_EXEC_RE.search(scan)
+              or patterns.RUST_TOOLCHAIN_LEGACY_EXEC_RE.search(raw)):
             return "toolchain"
     return ""
 
