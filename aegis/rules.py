@@ -7862,6 +7862,9 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
+    (patterns.RUST_TOOLCHAIN_PATH_RE, "a rust-toolchain file"),
+    (patterns.RUSTUP_STATE_PATH_RE, "rustup's toolchain/override state"),
 )
 
 
@@ -8670,6 +8673,206 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _cargo_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _cargo_scan(text: str) -> str:
+    """Comment-stripped, TOML-unescaped scan surface for the cargo/rustup
+    content checks."""
+    return patterns.toml_unescape(patterns.strip_comment_lines(text))
+
+
+def _cargo_content_hit(path_text: str, content: str) -> str:
+    """Return a short label for which exec surface ``content`` plants at a
+    path named in ``path_text``, or "" for none."""
+    scan = _cargo_scan(content)
+    if (patterns.CARGO_CONFIG_PATH_RE.search(path_text)
+            and patterns.CARGO_EXEC_HIT_RE.search(scan)):
+        return "cargo"
+    if (patterns.RUST_TOOLCHAIN_PATH_RE.search(path_text)
+            and patterns.RUST_TOOLCHAIN_EXEC_HIT_RE.search(scan)):
+        return "toolchain"
+    return ""
+
+
+_CARGO_LABELS = {
+    "cargo": ("a Cargo config exec key (rustc/rustc-wrapper/rustdoc, a "
+              "target runner/linker, a rustflags linker/plugin/codegen-"
+              "backend, a credential provider, doc.browser, an [env] "
+              "loader var, or a paths/include source redirect)"),
+    "toolchain": "a rust-toolchain `path` (a custom, unmanaged toolchain directory)",
+    "rustup": "rustup's own toolchain/override state",
+}
+
+
+def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a program-exec key in a Cargo config file
+    (``.cargo/config.toml``/``.cargo/config``), a custom-toolchain ``path``
+    in ``rust-toolchain(.toml)``, or a rustup toolchain link/override.
+
+    THREAT MODEL: Cargo merges ``.cargo/config.toml`` from the working
+    directory and EVERY parent up to the filesystem root, plus
+    ``$CARGO_HOME/config.toml``, and several keys name a program Cargo
+    itself spawns: ``build.rustc``/``rustc-wrapper``/``rustc-workspace-
+    wrapper``/``rustdoc`` (every build/check/test/clippy/doc),
+    ``target.<triple>.runner`` (every ``cargo run``/``test``/``bench``),
+    ``target.*.linker``/``host.linker`` and linker/plugin flags smuggled
+    through ``rustflags`` (every link), ``registry.credential-provider``/
+    ``global-credential-providers``/``[credential-alias]`` (every
+    authenticated registry call, handed the token), ``doc.browser``
+    (``cargo doc --open``), and ``[env]`` (injected into every build script
+    and rustc process -- an ``LD_PRELOAD`` there is a loader hijack);
+    ``paths``/``include`` pull in crate sources or more config this check
+    never reads. rustup's ``rust-toolchain.toml`` ``path = "..."`` runs
+    ``cargo``/``rustc`` themselves from an arbitrary directory for every
+    invocation under that tree, and ``rustup toolchain link`` plus
+    ``~/.rustup/settings.toml`` overrides do the same machine-wide. The
+    trigger needs no human action at all: rust-analyzer, the default Rust
+    language server in every mainstream editor, runs ``cargo check`` on
+    folder open, which runs the wrapper/linker/build scripts. A
+    ``.cargo/config.toml`` is usually TRACKED, so the plant also ships to
+    every teammate and CI runner that builds the repo -- the same "write
+    today, auto-exec on someone else's routine trigger" shape
+    ``rule_vscode_tasks_protect``/``rule_git_config_exec_protect`` gate.
+    ``rule_package_manifest_protect`` already gates this file's registry
+    ``replace-with`` redirect; it does not look at any exec key.
+
+    Detection: Edit/Write/MCP -- path is a cargo config (any depth) and the
+    written text (``content``/``new_string``, else every string leaf of the
+    args, so MultiEdit's ``edits`` and an MCP server's nested shapes are
+    covered, and an Edit's ``old_string`` too, so rewriting an existing
+    exec line's value is seen when the key is in the edited span) carries
+    an exec token (``CARGO_EXEC_HIT_RE``, after stripping ``#`` comment
+    lines and decoding TOML ``\\u`` escapes); a rust-toolchain file with
+    a ``path =`` key; or ANY write to rustup's ``settings.toml``/
+    ``toolchains/`` (rustup itself writes these; an agent tool never needs
+    to). Shell -- ``rustup toolchain link``; a cargo-config/rust-toolchain
+    path co-occurring with the exec token in the command text (heredoc,
+    echo/printf redirect, ``sed -i``, an interpreter one-liner); a copy/
+    move/link/archive verb naming a cargo-config, rust-toolchain, or
+    rustup-state path (``CARGO_OPAQUE_WRITE_RE`` -- the placed file's
+    content is invisible to the command, and these files are rarely written
+    at all); or a write redirect/in-place edit naming rustup state.
+    ``fetch_to_file`` already covers ``curl -o .cargo/config.toml`` via
+    ``REGISTRY_CONFIG_PATH_RE``; the toolchain/rustup paths are added to its
+    ``_FETCH_HUMAN_ESCAPABLE`` table here.
+
+    Config (``policy.cargo_config_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the gate
+    -- an embedded project's reviewed ``runner = "probe-rs run"``, say).
+    ``ask`` by default, matching every sibling: ``linker = "clang"``/
+    ``runner = "probe-rs run"``/``rustc-wrapper = "sccache"`` are all
+    ordinary in real projects, so a human looks rather than a hard block.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or ``AEGIS_ALLOW_CARGO_CONFIG_EXEC=1`` set before launch. A spawned agent
+    can do neither (``_override_allowed`` refuses its own marker; it can't set
+    the hook process's env).
+
+    Honest scope: see ``CARGO_EXEC_HIT_RE``'s trailing comment in
+    patterns.py -- indirectly built paths/keys, a value-only Edit with the key
+    outside both strings, ``build.rs``/proc macros, ``-L``/``link-arg``
+    object injection, env-var exports from shell rc files, and ``Cargo.toml``
+    ``[patch]`` overrides are not covered here. Like every whole-command
+    content guard, the shell branch is not clause-scoped: a read of a cargo
+    config sharing a command with an unrelated exec-token word (``grep
+    linker .cargo/config.toml``) is a false ASK, never a false ALLOW."""
+    cfg = getattr(policy, "cargo_config_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-config-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        path_text = p
+        if ev.action == ActionClass.MCP:
+            # An MCP server may name its target under a key `_path` doesn't
+            # know (`destination`, `target`, a nested object) -- widen the
+            # path check to every string leaf, the same move
+            # `rule_docker_cred_helper_protect` makes.
+            path_text = (p + " " + " ".join(_flatten_strings(a))).strip()
+        if not path_text:
+            return None
+        if patterns.RUSTUP_STATE_PATH_RE.search(path_text):
+            kind = "rustup"
+        else:
+            parts = []
+            for k in ("content", "new_string", "old_string"):
+                v = a.get(k)
+                if isinstance(v, str) and v:
+                    parts.append(v)
+            if not parts or ev.action == ActionClass.MCP or a.get("edits"):
+                parts.append(" ".join(_flatten_strings(a)))
+            kind = _cargo_content_hit(path_text, "\n".join(parts))
+        if not kind:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_CONFIG_EXEC")
+                or _cargo_config_exec_allowed_by_policy(cfg, p or path_text)):
+            return None
+        return _finish(Decision(action, "cargo-config-exec-protect",
+                         f"'{p or path_text[:200]}' is being written with "
+                         f"{_CARGO_LABELS[kind]} — Cargo/rustup execs it "
+                         "automatically on the next cargo build/check/test/"
+                         "run (rust-analyzer runs `cargo check` on folder "
+                         "open, so no human command is needed), here and on "
+                         "every teammate/CI runner that builds this tree. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_CARGO_CONFIG_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        kind = ""
+        if patterns.RUSTUP_LINK_CLI_RE.search(scan_cmd):
+            kind = "rustup"
+        elif patterns.RUSTUP_STATE_PATH_RE.search(scan_cmd) and (
+                patterns.CARGO_OPAQUE_WRITE_RE.search(scan_cmd)
+                or patterns.WRITE_REDIRECT_RE.search(scan_cmd)
+                or patterns.INPLACE_WRITE_RE.search(scan_cmd)):
+            kind = "rustup"
+        else:
+            kind = _cargo_content_hit(scan_cmd, scan_cmd)
+            if not kind and patterns.CARGO_OPAQUE_WRITE_RE.search(scan_cmd):
+                if patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd):
+                    kind = "cargo"
+                elif patterns.RUST_TOOLCHAIN_PATH_RE.search(scan_cmd):
+                    kind = "toolchain"
+        if not kind:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_CONFIG_EXEC")
+                or _cargo_config_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "cargo-config-exec-protect",
+                         f"A shell command is planting {_CARGO_LABELS[kind]} "
+                         "(or placing a cargo/rustup config whose content "
+                         "this check can't see) — Cargo/rustup execs it "
+                         "automatically on the next cargo build/check/test/"
+                         "run (rust-analyzer runs `cargo check` on folder "
+                         "open), here and on every teammate/CI runner that "
+                         "builds this tree. A human may append "
+                         "'# aegis-allow', or set "
+                         "AEGIS_ALLOW_CARGO_CONFIG_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -9296,6 +9499,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_config_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,

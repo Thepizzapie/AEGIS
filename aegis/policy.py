@@ -420,6 +420,15 @@ class Policy:
     # Terraform process is already authenticated with. See
     # rules.rule_terraform_exec_protect.
     terraform_exec: dict = field(default_factory=dict)
+    # Cargo / rustup toolchain exec-hijack protection: {mode: deny|ask|
+    # monitor|off, allow: [regex on path/command]}. Empty -> defaults
+    # (mode=ask). Covers a program-exec key (rustc/rustc-wrapper/runner/
+    # linker/credential-provider/...) in .cargo/config(.toml), a custom
+    # toolchain `path` in rust-toolchain(.toml), and rustup toolchain links/
+    # overrides -- Cargo/rustup exec these on the next cargo invocation,
+    # which rust-analyzer issues on folder open. See
+    # rules.rule_cargo_config_exec_protect.
+    cargo_config_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing
