@@ -8728,7 +8728,7 @@ def _cargo_content_hit(path_text: str, content: str, shell: bool = False) -> str
     return ""
 
 
-_CARGO_SHELL_PREFILTER_RE = re.compile(r"cargo|rust|\.c[a-z]{0,4}[*?\[]", re.IGNORECASE)
+_CARGO_SHELL_PREFILTER_RE = re.compile(r"cargo|rust|[*?\[]", re.IGNORECASE)
 
 
 # An MCP call's path may sit under any key; only path-SHAPED leaves (no
@@ -8856,6 +8856,22 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     ``runner``/``linker``/``browser``/``plugin`` words (closed by
     requiring key position or a dash flag) plus built-in ``cargo:``
     providers (exempted); a ~1s ``tar`` window scan was made token-bounded.
+    Round 3 (design): Windows bare-path legacy ``rust-toolchain`` broken by
+    escape decoding (now also checked raw), a ``CC_ENABLE_DEBUG_OUTPUT``
+    false ASK (``CC_``/``AR_`` suffix must look like a target triple); and
+    ``rustup default|override set <path>`` gated. Round 4 (bypass): the
+    reader allowlist + blanket heredoc exemption were bypassable (``sed -n p
+    /tmp/p >``, ``cat /tmp/p - <<EOF >``, ``cat >f </tmp/p``) -- replaced by
+    "a redirect into the config is opaque unless its source is a visible
+    echo/printf literal or an operand-free heredoc ``cat``", with heredoc
+    bodies stripped line-by-line first; leading-position globs (``.?argo``,
+    ``[c]onfig.toml``, ``*.toml``) are fnmatch-normalized
+    (``patterns.deglob_cargo_tokens``, linear, fnmatch budget fails closed);
+    ``7z -o``, ``scp``/``sftp``/``rclone``, ``git clone|pull|worktree|...``
+    and interpreter ``-c`` copies added as opaque writes, with the
+    directory counted as any argument of an opaque clause; ``rustup default
+    rel/dir/``. Self-check: the git/interpreter window scans were made
+    token-bounded (2.3s -> 0.4s on 400KB).
     """
     cfg = getattr(policy, "cargo_config_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -8940,7 +8956,7 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
         # Path checks on the comment-stripped raw text (decoding `\t` would
         # break a Windows `.rustup\toolchains` path); content checks on the
         # decoded-then-stripped text (`_cargo_scan`).
-        path_cmd = patterns.strip_comment_lines(cmd)
+        path_cmd = patterns.deglob_cargo_tokens(patterns.strip_comment_lines(cmd))
         dec_cmd = _cargo_scan(cmd)
         both = path_cmd + "\n" + dec_cmd
         rustup_path = bool(patterns.RUSTUP_STATE_PATH_RE.search(path_cmd))

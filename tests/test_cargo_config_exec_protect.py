@@ -531,3 +531,87 @@ def test_round2_redos_new_helpers():
         patterns.cargo_exec_hit(s)
         patterns.toml_unescape(s)
         assert time.time() - t < 2.0, s[:20]
+
+
+# ---- QA round 4 (bypass review) ----------------------------------------------
+
+ROUND4_SHELL_HITS = [
+    # heredoc + a file operand / here-string
+    "cat /tmp/p - <<EOF > .cargo/config.toml\nEOF",
+    "cat <<EOF /tmp/p > .cargo/config.toml\nEOF",
+    'cat <<<"" /tmp/p > .cargo/config.toml',
+    # readers beyond cat
+    "sed -n p /tmp/p > .cargo/config.toml",
+    "awk 1 /tmp/p > .cargo/config.toml",
+    "sort /tmp/p > .cargo/config.toml",
+    "tac /tmp/p | tac > .cargo/config.toml",
+    "cut -c1- /tmp/p > .cargo/config.toml",
+    "jq -r .x /tmp/p.json > .cargo/config.toml",
+    "cat >.cargo/config.toml </tmp/p",
+    "cd .cargo && sed -n p /tmp/p > config.toml",
+    'echo "$(cat /tmp/p)" > .cargo/config.toml',
+    # leading-position globs
+    "cd .?argo && cp /tmp/p config.toml",
+    "cd .[c]argo && cp /tmp/p config.toml",
+    "cp /tmp/p .[c]argo/config.toml",
+    "cp /tmp/p .?argo/config.toml",
+    "cp /tmp/p .cargo/[c]onfig.toml",
+    "cp /tmp/p .cargo/?onfig.toml",
+    "cp /tmp/p .cargo/*.toml",
+    # more opaque verbs
+    "7z x /tmp/p.7z -o.cargo",
+    "git clone https://example.invalid/r.git .cargo",
+    "git -C .cargo pull",
+    "git worktree add .cargo x",
+    "scp host:/x .cargo/config.toml",
+    "rclone copyto r:x .cargo/config.toml",
+    "python3 -c \"import shutil; shutil.copy('/tmp/p', '.cargo/config.toml')\"",
+    # rustup bare relative path
+    "rustup default tc-dir/",
+    "rustup override set sub/tc",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND4_SHELL_HITS)
+def test_round4_shell_hits(cmd):
+    from aegis.rules import rule_cargo_config_exec_protect
+    assert rule_cargo_config_exec_protect(_shell(cmd), EMPTY) is not None, cmd
+
+
+ROUND4_SHELL_BENIGN = [
+    "cat > .cargo/config.toml <<'EOF'\n[build]\njobs = 4\nmsg = \"a > b\"\nEOF",
+    "cat <<-EOF > .cargo/config.toml\n\t[build]\n\tjobs = 4\n\tEOF",
+    "printf '[build]\\njobs = 4\\n' >> .cargo/config.toml",
+    "echo '[alias]' >> .cargo/config.toml",
+    "ls *.rs && cargo build",
+    "cp src/*.rs /tmp/backup/",
+    "rm -f target/*.rlib",
+    "rustup default stable",
+    "git pull && cargo build",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND4_SHELL_BENIGN)
+def test_round4_shell_benign(cmd):
+    from aegis.rules import rule_cargo_config_exec_protect
+    assert rule_cargo_config_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+def test_round4_redos_new_helpers():
+    import time
+    from aegis import patterns
+    from aegis.rules import rule_cargo_config_exec_protect
+    for s in ("<<EOF\n" * 50000, "*" * 400000, "a*b " * 100000, "[" * 400000,
+              ".cargo/" + "?" * 400000, "cat " * 100000 + "> .cargo/config.toml",
+              "git " * 100000, "python " * 100000, "rustup default " + "a" * 400000,
+              " ".join("a%d*" % i for i in range(60000)),
+              " ".join("[%d]onfig" % i for i in range(50000)),
+              " ".join(".[%d]argo" % i for i in range(50000))):
+        t = time.time()
+        patterns.strip_heredoc_bodies(s)
+        patterns.deglob_cargo_tokens(s)
+        patterns.cargo_reader_redirect_hit(s)
+        patterns.CARGO_OPAQUE_WRITE_RE.search(s)
+        patterns.RUSTUP_LINK_CLI_RE.search(s)
+        rule_cargo_config_exec_protect(_shell(s), EMPTY)
+        assert time.time() - t < 3.0, s[:20]

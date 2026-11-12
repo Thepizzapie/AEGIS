@@ -3,6 +3,7 @@
 Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
+import fnmatch
 import functools
 import re
 
@@ -5466,22 +5467,22 @@ TF_EXEC_HIT_RE = re.compile(
 _CARGO_HOME_TOKEN = r"\$(?:CARGO_HOME\b|\{CARGO_HOME[^}\n]{0,100}\})"
 _CARGO_HOME_DIRS = r"(?:\.cargo|usr" + _SEP + r"local" + _SEP + r"cargo)"
 CARGO_CONFIG_PATH_RE = re.compile(
-    r"(?:(?:^|[\s'\"/\\=])" + _CARGO_HOME_DIRS + r"|" + _CARGO_HOME_TOKEN + r")"
+    r"(?:(?:^|[\s'\"/\\=<>])" + _CARGO_HOME_DIRS + r"|" + _CARGO_HOME_TOKEN + r")"
     + r"[\"']?" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 RUST_TOOLCHAIN_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])rust-toolchain(?:\.toml)?" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>])rust-toolchain(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
 # The legacy, extensionless toolchain file -- its content may be a bare path.
 RUST_TOOLCHAIN_LEGACY_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])rust-toolchain" + _CI_END,
+    r"(?:^|[\s'\"/\\=<>])rust-toolchain" + _CI_END,
     re.IGNORECASE,
 )
 _PATH_END = r"(?=[/\\;&|)]|\s|['\"]|$)"
 RUSTUP_STATE_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.rustup" + _WIN_TRIM + _SEP
+    r"(?:^|[\s'\"/\\=<>])\.rustup" + _WIN_TRIM + _SEP
     + r"(?:settings\.toml" + _CI_END + r"|toolchains" + _WIN_TRIM + _PATH_END + r")",
     re.IGNORECASE,
 )
@@ -5501,12 +5502,12 @@ _CARGO_DIR_CORE = (
 )
 _DIR_END = r"[ .]*(?:[/\\]+\.?)?[\"']?(?=[\s'\"\\;&|)}]|$)"
 CARGO_DIR_TOKEN_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])" + _CARGO_DIR_CORE + _DIR_END
+    r"(?:^|[\s'\"/\\=<>])" + _CARGO_DIR_CORE + _DIR_END
     + r"|" + _CARGO_HOME_TOKEN,
     re.IGNORECASE,
 )
 RUSTUP_DIR_TOKEN_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.rustup" + _DIR_END
+    r"(?:^|[\s'\"/\\=<>])\.rustup" + _DIR_END
     + r"|\$(?:RUSTUP_HOME\b|\{RUSTUP_HOME[^}\n]{0,100}\})",
     re.IGNORECASE,
 )
@@ -5521,6 +5522,78 @@ _CONFIG_SUBCOMMAND_RE = re.compile(
     r"(?:\s+-{1,2}[\w-]+(?:=\S+)?){0,5}\s+config\b",
     re.IGNORECASE,
 )
+
+
+# Glob tokens (QA bypass round 4): `.?argo`, `.[c]argo`, `[c]onfig.toml`,
+# `?onfig.toml`, `*.toml` all expand to the real names whenever they exist.
+# Every path segment carrying a glob metacharacter is fnmatch-tested against
+# `.cargo`/`.rustup`/`config.toml`/`config`/`rust-toolchain(.toml)` and
+# replaced by the literal name it matches, so every check sees it. A segment
+# must contain at least one literal character (a bare `*` stays), and a
+# leading-dot name needs a leading `.` or `[.]` (shell globs don't match
+# dotfiles otherwise).
+_GLOB_CHAR_RE = re.compile(r"[*?\[]")
+_GLOB_SEG_BOUNDARY = frozenset(" \t\n\r'\"/\\;&|()<>=")
+_GLOB_LITERAL_RE = re.compile(r"[A-Za-z0-9.]")
+_GLOB_TARGETS = (".cargo", ".rustup", "config.toml", "config", "rust-toolchain.toml", "rust-toolchain")
+
+
+_GLOB_BRACKET_RE = re.compile(r"\[[^\]]{0,50}\]")
+
+
+def _is_subsequence(lit: str, name: str) -> bool:
+    it = iter(name)
+    return all(ch in it for ch in lit)
+
+
+def _deglob_seg(seg: str, budget: list) -> str:
+    if len(seg) > 400 or not _GLOB_LITERAL_RE.search(seg):
+        return seg
+    low = seg.lower()
+    # Cheap pre-check before fnmatch (which compiles a regex per distinct
+    # pattern -- 60K distinct globs took 3s): the segment's literal
+    # characters must appear, in order, in the target name.
+    lit = _GLOB_BRACKET_RE.sub("", low).replace("*", "").replace("?", "")
+    for name in _GLOB_TARGETS:
+        if name.startswith(".") and not (low.startswith(".") or low.startswith("[.")):
+            continue
+        if len(lit) > len(name) or not _is_subsequence(lit, name):
+            continue
+        # fnmatch budget per command: past it, fail CLOSED (treat as the
+        # name) -- hundreds of near-`config` globs in one command is itself
+        # suspicious, and an unbounded loop is a hook-timeout bypass.
+        budget[0] -= 1
+        if budget[0] < 0:
+            return name
+        try:
+            if fnmatch.fnmatchcase(name, low):
+                return name
+        except re.error:
+            continue
+    return seg
+
+
+def deglob_cargo_tokens(cmd: str) -> str:
+    """Linear: walks only the segments that contain a glob character."""
+    if not _GLOB_CHAR_RE.search(cmd):
+        return cmd
+    out, pos, n = [], 0, len(cmd)
+    budget = [256]
+    for m in _GLOB_CHAR_RE.finditer(cmd):
+        i = m.start()
+        if i < pos:
+            continue
+        start = i
+        while start > pos and cmd[start - 1] not in _GLOB_SEG_BOUNDARY:
+            start -= 1
+        end = i + 1
+        while end < n and cmd[end] not in _GLOB_SEG_BOUNDARY:
+            end += 1
+        out.append(cmd[pos:start])
+        out.append(_deglob_seg(cmd[start:end], budget))
+        pos = end
+    out.append(cmd[pos:])
+    return "".join(out)
 
 
 def cargo_config_shell_path_hit(cmd: str) -> bool:
@@ -5618,7 +5691,7 @@ RUSTUP_LINK_CLI_RE = re.compile(
     r"\brustup\b[^|;&\n]{0,200}\btoolchain\s+link\b"
     r"|\brustup\b[^|;&\n]{0,200}\b(?:default|override\s+set)"
     r"(?:\s+(?:--path(?:=|\s+)[^\s|;&]{1,300}|-(?!-?path\b)-?[\w-]+)){0,4}"
-    r"\s+[\"']?(?:[/~\\]|\.{1,2}[/\\]|[a-z]:[/\\]|\$)",
+    r"\s+[\"']?(?:[^\s|;&'\"]{0,300}[/\\]|~|\$)",
     re.IGNORECASE,
 )
 # Opaque shell writes: a copy/move/link/archive/fetch/git-checkout that places
@@ -5630,29 +5703,90 @@ RUSTUP_LINK_CLI_RE = re.compile(
 CARGO_OPAQUE_WRITE_RE = re.compile(
     r"\b(?:cp|mv|ln|dd|install|copy|move|ren|copy-item|cpi|move-item|mi"
     r"|rename-item|new-item|ni|rsync|unzip|unrar|cpio|xcopy|robocopy|expand-archive"
-    r"|curl|wget|invoke-webrequest|iwr|invoke-restmethod|irm|start-bitstransfer|certutil)\b"
+    r"|curl|wget|invoke-webrequest|iwr|invoke-restmethod|irm|start-bitstransfer|certutil"
+    r"|7z|7za|7zr|bsdtar|scp|sftp|rclone)\b"
     # token-bounded (at most 8 args before the extract flag), not a {0,200}
     # char window: the window form ran ~1s on 400KB of repeated `tar `.
     r"|\btar(?:\s+[^\s|;&]{1,300}){0,8}?\s+(?:-{0,2}[a-zA-Z]{0,5}x[a-zA-Z]{0,5}|--extract)(?![\w-])"
-    r"|\bgit\b[^|;&\n]{0,200}\b(?:checkout|restore|show|apply|am)\b",
+    # git / interpreter forms are token-bounded (at most 6 args before the
+    # subcommand / -c flag), not a {0,200} char window: the window form ran
+    # ~2.3s on 400KB of repeated `git ` (QA round-4 self-check).
+    r"|\bgit(?:\s+[^\s|;&]{1,300}){0,6}?\s+(?:checkout|restore|show|apply|am|clone|pull|merge"
+    r"|worktree|submodule|reset|stash|cherry-pick|rebase|switch)\b"
+    # an interpreter one-liner can copy an unseen file (`open(src).read()`)
+    r"|\b(?:python[0-9.]*|node|ruby|perl|php|deno|bun)(?:\s+[^\s|;&]{1,300}){0,6}?\s+-[ce]\b",
     re.IGNORECASE,
 )
-# A redirect fed from a file reader (`cat /tmp/p > .cargo/config.toml`,
-# `... | tee`) is opaque the same way -- unless the clause carries a heredoc,
-# whose body IS in the command for the content check.
-_CARGO_READER_RE = re.compile(
-    r"\b(?:cat|type|get-content|gc|head|tail|envsubst|xxd|base64|openssl"
-    r"|zcat|gunzip|bzcat|xzcat|git)\b|(?<![<0-9])<(?![<(&])\s*\S",
-    re.IGNORECASE,
-)
+# A redirect into the config is OPAQUE unless its data source is visibly
+# inline: an `echo`/`printf`/`Write-Output` literal (no `$`/backtick
+# expansion) or a plain `cat` fed only by a heredoc (no file operand, no
+# `<file`, no `<<<` here-string). Anything else -- `cat /tmp/p`, `sed -n p
+# /tmp/p`, `awk 1 /tmp/p`, `sort`, `tac`, `jq`, `cat >f </tmp/p`, `cat /tmp/p
+# - <<EOF` -- copies bytes this check can't see (QA bypass round 4: the
+# earlier reader allowlist and blanket heredoc exemption were both
+# bypassable). Heredoc BODIES are removed first, line-based (linear), so a
+# `>` inside the TOML body isn't read as a redirect.
 _SHELL_CLAUSE_SPLIT_RE = re.compile(r"&&|\|\||[;\n&]")
+_HEREDOC_START_RE = re.compile(r"(?<!<)<<-?[ \t]*([\"']?)([A-Za-z_][\w-]{0,40})\1(?!<)")
+_INLINE_SOURCES = frozenset({"echo", "printf", "write-output", "write-host", "print"})
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=\S*$")
+_REDIRECT_TOKEN_RE = re.compile(r"^(?:\d*>{1,2}&?\S*|&>\S*|\d*<&\S*)$")
+
+
+def strip_heredoc_bodies(cmd: str) -> str:
+    out, term = [], None
+    for line in cmd.split("\n"):
+        if term is not None:
+            if line.strip() == term:
+                term = None
+            continue
+        out.append(line)
+        m = _HEREDOC_START_RE.search(line)
+        if m:
+            term = m.group(2)
+    return "\n".join(out)
+
+
+def _clause_source_visible(clause: str) -> bool:
+    if "$" in clause or "`" in clause:
+        return False
+    first_seg = clause.split("|", 1)[0]
+    toks = first_seg.split()
+    while toks and (toks[0] in ("sudo", "env", "command", "builtin", "(", "{")
+                    or _ENV_ASSIGN_RE.match(toks[0])):
+        toks = toks[1:]
+    if not toks:
+        return False
+    head = toks[0].lower().rsplit("/", 1)[-1]
+    if head in _INLINE_SOURCES:
+        return True
+    if head != "cat":
+        return False
+    if "<<<" in first_seg or not _HEREDOC_START_RE.search(first_seg):
+        return False
+    rest = _HEREDOC_START_RE.sub(" ", first_seg).split()[1:]
+    i = 0
+    while i < len(rest):
+        t = rest[i]
+        if t in (">", ">>", "1>", "1>>"):
+            i += 2
+            continue
+        if _REDIRECT_TOKEN_RE.match(t):
+            i += 1
+            continue
+        if t.startswith("-") and t != "-":
+            i += 1
+            continue
+        return False        # a file operand, `-`, or a `<file` input redirect
+    return True
 
 
 def cargo_reader_redirect_hit(cmd: str) -> bool:
-    for clause in _SHELL_CLAUSE_SPLIT_RE.split(cmd):
-        if "<<" in clause:
-            continue
-        if _CARGO_READER_RE.search(clause) and WRITE_REDIRECT_RE.search(clause):
+    """True if any clause writes through a redirect/tee whose data source is
+    not visibly inline (see the comment above). Called only once a cargo/
+    rust-toolchain path is confirmed in the command."""
+    for clause in _SHELL_CLAUSE_SPLIT_RE.split(strip_heredoc_bodies(cmd)):
+        if WRITE_REDIRECT_RE.search(clause) and not _clause_source_visible(clause):
             return True
     return False
 
@@ -5665,8 +5799,12 @@ def cargo_reader_redirect_hit(cmd: str) -> bool:
 # verb after a `cd`/`pushd` into it, counts.
 @functools.lru_cache(maxsize=4)
 def _dir_placement_res(core: str, home_token: str):
-    tok = r"(?:(?:^|(?<=[\s'\"/\\=]))" + core + _DIR_END + r"|" + home_token + r"[\"']?(?=[\s'\"/\\;&|)]|$))"
-    last_re = re.compile(r"(?:^|\s)[\"']?(?:[^\s'\"]{0,200}?)" + tok + r"[\"']?\s*\)*\s*$", re.IGNORECASE)
+    tok = (r"(?:(?:^|(?<=[\s'\"/\\=])|(?<=\s-[a-zA-Z]))" + core + _DIR_END
+           + r"|" + home_token + r"[\"']?(?=[\s'\"/\\;&|)]|$))")
+    # The directory as ANY whole argument of an opaque-verb clause (QA bypass
+    # round 4: `git worktree add .cargo x`, `7z x p.7z -o.cargo`) -- not
+    # direction-aware, the same disclosed trade-off as the file-level check.
+    last_re = re.compile(tok, re.IGNORECASE)
     flag_re = re.compile(
         r"(?:\s-[Cdt]|\s--(?:directory|target-directory)|\s-Destination(?:Path)?)(?:=|\s+)[\"']?[^\s'\"]{0,200}?" + tok,
         re.IGNORECASE)
