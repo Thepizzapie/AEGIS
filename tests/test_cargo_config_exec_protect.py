@@ -615,3 +615,70 @@ def test_round4_redos_new_helpers():
         patterns.RUSTUP_LINK_CLI_RE.search(s)
         rule_cargo_config_exec_protect(_shell(s), EMPTY)
         assert time.time() - t < 3.0, s[:20]
+
+
+# ---- QA round 5 (bypass review) ----------------------------------------------
+
+ROUND5_SHELL_HITS = [
+    # payload after > normalize._MAX chars of filler
+    "true " + "x " * 10000 + "; cp /tmp/p .cargo/config.toml",
+    "# " + "x" * 20100 + "\ncp /tmp/p .cargo/config.toml",
+    ": " + "x" * 20100 + "; rustup toolchain link e /tmp/tc",
+    # brace expansion
+    "echo 'runner = \"/tmp/x\"' | tee .{cargo,x}/config.toml",
+    "cat /tmp/p | tee .{x,cargo}/config.toml",
+    "cp /tmp/p .cargo/{config,x}.toml",
+    "cp -r /tmp/s .{cargo,x}",
+    # POSIX backslash escapes
+    "cp /tmp/p .c\\argo/config.toml",
+    "cp /tmp/p .\\cargo/config.toml",
+    "cp /tmp/p .cargo/con\\fig.toml",
+    "echo 'runner = \"/tmp/x\"' > .\\cargo/config.toml",
+    "cd .c\\argo && cp /tmp/p config.toml",
+    "mv /tmp/stage .ca\\rgo",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND5_SHELL_HITS)
+def test_round5_shell_hits(cmd):
+    from aegis.rules import rule_cargo_config_exec_protect
+    assert rule_cargo_config_exec_protect(_shell(cmd), EMPTY) is not None, cmd[:80]
+
+
+def test_round5_windows_path_still_raw():
+    from aegis.rules import rule_cargo_config_exec_protect
+    assert rule_cargo_config_exec_protect(_shell("copy C:\\tmp\\p C:\\proj\\.cargo\\config.toml"), EMPTY) is not None
+
+
+ROUND5_SHELL_BENIGN = [
+    "echo {a,b}.txt && cargo build",
+    "cp src/{main,lib}.rs /tmp/",
+    "echo \"${HOME}\" && cargo fmt",
+    "true " + "x " * 10000 + "; cargo build",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND5_SHELL_BENIGN)
+def test_round5_shell_benign(cmd):
+    from aegis.rules import rule_cargo_config_exec_protect
+    assert rule_cargo_config_exec_protect(_shell(cmd), EMPTY) is None, cmd[:80]
+
+
+def test_round5_views_bounded():
+    import time
+    from aegis import patterns
+    from aegis.rules import rule_cargo_config_exec_protect
+    for s in ("{a,b}" * 80000, "x{" + "a," * 150000 + "b}", "\\a" * 200000,
+              "a" * 300 + "{" * 100000 + ",}" , "{" + ",".join("{a,b}" for _ in range(20000)) + "}",
+              "cargo " + "z" * 2_000_000):
+        t = time.time()
+        patterns.shell_path_views(s)
+        rule_cargo_config_exec_protect(_shell(s), EMPTY)
+        assert time.time() - t < 3.0, s[:20]
+
+
+def test_round5_oversized_fails_closed():
+    from aegis.rules import rule_cargo_config_exec_protect
+    big = "true " + "x" * 300_000 + "; cp /tmp/p .cargo/config.toml"
+    assert rule_cargo_config_exec_protect(_shell(big), EMPTY) is not None
+    assert rule_cargo_config_exec_protect(_shell("true " + "x" * 300_000), EMPTY) is None

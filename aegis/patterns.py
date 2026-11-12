@@ -5546,10 +5546,15 @@ def _is_subsequence(lit: str, name: str) -> bool:
     return all(ch in it for ch in lit)
 
 
+_GLOB_TARGET_CHARS = frozenset("".join(_GLOB_TARGETS))
+
+
 def _deglob_seg(seg: str, budget: list) -> str:
     if len(seg) > 400 or not _GLOB_LITERAL_RE.search(seg):
         return seg
     low = seg.lower()
+    if not set(_GLOB_BRACKET_RE.sub("", low).replace("*", "").replace("?", "")) <= _GLOB_TARGET_CHARS:
+        return seg
     # Cheap pre-check before fnmatch (which compiles a regex per distinct
     # pattern -- 60K distinct globs took 3s): the segment's literal
     # characters must appear, in order, in the target name.
@@ -5579,6 +5584,7 @@ def deglob_cargo_tokens(cmd: str) -> str:
         return cmd
     out, pos, n = [], 0, len(cmd)
     budget = [256]
+    memo = {}
     for m in _GLOB_CHAR_RE.finditer(cmd):
         i = m.start()
         if i < pos:
@@ -5590,10 +5596,75 @@ def deglob_cargo_tokens(cmd: str) -> str:
         while end < n and cmd[end] not in _GLOB_SEG_BOUNDARY:
             end += 1
         out.append(cmd[pos:start])
-        out.append(_deglob_seg(cmd[start:end], budget))
+        seg = cmd[start:end]
+        r = memo.get(seg)
+        if r is None:
+            r = memo[seg] = _deglob_seg(seg, budget)
+        out.append(r)
         pos = end
     out.append(cmd[pos:])
     return "".join(out)
+
+
+# Extra shell VIEWS for the path checks (QA bypass round 5), ORed with the
+# raw text rather than replacing it (a Windows `.cargo\\config.toml` must
+# still match raw):
+#  - POSIX backslash-unescaped: `.c\\argo/con\\fig.toml` IS `.cargo/config.toml`
+#    to bash (a backslash before an ordinary character is just removed).
+#  - bounded brace expansion: `.{cargo,x}/config.toml` creates the real
+#    file. `${...}` parameter expansion is left alone; past the limits the
+#    group's alternatives are all emitted anyway (bounded output), so the
+#    check never silently skips one.
+_POSIX_ESCAPE_RE = re.compile(r"\\([^\n])")
+_SHELL_WORD_RE = re.compile(r"[^\s;&|()<>]+")
+
+
+def _innermost_brace_group(tok: str):
+    """(start, end) of the first innermost `{..,..}` group not preceded by
+    `$`, or None. Linear in len(tok)."""
+    open_at = -1
+    for i, ch in enumerate(tok):
+        if ch == "{":
+            open_at = i
+        elif ch == "}" and open_at >= 0:
+            inner = tok[open_at + 1:i]
+            if "," in inner and not (open_at > 0 and tok[open_at - 1] == "$"):
+                return open_at, i + 1
+            open_at = -1
+    return None
+
+
+def _expand_brace_token(tok: str, depth: int = 0) -> list:
+    g = _innermost_brace_group(tok) if depth <= 4 else None
+    if not g:
+        return [tok]
+    pre, inner, post = tok[:g[0]], tok[g[0] + 1:g[1] - 1], tok[g[1]:]
+    out = []
+    for alt in inner.split(",")[:32]:
+        out.extend(_expand_brace_token(pre + alt + post, depth + 1))
+        if len(out) >= 128:
+            break
+    return out[:128]
+
+
+def shell_path_views(cmd: str) -> str:
+    """Raw text plus its backslash-unescaped and brace-expanded views,
+    newline-joined, for the cargo/rustup path checks."""
+    views = [cmd]
+    if "\\" in cmd:
+        views.append(_POSIX_ESCAPE_RE.sub(r"\1", cmd))
+    if "{" in cmd and "," in cmd and "}" in cmd:
+        budget = [64]
+
+        def _sub(m):
+            tok = m.group(0)
+            if ("{" not in tok or "," not in tok or "}" not in tok
+                    or len(tok) > 2000 or budget[0] <= 0):
+                return tok
+            budget[0] -= 1
+            return " ".join(_expand_brace_token(tok))
+        views.extend(_SHELL_WORD_RE.sub(_sub, v) for v in list(views))
+    return "\n".join(views)
 
 
 def cargo_config_shell_path_hit(cmd: str) -> bool:

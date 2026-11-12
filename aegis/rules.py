@@ -8728,7 +8728,8 @@ def _cargo_content_hit(path_text: str, content: str, shell: bool = False) -> str
     return ""
 
 
-_CARGO_SHELL_PREFILTER_RE = re.compile(r"cargo|rust|[*?\[]", re.IGNORECASE)
+_CARGO_MAX_SCAN = 256_000
+_CARGO_SHELL_PREFILTER_RE = re.compile(r"cargo|rust|[*?\[]|\{[^{}\s]{0,300},", re.IGNORECASE)
 
 
 # An MCP call's path may sit under any key; only path-SHAPED leaves (no
@@ -8871,7 +8872,16 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     and interpreter ``-c`` copies added as opaque writes, with the
     directory counted as any argument of an opaque clause; ``rustup default
     rel/dir/``. Self-check: the git/interpreter window scans were made
-    token-bounded (2.3s -> 0.4s on 400KB).
+    token-bounded (2.3s -> 0.4s on 400KB). Round 5 (bypass): a payload
+    after ~20KB of filler was never scanned, because
+    ``normalize.scan_surface`` truncates at ``normalize._MAX`` -- an ENGINE-
+    WIDE fail-open shared by every shell rule (also reproduced with ``rm
+    -rf /``), closed here for this rule only by also scanning the
+    untruncated raw command, and failing CLOSED past ``_CARGO_MAX_SCAN``
+    (256KB) when the prefilter matches; bash brace expansion
+    (``.{cargo,x}/config.toml``) and POSIX backslash escapes
+    (``.c\\argo``) are added as extra path views
+    (``patterns.shell_path_views``, linear, bounded) ORed with the raw text.
     """
     cfg = getattr(policy, "cargo_config_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -8948,15 +8958,36 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
+        # `normalize.scan_surface` truncates at `normalize._MAX` chars: a
+        # payload after ~20KB of filler would otherwise never be scanned
+        # (QA bypass round 5 -- an engine-wide gap; closed here for this
+        # rule by also scanning the untruncated raw command).
+        raw_full = _cmd(ev)
+        if len(raw_full) > normalize._MAX:
+            if (len(raw_full) > _CARGO_MAX_SCAN
+                    and _CARGO_SHELL_PREFILTER_RE.search(raw_full)):
+                # Past this size the full scan would cost seconds (hook-
+                # timeout fail-open risk): fail CLOSED instead.
+                if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_CONFIG_EXEC")
+                        or _cargo_config_exec_allowed_by_policy(cfg, raw_full[:2000])):
+                    return None
+                return _finish(Decision(action, "cargo-config-exec-protect",
+                                 "A >256KB shell command mentions cargo/rustup "
+                                 "paths or globs -- too large to scan for a "
+                                 "Cargo/rustup exec plant. Split it up, or a "
+                                 "human may set AEGIS_ALLOW_CARGO_CONFIG_EXEC=1."))
+            cmd = cmd + "\n" + raw_full
         # Cheap prefilter: every path/CLI this branch matches contains
         # "cargo"/"rust" (incl. CARGO_HOME, rust-toolchain, .rustup) or a
         # `.c*`-style glob -- skip the full scan for everything else.
-        if not _CARGO_SHELL_PREFILTER_RE.search(cmd):
+        if not (_CARGO_SHELL_PREFILTER_RE.search(cmd)
+                or ("\\" in cmd and _CARGO_SHELL_PREFILTER_RE.search(cmd.replace("\\", "")))):
             return None
         # Path checks on the comment-stripped raw text (decoding `\t` would
         # break a Windows `.rustup\toolchains` path); content checks on the
         # decoded-then-stripped text (`_cargo_scan`).
-        path_cmd = patterns.deglob_cargo_tokens(patterns.strip_comment_lines(cmd))
+        path_cmd = patterns.deglob_cargo_tokens(
+            patterns.shell_path_views(patterns.strip_comment_lines(cmd)))
         dec_cmd = _cargo_scan(cmd)
         both = path_cmd + "\n" + dec_cmd
         rustup_path = bool(patterns.RUSTUP_STATE_PATH_RE.search(path_cmd))
