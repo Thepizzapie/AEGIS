@@ -8689,12 +8689,15 @@ def _cargo_scan(text: str) -> str:
     return patterns.toml_unescape(patterns.strip_comment_lines(text))
 
 
-def _cargo_content_hit(path_text: str, content: str) -> str:
+def _cargo_content_hit(path_text: str, content: str, shell: bool = False) -> str:
     """Return a short label for which exec surface ``content`` plants at a
-    path named in ``path_text``, or "" for none."""
+    path named in ``path_text``, or "" for none. ``shell`` also accepts a
+    split ``cd .cargo && ... config.toml`` path
+    (``patterns.cargo_config_shell_path_hit``)."""
     scan = _cargo_scan(content)
-    if (patterns.CARGO_CONFIG_PATH_RE.search(path_text)
-            and patterns.CARGO_EXEC_HIT_RE.search(scan)):
+    cargo_path = (patterns.cargo_config_shell_path_hit(path_text) if shell
+                  else patterns.CARGO_CONFIG_PATH_RE.search(path_text))
+    if cargo_path and patterns.CARGO_EXEC_HIT_RE.search(scan):
         return "cargo"
     if (patterns.RUST_TOOLCHAIN_PATH_RE.search(path_text)
             and patterns.RUST_TOOLCHAIN_EXEC_HIT_RE.search(scan)):
@@ -8760,6 +8763,10 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
     rustup-state path (``CARGO_OPAQUE_WRITE_RE`` -- the placed file's
     content is invisible to the command, and these files are rarely written
     at all); or a write redirect/in-place edit naming rustup state.
+    On the shell branch a cargo-config path also counts when the directory
+    and file are separate tokens (``cd .cargo && ... > config.toml``,
+    ``D=.cargo; ... > $D/config.toml``) -- QA bypass round 1, reproduced
+    and closed via ``patterns.cargo_config_shell_path_hit``.
     ``fetch_to_file`` already covers ``curl -o .cargo/config.toml`` via
     ``REGISTRY_CONFIG_PATH_RE``; the toolchain/rustup paths are added to its
     ``_FETCH_HUMAN_ESCAPABLE`` table here.
@@ -8848,9 +8855,9 @@ def rule_cargo_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]
                 or patterns.INPLACE_WRITE_RE.search(scan_cmd)):
             kind = "rustup"
         else:
-            kind = _cargo_content_hit(scan_cmd, scan_cmd)
+            kind = _cargo_content_hit(scan_cmd, scan_cmd, shell=True)
             if not kind and patterns.CARGO_OPAQUE_WRITE_RE.search(scan_cmd):
-                if patterns.CARGO_CONFIG_PATH_RE.search(scan_cmd):
+                if patterns.cargo_config_shell_path_hit(scan_cmd):
                     kind = "cargo"
                 elif patterns.RUST_TOOLCHAIN_PATH_RE.search(scan_cmd):
                     kind = "toolchain"

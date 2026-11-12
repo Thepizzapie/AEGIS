@@ -5463,6 +5463,29 @@ CARGO_CONFIG_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
     re.IGNORECASE,
 )
+# Split-path shell form (QA bypass round 1): `cd .cargo && ... > config.toml`,
+# `pushd .cargo; ...`, or `D=.cargo; ... > $D/config.toml` name the directory
+# and the file in separate tokens, so the contiguous CARGO_CONFIG_PATH_RE never
+# matches although Cargo reads the result. Shell branch only: a `.cargo`
+# directory token AND a bare `config`/`config.toml` token anywhere in the
+# command count as the path (a false ASK on an unrelated `config` word next
+# to a `.cargo` mention is the accepted safe direction).
+CARGO_DIR_TOKEN_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _CI_END,
+    re.IGNORECASE,
+)
+CARGO_BARE_CONFIG_TOKEN_RE = re.compile(
+    r"(?:^|[\s'\"/\\=>}])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+
+
+def cargo_config_shell_path_hit(cmd: str) -> bool:
+    return bool(CARGO_CONFIG_PATH_RE.search(cmd)
+                or (CARGO_DIR_TOKEN_RE.search(cmd)
+                    and CARGO_BARE_CONFIG_TOKEN_RE.search(cmd)))
+
+
 RUST_TOOLCHAIN_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=])rust-toolchain(?:\.toml)?" + _CI_END,
     re.IGNORECASE,

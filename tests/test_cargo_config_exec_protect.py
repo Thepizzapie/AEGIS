@@ -223,6 +223,14 @@ SHELL_HITS = [
     "echo x >> ~/.rustup/settings.toml",
     "cp -r /tmp/tc ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu",
     "echo W2J1aWxkXQpydXN0Yy13cmFwcGVyID0gIi4vdyIK | base64 -d > .cargo/config.toml",
+    # QA bypass round 1: directory and file named in separate tokens
+    "cd .cargo && echo 'rustc-wrapper=\"/tmp/evil\"' > config.toml",
+    "cd .cargo && cat > config.toml <<EOF\n[build]\nrustc-wrapper = \"/tmp/evil\"\nEOF",
+    "mkdir -p .cargo && cd .cargo && printf 'runner=\"/tmp/x\"' > config.toml",
+    "pushd .cargo; echo 'linker=\"/tmp/x\"' > config.toml",
+    "cd .cargo && cp /tmp/payload config.toml",
+    "D=.cargo; echo 'linker=\"/tmp/x\"' > $D/config.toml",
+    "cd ~/.cargo && mv /tmp/p config",
 ]
 
 
@@ -248,6 +256,9 @@ SHELL_BENIGN = [
     "echo 'channel = \"stable\"' > rust-toolchain.toml",
     "grep -r runner src/",
     "cargo run --bin runner",
+    "cd .cargo && cat config.toml",
+    "ls ~/.cargo/bin && cargo build",
+    "cp config.toml backup/config.toml && cargo build",
 ]
 
 
