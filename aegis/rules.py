@@ -9031,7 +9031,22 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     `$CARGO_HOME` pointing somewhere other than a literal `.cargo`/
     `$CARGO_HOME` path is not recognised; and the shell branch is not
     clause-scoped (a write anywhere in a command that also names a cargo
-    config ASKs), the same false-ASK trade-off its siblings accept."""
+    config ASKs), the same false-ASK trade-off its siblings accept.
+
+    QA history: an independent design/wiring review confirmed registration
+    everywhere its siblings are (`_CORE_RULES`, `_FETCH_HUMAN_ESCAPABLE`,
+    `Policy`, all three `loader.py` spots, both `skills.py` knob lists, the
+    `_REMEDIES` table, the README), a live YAML `cargo_exec:` block through
+    `load_policy()` into `evaluate()`, no exceptions on 28 odd-input shapes,
+    and human-only escapes. Round 1 found two fail-open paths (a value-only
+    edit inside a multi-line array/string slipping past the regex fallback,
+    reachable by making the file invalid TOML for one step; and an Edit to
+    an over-1-MiB/FIFO/device config skipping the replay), both closed by
+    failing closed; round 2 re-verified both closed with zero new false-ASK
+    cost on 3.11. A parallel bypass-hunting review was stopped before it
+    tested anything, so this guard has NOT yet had an independent
+    adversarial bypass pass -- only the author's own variant sweep (TOML
+    syntax/encoding variants, path spellings, shell write forms)."""
     cfg = getattr(policy, "cargo_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
