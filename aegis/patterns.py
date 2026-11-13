@@ -5559,3 +5559,101 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
     re.IGNORECASE,
 )
+
+
+# ---- Cargo / rustup toolchain exec-hijack protection --------------------------
+# Cargo reads `.cargo/config.toml` (legacy name `.cargo/config`) from the
+# current directory and EVERY ancestor, plus `$CARGO_HOME/config.toml`
+# (`~/.cargo/config.toml` by default), and several of its keys name a program
+# Cargo itself execs on the next ordinary build: `build.rustc`/`rustc-wrapper`/
+# `rustc-workspace-wrapper`/`rustdoc` wrap or replace the compiler on EVERY
+# `cargo build`/`check`/`test`/`clippy` (and on rust-analyzer's own automatic
+# `cargo check` the moment an editor opens the folder -- no human command at
+# all); `target.<triple|cfg>.runner` wraps every `cargo run`/`test`/`bench`
+# binary; `target.*.linker`/`host.linker` and a `-C linker=`/`link-arg=`
+# rustflag replace the link step; `registry.credential-provider`/
+# `global-credential-providers`/`registries.<n>.credential-provider`/
+# `credential-alias.*` name a process Cargo hands a live registry token to;
+# `doc.browser` runs on `cargo doc --open`; dangerous names in `[env]`
+# (`CC`/`LD_PRELOAD`/`RUSTC_WRAPPER`/...) reach every build script and rustc
+# child; `paths`/`[patch]`/`include` swap in an arbitrary local crate (whose
+# `build.rs` then runs) or another config file. rustup reads
+# `rust-toolchain.toml`/`rust-toolchain` the same way: `[toolchain] path =`
+# points EVERY `cargo`/`rustc` proxy invocation in the tree at an arbitrary
+# directory of binaries. None of this is a registry redirect, so
+# REGISTRY_CONFIG_PATH_RE/REGISTRY_HIJACK_RE (which already watch
+# `.cargo/config.toml` for `replace-with`) never fire.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END
+    + r"|(?:\$\{?|%|\$env:)CARGO_HOME\}?%?" + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+RUST_TOOLCHAIN_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])rust-toolchain(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# rustup's own state: `settings.toml` (default toolchain + per-directory
+# `[overrides]`) and the installed toolchains' binaries themselves. rustup
+# writes these itself; an agent writing them directly is planting a binary
+# every `cargo`/`rustc` proxy call resolves to, or re-pointing a directory's
+# override at one. Path-only gated (no content to inspect in a binary).
+RUSTUP_STATE_PATH_RE = re.compile(
+    r"(?:(?:^|[\s'\"/\\=])\.rustup|(?:\$\{?|%|\$env:)RUSTUP_HOME\}?%?)" + _WIN_TRIM + _SEP
+    + r"(?:settings\.toml" + _CI_END + r"|toolchains(?:" + _SEP + r"|" + _CI_END + r"))",
+    re.IGNORECASE,
+)
+# `rustup toolchain link <name> <dir>` registers an arbitrary directory as a
+# toolchain (pair it with `rust-toolchain.toml`'s `channel = "<name>"` or
+# `rustup override set <name>` and every build in the tree runs those
+# binaries) -- the CLI form of the toolchain-file `path` key.
+RUSTUP_LINK_CLI_RE = re.compile(
+    r"\brustup\b[^|;&\n]{0,200}\btoolchain\s+link\b",
+    re.IGNORECASE,
+)
+# A prior `cd`/`pushd`/`Set-Location` into a `.cargo` directory, so a later
+# bare `config.toml`/`config` write lands in it (the same shape
+# VSCODE_*/JETBRAINS_* cwd checks cover for their own directories).
+CARGO_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|set-location|sl)\s+[\"']?[^\s;&|\"']*\.cargo[/\\]?[\"']?\s*(?:[;&|\n]|$)",
+    re.IGNORECASE,
+)
+CARGO_BARE_CONFIG_RE = re.compile(
+    r"(?:^|[\s'\"=>])config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+# Regex fallback (shell text, or a file whose TOML won't parse): a TOML key in
+# KEY position (line start, after `[`/`{`/`,`/`.`, optionally quoted) for any
+# exec-capable Cargo/rustup key, or a `[credential-alias]`/`[env]`-style
+# danger name, or a linker/link-arg rustflag. Over-matches on purpose (e.g.
+# `runner =` under a non-target table) -- false ASK is the safe direction.
+_CARGO_KEY_PREFIX = r"(?:^|[\s{,.\[])[\"']?"
+_CARGO_KEY_SUFFIX = r"[\"']?\s*(?:=|\]|\.)"
+CARGO_EXEC_KEY_RE = re.compile(
+    _CARGO_KEY_PREFIX
+    + r"(?:rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
+    r"|credential-provider|global-credential-providers|credential-alias"
+    r"|browser|paths|patch|include|path"
+    r"|CC|CXX|AR|LD|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTC_LINKER|RUSTDOC"
+    r"|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH"
+    r"|BASH_ENV|ENV|NODE_OPTIONS|PYTHONSTARTUP|PYTHONPATH|PERL5OPT|RUBYOPT"
+    r"|GIT_SSH_COMMAND|GIT_SSH|PATH|SHELL"
+    r"|CARGO_[A-Z0-9_]+|RUSTC_[A-Z0-9_]+|RUSTDOC_[A-Z0-9_]+|RUSTUP_[A-Z0-9_]+"
+    r"|CC_[A-Za-z0-9_]+|CXX_[A-Za-z0-9_]+|TARGET_CC|HOST_CC|TARGET_CXX|HOST_CXX)"
+    + _CARGO_KEY_SUFFIX
+    + r"|-C\s*[\"']?\s*,?\s*[\"']?(?:linker|link-args?)\s*="
+    + r"|\blink(?:er|-args?)\s*=\s*[^\s\"',\]]",
+    re.MULTILINE,
+)
+# TOML basic strings (and quoted keys) accept \uXXXX / \UXXXXXXXX escapes;
+# decode them before the regex fallback so `"rustc-wrapper"` can't slip
+# past a literal key match.
+_TOML_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+
+
+def toml_unescape(text: str) -> str:
+    def _sub(m):
+        try:
+            return chr(int(m.group(1) or m.group(2), 16))
+        except (ValueError, OverflowError):
+            return m.group(0)
+    return _TOML_UNICODE_ESCAPE_RE.sub(_sub, text or "")
