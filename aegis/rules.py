@@ -8856,11 +8856,18 @@ def _cargo_new_exec(pre: str, post: str, kind: str) -> set:
     """Exec-capable entries present in `post` but not in `pre` (a new key, or
     an existing key with a changed value). Semantic (TOML-parsed) when both
     sides parse, else a line-level regex diff of both."""
+    fn = _cargo_config_doc_sigs if kind == "cargo" else _cargo_toolchain_doc_sigs
     a, b = _cargo_parse(pre), _cargo_parse(post)
-    if a is not None and b is not None:
-        fn = _cargo_config_doc_sigs if kind == "cargo" else _cargo_toolchain_doc_sigs
-        return fn(b) - fn(a)
-    return _cargo_regex_sigs(post) - _cargo_regex_sigs(pre)
+    if b is not None:
+        # `pre` unparseable (or absent) -> nothing on disk to diff against
+        # semantically, so every exec entry in `post` counts as new.
+        return fn(b) - fn(a) if a is not None else fn(b)
+    # `post` won't parse (invalid TOML, or no tomllib on 3.10): fail CLOSED
+    # on any exec-key line at all. A line diff can't see a value-only edit
+    # inside a multi-line array/string (`runner = [\n "x",\n]` -- only the
+    # key line carries a signature), and an agent can make the file
+    # unparseable on purpose for one step to force this branch (QA round 1).
+    return _cargo_regex_sigs(post)
 
 
 def _cargo_resolve(ev: Event, p: str) -> str:
@@ -8927,24 +8934,29 @@ def _cargo_edit_write_hit(ev: Event, p: str, kind: str) -> bool:
     # sits under; if that can't be done, fall back to the strings alone,
     # counting a key mention on EITHER side (old_string carries the key in a
     # value-only diff).
-    if pre is not None:
-        post = pre
-        replayable = True
-        for old, new in pairs:
-            if old and old in post:
-                post = (post.replace(old, new) if a.get("replace_all")
-                        else post.replace(old, new, 1))
-            elif not old and not post:
-                post = new
-            else:
-                replayable = False
-                break
-        if replayable:
-            return bool(_cargo_new_exec(pre, post, kind))
+    if pre is None:
+        # Exists but can't be safely read (over the size cap, not a regular
+        # file, unreadable): the edit can't be replayed, and a value-only
+        # diff (`""` -> `"/tmp/x"`) carries no key to see -- fail CLOSED
+        # (QA round 1).
+        return True
+    post = pre
+    replayable = True
     for old, new in pairs:
-        if _cargo_regex_sigs(new) - _cargo_regex_sigs(old if old != new else ""):
-            return True
-        if _cargo_regex_sigs(old) and new != old:
+        if old and old in post:
+            post = (post.replace(old, new) if a.get("replace_all")
+                    else post.replace(old, new, 1))
+        elif not old and not post:
+            post = new
+        else:
+            replayable = False
+            break
+    if replayable:
+        return bool(_cargo_new_exec(pre, post, kind))
+    # Not replayable (old_string not found -- the Edit tool itself would
+    # reject it): judge the strings alone, a key on EITHER side counting.
+    for old, new in pairs:
+        if new != old and (_cargo_regex_sigs(new) or _cargo_regex_sigs(old)):
             return True
     return False
 
@@ -8989,8 +9001,12 @@ def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ""`, which DISABLES a wrapper) and Cargo's built-in credential
     providers (`cargo:token`, `cargo:wincred`, `cargo:macos-keychain`,
     `cargo:libsecret`) stay allowed. When TOML parsing isn't possible
-    (invalid TOML, Python 3.10) a line-level regex over the same key set,
-    with TOML `\\uXXXX` escapes decoded first, is diffed instead. The shell
+    (invalid TOML, Python 3.10) the guard fails closed: a line-level regex
+    over the same key set, with TOML `\\uXXXX` escapes decoded first, asks
+    on ANY exec-key line in the result (not just a new one -- a line diff
+    can't see a value-only edit inside a multi-line array/string), and an
+    Edit to a file that exists but can't be safely read (over 1 MiB, not a
+    regular file, unreadable) always asks, since it can't be replayed. The shell
     branch is path-gated: any write verb (redirect, `tee`, `sed -i`, `cp`/
     `mv`/`ln -f`, archive/sync, `git apply`/`patch`, `sponge`, interpreter
     one-liners) in a command naming one of these files ASKs, as does an

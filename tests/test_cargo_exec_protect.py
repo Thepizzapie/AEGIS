@@ -380,3 +380,66 @@ def test_regex_fallback_without_tomllib(content, tmp_path, monkeypatch):
     import aegis.rules as rules
     monkeypatch.setattr(rules, "_tomllib", None)
     assert _gated(evaluate(_write(str(tmp_path / CFG), content), EMPTY)), content
+
+
+# ---- QA round 1 (design review): fail closed when the TOML can't be judged --
+
+RUNNER_ML = '[target.thumbv7em-none-eabihf]\nrunner = [\n  "probe-rs", "run",\n]\n'
+
+
+def test_qa1_three_step_unparseable_dance_gated(tmp_path):
+    # Step 1 of the dance makes the file invalid TOML; with an exec key still
+    # present that step itself must ask (fail closed), so the later
+    # value-only element swap can never ride the regex fallback.
+    p = tmp_path / CFG
+    p.parent.mkdir()
+    p.write_text(RUNNER_ML)
+    d = evaluate(_edit(str(p), "]\n", "]\n=garbage\n"), EMPTY)
+    assert _gated(d)
+    p.write_text(RUNNER_ML + "=garbage\n")
+    d = evaluate(_edit(str(p), '"probe-rs", "run",', '"/tmp/evil.sh",'), EMPTY)
+    assert _gated(d)
+
+
+def test_qa1_multiline_element_edit_without_tomllib_gated(tmp_path, monkeypatch):
+    import aegis.rules as rules
+    monkeypatch.setattr(rules, "_tomllib", None)
+    p = tmp_path / CFG
+    p.parent.mkdir()
+    p.write_text(RUNNER_ML)
+    assert _gated(evaluate(_edit(str(p), '"probe-rs", "run",', '"/tmp/evil.sh",'), EMPTY))
+    p.write_text("[build]\nrustc-wrapper = '''\nsccache'''\n")
+    assert _gated(evaluate(_edit(str(p), "sccache", "/tmp/evil"), EMPTY))
+
+
+def test_qa1_multiline_element_edit_with_tomllib_gated(tmp_path):
+    p = tmp_path / CFG
+    p.parent.mkdir()
+    p.write_text(RUNNER_ML)
+    assert _gated(evaluate(_edit(str(p), '"probe-rs", "run",', '"/tmp/evil.sh",'), EMPTY))
+
+
+def test_qa1_oversized_file_edit_fails_closed(tmp_path):
+    p = tmp_path / CFG
+    p.parent.mkdir()
+    p.write_text("#" * (1 << 20) + '\n[build]\nrustc-wrapper = ""\n')
+    assert _gated(evaluate(_edit(str(p), '""\n', '"/tmp/evil.sh"\n'), EMPTY))
+    t = tmp_path / "rust-toolchain.toml"
+    t.write_text("#" * (1 << 20) + '\n[toolchain]\npath = ""\n')
+    assert _gated(evaluate(_edit(str(t), '""', '"/tmp/tc"'), EMPTY))
+
+
+def test_qa1_fifo_config_edit_fails_closed(tmp_path):
+    import os
+    p = tmp_path / CFG
+    p.parent.mkdir()
+    os.mkfifo(p)
+    assert _gated(evaluate(_edit(str(p), "a", "b"), EMPTY))
+
+
+def test_qa1_unparseable_pre_parseable_post_counts_all(tmp_path):
+    p = tmp_path / CFG
+    p.parent.mkdir()
+    p.write_text('[build\nrustc-wrapper = "sccache"\n')
+    d = evaluate(_edit(str(p), "[build\n", "[build]\n"), EMPTY)
+    assert _gated(d)
