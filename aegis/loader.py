@@ -64,7 +64,7 @@ def load_policy(path) -> Policy:
         "claude_env": {}, "claude_cred_helper": {}, "claude_mcp_autoapprove": {},
         "conftest": {}, "pysite": {},
         "ipython_startup": {}, "cloud_cred_exec": {}, "docker_cred_helper": {},
-        "terraform_exec": {}, "fetch_to_file": {},
+        "terraform_exec": {}, "cargo_exec": {}, "fetch_to_file": {},
         "inject": {}, "failures": {},
         "completion": {},
         "lifecycle": {"team": {}, "compaction": {}, "permission": {}, "mcp": {}},
@@ -124,6 +124,7 @@ def load_policy(path) -> Policy:
                   cloud_cred_exec=st["cloud_cred_exec"],
                   docker_cred_helper=st["docker_cred_helper"],
                   terraform_exec=st["terraform_exec"],
+                  cargo_exec=st["cargo_exec"],
                   fetch_to_file=st["fetch_to_file"],
                   inject=st["inject"], failures=st["failures"],
                   completion=st["completion"],
@@ -163,7 +164,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
                 "path_hijack", "claude_hooks", "statusline",
                 "permission_bypass", "claude_env", "claude_cred_helper", "claude_mcp_autoapprove", "conftest", "pysite",
                 "ipython_startup", "cloud_cred_exec", "docker_cred_helper", "terraform_exec",
-                "fetch_to_file",
+                "cargo_exec", "fetch_to_file",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
             st[key] = dict(data[key])

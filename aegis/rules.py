@@ -18,6 +18,11 @@ import shlex
 import subprocess
 from typing import Optional
 
+try:  # stdlib on 3.11+; on 3.10 the cargo-exec guard falls back to its regex
+    import tomllib as _tomllib
+except ImportError:  # pragma: no cover - exercised only on 3.10
+    _tomllib = None
+
 from . import normalize, patterns, review
 from .events import ActionClass, Event, HookEvent
 from .policy import Action, Decision
@@ -7862,6 +7867,9 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
+    (patterns.RUST_TOOLCHAIN_PATH_RE, "a rustup toolchain file"),
+    (patterns.RUSTUP_STATE_PATH_RE, "rustup's own toolchain state"),
 )
 
 
@@ -8670,6 +8678,460 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+_CARGO_BUILD_EXEC_KEYS = ("rustc", "rustc-wrapper", "rustc-workspace-wrapper", "rustdoc")
+_CARGO_FLAG_KEYS = ("rustflags", "rustdocflags")
+_CARGO_BUILTIN_CRED_PROVIDERS = frozenset({
+    "cargo:token", "cargo:wincred", "cargo:macos-keychain", "cargo:libsecret"})
+# `[env]` names that reach a program Cargo (or a build script it runs) execs:
+# the C/C++ toolchain the `cc` crate shells out to, the dynamic loader,
+# interpreter startup hooks, and anything Cargo/rustc/rustup read themselves.
+_CARGO_DANGER_ENV = frozenset({
+    "CC", "CXX", "AR", "LD", "RANLIB", "TARGET_CC", "HOST_CC", "TARGET_CXX",
+    "HOST_CXX", "TARGET_AR", "HOST_AR", "LD_PRELOAD", "LD_LIBRARY_PATH",
+    "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "BASH_ENV", "ENV",
+    "NODE_OPTIONS", "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "PERL5OPT",
+    "PERL5LIB", "RUBYOPT", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXEC_PATH",
+    "PATH", "SHELL", "PKG_CONFIG", "CMAKE", "PROTOC", "MAKE", "MAKEFLAGS",
+    "CMAKE_TOOLCHAIN_FILE", "RUSTFLAGS", "RUSTDOCFLAGS"})
+_CARGO_DANGER_ENV_PREFIXES = ("CARGO_", "RUSTC", "RUSTDOC", "RUSTUP_", "CC_",
+                              "CXX_", "AR_", "CFLAGS", "CXXFLAGS", "LDFLAGS",
+                              "LD_", "DYLD_")
+_CARGO_READ_LIMIT = 1 << 20
+_CARGO_HARMLESS_REDIRECT_RE = re.compile(
+    r"\d*>&\s*\d+|&?\d*>{1,2}\s*(?:/dev/null|nul)\b", re.IGNORECASE)
+_CARGO_EXTRA_WRITE_RE = re.compile(
+    r"\bgit\s+(?:apply|am)\b|(?:^|[;&|\n(]\s*)patch\b|\bsponge\b", re.IGNORECASE)
+_CARGO_CWD_RE = re.compile(r"[/\\]\.cargo[/\\]*$|^\.cargo[/\\]*$", re.IGNORECASE)
+_CARGO_BARE_NAMES = ("config", "config.toml")
+
+
+def _cargo_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _cargo_nonempty(v) -> bool:
+    if v is None or v is False:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, (list, dict)):
+        return bool(v)
+    return True
+
+
+def _cargo_sig(path: str, v) -> str:
+    try:
+        return f"{path}={json.dumps(v, sort_keys=True, default=str)}"
+    except (TypeError, ValueError):
+        return f"{path}={v!r}"
+
+
+def _cargo_flags_link(v) -> bool:
+    """True if a rustflags value (string or list) touches the link step."""
+    return any("link" in s.lower() for s in _flatten_strings(v))
+
+
+def _cargo_cred_provider_custom(v) -> bool:
+    """True unless `v` is exactly one of Cargo's built-in providers (which
+    run no external program)."""
+    if not _cargo_nonempty(v):
+        return False
+    if isinstance(v, str):
+        return v.strip() not in _CARGO_BUILTIN_CRED_PROVIDERS
+    if isinstance(v, list) and len(v) == 1 and isinstance(v[0], str):
+        return v[0].strip() not in _CARGO_BUILTIN_CRED_PROVIDERS
+    return True
+
+
+def _cargo_env_dangerous(name: str) -> bool:
+    n = str(name).strip().upper()
+    return n in _CARGO_DANGER_ENV or n.startswith(_CARGO_DANGER_ENV_PREFIXES)
+
+
+def _cargo_target_like(prefix: str, t: dict, out: set) -> None:
+    for k in ("runner", "linker"):
+        if _cargo_nonempty(t.get(k)):
+            out.add(_cargo_sig(f"{prefix}.{k}", t.get(k)))
+    for k in _CARGO_FLAG_KEYS:
+        if _cargo_flags_link(t.get(k)):
+            out.add(_cargo_sig(f"{prefix}.{k}", t.get(k)))
+
+
+def _cargo_config_doc_sigs(doc: dict) -> set:
+    """Every exec-capable (key, value) in a parsed Cargo config document."""
+    out: set = set()
+    build = doc.get("build")
+    if isinstance(build, dict):
+        for k in _CARGO_BUILD_EXEC_KEYS:
+            if _cargo_nonempty(build.get(k)):
+                out.add(_cargo_sig(f"build.{k}", build.get(k)))
+        for k in _CARGO_FLAG_KEYS:
+            if _cargo_flags_link(build.get(k)):
+                out.add(_cargo_sig(f"build.{k}", build.get(k)))
+    for top in ("target", "host"):
+        tbl = doc.get(top)
+        if not isinstance(tbl, dict):
+            continue
+        if top == "host":
+            _cargo_target_like("host", tbl, out)
+        for name, t in tbl.items():
+            if isinstance(t, dict):
+                _cargo_target_like(f"{top}.{name}", t, out)
+    reg = doc.get("registry")
+    if isinstance(reg, dict):
+        if _cargo_cred_provider_custom(reg.get("credential-provider")):
+            out.add(_cargo_sig("registry.credential-provider", reg.get("credential-provider")))
+        g = reg.get("global-credential-providers")
+        if isinstance(g, list):
+            for item in g:
+                if _cargo_cred_provider_custom(item):
+                    out.add(_cargo_sig("registry.global-credential-providers", item))
+        elif _cargo_nonempty(g):
+            out.add(_cargo_sig("registry.global-credential-providers", g))
+    regs = doc.get("registries")
+    if isinstance(regs, dict):
+        for name, r in regs.items():
+            if isinstance(r, dict) and _cargo_cred_provider_custom(r.get("credential-provider")):
+                out.add(_cargo_sig(f"registries.{name}.credential-provider",
+                                   r.get("credential-provider")))
+    for top in ("credential-alias", "patch"):
+        tbl = doc.get(top)
+        if isinstance(tbl, dict):
+            for name, v in tbl.items():
+                out.add(_cargo_sig(f"{top}.{name}", v))
+        elif _cargo_nonempty(tbl):
+            out.add(_cargo_sig(top, tbl))
+    env = doc.get("env")
+    if isinstance(env, dict):
+        for name, v in env.items():
+            if _cargo_env_dangerous(name):
+                out.add(_cargo_sig(f"env.{name}", v))
+    elif _cargo_nonempty(env):
+        out.add(_cargo_sig("env", env))
+    d = doc.get("doc")
+    if isinstance(d, dict) and _cargo_nonempty(d.get("browser")):
+        out.add(_cargo_sig("doc.browser", d.get("browser")))
+    for top in ("paths", "include"):
+        if _cargo_nonempty(doc.get(top)):
+            out.add(_cargo_sig(top, doc.get(top)))
+    return out
+
+
+def _cargo_toolchain_doc_sigs(doc: dict) -> set:
+    out: set = set()
+    tc = doc.get("toolchain")
+    if isinstance(tc, dict) and _cargo_nonempty(tc.get("path")):
+        out.add(_cargo_sig("toolchain.path", tc.get("path")))
+    if _cargo_nonempty(doc.get("path")):
+        out.add(_cargo_sig("path", doc.get("path")))
+    return out
+
+
+def _cargo_regex_sigs(text: str) -> set:
+    out: set = set()
+    scan = patterns.strip_comment_lines(patterns.toml_unescape(text or ""))
+    for line in scan.splitlines():
+        if patterns.CARGO_EXEC_KEY_RE.search(line):
+            out.add("~" + " ".join(line.split()))
+    return out
+
+
+def _cargo_parse(text: str):
+    if _tomllib is None:
+        return None
+    try:
+        doc = _tomllib.loads(text or "")
+    except Exception:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _cargo_new_exec(pre: str, post: str, kind: str) -> set:
+    """Exec-capable entries present in `post` but not in `pre` (a new key, or
+    an existing key with a changed value). Semantic (TOML-parsed) when both
+    sides parse, else a line-level regex diff of both."""
+    fn = _cargo_config_doc_sigs if kind == "cargo" else _cargo_toolchain_doc_sigs
+    a, b = _cargo_parse(pre), _cargo_parse(post)
+    if b is not None:
+        # `pre` unparseable (or absent) -> nothing on disk to diff against
+        # semantically, so every exec entry in `post` counts as new.
+        return fn(b) - fn(a) if a is not None else fn(b)
+    # `post` won't parse (invalid TOML, or no tomllib on 3.10): fail CLOSED
+    # on any exec-key line at all. A line diff can't see a value-only edit
+    # inside a multi-line array/string (`runner = [\n "x",\n]` -- only the
+    # key line carries a signature), and an agent can make the file
+    # unparseable on purpose for one step to force this branch (QA round 1).
+    return _cargo_regex_sigs(post)
+
+
+def _cargo_resolve(ev: Event, p: str) -> str:
+    p = os.path.expanduser(p)
+    if p.startswith("file://"):
+        p = p[len("file://"):]
+    if not os.path.isabs(p) and getattr(ev, "cwd", None):
+        p = os.path.join(str(ev.cwd), p)
+    return p
+
+
+def _cargo_read_disk(ev: Event, p: str) -> Optional[str]:
+    """Current on-disk text of `p`, '' if it doesn't exist, None if it exists
+    but can't be safely read (not a regular file, too large, unreadable)."""
+    full = _cargo_resolve(ev, p)
+    try:
+        if not os.path.lexists(full):
+            return ""
+        if not os.path.isfile(full):
+            return None
+        if os.path.getsize(full) > _CARGO_READ_LIMIT:
+            return None
+        with open(full, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(_CARGO_READ_LIMIT + 1)
+    except OSError:
+        return None
+
+
+def _cargo_kind(ev: Event, p: str) -> Optional[str]:
+    if patterns.RUSTUP_STATE_PATH_RE.search(p):
+        return "rustup"
+    if patterns.CARGO_CONFIG_PATH_RE.search(p):
+        return "cargo"
+    if patterns.RUST_TOOLCHAIN_PATH_RE.search(p):
+        return "toolchain"
+    cwd = getattr(ev, "cwd", None)
+    base = re.split(r"[/\\]", p.rstrip(" ."))[-1].lower()
+    if (cwd and _CARGO_CWD_RE.search(str(cwd)) and base in _CARGO_BARE_NAMES
+            and not re.search(r"[/\\]", p.strip())):
+        return "cargo"
+    return None
+
+
+def _cargo_edit_write_hit(ev: Event, p: str, kind: str) -> bool:
+    a = ev.args or {}
+    pre = _cargo_read_disk(ev, p)
+    content = a.get("content")
+    if not isinstance(content, str):
+        content = None
+        for k in ("contents", "text", "data", "body"):
+            if isinstance(a.get(k), str):
+                content = a[k]
+                break
+    if content is None and a.get("content") is not None:
+        content = "\n".join(_flatten_strings(a.get("content")))
+    pairs = _claude_mcp_aa_edit_pairs(a)
+    if content is None and not pairs:
+        # Unknown argument shape: scan every string the tool was given.
+        content = "\n".join(_flatten_strings(a))
+    if content is not None and not pairs:
+        return bool(_cargo_new_exec(pre or "", content, kind))
+    # Edit / MultiEdit: replay the edits against the on-disk file so a
+    # value-only diff (`"sccache"` -> `"/tmp/x"`) is judged with the key it
+    # sits under; if that can't be done, fall back to the strings alone,
+    # counting a key mention on EITHER side (old_string carries the key in a
+    # value-only diff).
+    if pre is None:
+        # Exists but can't be safely read (over the size cap, not a regular
+        # file, unreadable): the edit can't be replayed, and a value-only
+        # diff (`""` -> `"/tmp/x"`) carries no key to see -- fail CLOSED
+        # (QA round 1).
+        return True
+    post = pre
+    replayable = True
+    for old, new in pairs:
+        if old and old in post:
+            post = (post.replace(old, new) if a.get("replace_all")
+                    else post.replace(old, new, 1))
+        elif not old and not post:
+            post = new
+        else:
+            replayable = False
+            break
+    if replayable:
+        return bool(_cargo_new_exec(pre, post, kind))
+    # Not replayable (old_string not found -- the Edit tool itself would
+    # reject it): judge the strings alone, a key on EITHER side counting.
+    for old, new in pairs:
+        if new != old and (_cargo_regex_sigs(new) or _cargo_regex_sigs(old)):
+            return True
+    return False
+
+
+def rule_cargo_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an exec-capable key in a Cargo config
+    (`.cargo/config.toml`/`.cargo/config`, any depth, or `$CARGO_HOME`'s),
+    a `path` in a rustup toolchain file (`rust-toolchain.toml`/
+    `rust-toolchain`), a direct write to rustup's own state
+    (`~/.rustup/settings.toml`, `~/.rustup/toolchains/**`), or
+    `rustup toolchain link`.
+
+    THREAT MODEL: Cargo merges `.cargo/config.toml` from the working
+    directory and every ancestor, plus `$CARGO_HOME/config.toml`, on every
+    invocation, and a handful of its keys name a program Cargo itself runs:
+    `build.rustc`/`rustc-wrapper`/`rustc-workspace-wrapper`/`rustdoc` on
+    every `cargo build`/`check`/`test`/`clippy` -- including the `cargo
+    check` rust-analyzer runs on its own the moment an editor opens the
+    folder, with no human command at all; `target.<triple|cfg>.runner` on
+    every `cargo run`/`test`/`bench`; `target.*.linker`/`host.linker` and
+    `-C linker=`/`link-arg=` rustflags at every link; `registry.credential-
+    provider`/`global-credential-providers`/`registries.<n>.credential-
+    provider`/`credential-alias.*` on every authenticated publish/fetch,
+    handed the live registry token; `doc.browser` on `cargo doc --open`.
+    `[env]` entries for `CC`/`LD_PRELOAD`/`RUSTC_WRAPPER`/... reach every
+    build script and compiler child, and `paths`/`[patch]`/`include` swap
+    in an arbitrary local crate (its `build.rs` then runs) or another
+    config. rustup's `[toolchain] path = "<dir>"` makes every `cargo`/
+    `rustc` proxy call in the tree exec binaries from that directory. All
+    of it is "write a config file now, Cargo runs the command later" --
+    by this agent's next `cargo test`, by a teammate who clones the repo
+    (a committed `.cargo/config.toml` is ordinary, reviewed-looking
+    tooling), or by CI -- and none of it is a registry redirect, which is
+    all `rule_package_manifest_protect` checks in the same file.
+
+    Detection: for Edit/MultiEdit/Write/MCP writes the guard parses the
+    resulting TOML (replaying Edit pairs against the on-disk file, so a
+    value-only diff is judged under the key it edits) and gates only an
+    exec-capable entry that is NEW or CHANGED versus what is already on
+    disk -- an existing, reviewed `rustc-wrapper = "sccache"` doesn't ASK
+    on every unrelated `[profile]` tweak. Empty values (`rustc-wrapper =
+    ""`, which DISABLES a wrapper) and Cargo's built-in credential
+    providers (`cargo:token`, `cargo:wincred`, `cargo:macos-keychain`,
+    `cargo:libsecret`) stay allowed. When TOML parsing isn't possible
+    (invalid TOML, Python 3.10) the guard fails closed: a line-level regex
+    over the same key set, with TOML `\\uXXXX` escapes decoded first, asks
+    on ANY exec-key line in the result (not just a new one -- a line diff
+    can't see a value-only edit inside a multi-line array/string), and an
+    Edit to a file that exists but can't be safely read (over 1 MiB, not a
+    regular file, unreadable) always asks, since it can't be replayed. The shell
+    branch is path-gated: any write verb (redirect, `tee`, `sed -i`, `cp`/
+    `mv`/`ln -f`, archive/sync, `git apply`/`patch`, `sponge`, interpreter
+    one-liners) in a command naming one of these files ASKs, as does an
+    exec-key assignment plus the path with no recognised verb; read-only
+    commands (`cat`, `grep`, `cargo build` itself) stay allowed. Shell
+    text isn't parsed as TOML, so unlike the Edit branch it doesn't try to
+    distinguish a benign shell write from a dangerous one.
+
+    Config (`policy.cargo_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command). Escapable only by a
+    human: trailing `# aegis-allow` on the shell form, or
+    `AEGIS_ALLOW_CARGO_EXEC=1` set before launch.
+
+    Honest scope: `build.rs` itself (Rust source Cargo compiles and runs)
+    is ordinary code, not config, and out of scope -- the same line every
+    guard here draws between config and source; a `cargo --config KEY=VAL`
+    / `RUSTC_WRAPPER=x cargo build` invocation is an immediate, visible
+    exec, not persistence, and isn't gated here (env-var persistence via
+    `.claude/settings.local.json` is `rule_claude_env_protect`'s surface);
+    `[alias]` entries only expand to cargo subcommands and aren't gated;
+    `http.proxy`/`http.cainfo` (MITM, not exec) aren't gated; a
+    `$CARGO_HOME` pointing somewhere other than a literal `.cargo`/
+    `$CARGO_HOME` path is not recognised; and the shell branch is not
+    clause-scoped (a write anywhere in a command that also names a cargo
+    config ASKs), the same false-ASK trade-off its siblings accept.
+
+    QA history: an independent design/wiring review confirmed registration
+    everywhere its siblings are (`_CORE_RULES`, `_FETCH_HUMAN_ESCAPABLE`,
+    `Policy`, all three `loader.py` spots, both `skills.py` knob lists, the
+    `_REMEDIES` table, the README), a live YAML `cargo_exec:` block through
+    `load_policy()` into `evaluate()`, no exceptions on 28 odd-input shapes,
+    and human-only escapes. Round 1 found two fail-open paths (a value-only
+    edit inside a multi-line array/string slipping past the regex fallback,
+    reachable by making the file invalid TOML for one step; and an Edit to
+    an over-1-MiB/FIFO/device config skipping the replay), both closed by
+    failing closed; round 2 re-verified both closed with zero new false-ASK
+    cost on 3.11. A parallel bypass-hunting review was stopped before it
+    tested anything, so this guard has NOT yet had an independent
+    adversarial bypass pass -- only the author's own variant sweep (TOML
+    syntax/encoding variants, path spellings, shell write forms)."""
+    cfg = getattr(policy, "cargo_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "cargo-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        kind = _cargo_kind(ev, p)
+        if kind is None:
+            return None
+        if kind != "rustup" and not _cargo_edit_write_hit(ev, p, kind):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, p)):
+            return None
+        what = {"cargo": "plants or changes an exec-capable Cargo config key "
+                         "(rustc/rustc-wrapper/rustdoc, target runner/linker, a "
+                         "credential provider, a dangerous [env] entry, "
+                         "paths/patch/include)",
+                "toolchain": "points rustup's toolchain at an arbitrary "
+                             "directory ([toolchain] path)",
+                "rustup": "writes rustup's own state (settings/overrides or an "
+                          "installed toolchain's binaries)"}[kind]
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"'{p}' {what} — Cargo/rustup execs it automatically "
+                         "on the next cargo build/check/test/run (rust-analyzer "
+                         "runs 'cargo check' on its own when an editor opens the "
+                         "folder), by this session, a teammate, or CI. Review "
+                         "the change, then confirm with AEGIS_ALLOW_CARGO_EXEC=1; "
+                         "a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan = patterns.strip_comment_lines(cmd)
+        cli_hit = bool(patterns.RUSTUP_LINK_CLI_RE.search(scan))
+        cwd = getattr(ev, "cwd", None)
+        path_hit = bool(
+            patterns.CARGO_CONFIG_PATH_RE.search(scan)
+            or patterns.RUST_TOOLCHAIN_PATH_RE.search(scan)
+            or patterns.RUSTUP_STATE_PATH_RE.search(scan)
+            or ((patterns.CARGO_CD_RE.search(scan)
+                 or (cwd and _CARGO_CWD_RE.search(str(cwd))))
+                and patterns.CARGO_BARE_CONFIG_RE.search(scan)))
+        hit = cli_hit
+        if not hit and path_hit:
+            verb_scan = _CARGO_HARMLESS_REDIRECT_RE.sub(" ", scan)
+            write_verb = bool(
+                patterns.WRITE_REDIRECT_RE.search(verb_scan)
+                or patterns.INPLACE_WRITE_RE.search(verb_scan)
+                or patterns.COPY_WRITE_VERB_RE.search(verb_scan)
+                or patterns.FORCED_LINK_WRITE_RE.search(verb_scan)
+                or patterns.DELETE_OR_MOVE_VERB_RE.search(verb_scan)
+                or patterns.ARCHIVE_SYNC_VERB_RE.search(verb_scan)
+                or _CARGO_EXTRA_WRITE_RE.search(verb_scan))
+            hit = write_verb or bool(
+                patterns.CARGO_EXEC_KEY_RE.search(patterns.toml_unescape(scan)))
+        if not hit:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CARGO_EXEC")
+                or _cargo_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        reason = ("'rustup toolchain link' registers an arbitrary directory as "
+                  "a toolchain" if cli_hit else
+                  "A Cargo config / rustup toolchain file is being written from "
+                  "a shell")
+        return _finish(Decision(action, "cargo-exec-protect",
+                         f"{reason} — exec-capable keys there (rustc-wrapper, "
+                         "target runner/linker, credential providers, "
+                         "[toolchain] path, ...) run automatically on the next "
+                         "cargo build/check/test/run, by anyone. A human may "
+                         "append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_CARGO_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -9296,6 +9758,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_cargo_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
