@@ -5559,3 +5559,175 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
     re.IGNORECASE,
 )
+
+
+# ---- Foreign-agent runtime protection (rules.rule_foreign_agent_protect) ----
+# Aegis evaluates Claude Code's OWN tool calls. Every other AI coding agent on
+# the machine (Gemini CLI, Codex CLI, Cursor / cursor-agent, GitHub Copilot in
+# VS Code and its CLI, Windsurf, Kiro, Amazon Q, Roo/Cline, Continue,
+# opencode, aider, Zed, Qwen Code, Crush, Amp) runs WITHOUT Aegis. Two ways a
+# hijacked session uses that to step outside every guard in this file:
+#   (1) launching one of those agents right now with its approval prompts /
+#       sandbox switched off -- Aegis sees a single Bash call, never the
+#       commands the nested agent then runs on its own; and
+#   (2) planting config another agent (or the IDE hosting it) auto-loads:
+#       hooks, MCP servers, notify/test/lint commands, plugins, or a setting
+#       that silences that agent's own confirmation prompt.
+
+# Root boundary shared by every path below (same shape as MCP_CONFIG_PATH_RE).
+_FA_ROOT = r"(?:^|[\s'\"/\\=])"
+_FA_SEG = r"[^\s'\"/\\]{1,200}"
+_FA_DIR = _WIN_TRIM + _SEP
+
+
+def _fa_dir(*parts: str) -> str:
+    return _FA_ROOT + _FA_DIR.join(parts) + _FA_DIR
+
+
+# Files whose WHOLE content is agent execution / approval config: any write,
+# edit, or delete is gated (path-gated, the MCP_CONFIG_PATH_RE posture).
+FOREIGN_AGENT_CONFIG_PATH_RE = re.compile(
+    # Gemini CLI: settings (mcpServers, hooks, tools.discoveryCommand /
+    # callCommand, tools.allowed, yolo / approval defaults), custom commands
+    # (`!{...}` shell interpolation), extensions (each may declare
+    # mcpServers); /etc/gemini-cli/settings.json is the system scope.
+    r"" + _fa_dir(r"\.gemini") + r"settings\.json" + _CI_END
+    + r"|" + _fa_dir(r"gemini-cli") + r"settings\.json" + _CI_END
+    + r"|" + _fa_dir(r"\.gemini", r"commands") + r"(?:" + _FA_SEG + _FA_DIR + r"){0,6}"
+    + _FA_SEG + r"\.toml" + _CI_END
+    + r"|" + _fa_dir(r"\.gemini", r"extensions") + _FA_SEG
+    # Qwen Code (Gemini CLI fork): same settings shape.
+    + r"|" + _fa_dir(r"\.qwen") + r"settings\.json" + _CI_END
+    # Codex CLI: config.toml (notify command, mcp_servers, approval_policy,
+    # sandbox_mode, profiles), execpolicy rules (prefix_rule allow-lists).
+    + r"|" + _fa_dir(r"\.codex") + r"config\.toml" + _CI_END
+    + r"|" + _fa_dir(r"\.codex", r"rules") + _FA_SEG
+    # Cursor: agent hooks, CLI permission allow-list, background-agent
+    # environment (install/start commands).
+    + r"|" + _fa_dir(r"\.cursor") + r"(?:hooks|cli|cli-config|environment)\.json" + _CI_END
+    # Windsurf / Codeium Cascade hooks.
+    + r"|" + _fa_dir(r"\.windsurf") + r"hooks\.json" + _CI_END
+    + r"|" + _fa_dir(r"\.codeium", r"windsurf") + r"hooks\.json" + _CI_END
+    # Kiro: MCP servers and agent hooks.
+    + r"|" + _fa_dir(r"\.kiro", r"settings") + r"mcp\.json" + _CI_END
+    + r"|" + _fa_dir(r"\.kiro", r"hooks") + _FA_SEG
+    # Amazon Q Developer: workspace + global MCP / custom agents.
+    + r"|" + _fa_dir(r"\.amazonq") + r"(?:mcp\.json|default\.json)" + _CI_END
+    + r"|" + _fa_dir(r"\.amazonq", r"(?:cli-)?agents") + _FA_SEG
+    + r"|" + _fa_dir(r"\.aws", r"amazonq") + r"(?:mcp\.json|default\.json)" + _CI_END
+    + r"|" + _fa_dir(r"\.aws", r"amazonq", r"(?:cli-)?agents") + _FA_SEG
+    # Roo Code / Cline MCP settings.
+    + r"|" + _fa_dir(r"\.roo") + r"mcp\.json" + _CI_END
+    + r"|" + _FA_ROOT + r"cline_mcp_settings\.json" + _CI_END
+    # Continue: config (mcpServers, slash-command `run`), MCP server blocks.
+    + r"|" + _fa_dir(r"\.continue") + r"config\.(?:ya?ml|json|ts|js)" + _CI_END
+    + r"|" + _fa_dir(r"\.continue", r"mcpServers") + _FA_SEG
+    # opencode: config (mcp, permission), auto-loaded JS/TS plugins & tools.
+    + r"|" + _FA_ROOT + r"opencode\.jsonc?" + _CI_END
+    + r"|" + _fa_dir(r"\.opencode") + r"(?:plugins?|tools?)" + _FA_DIR + _FA_SEG
+    # aider: test-cmd / lint-cmd / auto-test / yes-always.
+    + r"|" + _FA_ROOT + r"\.aider\.conf\.ya?ml" + _CI_END
+    # GitHub Copilot CLI / coding agent: config, MCP config, agent hooks.
+    + r"|" + _fa_dir(r"\.copilot") + r"(?:config|mcp-config)\.json" + _CI_END
+    + r"|" + _fa_dir(r"\.github", r"hooks") + _FA_SEG + r"\.json" + _CI_END
+    # Crush (charm): config incl. mcp + permissions.
+    + r"|" + _FA_ROOT + r"\.?crush\.json" + _CI_END
+    # Amp: user settings (amp.dangerouslyAllowAll, amp.mcpServers, ...).
+    + r"|" + _fa_dir(r"amp") + r"settings\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Shared editor settings files: mostly unrelated preferences, so only the
+# specific agent keys below are gated (FOREIGN_AGENT_SHARED_KEY_RE). VS Code
+# workspace + user + profile settings (and its forks Cursor/Windsurf/VSCodium,
+# which keep the same `User/settings.json` layout), `*.code-workspace`
+# multi-root settings, and Zed project + user settings.
+FOREIGN_AGENT_SHARED_PATH_RE = re.compile(
+    _fa_dir(r"\.vscode") + r"settings\.json" + _CI_END
+    + r"|" + _fa_dir(r"User") + r"(?:profiles" + _FA_DIR + _FA_SEG + _FA_DIR + r")?settings\.json" + _CI_END
+    + r"|" + _FA_ROOT + r"(?:" + _FA_SEG + r")?\.code-workspace" + _CI_END
+    + r"|" + _fa_dir(r"\.zed") + r"settings\.json" + _CI_END
+    + r"|" + _fa_dir(r"zed") + r"settings\.json" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Dotted-key paths (after JSONC parse + flatten, joined with '.') under which a
+# truthy leaf means "another agent auto-runs / auto-approves something":
+#   chat.tools.autoApprove / chat.tools.global.autoApprove /
+#   chat.tools.terminal.autoApprove / .edits.autoApprove / .urls.autoApprove /
+#   chat.tools.terminal.enableAutoApprove / ...eligibleForAutoApproval
+#   (Copilot agent mode "YOLO", CVE-2025-53773), the legacy
+#   github.copilot.chat.agent.terminal.allowList, the settings.json `mcp`
+#   server block and chat.mcp.* (discovery/autostart), Zed's
+#   agent.always_allow_tool_actions / context_servers / agent_servers, and
+#   Amp's amp.dangerouslyAllowAll / amp.mcpServers / amp.commands.allowlist /
+#   amp.permissions. Cline/Roo-style autoApprove maps match the first branch.
+FOREIGN_AGENT_SHARED_KEY_RE = re.compile(
+    r"auto[-_]?approv"
+    r"|(?:^|\.)terminal\.allow_?list\b"
+    r"|^(?:settings\.)?mcp(?:\.|$)|(?:^|\.)chat\.mcp\."
+    r"|always_allow_tool_actions|(?:^|\.)context_servers(?:\.|$)|(?:^|\.)agent_servers(?:\.|$)"
+    r"|(?:^|\.)amp\.(?:dangerously|mcpServers|commands|permissions|tools)",
+    re.IGNORECASE,
+)
+
+# Text-level fallback (unparseable post-image, Edit that cannot be replayed,
+# shell writes): any fragment of a gated key name. Deliberately broad; it is
+# only consulted for a write that already targets a shared settings path.
+FOREIGN_AGENT_SHARED_FRAG_RE = re.compile(
+    r"approv|allow_?list|\bmcp|context_serv|agent_serv|always_allow|dangerous"
+    r"|\bamp\.",
+    re.IGNORECASE,
+)
+
+# Known agent CLIs, matched per shell segment. `q chat` (Amazon Q) is spelled
+# out because a bare `q` would match far too much.
+# The name must be a whole command word -- start of segment, after
+# whitespace, a path separator, or an `@scope/` prefix -- and not part of a
+# dotted directory (`~/.codex`), so `find ~/.codex -type f` stays allowed.
+FOREIGN_AGENT_BIN_RE = re.compile(
+    r"(?:^|[\s/\\\"'=(`])"
+    r"(?:codex|gemini(?:-cli)?|qwen(?:-code)?|cursor-agent|copilot|crush|amp|opencode|aider|kiro-cli)"
+    r"(?:@[\w.\-]{1,40})?(?:\.(?:exe|cmd|js|mjs))?(?=[\s\"'`)]|$)"
+    r"|(?:^|[\s/\\\"'=(`])q(?:\.exe)?\s+chat\b",
+    re.IGNORECASE,
+)
+
+# Approval/sandbox-off flags specific enough to gate with no binary name in
+# the segment at all (survives `$BIN`, `$(which x)`, renamed binaries).
+FOREIGN_AGENT_UNIQUE_FLAG_RE = re.compile(
+    r"--dangerously-bypass-approvals-and-sandbox\b"          # codex
+    r"|\bdanger-full-access\b"                               # codex sandbox_mode
+    r"|--approval-mode(?:=|\s+)[\"']?yolo\b"                 # gemini / qwen
+    r"|--trust-all-tools\b"                                  # amazon q / kiro-cli
+    r"|--allow-all-tools\b"                                  # copilot cli
+    r"|--dangerously-allow-all\b"                            # amp
+    r"|--yes-always\b"                                       # aider
+    r"|\bCOPILOT_ALLOW_ALL\s*=\s*[\"']?(?!0\b|false\b)[^\s\"']",  # copilot cli env
+    re.IGNORECASE,
+)
+
+# Generic flags that only mean "approve everything" next to a known agent CLI.
+FOREIGN_AGENT_BIN_FLAG_RE = re.compile(
+    r"--yolo\b"                                              # gemini/qwen/codex/crush/copilot
+    r"|(?:^|\s)-(?=[a-z]{0,8}y)[a-z]{1,9}(?=\s|$|[\"'])"     # gemini/qwen/crush -y (incl. -yp); bounded
+    r"|--force\b|(?:^|\s)-f(?=\s|$)"                         # cursor-agent
+    r"|(?:--ask-for-approval|(?:^|\s)-a)(?:=|\s+)[\"']?never\b"   # codex
+    r"|\bapproval_policy\s*=\s*[\"']*never\b"                # codex -c approval_policy=never
+    r"|--full-auto\b"                                        # codex (no approval prompts)
+    r"|--yes\b"                                              # aider (legacy --yes)
+    r"|--allow-all(?:-paths)?\b|--allow-tool(?:=|\s+)[\"']?shell\b",  # copilot cli
+    re.IGNORECASE,
+)
+
+# Shell-segment separators for the per-segment launch scan (linear time).
+FOREIGN_AGENT_SEGMENT_SPLIT_RE = re.compile(r"[|;&\n]")
+
+# Package-manager install/remove of an agent CLI (`npm i -g @openai/codex
+# --force`, `brew install gemini-cli -y`): the agent's name is an ARGUMENT, so
+# generic flags in that segment belong to the package manager, not the agent.
+FOREIGN_AGENT_PKG_INSTALL_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun|brew|pip3?|pipx|uv|cargo|apt(?:-get)?|dnf|yum|apk|winget|choco|scoop|port|nix-env|gem|go)"
+    r"\s+(?:-\S+\s+)*(?:i|in|install|add|remove|rm|uninstall|un|upgrade|update|up|reinstall|tool\s+install)\b",
+    re.IGNORECASE,
+)

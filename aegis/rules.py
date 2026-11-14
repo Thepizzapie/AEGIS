@@ -7058,6 +7058,434 @@ def rule_claude_mcp_autoapprove_protect(ev: Event, policy=None) -> Optional[Deci
     return None
 
 
+# ---- foreign-agent runtime protection: escapable with human confirmation ----
+def _foreign_agent_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_FA_MAX_READ = 2 * 1024 * 1024      # never read an on-disk pre-image larger than this
+_FA_MAX_DEPTH = 64                  # flatten depth cap (deeper -> conservative fallback)
+_FA_FALSY_STR = frozenset({"", "off", "false", "0", "no", "never", "none", "null", "disabled"})
+
+
+def _fa_launch_hit(text: str) -> Optional[str]:
+    """Per-segment scan for a foreign-agent CLI launched with approvals/sandbox
+    off. Splitting first and then running plain searches keeps this linear in
+    the command length (no `[^;]*`-style gap regex across the whole input)."""
+    for seg in patterns.FOREIGN_AGENT_SEGMENT_SPLIT_RE.split(text):
+        if not seg.strip():
+            continue
+        m = patterns.FOREIGN_AGENT_UNIQUE_FLAG_RE.search(seg)
+        if m:
+            return m.group(0).strip()
+        if (patterns.FOREIGN_AGENT_BIN_RE.search(seg)
+                and not patterns.FOREIGN_AGENT_PKG_INSTALL_RE.search(seg)):
+            m = patterns.FOREIGN_AGENT_BIN_FLAG_RE.search(seg)
+            if m:
+                return m.group(0).strip()
+    return None
+
+
+def _fa_strip_jsonc(text: str) -> str:
+    """Remove // and /* */ comments and trailing commas outside strings, so
+    VS Code/Zed JSONC settings parse with the stdlib json module."""
+    out = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "]}":
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _fa_pairs_hook(pairs):
+    # Keep BOTH values of a duplicate key: a parser that is last-wins and one
+    # that is first-wins must not disagree about what is in the file.
+    d = {}
+    for k, v in pairs:
+        key = k
+        n = 1
+        while key in d:
+            key = f"{k}\x00{n}"
+            n += 1
+        d[key] = v
+    return d
+
+
+def _fa_parse(text: str):
+    """JSONC text -> object, or None when it cannot be parsed."""
+    if not isinstance(text, str):
+        return None
+    if not text.strip():
+        return {}
+    try:
+        return json.loads(_fa_strip_jsonc(text.lstrip("﻿")), object_pairs_hook=_fa_pairs_hook)
+    except (ValueError, RecursionError):
+        return None
+
+
+def _fa_gated_entries(obj) -> Optional[dict]:
+    """Flatten to {dotted.path: canonical-json-value} for leaves whose path
+    names a gated agent key. None when the structure is too deep to trust."""
+    out: dict = {}
+    stack = [("", obj, 0)]
+    while stack:
+        path, v, depth = stack.pop()
+        if depth > _FA_MAX_DEPTH:
+            return None
+        if isinstance(v, dict) and v:
+            for k, sub in v.items():
+                stack.append((f"{path}.{k}" if path else str(k), sub, depth + 1))
+            continue
+        if isinstance(v, list) and v:
+            for i, sub in enumerate(v):
+                stack.append((f"{path}.{i}", sub, depth + 1))
+            continue
+        if path and patterns.FOREIGN_AGENT_SHARED_KEY_RE.search(path.replace("\x00", "")):
+            out[path] = json.dumps(v, sort_keys=True)
+    return out
+
+
+def _fa_truthy(canon: str) -> bool:
+    try:
+        v = json.loads(canon)
+    except ValueError:
+        return True
+    if v is None or v is False or v == 0 or v == {} or v == []:
+        return False
+    if isinstance(v, str) and v.strip().lower() in _FA_FALSY_STR:
+        return False
+    return True
+
+
+def _fa_read_pre(ev: Event, p: str) -> Optional[str]:
+    try:
+        path = os.path.expanduser(p)
+        if path.startswith("file://"):
+            path = path[len("file://"):]
+        if not os.path.isabs(path):
+            path = os.path.join(ev.cwd or os.getcwd(), path)
+        if not os.path.isfile(path) or os.path.getsize(path) > _FA_MAX_READ:
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except (OSError, ValueError):
+        return None
+
+
+def _fa_edit_list(a: dict) -> Optional[list]:
+    """[(old, new, replace_all)] for an Edit / MultiEdit / MCP edit_file call,
+    or None when the call is not an edit."""
+    if isinstance(a.get("edits"), list):
+        out = []
+        for e in a["edits"]:
+            if not isinstance(e, dict):
+                return None
+            old = e.get("old_string", e.get("oldText", e.get("old_str")))
+            new = e.get("new_string", e.get("newText", e.get("new_str")))
+            if not isinstance(old, str) or not isinstance(new, str):
+                return None
+            out.append((old, new, bool(e.get("replace_all"))))
+        return out
+    old = a.get("old_string", a.get("old_str", a.get("oldText")))
+    new = a.get("new_string", a.get("new_str", a.get("newText")))
+    if isinstance(old, str) and isinstance(new, str):
+        return [(old, new, bool(a.get("replace_all")))]
+    return None
+
+
+def _fa_post_image(pre: Optional[str], a: dict) -> Optional[str]:
+    """The file content after this Write/Edit, or None if it cannot be known."""
+    for key in ("content", "text", "data", "contents", "file_text"):
+        if isinstance(a.get(key), str):
+            return a[key]
+    edits = _fa_edit_list(a)
+    if edits is None or pre is None:
+        return None
+    buf = pre
+    for old, new, replace_all in edits:
+        if old == "":
+            if buf.strip():
+                return None
+            buf = new
+            continue
+        if old not in buf:
+            return None
+        buf = buf.replace(old, new) if replace_all else buf.replace(old, new, 1)
+    return buf
+
+
+def _fa_fragment_hit(text: str) -> bool:
+    return bool(patterns.FOREIGN_AGENT_SHARED_FRAG_RE.search(_claude_cred_helper_normalize(text)))
+
+
+def _fa_shared_write_hit(ev: Event, p: str) -> bool:
+    """A write to a shared editor-settings file: gated only when it adds or
+    changes a gated agent key to a truthy value (semantic pre/post diff),
+    falling back to a key-fragment check when either image is unknowable."""
+    a = ev.args or {}
+    pre = _fa_read_pre(ev, p)
+    post = _fa_post_image(pre, a)
+    post_obj = _fa_parse(post) if post is not None else None
+    post_entries = _fa_gated_entries(post_obj) if post_obj is not None else None
+    if post_entries is None:
+        edits = _fa_edit_list(a)
+        if edits is not None:
+            return any(_fa_fragment_hit(new) for _, new, _ in edits) or (
+                pre is not None and _fa_fragment_hit(pre)
+                and any(new.strip() and not old.strip() for old, new, _ in edits))
+        if post is not None:
+            return _fa_fragment_hit(post)
+        return _fa_fragment_hit(" ".join(_flatten_strings(a)))
+    pre_obj = _fa_parse(pre) if pre is not None else {}
+    pre_entries = (_fa_gated_entries(pre_obj) if pre_obj is not None else None) or {}
+    for path, val in post_entries.items():
+        if pre_entries.get(path) != val and _fa_truthy(val):
+            return True
+    return False
+
+
+def _fa_shell_writes(cmd: str, raw: str) -> bool:
+    return bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                or patterns.DESTRUCTIVE_DELETE_RE.search(cmd)
+                or patterns.INPLACE_WRITE_RE.search(cmd)
+                or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                or patterns.SPONGE_RE.search(cmd) or patterns.SPONGE_RE.search(raw)
+                or patterns.GITMODULES_PATCH_APPLY_RE.search(cmd)
+                or _CLAUDE_MCP_AA_APPLY_PATCH_RE.search(raw)
+                or _CLAUDE_MCP_AA_EXTRA_WRITER_RE.search(cmd)
+                or _CLAUDE_MCP_AA_EXTRA_WRITER_RE.search(raw))
+
+
+def rule_foreign_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block stepping outside Aegis through ANOTHER AI coding agent: launching
+    a foreign agent CLI with its approvals/sandbox switched off, or planting
+    config that makes a foreign agent (or the IDE hosting it) auto-execute
+    commands or auto-approve its own tool calls.
+
+    THREAT MODEL: Aegis evaluates Claude Code's own tool calls at its hook
+    boundary. Gemini CLI, Codex CLI, Cursor / cursor-agent, GitHub Copilot
+    (VS Code agent mode and the Copilot CLI), Windsurf, Kiro, Amazon Q,
+    Roo/Cline, Continue, opencode, aider, Zed, Qwen Code, Crush and Amp are
+    commonly installed side by side and run with NONE of these guards. A
+    prompt-injected session can use one of them two ways:
+
+    (1) Nested launch, same session, immediate: ``gemini --yolo -p "..."``,
+        ``codex exec --dangerously-bypass-approvals-and-sandbox "..."``,
+        ``copilot --allow-all-tools -p ...``, ``cursor-agent --force``,
+        ``q chat --trust-all-tools``, ``aider --yes-always``. Aegis sees one
+        Bash call whose payload is natural language; every file write,
+        credential read and network call the nested agent then makes on its
+        own is invisible to every rule in this file. ``rule_permission_
+        bypass_protect`` covers this shape for ``claude`` itself only.
+    (2) Cross-agent config, persistent: the next time a human (or CI) runs
+        that agent or opens the folder in that IDE, a planted hook / MCP
+        server / notify / test-cmd / plugin runs, or a planted approval
+        setting lets the other agent execute anything without asking --
+        e.g. ``"chat.tools.autoApprove": true`` in ``.vscode/settings.json``
+        (Copilot agent-mode "YOLO", CVE-2025-53773, exploited precisely by
+        prompt injection telling an agent to write it). ``rule_mcp_config_
+        protect`` covers only the ``.cursor``/``.vscode``/``.windsurf``
+        ``mcp.json`` files and ``rule_vscode_tasks_protect`` only
+        ``task.allowAutomaticTasks``; none of the files below.
+
+    Coverage:
+      * Launch flags, per shell segment (split on ``| ; & newline``, so it is
+        linear in the command length). Flags no other tool uses are gated
+        with no binary name present (``--dangerously-bypass-approvals-and-
+        sandbox``, ``danger-full-access``, ``--approval-mode yolo``,
+        ``--trust-all-tools``, ``--allow-all-tools``, ``--dangerously-allow-
+        all``, ``--yes-always``, ``COPILOT_ALLOW_ALL=1``); generic ones
+        (``--yolo``, ``-y``, ``--force``/``-f``, ``-a never``, ``-c
+        approval_policy=never``, ``--full-auto``, ``--yes``, ``--allow-all``,
+        ``--allow-tool shell``) only next to a known agent command word --
+        not a dotted directory (``find ~/.codex -type f`` is fine) and not
+        the argument of a package-manager install (``npm i -g @openai/codex
+        --force`` is fine).
+      * Dedicated config files (``FOREIGN_AGENT_CONFIG_PATH_RE``), whose
+        whole content is agent exec/approval config: ANY Edit/Write/MCP
+        write, and any shell redirect/copy/move/delete/in-place edit/
+        interpreter write naming the path. ``.gemini/settings.json``,
+        ``.gemini/commands/**.toml``, ``.gemini/extensions/*``,
+        ``.qwen/settings.json``, ``.codex/config.toml``, ``.codex/rules/*``,
+        ``.cursor/{hooks,cli,cli-config,environment}.json``,
+        ``.windsurf/hooks.json``, ``.kiro/settings/mcp.json``,
+        ``.kiro/hooks/*``, ``.amazonq/{mcp,default}.json``,
+        ``.amazonq/[cli-]agents/*`` (and the ``~/.aws/amazonq`` forms),
+        ``.roo/mcp.json``, ``cline_mcp_settings.json``, ``.continue/config.*``,
+        ``.continue/mcpServers/*``, ``opencode.json[c]``,
+        ``.opencode/{plugin,plugins,tool,tools}/*``, ``.aider.conf.yml``,
+        ``.copilot/{config,mcp-config}.json``, ``.github/hooks/*.json``,
+        ``[.]crush.json``, ``amp/settings.json``.
+      * Shared editor settings (``FOREIGN_AGENT_SHARED_PATH_RE``:
+        ``.vscode/settings.json``, VS Code-family ``User/[profiles/<id>/]
+        settings.json``, ``*.code-workspace``, ``.zed/settings.json``,
+        ``zed/settings.json``) -- VALUE-gated by a semantic diff: the on-disk
+        pre-image (<= 2 MB) and the post-image (Write content, or the
+        Edit/MultiEdit/MCP ``edits`` replayed onto the pre-image) are parsed
+        as JSONC (comments + trailing commas stripped; duplicate keys keep
+        every value) and flattened to dotted paths; the write is gated when
+        a leaf under a gated key (``FOREIGN_AGENT_SHARED_KEY_RE``: any
+        ``*autoApprov*`` key, ``terminal.allowList``, the ``mcp`` server
+        block and ``chat.mcp.*``, Zed ``always_allow_tool_actions``/
+        ``context_servers``/``agent_servers``, ``amp.dangerouslyAllowAll``/
+        ``mcpServers``/``commands``/``permissions``/``tools``) is ADDED or
+        CHANGED to a truthy value. Removing a key, setting it to ``false``/
+        ``null``/``"off"``/``{}``/``[]``, and editing unrelated settings (or
+        rewriting the file with an existing approval left unchanged) are
+        never gated. A value-only Edit (``old: 'false'`` -> ``new: 'true'``)
+        is caught because the diff is computed on the replayed whole file,
+        not on the edit text. If either image cannot be known or parsed the
+        guard falls back to a key-FRAGMENT check on the new text
+        (``approv``/``allowlist``/``mcp``/``context_serv``/...), and an Edit
+        that cannot be replayed is also gated when it inserts text into a
+        file that already mentions a fragment. Shell writes to these paths
+        get the fragment check on the command.
+
+    Config (``policy.foreign_agent``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command that skip the
+    gate). ``ask`` because a human really does run ``gemini --yolo`` in a
+    throwaway container, or keep a reviewed ``.codex/config.toml`` in a
+    dotfiles repo -- it just needs a human to say so.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell form,
+    or ``AEGIS_ALLOW_FOREIGN_AGENT=1`` set by the orchestrator/human before
+    launch. A spawned agent cannot set its own env for a hook invocation it
+    doesn't control.
+
+    Honest scope (denylist trade-offs, as every sibling guard discloses):
+    an agent CLI not listed above, or one invoked through a variable/alias
+    whose GENERIC flag (``$G --yolo``) has no binary name beside it (the
+    unique flags still match); an agent that is autonomous by DEFAULT with
+    no flag at all (opencode's default permission set, aider's default
+    auto-edit, ``gemini --approval-mode auto_edit``, ``codex -s workspace-
+    write``) -- these let the nested agent WRITE files Aegis's file guards
+    never see, but not run arbitrary commands unprompted, and gating every
+    non-interactive agent run would ask on ordinary use; an approval
+    flag that lives in a separately-written file (a shell script run later,
+    a ``CODEX_HOME`` pointing at a fresh directory whose config.toml was
+    written under an unlisted name, ``codex --profile p`` selecting a
+    profile planted earlier -- the planting itself is gated when it lands
+    in ``.codex/config.toml``); a generic flag inside an unrelated string
+    in the same segment as an agent name (``git commit -m "codex --yolo"``)
+    asks unnecessarily; shared-settings writes from a shell are judged by
+    key fragment, not semantically, so a shell edit of an unrelated key in
+    a file whose command text happens to mention ``mcp`` asks; a key built
+    in a shell from pieces finer than the fragments (``"ap"+"prov"``) is
+    not caught; a shared-settings path assembled from a shell variable, or
+    a bare ``settings.json`` after a ``cd`` in an EARLIER Bash call (shared
+    with every sibling guard); a TOCTOU change to the on-disk pre-image
+    between this hook and the Edit landing (another process writing the
+    file -- which itself went through this guard if it was this agent);
+    settings that VS Code-family IDEs read from places not listed here
+    (remote/devcontainer machine settings, policy files, a ``settingsSync``
+    pull); and a direct fetch-to-file write, closed separately by
+    `rule_fetch_to_file_protect` (both path regexes are registered there)."""
+    cfg = getattr(policy, "foreign_agent", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "foreign-agent-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        if patterns.FOREIGN_AGENT_CONFIG_PATH_RE.search(p):
+            what = "another AI agent's execution/approval config"
+        elif patterns.FOREIGN_AGENT_SHARED_PATH_RE.search(p) and _fa_shared_write_hit(ev, p):
+            what = "an AI-agent auto-approve / MCP / tool-trust key in shared editor settings"
+        else:
+            return None
+        if os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT") or _foreign_agent_allowed_by_policy(cfg, p):
+            return None
+        return _finish(Decision(action, "foreign-agent-protect",
+                         f"'{p}' is being written: {what} (hooks, MCP servers, "
+                         "notify/test commands, plugins, or a setting that "
+                         "silences that agent's own confirmation prompt). The "
+                         "other agent runs it later with none of Aegis's "
+                         "guards in front of it. Review the change, then "
+                         "confirm with AEGIS_ALLOW_FOREIGN_AGENT=1; a spawned "
+                         "agent cannot."))
+
+    if _is_shell(ev):
+        raw = _cmd(ev)
+        cmd = _shell_scan(ev)
+        reason = None
+        flag = _fa_launch_hit(cmd) or (_fa_launch_hit(raw) if len(raw) > 20000 else None)
+        if flag:
+            reason = (f"A foreign AI agent CLI is being launched with its "
+                      f"approvals/sandbox disabled ('{flag[:60]}'). Everything "
+                      "that nested agent then does -- file writes, credential "
+                      "reads, network calls -- happens outside every Aegis "
+                      "guard; this session only sees the one launch.")
+        else:
+            surf = cmd if len(raw) <= 20000 else f"{cmd} {raw}"
+            dedicated = bool(patterns.FOREIGN_AGENT_CONFIG_PATH_RE.search(surf))
+            shared = bool(patterns.FOREIGN_AGENT_SHARED_PATH_RE.search(surf))
+            if (dedicated or shared) and _fa_shell_writes(cmd, raw):
+                if dedicated or _fa_fragment_hit(surf):
+                    reason = ("Another AI agent's execution/approval config is "
+                              "being modified from a shell (hooks, MCP servers, "
+                              "notify/test commands, plugins, or an auto-approve "
+                              "setting) -- that agent runs it later with none of "
+                              "Aegis's guards in front of it.")
+        if not reason:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_FOREIGN_AGENT")
+                or _foreign_agent_allowed_by_policy(cfg, raw)):
+            return None
+        return _finish(Decision(action, "foreign-agent-protect",
+                         reason + " A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_FOREIGN_AGENT=1; a spawned agent cannot."))
+    return None
+
+
 def _conftest_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -7862,6 +8290,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.FOREIGN_AGENT_CONFIG_PATH_RE, "another AI agent's execution/approval config"),
+    (patterns.FOREIGN_AGENT_SHARED_PATH_RE, "editor settings holding AI-agent auto-approve keys"),
 )
 
 
@@ -9290,6 +9720,7 @@ _CORE_RULES = (
     rule_claude_env_protect,
     rule_claude_cred_helper_protect,
     rule_claude_mcp_autoapprove_protect,
+    rule_foreign_agent_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
