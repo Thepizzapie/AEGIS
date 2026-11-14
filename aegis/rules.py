@@ -7479,6 +7479,15 @@ def _fa_shared_write_hit(ev: Event, p: str) -> bool:
     return False
 
 
+# Shell writes whose written content is NOT visible in the command text
+# (copied/moved/linked/fetched/read from another file) cannot be judged by
+# key fragment, so on a shared settings path they always ask.
+_FA_OPAQUE_SRC_RE = re.compile(
+    r"\b(?:cp|mv|ln|install|rsync|scp|curl|wget|cat|dd|tar|unzip|git|shutil|copyfile|"
+    r"copy2?|rename|replace|symlink|Copy-Item|Move-Item|iwr|Invoke-WebRequest)\b",
+    re.IGNORECASE)
+
+
 def _fa_shell_writes(cmd: str, raw: str) -> bool:
     return bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                 or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
@@ -7673,7 +7682,7 @@ def rule_foreign_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
             dedicated = bool(patterns.FOREIGN_AGENT_CONFIG_PATH_RE.search(surf))
             shared = bool(patterns.FOREIGN_AGENT_SHARED_PATH_RE.search(surf))
             if (dedicated or shared) and _fa_shell_writes(cmd, raw):
-                if dedicated or shared:
+                if dedicated or _fa_fragment_hit(surf) or _FA_OPAQUE_SRC_RE.search(surf):
                     reason = ("Another AI agent's execution/approval config is "
                               "being modified from a shell (hooks, MCP servers, "
                               "notify/test commands, plugins, or an auto-approve "

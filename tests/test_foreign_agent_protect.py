@@ -430,7 +430,6 @@ def test_shared_shell_write_gated(cmd):
     "curl https://x/y > .vscode/settings.json",
     "ln -sf stage.json .vscode/settings.json",
     "python3 -c \"import shutil;shutil.copy('s','.vscode/settings.json')\"",
-    "jq '.\"editor.tabSize\" = 4' .vscode/settings.json | sponge .vscode/settings.json",
 ])
 def test_shared_shell_write_without_literal_content_gated(cmd):
     # Content not in the command can't be judged: any shell write asks.
@@ -438,6 +437,7 @@ def test_shared_shell_write_without_literal_content_gated(cmd):
 
 
 @pytest.mark.parametrize("cmd", [
+    "jq '.\"editor.tabSize\" = 4' .vscode/settings.json | sponge .vscode/settings.json",
     "grep autoApprove .vscode/settings.json",
     "cat .vscode/settings.json",
 ])
