@@ -125,3 +125,46 @@ def scan_surface(cmd, _depth=0) -> str:
             if inner:
                 parts.append(scan_surface(inner, _depth + 1))
     return " ".join(p for p in parts if p)
+
+
+_STR_LITERAL_RE = re.compile(r"\"((?:\\.|[^\"\\]){0,4000})\"|'((?:\\.|[^'\\]){0,4000})'")
+
+
+def scan_layers(cmd, _depth=0) -> list:
+    """Like ``scan_surface`` but as a LIST of separately-parseable command
+    texts, and WITHOUT the quote-stripped variant: the raw command (ANSI-C
+    ``$'...'`` decoded, quotes kept), each decoded PowerShell/base64 payload,
+    and each inner interpreter body -- for a python/node body also its string
+    literals joined by spaces (``subprocess.run(["x", "--y"])`` -> ``x --y``).
+    For guards that tokenize a command and must not see a quoted argument's
+    words as separate flags."""
+    if not cmd or _depth > 3:
+        return [cmd] if cmd else []
+    try:
+        cmd = _LINE_CONT_RE.sub(" ", str(cmd)[:_MAX])
+        out = [cmd]
+        dec_ansic = _ANSIC_MARKER_RE.sub("", _decode_ansic(cmd))
+        if dec_ansic != cmd:
+            out.append(dec_ansic)
+        for m in _PS_ENC_RE.finditer(cmd):
+            dec = _b64(m.group(1), utf16=True) or _b64(m.group(1))
+            if dec:
+                out.extend(scan_layers(dec, _depth + 1))
+        if _B64_DECODE_HINT.search(cmd):
+            for tok in _B64_TOKEN_RE.findall(cmd):
+                dec = _b64(tok)
+                if dec:
+                    out.extend(scan_layers(dec, _depth + 1))
+        for idx, rx in enumerate(_INTERP_RES):
+            for m in rx.finditer(cmd):
+                inner = m.group(m.lastindex)
+                if not inner:
+                    continue
+                out.extend(scan_layers(inner, _depth + 1))
+                if idx == 3:
+                    lits = [a or b for a, b in _STR_LITERAL_RE.findall(inner)]
+                    if lits:
+                        out.append(" ".join(lits))
+        return out
+    except Exception:  # noqa: BLE001 -- additive, never fatal
+        return [cmd]

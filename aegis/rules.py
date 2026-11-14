@@ -7074,65 +7074,242 @@ _FA_MAX_DEPTH = 64                  # flatten depth cap (deeper -> conservative 
 _FA_FALSY_STR = frozenset({"", "off", "false", "0", "no", "never", "none", "null", "disabled"})
 
 
-def _fa_launch_hit(text: str) -> Optional[str]:
-    """Per-segment scan for a foreign-agent CLI launched with approvals/sandbox
-    off. Splitting first and then running plain searches keeps this linear in
-    the command length (no `[^;]*`-style gap regex across the whole input)."""
-    for seg in patterns.FOREIGN_AGENT_SEGMENT_SPLIT_RE.split(text):
-        if not seg.strip():
+_FA_AGENTS = frozenset({"codex", "gemini", "gemini-cli", "qwen", "qwen-code", "cursor-agent",
+                        "copilot", "crush", "amp", "opencode", "aider", "kiro-cli", "q"})
+_FA_Y_AGENTS = frozenset({"gemini", "gemini-cli", "qwen", "qwen-code", "crush"})
+# Wrappers that run the NEXT word as the command; option tokens after them
+# are skipped. Values: option flags of that wrapper which consume an argument.
+_FA_WRAPPERS = {
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T"},
+    "doas": {"-u", "-C"}, "env": {"-u", "-C", "-S", "--unset", "--chdir"},
+    "exec": {"-a"}, "command": set(), "builtin": set(), "nohup": set(), "time": set(),
+    "timeout": {"-s", "-k", "--signal", "--kill-after"}, "nice": {"-n"},
+    "ionice": {"-c", "-n"}, "stdbuf": {"-i", "-o", "-e"}, "setsid": set(),
+    "xargs": {"-n", "-I", "-P", "-L", "-d", "-a", "-E", "-s"}, "caffeinate": set(),
+    "npx": {"-p", "--package", "-c", "--call"}, "bunx": {"-p", "--package"},
+    "pnpx": set(), "uvx": {"--from", "--with", "-p", "--python"},
+    "node": {"-r", "--require", "--import", "--loader"}, "nodejs": {"-r", "--require"},
+    "winpty": set(), "strace": {"-o", "-e"}, "unbuffer": set(), "chronic": set(),
+}
+# Two-word wrappers (`npm exec`, `pnpm dlx`, `bun x`, `pipx run`, `uv tool run`).
+_FA_WRAPPER_PAIRS = {("npm", "exec"), ("npm", "x"), ("pnpm", "dlx"), ("pnpm", "exec"),
+                     ("yarn", "dlx"), ("yarn", "exec"), ("bun", "x"), ("bun", "run"),
+                     ("pipx", "run"), ("uv", "run"), ("deno", "run")}
+_FA_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "busybox"})
+_FA_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_FA_SUBST_RE = re.compile(r"\$\(([^()]{0,2000})\)|`([^`]{0,2000})`")
+_FA_TIMEOUT_ARG_RE = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
+_FA_SHORT_RE = re.compile(r"^-[A-Za-z]{1,9}$")
+_FA_TOKENIZE_MAX = 50000
+_FA_QUOTES_RE = re.compile(r"[\"'\\]")
+
+
+def _fa_basename(tok: str) -> str:
+    t = tok.strip().strip("()`\"'")
+    t = re.split(r"[/\\]", t)[-1] if t else t
+    if "@" in t[1:]:
+        t = t[0] + t[1:].split("@", 1)[0]
+    t = t.lower()
+    for suf in (".exe", ".cmd", ".bat", ".ps1", ".js", ".mjs", ".cjs"):
+        if t.endswith(suf):
+            t = t[: -len(suf)]
+            break
+    return t
+
+
+def _fa_tokenize(line: str):
+    """shlex-tokenize one line into commands (lists of words), splitting on
+    shell control operators. None when it cannot be tokenized."""
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        toks = list(lex)
+    except ValueError:
+        return None
+    cmds, cur = [], []
+    for t in toks:
+        if t and set(t) <= set(";&|()"):
+            if cur:
+                cmds.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        cmds.append(cur)
+    return cmds
+
+
+def _fa_flags_hit(agent: str, args: list) -> Optional[str]:
+    """Token-level check of the arguments after an agent command word. Whole
+    tokens only, so a prompt string mentioning `--yolo` is not a flag."""
+    n = len(args)
+    for k, t in enumerate(args):
+        nxt = args[k + 1] if k + 1 < n else ""
+        tl = t.lower()
+        if tl == "--":
+            break
+        if tl == "--yolo" or tl.startswith("--yolo="):
+            return t
+        if agent in _FA_Y_AGENTS and _FA_SHORT_RE.match(t) and "y" in tl:
+            return t
+        if agent in _FA_Y_AGENTS and (tl == "--allowed-tools" or tl.startswith("--allowed-tools=")):
+            val = tl.split("=", 1)[1] if "=" in tl else nxt.lower()
+            if "shell" in val:
+                return t
+        if agent == "cursor-agent" and (tl == "--force" or (_FA_SHORT_RE.match(t) and "f" in tl)):
+            return t
+        if agent == "codex":
+            if tl in ("-a", "--ask-for-approval") and nxt.lower().strip("\"'") == "never":
+                return f"{t} {nxt}"
+            if tl in ("-a=never", "--ask-for-approval=never"):
+                return t
+            if tl in ("-c", "--config") and re.search(r"approval_policy\s*=\s*[\"']*never", nxt, re.I):
+                return f"{t} {nxt}"
+            if re.match(r"^(?:-c|--config=)approval_policy\s*=\s*[\"']*never", t, re.I):
+                return t
+            if tl == "--full-auto":
+                return t
+        if agent == "aider" and tl in ("--yes", "--yes-always"):
+            return t
+        if agent == "copilot":
+            if tl in ("--allow-all", "--allow-all-paths", "--allow-all-tools"):
+                return t
+            if tl == "--allow-tool" and "shell" in nxt.lower():
+                return f"{t} {nxt}"
+            if tl.startswith("--allow-tool=") and "shell" in tl:
+                return t
+        if agent in ("q", "kiro-cli") and (tl == "--trust-tools" or tl.startswith("--trust-tools=")):
+            val = tl.split("=", 1)[1] if "=" in tl else nxt.lower()
+            if re.search(r"execute|bash|shell|use_aws", val):
+                return t
+    return None
+
+
+def _fa_command_hit(words: list, depth: int) -> Optional[str]:
+    i, n = 0, len(words)
+    while i < n:
+        w = words[i]
+        b = _fa_basename(w)
+        if _FA_ASSIGN_RE.match(w):
+            i += 1
             continue
-        m = patterns.FOREIGN_AGENT_UNIQUE_FLAG_RE.search(seg)
-        if m:
-            return m.group(0).strip()
-        if (patterns.FOREIGN_AGENT_BIN_RE.search(seg)
-                and not patterns.FOREIGN_AGENT_PKG_INSTALL_RE.search(seg)):
+        if i + 1 < n and (b, words[i + 1].lower()) in _FA_WRAPPER_PAIRS:
+            i += 2
+            while i < n and words[i].startswith("-"):
+                i += 1
+            continue
+        if b in ("python", "python3", "pypy3") or re.match(r"^python3?\.\d+$", b):
+            if i + 2 < n and words[i + 1] == "-m":
+                i += 2
+                continue
+            return None
+        if b in _FA_WRAPPERS:
+            takes = _FA_WRAPPERS[b]
+            i += 1
+            while i < n and (words[i].startswith("-") or _FA_ASSIGN_RE.match(words[i])
+                             or (b == "timeout" and _FA_TIMEOUT_ARG_RE.match(words[i]))
+                             or (b == "nice" and re.match(r"^-?\d+$", words[i]))):
+                if words[i] == "--":
+                    i += 1
+                    break
+                if words[i].split("=", 1)[0] in takes and "=" not in words[i]:
+                    i += 1
+                i += 1
+            if b == "timeout" and i < n and _FA_TIMEOUT_ARG_RE.match(words[i]):
+                i += 1
+            continue
+        if b in _FA_SHELLS or b == "eval":
+            if b == "eval":
+                return _fa_launch_hit(" ".join(words[i + 1:]), depth + 1)
+            for k in range(i + 1, n - 1):
+                if _FA_SHORT_RE.match(words[k]) and "c" in words[k]:
+                    return _fa_launch_hit(words[k + 1], depth + 1)
+            return None
+        # `$(which codex) --yolo`, `` `command -v gemini` -y ``
+        if w.startswith("$(") or w.startswith("`"):
+            inner = w.strip("$()`")
+            j = i
+            while not (words[j].endswith(")") or words[j].endswith("`")) and j + 1 < n and j > i - 1:
+                j += 1
+                inner += " " + words[j].strip("()`")
+                if j - i > 8:
+                    break
+            cand = _fa_basename(inner.split()[-1]) if inner.split() else ""
+            if cand in _FA_AGENTS:
+                return _fa_flags_hit(cand, words[j + 1:])
+            return None
+        if b in _FA_AGENTS:
+            if b == "q":
+                if i + 1 < n and words[i + 1].lower() == "chat":
+                    return _fa_flags_hit("q", words[i + 2:])
+                return None
+            return _fa_flags_hit(b, words[i + 1:])
+        return None
+    return None
+
+
+def _fa_loose_hit(text: str) -> Optional[str]:
+    """Regex-only per-segment scan, for surfaces that cannot be tokenized
+    (decoded base64 / PowerShell payloads joined by `scan_surface`, or input
+    too long to tokenize): an agent word anywhere plus a generic flag."""
+    for seg in patterns.FOREIGN_AGENT_SEGMENT_SPLIT_RE.split(text):
+        if patterns.FOREIGN_AGENT_BIN_RE.search(seg):
             m = patterns.FOREIGN_AGENT_BIN_FLAG_RE.search(seg)
             if m:
                 return m.group(0).strip()
     return None
 
 
+def _fa_launch_hit(text: str, depth: int = 0) -> Optional[str]:
+    """Is a foreign-agent CLI launched with approvals/sandbox off?
+
+    Flags no other tool uses match anywhere (per segment, plain searches --
+    linear). Generic flags (`--yolo`, `-y`, `--force`, `-a never`, ...)
+    count only as whole argument tokens AFTER an agent name in COMMAND
+    position (after env assignments and wrappers like sudo/env/npx/timeout;
+    `sh -c`/`eval`/`$(...)` are recursed into), so `git push -f origin
+    codex`, `npx -y @google/gemini-cli -p x` and a prompt that merely says
+    "--yolo" or "go in" are not launches."""
+    if not text or depth > 4:
+        return None
+    for seg in patterns.FOREIGN_AGENT_SEGMENT_SPLIT_RE.split(text):
+        m = patterns.FOREIGN_AGENT_UNIQUE_FLAG_RE.search(seg)
+        if m:
+            return m.group(0).strip()
+    # Cheap prefilter on a quote/backslash-stripped copy (`ge""mini`, `g\\emini`
+    # are the same word to the shell and to shlex below).
+    if not patterns.FOREIGN_AGENT_BIN_RE.search(_FA_QUOTES_RE.sub("", text)):
+        return None
+    for line in text.splitlines() or [text]:
+        if not patterns.FOREIGN_AGENT_BIN_RE.search(_FA_QUOTES_RE.sub("", line)):
+            continue
+        cmds = _fa_tokenize(line) if len(line) <= _FA_TOKENIZE_MAX else None
+        if cmds is None:
+            hit = _fa_loose_hit(line)
+            if hit:
+                return hit
+            continue
+        for words in cmds:
+            hit = _fa_command_hit(words, depth)
+            if hit:
+                return hit
+        for m in _FA_SUBST_RE.finditer(line):
+            hit = _fa_launch_hit(m.group(1) or m.group(2) or "", depth + 1)
+            if hit:
+                return hit
+    return None
+
+
+_FA_JSONC_COMMENT_RE = re.compile(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*[\s\S]*?\*/')
+_FA_JSONC_COMMA_RE = re.compile(r'("(?:\\.|[^"\\])*")|,(\s*[\]}])')
+
+
 def _fa_strip_jsonc(text: str) -> str:
-    """Remove // and /* */ comments and trailing commas outside strings, so
-    VS Code/Zed JSONC settings parse with the stdlib json module."""
-    out = []
-    i, n = 0, len(text)
-    in_str = False
-    while i < n:
-        c = text[i]
-        if in_str:
-            out.append(c)
-            if c == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if c == '"':
-                in_str = False
-            i += 1
-            continue
-        if c == '"':
-            in_str = True
-            out.append(c)
-            i += 1
-            continue
-        if c == "/" and i + 1 < n and text[i + 1] == "/":
-            j = text.find("\n", i)
-            i = n if j < 0 else j
-            continue
-        if c == "/" and i + 1 < n and text[i + 1] == "*":
-            j = text.find("*/", i + 2)
-            i = n if j < 0 else j + 2
-            continue
-        if c == ",":
-            j = i + 1
-            while j < n and text[j] in " \t\r\n":
-                j += 1
-            if j < n and text[j] in "]}":
-                i += 1
-                continue
-        out.append(c)
-        i += 1
-    return "".join(out)
+    """Remove // and /* */ comments, THEN trailing commas, outside strings,
+    so VS Code/Zed JSONC settings parse with the stdlib json module."""
+    text = _FA_JSONC_COMMENT_RE.sub(lambda m: m.group(1) or "", text)
+    return _FA_JSONC_COMMA_RE.sub(lambda m: m.group(1) or m.group(2), text)
 
 
 def _fa_pairs_hook(pairs):
@@ -7196,16 +7373,30 @@ def _fa_truthy(canon: str) -> bool:
 
 
 def _fa_read_pre(ev: Event, p: str) -> Optional[str]:
+    """The on-disk pre-image, or None when it is unknowable. Never blocks:
+    procfs/sysfs/devfs targets are refused, the file is opened non-blocking,
+    must be a regular file by fstat, and at most _FA_MAX_READ+1 bytes are
+    read (over the cap counts as unknown)."""
     try:
-        path = os.path.expanduser(p)
-        if path.startswith("file://"):
-            path = path[len("file://"):]
+        path = p[len("file://"):] if p.startswith("file://") else p
+        path = os.path.expanduser(path)
         if not os.path.isabs(path):
             path = os.path.join(ev.cwd or os.getcwd(), path)
-        if not os.path.isfile(path) or os.path.getsize(path) > _FA_MAX_READ:
+        real = os.path.realpath(path)
+        if re.match(r"^/(?:proc|sys|dev)(?:/|$)", real):
             return None
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            st = os.fstat(fd)
+            import stat as _stat
+            if not _stat.S_ISREG(st.st_mode) or st.st_size > _FA_MAX_READ:
+                return None
+            data = os.read(fd, _FA_MAX_READ + 1)
+        finally:
+            os.close(fd)
+        if len(data) > _FA_MAX_READ:
+            return None
+        return data.decode("utf-8", errors="replace")
     except (OSError, ValueError):
         return None
 
@@ -7263,14 +7454,20 @@ def _fa_shared_write_hit(ev: Event, p: str) -> bool:
     a = ev.args or {}
     pre = _fa_read_pre(ev, p)
     post = _fa_post_image(pre, a)
+    if post is not None and len(post) > _FA_MAX_READ:
+        return _fa_fragment_hit(post)
     post_obj = _fa_parse(post) if post is not None else None
     post_entries = _fa_gated_entries(post_obj) if post_obj is not None else None
     if post_entries is None:
         edits = _fa_edit_list(a)
         if edits is not None:
-            return any(_fa_fragment_hit(new) for _, new, _ in edits) or (
-                pre is not None and _fa_fragment_hit(pre)
-                and any(new.strip() and not old.strip() for old, new, _ in edits))
+            # The edit cannot be replayed (pre-image unreadable/oversized, or
+            # old_string not found verbatim -- Claude Code's Edit may still
+            # apply it after quote normalisation), so a value-only diff
+            # (`false` -> `true`) is invisible: gate whenever the file or the
+            # edit could involve a gated key at all.
+            return (pre is None or _fa_fragment_hit(pre)
+                    or any(_fa_fragment_hit(o) or _fa_fragment_hit(nw) for o, nw, _ in edits))
         if post is not None:
             return _fa_fragment_hit(post)
         return _fa_fragment_hit(" ".join(_flatten_strings(a)))
@@ -7457,7 +7654,14 @@ def rule_foreign_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = _cmd(ev)
         cmd = _shell_scan(ev)
         reason = None
-        flag = _fa_launch_hit(cmd) or (_fa_launch_hit(raw) if len(raw) > 20000 else None)
+        flag = None
+        layers = normalize.scan_layers(raw)
+        if len(raw) > 20000:
+            layers.append(raw)   # beyond the 20KB decode truncation
+        for layer in layers:
+            flag = _fa_launch_hit(layer)
+            if flag:
+                break
         if flag:
             reason = (f"A foreign AI agent CLI is being launched with its "
                       f"approvals/sandbox disabled ('{flag[:60]}'). Everything "
@@ -7469,7 +7673,7 @@ def rule_foreign_agent_protect(ev: Event, policy=None) -> Optional[Decision]:
             dedicated = bool(patterns.FOREIGN_AGENT_CONFIG_PATH_RE.search(surf))
             shared = bool(patterns.FOREIGN_AGENT_SHARED_PATH_RE.search(surf))
             if (dedicated or shared) and _fa_shell_writes(cmd, raw):
-                if dedicated or _fa_fragment_hit(surf):
+                if dedicated or shared:
                     reason = ("Another AI agent's execution/approval config is "
                               "being modified from a shell (hooks, MCP servers, "
                               "notify/test commands, plugins, or an auto-approve "
@@ -9720,7 +9924,6 @@ _CORE_RULES = (
     rule_claude_env_protect,
     rule_claude_cred_helper_protect,
     rule_claude_mcp_autoapprove_protect,
-    rule_foreign_agent_protect,
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
@@ -9739,6 +9942,9 @@ _CORE_RULES = (
     rule_destructive_delete,
     rule_install_review,
     rule_branch_strands,
+    # Ask-default and broad: last, so it never shadows a DENY from the
+    # destructive/remote-exec/containment rules on a compound command.
+    rule_foreign_agent_protect,
 )
 
 # Core PreToolUse/shell guards first, then the lifecycle-hook rules that cover the

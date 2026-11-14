@@ -340,10 +340,45 @@ def test_shared_key_rename_caught(tmp_path):
     assert _ours(_edit(str(f), "zzzz", "autoApprove"))
 
 
-def test_shared_edit_unreplayable_falls_back_to_fragment(tmp_path):
-    p = str(tmp_path / "nope" / VS)   # no pre-image on disk
+def test_shared_edit_unreadable_pre_image_gated(tmp_path):
+    p = str(tmp_path / "nope" / VS)   # no pre-image on disk: diff unknowable
     assert _ours(_edit(p, "x", '"chat.tools.autoApprove": true'))
-    assert not _ours(_edit(p, "x", '"editor.tabSize": 2'))
+    assert _ours(_edit(p, "false", "true"))
+
+
+def test_shared_edit_unreplayable_falls_back_to_fragment(tmp_path):
+    f = tmp_path / VS
+    f.parent.mkdir(parents=True)
+    f.write_text('{"editor.tabSize": 2}')
+    # old_string not found verbatim -> cannot replay
+    assert _ours(_edit(str(f), "nothere", '"chat.tools.autoApprove": true'))
+    assert not _ours(_edit(str(f), "nothere", '"editor.tabSize": 4'))
+
+
+def test_shared_value_flip_with_oversized_pre_image_gated(tmp_path):
+    f = tmp_path / VS
+    f.parent.mkdir(parents=True)
+    f.write_text('{"chat.tools.autoApprove": false, "pad": "' + "x" * (3 * 1024 * 1024) + '"}')
+    assert _ours(_edit(str(f), "false", "true"))
+
+
+def test_shared_value_flip_unreplayable_quote_mismatch_gated(tmp_path):
+    f = tmp_path / VS
+    f.parent.mkdir(parents=True)
+    f.write_text('{"chat.tools.autoApprove": false, "note": "it\u2019s"}')
+    f.write_text('{"chat.tools.autoApprove": false, "note": "it’s"}', encoding="utf-8")
+    assert _ours(_edit(str(f), 'false, "note": "it\'s"', 'true, "note": "it\'s"'))
+
+
+@pytest.mark.parametrize("target", ["/proc/kmsg", "/dev/zero", "/proc/self/mem"])
+def test_pre_image_special_file_does_not_hang(tmp_path, target):
+    import os
+    d = tmp_path / ".vscode"
+    d.mkdir()
+    os.symlink(target, d / "settings.json")
+    t = time.perf_counter()
+    assert _ours(_edit(str(d / "settings.json"), "false", "true"))
+    assert time.perf_counter() - t < 2.0
 
 
 def test_shared_unparseable_post_image_falls_back(tmp_path):
@@ -389,7 +424,20 @@ def test_shared_shell_write_gated(cmd):
 
 
 @pytest.mark.parametrize("cmd", [
+    "cp /proj/stage.json /proj/.vscode/settings.json",
+    "mv tmp.json .vscode/settings.json",
+    "cat stage.json > .vscode/settings.json",
+    "curl https://x/y > .vscode/settings.json",
+    "ln -sf stage.json .vscode/settings.json",
+    "python3 -c \"import shutil;shutil.copy('s','.vscode/settings.json')\"",
     "jq '.\"editor.tabSize\" = 4' .vscode/settings.json | sponge .vscode/settings.json",
+])
+def test_shared_shell_write_without_literal_content_gated(cmd):
+    # Content not in the command can't be judged: any shell write asks.
+    assert _ours(_shell(cmd)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
     "grep autoApprove .vscode/settings.json",
     "cat .vscode/settings.json",
 ])
