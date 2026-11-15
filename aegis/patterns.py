@@ -5615,8 +5615,20 @@ GO_ENV_KEY_MENTION_RE = re.compile(
 _BANG_COMMENT_LINE_RE = re.compile(r"^[ \t]*!.*$", re.MULTILINE)
 
 
+# Java .properties parsing (Properties.load) joins a line ending in an odd
+# number of backslashes with the next line, dropping the next line's leading
+# whitespace, and decodes `\\uXXXX` escapes in keys and values -- so a key or
+# flag split across a continuation (`-java\\<newline>  agent:`) or spelled
+# with escapes (`distribution\\u0055rl`) is what Gradle/Maven actually read
+# (QA round 3). Normalized the same way before matching.
+_PROPS_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\r?\n[ \t\f]*")
+_PROPS_UNICODE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
 def strip_properties_comment_lines(text: str) -> str:
-    return _BANG_COMMENT_LINE_RE.sub("", strip_comment_lines(text))
+    text = _BANG_COMMENT_LINE_RE.sub("", strip_comment_lines(text))
+    text = _PROPS_CONTINUATION_RE.sub(lambda m: m.group(1), text)
+    return _PROPS_UNICODE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
 # Redirects that never write a file (`2>/dev/null`, `2>&1`, `>&2`) -- removed

