@@ -7862,6 +7862,12 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.BUILD_TOOL_EXEC_FILE_PATH_RE, "a Gradle init script / wrapper jar / Maven extensions or mavenrc"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
+    (patterns.GRADLE_PROPS_PATH_RE, "a gradle.properties file"),
+    (patterns.JVM_CONFIG_PATH_RE, "a Maven .mvn/jvm.config"),
+    (patterns.WRAPPER_PROPS_PATH_RE, "a Gradle/Maven wrapper properties file"),
+    (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
 )
 
 
@@ -8670,6 +8676,324 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _build_tool_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _build_tool_exec_surfaces():
+    """(path_re, content_re, key_mention_re, comment_stripper, label) for each
+    content-gated build-toolchain surface."""
+    props = patterns.strip_properties_comment_lines
+    hashc = patterns.strip_comment_lines
+    return (
+        (patterns.CARGO_CONFIG_PATH_RE, patterns.CARGO_EXEC_KEY_RE,
+         patterns.CARGO_EXEC_KEY_MENTION_RE, hashc,
+         "a Cargo config compiler/runner/linker/rustflags/credential-provider/[env] override"),
+        (patterns.GRADLE_PROPS_PATH_RE, patterns.GRADLE_PROPS_EXEC_RE,
+         patterns.GRADLE_PROPS_KEY_MENTION_RE, props,
+         "a gradle.properties JVM agent / Java-home override"),
+        (patterns.JVM_CONFIG_PATH_RE, patterns.JVM_CONFIG_EXEC_RE,
+         patterns.JVM_CONFIG_EXEC_RE, hashc,
+         "a .mvn/jvm.config JVM agent flag"),
+        (patterns.WRAPPER_PROPS_PATH_RE, patterns.WRAPPER_URL_HIJACK_RE,
+         patterns.WRAPPER_URL_KEY_MENTION_RE, props,
+         "a Gradle/Maven wrapper distribution URL off the official host"),
+        (patterns.GO_ENV_FILE_PATH_RE, patterns.GO_ENV_FILE_EXEC_RE,
+         patterns.GO_ENV_KEY_MENTION_RE, hashc,
+         "a Go env-file compiler/toolexec/proxy/checksum override"),
+    )
+
+
+_BTE_PATH_ONLY_LABEL = ("a build-tool file that is itself executed or sourced "
+                        "(Gradle init script, wrapper jar, Maven extensions/mavenrc)")
+_BTE_READ_CAP = 1 << 20
+
+
+def _bte_raw_variants(text: str) -> tuple:
+    """Unstripped text plus its properties-unescaped form, for text that is
+    NOT a whole file: a shell command (a `!`-led line is bash negation, not
+    a properties comment -- QA round 4) or an edit fragment (which may land
+    mid-line, where a leading `#`/`!` is value text). Over-matches only."""
+    return (text, patterns._props_unescape(text))
+
+
+def _build_tool_exec_hit(target: str, content: str) -> Optional[str]:
+    """Shell-branch check: which build-toolchain exec surface the whole
+    command `target`/`content` hits, or None. Path-only surfaces need no
+    content; content-gated surfaces need their own exec-key pattern to match
+    the command text (already shell-comment-stripped by the caller; no
+    file-format comment/line parsing is applied to shell text)."""
+    if patterns.BUILD_TOOL_EXEC_FILE_PATH_RE.search(target):
+        return _BTE_PATH_ONLY_LABEL
+    if not content:
+        return None
+    for path_re, content_re, _key, _strip, label in _build_tool_exec_surfaces():
+        if path_re.search(target) and any(content_re.search(v) for v in _bte_raw_variants(content)):
+            return label
+    return None
+
+
+def _bte_hit_spans(content_re, text: str) -> set:
+    """Each exec hit, extended through the end of the line its match ends on,
+    so a value-only change to an existing key produces a different span."""
+    out = set()
+    for m in content_re.finditer(text):
+        eol = text.find("\n", m.end())
+        out.add(text[m.start():eol if eol != -1 else len(text)].strip())
+    return out
+
+
+def _bte_edit_pairs(a: dict) -> list:
+    """(old, new, replace_all) for Edit, MultiEdit, and the MCP
+    `edits: [{oldText,newText}]` shape."""
+    pairs = []
+    if isinstance(a.get("old_string"), str) and isinstance(a.get("new_string"), str):
+        pairs.append((a["old_string"], a["new_string"], bool(a.get("replace_all"))))
+    for e in (a.get("edits") or []) if isinstance(a.get("edits"), list) else []:
+        if not isinstance(e, dict):
+            continue
+        old = e.get("old_string", e.get("oldText"))
+        new = e.get("new_string", e.get("newText"))
+        if isinstance(old, str) and isinstance(new, str):
+            pairs.append((old, new, bool(e.get("replace_all"))))
+    return pairs
+
+
+def _bte_read_target(ev: Event, p: str) -> Optional[str]:
+    try:
+        path = os.path.expanduser(p)
+        if not os.path.isabs(path):
+            path = os.path.join(ev.cwd or os.getcwd(), path)
+        if not os.path.isfile(path) or os.path.getsize(path) > _BTE_READ_CAP:
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _build_tool_exec_file_hit(ev: Event, p: str) -> Optional[str]:
+    """Edit/Write/MCP branch. Path-only surfaces gate on the path. For a
+    content-gated surface, when the target file is readable the write is
+    simulated and only an exec hit the write INTRODUCES gates (a value-only
+    swap of an existing key's value counts; an unrelated edit to a file that
+    already carries a reviewed hook, or removing a hook, does not). When the
+    file is unreadable (new file, remote), falls back to scanning the new
+    text, plus gating a non-empty replacement of text naming an exec key."""
+    if patterns.BUILD_TOOL_EXEC_FILE_PATH_RE.search(p):
+        return _BTE_PATH_ONLY_LABEL
+    surface = next((s for s in _build_tool_exec_surfaces() if s[0].search(p)), None)
+    if surface is None:
+        return None
+    _path_re, content_re, key_re, strip, label = surface
+    a = ev.args or {}
+    pairs = _bte_edit_pairs(a)
+    write_content = a.get("content")
+    if not isinstance(write_content, str):
+        write_content = None
+    pre = _bte_read_target(ev, p)
+    if pre is not None and (pairs or write_content is not None):
+        if write_content is not None and not pairs:
+            post = write_content
+        else:
+            post = pre
+            for old, new, rall in pairs:
+                if old and old in post:
+                    post = post.replace(old, new) if rall else post.replace(old, new, 1)
+                elif not old:
+                    post = new + post
+                else:
+                    # old text not found: the real tool will refuse; scan
+                    # the new text alone, conservatively.
+                    post = post + "\n" + new
+        added = _bte_hit_spans(content_re, strip(post)) - _bte_hit_spans(content_re, strip(pre))
+        return label if added else None
+    if pairs:
+        for old, new, _r in pairs:
+            if any(content_re.search(v) for v in _bte_raw_variants(new)):
+                return label
+            if new.strip() and any(key_re.search(v) for v in _bte_raw_variants(old)):
+                return label
+        return None
+    if write_content is not None:
+        # a whole file: parse it the way the tool does (comments are inert)
+        return label if write_content and content_re.search(strip(write_content)) else None
+    # generic MCP args: usually a fragment that may land mid-line (QA round 4)
+    content = " ".join(_flatten_strings(a))
+    if not content:
+        return None
+    return label if any(content_re.search(v) for v in _bte_raw_variants(content)) else None
+
+
+def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a build-toolchain exec hook: a config line or file that
+    makes Cargo, Gradle, Maven, or the Go toolchain run an arbitrary program
+    on every ordinary build/test.
+
+    THREAT MODEL: the compiled-language build tools each honor config that
+    names a program THE BUILD TOOL ITSELF executes -- Cargo's
+    `rustc-wrapper`/`rustc`/`rustdoc`/`runner`/`linker`/
+    `credential-provider` keys and `[env]` table in `.cargo/config(.toml)`;
+    Gradle init scripts (`init.d/*.gradle(.kts)`, `~/.gradle/init.gradle`),
+    `gradle.properties` JVM agents / `org.gradle.java.home`, the wrapper's
+    `distributionUrl` and bootstrap jar; Maven's `.mvn/extensions.xml`,
+    `~/.mavenrc`/`mavenrc_pre.*` (sourced as shell by the `mvn` launcher),
+    `.mvn/jvm.config` agents, and the `./mvnw` wrapper URL/jar; and Go's
+    persistent `go env -w` (`CC`/`CXX`/`FC`/`AR`/`PKG_CONFIG`, `GOFLAGS`
+    with `-toolexec`/`-exec`/`-overlay`, and `GOPROXY`/`GOSUMDB`/
+    `GONOSUMDB`/`GOINSECURE`, which control whether downloaded module code
+    is checksum-verified). A hijacked or prompt-injected agent writes one
+    line; the NEXT routine `cargo test`, `./gradlew build`, `mvn package`, or
+    `go build` -- by this agent, a developer, or an unattended CI runner --
+    runs the attacker's program with the builder's credentials. No
+    lifecycle-script key, git hook, or CI file is involved, so
+    `package_manifest`/`git_hooks`/`ci_workflow` never see it, and the
+    `$HOME` variants (`~/.cargo/config.toml`, `~/.gradle/init.d/`,
+    `~/.mavenrc`, `~/.config/go/env`) never appear in any repo diff while
+    applying to every project on the machine.
+
+    Path-only for files that ARE code (init scripts, wrapper jars,
+    `extensions.xml`, `mavenrc`); content-gated for ordinary config files
+    edited for routine reasons (`gradle.properties` heap sizes, a Cargo
+    `[profile]`, a wrapper version bump to the official host), so routine
+    edits stay allowed.
+
+    Config (`policy.build_tool_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes matched against the PATH for file edits and the
+    whole COMMAND for shell -- e.g. `'^/home/ci/\\.cargo/config\\.toml$'` for
+    a reviewed machine-level sccache setup; it never matches file content).
+    Defaults to `ask`: `rustc-wrapper = "sccache"`, a cross-compile
+    `linker`, or a corporate `GOPROXY` are legitimate; they just need a
+    human to have looked.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or `AEGIS_ALLOW_BUILD_TOOL_EXEC=1` set before launch.
+
+    Disclosed gaps (same class every sibling guard accepts): the same
+    settings supplied as process env vars (`RUSTC_WRAPPER`,
+    `JAVA_TOOL_OPTIONS`, `MAVEN_OPTS`, `GOFLAGS`) persisted via a shell rc
+    file are `shell_persist`'s surface, not this guard's; Cargo `paths`
+    overrides / `[patch]`, `go.mod` `replace`, and Maven `settings.xml`
+    mirrors substitute dependency SOURCE rather than naming a program, and
+    are not covered; a value assembled indirectly (generator script,
+    interpreter string-building) defeats the content checks; the shell
+    branch is not clause-scoped (false ASK, never false ALLOW, on an
+    unrelated clause naming the same path), and for the path-only targets a
+    copy/archive verb READING the file (`cp gradle-wrapper.jar /tmp/`,
+    `unzip -l ...jar`) asks just like one writing it.
+
+    Edit/Write/MCP: when the target file is readable, the write is simulated
+    and only exec hits it INTRODUCES gate -- so a value-only swap
+    (`services.gradle.org` -> `evil.example`, `"sccache"` -> `"/tmp/x"`)
+    gates, while an unrelated edit to a file already carrying a reviewed
+    hook, or a hook's removal, does not. Unreadable target: scan the new
+    text, and gate a non-empty replacement of text naming an exec key.
+
+    QA history: round 1 (two independent reviewers, parallel). Bypass hunt
+    found `rustflags = ["-Clinker=..."]` / `[env] RUSTFLAGS` reaching the
+    linker exec the `linker` key already covers (high), `GOPRIVATE` disabling
+    checksum verification like its gated siblings, `CGO_*FLAGS` compiler
+    plugins (`-fplugin`, `-B`, `-fuse-ld`), and legacy `credential-process`
+    -- all closed. Wiring review confirmed registration parity and found:
+    value-only Edits slipping past new_string-only scanning (closed by the
+    simulated diff above); false ASKs from `2>/dev/null`/`2>&1` counted as
+    writes, `!` properties comments, a bare `mavenrc` filename, and a sed
+    `distributionUrl=.*` match side (closed); a misleading `allow` example
+    (docs fixed). It also found that the engine returns the FIRST non-allow
+    decision, so this ASK-tier guard (like every sibling ASK guard) can mask
+    a later hard DENY (workspace-confine, destructive-git/delete,
+    remote-exec) in the same call. Not fixed here: making DENY outrank an
+    earlier ASK in `engine._run` was tried and flips 28 existing tests, many
+    into false DENYs (remote-exec firing on `curl|sh` text inside a heredoc
+    being written to a file) -- an engine-wide behavior change for its own
+    review, not this guard's. Round 2 (fresh reviewer): on-disk edit
+    simulation, error handling (no exception paths -> no fail-open), false
+    positives and ReDoS all held; no confirmed findings. Round 3 (self-run
+    syntax-coverage check after a reviewer could not complete): Java
+    properties `\\` line continuations and `\\uXXXX` escapes splitting or
+    spelling a key/flag evaded the gradle.properties/wrapper checks -- closed
+    by `patterns.strip_properties_comment_lines`. Round 4 (fresh sign-off
+    reviewer, CHANGES REQUESTED): that first normalizer was only partly
+    faithful -- generic `\\x` escapes (`-java\\agent`), lone `\\r` line ends,
+    form-feed-led comments, and comment-vs-continuation ordering still
+    diverged from Java. Replaced with a small Properties.load-faithful
+    logical-line parser + one-pass unescape; over-matches only for
+    maven-wrapper.properties (read by the mvnw shell script, not Java).
+    Round 4 re-review: the normalizer itself verified faithful (fuzzed, no
+    exceptions, linear), but applying file-format comment parsing to SHELL
+    text let a `!`-led command (bash negation) drop the payload line, and
+    stripping `#`/`!` from an unreadable-target Edit fragment missed a
+    fragment landing mid-line -- both now scan unstripped + unescaped text. Remaining low-severity notes: an Edit through a
+    symlink whose own name matches no surface is unseen (engine-wide: no
+    guard resolves real paths); duplicating an already-present, reviewed
+    hook line verbatim is not a new hit."""
+    cfg = getattr(policy, "build_tool_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "build-tool-exec-protect-monitor")
+            return None
+        return would
+
+    tail = ("It runs automatically, with the builder's credentials, on the "
+            "next ordinary build/test (cargo/gradle/mvn/go) by this agent, a "
+            "developer, or CI.")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        label = _build_tool_exec_file_hit(ev, p)
+        if not label:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_BUILD_TOOL_EXEC")
+                or _build_tool_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "build-tool-exec-protect",
+                         f"'{p}' plants {label}. {tail} Review the change, "
+                         "then confirm with AEGIS_ALLOW_BUILD_TOOL_EXEC=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        verb_cmd = patterns.NULL_REDIRECT_RE.sub(" ", scan_cmd)
+        label = None
+        if patterns.GO_ENV_W_RE.search(scan_cmd):
+            label = "a persistent Go toolchain compiler/toolexec/proxy/checksum override (go env -w)"
+        else:
+            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(verb_cmd)
+                               or patterns.DELETE_OR_MOVE_VERB_RE.search(verb_cmd)
+                               or patterns.INPLACE_WRITE_RE.search(verb_cmd)
+                               or patterns.FORCED_LINK_WRITE_RE.search(verb_cmd)
+                               or patterns.COPY_WRITE_VERB_RE.search(verb_cmd)
+                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(verb_cmd))
+            if write_verb:
+                label = _build_tool_exec_hit(scan_cmd, scan_cmd)
+        if not label:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_BUILD_TOOL_EXEC")
+                or _build_tool_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "build-tool-exec-protect",
+                         f"A shell command plants {label}. {tail} A human may "
+                         "append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_BUILD_TOOL_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -9296,6 +9620,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_build_tool_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,

@@ -420,6 +420,15 @@ class Policy:
     # Terraform process is already authenticated with. See
     # rules.rule_terraform_exec_protect.
     terraform_exec: dict = field(default_factory=dict)
+    # Build-toolchain exec-hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers config that makes Cargo/Gradle/Maven/Go run a named program on
+    # every ordinary build: Cargo rustc-wrapper/runner/linker/credential-
+    # provider/[env], Gradle init scripts/JVM agents/wrapper URL+jar, Maven
+    # extensions.xml/mavenrc/jvm.config agents/wrapper URL+jar, and
+    # persistent `go env -w` CC/GOFLAGS -toolexec/GOPROXY/GOSUMDB. See
+    # rules.rule_build_tool_exec_protect.
+    build_tool_exec: dict = field(default_factory=dict)
     # Fetch-to-file backstop: {mode: deny|ask|monitor|off, allow: [regex on
     # command]}. Empty -> defaults (mode=ask) apply. Governs ONLY the
     # human-escapable tier -- a curl/wget/PowerShell/certutil fetch writing
