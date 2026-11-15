@@ -5450,6 +5450,144 @@ def strip_comment_lines(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", text)
 
 
+# ---- Build-toolchain exec-hijack protection (Cargo / Gradle / Maven / Go) -----
+# The compiled-language build tools each read a config file that names a
+# program THE BUILD TOOL ITSELF executes on every ordinary build/test -- no
+# lifecycle script, no hook, no explicit invocation by name:
+#   * Cargo (`.cargo/config(.toml)`, in the project or `~/.cargo`):
+#     `build.rustc-wrapper`/`rustc-workspace-wrapper`/`rustc`/`rustdoc`
+#     replace the compiler on every `cargo build/check/test`; `target.*.runner`
+#     wraps every `cargo run/test` binary; `target.*.linker` runs at every
+#     link; `credential-provider`/`global-credential-providers` exec on every
+#     registry auth; an `[env]` entry like `LD_PRELOAD` is injected into every
+#     process cargo spawns (build scripts, rustc).
+#   * Gradle: every `init.d/*.gradle(.kts)` and `~/.gradle/init.gradle(.kts)`
+#     is a full Groovy/Kotlin program run before EVERY build of EVERY project
+#     on the machine; `gradle.properties`' `org.gradle.jvmargs` can load a
+#     `-javaagent` into the daemon and `org.gradle.java.home` swaps the JVM
+#     binary itself; `gradle-wrapper.properties`' `distributionUrl` decides
+#     which Gradle distribution `./gradlew` downloads and runs, and
+#     `gradle-wrapper.jar` is the bootstrap `./gradlew` executes directly.
+#   * Maven: `.mvn/extensions.xml` loads an arbitrary build-extension jar into
+#     every `mvn` run; `~/.mavenrc`/`mavenrc_pre.{sh,bat,cmd}` are SOURCED AS
+#     SHELL by the `mvn` launcher script itself; `.mvn/jvm.config` feeds JVM
+#     flags (a `-javaagent`) to every run; `maven-wrapper.properties`'
+#     `distributionUrl`/`wrapperUrl` and `maven-wrapper.jar` are the `./mvnw`
+#     analog of the Gradle wrapper pair above.
+#   * Go: `go env -w` persists into the user's go env file
+#     (`~/.config/go/env`, or GOROOT's `go.env`) and applies to every future
+#     `go build/test/run` in every module: `CC`/`CXX`/`FC`/`AR`/`PKG_CONFIG`
+#     are exec'd for any cgo package, `GOFLAGS=-toolexec=...` wraps every
+#     compiler/linker invocation, and `GOPROXY`/`GOSUMDB`/`GONOSUMDB`/
+#     `GOINSECURE` decide whether downloaded module code is checksum-verified
+#     at all.
+# Same "write now, auto-exec later, by anyone" shape as git hooks/CI/
+# package-manifest lifecycle scripts, but a layer they do not reach: the
+# compiler/build-runner itself. The home-directory variants never appear in
+# any repo diff and persist across every project on the machine.
+
+_JVM_EXEC_FLAG = (r"-(?:javaagent|agentpath|agentlib)\b"
+                  r"|-XX:\+?On(?:Error|OutOfMemoryError)\b"
+                  r"|-Xbootclasspath/[ap]\b")
+
+# Path-only targets: the file IS code (a Gradle init script, a wrapper
+# bootstrap jar, a Maven extension manifest, a shell file `mvn` sources) --
+# there is no benign content to narrow past, the same "gate the mechanism's
+# mere presence" choice PNPMFILE_PATH_RE makes.
+BUILD_TOOL_EXEC_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])init\.d" + _WIN_TRIM + _SEP + _CI_SEG + r"\.gradle(?:\.kts)?" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.gradle" + _WIN_TRIM + _SEP + r"init\.gradle(?:\.kts)?" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])gradle-wrapper\.jar" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])maven-wrapper\.jar" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.mvn" + _WIN_TRIM + _SEP + r"extensions\.xml" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.?mavenrc(?:_pre\.(?:sh|bat|cmd))?" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Content-gated targets: ordinary files edited for routine reasons, gated only
+# when the content names one of the exec-capable keys/flags below.
+CARGO_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.cargo" + _WIN_TRIM + _SEP + r"config(?:\.toml)?" + _CI_END,
+    re.IGNORECASE,
+)
+GRADLE_PROPS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])gradle\.properties" + _CI_END, re.IGNORECASE)
+JVM_CONFIG_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.mvn" + _WIN_TRIM + _SEP + r"jvm\.config" + _CI_END, re.IGNORECASE)
+WRAPPER_PROPS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])(?:gradle|maven)-wrapper\.properties" + _CI_END, re.IGNORECASE)
+GO_ENV_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])go" + _WIN_TRIM + _SEP + r"env" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])go\.env" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Cargo: an exec-capable key assignment. The key may be bare (inside a
+# `[build]`/`[target.x]` table), dotted (`build.rustc-wrapper = ...`,
+# `target.'cfg(unix)'.runner = ...`), quoted, or inside an inline table
+# (`target = { x = { runner = "..." } }`) -- so it is matched by the key
+# token itself preceded by a key boundary, not by a line-start anchor. The
+# `[env]` alternative gates loader/interpreter-hijack variable names cargo
+# would inject into every build script and rustc process.
+_CARGO_EXEC_KEYS = (r"rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
+                    r"|credential-provider|global-credential-providers")
+_CARGO_ENV_KEYS = (r"LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES"
+                   r"|DYLD_LIBRARY_PATH|BASH_ENV|NODE_OPTIONS|PERL5OPT|RUBYOPT"
+                   r"|PYTHONSTARTUP|PYTHONPATH|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER"
+                   r"|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC|RUSTC|RUSTDOC")
+# Key boundary: not preceded by a word char or `-` (so `test-runner`/
+# `xrunner` stay out), OR preceded by a literal `\n`/`\t` escape -- the
+# shape a key takes inside a shell `printf '[build]\nrustc-wrapper=...'`.
+_CARGO_KEY_START = r"(?:(?<![\w-])|(?<=\\[nt]))"
+CARGO_EXEC_KEY_RE = re.compile(
+    _CARGO_KEY_START + r"[\"']?(?:" + _CARGO_EXEC_KEYS + r")[\"']?\s*="
+    r"|" + _CARGO_KEY_START + r"[\"']?(?:" + _CARGO_ENV_KEYS + r")[\"']?\s*=",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# gradle.properties / .mvn/jvm.config: a JVM agent/exec flag anywhere, or
+# (gradle only) a JVM-binary swap. Properties files accept `=`, `:` or
+# whitespace as the key/value separator.
+GRADLE_PROPS_EXEC_RE = re.compile(
+    _JVM_EXEC_FLAG
+    + r"|\borg\.gradle\.java\.home\b\s*[=:\s]"
+    + r"|\borg\.gradle\.java\.installations\.paths\b\s*[=:\s]",
+    re.IGNORECASE,
+)
+JVM_CONFIG_EXEC_RE = re.compile(_JVM_EXEC_FLAG, re.IGNORECASE)
+
+# Wrapper properties: a distribution/wrapper URL that is NOT the official
+# Gradle/Maven host. Gradle writes the scheme colon escaped (`https\://`), so
+# an optional backslash is tolerated before each `:`/`/`. A relative path or
+# file: URL (resolved against the properties file) is not the official host
+# and so is gated too.
+_OFFICIAL_WRAPPER_HOST = (
+    r"https\\?:\\?/\\?/(?:services\.gradle\.org|repo\.maven\.apache\.org"
+    r"|repo1\.maven\.org)\\?/"
+)
+WRAPPER_URL_HIJACK_RE = re.compile(
+    r"\b(?:distributionUrl|wrapperUrl)\s*[=:\s]\s*(?!" + _OFFICIAL_WRAPPER_HOST + r")\S",
+    re.IGNORECASE,
+)
+
+# Go env: the dangerous variable names, for both the `go env -w` CLI and a
+# direct write of the env file (`KEY=value` lines). GOFLAGS is gated only
+# when it carries an exec/overlay flag (a plain `-mod=mod` is routine);
+# GOPROXY/GOSUMDB only when the value leaves the official/off/direct set.
+_GO_SAFE_PROXY = r"(?:https://proxy\.golang\.org|direct|off)"
+_GO_VAL_END = r"(?=[\s'\"]|$)"
+_GO_ENV_DANGER = (
+    r"(?:CC|CXX|FC|AR|PKG_CONFIG|GONOSUMDB|GONOSUMCHECK|GOINSECURE)\s*=\s*[\"']?\S"
+    r"|GOFLAGS\s*=[^\n]{0,300}?-(?:toolexec|exec|overlay)\b"
+    r"|GOPROXY\s*=\s*[\"']?(?!" + _GO_SAFE_PROXY + r"(?:[,|]" + _GO_SAFE_PROXY + r"){0,4}[\"']?" + _GO_VAL_END + r")\S"
+    r"|GOSUMDB\s*=\s*[\"']?(?!sum\.golang\.org[\"']?" + _GO_VAL_END + r")\S"
+)
+GO_ENV_FILE_EXEC_RE = re.compile(
+    r"(?:^|[\s'\"])(?:" + _GO_ENV_DANGER + r")", re.MULTILINE)
+GO_ENV_W_RE = re.compile(
+    r"\bgo\s+env\b[^|;&\n]{0,200}?\s-w\b[^|;&\n]{0,400}?[\s'\"](?:" + _GO_ENV_DANGER + r")")
+
+
 # ---- MCP tool-catalog integrity: rug-pull / tool-poisoning heuristics --------
 #
 # Every guard above scans a shell command or a config file's own syntax for a

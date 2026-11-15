@@ -7862,6 +7862,12 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
     (patterns.TF_PATH_RE, "a Terraform config file"),
+    (patterns.BUILD_TOOL_EXEC_FILE_PATH_RE, "a Gradle init script / wrapper jar / Maven extensions or mavenrc"),
+    (patterns.CARGO_CONFIG_PATH_RE, "a Cargo config file"),
+    (patterns.GRADLE_PROPS_PATH_RE, "a gradle.properties file"),
+    (patterns.JVM_CONFIG_PATH_RE, "a Maven .mvn/jvm.config"),
+    (patterns.WRAPPER_PROPS_PATH_RE, "a Gradle/Maven wrapper properties file"),
+    (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
 )
 
 
@@ -8670,6 +8676,165 @@ def rule_terraform_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _build_tool_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _build_tool_exec_hit(target: str, content: str) -> Optional[str]:
+    """Which build-toolchain exec surface `target` (a path, or a whole shell
+    command) plus `content` hits, or None. Path-only surfaces need no
+    content; content-gated surfaces need their own exec-key pattern to match
+    the comment-stripped content."""
+    if patterns.BUILD_TOOL_EXEC_FILE_PATH_RE.search(target):
+        return "a build-tool file that is itself executed or sourced (Gradle init script, wrapper jar, Maven extensions/mavenrc)"
+    body = patterns.strip_comment_lines(content or "")
+    if not body:
+        return None
+    checks = (
+        (patterns.CARGO_CONFIG_PATH_RE, patterns.CARGO_EXEC_KEY_RE,
+         "a Cargo config compiler/runner/linker/credential-provider/[env] override"),
+        (patterns.GRADLE_PROPS_PATH_RE, patterns.GRADLE_PROPS_EXEC_RE,
+         "a gradle.properties JVM agent / Java-home override"),
+        (patterns.JVM_CONFIG_PATH_RE, patterns.JVM_CONFIG_EXEC_RE,
+         "a .mvn/jvm.config JVM agent flag"),
+        (patterns.WRAPPER_PROPS_PATH_RE, patterns.WRAPPER_URL_HIJACK_RE,
+         "a Gradle/Maven wrapper distribution URL off the official host"),
+        (patterns.GO_ENV_FILE_PATH_RE, patterns.GO_ENV_FILE_EXEC_RE,
+         "a Go env-file compiler/toolexec/proxy/checksum override"),
+    )
+    for path_re, content_re, label in checks:
+        if path_re.search(target) and content_re.search(body):
+            return label
+    return None
+
+
+def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a build-toolchain exec hook: a config line or file that
+    makes Cargo, Gradle, Maven, or the Go toolchain run an arbitrary program
+    on every ordinary build/test.
+
+    THREAT MODEL: the compiled-language build tools each honor config that
+    names a program THE BUILD TOOL ITSELF executes -- Cargo's
+    `rustc-wrapper`/`rustc`/`rustdoc`/`runner`/`linker`/
+    `credential-provider` keys and `[env]` table in `.cargo/config(.toml)`;
+    Gradle init scripts (`init.d/*.gradle(.kts)`, `~/.gradle/init.gradle`),
+    `gradle.properties` JVM agents / `org.gradle.java.home`, the wrapper's
+    `distributionUrl` and bootstrap jar; Maven's `.mvn/extensions.xml`,
+    `~/.mavenrc`/`mavenrc_pre.*` (sourced as shell by the `mvn` launcher),
+    `.mvn/jvm.config` agents, and the `./mvnw` wrapper URL/jar; and Go's
+    persistent `go env -w` (`CC`/`CXX`/`FC`/`AR`/`PKG_CONFIG`, `GOFLAGS`
+    with `-toolexec`/`-exec`/`-overlay`, and `GOPROXY`/`GOSUMDB`/
+    `GONOSUMDB`/`GOINSECURE`, which control whether downloaded module code
+    is checksum-verified). A hijacked or prompt-injected agent writes one
+    line; the NEXT routine `cargo test`, `./gradlew build`, `mvn package`, or
+    `go build` -- by this agent, a developer, or an unattended CI runner --
+    runs the attacker's program with the builder's credentials. No
+    lifecycle-script key, git hook, or CI file is involved, so
+    `package_manifest`/`git_hooks`/`ci_workflow` never see it, and the
+    `$HOME` variants (`~/.cargo/config.toml`, `~/.gradle/init.d/`,
+    `~/.mavenrc`, `~/.config/go/env`) never appear in any repo diff while
+    applying to every project on the machine.
+
+    Path-only for files that ARE code (init scripts, wrapper jars,
+    `extensions.xml`, `mavenrc`); content-gated for ordinary config files
+    edited for routine reasons (`gradle.properties` heap sizes, a Cargo
+    `[profile]`, a wrapper version bump to the official host), so routine
+    edits stay allowed.
+
+    Config (`policy.build_tool_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate -- a
+    team's reviewed `sccache` wrapper or internal Gradle mirror, say).
+    Defaults to `ask`: `rustc-wrapper = "sccache"`, a cross-compile
+    `linker`, or a corporate `GOPROXY` are legitimate; they just need a
+    human to have looked.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or `AEGIS_ALLOW_BUILD_TOOL_EXEC=1` set before launch.
+
+    Disclosed gaps (same class every sibling guard accepts): the same
+    settings supplied as process env vars (`RUSTC_WRAPPER`,
+    `JAVA_TOOL_OPTIONS`, `MAVEN_OPTS`, `GOFLAGS`) persisted via a shell rc
+    file are `shell_persist`'s surface, not this guard's; Cargo `paths`
+    overrides / `[patch]`, `go.mod` `replace`, and Maven `settings.xml`
+    mirrors substitute dependency SOURCE rather than naming a program, and
+    are not covered; a value assembled indirectly (generator script,
+    interpreter string-building) defeats the content checks; the shell
+    branch is not clause-scoped (false ASK, never false ALLOW, on an
+    unrelated clause naming the same path)."""
+    cfg = getattr(policy, "build_tool_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "build-tool-exec-protect-monitor")
+            return None
+        return would
+
+    tail = ("It runs automatically, with the builder's credentials, on the "
+            "next ordinary build/test (cargo/gradle/mvn/go) by this agent, a "
+            "developer, or CI.")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p:
+            return None
+        a = ev.args or {}
+        raw_content = a.get("content")
+        if not isinstance(raw_content, str) or not raw_content:
+            raw_content = a.get("new_string")
+        if isinstance(raw_content, str) and raw_content:
+            content = raw_content
+        else:
+            content = " ".join(_flatten_strings(a))
+        label = _build_tool_exec_hit(p, content)
+        if not label:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_BUILD_TOOL_EXEC")
+                or _build_tool_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "build-tool-exec-protect",
+                         f"'{p}' plants {label}. {tail} Review the change, "
+                         "then confirm with AEGIS_ALLOW_BUILD_TOOL_EXEC=1; a "
+                         "spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        scan_cmd = patterns.strip_comment_lines(cmd)
+        label = None
+        if patterns.GO_ENV_W_RE.search(scan_cmd):
+            label = "a persistent Go toolchain compiler/toolexec/proxy/checksum override (go env -w)"
+        else:
+            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(scan_cmd)
+                               or patterns.DELETE_OR_MOVE_VERB_RE.search(scan_cmd)
+                               or patterns.INPLACE_WRITE_RE.search(scan_cmd)
+                               or patterns.FORCED_LINK_WRITE_RE.search(scan_cmd)
+                               or patterns.COPY_WRITE_VERB_RE.search(scan_cmd)
+                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(scan_cmd))
+            if write_verb:
+                label = _build_tool_exec_hit(scan_cmd, scan_cmd)
+        if not label:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_BUILD_TOOL_EXEC")
+                or _build_tool_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "build-tool-exec-protect",
+                         f"A shell command plants {label}. {tail} A human may "
+                         "append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_BUILD_TOOL_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 def rule_fetch_to_file_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block a shell fetch tool (curl/wget/PowerShell Invoke-WebRequest/
     Start-BitsTransfer/certutil) writing its response DIRECTLY to a path
@@ -9296,6 +9461,7 @@ _CORE_RULES = (
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
+    rule_build_tool_exec_protect,
     rule_fetch_to_file_protect,
     rule_workspace_confine,
     rule_migration_protection,
