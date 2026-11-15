@@ -8715,17 +8715,26 @@ _BTE_PATH_ONLY_LABEL = ("a build-tool file that is itself executed or sourced "
 _BTE_READ_CAP = 1 << 20
 
 
+def _bte_raw_variants(text: str) -> tuple:
+    """Unstripped text plus its properties-unescaped form, for text that is
+    NOT a whole file: a shell command (a `!`-led line is bash negation, not
+    a properties comment -- QA round 4) or an edit fragment (which may land
+    mid-line, where a leading `#`/`!` is value text). Over-matches only."""
+    return (text, patterns._props_unescape(text))
+
+
 def _build_tool_exec_hit(target: str, content: str) -> Optional[str]:
-    """Which build-toolchain exec surface `target` (a path, or a whole shell
-    command) plus `content` hits, or None. Path-only surfaces need no
+    """Shell-branch check: which build-toolchain exec surface the whole
+    command `target`/`content` hits, or None. Path-only surfaces need no
     content; content-gated surfaces need their own exec-key pattern to match
-    the comment-stripped content."""
+    the command text (already shell-comment-stripped by the caller; no
+    file-format comment/line parsing is applied to shell text)."""
     if patterns.BUILD_TOOL_EXEC_FILE_PATH_RE.search(target):
         return _BTE_PATH_ONLY_LABEL
     if not content:
         return None
-    for path_re, content_re, _key, strip, label in _build_tool_exec_surfaces():
-        if path_re.search(target) and content_re.search(strip(content)):
+    for path_re, content_re, _key, _strip, label in _build_tool_exec_surfaces():
+        if path_re.search(target) and any(content_re.search(v) for v in _bte_raw_variants(content)):
             return label
     return None
 
@@ -8807,9 +8816,9 @@ def _build_tool_exec_file_hit(ev: Event, p: str) -> Optional[str]:
         return label if added else None
     if pairs:
         for old, new, _r in pairs:
-            if content_re.search(strip(new)):
+            if any(content_re.search(v) for v in _bte_raw_variants(new)):
                 return label
-            if new.strip() and key_re.search(strip(old)):
+            if new.strip() and any(key_re.search(v) for v in _bte_raw_variants(old)):
                 return label
         return None
     if write_content is not None:
@@ -8912,7 +8921,12 @@ def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     form-feed-led comments, and comment-vs-continuation ordering still
     diverged from Java. Replaced with a small Properties.load-faithful
     logical-line parser + one-pass unescape; over-matches only for
-    maven-wrapper.properties (read by the mvnw shell script, not Java). Remaining low-severity notes: an Edit through a
+    maven-wrapper.properties (read by the mvnw shell script, not Java).
+    Round 4 re-review: the normalizer itself verified faithful (fuzzed, no
+    exceptions, linear), but applying file-format comment parsing to SHELL
+    text let a `!`-led command (bash negation) drop the payload line, and
+    stripping `#`/`!` from an unreadable-target Edit fragment missed a
+    fragment landing mid-line -- both now scan unstripped + unescaped text. Remaining low-severity notes: an Edit through a
     symlink whose own name matches no surface is unseen (engine-wide: no
     guard resolves real paths); duplicating an already-present, reviewed
     hook line verbatim is not a new hit."""
