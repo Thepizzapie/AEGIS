@@ -8822,13 +8822,13 @@ def _build_tool_exec_file_hit(ev: Event, p: str) -> Optional[str]:
                 return label
         return None
     if write_content is not None:
-        content = write_content
-    else:
-        content = " ".join(_flatten_strings(a))
+        # a whole file: parse it the way the tool does (comments are inert)
+        return label if write_content and content_re.search(strip(write_content)) else None
+    # generic MCP args: usually a fragment that may land mid-line (QA round 4)
+    content = " ".join(_flatten_strings(a))
     if not content:
         return None
-    variants = (strip(content),) + _bte_raw_variants(content)
-    return label if any(content_re.search(v) for v in variants) else None
+    return label if any(content_re.search(v) for v in _bte_raw_variants(content)) else None
 
 
 def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
