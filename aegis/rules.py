@@ -8686,32 +8686,137 @@ def _build_tool_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
+def _build_tool_exec_surfaces():
+    """(path_re, content_re, key_mention_re, comment_stripper, label) for each
+    content-gated build-toolchain surface."""
+    props = patterns.strip_properties_comment_lines
+    hashc = patterns.strip_comment_lines
+    return (
+        (patterns.CARGO_CONFIG_PATH_RE, patterns.CARGO_EXEC_KEY_RE,
+         patterns.CARGO_EXEC_KEY_MENTION_RE, hashc,
+         "a Cargo config compiler/runner/linker/rustflags/credential-provider/[env] override"),
+        (patterns.GRADLE_PROPS_PATH_RE, patterns.GRADLE_PROPS_EXEC_RE,
+         patterns.GRADLE_PROPS_KEY_MENTION_RE, props,
+         "a gradle.properties JVM agent / Java-home override"),
+        (patterns.JVM_CONFIG_PATH_RE, patterns.JVM_CONFIG_EXEC_RE,
+         patterns.JVM_CONFIG_EXEC_RE, hashc,
+         "a .mvn/jvm.config JVM agent flag"),
+        (patterns.WRAPPER_PROPS_PATH_RE, patterns.WRAPPER_URL_HIJACK_RE,
+         patterns.WRAPPER_URL_KEY_MENTION_RE, props,
+         "a Gradle/Maven wrapper distribution URL off the official host"),
+        (patterns.GO_ENV_FILE_PATH_RE, patterns.GO_ENV_FILE_EXEC_RE,
+         patterns.GO_ENV_KEY_MENTION_RE, hashc,
+         "a Go env-file compiler/toolexec/proxy/checksum override"),
+    )
+
+
+_BTE_PATH_ONLY_LABEL = ("a build-tool file that is itself executed or sourced "
+                        "(Gradle init script, wrapper jar, Maven extensions/mavenrc)")
+_BTE_READ_CAP = 1 << 20
+
+
 def _build_tool_exec_hit(target: str, content: str) -> Optional[str]:
     """Which build-toolchain exec surface `target` (a path, or a whole shell
     command) plus `content` hits, or None. Path-only surfaces need no
     content; content-gated surfaces need their own exec-key pattern to match
     the comment-stripped content."""
     if patterns.BUILD_TOOL_EXEC_FILE_PATH_RE.search(target):
-        return "a build-tool file that is itself executed or sourced (Gradle init script, wrapper jar, Maven extensions/mavenrc)"
-    body = patterns.strip_comment_lines(content or "")
-    if not body:
+        return _BTE_PATH_ONLY_LABEL
+    if not content:
         return None
-    checks = (
-        (patterns.CARGO_CONFIG_PATH_RE, patterns.CARGO_EXEC_KEY_RE,
-         "a Cargo config compiler/runner/linker/credential-provider/[env] override"),
-        (patterns.GRADLE_PROPS_PATH_RE, patterns.GRADLE_PROPS_EXEC_RE,
-         "a gradle.properties JVM agent / Java-home override"),
-        (patterns.JVM_CONFIG_PATH_RE, patterns.JVM_CONFIG_EXEC_RE,
-         "a .mvn/jvm.config JVM agent flag"),
-        (patterns.WRAPPER_PROPS_PATH_RE, patterns.WRAPPER_URL_HIJACK_RE,
-         "a Gradle/Maven wrapper distribution URL off the official host"),
-        (patterns.GO_ENV_FILE_PATH_RE, patterns.GO_ENV_FILE_EXEC_RE,
-         "a Go env-file compiler/toolexec/proxy/checksum override"),
-    )
-    for path_re, content_re, label in checks:
-        if path_re.search(target) and content_re.search(body):
+    for path_re, content_re, _key, strip, label in _build_tool_exec_surfaces():
+        if path_re.search(target) and content_re.search(strip(content)):
             return label
     return None
+
+
+def _bte_hit_spans(content_re, text: str) -> set:
+    """Each exec hit, extended through the end of the line its match ends on,
+    so a value-only change to an existing key produces a different span."""
+    out = set()
+    for m in content_re.finditer(text):
+        eol = text.find("\n", m.end())
+        out.add(text[m.start():eol if eol != -1 else len(text)].strip())
+    return out
+
+
+def _bte_edit_pairs(a: dict) -> list:
+    """(old, new, replace_all) for Edit, MultiEdit, and the MCP
+    `edits: [{oldText,newText}]` shape."""
+    pairs = []
+    if isinstance(a.get("old_string"), str) and isinstance(a.get("new_string"), str):
+        pairs.append((a["old_string"], a["new_string"], bool(a.get("replace_all"))))
+    for e in (a.get("edits") or []) if isinstance(a.get("edits"), list) else []:
+        if not isinstance(e, dict):
+            continue
+        old = e.get("old_string", e.get("oldText"))
+        new = e.get("new_string", e.get("newText"))
+        if isinstance(old, str) and isinstance(new, str):
+            pairs.append((old, new, bool(e.get("replace_all"))))
+    return pairs
+
+
+def _bte_read_target(ev: Event, p: str) -> Optional[str]:
+    try:
+        path = os.path.expanduser(p)
+        if not os.path.isabs(path):
+            path = os.path.join(ev.cwd or os.getcwd(), path)
+        if not os.path.isfile(path) or os.path.getsize(path) > _BTE_READ_CAP:
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _build_tool_exec_file_hit(ev: Event, p: str) -> Optional[str]:
+    """Edit/Write/MCP branch. Path-only surfaces gate on the path. For a
+    content-gated surface, when the target file is readable the write is
+    simulated and only an exec hit the write INTRODUCES gates (a value-only
+    swap of an existing key's value counts; an unrelated edit to a file that
+    already carries a reviewed hook, or removing a hook, does not). When the
+    file is unreadable (new file, remote), falls back to scanning the new
+    text, plus gating a non-empty replacement of text naming an exec key."""
+    if patterns.BUILD_TOOL_EXEC_FILE_PATH_RE.search(p):
+        return _BTE_PATH_ONLY_LABEL
+    surface = next((s for s in _build_tool_exec_surfaces() if s[0].search(p)), None)
+    if surface is None:
+        return None
+    _path_re, content_re, key_re, strip, label = surface
+    a = ev.args or {}
+    pairs = _bte_edit_pairs(a)
+    write_content = a.get("content")
+    if not isinstance(write_content, str):
+        write_content = None
+    pre = _bte_read_target(ev, p)
+    if pre is not None and (pairs or write_content is not None):
+        if write_content is not None and not pairs:
+            post = write_content
+        else:
+            post = pre
+            for old, new, rall in pairs:
+                if old and old in post:
+                    post = post.replace(old, new) if rall else post.replace(old, new, 1)
+                elif not old:
+                    post = new + post
+                else:
+                    # old text not found: the real tool will refuse; scan
+                    # the new text alone, conservatively.
+                    post = post + "\n" + new
+        added = _bte_hit_spans(content_re, strip(post)) - _bte_hit_spans(content_re, strip(pre))
+        return label if added else None
+    if pairs:
+        for old, new, _r in pairs:
+            if content_re.search(strip(new)):
+                return label
+            if new.strip() and key_re.search(strip(old)):
+                return label
+        return None
+    if write_content is not None:
+        content = write_content
+    else:
+        content = " ".join(_flatten_strings(a))
+    return label if content and content_re.search(strip(content)) else None
 
 
 def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -8748,8 +8853,9 @@ def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     edits stay allowed.
 
     Config (`policy.build_tool_exec`): `mode` (deny|ask|monitor|off, default
-    ask), `allow` (regexes on the path/command that skip the gate -- a
-    team's reviewed `sccache` wrapper or internal Gradle mirror, say).
+    ask), `allow` (regexes matched against the PATH for file edits and the
+    whole COMMAND for shell -- e.g. `'^/home/ci/\\.cargo/config\\.toml$'` for
+    a reviewed machine-level sccache setup; it never matches file content).
     Defaults to `ask`: `rustc-wrapper = "sccache"`, a cross-compile
     `linker`, or a corporate `GOPROXY` are legitimate; they just need a
     human to have looked.
@@ -8766,7 +8872,35 @@ def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     are not covered; a value assembled indirectly (generator script,
     interpreter string-building) defeats the content checks; the shell
     branch is not clause-scoped (false ASK, never false ALLOW, on an
-    unrelated clause naming the same path)."""
+    unrelated clause naming the same path), and for the path-only targets a
+    copy/archive verb READING the file (`cp gradle-wrapper.jar /tmp/`,
+    `unzip -l ...jar`) asks just like one writing it.
+
+    Edit/Write/MCP: when the target file is readable, the write is simulated
+    and only exec hits it INTRODUCES gate -- so a value-only swap
+    (`services.gradle.org` -> `evil.example`, `"sccache"` -> `"/tmp/x"`)
+    gates, while an unrelated edit to a file already carrying a reviewed
+    hook, or a hook's removal, does not. Unreadable target: scan the new
+    text, and gate a non-empty replacement of text naming an exec key.
+
+    QA history: round 1 (two independent reviewers, parallel). Bypass hunt
+    found `rustflags = ["-Clinker=..."]` / `[env] RUSTFLAGS` reaching the
+    linker exec the `linker` key already covers (high), `GOPRIVATE` disabling
+    checksum verification like its gated siblings, `CGO_*FLAGS` compiler
+    plugins (`-fplugin`, `-B`, `-fuse-ld`), and legacy `credential-process`
+    -- all closed. Wiring review confirmed registration parity and found:
+    value-only Edits slipping past new_string-only scanning (closed by the
+    simulated diff above); false ASKs from `2>/dev/null`/`2>&1` counted as
+    writes, `!` properties comments, a bare `mavenrc` filename, and a sed
+    `distributionUrl=.*` match side (closed); a misleading `allow` example
+    (docs fixed). It also found that the engine returns the FIRST non-allow
+    decision, so this ASK-tier guard (like every sibling ASK guard) can mask
+    a later hard DENY (workspace-confine, destructive-git/delete,
+    remote-exec) in the same call. Not fixed here: making DENY outrank an
+    earlier ASK in `engine._run` was tried and flips 28 existing tests, many
+    into false DENYs (remote-exec firing on `curl|sh` text inside a heredoc
+    being written to a file) -- an engine-wide behavior change for its own
+    review, not this guard's."""
     cfg = getattr(policy, "build_tool_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -8788,15 +8922,7 @@ def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         p = _path(ev)
         if not p:
             return None
-        a = ev.args or {}
-        raw_content = a.get("content")
-        if not isinstance(raw_content, str) or not raw_content:
-            raw_content = a.get("new_string")
-        if isinstance(raw_content, str) and raw_content:
-            content = raw_content
-        else:
-            content = " ".join(_flatten_strings(a))
-        label = _build_tool_exec_hit(p, content)
+        label = _build_tool_exec_file_hit(ev, p)
         if not label:
             return None
         if (os.environ.get("AEGIS_ALLOW_BUILD_TOOL_EXEC")
@@ -8810,16 +8936,17 @@ def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         scan_cmd = patterns.strip_comment_lines(cmd)
+        verb_cmd = patterns.NULL_REDIRECT_RE.sub(" ", scan_cmd)
         label = None
         if patterns.GO_ENV_W_RE.search(scan_cmd):
             label = "a persistent Go toolchain compiler/toolexec/proxy/checksum override (go env -w)"
         else:
-            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(scan_cmd)
-                               or patterns.DELETE_OR_MOVE_VERB_RE.search(scan_cmd)
-                               or patterns.INPLACE_WRITE_RE.search(scan_cmd)
-                               or patterns.FORCED_LINK_WRITE_RE.search(scan_cmd)
-                               or patterns.COPY_WRITE_VERB_RE.search(scan_cmd)
-                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(scan_cmd))
+            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(verb_cmd)
+                               or patterns.DELETE_OR_MOVE_VERB_RE.search(verb_cmd)
+                               or patterns.INPLACE_WRITE_RE.search(verb_cmd)
+                               or patterns.FORCED_LINK_WRITE_RE.search(verb_cmd)
+                               or patterns.COPY_WRITE_VERB_RE.search(verb_cmd)
+                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(verb_cmd))
             if write_verb:
                 label = _build_tool_exec_hit(scan_cmd, scan_cmd)
         if not label:

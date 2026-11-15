@@ -5500,7 +5500,7 @@ BUILD_TOOL_EXEC_FILE_PATH_RE = re.compile(
     + r"|(?:^|[\s'\"/\\=])gradle-wrapper\.jar" + _CI_END
     + r"|(?:^|[\s'\"/\\=])maven-wrapper\.jar" + _CI_END
     + r"|(?:^|[\s'\"/\\=])\.mvn" + _WIN_TRIM + _SEP + r"extensions\.xml" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.?mavenrc(?:_pre\.(?:sh|bat|cmd))?" + _CI_END,
+    + r"|(?:^|[\s'\"/\\=])(?:\.mavenrc|mavenrc_pre\.(?:sh|bat|cmd))" + _CI_END,
     re.IGNORECASE,
 )
 
@@ -5530,18 +5530,27 @@ GO_ENV_FILE_PATH_RE = re.compile(
 # `[env]` alternative gates loader/interpreter-hijack variable names cargo
 # would inject into every build script and rustc process.
 _CARGO_EXEC_KEYS = (r"rustc-wrapper|rustc-workspace-wrapper|rustc|rustdoc|runner|linker"
-                    r"|credential-provider|global-credential-providers")
+                    r"|credential-provider|global-credential-providers|credential-process")
 _CARGO_ENV_KEYS = (r"LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES"
                    r"|DYLD_LIBRARY_PATH|BASH_ENV|NODE_OPTIONS|PERL5OPT|RUBYOPT"
                    r"|PYTHONSTARTUP|PYTHONPATH|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER"
-                   r"|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC|RUSTC|RUSTDOC")
+                   r"|CARGO_BUILD_RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                   r"|CARGO_BUILD_RUSTC|CARGO_BUILD_RUSTDOC|RUSTC|RUSTDOC"
+                   r"|CARGO_TARGET_\w{1,100}_(?:LINKER|RUNNER)")
 # Key boundary: not preceded by a word char or `-` (so `test-runner`/
 # `xrunner` stay out), OR preceded by a literal `\n`/`\t` escape -- the
 # shape a key takes inside a shell `printf '[build]\nrustc-wrapper=...'`.
 _CARGO_KEY_START = r"(?:(?<![\w-])|(?<=\\[nt]))"
 CARGO_EXEC_KEY_RE = re.compile(
     _CARGO_KEY_START + r"[\"']?(?:" + _CARGO_EXEC_KEYS + r")[\"']?\s*="
-    r"|" + _CARGO_KEY_START + r"[\"']?(?:" + _CARGO_ENV_KEYS + r")[\"']?\s*=",
+    r"|" + _CARGO_KEY_START + r"[\"']?(?:" + _CARGO_ENV_KEYS + r")[\"']?\s*="
+    # `rustflags` (build/target table, or RUSTFLAGS-family in [env]) reaches
+    # the same linker exec as the `linker` key via `-C linker=`/`-C
+    # link-arg(s)=` (QA round 1). Gated only when a link-related flag appears
+    # within a bounded window after the key -- `-C target-cpu=native` stays
+    # allowed. `[\s\S]` so a multi-line TOML array is still covered.
+    r"|" + _CARGO_KEY_START + r"[\"']?(?:rustflags|rustdocflags|RUSTFLAGS|RUSTDOCFLAGS"
+    r"|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS)[\"']?\s*=[\s\S]{0,500}?link",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -5564,6 +5573,9 @@ JVM_CONFIG_EXEC_RE = re.compile(_JVM_EXEC_FLAG, re.IGNORECASE)
 _OFFICIAL_WRAPPER_HOST = (
     r"https\\?:\\?/\\?/(?:services\.gradle\.org|repo\.maven\.apache\.org"
     r"|repo1\.maven\.org)\\?/"
+    # a sed match-side `distributionUrl=.*` is a regex, not a URL (QA round 1);
+    # the replacement side is still checked as its own occurrence.
+    r"|\.\*"
 )
 WRAPPER_URL_HIJACK_RE = re.compile(
     r"\b(?:distributionUrl|wrapperUrl)\s*[=:\s]\s*(?!" + _OFFICIAL_WRAPPER_HOST + r")\S",
@@ -5577,13 +5589,41 @@ WRAPPER_URL_HIJACK_RE = re.compile(
 _GO_SAFE_PROXY = r"(?:https://proxy\.golang\.org|direct|off)"
 _GO_VAL_END = r"(?=[\s'\"]|$)"
 _GO_ENV_DANGER = (
-    r"(?:CC|CXX|FC|AR|PKG_CONFIG|GONOSUMDB|GONOSUMCHECK|GOINSECURE)\s*=\s*[\"']?\S"
+    r"(?:CC|CXX|FC|AR|PKG_CONFIG|GONOSUMDB|GOINSECURE|GOPRIVATE)\s*=\s*[\"']?\S"
+    # cgo flag vars: a compiler plugin / alternate tool dir / linker swap makes
+    # the C toolchain load attacker code at compile time (QA round 1).
+    r"|CGO_(?:CFLAGS|CPPFLAGS|CXXFLAGS|FFLAGS|LDFLAGS)\s*=[^\n]{0,300}?"
+    r"(?:-fplugin|(?<![\w,])-B|-wrapper\b|-specs\b|--ld-path|-fuse-ld|-Xclang|-load\b)"
     r"|GOFLAGS\s*=[^\n]{0,300}?-(?:toolexec|exec|overlay)\b"
     r"|GOPROXY\s*=\s*[\"']?(?!" + _GO_SAFE_PROXY + r"(?:[,|]" + _GO_SAFE_PROXY + r"){0,4}[\"']?" + _GO_VAL_END + r")\S"
     r"|GOSUMDB\s*=\s*[\"']?(?!sum\.golang\.org[\"']?" + _GO_VAL_END + r")\S"
 )
 GO_ENV_FILE_EXEC_RE = re.compile(
     r"(?:^|[\s'\"])(?:" + _GO_ENV_DANGER + r")", re.MULTILINE)
+# Key-name-only mentions per content-gated surface, for a value-only Edit
+# whose old_string names the key and whose new_string only swaps the value
+# (QA round 1) when the target file cannot be read to diff against.
+CARGO_EXEC_KEY_MENTION_RE = CARGO_EXEC_KEY_RE
+GRADLE_PROPS_KEY_MENTION_RE = re.compile(
+    r"\borg\.gradle\.(?:jvmargs|java\.home|java\.installations\.paths)\b|" + _JVM_EXEC_FLAG,
+    re.IGNORECASE)
+WRAPPER_URL_KEY_MENTION_RE = re.compile(r"\b(?:distributionUrl|wrapperUrl)\b", re.IGNORECASE)
+GO_ENV_KEY_MENTION_RE = re.compile(
+    r"\b(?:CC|CXX|FC|AR|PKG_CONFIG|GOFLAGS|GOPROXY|GOSUMDB|GONOSUMDB|GOINSECURE"
+    r"|GOPRIVATE|CGO_[A-Z]{1,20})\s*=")
+# Properties-file `!` comment lines (Java .properties accepts `#` and `!`).
+_BANG_COMMENT_LINE_RE = re.compile(r"^[ \t]*!.*$", re.MULTILINE)
+
+
+def strip_properties_comment_lines(text: str) -> str:
+    return _BANG_COMMENT_LINE_RE.sub("", strip_comment_lines(text))
+
+
+# Redirects that never write a file (`2>/dev/null`, `2>&1`, `>&2`) -- removed
+# before this guard's write-verb check so a read like `ls x 2>/dev/null` of a
+# protected path is not mistaken for a write (QA round 1).
+NULL_REDIRECT_RE = re.compile(r"\d?>{1,2}\s*/dev/null\b|\d?>&\s*\d")
+
 GO_ENV_W_RE = re.compile(
     r"\bgo\s+env\b[^|;&\n]{0,200}?\s-w\b[^|;&\n]{0,400}?[\s'\"](?:" + _GO_ENV_DANGER + r")")
 

