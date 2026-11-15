@@ -8825,7 +8825,10 @@ def _build_tool_exec_file_hit(ev: Event, p: str) -> Optional[str]:
         content = write_content
     else:
         content = " ".join(_flatten_strings(a))
-    return label if content and content_re.search(strip(content)) else None
+    if not content:
+        return None
+    variants = (strip(content),) + _bte_raw_variants(content)
+    return label if any(content_re.search(v) for v in variants) else None
 
 
 def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:

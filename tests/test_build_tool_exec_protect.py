@@ -522,3 +522,11 @@ def test_qa4b_edit_fragment_comment_lead_gated():
         "file_path": "/nonexistent/gradle.properties",
         "old_string": "x", "new_string": "# -javaagent:/x.jar"})
     assert _hit(evaluate(ev, EMPTY))
+
+
+def test_qa4c_generic_mcp_fragment_comment_lead_gated():
+    for args in ({"text": "# -javaagent:/x.jar", "path": "gradle.properties"},
+                 {"path": "gradle.properties", "text": "# -javaagent:/x.jar"}):
+        ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__insert_text",
+                        action=ActionClass.MCP, args=args)
+        assert _hit(evaluate(ev, EMPTY))
