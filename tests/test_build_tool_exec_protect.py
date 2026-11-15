@@ -473,3 +473,28 @@ def test_qa3_properties_even_backslash_not_joined():
     assert evaluate(_write("gradle.properties", c), EMPTY).action == Action.ALLOW
     ok = "distributionUrl=https\\://services.gradle.org/distributions/\\\n  gradle-8.5-bin.zip\n"
     assert evaluate(_write("gradle/wrapper/gradle-wrapper.properties", ok), EMPTY).action == Action.ALLOW
+
+
+# ---- QA round 4: full Properties.load fidelity ----------------------------------
+
+@pytest.mark.parametrize("path,content", [
+    ("gradle.properties", "org.gradle.jvmargs=-java\\agent:/x.jar\n"),
+    ("gradle.properties", "org.gradle.java\\.home=/tmp/j\n"),
+    ("gradle.properties", "org.gradle.java.ho\\me=/tmp/j\n"),
+    ("gradle/wrapper/gradle-wrapper.properties", "distribution\\Url=https\\://evil/x.zip\n"),
+    ("gradle.properties", "#\rorg.gradle.java.home=/tmp/j\r"),
+    ("gradle.properties", "org.gradle.jvmargs=-java\\\r  agent:/x.jar\r"),
+    ("gradle.properties", "\f# c\\\norg.gradle.java.home=/x\n"),
+    ("gradle.properties", "org.gradle.jvmargs=-Xmx1g \\\n  #x -javaagent:/a.jar\n"),
+])
+def test_qa4_properties_fidelity_gated(path, content):
+    assert _hit(evaluate(_write(path, content), EMPTY))
+
+
+def test_qa4_properties_normalizer_semantics():
+    from aegis.patterns import strip_properties_comment_lines as n
+    assert n("a=b\\\\\nc=d") == "a=b\\\nc=d"           # escaped backslash, no join
+    assert n("a=x\\\n   y") == "a=xy"                    # continuation drops indent
+    assert n("! c\n# c\\\nk=v") == "k=v"                 # comments never continue
+    assert n("k=\\u0041\\t\\q") == "k=A\tq"
+    assert n("k=\\uZZZZ\\ud800") == "k=\\uZZZZ\ud800"    # malformed kept, no raise

@@ -8906,8 +8906,13 @@ def rule_build_tool_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     syntax-coverage check after a reviewer could not complete): Java
     properties `\\` line continuations and `\\uXXXX` escapes splitting or
     spelling a key/flag evaded the gradle.properties/wrapper checks -- closed
-    by `patterns.strip_properties_comment_lines` normalizing exactly as
-    `Properties.load` does. Remaining low-severity notes: an Edit through a
+    by `patterns.strip_properties_comment_lines`. Round 4 (fresh sign-off
+    reviewer, CHANGES REQUESTED): that first normalizer was only partly
+    faithful -- generic `\\x` escapes (`-java\\agent`), lone `\\r` line ends,
+    form-feed-led comments, and comment-vs-continuation ordering still
+    diverged from Java. Replaced with a small Properties.load-faithful
+    logical-line parser + one-pass unescape; over-matches only for
+    maven-wrapper.properties (read by the mvnw shell script, not Java). Remaining low-severity notes: an Edit through a
     symlink whose own name matches no surface is unseen (engine-wide: no
     guard resolves real paths); duplicating an already-present, reviewed
     hook line verbatim is not a new hit."""

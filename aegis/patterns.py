@@ -5615,20 +5615,71 @@ GO_ENV_KEY_MENTION_RE = re.compile(
 _BANG_COMMENT_LINE_RE = re.compile(r"^[ \t]*!.*$", re.MULTILINE)
 
 
-# Java .properties parsing (Properties.load) joins a line ending in an odd
-# number of backslashes with the next line, dropping the next line's leading
-# whitespace, and decodes `\\uXXXX` escapes in keys and values -- so a key or
-# flag split across a continuation (`-java\\<newline>  agent:`) or spelled
-# with escapes (`distribution\\u0055rl`) is what Gradle/Maven actually read
-# (QA round 3). Normalized the same way before matching.
-_PROPS_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\r?\n[ \t\f]*")
-_PROPS_UNICODE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+# Java .properties parsing (java.util.Properties.load), reproduced so the
+# guard matches the text Gradle/Maven actually read (QA rounds 3 and 4):
+#   * a line ends at `\n`, `\r`, or `\r\n`;
+#   * leading space/tab/form-feed is skipped; a NEW logical line whose first
+#     char is `#`/`!` is a comment (comment lines never continue);
+#   * a line ending in an odd number of backslashes continues onto the next
+#     physical line, whose leading whitespace is dropped -- and that
+#     continuation text is value text even if it starts with `#`/`!`;
+#   * escapes are then decoded in one left-to-right pass: `\uXXXX` -> char,
+#     `\t \n \r \f` -> control char, `\<other>` -> `<other>` (so `\\` is
+#     one literal backslash, and `-java\agent` reads as `-javaagent`).
+# A malformed `\uXXXX` makes Java throw (the file never loads); here it is
+# left as-is. Pure string work, never raises.
+_PROPS_WS = " \t\f"
+_PROPS_CTRL = {"t": "\t", "n": "\n", "r": "\r", "f": "\f"}
+_PROPS_HEX = set("0123456789abcdefABCDEF")
+
+
+def _props_unescape(s: str) -> str:
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt == "u" and i + 6 <= n and all(h in _PROPS_HEX for h in s[i + 2:i + 6]):
+            out.append(chr(int(s[i + 2:i + 6], 16)))
+            i += 6
+        elif nxt == "u":
+            out.append(s[i:i + 2])  # malformed: Java rejects the file
+            i += 2
+        else:
+            out.append(_PROPS_CTRL.get(nxt, nxt))
+            i += 2
+    return "".join(out)
+
+
+def _props_odd_trailing_backslashes(line: str) -> bool:
+    k = len(line) - len(line.rstrip("\\"))
+    return k % 2 == 1
 
 
 def strip_properties_comment_lines(text: str) -> str:
-    text = _BANG_COMMENT_LINE_RE.sub("", strip_comment_lines(text))
-    text = _PROPS_CONTINUATION_RE.sub(lambda m: m.group(1), text)
-    return _PROPS_UNICODE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    """Normalize .properties text into its logical `key<sep>value` lines,
+    comments removed and escapes decoded, as Properties.load reads it."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    logical, cur, cont = [], [], False
+    for raw in lines:
+        line = raw.lstrip(_PROPS_WS)
+        if not cont:
+            if not line or line[0] in "#!":
+                continue
+        if _props_odd_trailing_backslashes(line):
+            cur.append(line[:-1])
+            cont = True
+            continue
+        cur.append(line)
+        logical.append("".join(cur))
+        cur, cont = [], False
+    if cur:
+        logical.append("".join(cur))
+    return "\n".join(_props_unescape(l) for l in logical)
 
 
 # Redirects that never write a file (`2>/dev/null`, `2>&1`, `>&2`) -- removed
