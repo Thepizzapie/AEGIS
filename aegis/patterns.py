@@ -5550,7 +5550,7 @@ CARGO_EXEC_KEY_RE = re.compile(
     # within a bounded window after the key -- `-C target-cpu=native` stays
     # allowed. `[\s\S]` so a multi-line TOML array is still covered.
     r"|" + _CARGO_KEY_START + r"[\"']?(?:rustflags|rustdocflags|RUSTFLAGS|RUSTDOCFLAGS"
-    r"|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS)[\"']?\s*=[\s\S]{0,500}?link",
+    r"|CARGO_ENCODED_RUSTFLAGS|CARGO_ENCODED_RUSTDOCFLAGS)[\"']?\s*=[\s\S]{0,500}?(?:link|codegen-backend|llvm-plugins)",
     re.IGNORECASE | re.MULTILINE,
 )
 

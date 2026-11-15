@@ -498,3 +498,9 @@ def test_qa4_properties_normalizer_semantics():
     assert n("! c\n# c\\\nk=v") == "k=v"                 # comments never continue
     assert n("k=\\u0041\\t\\q") == "k=A\tq"
     assert n("k=\\uZZZZ\\ud800") == "k=\\uZZZZ\ud800"    # malformed kept, no raise
+
+
+def test_qa3_rustflags_codegen_backend_gated():
+    for c in ('[build]\nrustflags = ["-Zcodegen-backend=/tmp/x.so"]\n',
+              '[build]\nrustflags = ["-Z", "llvm-plugins=/tmp/p.so"]\n'):
+        assert _hit(evaluate(_write(".cargo/config.toml", c), EMPTY))
