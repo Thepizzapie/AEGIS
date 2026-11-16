@@ -1349,14 +1349,18 @@ def _agent_rules_path_forms(ev: Event, p: str) -> list:
             flat = urllib.parse.unquote(flat)
         # NTFS alternate-data-stream suffix (`file::$DATA`, `file:stream`) names
         # the same file; a drive letter's colon is not one.
-        flat = re.sub(r"(?<=[^/:]{2}):[^/]*$", "", flat)
+        head, sep, last = flat.rpartition("/")
+        colon = last.find(":", 2)
+        if colon > 0:
+            flat = head + sep + last[:colon]
         forms.append(posixpath.normpath(flat))
         if not flat.startswith("/") and not re.match(r"^[A-Za-z]:/", flat):
             if not ev.cwd:
                 return forms
             flat = posixpath.join(str(ev.cwd).replace("\\", "/"), flat)
         forms.append(posixpath.normpath(flat))
-        if flat.startswith("/") and not flat.startswith("//"):   # never touch a UNC path
+        # never touch a UNC path; bounded lstat work
+        if flat.startswith("/") and not flat.startswith("//") and flat.count("/") <= 64:
             forms.append(os.path.realpath(flat))
     except Exception:
         pass
@@ -1400,7 +1404,11 @@ def _agent_rules_target(ev: Event):
             if key not in seen:
                 seen.add(key)
                 cands.append(key)
+    spent = 0
     for i, c in enumerate(cands[:4096]):
+        spent += len(c)
+        if spent > 262144:               # bounded work; the flat scan below takes over
+            break
         if re.match(r"^[a-z][a-z0-9+.-]*://", c, re.IGNORECASE) and not c.lower().startswith("file://"):
             continue                      # an http(s) URL is not a local path
         forms = _agent_rules_path_forms(ev, c)
@@ -1412,7 +1420,7 @@ def _agent_rules_target(ev: Event):
             if form and (patterns.agent_rules_path_hit(form)
                          or _agent_rules_generic_hit(ev, form)):
                 return c, forms
-    if len(cands) >= 2000:
+    if len(cands) >= 2000 or spent > 262144:
         # The bounded walk ran out before seeing every argument: fall back to
         # a flat scan of all string leaves so padding cannot hide the target.
         for leaf in _flatten_strings(args):
@@ -1431,14 +1439,15 @@ def _agent_rules_target(ev: Event):
 #     concatenate tool (cp, mv, cat, tee, dd, install, ln, rsync);
 #   - only operands that are existing REGULAR files, named literally (after
 #     `~`/`$PWD` expansion): no directories, no globs, no variables;
-#   - at most 16 files, first 1 MB of each, opened non-blocking and re-checked
+#   - at most 16 distinct files and 500 KB in total (in operand order), opened
+#     non-blocking and re-checked
 #     with fstat; nothing under /proc, /sys, /dev; no UNC paths (a hook
 #     timeout fails open, so nothing here may stall);
 #   - text only: a file with NUL bytes or more than 1% undecodable bytes is an
 #     archive/image/binary, not instructions.
 _AGENT_RULES_SRC_MAX_FILES = 16
-_AGENT_RULES_SRC_MAX_BYTES = 1_000_000
-_AGENT_RULES_SRC_TOTAL_BYTES = 2_000_000
+_AGENT_RULES_SRC_MAX_BYTES = 500_000
+_AGENT_RULES_SRC_TOTAL_BYTES = 500_000
 _AGENT_RULES_SRC_CMD_RE = re.compile(
     r"(?:^|[\s/\\!])(?:cp|mv|cat|tee|dd|install|ln|rsync|copy|move)(?=[\s<>]|$)", re.IGNORECASE)
 # the rules path is where the command WRITES: a redirect/of=/tee/-t target, or
@@ -1493,6 +1502,10 @@ def _agent_rules_source_hidden(ev: Event, names: list) -> list:
                 continue
         except Exception:
             continue
+        try:
+            fp = os.path.realpath(fp)
+        except Exception:
+            continue
         if fp in done:
             continue
         done.add(fp)
@@ -1527,11 +1540,21 @@ def _agent_rules_shell_sources(ev: Event, raw: str) -> list:
         if not _AGENT_RULES_SRC_CMD_RE.search(seg[:200]) or not _is_rules(seg):
             continue
         try:
-            toks = shlex.split(seg, posix=True)
+            toks = shlex.split(seg, comments=True, posix=True)
         except Exception:
             toks = []
-        if not _AGENT_RULES_SRC_DEST_RE.search(seg) and not (toks and _is_rules(toks[-1])):
-            continue                      # the rules file is being read, not written
+        if not _AGENT_RULES_SRC_DEST_RE.search(seg):
+            # No redirect/of=/tee/-t: for cp/mv/install/ln/rsync the rules file
+            # is the destination unless it is the FIRST operand (a trailing
+            # flag or comment must not change that); a bare `cat a b` reads.
+            if not re.search(r"(?:^|[\s/\\!])(?:cp|mv|install|ln|rsync|copy|move)(?=\s|$)",
+                             seg[:200], re.IGNORECASE):
+                continue
+            ops = [t for t in toks[1:] if not t.startswith("-")
+                   and not re.fullmatch(r"(?:cp|mv|install|ln|rsync|copy|move|sudo|env|command)", t)
+                   and "=" not in t.split("/")[0]]
+            if not ops or _is_rules(ops[0]) and not any(_is_rules(t) for t in ops[1:]):
+                continue                  # the rules file is being read, not written
         out.extend(toks[1:])
         for t in _AGENT_RULES_SRC_TOKEN_SPLIT_RE.split(seg):   # `cat<a>b`, `if=a`
             t = t.strip("'\"")
@@ -1620,7 +1643,11 @@ def _agent_rules_shell_write_hit(ev: Event, cmd: str) -> str:
                          for part in parts
                          for rx in (patterns.AGENT_RULES_CMD_WRITE_VERB_RE,
                                     patterns.AGENT_RULES_API_WRITE_VERB_RE)):
-            for m in rx.finditer(text):
+            for n, m in enumerate(rx.finditer(text)):
+                if n >= 64:
+                    # Bounded work: a command with this many write verbs that
+                    # also names a rules file is treated as a write.
+                    return "many write verbs"
                 lo = max(m.start() - 400, 0)
                 before = text[lo:m.start()]
                 cut = max((s.end() for s in patterns.AGENT_RULES_CMD_SEP_RE.finditer(before)),
@@ -1711,21 +1738,23 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``rule_fetch_to_file_protect``'s backstop list: that rule runs before the
     hard-deny guards, and its ask would mask their deny.
 
-    Rule order: this guard is the LAST core rule. The engine returns the
-    first non-allow decision, and an ``ask`` here must never mask a ``deny``
-    from another guard (QA: placed beside ``rule_agent_def_protect`` it turned
-    ``rm -rf ~ .cursorrules`` from deny into ask; placed before
+    Rule order: PreToolUse events only, and the LAST core rule. The engine
+    returns the first non-allow decision, and an ``ask`` here must not mask a
+    ``deny`` from another guard (QA: placed beside ``rule_agent_def_protect``
+    it turned ``rm -rf ~ .cursorrules`` from deny into ask; before
     ``rule_install_review``/``rule_branch_strands`` it did the same to
-    theirs). The cost is the reverse: any earlier guard's ``ask`` on the same
-    call wins over this guard's hidden-character ``deny``.
+    theirs; on a PermissionRequest event it preceded the lifecycle rules'
+    ``permission-escalation`` deny). The cost is the reverse: any earlier
+    guard's ``ask`` on the same call wins over this guard's hidden-character
+    ``deny``.
 
     Staged sources: when a plain copy/move/concatenate command (``cp``,
     ``mv``, ``cat``, ``tee``, ``dd``, ``install``, ``ln``, ``rsync``) names a
     rules path, the literally-named regular files among its own operands are
     read for hidden characters, as is an MCP move/copy tool's ``source`` --
     so ``mv notes.txt .cursorrules`` cannot launder a payload staged in
-    notes.txt. Narrow and bounded on purpose: 16 files, first 1 MB, text
-    only, never /proc|/sys|/dev or a UNC path, no directories, no globs, no
+    notes.txt. Narrow and bounded on purpose: 16 files, the first 500 KB in
+    total (in operand order), text only, never /proc|/sys|/dev or a UNC path, no directories, no globs, no
     variables, no other commands' operands. Anything outside that is NOT
     inspected and only gets the ordinary ask.
 
@@ -1767,10 +1796,18 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     so an allow-listed path mentioned anywhere in a command skips the ask. The extra write verbs this guard knows (git
     checkout/restore/apply, patch, touch, editors, runtime file APIs) only
     count when the rules path is in the same simple command, so a ``;`` inside
-    a quoted argument between such a verb and the path hides it. Most shell
+    a quoted argument between such a verb and the path hides it -- unless the
+    command contains a heredoc, loop, ``xargs`` or command substitution,
+    where the target can travel between simple commands and any such verb
+    anywhere in the command counts (more false asks, by design). Most shell
     writes under ``.claude/`` are already hard-denied by
     ``rule_self_protect``; this guard adds the Edit/Write/MCP form for
     ``.claude/rules`` and the shell verbs self-protect does not know."""
+    # PreToolUse only. Ten lifecycle rules run after the core rules; on a
+    # PermissionRequest/other lifecycle event an ask here would be returned
+    # before e.g. `permission-escalation` could deny (QA round 5).
+    if ev.event != HookEvent.PRE_TOOL_USE:
+        return None
     cfg = getattr(policy, "agent_rules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1858,7 +1895,7 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
                 # ordinary path segment yields them by accident)
                 found = sorted({f.split("@", 1)[0] + " (decoded)"
                                 for f in patterns.agent_rules_hidden_chars(cmd)
-                                if int(f.split("@", 1)[0][2:], 16) >= 0xa0})
+                                if not f.startswith("U+00")})
             if not found:
                 m = _AGENT_RULES_ESCAPED_HIDDEN_RE.search(raw[:20000] + "\n" + cmd)
                 if m:

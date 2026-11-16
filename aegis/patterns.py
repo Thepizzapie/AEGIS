@@ -1679,7 +1679,7 @@ def skill_find_hit(cmd: str) -> bool:
 # with no space between (QA, bypass review: `echo x >.cursorrules`,
 # `cat<x>.cursorrules`, `cp x {.cursorrules,y}` all slipped past the narrower
 # pair -- and with the path unseen, the hidden-character deny never ran).
-_AR_LEFT = r"\s'\"=<>|&;({,:"
+_AR_LEFT = r"\s'\"=<>|&;({,"
 _AR_B = r"(?:^|[" + _AR_LEFT + r"/\\])"
 _AR_E = _WIN_TRIM + r"(?=[/\;&|)<>,}]|\s|['\"]|$)"
 _AR_MODE = r"(?:-[\w-]{1,60})?"
@@ -1762,7 +1762,8 @@ AGENT_RULES_OUT_OPT_SRC = (r"(?:-(?-i:[A-Za-z0-9#]{0,8}[oOP])|--?out(?:put|file|
                            r"|--(?:directory-prefix|output-dir(?:ectory)?|output-document))")
 AGENT_RULES_OPT_VALUE_RE = re.compile(
     r"(?:^|\s)(?:"
-    r"-{1,2}[A-Za-z][A-Za-z-]{0,20}=?"                       # glued: -o<path>, --output=<path>
+    r"-[A-Za-z]{1,9}=?"                                      # glued: -o<path>, -C<path>
+    r"|--[a-z-]{0,20}(?:out|dest|dir|file|target|prefix)[a-z-]{0,20}="   # --output=<path>
     r"|" + AGENT_RULES_OUT_OPT_SRC + r"(?:\s+|=)"              # output option, then path
     r")" + _AR_ANY_PATH,
     re.IGNORECASE)
@@ -1839,7 +1840,8 @@ AGENT_RULES_CMD_WRITE_VERB_RE = re.compile(
     re.IGNORECASE)
 AGENT_RULES_API_WRITE_VERB_RE = re.compile(
     r"\bgit(?:\s+(?:-[cC]\s*\S+|--?[\w-]+(?:[=\s]\S+)?)){0,6}?\s+"
-    r"(?:checkout|restore|checkout-index|apply|am|clone|stash\s+(?:pop|apply))(?=\s|$)"
+    r"(?:checkout(?!\s+-[bB]\b)|restore|checkout-index|apply(?!\s+--check\b)|am|clone"
+    r"|submodule\s+add|stash\s+(?:pop|apply))(?=\s|$)"
     r"|(?:^|\s)--in-place\b|\b(?:yq|jq|ruby)\b[^|;&\n]{0,200}?\s-[a-zA-Z]{0,8}i\b"
     r"|\bsed\b[^|;&\n]{0,200}?['\"\s;]w\s"
     r"|file_put_contents|WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|Clear-Content"
@@ -1887,6 +1889,7 @@ AGENT_RULES_HIDDEN_CPS = tuple(sorted(
     | set(range(0xfff0, 0xfffc)) | set(range(0x1d173, 0x1d17b)) | set(range(0x1bca0, 0x1bca4))))
 AGENT_RULES_CONTEXT_CPS = (0x200b, 0x200c, 0x200e, 0x200f, 0x061c)
 AGENT_RULES_MAX_SELECTORS = 32
+AGENT_RULES_MAX_CONTEXT_MARKS = 20000
 _AR_FE = chr(0xfe00) + "-" + chr(0xfe0e)
 _AR_IVS = chr(0xe0100) + "-" + chr(0xe01ef)
 _AR_PLANE14 = chr(0xe0000) + "-" + chr(0xe0fff)
@@ -1943,8 +1946,15 @@ def agent_rules_hidden_chars(text: str) -> list:
             out.append((m.start(), ord(m.group(0))))
         for m in _AR_SOFT_RUN_RE.finditer(scan):
             out.append((m.start(), ord(m.group(0)[0])))
+        examined = 0
         for m in _AR_HIDDEN_CONTEXT_RE.finditer(scan):
             i = m.start()
+            examined += 1
+            if examined > AGENT_RULES_MAX_CONTEXT_MARKS:
+                # Bounded work: past this many zero-width/direction marks the
+                # per-mark context check stops and the text is reported.
+                out.append((i, ord(m.group(0))))
+                break
             near = scan[max(0, i - 2):i] + scan[i + 1:i + 3]
             in_run = any(c in _AR_INVISIBLE_NEIGHBOUR
                          for c in scan[max(0, i - 1):i] + scan[i + 1:i + 2])
