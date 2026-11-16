@@ -1665,8 +1665,10 @@ def skill_find_hit(cmd: str) -> bool:
 #     what a prompt cannot show them. `hidden_chars: ask|off` relaxes it.
 #   - Runs AFTER the hard-deny shell guards (remote-exec, destructive git/
 #     delete), so an ask here never masks a deny there.
-#   - Registered in the fetch-to-file backstop so `curl -o .cursorrules` is
-#     covered too.
+#   - A fetch written straight to a rules file (`curl -o .cursorrules`) is
+#     matched here through the output option's own operand. NOT registered in
+#     the fetch-to-file backstop: that rule runs before the hard-deny guards,
+#     and an ask there masks their deny.
 # Not covered (disclosed in the rule's docstring): Claude Code's own
 # auto-memory directory (the agent writes it constantly by design; an ask on
 # every write would be noise), files an agent is merely CONFIGURED to read
@@ -1751,13 +1753,17 @@ AGENT_RULES_GENERIC_TAIL = _AR_GENERIC + _AR_E      # source; rules.py prefixes 
 # Anchoring on the operand is what keeps `grep -o foo GEMINI.md`,
 # `[ -f a -o -f b ]` and `pandoc GEMINI.md -o out.pdf` out (QA, false-positive
 # review: a bare "command has an -o flag" test asked on all of them).
-_AR_ANY_PATH = (r"['\"]?(?:[^\s'\"|;&<>]{0,200}[/\\])?(?:" + _AR_FILE_CORE + r"|" + _AR_DIR_CORE
-                + r"|" + _AR_GENERIC + r")" + _AR_E)
+_AR_DEEP = r"(?:" + _AR_FILE_CORE + r"|" + _AR_DIR_CORE + r")" + _AR_E
+_AR_ANY_PATH = (r"(?:(?:[^\s'\"|;&<>]{0,1000}[/\\])?" + _AR_DEEP           # bare operand
+                + r"|\"(?:[^\"\n]{0,1000}[/\\])?" + _AR_DEEP               # "quoted, may hold spaces"
+                + r"|'(?:[^'\n]{0,1000}[/\\])?" + _AR_DEEP
+                + r"|['\"]?(?:\.[/\\]+|\$\{?PWD\}?[/\\]+)?" + _AR_GENERIC + _AR_E + r")")
+AGENT_RULES_OUT_OPT_SRC = (r"(?:-(?-i:[A-Za-z0-9#]{0,8}[oOP])|--?out(?:put|file|-file)?"
+                           r"|--(?:directory-prefix|output-dir(?:ectory)?|output-document))")
 AGENT_RULES_OPT_VALUE_RE = re.compile(
     r"(?:^|\s)(?:"
     r"-{1,2}[A-Za-z][A-Za-z-]{0,20}=?"                       # glued: -o<path>, --output=<path>
-    r"|(?:-(?-i:[A-Za-z0-9#]{0,8}[oOP])|--?out(?:put|file|-file)?"   # output option, then path
-    r"|--(?:directory-prefix|output-dir(?:ectory)?|output-document))\s+"
+    r"|" + AGENT_RULES_OUT_OPT_SRC + r"(?:\s+|=)"              # output option, then path
     r")" + _AR_ANY_PATH,
     re.IGNORECASE)
 
@@ -1780,7 +1786,7 @@ AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
 def agent_rules_find_hit(cmd: str) -> bool:
     # a `-prune` on the matched directory EXCLUDES it from whatever follows
     if re.search(r"\s-prune\b", cmd) and not re.search(r"-(?:delete|exec|ok)\b[^|;&]*$", cmd.split("-prune")[0]):
-        cmd = re.sub(r"(?<!\S)-i?(?:path|name|wholename|regex)\s+\S+\s+-prune\b", " ", cmd)
+        cmd = re.sub(r"(?<!\S)-i?(?:path|name|wholename|regex)\s+\S+\s+-prune\s+-o(?=\s)", " ", cmd)
     return _find_word_and_predicate_hit(cmd, AGENT_RULES_FIND_PREDICATE_RE)
 
 
@@ -1796,7 +1802,10 @@ def agent_rules_path_hit(text: str) -> bool:
 # pattern cannot rescan it from every offset (QA round 2: the unanchored form
 # was quadratic -- 12 s on 60k `&`).
 AGENT_RULES_FD_NOISE_RE = re.compile(
-    r"(?<![0-9&])[0-9&]{0,4}>>?\s*&[0-9-]{1,4}|(?<![0-9&])[0-9&]{0,4}>>?\s*/dev/null\b")
+    r"(?<![0-9&])[0-9&]{0,4}>>?\s*&[0-9-]{1,4}|(?<![0-9&])[0-9&]{0,4}>>?\s*/dev/null\b"
+    # `Co-Authored-By: Name <a@b.c>` -- the `>` of an e-mail address in a commit
+    # trailer is not a redirect (QA round 4: every commit of a rules file asked)
+    r"|<[\w.+-]{1,64}@[\w.-]{1,255}>")
 
 # Whole-directory placement: `cp -r /tmp/rules .cursor/`, `rsync -a x/ .cursor/`,
 # `tar xf a.tar -C .cursor`, `ln -s /tmp/evil .cursor` drop a rules directory
@@ -1822,19 +1831,21 @@ AGENT_RULES_CMD_WRITE_VERB_RE = re.compile(
     _AR_CMD_PREFIX + r"(?:patch|touch|sponge|truncate|gunzip|bunzip2|unxz|uncompress|scp|sftp"
     r"|aria2c|axel|vim?|nvim|emacs|nano|ed|ex)(?=\s|$)"
     # wget always writes a file unless told to print to stdout (`-O-`/`-qO -`)
-    r"|" + _AR_CMD_PREFIX + r"wget\b(?![^|;&\n]{0,200}\s-[A-Za-z]{0,8}O\s*-(?=\s|$))"
-    r"|" + _AR_CMD_PREFIX + r"curl\b(?=[^|;&\n]{0,200}(?:\s-(?-i:[A-Za-z0-9#]{0,8}O)\b|\s--remote-name))"
+    r"|" + _AR_CMD_PREFIX + r"wget\b(?![^|;&\n'\"]{0,200}\s-(?-i:[A-Za-z]{0,8}O)\s*-(?=\s|$))"
+    r"|" + _AR_CMD_PREFIX + r"curl\b(?=[^|;&\n]{0,400}(?:\s-(?-i:[A-Za-z0-9#]{0,8}O[A-Za-z0-9#]{0,8})(?=\s|$)"
+    r"|\s--remote-name))"
     r"|" + _AR_CMD_PREFIX + r"(?:xz|zstd|gzip|bzip2)\b[^|;&\n]{0,60}?\s-[a-zA-Z]{0,8}d"
     r"|" + _AR_CMD_PREFIX + r"(?:npx\s+)?(?:degit|tiged)\b",
     re.IGNORECASE)
 AGENT_RULES_API_WRITE_VERB_RE = re.compile(
-    r"\bgit(?:\s+(?:-[cC]\s*\S+|--?[\w-]+(?:=\S+)?)){0,6}\s+"
+    r"\bgit(?:\s+(?:-[cC]\s*\S+|--?[\w-]+(?:[=\s]\S+)?)){0,6}?\s+"
     r"(?:checkout|restore|checkout-index|apply|am|clone|stash\s+(?:pop|apply))(?=\s|$)"
     r"|(?:^|\s)--in-place\b|\b(?:yq|jq|ruby)\b[^|;&\n]{0,200}?\s-[a-zA-Z]{0,8}i\b"
     r"|\bsed\b[^|;&\n]{0,200}?['\"\s;]w\s"
     r"|file_put_contents|WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|Clear-Content"
     r"|Start-BitsTransfer|write_text|write_bytes|writeFile|appendFile|write-region"
-    r"|\bopen\s*\(\s*\w{1,40}\s*,\s*['\"]\s*\+?>|\bexec\s+[0-9]{0,3}>",
+    r"|\bopen\s*\(\s*\w{1,40}\s*,\s*['\"]\s*\+?>|\bexec\s+[0-9]{0,3}>"
+    r"|\bopen\s*\([^)\n]{0,300}['\"][wax]\+?b?['\"]",
     re.IGNORECASE)
 AGENT_RULES_CMD_SEP_RE = re.compile(r"[|;&\n]")
 
