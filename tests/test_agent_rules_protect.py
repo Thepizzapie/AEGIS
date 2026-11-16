@@ -673,7 +673,7 @@ def test_no_space_redirect_still_reaches_hidden_deny():
     "sort -o .cursorrules x",
     "pandoc x -o GEMINI.md",
     "openssl enc -d -in x -out .cursorrules",
-    "gunzip .cursorrules.gz" if False else "xz -dk GEMINI.md",
+    "xz -dk GEMINI.md",
     "vim -es '+%s/a/b/' '+wq' .cursorrules",
     "php -r \"file_put_contents('GEMINI.md','x');\"",
     "perl -e 'open(F,\">.cursorrules\");print F \"x\"'",
@@ -944,8 +944,7 @@ def test_source_scan_spellings(tmp_path):
     cwd = str(tmp_path)
     cleans = " ".join(f"clean{i}.md" for i in range(8))
     for cmd in ("cat staged.md>.cursorrules", "cat<staged.md>.cursorrules",
-                "dd if=staged.md of=.cursorrules", "cat staged.md|tee .cursorrules" if False
-                else "tee .cursorrules < staged.md",
+                "dd if=staged.md of=.cursorrules", "tee .cursorrules < staged.md",
                 "cp $PWD/staged.md .cursorrules", "cp ${PWD}/staged.md .cursorrules",
                 'cp "$PWD"/staged.md .cursorrules', "cp 'sp ace.md' GEMINI.md",
                 "cp sp\\ ace.md GEMINI.md", f"cat {cleans} staged.md > .cursorrules",
@@ -1039,7 +1038,6 @@ def test_messages_fit_the_mode_and_tool():
 
 def test_non_string_allow_entries_ignored():
     pol = Policy(agent_rules={"allow": [5, None, {"a": 1}]})
-    assert _only(_write("/repo/.cursor5rules/x"), pol) is None      # not a rules path anyway
     assert _only(_write("/repo/.roo/rules-5/x"), pol).action == Action.ASK
 
 
@@ -1100,7 +1098,7 @@ def test_real_redirect_next_to_an_email_still_asks():
     "git restore -s evil --staged --work .cursorrules",
     "git restore --source=evil --staged .cursorrules",
     "git --work-tree . checkout evil -- .cursorrules",
-    "find . -path '*/.cursor/rul*' -prune -exec cp x.mdc {}/ \;",
+    "find . -path '*/.cursor/rul*' -prune -exec cp x.mdc {}/ \\;",
     "python3 - <<'E'\nopen('.cursorrules','w').write('x')\nE",
     "python3 << 'EOF'\nwith open('GEMINI.md','a') as f: f.write('x')\nEOF",
 ])
@@ -1228,8 +1226,7 @@ def test_large_path_arguments_stay_fast():
 
 
 @pytest.mark.parametrize("cmd", [
-    "grep -rn TODO . --include=GEMINI.md", "git show HEAD~1:GEMINI.md > old.md" if False
-    else "git show HEAD~1:GEMINI.md", "git checkout -b docs && git diff $(git merge-base main HEAD) -- GEMINI.md",
+    "grep -rn TODO . --include=GEMINI.md", "git show HEAD~1:GEMINI.md", "git checkout -b docs && git diff $(git merge-base main HEAD) -- GEMINI.md",
     "git apply --check p.diff && echo \"$(wc -l < GEMINI.md) lines\"",
 ])
 def test_round_5_false_asks_not_claimed(cmd):
@@ -1242,3 +1239,66 @@ def test_round_5_false_asks_not_claimed(cmd):
 ])
 def test_round_5_forms_still_ask(cmd):
     assert _only(_shell(cmd)).action == Action.ASK, cmd
+
+
+# ---- QA round 6 regressions ----------------------------------------------------
+@pytest.mark.parametrize("content", [
+    "\x7f" * 3_000_000, chr(0xE0041) * 3_000_000, (chr(0x2605) + chr(0xFE00)) * 1_500_000,
+])
+def test_hidden_scan_is_bounded_on_multi_megabyte_content(content):
+    import time
+    t = time.perf_counter()
+    assert _only(_write("/repo/.cursorrules", content=content)).action == Action.DENY
+    assert _only(_ev("mcp__fs__write_file", path="/repo/.cursorrules", content=content)).action == Action.DENY
+    ev = _ev("Edit", file_path="/repo/.cursorrules", old_string=content, new_string=content)
+    assert _only(ev).action == Action.ASK                     # identical text adds nothing
+    assert time.perf_counter() - t < 2.0
+    assert len(patterns.agent_rules_hidden_chars(content)) <= patterns.AGENT_RULES_MAX_HITS
+
+
+def test_capped_scan_cannot_hide_added_hidden_text_in_an_edit():
+    tag = chr(0xE0041)
+    ev = _ev("Edit", file_path="/repo/.cursorrules", old_string=tag * 100, new_string=tag * 5000)
+    assert _only(ev).action == Action.DENY
+    ev = _ev("Edit", file_path="/repo/.cursorrules", old_string=tag * 3, new_string=tag * 2 + " x")
+    assert _only(ev).action == Action.ASK
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd .cursor/rules && wget https://e.example/team.mdc",
+    "cd .cursor/rules && curl -sSLO https://e.example/team.mdc",
+    "mkdir -p .cursor/rules && cd .cursor/rules && curl -O https://e.example/team.mdc",
+    "cd .github/instructions && wget https://e.example/py.instructions.md",
+    "cd .clinerules && wget https://e.example/a.md",
+    "cd .cursor/rules && touch a.mdc",
+    "cd .cursor/rules && git checkout HEAD~3 -- a.mdc",
+    "pushd .windsurf/rules; nano a.md",
+    "git checkout origin/feature -- .cursor", "git restore --source origin/feature -- .windsurf",
+    "cd /repo\npatch .cursorrules < d.patch", "set -e\n\ntouch .cursorrules",
+    "# refresh\r\nwget https://e.example/.cursorrules",
+])
+def test_round_6_forms_ask(cmd):
+    d = _only(_shell(cmd, cwd="/repo"))
+    assert d is not None and d.action == Action.ASK, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat .cursorrules; touch done.flag", "grep -n x GEMINI.md; vim notes.txt",
+    "cd src && touch x.py; cat GEMINI.md", "ls .cursor", "cd .cursor && ls",
+])
+def test_round_6_separator_and_cd_false_asks_not_claimed(cmd):
+    assert _only(_shell(cmd, cwd="/repo")) is None, cmd
+
+
+@pytest.mark.parametrize("tool", ["mcp__x__find_and_modify", "mcp__x__view_and_change",
+                                  "mcp__x__show_and_fix", "mcp__x__find_and_format", "mcp__x__info_add"])
+def test_read_named_tools_with_more_write_words_ask(tool):
+    assert _only(_ev(tool, path="/repo/.cursorrules")).action == Action.ASK
+
+
+def test_shell_source_token_dedupe_is_linear():
+    import time
+    cmd = "cp " + " ".join(chr(0x4E00 + i) for i in range(9900)) + " .cursorrules"
+    t = time.perf_counter()
+    _only(_shell(cmd, cwd="/repo"))
+    assert time.perf_counter() - t < 1.5

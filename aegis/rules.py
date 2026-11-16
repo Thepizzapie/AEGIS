@@ -1266,9 +1266,16 @@ def _agent_rules_new_hidden(v, _depth: int = 0) -> list:
             old, new = v.get(old_k), v.get(new_k)
             if isinstance(old, str) and isinstance(new, str):
                 skip.update((old_k, new_k))
-                had = _agent_rules_counter(patterns.agent_rules_hidden_chars(old))
+                if old == new:
+                    continue
                 found = patterns.agent_rules_hidden_chars(new)
-                if any(n > had.get(k, 0) for k, n in _agent_rules_counter(found).items()):
+                if not found:
+                    continue
+                had = _agent_rules_counter(patterns.agent_rules_hidden_chars(old))
+                # a capped result means "at least this many": it cannot show
+                # that the old text already held them all
+                if (len(found) >= patterns.AGENT_RULES_MAX_HITS
+                        or any(n > had.get(k, 0) for k, n in _agent_rules_counter(found).items())):
                     out.extend(found)
         for k, x in v.items():
             if k not in skip:
@@ -1555,10 +1562,12 @@ def _agent_rules_shell_sources(ev: Event, raw: str) -> list:
                    and "=" not in t.split("/")[0]]
             if not ops or _is_rules(ops[0]) and not any(_is_rules(t) for t in ops[1:]):
                 continue                  # the rules file is being read, not written
+        have = set(toks)
         out.extend(toks[1:])
         for t in _AGENT_RULES_SRC_TOKEN_SPLIT_RE.split(seg):   # `cat<a>b`, `if=a`
             t = t.strip("'\"")
-            if t and t not in out:
+            if t and t not in have:
+                have.add(t)
                 out.append(t)
     return out
 
@@ -1581,12 +1590,18 @@ def _agent_rules_cwd_generic_hit(ev: Event, text: str,
 # same-simple-command requirement is dropped when one is present.
 _AGENT_RULES_JOINED_CMD_RE = re.compile(r"<<|\bxargs\b|\bfor\s|\bwhile\s|\$\(|`|<\(|\bparallel\b",
                                         re.IGNORECASE)
+# `cd .cursor/rules && wget URL`: the directory operand carries the target
+# into the commands that follow.
+_AGENT_RULES_CHDIR_RE = re.compile(
+    r"(?:\b(?:cd|pushd|chdir|Set-Location)|\s-C|--(?:prefix|directory|work-tree))[\s=]+(\S{1,1024})",
+    re.IGNORECASE)
 _AGENT_RULES_READ_TOOL_RE = re.compile(
     r"^(?:read|get|list|ls|search|find|grep|glob|stat|info|view|show|head|tail|tree|describe"
     r"|exists|cat|query|diff|blame|log|status|directory_tree)(?:[_-]|(?-i:[A-Z])|$)", re.IGNORECASE)
 _AGENT_RULES_WRITE_WORD_RE = re.compile(
     r"write|edit|creat|updat|delet|remov|move|renam|put|set|push|commit|append|replac|patch"
-    r"|insert|save|upload|apply|copy|output|export|download|clone|checkout|restore|exec|run",
+    r"|insert|save|upload|apply|copy|output|export|download|clone|checkout|restore|exec|run"
+    r"|modif|chang|fix|format|add",
     re.IGNORECASE)
 
 
@@ -1621,10 +1636,13 @@ def _agent_rules_shell_write_hit(ev: Event, cmd: str) -> str:
                    or patterns.COPY_WRITE_VERB_RE.search(verbs)
                    or patterns.FORCED_LINK_WRITE_RE.search(verbs)
                    or patterns.DELETE_OR_MOVE_VERB_RE.search(verbs))
-    if names_file or find_hit:
+    if names_file or find_hit or parent:
+        if placing and not (names_file or find_hit):
+            return "a whole agent directory being placed"
         if placing:
             return "a copy/move/delete/archive verb"
-        if (patterns.WRITE_REDIRECT_RE.search(verbs)
+        if (names_file or find_hit) and (
+                patterns.WRITE_REDIRECT_RE.search(verbs)
                 or patterns.DESTRUCTIVE_DELETE_RE.search(verbs)
                 or patterns.INPLACE_WRITE_RE.search(verbs)):
             return "a redirect / in-place edit / delete"
@@ -1638,7 +1656,10 @@ def _agent_rules_shell_write_hit(ev: Event, cmd: str) -> str:
             parts = [first, cmd[len(first) + 1:]]
         else:
             parts = [cmd]
-        joined = bool(_AGENT_RULES_JOINED_CMD_RE.search(cmd))
+        joined = bool(_AGENT_RULES_JOINED_CMD_RE.search(cmd)) or any(
+            patterns.agent_rules_path_hit(m.group(1))
+            or patterns.AGENT_RULES_PARENT_DIR_RE.search(m.group(1))
+            for m in _AGENT_RULES_CHDIR_RE.finditer(cmd))
         for rx, text in ((rx, patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", part))
                          for part in parts
                          for rx in (patterns.AGENT_RULES_CMD_WRITE_VERB_RE,
@@ -1649,14 +1670,14 @@ def _agent_rules_shell_write_hit(ev: Event, cmd: str) -> str:
                     # also names a rules file is treated as a write.
                     return "many write verbs"
                 lo = max(m.start() - 400, 0)
-                before = text[lo:m.start()]
+                # the match may START with the separator that precedes the
+                # verb, so cut on the text up to the END of the match
+                before = text[lo:m.end()]
                 cut = max((s.end() for s in patterns.AGENT_RULES_CMD_SEP_RE.finditer(before)),
                           default=0)
                 after = text[m.end():m.end() + 400]
                 nxt = patterns.AGENT_RULES_CMD_SEP_RE.search(after)
-                simple = before[cut:] + m.group(0) + (after[:nxt.start()] if nxt else after)
-                # `git restore --staged <f>` only unstages; with --worktree/-W
-                # (or any other verb) the file itself is rewritten.
+                simple = before[cut:] + (after[:nxt.start()] if nxt else after)
                 # `git restore --staged <f>` only unstages -- unless it also
                 # touches the worktree (--worktree, abbreviable; -W) or takes
                 # its content from another revision (-s/--source).
@@ -1672,6 +1693,7 @@ def _agent_rules_shell_write_hit(ev: Event, cmd: str) -> str:
                 if (patterns.agent_rules_path_hit(span)
                         or patterns.AGENT_RULES_ROOT_FILE_RE.search(span)
                         or _agent_rules_cwd_generic_hit(ev, span)
+                        or (parent and patterns.AGENT_RULES_PARENT_DIR_RE.search(span))
                         or (find_hit and patterns.agent_rules_find_hit("find " + span))):
                     return f"the write verb `{m.group(0).strip()[:40]}`"
     if parent and placing:
@@ -1702,7 +1724,7 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     Crush, OpenCode, Kiro, IDX, JetBrains AI Assistant, OpenHands, Claude
     Code's own ``.claude/rules/``, and -- at the worktree root only -- Zed's
     ``.rules``, Amp's ``AGENT.md`` and Replit's ``replit.md``. The full
-    plan and threat model sit above ``patterns.AGENT_RULES_FILE_RE``.
+    plan and threat model sit above ``patterns._AR_LEFT``.
 
     Why it matters: each file is folded into some agent's context on every
     session with no per-use trust check, and it is committed -- so one
@@ -1746,7 +1768,10 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     theirs; on a PermissionRequest event it preceded the lifecycle rules'
     ``permission-escalation`` deny). The cost is the reverse: any earlier
     guard's ``ask`` on the same call wins over this guard's hidden-character
-    ``deny``.
+    ``deny``. Like every built-in guard it also runs BEFORE plugin rules, the
+    policy's own declarative rules and ``default_action``, so a user-written
+    deny for these paths is preceded by this ask (set ``mode: deny`` here to
+    hard-block).
 
     Staged sources: when a plain copy/move/concatenate command (``cp``,
     ``mv``, ``cat``, ``tee``, ``dd``, ``install``, ``ln``, ``rsync``) names a

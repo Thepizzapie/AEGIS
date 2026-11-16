@@ -1826,7 +1826,7 @@ AGENT_RULES_EXCLUDE_ARG_RE = re.compile(r"--exclude(?:-from)?(?:=|\s+)\S+", re.I
 # `git checkout main && cat GEMINI.md`, `git commit -m 'patch .cursorrules'`).
 #   COMMAND verbs must sit at command position (optionally after sudo/env/
 #   xargs/...), so `grep -c vi GEMINI.md` is not "vi".
-_AR_CMD_PREFIX = (r"(?:^|[;&|({]|\b(?:sudo|doas|env|xargs|exec|command|nohup|time|then|do|else)\b"
+_AR_CMD_PREFIX = (r"(?:^|[;&|({\n]|\b(?:sudo|doas|env|xargs|exec|command|nohup|time|then|do|else)\b"
                   r"(?:\s+-\S+){0,4})\s*")
 AGENT_RULES_CMD_WRITE_VERB_RE = re.compile(
     _AR_CMD_PREFIX + r"(?:patch|touch|sponge|truncate|gunzip|bunzip2|unxz|uncompress|scp|sftp"
@@ -1921,49 +1921,68 @@ def _ar_selector_ok(prev: str, sel: str) -> bool:
     return cat[0] in "LS" or cat in ("No", "Po")
 
 
+AGENT_RULES_MAX_HITS = 64
+
+
 def agent_rules_hidden_chars(text: str) -> list:
     """Code points (``U+XXXX@offset``) of review-invisible characters in
     ``text`` that have no legitimate reading in their context. Empty list ->
-    nothing suspicious."""
+    nothing suspicious. Bounded work: at most AGENT_RULES_MAX_HITS findings
+    are collected (a result of that length means "at least this many")."""
     if not text:
         return []
     out = []
+    cap = AGENT_RULES_MAX_HITS
     try:
         # Blank out legitimate sequences with same-length filler so reported
         # offsets still index the original text.
         scan = _AR_FLAG_TAG_SEQ_RE.sub(lambda m: "x" * len(m.group(0)), text)
-        ok_selectors = []
+        ok_selectors, bad = [], 0
         for m in _AR_SELECTOR_RE.finditer(scan):
             i = m.start()
             if _ar_selector_ok(scan[i - 1:i] if i else "", m.group(0)):
                 ok_selectors.append(i)
-        if len(ok_selectors) <= AGENT_RULES_MAX_SELECTORS:
+                if len(ok_selectors) > AGENT_RULES_MAX_SELECTORS:
+                    break                 # over the cap: none are exempt
+            else:
+                bad += 1
+                if bad >= cap:
+                    break                 # already enough to report
+        if ok_selectors and len(ok_selectors) <= AGENT_RULES_MAX_SELECTORS:
             chars = list(scan)
             for i in ok_selectors:
                 chars[i] = "x"
             scan = "".join(chars)
         for m in _AR_HIDDEN_ALWAYS_RE.finditer(scan):
             out.append((m.start(), ord(m.group(0))))
-        for m in _AR_SOFT_RUN_RE.finditer(scan):
-            out.append((m.start(), ord(m.group(0)[0])))
-        examined = 0
-        for m in _AR_HIDDEN_CONTEXT_RE.finditer(scan):
-            i = m.start()
-            examined += 1
-            if examined > AGENT_RULES_MAX_CONTEXT_MARKS:
-                # Bounded work: past this many zero-width/direction marks the
-                # per-mark context check stops and the text is reported.
-                out.append((i, ord(m.group(0))))
+            if len(out) >= cap:
                 break
-            near = scan[max(0, i - 2):i] + scan[i + 1:i + 3]
-            in_run = any(c in _AR_INVISIBLE_NEIGHBOUR
-                         for c in scan[max(0, i - 1):i] + scan[i + 1:i + 2])
-            if in_run or not any(ord(c) > 0x7f and c.isalpha() for c in near):
-                out.append((i, ord(m.group(0))))
+        if len(out) < cap:
+            for m in _AR_SOFT_RUN_RE.finditer(scan):
+                out.append((m.start(), ord(m.group(0)[0])))
+                if len(out) >= cap:
+                    break
+        examined = 0
+        if len(out) < cap:
+            for m in _AR_HIDDEN_CONTEXT_RE.finditer(scan):
+                i = m.start()
+                examined += 1
+                if examined > AGENT_RULES_MAX_CONTEXT_MARKS:
+                    # Bounded work: past this many zero-width/direction marks
+                    # the per-mark context check stops and the text is reported.
+                    out.append((i, ord(m.group(0))))
+                    break
+                near = scan[max(0, i - 2):i] + scan[i + 1:i + 3]
+                in_run = any(c in _AR_INVISIBLE_NEIGHBOUR
+                             for c in scan[max(0, i - 1):i] + scan[i + 1:i + 2])
+                if in_run or not any(ord(c) > 0x7f and c.isalpha() for c in near):
+                    out.append((i, ord(m.group(0))))
+                    if len(out) >= cap:
+                        break
     except Exception:
         return ["unreadable text"]
     out.sort()
-    return [f"U+{cp:04X}@{i}" for i, cp in out]
+    return [f"U+{cp:04X}@{i}" for i, cp in out[:cap]]
 
 
 # ---- Shell-startup / SSH persistence protection --------------------------------
