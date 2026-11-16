@@ -1302,3 +1302,57 @@ def test_shell_source_token_dedupe_is_linear():
     t = time.perf_counter()
     _only(_shell(cmd, cwd="/repo"))
     assert time.perf_counter() - t < 1.5
+
+
+# ---- QA round 7 regressions ----------------------------------------------------
+@pytest.mark.parametrize("flood", ["\n", " \n", "    \n", "\r\n", "'\n", '"\n', "\t\n", ";\n", "\n\n ; "])
+def test_newline_and_blank_line_floods_are_linear(flood):
+    import time
+    t = time.perf_counter()
+    _only(_shell("cat .cursorrules" + flood * (20000 // len(flood))))
+    d = _only(_shell("true" + flood * (12000 // len(flood)) + "x\ntouch .cursorrules"))
+    assert time.perf_counter() - t < 2.0
+    assert d is not None and d.action == Action.ASK
+
+
+def test_symlink_resolution_is_time_bounded(tmp_path):
+    import os as _os, time
+    d = tmp_path / "d"
+    (d / "a").mkdir(parents=True)
+    names = [chr(c) for c in range(ord("A"), ord("A") + 26)] + list("0123")
+    try:
+        for n in names:
+            _os.symlink("a/" + "../a/" * 818, d / n)
+        _os.symlink("d/" + "/".join(names), tmp_path / "z")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    (d / "a" / "f").write_text("plain", encoding="utf-8")
+    (tmp_path / "payload.txt").write_text("ok" + _tags("ignore"), encoding="utf-8")
+    cwd = str(tmp_path)
+    t = time.perf_counter()
+    r1 = _only(_shell("cat " + "z/f " * 1000 + "payload.txt > .cursorrules", cwd=cwd))
+    files = [{"path": "d/" + "/".join(names) + f"/f{i}.py", "content": "x"} for i in range(500)]
+    r2 = _only(_ev("mcp__github__push_files", cwd=cwd, files=files + [{"path": ".cursorrules"}]))
+    assert time.perf_counter() - t < 2.0
+    assert r1.action in (Action.ASK, Action.DENY) and r2.action == Action.ASK
+    # and the plain case is still a deny
+    assert _only(_shell("cat payload.txt > .cursorrules", cwd=cwd)).action == Action.DENY
+
+
+@pytest.mark.parametrize("cmd", [
+    "wc -c .cursorrules && git checkout main", "du -c .cursor/rules && touch x",
+    "ls -c .cursor/rules && touch x",
+    "git add .cursorrules && git commit -m \"$(cat <<'EOF'\nUpdate rules\n\nTouch up wording.\nPatch the stale section.\nEOF\n)\"",
+])
+def test_round_7_false_asks_not_claimed(cmd):
+    assert _only(_shell(cmd)) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    'cd "My Project/.cursor/rules" && touch x.mdc', "cd -- .cursor/rules && touch x.mdc",
+    "FOO=1 touch .cursorrules", "env FOO=1 touch .cursorrules", "sudo -u bob touch .cursorrules",
+    "make -C .cursor/rules install && touch x",
+])
+def test_round_7_forms_ask(cmd):
+    d = _only(_shell(cmd))
+    assert d is not None and d.action == Action.ASK, cmd

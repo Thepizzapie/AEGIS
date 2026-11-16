@@ -1826,10 +1826,16 @@ AGENT_RULES_EXCLUDE_ARG_RE = re.compile(r"--exclude(?:-from)?(?:=|\s+)\S+", re.I
 # `git checkout main && cat GEMINI.md`, `git commit -m 'patch .cursorrules'`).
 #   COMMAND verbs must sit at command position (optionally after sudo/env/
 #   xargs/...), so `grep -c vi GEMINI.md` is not "vi".
+# No `\s*` here: with `\n` as an anchor, a whitespace-run quantifier that can
+# also cross newlines rescans the run from every newline (QA round 7: 88 s on
+# 20 KB of blank lines). Horizontal whitespace only, bounded.
 _AR_CMD_PREFIX = (r"(?:^|[;&|({\n]|\b(?:sudo|doas|env|xargs|exec|command|nohup|time|then|do|else)\b"
-                  r"(?:\s+-\S+){0,4})\s*")
+                  r"(?:[ \t]{1,8}-[^\s;&|]{1,40}(?:[ \t]{1,8}[^\s;&|-][^\s;&|]{0,40})?){0,4})[ \t]{0,8}"
+                  r"(?:[A-Za-z_][A-Za-z0-9_]{0,40}=[^\s;&|]{0,200}[ \t]{1,8}){0,4}")
 AGENT_RULES_CMD_WRITE_VERB_RE = re.compile(
-    _AR_CMD_PREFIX + r"(?:patch|touch|sponge|truncate|gunzip|bunzip2|unxz|uncompress|scp|sftp"
+    # command names are case-sensitive: a commit-message line starting with
+    # "Touch up ..." or "Patch the ..." is prose
+    _AR_CMD_PREFIX + r"(?-i:patch|touch|sponge|truncate|gunzip|bunzip2|unxz|uncompress|scp|sftp"
     r"|aria2c|axel|vim?|nvim|emacs|nano|ed|ex)(?=\s|$)"
     # wget always writes a file unless told to print to stdout (`-O-`/`-qO -`)
     r"|" + _AR_CMD_PREFIX + r"wget\b(?![^|;&\n'\"]{0,200}\s-(?-i:[A-Za-z]{0,8}O)\s*-(?=\s|$))"

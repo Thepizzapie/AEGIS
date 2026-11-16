@@ -18,6 +18,7 @@ import re
 import shlex
 import stat
 import subprocess
+import time
 import urllib.parse
 from typing import Optional
 
@@ -1338,6 +1339,29 @@ def _agent_rules_mapping_keys(v, _depth: int = 0, _budget=None) -> list:
     return out
 
 
+# Filesystem budget. Symlink resolution on agent-chosen names is bounded per
+# evaluation: Python's realpath lstat()s every component of every link target,
+# so planted links with 4 KB targets made a 430-character command take 3.5 s
+# (QA round 7). Past the deadline, paths are handled lexically only and the
+# staged-source scan stops -- the decision degrades to the ordinary ask, never
+# to a stall (a hook timeout fails open).
+_AGENT_RULES_FS_BUDGET_S = 0.15
+_AGENT_RULES_FS_DEADLINE = [0.0]
+
+
+def _agent_rules_fs_ok() -> bool:
+    return time.monotonic() < _AGENT_RULES_FS_DEADLINE[0]
+
+
+def _agent_rules_realpath(p: str) -> Optional[str]:
+    if not _agent_rules_fs_ok():
+        return None
+    try:
+        return os.path.realpath(p)
+    except Exception:
+        return None
+
+
 def _agent_rules_path_forms(ev: Event, p: str) -> list:
     """The path as written, lexically normalized (``a/../.cursor/rules/x``),
     and -- only when it is absolute or the event carries a cwd to anchor it --
@@ -1368,7 +1392,9 @@ def _agent_rules_path_forms(ev: Event, p: str) -> list:
         forms.append(posixpath.normpath(flat))
         # never touch a UNC path; bounded lstat work
         if flat.startswith("/") and not flat.startswith("//") and flat.count("/") <= 64:
-            forms.append(os.path.realpath(flat))
+            real = _agent_rules_realpath(flat)
+            if real:
+                forms.append(real)
     except Exception:
         pass
     return forms
@@ -1385,10 +1411,7 @@ def _agent_rules_generic_hit(ev: Event, form: str) -> bool:
     if not head or head == "." or not ev.cwd:
         return True
     cwd = posixpath.normpath(str(ev.cwd).replace("\\", "/"))
-    try:
-        real_cwd = os.path.realpath(cwd) if cwd.startswith("/") else cwd
-    except Exception:
-        real_cwd = cwd
+    real_cwd = (_agent_rules_realpath(cwd) if cwd.startswith("/") else None) or cwd
     return posixpath.normpath(head).lower() in (cwd.lower(), real_cwd.lower())
 
 
@@ -1465,8 +1488,8 @@ _AGENT_RULES_SRC_TOKEN_SPLIT_RE = re.compile(r"[\s<>()=]+")
 
 def _agent_rules_read_text(fp: str) -> Optional[str]:
     try:
-        real = os.path.realpath(fp)
-        if real.startswith(("/proc/", "/sys/", "/dev/")) or real.startswith("//"):
+        real = _agent_rules_realpath(fp)
+        if not real or real.startswith(("/proc/", "/sys/", "/dev/")) or real.startswith("//"):
             return None
         fd = os.open(real, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0))
     except Exception:
@@ -1494,7 +1517,11 @@ def _agent_rules_source_hidden(ev: Event, names: list) -> list:
     """Hidden characters in the literally-named regular files among ``names``
     (bounded; see the comment above)."""
     seen, done, budget = 0, set(), _AGENT_RULES_SRC_TOTAL_BYTES
-    for t in names:
+    # distinct operand strings only, and a bounded number of them, BEFORE any
+    # filesystem call
+    for t in list(dict.fromkeys(names))[:64]:
+        if not _agent_rules_fs_ok():
+            break
         if (not t or t.startswith("-") or len(t) > 1024 or t.startswith(("//", "\\\\"))
                 or any(ch in t for ch in "*?[{")
                 or patterns.agent_rules_path_hit(t)
@@ -1509,10 +1536,9 @@ def _agent_rules_source_hidden(ev: Event, names: list) -> list:
                 continue
         except Exception:
             continue
-        try:
-            fp = os.path.realpath(fp)
-        except Exception:
-            continue
+        fp = _agent_rules_realpath(fp)
+        if not fp:
+            break
         if fp in done:
             continue
         done.add(fp)
@@ -1593,7 +1619,8 @@ _AGENT_RULES_JOINED_CMD_RE = re.compile(r"<<|\bxargs\b|\bfor\s|\bwhile\s|\$\(|`|
 # `cd .cursor/rules && wget URL`: the directory operand carries the target
 # into the commands that follow.
 _AGENT_RULES_CHDIR_RE = re.compile(
-    r"(?:\b(?:cd|pushd|chdir|Set-Location)|\s-C|--(?:prefix|directory|work-tree))[\s=]+(\S{1,1024})",
+    r"(?:\b(?:cd|pushd|chdir|Set-Location)|(?-i:\s-C)|--(?:prefix|directory|work-tree))[ \t=]{1,8}"
+    r"(?:--[ \t]{1,8})?(?:\"([^\"\n]{1,1024})\"|'([^'\n]{1,1024})'|(\S{1,1024}))",
     re.IGNORECASE)
 _AGENT_RULES_READ_TOOL_RE = re.compile(
     r"^(?:read|get|list|ls|search|find|grep|glob|stat|info|view|show|head|tail|tree|describe"
@@ -1657,8 +1684,8 @@ def _agent_rules_shell_write_hit(ev: Event, cmd: str) -> str:
         else:
             parts = [cmd]
         joined = bool(_AGENT_RULES_JOINED_CMD_RE.search(cmd)) or any(
-            patterns.agent_rules_path_hit(m.group(1))
-            or patterns.AGENT_RULES_PARENT_DIR_RE.search(m.group(1))
+            patterns.agent_rules_path_hit(m.group(1) or m.group(2) or m.group(3))
+            or patterns.AGENT_RULES_PARENT_DIR_RE.search(m.group(1) or m.group(2) or m.group(3))
             for m in _AGENT_RULES_CHDIR_RE.finditer(cmd))
         for rx, text in ((rx, patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", part))
                          for part in parts
@@ -1780,7 +1807,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     so ``mv notes.txt .cursorrules`` cannot launder a payload staged in
     notes.txt. Narrow and bounded on purpose: 16 files, the first 500 KB in
     total (in operand order), text only, never /proc|/sys|/dev or a UNC path, no directories, no globs, no
-    variables, no other commands' operands. Anything outside that is NOT
+    variables, no other commands' operands, and at most 150 ms of filesystem
+    work per call (symlink resolution included). Anything outside that is NOT
     inspected and only gets the ordinary ask.
 
     Honest scope -- a path-string match, with the same denylist trade-offs as
@@ -1822,7 +1850,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     checkout/restore/apply, patch, touch, editors, runtime file APIs) only
     count when the rules path is in the same simple command, so a ``;`` inside
     a quoted argument between such a verb and the path hides it -- unless the
-    command contains a heredoc, loop, ``xargs`` or command substitution,
+    command contains a heredoc, loop, ``xargs``, command substitution, or a
+    ``cd``/``pushd``/``-C`` into a rules directory,
     where the target can travel between simple commands and any such verb
     anywhere in the command counts (more false asks, by design). Most shell
     writes under ``.claude/`` are already hard-denied by
@@ -1833,6 +1862,7 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     # before e.g. `permission-escalation` could deny (QA round 5).
     if ev.event != HookEvent.PRE_TOOL_USE:
         return None
+    _AGENT_RULES_FS_DEADLINE[0] = time.monotonic() + _AGENT_RULES_FS_BUDGET_S
     cfg = getattr(policy, "agent_rules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
