@@ -13,9 +13,13 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import posixpath
 import re
 import shlex
+import stat
 import subprocess
+import time
+import urllib.parse
 from typing import Optional
 
 from . import normalize, patterns, review
@@ -1161,6 +1165,850 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
             _record_monitor(ev, would, "agent-def-protect-monitor")
             return None
         return would
+    return None
+
+
+# ---- cross-agent rules / instructions file protection: escapable with human ---
+# Zero-width/direction marks still allowed a per-mark context check in this
+# evaluation -- one budget shared by every string scanned, reset at rule entry
+# (QA round 8: a per-string cap let 60 strings of 20,000 marks cost 1.8 s).
+# Module-level, like _AGENT_RULES_FS_DEADLINE: the hook evaluates one event
+# per process. Concurrent evaluate() calls in one process would share it; the
+# only effect found is a spurious deny, never a weaker decision.
+_AGENT_RULES_MARK_BUDGET = [patterns.AGENT_RULES_MAX_CONTEXT_MARKS]
+
+
+def _agent_rules_hidden(text: str) -> list:
+    return patterns.agent_rules_hidden_chars(text, _AGENT_RULES_MARK_BUDGET)
+
+
+def _agent_rules_allowed_by_policy(cfg: dict, texts) -> bool:
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):          # `allow: 'x'` (not a list) is one regex
+        allow = [allow]
+    if not isinstance(allow, (list, tuple)):   # `allow: 5` must not raise (the
+        return False                            # engine treats a raise as allow)
+    for pat in allow:
+        if not isinstance(pat, str):
+            continue
+        for text in texts:
+            try:
+                if text and re.search(pat, text, re.IGNORECASE):
+                    return True
+            except re.error:
+                break
+    return False
+
+
+# Recognised edit shapes: (key of the text being REPLACED, key of its replacement).
+_AGENT_RULES_EDIT_PAIRS = (("old_string", "new_string"), ("oldText", "newText"),
+                           ("old_str", "new_str"), ("old_text", "new_text"))
+# Keys under which a tool call carries a file path: `_path()`'s own names at
+# any depth (`files: [{path: ...}]`), anything path/file-ish, and
+# destination-like names (a `move_file`-style `destination`).
+_AGENT_RULES_PATH_KEY_RE = re.compile(
+    r"path|file|uri|^(?:dest(?:ination)?|dst|target|to|new|out(?:put)?)"
+    r"(?:[_-]?(?:name))?$", re.IGNORECASE)
+_AGENT_RULES_SRC_KEY_RE = re.compile(r"^(?:source|src|from)(?:[_-]?(?:path|file|uri))?$",
+                                     re.IGNORECASE)
+
+
+# The hidden characters written as an escape a shell tool expands at run time
+# (printf/echo -e/$'..' code-point, hex-byte and octal-byte forms, perl and
+# node brace forms, PowerShell backtick-u and [char]0x forms) -- the command
+# text holds no invisible character, but the file will. GENERATED from the
+# same code-point table as the literal matcher (an escape has no surrounding
+# script to justify a context-dependent mark, so those are included); plane 14
+# is matched by its shared lead bytes / hex prefix.
+def _agent_rules_escaped_hidden_re():
+    cps = sorted(set(patterns.AGENT_RULES_HIDDEN_CPS) | set(patterns.AGENT_RULES_CONTEXT_CPS)
+                 | set(range(0xfe00, 0xfe0f)))
+    hexes = "|".join(f"{c:x}" for c in cps) + r"|e0[0-9a-f]{3}"
+    hx, oc = [], []
+    for c in cps:
+        bs = chr(c).encode("utf-8")
+        hx.append("".join(r"\\x\{?%02x\}?" % x for x in bs))
+        oc.append("".join(r"\\[0o]?%03o" % x for x in bs))
+    hx.append(r"\\x\{?f3\}?\\x\{?a0\}?")              # plane 14 lead bytes
+    oc.append(r"\\[0o]?363\\[0o]?240")
+    # A four-digit / eight-digit code-point escape is fixed width, so a
+    # following hex-looking letter is text; shells also accept a short `\U`.
+    u4 = "|".join(f"{c:04x}" for c in cps if c <= 0xffff)
+    u8 = "|".join(f"{c:08x}" for c in cps) + r"|000e0[0-9a-f]{3}"
+    return re.compile(
+        r"\\u(?:" + u4 + r")"
+        r"|(?:\\|`)u\{0*(?:" + hexes + r")\}"
+        r"|\\x\{0*(?:" + hexes + r")\}"
+        r"|\\U(?:" + u8 + r")"
+        r"|\\U0{0,3}(?:" + hexes + r")(?![0-9a-f])"
+        r"|\\udb40\\ud[c-f][0-9a-f]{2}"
+        # a bare hex constant only inside a character-construction call
+        r"|(?:\bchr|\bunichr|char\]|fromCodePoint|fromCharCode|\\N\{U\+)[ \t]{0,4}\(?[ \t]{0,4}"
+        r"(?:0x)?0{0,8}(?:" + hexes + r")\b"
+        r"|&#x0*(?:" + hexes + r");"
+        r"|" + "|".join(hx) + "|" + "|".join(oc),
+        re.IGNORECASE)
+
+
+_AGENT_RULES_ESCAPED_HIDDEN_RE = _agent_rules_escaped_hidden_re()
+
+
+def _agent_rules_counter(found: list) -> dict:
+    out = {}
+    for f in found:
+        k = f.split("@", 1)[0]
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _agent_rules_new_hidden(v, _depth: int = 0) -> list:
+    """Suspicious hidden characters a tool call ADDS. Every string leaf is
+    scanned, with one exception: inside a mapping that is a recognised edit
+    pair (``old_string``/``new_string`` and the like), the old text is not
+    scanned, and the new text is clean if every hidden character in it was
+    already in the old text (same code point, no more occurrences) -- so an
+    edit that removes them, or keeps a line that already had them, is not
+    denied. An ``old*`` key WITHOUT its partner earns nothing (QA round 2: a
+    spurious ``old`` key next to ``content`` suppressed the deny)."""
+    if _depth > 12:
+        return []
+    if isinstance(v, str):
+        return _agent_rules_hidden(v)
+    if isinstance(v, dict):
+        skip, out = set(), []
+        for old_k, new_k in _AGENT_RULES_EDIT_PAIRS:
+            old, new = v.get(old_k), v.get(new_k)
+            if isinstance(old, str) and isinstance(new, str):
+                skip.update((old_k, new_k))
+                if old == new:
+                    continue
+                found = _agent_rules_hidden(new)
+                if not found:
+                    continue
+                had = _agent_rules_counter(_agent_rules_hidden(old))
+                # a capped result means "at least this many": it cannot show
+                # that the old text already held them all
+                if (len(found) >= patterns.AGENT_RULES_MAX_HITS
+                        or any(n > had.get(k, 0) for k, n in _agent_rules_counter(found).items())):
+                    out.extend(found)
+        for k, x in v.items():
+            if k not in skip:
+                out.extend(_agent_rules_new_hidden(x, _depth + 1))
+        return out
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            out.extend(_agent_rules_new_hidden(x, _depth + 1))
+        return out
+    return []
+
+
+def _agent_rules_keyed_strings(v, key_re, _depth: int = 0, _budget=None, _hit=False) -> list:
+    """String values (or lists of strings) under keys matching ``key_re``, at
+    any depth (bounded)."""
+    if _budget is None:
+        _budget = [2048]
+    out = []
+    if _depth > 12 or _budget[0] <= 0:
+        return out
+    if isinstance(v, str):
+        if _hit and 0 < len(v) <= 4096:
+            _budget[0] -= 1
+            out.append(v)
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            hit = isinstance(k, str) and bool(key_re.search(k))
+            if isinstance(x, str) or (hit and isinstance(x, (list, tuple))):
+                out.extend(_agent_rules_keyed_strings(x, key_re, _depth + 1, _budget, hit))
+            elif isinstance(x, (dict, list, tuple)):
+                out.extend(_agent_rules_keyed_strings(x, key_re, _depth + 1, _budget, False))
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            if isinstance(x, str) or isinstance(x, (dict, list, tuple)):
+                out.extend(_agent_rules_keyed_strings(
+                    x, key_re, _depth + 1, _budget,
+                    _hit and isinstance(x, (str, list, tuple))))
+    return out
+
+
+def _agent_rules_mapping_keys(v, _depth: int = 0, _budget=None) -> list:
+    """Mapping keys, at any depth (bounded): `{"files": {"<path>": "<content>"}}`
+    carries the path as a KEY."""
+    if _budget is None:
+        _budget = [256]
+    out = []
+    if _depth > 12 or _budget[0] <= 0:
+        return out
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if isinstance(k, str) and 0 < len(k) <= 1024 and _budget[0] > 0:
+                _budget[0] -= 1
+                out.append(k)
+            if isinstance(x, (dict, list, tuple)):
+                out.extend(_agent_rules_mapping_keys(x, _depth + 1, _budget))
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            out.extend(_agent_rules_mapping_keys(x, _depth + 1, _budget))
+    return out
+
+
+# Filesystem budget. Symlink resolution on agent-chosen names is bounded per
+# evaluation: Python's realpath lstat()s every component of every link target,
+# so planted links with 4 KB targets made a 430-character command take 3.5 s
+# (QA round 7). Past the deadline, paths are handled lexically only and the
+# staged-source scan stops -- the decision degrades to the ordinary ask, never
+# to a stall (a hook timeout fails open).
+_AGENT_RULES_FS_BUDGET_S = 0.15
+_AGENT_RULES_FS_DEADLINE = [None]
+
+
+def _agent_rules_fs_ok() -> bool:
+    # The clock starts at the FIRST filesystem call, not at rule entry: time
+    # spent walking large arguments must not use up the budget before the
+    # target path itself has been resolved (QA round 8).
+    if _AGENT_RULES_FS_DEADLINE[0] is None:
+        _AGENT_RULES_FS_DEADLINE[0] = time.monotonic() + _AGENT_RULES_FS_BUDGET_S
+    return time.monotonic() < _AGENT_RULES_FS_DEADLINE[0]
+
+
+def _agent_rules_realpath(p: str) -> Optional[str]:
+    if not _agent_rules_fs_ok():
+        return None
+    try:
+        return os.path.realpath(p)
+    except Exception:
+        return None
+
+
+def _agent_rules_path_forms(ev: Event, p: str) -> list:
+    """The path as written, lexically normalized (``a/../.cursor/rules/x``),
+    and -- only when it is absolute or the event carries a cwd to anchor it --
+    resolved with symlinks followed. A relative path with no known cwd is NOT
+    resolved: that would silently anchor it to the hook process's own cwd."""
+    forms = [p]
+    try:
+        if len(p) > 4096:
+            return forms
+        flat = p.replace("\\", "/")
+        if flat.lower().startswith("file://"):
+            flat = flat[7:]
+            if flat.lower().startswith("localhost/"):
+                flat = flat[9:]
+        if "%" in flat:
+            flat = urllib.parse.unquote(flat)
+        # NTFS alternate-data-stream suffix (`file::$DATA`, `file:stream`) names
+        # the same file; a drive letter's colon is not one.
+        head, sep, last = flat.rpartition("/")
+        colon = last.find(":", 2)
+        if colon > 0:
+            flat = head + sep + last[:colon]
+        forms.append(posixpath.normpath(flat))
+        if not flat.startswith("/") and not re.match(r"^[A-Za-z]:/", flat):
+            if not ev.cwd:
+                return forms
+            flat = posixpath.join(str(ev.cwd).replace("\\", "/"), flat)
+        forms.append(posixpath.normpath(flat))
+        # never touch a UNC path; bounded lstat work
+        if flat.startswith("/") and not flat.startswith("//") and flat.count("/") <= 64:
+            real = _agent_rules_realpath(flat)
+            if real:
+                forms.append(real)
+    except Exception:
+        pass
+    return forms
+
+
+def _agent_rules_generic_hit(ev: Event, form: str) -> bool:
+    """`.rules` / `AGENT.md` / `replit.md` count only at the worktree root: a
+    bare name, or a path whose parent is the session cwd (or any parent when
+    no cwd is known -- the safe direction)."""
+    flat = form.replace("\\", "/")
+    head, _, name = flat.rpartition("/")
+    if not patterns.AGENT_RULES_GENERIC_NAME_RE.match(name):
+        return False
+    if not head or head == "." or not ev.cwd:
+        return True
+    cwd = posixpath.normpath(str(ev.cwd).replace("\\", "/"))
+    real_cwd = (_agent_rules_realpath(cwd) if cwd.startswith("/") else None) or cwd
+    return posixpath.normpath(head).lower() in (cwd.lower(), real_cwd.lower())
+
+
+def _agent_rules_target(ev: Event):
+    """(path as written, all its forms) for the first argument path that names
+    an agent rules/instructions file, else ('', [])."""
+    cands = []
+    p = _path(ev)
+    if p:
+        cands.append(p)
+    args = ev.args or {}
+    for leaf in _agent_rules_keyed_strings(args, _AGENT_RULES_PATH_KEY_RE):
+        if len(leaf) <= 4096 and "\n" not in leaf:
+            cands.append(leaf)
+    cands = list(dict.fromkeys(cands))
+    n_values = len(cands)
+    if ev.action == ActionClass.MCP:
+        seen = set(cands)
+        for key in _agent_rules_mapping_keys(args):
+            if key not in seen:
+                seen.add(key)
+                cands.append(key)
+    spent = 0
+    for i, c in enumerate(cands[:4096]):
+        spent += len(c)
+        if spent > 262144:               # bounded work; the flat scan below takes over
+            break
+        if re.match(r"^[a-z][a-z0-9+.-]*://", c, re.IGNORECASE) and not c.lower().startswith("file://"):
+            continue                      # an http(s) URL is not a local path
+        forms = _agent_rules_path_forms(ev, c)
+        if i >= n_values:
+            # A mapping KEY is only a path if it reads as one by itself: never
+            # anchor an argument NAME (`text`, `channel`) to the session cwd.
+            forms = forms[:2]
+        for form in forms:
+            if form and (patterns.agent_rules_path_hit(form)
+                         or _agent_rules_generic_hit(ev, form)):
+                return c, forms
+    if len(cands) >= 2000 or spent > 262144:
+        # The bounded walk ran out before seeing every argument: fall back to
+        # a flat scan of all string leaves so padding cannot hide the target.
+        for leaf in _flatten_strings(args):
+            if 0 < len(leaf) <= 4096 and patterns.agent_rules_path_hit(leaf):
+                return leaf, [leaf]
+    return "", []
+
+
+# Staged sources. `cp notes.txt .cursorrules` shows the reviewer a harmless
+# command while the hidden payload sits in notes.txt, so the file being copied
+# is read for hidden characters. Deliberately NARROW (QA round 3: a wider
+# version globbed agent-chosen patterns -- an 80 s hang -- and denied on files
+# that were never sources):
+#   - only the simple command (no `;`/`&`/`|`/newline inside) that names the
+#     rules path, and only when its command word is a plain copy/move/
+#     concatenate tool (cp, mv, cat, tee, dd, install, ln, rsync);
+#   - only operands that are existing REGULAR files, named literally (after
+#     `~`/`$PWD` expansion): no directories, no globs, no variables;
+#   - at most 16 distinct files and 500 KB in total (in operand order), opened
+#     non-blocking and re-checked
+#     with fstat; nothing under /proc, /sys, /dev; no UNC paths (a hook
+#     timeout fails open, so nothing here may stall);
+#   - text only: a file with NUL bytes or more than 1% undecodable bytes is an
+#     archive/image/binary, not instructions.
+_AGENT_RULES_SRC_MAX_FILES = 16
+_AGENT_RULES_SRC_MAX_BYTES = 500_000
+_AGENT_RULES_SRC_TOTAL_BYTES = 500_000
+_AGENT_RULES_SRC_CMD_RE = re.compile(
+    r"(?:^|[\s/\\!])(?:cp|mv|cat|tee|dd|install|ln|rsync|copy|move)(?=[\s<>]|$)", re.IGNORECASE)
+# the rules path is where the command WRITES: a redirect/of=/tee/-t target, or
+# the last operand
+_AGENT_RULES_SRC_DEST_RE = re.compile(r">|\bof=|\btee\b|\s-t\b|--target-directory", re.IGNORECASE)
+_AGENT_RULES_SRC_TOKEN_SPLIT_RE = re.compile(r"[\s<>()=]+")
+
+
+def _agent_rules_read_text(fp: str) -> Optional[str]:
+    try:
+        real = _agent_rules_realpath(fp)
+        if not real or real.startswith(("/proc/", "/sys/", "/dev/")) or real.startswith("//"):
+            return None
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0))
+    except Exception:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, _AGENT_RULES_SRC_MAX_BYTES)
+    except Exception:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    if not data or b"\x00" in data:
+        return None
+    text = data.decode("utf-8", "replace")
+    if text.count(chr(0xfffd)) * 100 > len(text):
+        return None
+    return text
+
+
+def _agent_rules_source_hidden(ev: Event, names: list) -> list:
+    """Hidden characters in the literally-named regular files among ``names``
+    (bounded; see the comment above)."""
+    seen, done, budget = 0, set(), _AGENT_RULES_SRC_TOTAL_BYTES
+    # distinct operand strings only, and a bounded number of them, BEFORE any
+    # filesystem call
+    for t in list(dict.fromkeys(names))[:64]:
+        if not _agent_rules_fs_ok():
+            break
+        if (not t or t.startswith("-") or len(t) > 1024 or t.startswith(("//", "\\\\"))
+                or any(ch in t for ch in "*?[{")
+                or patterns.agent_rules_path_hit(t)
+                or patterns.AGENT_RULES_ROOT_FILE_RE.search(t)):
+            continue                      # flag, glob, UNC, or the rules file itself
+        try:
+            if ev.cwd:
+                t = re.sub(r"^\$\{?PWD\}?(?=/|$)", lambda m: str(ev.cwd), t)
+            t = os.path.expanduser(t)
+            fp = t if os.path.isabs(t) else (os.path.join(str(ev.cwd), t) if ev.cwd else None)
+            if not fp or _agent_rules_generic_hit(ev, fp) or not os.path.isfile(fp):
+                continue
+        except Exception:
+            continue
+        fp = _agent_rules_realpath(fp)
+        if not fp:
+            break
+        if fp in done:
+            continue
+        done.add(fp)
+        seen += 1
+        if seen > _AGENT_RULES_SRC_MAX_FILES or budget <= 0:
+            break
+        text = _agent_rules_read_text(fp)
+        if text:
+            text = text[:budget]
+            budget -= len(text)
+            hits = _agent_rules_hidden(text)
+            if hits:
+                return [f"{h} in {os.path.basename(fp)}" for h in hits[:6]]
+    return []
+
+
+def _agent_rules_shell_sources(ev: Event, raw: str) -> list:
+    """Operand tokens of the copy/move/concatenate simple commands in ``raw``
+    that also name a rules path."""
+    out = []
+    text = normalize._LINE_CONT_RE.sub(" ", raw[:20000])
+    text = re.sub(r"\$\{PWD\}|\"\$PWD\"", "$PWD", text)
+
+    def _is_rules(tok: str) -> bool:
+        return bool(patterns.agent_rules_path_hit(tok) or patterns.AGENT_RULES_ROOT_FILE_RE.search(tok)
+                    or _agent_rules_cwd_generic_hit(ev, tok))
+
+    for seg in patterns.AGENT_RULES_CMD_SEP_RE.split(text):
+        if len(out) > 256:
+            break
+        seg = seg.strip().lstrip("({ ")
+        if not _AGENT_RULES_SRC_CMD_RE.search(seg[:200]) or not _is_rules(seg):
+            continue
+        try:
+            toks = shlex.split(seg, comments=True, posix=True)
+        except Exception:
+            toks = []
+        if not _AGENT_RULES_SRC_DEST_RE.search(seg):
+            # No redirect/of=/tee/-t: for cp/mv/install/ln/rsync the rules file
+            # is the destination unless it is the FIRST operand (a trailing
+            # flag or comment must not change that); a bare `cat a b` reads.
+            if not re.search(r"(?:^|[\s/\\!])(?:cp|mv|install|ln|rsync|copy|move)(?=\s|$)",
+                             seg[:200], re.IGNORECASE):
+                continue
+            ops = [t for t in toks[1:] if not t.startswith("-")
+                   and not re.fullmatch(r"(?:cp|mv|install|ln|rsync|copy|move|sudo|env|command)", t)
+                   and "=" not in t.split("/")[0]]
+            if not ops or _is_rules(ops[0]) and not any(_is_rules(t) for t in ops[1:]):
+                continue                  # the rules file is being read, not written
+        have = set(toks)
+        out.extend(toks[1:])
+        for t in _AGENT_RULES_SRC_TOKEN_SPLIT_RE.split(seg):   # `cat<a>b`, `if=a`
+            t = t.strip("'\"")
+            if t and t not in have:
+                have.add(t)
+                out.append(t)
+    return out
+
+
+def _agent_rules_cwd_generic_hit(ev: Event, text: str,
+                                 lead: str = r"(?:^|[\s'\"=<>|&;({,:])") -> bool:
+    """A root-only generic name written through the session cwd's absolute path."""
+    if not ev.cwd or len(str(ev.cwd)) > 1024:
+        return False
+    cwd = re.escape(str(ev.cwd).rstrip("/\\")).replace("/", r"[/\\]")
+    try:
+        return bool(re.search(lead + cwd + r"[/\\]+" + patterns.AGENT_RULES_GENERIC_TAIL,
+                              text, re.IGNORECASE))
+    except re.error:
+        return False
+
+
+# Constructs that carry a target from one simple command into another (a
+# heredoc body, a loop variable, xargs, a command substitution): the
+# same-simple-command requirement is dropped when one is present.
+_AGENT_RULES_JOINED_CMD_RE = re.compile(r"<<|\bxargs\b|\bfor\s|\bwhile\s|\$\(|`|<\(|\bparallel\b",
+                                        re.IGNORECASE)
+# `cd .cursor/rules && wget URL`: the directory operand carries the target
+# into the commands that follow.
+_AGENT_RULES_CHDIR_RE = re.compile(
+    r"(?:\b(?:cd|pushd|chdir|Set-Location)|(?-i:\s-C)|--(?:prefix|directory|work-tree))[ \t=]{1,8}"
+    r"(?:--[ \t]{1,8})?(?:\"([^\"\n]{1,1024})\"|'([^'\n]{1,1024})'|(\S{1,1024}))",
+    re.IGNORECASE)
+_AGENT_RULES_READ_TOOL_RE = re.compile(
+    r"^(?:read|get|list|ls|search|find|grep|glob|stat|info|view|show|head|tail|tree|describe"
+    r"|exists|cat|query|diff|blame|log|status|directory_tree)(?:[_-]|(?-i:[A-Z])|$)", re.IGNORECASE)
+_AGENT_RULES_WRITE_WORD_RE = re.compile(
+    r"write|edit|creat|updat|delet|remov|move|renam|put|set|push|commit|append|replac|patch"
+    r"|insert|save|upload|apply|copy|output|export|download|clone|checkout|restore|exec|run"
+    r"|modif|chang|fix|format|add",
+    re.IGNORECASE)
+
+
+# The text between the start of a simple command and an `-o`-style option,
+# when that command is `ls`/`test`/`[` (where -o / -lo is not "output"). No
+# quote may sit in between: a quoted `;` would otherwise fake a command start.
+_AGENT_RULES_READONLY_CMD_RE = re.compile(
+    r"^\s*(?:ls|ll|dir|test|\[\[?)(?:\s[^'\"$<>]{0,400})?$", re.IGNORECASE)
+
+
+def _agent_rules_shell_write_hit(ev: Event, cmd: str) -> str:
+    """Why this shell command counts as writing an agent rules file ('' if it
+    does not). ``cmd`` is the de-obfuscated scan surface."""
+    names_file = bool(patterns.agent_rules_path_hit(cmd)
+                      or patterns.AGENT_RULES_ROOT_FILE_RE.search(cmd))
+    names_file = names_file or _agent_rules_cwd_generic_hit(ev, cmd)
+    find_hit = patterns.agent_rules_find_hit(cmd)
+    parent = bool(patterns.AGENT_RULES_PARENT_DIR_RE.search(
+        patterns.AGENT_RULES_EXCLUDE_ARG_RE.sub(" ", cmd)))
+    for opt in patterns.AGENT_RULES_OPT_VALUE_RE.finditer(cmd):
+        # `ls -lo <path>` / `[ -e a -o <path> ]`: not output options
+        head = re.split(r"[|;&\n(){}`]", cmd[max(opt.start() - 400, 0):opt.start()])[-1]
+        if not _AGENT_RULES_READONLY_CMD_RE.match(head):
+            return "an output option whose value is the rules path"
+    if _agent_rules_cwd_generic_hit(
+            ev, cmd, r"(?:^|\s)" + patterns.AGENT_RULES_OUT_OPT_SRC + r"(?:\s+|=)['\"]?"):
+        return "an output option whose value is the rules path"
+    if not (names_file or find_hit or parent):
+        return ""
+    verbs = patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", cmd)
+    placing = bool(patterns.ARCHIVE_SYNC_VERB_RE.search(verbs)
+                   or patterns.COPY_WRITE_VERB_RE.search(verbs)
+                   or patterns.FORCED_LINK_WRITE_RE.search(verbs)
+                   or patterns.DELETE_OR_MOVE_VERB_RE.search(verbs))
+    if names_file or find_hit or parent:
+        if placing and not (names_file or find_hit):
+            return "a whole agent directory being placed"
+        if placing:
+            return "a copy/move/delete/archive verb"
+        if (names_file or find_hit) and (
+                patterns.WRITE_REDIRECT_RE.search(verbs)
+                or patterns.DESTRUCTIVE_DELETE_RE.search(verbs)
+                or patterns.INPLACE_WRITE_RE.search(verbs)):
+            return "a redirect / in-place edit / delete"
+        # Common-word verbs: the rules path must sit in the same simple command.
+        # The scan surface is several renderings of the command joined by a
+        # space (raw, quote-stripped, decoded...); test the first rendering
+        # apart from the rest so the END of one copy and the START of the
+        # next are never read as one simple command.
+        first = normalize._LINE_CONT_RE.sub(" ", _cmd(ev)[:normalize._MAX])
+        if cmd.startswith(first) and len(cmd) > len(first):
+            parts = [first, cmd[len(first) + 1:]]
+        else:
+            parts = [cmd]
+        joined = bool(_AGENT_RULES_JOINED_CMD_RE.search(cmd)) or any(
+            patterns.agent_rules_path_hit(m.group(1) or m.group(2) or m.group(3))
+            or patterns.AGENT_RULES_PARENT_DIR_RE.search(m.group(1) or m.group(2) or m.group(3))
+            for m in _AGENT_RULES_CHDIR_RE.finditer(cmd))
+        for rx, text in ((rx, patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", part))
+                         for part in parts
+                         for rx in (patterns.AGENT_RULES_CMD_WRITE_VERB_RE,
+                                    patterns.AGENT_RULES_API_WRITE_VERB_RE)):
+            for n, m in enumerate(rx.finditer(text)):
+                if n >= 64:
+                    # Bounded work: a command with this many write verbs that
+                    # also names a rules file is treated as a write.
+                    return "many write verbs"
+                lo = max(m.start() - 400, 0)
+                # the match may START with the separator that precedes the
+                # verb, so cut on the text up to the END of the match
+                before = text[lo:m.end()]
+                cut = max((s.end() for s in patterns.AGENT_RULES_CMD_SEP_RE.finditer(before)),
+                          default=0)
+                after = text[m.end():m.end() + 400]
+                nxt = patterns.AGENT_RULES_CMD_SEP_RE.search(after)
+                simple = before[cut:] + (after[:nxt.start()] if nxt else after)
+                # `git restore --staged <f>` only unstages -- unless it also
+                # touches the worktree (--worktree, abbreviable; -W) or takes
+                # its content from another revision (-s/--source).
+                if (re.search(r"\bgit\b.*\brestore\b", m.group(0), re.IGNORECASE)
+                        and re.search(r"\s--staged\b|\s-S\b", simple.split(" #")[0])
+                        and not re.search(r"\s--w[a-z-]*|\s-[A-Za-z]*[Ws]|\s--so[a-z]*", simple)):
+                    continue
+                if joined:
+                    # the target may sit in a heredoc body / loop list / xargs
+                    # input: it is already known to be named in the command
+                    return f"the write verb `{m.group(0).strip()[:40]}`"
+                span = simple
+                if (patterns.agent_rules_path_hit(span)
+                        or patterns.AGENT_RULES_ROOT_FILE_RE.search(span)
+                        or _agent_rules_cwd_generic_hit(ev, span)
+                        or (parent and patterns.AGENT_RULES_PARENT_DIR_RE.search(span))
+                        or (find_hit and patterns.agent_rules_find_hit("find " + span))):
+                    return f"the write verb `{m.group(0).strip()[:40]}`"
+    if parent and placing:
+        return "a whole agent directory being placed"
+    return ""
+
+
+def _agent_rules_hidden_mode(cfg: dict) -> str:
+    raw = cfg.get("hidden_chars", "deny")
+    if raw is False:
+        return "off"
+    m = str(raw).lower()
+    return m if m in ("ask", "off") else ("off" if m == "false" else "deny")
+
+
+def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate writes to ANOTHER AI coding agent's auto-loaded rules/instructions
+    files -- the surface ``rule_agent_def_protect`` (``CLAUDE.md``/``AGENTS.md``
+    only) never reaches: Cursor (``.cursorrules``, ``.cursor/rules/``,
+    ``.cursor/commands/``), GitHub Copilot (``.github/copilot-instructions.md``,
+    ``.github/instructions|prompts|chatmodes|agents/``), Gemini CLI
+    (``GEMINI.md``, ``.gemini/commands/``), Codex (``AGENTS.override.md``,
+    ``.codex/prompts/``), Windsurf (``.windsurfrules``, ``.windsurf/rules|
+    workflows/``, ``.codeium/windsurf/memories/``), Cline/Roo/Kilo
+    (``.clinerules``, ``.roorules``, ``.roomodes``, ``.roo/rules*/``,
+    ``.kilocode/rules*/``), Continue, Aider (``.aider.conf.yml``), Junie
+    (``.junie/guidelines``), Amazon Q, Augment, Trae, Goose, Qwen, Warp,
+    Crush, OpenCode, Kiro, IDX, JetBrains AI Assistant, OpenHands, Claude
+    Code's own ``.claude/rules/``, and -- at the worktree root only -- Zed's
+    ``.rules``, Amp's ``AGENT.md`` and Replit's ``replit.md``. The full
+    plan and threat model sit above ``patterns._AR_LEFT``.
+
+    Why it matters: each file is folded into some agent's context on every
+    session with no per-use trust check, and it is committed -- so one
+    injected write persists across sessions and people, and executes under a
+    DIFFERENT agent's authority (a teammate's auto-approving Cursor/Copilot
+    that Aegis does not gate): cross-agent privilege escalation through a file
+    that reviews as documentation.
+
+    Decisions:
+      - an Edit/Write whose target is one of these paths, an MCP tool call
+        naming one under a path/file/destination-like key (at any depth) or
+        as a mapping key, or a shell command that names one alongside a
+        write/delete/copy/archive verb, as the value of an output option, or
+        through a ``find`` predicate -> ``ask`` by default;
+      - the same, when the text being ADDED carries invisible / bidirectional
+        / Unicode-tag characters with no legitimate reading in context (the
+        "Rules File Backdoor" carrier, literal or as a shell escape) ->
+        ``deny`` even in ``ask`` mode and even when the policy ``allow`` list
+        matches: a human cannot review what the prompt cannot show them.
+
+    Config (``policy.agent_rules``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path -- as written or resolved -- or the
+    command, that skip the ask), ``hidden_chars`` (deny|ask|off, default deny:
+    how hidden characters are treated; ``ask`` folds them into the ordinary
+    ask with the code points listed, ``off`` ignores them). Human escape: a
+    trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_AGENT_RULES=1`` set before launch. Only the env toggle (or
+    ``hidden_chars``) lifts the hidden-character deny -- the comment does
+    not, since a main-session agent's own command can carry it. A spawned
+    agent can use neither. A fetch written straight to a rules file
+    (``curl -sSLo .cursorrules``, ``wget -P .cursor/rules``) is matched here
+    through the output option's operand, not through
+    ``rule_fetch_to_file_protect``'s backstop list: that rule runs before the
+    hard-deny guards, and its ask would mask their deny.
+
+    Rule order: PreToolUse events only, and the LAST core rule. The engine
+    returns the first non-allow decision, and an ``ask`` here must not mask a
+    ``deny`` from another guard (QA: placed beside ``rule_agent_def_protect``
+    it turned ``rm -rf ~ .cursorrules`` from deny into ask; before
+    ``rule_install_review``/``rule_branch_strands`` it did the same to
+    theirs; on a PermissionRequest event it preceded the lifecycle rules'
+    ``permission-escalation`` deny). The cost is the reverse: any earlier
+    guard's ``ask`` on the same call wins over this guard's hidden-character
+    ``deny``. Like every built-in guard it also runs BEFORE plugin rules, the
+    policy's own declarative rules and ``default_action``, so a user-written
+    deny for these paths is preceded by this ask (set ``mode: deny`` here to
+    hard-block).
+
+    Staged sources: when a plain copy/move/concatenate command (``cp``,
+    ``mv``, ``cat``, ``tee``, ``dd``, ``install``, ``ln``, ``rsync``) names a
+    rules path, the literally-named regular files among its own operands are
+    read for hidden characters, as is an MCP move/copy tool's ``source`` --
+    so ``mv notes.txt .cursorrules`` cannot launder a payload staged in
+    notes.txt. Narrow and bounded on purpose: 16 files, the first 500 KB in
+    total (in operand order), text only, never /proc|/sys|/dev or a UNC path, no directories, no globs, no
+    variables, no other commands' operands, the first 64 distinct operands,
+    and at most 150 ms of filesystem
+    work per call (symlink resolution included). Anything outside that is NOT
+    inspected and only gets the ordinary ask.
+
+    Honest scope -- a path-string match, with the same denylist trade-offs as
+    its siblings. Known gaps: Claude Code's auto-memory directory
+    (``~/.claude/projects/*/memory/``) is deliberately NOT gated (the agent
+    writes it by design); files an agent is only CONFIGURED to read (Aider
+    ``CONVENTIONS.md``, OpenCode ``instructions:`` globs, VS Code custom
+    instruction locations) are not known by name; ``.rules``/``AGENT.md``/
+    ``replit.md`` below the worktree root (and, in shell text, reached through
+    a path other than a bare name, ``./``, ``$PWD/`` or the literal cwd); a
+    rules filename outside the list above; visible malicious instructions
+    are not classified (the ask exists so a human reads them); a single
+    U+200D/U+FE0F/U+00AD is never treated as hidden, and zero-width/
+    direction marks beside non-ASCII letters, the three subdivision-flag tag
+    sequences and up to 32 variation selectors after a visible symbol are
+    accepted -- an attacker limited to those can still hide a few bits per
+    visible character; legitimate text outside those exemptions (bidi
+    isolates, ZWNJ in Latin-script words) is denied until ``hidden_chars``
+    is relaxed; a hidden character produced by an
+    encoding this guard does not decode or computed at run time
+    (``chr(8203)``, ``\\N{ZERO WIDTH SPACE}``, base64 into the file), and
+    control characters written as escapes (``\\033[8m``, ``\\b``) -- only
+    the literal characters are caught; a path spelled with a glob/brace/variable expansion
+    (``.cursorrule[s]``, ``$N.md``); a command longer than the shared
+    20,000-character scan window, or whose de-obfuscated surface (decoded
+    base64, inner interpreters) runs past 60,000 characters before the
+    rules path appears; one call carrying more than 20,000 zero-width/
+    direction marks in total (the per-mark context check stops there: later
+    strings are reported on their first mark, and an edit pair can no longer
+    be compared mark for mark); command verbs indented by more than 256
+    blanks; a tool whose name is neither a known
+    edit/write tool nor ``mcp__*``; an MCP path split across two arguments; a
+    shell command that builds the path across variables, or ``cd``s into the parent of a rules directory (or
+    starts with its cwd inside one) and writes a relative path; an MCP tool
+    whose write target sits under a key that is neither one of ``_path()``'s
+    nor destination-like. Shell matching is textual: a command that merely
+    mentions a rules file while writing elsewhere (``cp .cursorrules /tmp/x``)
+    asks too. An MCP tool whose own name marks it as a read (``read_*``,
+    ``get_*``, ``list_*``, ``search_*``, ... with no write-like word) is NOT
+    gated -- the name comes from the server the human configured; a server
+    that writes from a tool named like a read is outside what a path gate can
+    see. Every other MCP call naming a rules path asks. A false ask is the
+    safe direction. ``allow`` regexes are searched in the whole shell command,
+    so an allow-listed path mentioned anywhere in a command skips the ask. The extra write verbs this guard knows (git
+    checkout/restore/apply, patch, touch, editors, runtime file APIs) only
+    count when the rules path is in the same simple command, so a ``;`` inside
+    a quoted argument between such a verb and the path hides it -- unless the
+    command contains a heredoc, loop, ``xargs``, command substitution, or a
+    ``cd``/``pushd``/``-C`` into a rules directory,
+    where the target can travel between simple commands and any such verb
+    anywhere in the command counts (more false asks, by design). Most shell
+    writes under ``.claude/`` are already hard-denied by
+    ``rule_self_protect``; this guard adds the Edit/Write/MCP form for
+    ``.claude/rules`` and the shell verbs self-protect does not know."""
+    # PreToolUse only. Ten lifecycle rules run after the core rules; on a
+    # PermissionRequest/other lifecycle event an ask here would be returned
+    # before e.g. `permission-escalation` could deny (QA round 5).
+    if ev.event != HookEvent.PRE_TOOL_USE:
+        return None
+    _AGENT_RULES_FS_DEADLINE[0] = None
+    _AGENT_RULES_MARK_BUDGET[0] = patterns.AGENT_RULES_MAX_CONTEXT_MARKS
+    cfg = getattr(policy, "agent_rules", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+    hidden_mode = _agent_rules_hidden_mode(cfg)
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "agent-rules-protect-monitor")
+            return None
+        return would
+
+    def _hidden_text(found: list) -> str:
+        uniq = list(dict.fromkeys(found))
+        shown = ", ".join(uniq[:8]) + (", ..." if len(uniq) > 8 else "")
+        return (f"with characters a diff or review prompt does not render ({shown}) "
+                "-- the agent that later loads this file still reads them as "
+                "instructions (the 'Rules File Backdoor' technique)")
+
+    hidden_remedy = (" Denied: write the content without them (to clean an existing "
+                     "file, use an Edit that replaces the affected text), or a human "
+                     "may confirm with AEGIS_ALLOW_AGENT_RULES=1 or relax "
+                     "`agent_rules.hidden_chars` in policy; a spawned agent cannot.")
+    why_it_matters = ("an AI coding agent (Cursor, Copilot, Gemini, Windsurf, Cline/Roo, "
+                      "Codex, Claude Code, ...) folds this file into its own context on "
+                      "every session and acts on it with its own permissions; if it is "
+                      "committed, that reaches everyone who clones the repo")
+    next_step = ("Review the change before approving; to pre-approve, a human can launch "
+                 "with AEGIS_ALLOW_AGENT_RULES=1 -- a spawned agent cannot."
+                 if action == Action.ASK else
+                 "Blocked by policy (`agent_rules.mode: deny`); a human can launch with "
+                 "AEGIS_ALLOW_AGENT_RULES=1 after review -- a spawned agent cannot.")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        target, forms = _agent_rules_target(ev)
+        if not target:
+            return None
+        if os.environ.get("AEGIS_ALLOW_AGENT_RULES"):
+            return None
+        is_mcp = ev.action == ActionClass.MCP
+        if is_mcp:
+            # A tool that is a read by its own name (`read_file`,
+            # `get_file_contents`, `search_files`) does not write the file it
+            # names. The name comes from the server the human configured, not
+            # from the agent.
+            op = re.sub(r"^git[_-]", "", str(ev.tool or "").split("__")[-1], flags=re.IGNORECASE)
+            if _AGENT_RULES_READ_TOOL_RE.match(op) and not _AGENT_RULES_WRITE_WORD_RE.search(op):
+                return None
+        verb = ("is named by an MCP tool call (it may write it -- check what the call does)"
+                if is_mcp else "is being written")
+        found = []
+        if hidden_mode != "off":
+            found = _agent_rules_new_hidden(ev.args or {})
+            if not found and is_mcp:      # a move/copy tool's source file
+                found = _agent_rules_source_hidden(ev, [
+                    v for k, v in (ev.args or {}).items()
+                    if isinstance(k, str) and isinstance(v, str)
+                    and _AGENT_RULES_SRC_KEY_RE.match(k)])
+        if found and hidden_mode == "deny":
+            return _finish(Decision(Action.DENY, "agent-rules-protect",
+                                    f"AI-agent rules/instructions file '{target}' {verb} "
+                                    f"{_hidden_text(found)}.{hidden_remedy}"))
+        if not found and _agent_rules_allowed_by_policy(cfg, forms):
+            return None
+        extra = f" NOTE: the new text comes {_hidden_text(found)}." if found else ""
+        return _finish(Decision(action, "agent-rules-protect",
+                         f"AI-agent rules/instructions file '{target}' {verb} -- "
+                         f"{why_it_matters}.{extra} {next_step}"))
+
+    if _is_shell(ev):
+        # Bounded surface: nested interpreter wrappers can blow a 20 KB command
+        # up ~50x; the raw command is always the first rendering.
+        cmd = _shell_scan(ev)[:60000]
+        raw = _cmd(ev)
+        why = _agent_rules_shell_write_hit(ev, cmd)
+        if not why:
+            return None
+        if os.environ.get("AEGIS_ALLOW_AGENT_RULES"):
+            return None
+        found = []
+        if hidden_mode != "off":
+            found = _agent_rules_hidden(raw[:200000])
+            if not found:                 # only in a decoded / inner-interpreter form
+                # (control characters are ignored there: base64-decoding an
+                # ordinary path segment yields them by accident)
+                found = sorted({f.split("@", 1)[0] + " (decoded)"
+                                for f in _agent_rules_hidden(cmd)
+                                if not f.startswith("U+00")})
+            if not found:
+                m = _AGENT_RULES_ESCAPED_HIDDEN_RE.search(raw[:20000] + "\n" + cmd)
+                if m:
+                    found = [f"escape {m.group(0)}"]
+            if not found:
+                found = _agent_rules_source_hidden(ev, _agent_rules_shell_sources(ev, raw))
+        if found and hidden_mode == "deny":
+            # NOT waived by '# aegis-allow': that comment is text the agent's
+            # own command can carry in a main session; only the launch-time env
+            # toggle (or the policy knob) lifts the hidden-character deny.
+            return _finish(Decision(Action.DENY, "agent-rules-protect",
+                                    "An AI-agent rules/instructions file is being "
+                                    f"written from a shell {_hidden_text(found)}."
+                                    f"{hidden_remedy}"))
+        if _override_allowed(ev):
+            return None
+        if not found and _agent_rules_allowed_by_policy(cfg, [raw]):
+            return None
+        extra = f" NOTE: the command comes {_hidden_text(found)}." if found else ""
+        tail = ("A human may append '# aegis-allow', or set AEGIS_ALLOW_AGENT_RULES=1; "
+                "a spawned agent cannot." if action == Action.ASK else
+                "Blocked by policy (`agent_rules.mode: deny`); a human may append "
+                "'# aegis-allow' or set AEGIS_ALLOW_AGENT_RULES=1; a spawned agent cannot.")
+        return _finish(Decision(action, "agent-rules-protect",
+                         "This shell command names an AI-agent rules/instructions file "
+                         "(.cursorrules, .cursor/rules, .github/copilot-instructions.md, "
+                         f"GEMINI.md, .windsurfrules, .clinerules, ...) together with {why} "
+                         f"-- {why_it_matters}.{extra} "
+                         + ("If the command only reads the file, approving is safe. "
+                            if action == Action.ASK else "") + tail))
     return None
 
 
@@ -9633,6 +10481,7 @@ _CORE_RULES = (
     rule_destructive_delete,
     rule_install_review,
     rule_branch_strands,
+    rule_agent_rules_protect,
 )
 
 # Core PreToolUse/shell guards first, then the lifecycle-hook rules that cover the

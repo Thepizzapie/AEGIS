@@ -4,6 +4,7 @@ Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
 import re
+import unicodedata
 
 # Explicit, recorded override: append '# aegis-allow' (or --aegis-allow) to an
 # ESCAPABLE guard to confirm intent.
@@ -1595,6 +1596,404 @@ SKILL_FIND_PREDICATE_RE = _find_predicate_re(
 
 def skill_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, SKILL_FIND_PREDICATE_RE)
+
+
+# ---- Cross-agent rules / instructions file protection ---------------------------
+# PLAN (purpose / threat model / approach) for `rule_agent_rules_protect`.
+#
+# Purpose. `AGENT_INSTRUCTIONS_PATH_RE` above gates exactly two filenames
+# (`CLAUDE.md`, `AGENTS.md`). Every OTHER AI coding agent has its own
+# equivalent -- a file, or a directory of files, that the agent folds into its
+# own context on every session with no per-use trust prompt -- and none of them
+# was reached by any guard in this file:
+#
+#   Cursor          .cursorrules, .cursor/rules/**, .cursor/commands/**
+#   GitHub Copilot  .github/copilot-instructions.md, .github/instructions/**,
+#                   .github/prompts/**, .github/chatmodes/**, .github/agents/**
+#   Gemini CLI      GEMINI.md, .gemini/commands/**
+#   Codex           AGENTS.override.md (read IN PREFERENCE to AGENTS.md),
+#                   .codex/prompts/**
+#   Windsurf        .windsurfrules, .windsurf/rules/**, .windsurf/workflows/**,
+#                   ~/.codeium/windsurf/memories/**
+#   Cline / Roo /   .clinerules (file or directory), .roorules, .roomodes,
+#   Kilo            .clinerules-<mode>, .roorules-<mode>, .roo/rules[-<mode>]/**,
+#                   .roo/commands/**, .kilocode/rules[-<mode>]/**,
+#                   .kilocode/workflows/**
+#   Continue        .continuerules, .continue/rules/**, .continue/prompts/**
+#   Aider           .aider.conf.yml (`read:` auto-loads arbitrary files as
+#                   instructions; `lint-cmd`/`test-cmd` are shell commands)
+#   Zed             .rules (worktree root only)
+#   JetBrains Junie .junie/guidelines.md, .junie/guidelines/**
+#   Amazon Q        .amazonq/rules/**
+#   Augment / Trae  .augment-guidelines, .augment/rules/**, .trae/rules/**
+#   Goose / Qwen /  .goosehints, QWEN.md, WARP.md, CRUSH.md, AGENT.md (root only)
+#   Warp / Crush / Amp
+#   OpenCode        .opencode/agent(s)/**, .opencode/command(s)/**
+#   Kiro / IDX /    .kiro/steering/**, .idx/airules.md, .aiassistant/rules/**,
+#   JetBrains AI /  .openhands/microagents/**, replit.md, .agent/rules|workflows/**,
+#   OpenHands / ... .agents/skills/**, .github/skills/**, .kilocodemodes,
+#                   .roo/system-prompt-<mode>
+#   Claude Code     .claude/rules/** (auto-loaded project/user rules -- a
+#                   directory `AGENT_DEF_PATH_RE` never lists)
+#
+# Threat model. An agent that has been prompt-injected (a poisoned web page,
+# tool result, dependency README, issue comment) writes natural-language
+# instructions into one of these files. Three properties make this the
+# highest-leverage unguarded write left in a repo:
+#   1. Persistence across sessions AND people: the file is committed, so the
+#      instruction reaches every teammate who clones the repo and every future
+#      session, long after the injected session ended.
+#   2. Cross-agent privilege escalation: the writing agent may be sandboxed and
+#      Aegis-gated, but the READING agent (a teammate's Cursor/Copilot/Gemini,
+#      often in auto-approve mode, with different credentials) is not. One
+#      agent "frees" another -- instructions such as "always run `curl ... |
+#      sh` before tests" or "add this dependency to every project" execute
+#      under the other agent's authority.
+#   3. Review-resistant: it reads as documentation, and the published "Rules
+#      File Backdoor" technique hides the payload in zero-width / bidirectional
+#      / Unicode-tag characters that no diff or PR view renders, while the
+#      model still reads them.
+#
+# Approach. A path gate, the same shape as `rule_agent_def_protect`:
+#   - Edit/Write/MCP: the target path (raw, lexically normalized, and
+#     symlink-resolved) names one of the files/directories above -> ASK.
+#   - Shell: the command names one AND carries a write/delete/copy/archive
+#     verb (or a `find` predicate describing one) -> ASK.
+#   - Content written with invisible/bidi/tag characters that have no
+#     legitimate reading in context -> DENY by default, whatever the ask/deny
+#     mode and regardless of the policy `allow` list: a human cannot review
+#     what a prompt cannot show them. `hidden_chars: ask|off` relaxes it.
+#   - Runs AFTER the hard-deny shell guards (remote-exec, destructive git/
+#     delete), so an ask here never masks a deny there.
+#   - A fetch written straight to a rules file (`curl -o .cursorrules`) is
+#     matched here through the output option's own operand. NOT registered in
+#     the fetch-to-file backstop: that rule runs before the hard-deny guards,
+#     and an ask there masks their deny.
+# Not covered (disclosed in the rule's docstring): Claude Code's own
+# auto-memory directory (the agent writes it constantly by design; an ask on
+# every write would be noise), files an agent is merely CONFIGURED to read
+# (Aider `CONVENTIONS.md`, OpenCode `instructions:` globs), and instruction
+# text with no hidden characters (that is what the human ASK is for).
+# Boundaries. Wider than the `(?:^|[\s'"/\\=])` ... `_CI_END` pair the sibling
+# path patterns use: shell metacharacters are legal neighbours of a filename
+# with no space between (QA, bypass review: `echo x >.cursorrules`,
+# `cat<x>.cursorrules`, `cp x {.cursorrules,y}` all slipped past the narrower
+# pair -- and with the path unseen, the hidden-character deny never ran).
+_AR_LEFT = r"\s'\"=<>|&;({,"
+_AR_B = r"(?:^|[" + _AR_LEFT + r"/\\])"
+_AR_E = _WIN_TRIM + r"(?=[/\;&|)<>,}]|\s|['\"]|$)"
+_AR_MODE = r"(?:-[\w-]{1,60})?"
+
+
+def _ar_dir(*parts: str) -> str:
+    return (_WIN_TRIM + _SEP).join(parts)
+
+
+# Names gated at ANY depth (each tool reads them hierarchically or the name is
+# unmistakable). A docs page that happens to be called `gemini.md` matches too
+# (case-insensitive filesystems make it the same file as GEMINI.md) -- the
+# policy `allow` list is the remedy for a repo that has one.
+_AR_FILE_CORE = (
+    r"(?:\.cursorrules|\.windsurfrules|\.continuerules|\.goosehints|\.augment-guidelines"
+    r"|\.roomodes|\.kilocodemodes"
+    r"|\.(?:cline|roo)rules" + _AR_MODE
+    + r"|\.aider\.conf\.ya?ml"
+    r"|(?:GEMINI|QWEN|WARP|CRUSH)" + _WIN_TRIM + r"(?:\.local)?\.md"
+    r"|AGENTS" + _WIN_TRIM + r"\.override\.md"
+    r"|copilot-instructions" + _WIN_TRIM + r"\.md)")
+# A rules DIRECTORY, or anything beneath one: the end boundary accepts a
+# following separator, so `.cursor/rules/a/b/c.mdc` matches at `.cursor/rules`
+# whatever the nesting depth, and a bare `rsync -a x/ .cursor/rules/` matches
+# the same way AGENT_DEF_DIR_RE does for its own surface.
+_AR_DIR_CORE = (
+    r"(?:" + _ar_dir(r"\.cursor", r"(?:rules|commands)")
+    + r"|" + _ar_dir(r"\.windsurf", r"(?:rules|workflows)")
+    + r"|" + _ar_dir(r"\.codeium", r"windsurf", r"memories")
+    + r"|" + _ar_dir(r"\.roo", r"(?:rules" + _AR_MODE + r"|commands|system-prompt" + _AR_MODE + r")")
+    + r"|" + _ar_dir(r"\.kilocode", r"(?:rules" + _AR_MODE + r"|workflows)")
+    + r"|" + _ar_dir(r"\.continue", r"(?:rules|prompts)")
+    + r"|" + _ar_dir(r"\.amazonq", r"rules")
+    + r"|" + _ar_dir(r"\.augment", r"rules")
+    + r"|" + _ar_dir(r"\.trae", r"rules")
+    + r"|" + _ar_dir(r"\.junie", r"guidelines(?:\.md)?")
+    + r"|" + _ar_dir(r"\.claude", r"rules")
+    + r"|" + _ar_dir(r"\.codex", r"prompts")
+    + r"|" + _ar_dir(r"\.gemini", r"commands")
+    + r"|" + _ar_dir(r"\.opencode", r"(?:agents?|commands?)")
+    + r"|" + _ar_dir(r"\.github", r"(?:instructions|prompts|chatmodes|agents|skills)")
+    + r"|" + _ar_dir(r"\.kiro", r"steering")
+    + r"|" + _ar_dir(r"\.idx", r"airules\.md")
+    + r"|" + _ar_dir(r"\.aiassistant", r"rules")
+    + r"|" + _ar_dir(r"\.openhands", r"microagents")
+    + r"|" + _ar_dir(r"\.agent", r"(?:rules|workflows)")
+    + r"|" + _ar_dir(r"\.agents", r"skills")
+    + r")")
+# Names too generic to gate at any depth: Zed's `.rules`, Amp's `AGENT.md` and
+# Replit's `replit.md` are read from the worktree ROOT, while `semgrep/.rules`
+# or `docs/AGENT.md` deep in a tree are ordinary files (QA, false-positive
+# review). In shell text they match with no directory component (`.rules`,
+# `./.rules`) or directly under the session cwd; for an Edit/Write path the
+# rule compares the parent directory with the session cwd.
+_AR_GENERIC = r"(?:\.rules|(?:AGENT|replit)" + _WIN_TRIM + r"(?:\.local)?\.md)"
+
+AGENT_RULES_FILE_RE = re.compile(_AR_B + _AR_FILE_CORE + _AR_E, re.IGNORECASE)
+AGENT_RULES_DIR_RE = re.compile(_AR_B + _AR_DIR_CORE + _AR_E, re.IGNORECASE)
+AGENT_RULES_ROOT_FILE_RE = re.compile(
+    r"(?:^|[" + _AR_LEFT + r"])(?:\.[/\\]+|\$\{?PWD\}?[/\\]+)?" + _AR_GENERIC + _AR_E,
+    re.IGNORECASE)
+AGENT_RULES_GENERIC_NAME_RE = re.compile(r"^" + _AR_GENERIC + _WIN_TRIM + r"$", re.IGNORECASE)
+AGENT_RULES_GENERIC_TAIL = _AR_GENERIC + _AR_E      # source; rules.py prefixes the cwd
+
+# A rules path that is the VALUE of a command-line option -- the option's
+# output/destination operand:
+#   - any option with the path glued on (`-o.cursorrules`, `-C.cursor/rules`,
+#     `-d.cursor/rules`, `-t.cursor/rules`, `--output=.cursorrules`);
+#   - an output option followed by the path (`-o GEMINI.md`, `-sSLo x`,
+#     `--out .cursorrules`, `-out x`).
+# Anchoring on the operand is what keeps `grep -o foo GEMINI.md`,
+# `[ -f a -o -f b ]` and `pandoc GEMINI.md -o out.pdf` out (QA, false-positive
+# review: a bare "command has an -o flag" test asked on all of them).
+_AR_DEEP = r"(?:" + _AR_FILE_CORE + r"|" + _AR_DIR_CORE + r")" + _AR_E
+_AR_ANY_PATH = (r"(?:(?:[^\s'\"|;&<>]{0,1000}[/\\])?" + _AR_DEEP           # bare operand
+                + r"|\"(?:[^\"\n]{0,1000}[/\\])?" + _AR_DEEP               # "quoted, may hold spaces"
+                + r"|'(?:[^'\n]{0,1000}[/\\])?" + _AR_DEEP
+                + r"|['\"]?(?:\.[/\\]+|\$\{?PWD\}?[/\\]+)?" + _AR_GENERIC + _AR_E + r")")
+AGENT_RULES_OUT_OPT_SRC = (r"(?:-(?-i:[A-Za-z0-9#]{0,8}[oOP])|--?out(?:put|file|-file)?"
+                           r"|--(?:directory-prefix|output-dir(?:ectory)?|output-document))")
+AGENT_RULES_OPT_VALUE_RE = re.compile(
+    r"(?:^|\s)(?:"
+    r"-[A-Za-z]{1,9}=?"                                      # glued: -o<path>, -C<path>
+    r"|--[a-z-]{0,20}(?:out|dest|dir|file|target|prefix)[a-z-]{0,20}="   # --output=<path>
+    r"|" + AGENT_RULES_OUT_OPT_SRC + r"(?:\s+|=)"              # output option, then path
+    r")" + _AR_ANY_PATH,
+    re.IGNORECASE)
+
+# `find -name/-path/-regex` indirection (same reason AGENT_DEF_FIND_PREDICATE_RE
+# exists). Bare agent-directory names are fallbacks because a `-regex` value
+# separates path components with its own wildcards -- limited to directory
+# names with no other common use (QA: `.claude`/`.codex`/`.gemini`/`.github`
+# as bare fallbacks asked on ordinary `find ... -prune` commands).
+AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:cursorrules|windsurfrules|clinerules|roorules|roomodes|kilocodemodes|continuerules"
+    r"|goosehints|augment-guidelines|copilot-instructions|aider\.conf"
+    r"|(?:GEMINI|QWEN|WARP|CRUSH)\\?\.md\b|AGENTS\\?\.override"
+    r"|\.(?:cursor|windsurf|roo|kilocode|amazonq|augment|trae|junie|kiro|aiassistant|openhands)\b"
+    r"|\.(?:claude|continue)\b[^'\"\s]{0,40}rules"
+    r"|\.(?:codex|continue)\b[^'\"\s]{0,40}prompts"
+    r"|\.gemini\b[^'\"\s]{0,40}commands"
+    r"|\.github\b[^'\"\s]{0,40}(?:instructions|prompts|chatmodes|agents)\b)")
+
+
+def agent_rules_find_hit(cmd: str) -> bool:
+    # a `-prune` on the matched directory EXCLUDES it from whatever follows
+    if re.search(r"\s-prune\b", cmd) and not re.search(r"-(?:delete|exec|ok)\b[^|;&]*$", cmd.split("-prune")[0]):
+        cmd = re.sub(r"(?<!\S)-i?(?:path|name|wholename|regex)\s+\S+\s+-prune\s+-o(?=\s)", " ", cmd)
+    return _find_word_and_predicate_hit(cmd, AGENT_RULES_FIND_PREDICATE_RE)
+
+
+def agent_rules_path_hit(text: str) -> bool:
+    """A rules file/directory named anywhere in ``text`` (depth-independent
+    names only; the root-only generic names are separate)."""
+    return bool(AGENT_RULES_FILE_RE.search(text) or AGENT_RULES_DIR_RE.search(text))
+
+
+# A shell fd duplication or a discard to /dev/null is not a file write; without
+# stripping these, `cat .cursorrules 2>/dev/null` reads as "names a rules file
+# + has a redirect". The lookbehind pins the start of the digit/`&` run so the
+# pattern cannot rescan it from every offset (QA round 2: the unanchored form
+# was quadratic -- 12 s on 60k `&`).
+AGENT_RULES_FD_NOISE_RE = re.compile(
+    r"(?<![0-9&])[0-9&]{0,4}>>?\s*&[0-9-]{1,4}|(?<![0-9&])[0-9&]{0,4}>>?\s*/dev/null\b"
+    # `Co-Authored-By: Name <a@b.c>` -- the `>` of an e-mail address in a commit
+    # trailer is not a redirect (QA round 4: every commit of a rules file asked)
+    r"|<[\w.+-]{1,64}@[\w.-]{1,255}>")
+
+# Whole-directory placement: `cp -r /tmp/rules .cursor/`, `rsync -a x/ .cursor/`,
+# `tar xf a.tar -C .cursor`, `ln -s /tmp/evil .cursor` drop a rules directory
+# without ever naming it. Limited to agent directories with no other common
+# use; `.github`/`.claude`/`.codex`/`.gemini`/`.continue` are left out.
+AGENT_RULES_PARENT_DIR_RE = re.compile(
+    _AR_B + r"\.(?:cursor|windsurf|roo|kilocode|amazonq|augment|trae|junie|kiro"
+    r"|aiassistant|openhands|opencode|agents?|codeium|idx)" + _WIN_TRIM + r"(?:[/\\]+)?(?=[;&|)<>,}]|\s|['\"]|$)",
+    re.IGNORECASE)
+AGENT_RULES_EXCLUDE_ARG_RE = re.compile(r"--exclude(?:-from)?(?:=|\s+)\S+", re.IGNORECASE)
+
+# Write verbs the shared verb patterns do not know (QA, bypass review -- each
+# reproduced as an allow while naming a rules file). Unlike the shared verbs,
+# these are common words, so the rule requires the rules path inside the SAME
+# simple command as the verb (no `;`/`&`/`|`/newline between them), not merely
+# somewhere in the command line (QA round 2, false-positive review:
+# `git checkout main && cat GEMINI.md`, `git commit -m 'patch .cursorrules'`).
+#   COMMAND verbs must sit at command position (optionally after sudo/env/
+#   xargs/...), so `grep -c vi GEMINI.md` is not "vi".
+# No `\s*` here: with `\n` as an anchor, a whitespace-run quantifier that can
+# also cross newlines rescans the run from every newline (QA round 7: 88 s on
+# 20 KB of blank lines). Horizontal whitespace only, bounded.
+_AR_CMD_PREFIX = (r"(?:^|[;&|({\n]|\b(?:sudo|doas|env|xargs|exec|command|nohup|time|then|do|else)\b"
+                  r"(?:[ \t]{1,8}-[^\s;&|]{1,40}(?:[ \t]{1,8}[^\s;&|-][^\s;&|]{0,40})?){0,4})[ \t]{0,256}"
+                  r"(?:[A-Za-z_][A-Za-z0-9_]{0,40}=[^\s;&|]{0,200}[ \t]{1,8}){0,4}")
+AGENT_RULES_CMD_WRITE_VERB_RE = re.compile(
+    # command names are case-sensitive: a commit-message line starting with
+    # "Touch up ..." or "Patch the ..." is prose
+    _AR_CMD_PREFIX + r"(?-i:patch|touch|sponge|truncate|gunzip|bunzip2|unxz|uncompress|scp|sftp"
+    r"|aria2c|axel|vim?|nvim|emacs|nano|ed|ex)(?=\s|$)"
+    # wget always writes a file unless told to print to stdout (`-O-`/`-qO -`)
+    r"|" + _AR_CMD_PREFIX + r"wget\b(?![^|;&\n'\"]{0,200}\s-(?-i:[A-Za-z]{0,8}O)\s*-(?=\s|$))"
+    r"|" + _AR_CMD_PREFIX + r"curl\b(?=[^|;&\n]{0,400}(?:\s-(?-i:[A-Za-z0-9#]{0,8}O[A-Za-z0-9#]{0,8})(?=\s|$)"
+    r"|\s--remote-name))"
+    r"|" + _AR_CMD_PREFIX + r"(?:xz|zstd|gzip|bzip2)\b[^|;&\n]{0,60}?\s-[a-zA-Z]{0,8}d"
+    r"|" + _AR_CMD_PREFIX + r"(?:npx\s+)?(?:degit|tiged)\b",
+    re.IGNORECASE)
+AGENT_RULES_API_WRITE_VERB_RE = re.compile(
+    r"\bgit(?:\s+(?:-[cC]\s*\S+|--?[\w-]+(?:[=\s]\S+)?)){0,6}?\s+"
+    r"(?:checkout(?!\s+-[bB]\b)|restore|checkout-index|apply(?!\s+--check\b)|am|clone"
+    r"|submodule\s+add|stash\s+(?:pop|apply))(?=\s|$)"
+    r"|(?:^|\s)--in-place\b|\b(?:yq|jq|ruby)\b[^|;&\n]{0,200}?\s-[a-zA-Z]{0,8}i\b"
+    r"|\bsed\b[^|;&\n]{0,200}?['\"\s;]w\s"
+    r"|file_put_contents|WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|Clear-Content"
+    r"|Start-BitsTransfer|write_text|write_bytes|writeFile|appendFile|write-region"
+    r"|\bopen\s*\(\s*\w{1,40}\s*,\s*['\"]\s*\+?>|\bexec\s+[0-9]{0,3}>"
+    r"|\bopen\s*\([^)\n]{0,300}['\"][wax]\+?b?['\"]",
+    re.IGNORECASE)
+AGENT_RULES_CMD_SEP_RE = re.compile(r"[|;&\n]")
+
+
+# Characters a diff/PR view/terminal does not render but a model's tokenizer
+# still reads -- the "Rules File Backdoor" carrier. Built from code-point
+# numbers only (no invisible character is typed in this file). ONE table
+# feeds both the literal matcher here and the shell-escape matcher in
+# rules.py, so they cannot drift.
+#   Always suspicious (AGENT_RULES_HIDDEN_CPS): word joiner + invisible
+#   operators, bidi embeddings/overrides/isolates, deprecated format controls,
+#   combining grapheme joiner, Mongolian vowel separator and free variation
+#   selectors, Khmer inherent vowels, Hangul fillers, braille blank,
+#   interlinear-annotation / specials / musical / shorthand format controls,
+#   C0/C1 control characters other than tab/LF/CR, a BOM anywhere but offset
+#   0, and (as ranges) all of plane 14 -- TAG characters and the
+#   variation-selector supplement.
+#   Suspicious unless in their legitimate context (QA, design review: a flat
+#   deny broke ordinary Persian/Hindi/Arabic/Hebrew/Thai/Japanese text and
+#   flag emoji; QA round 2, bypass review: the first exemptions were loose
+#   enough to carry a whole payload, so each is now narrow and capped):
+#     - ZWSP U+200B, ZWNJ U+200C, LRM U+200E, RLM U+200F, ALM U+061C: fine
+#       with a non-ASCII letter within two characters and no other invisible
+#       character adjacent; suspicious in ASCII surroundings or in a run.
+#     - TAG characters: fine only as one of the three real subdivision flags
+#       (England, Scotland, Wales).
+#     - Variation selectors U+FE00-FE0E: fine directly after a visible
+#       non-ASCII symbol or letter; U+E0100-E01EF: fine directly after a CJK
+#       ideograph. More than AGENT_RULES_MAX_SELECTORS exempted selectors in
+#       one text are all reported.
+#   Not treated as hidden: U+200D (emoji ZWJ), U+FE0F (emoji presentation)
+#   and U+00AD (soft hyphen) one at a time (a doubled one, or three of them
+#   in a row, is reported); ordinary wide spaces and line/paragraph
+#   separators.
+AGENT_RULES_HIDDEN_CPS = tuple(sorted(
+    {0x180e, 0x180b, 0x180c, 0x180d, 0x180f, 0x034f, 0x115f, 0x1160, 0x3164, 0xffa0,
+     0x2800, 0x17b4, 0x17b5, 0xfeff}
+    | set(range(0x2060, 0x2070)) | set(range(0x202a, 0x202f))
+    | set(range(0xfff0, 0xfffc)) | set(range(0x1d173, 0x1d17b)) | set(range(0x1bca0, 0x1bca4))))
+AGENT_RULES_CONTEXT_CPS = (0x200b, 0x200c, 0x200e, 0x200f, 0x061c)
+AGENT_RULES_MAX_SELECTORS = 32
+AGENT_RULES_MAX_CONTEXT_MARKS = 20000
+_AR_FE = chr(0xfe00) + "-" + chr(0xfe0e)
+_AR_IVS = chr(0xe0100) + "-" + chr(0xe01ef)
+_AR_PLANE14 = chr(0xe0000) + "-" + chr(0xe0fff)
+_AR_BOM = chr(0xfeff)
+_AR_HIDDEN_ALWAYS_RE = re.compile(
+    "[" + "".join(chr(c) for c in AGENT_RULES_HIDDEN_CPS if c != 0xfeff)
+    + _AR_PLANE14 + _AR_FE + "\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|(?<=.)" + _AR_BOM, re.DOTALL)
+_AR_CONTEXT_CHARS = "".join(chr(c) for c in AGENT_RULES_CONTEXT_CPS)
+_AR_INVISIBLE_NEIGHBOUR = _AR_CONTEXT_CHARS + chr(0x200d) + chr(0xfe0f) + chr(0xad) + chr(0x2060)
+_AR_HIDDEN_CONTEXT_RE = re.compile("[" + _AR_CONTEXT_CHARS + "]")
+_AR_FLAG_TAG_SEQ_RE = re.compile(
+    chr(0x1f3f4) + "(?:" + "|".join("".join(chr(0xe0000 + ord(ch)) for ch in name)
+                                    for name in ("gbeng", "gbsct", "gbwls")) + ")" + chr(0xe007f))
+_AR_SELECTOR_RE = re.compile("[" + _AR_FE + _AR_IVS + "]")
+# U+200D / U+FE0F / U+00AD are legitimate one at a time (emoji joiner,
+# presentation selector, soft hyphen) -- never doubled, never three in a row.
+_AR_SOFT = chr(0x200d) + chr(0xfe0f) + chr(0xad)
+_AR_SOFT_RUN_RE = re.compile("([" + _AR_SOFT + "])\\1|[" + _AR_SOFT + "]{3,}")
+_AR_CJK_RE = re.compile("[" + chr(0x2e80) + "-" + chr(0x9fff) + chr(0xf900) + "-" + chr(0xfaff)
+                        + chr(0x20000) + "-" + chr(0x3ffff) + "]")
+
+
+def _ar_selector_ok(prev: str, sel: str) -> bool:
+    if not prev or ord(prev) < 0x80:
+        return False
+    if ord(sel) >= 0xe0100:
+        return bool(_AR_CJK_RE.match(prev))
+    cat = unicodedata.category(prev)
+    return cat[0] in "LS" or cat in ("No", "Po")
+
+
+AGENT_RULES_MAX_HITS = 64
+
+
+def agent_rules_hidden_chars(text: str, budget: list = None) -> list:
+    """Code points (``U+XXXX@offset``) of review-invisible characters in
+    ``text`` that have no legitimate reading in their context. Empty list ->
+    nothing suspicious. Bounded work: at most AGENT_RULES_MAX_HITS findings
+    are collected (a result of that length means "at least this many").
+    ``budget`` is an optional one-element list holding how many zero-width/
+    direction marks may still be context-checked; a caller scanning several
+    strings shares one list so the bound holds per evaluation, not per
+    string."""
+    if not text:
+        return []
+    out = []
+    cap = AGENT_RULES_MAX_HITS
+    try:
+        # Blank out legitimate sequences with same-length filler so reported
+        # offsets still index the original text.
+        scan = _AR_FLAG_TAG_SEQ_RE.sub(lambda m: "x" * len(m.group(0)), text)
+        ok_selectors, bad = [], 0
+        for m in _AR_SELECTOR_RE.finditer(scan):
+            i = m.start()
+            if _ar_selector_ok(scan[i - 1:i] if i else "", m.group(0)):
+                ok_selectors.append(i)
+                if len(ok_selectors) > AGENT_RULES_MAX_SELECTORS:
+                    break                 # over the cap: none are exempt
+            else:
+                bad += 1
+                if bad >= cap:
+                    break                 # already enough to report
+        if ok_selectors and len(ok_selectors) <= AGENT_RULES_MAX_SELECTORS:
+            chars = list(scan)
+            for i in ok_selectors:
+                chars[i] = "x"
+            scan = "".join(chars)
+        for m in _AR_HIDDEN_ALWAYS_RE.finditer(scan):
+            out.append((m.start(), ord(m.group(0))))
+            if len(out) >= cap:
+                break
+        if len(out) < cap:
+            for m in _AR_SOFT_RUN_RE.finditer(scan):
+                out.append((m.start(), ord(m.group(0)[0])))
+                if len(out) >= cap:
+                    break
+        if budget is None:
+            budget = [AGENT_RULES_MAX_CONTEXT_MARKS]
+        if len(out) < cap:
+            for m in _AR_HIDDEN_CONTEXT_RE.finditer(scan):
+                i = m.start()
+                budget[0] -= 1
+                if budget[0] < 0:
+                    # Bounded work: past this many zero-width/direction marks
+                    # the per-mark context check stops and the text is reported.
+                    out.append((i, ord(m.group(0))))
+                    break
+                near = scan[max(0, i - 2):i] + scan[i + 1:i + 3]
+                in_run = any(c in _AR_INVISIBLE_NEIGHBOUR
+                             for c in scan[max(0, i - 1):i] + scan[i + 1:i + 2])
+                if in_run or not any(ord(c) > 0x7f and c.isalpha() for c in near):
+                    out.append((i, ord(m.group(0))))
+                    if len(out) >= cap:
+                        break
+    except Exception:
+        return ["unreadable text"]
+    out.sort()
+    return [f"U+{cp:04X}@{i}" for i, cp in out[:cap]]
 
 
 # ---- Shell-startup / SSH persistence protection --------------------------------
