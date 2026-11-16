@@ -1356,3 +1356,65 @@ def test_round_7_false_asks_not_claimed(cmd):
 def test_round_7_forms_ask(cmd):
     d = _only(_shell(cmd))
     assert d is not None and d.action == Action.ASK, cmd
+
+
+# ---- QA round 8 regressions ----------------------------------------------------
+def test_amplified_scan_surface_is_bounded():
+    import time
+    pre, suf = 'cmd /c bash -c \'cmd /c pwsh -c "cmd /c cmd /c ', '`"\''
+    head = "cat .cursorrules; " + pre
+    worst = 0.0
+    for tok in ("git --x ", "sudo -", "x "):
+        cmd = head + tok * ((20000 - len(head) - 4) // len(tok)) + suf
+        t = time.perf_counter()
+        _only(_shell(cmd, cwd="/repo"))
+        worst = max(worst, time.perf_counter() - t)
+    assert worst < 2.5      # ~0.6 s here; several seconds before the surface cap
+
+
+def test_context_mark_budget_is_per_evaluation_not_per_string():
+    import time
+    s = (chr(0x05D0) + chr(0x200E)) * 20000
+    t = time.perf_counter()
+    d1 = _only(_ev("mcp__fs__write_file", path="/repo/.cursorrules", contents=[s] * 125))
+    edits = [{"old_string": s, "new_string": s + "b"}] * 60
+    d2 = _only(_ev("MultiEdit", file_path="/repo/.cursorrules", edits=edits))
+    assert time.perf_counter() - t < 2.0
+    assert d1 is not None and d2 is not None
+    # the budget is reset for the next evaluation
+    ok = (chr(0x05D0) + chr(0x200E)) * 100
+    assert _only(_write("/repo/.cursorrules", content=ok)).action == Action.ASK
+
+
+def test_fs_budget_clock_starts_at_first_filesystem_call(tmp_path):
+    import os as _os
+    (tmp_path / ".cursorrules").write_text("x", encoding="utf-8")
+    try:
+        _os.symlink(tmp_path / ".cursorrules", tmp_path / "lnk_rules")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    hidden = "x" + chr(0x202E)
+    base = {"path": str(tmp_path / "lnk_rules"), "content": hidden}
+    assert _only(_ev("mcp__fs__write_file", **base)).action == Action.DENY
+    padded = dict(base, meta=[[[]]] * 400000)
+    assert _only(_ev("mcp__fs__write_file", **padded)).action == Action.DENY
+
+
+@pytest.mark.parametrize("cmd", [
+    "         touch .cursorrules",
+    "cd .cursor/rules && \\\n          curl -LO https://e.example/r.mdc",
+    "test -d .cursor &&\n            touch .cursor/rules/a.mdc",
+    "if [ ! -f .cursorrules ]; then\n" + "\t" * 9 + "touch .cursorrules\nfi",
+    "make && (\n          cd .cursor/rules\n          wget https://e.example/r.mdc\n)",
+])
+def test_indented_command_verbs_ask(cmd):
+    d = _only(_shell(cmd))
+    assert d is not None and d.action == Action.ASK, cmd
+
+
+def test_indentation_floods_stay_linear():
+    import time
+    t = time.perf_counter()
+    for blob in ("\n" + " " * 300) * 60, ";" + " " * 19000, ("; " * 9000), " \t" * 9000, "\n \n\t" * 5000:
+        _only(_shell("cat .cursorrules" + blob))
+    assert time.perf_counter() - t < 2.5

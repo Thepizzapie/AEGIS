@@ -1830,7 +1830,7 @@ AGENT_RULES_EXCLUDE_ARG_RE = re.compile(r"--exclude(?:-from)?(?:=|\s+)\S+", re.I
 # also cross newlines rescans the run from every newline (QA round 7: 88 s on
 # 20 KB of blank lines). Horizontal whitespace only, bounded.
 _AR_CMD_PREFIX = (r"(?:^|[;&|({\n]|\b(?:sudo|doas|env|xargs|exec|command|nohup|time|then|do|else)\b"
-                  r"(?:[ \t]{1,8}-[^\s;&|]{1,40}(?:[ \t]{1,8}[^\s;&|-][^\s;&|]{0,40})?){0,4})[ \t]{0,8}"
+                  r"(?:[ \t]{1,8}-[^\s;&|]{1,40}(?:[ \t]{1,8}[^\s;&|-][^\s;&|]{0,40})?){0,4})[ \t]{0,256}"
                   r"(?:[A-Za-z_][A-Za-z0-9_]{0,40}=[^\s;&|]{0,200}[ \t]{1,8}){0,4}")
 AGENT_RULES_CMD_WRITE_VERB_RE = re.compile(
     # command names are case-sensitive: a commit-message line starting with
@@ -1930,11 +1930,15 @@ def _ar_selector_ok(prev: str, sel: str) -> bool:
 AGENT_RULES_MAX_HITS = 64
 
 
-def agent_rules_hidden_chars(text: str) -> list:
+def agent_rules_hidden_chars(text: str, budget: list = None) -> list:
     """Code points (``U+XXXX@offset``) of review-invisible characters in
     ``text`` that have no legitimate reading in their context. Empty list ->
     nothing suspicious. Bounded work: at most AGENT_RULES_MAX_HITS findings
-    are collected (a result of that length means "at least this many")."""
+    are collected (a result of that length means "at least this many").
+    ``budget`` is an optional one-element list holding how many zero-width/
+    direction marks may still be context-checked; a caller scanning several
+    strings shares one list so the bound holds per evaluation, not per
+    string."""
     if not text:
         return []
     out = []
@@ -1968,12 +1972,13 @@ def agent_rules_hidden_chars(text: str) -> list:
                 out.append((m.start(), ord(m.group(0)[0])))
                 if len(out) >= cap:
                     break
-        examined = 0
+        if budget is None:
+            budget = [AGENT_RULES_MAX_CONTEXT_MARKS]
         if len(out) < cap:
             for m in _AR_HIDDEN_CONTEXT_RE.finditer(scan):
                 i = m.start()
-                examined += 1
-                if examined > AGENT_RULES_MAX_CONTEXT_MARKS:
+                budget[0] -= 1
+                if budget[0] < 0:
                     # Bounded work: past this many zero-width/direction marks
                     # the per-mark context check stops and the text is reported.
                     out.append((i, ord(m.group(0))))

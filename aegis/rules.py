@@ -1169,6 +1169,16 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
 
 
 # ---- cross-agent rules / instructions file protection: escapable with human ---
+# Zero-width/direction marks still allowed a per-mark context check in this
+# evaluation -- one budget shared by every string scanned, reset at rule entry
+# (QA round 8: a per-string cap let 60 strings of 20,000 marks cost 1.8 s).
+_AGENT_RULES_MARK_BUDGET = [patterns.AGENT_RULES_MAX_CONTEXT_MARKS]
+
+
+def _agent_rules_hidden(text: str) -> list:
+    return patterns.agent_rules_hidden_chars(text, _AGENT_RULES_MARK_BUDGET)
+
+
 def _agent_rules_allowed_by_policy(cfg: dict, texts) -> bool:
     allow = cfg.get("allow") or []
     if isinstance(allow, str):          # `allow: 'x'` (not a list) is one regex
@@ -1260,7 +1270,7 @@ def _agent_rules_new_hidden(v, _depth: int = 0) -> list:
     if _depth > 12:
         return []
     if isinstance(v, str):
-        return patterns.agent_rules_hidden_chars(v)
+        return _agent_rules_hidden(v)
     if isinstance(v, dict):
         skip, out = set(), []
         for old_k, new_k in _AGENT_RULES_EDIT_PAIRS:
@@ -1269,10 +1279,10 @@ def _agent_rules_new_hidden(v, _depth: int = 0) -> list:
                 skip.update((old_k, new_k))
                 if old == new:
                     continue
-                found = patterns.agent_rules_hidden_chars(new)
+                found = _agent_rules_hidden(new)
                 if not found:
                     continue
-                had = _agent_rules_counter(patterns.agent_rules_hidden_chars(old))
+                had = _agent_rules_counter(_agent_rules_hidden(old))
                 # a capped result means "at least this many": it cannot show
                 # that the old text already held them all
                 if (len(found) >= patterns.AGENT_RULES_MAX_HITS
@@ -1346,10 +1356,15 @@ def _agent_rules_mapping_keys(v, _depth: int = 0, _budget=None) -> list:
 # staged-source scan stops -- the decision degrades to the ordinary ask, never
 # to a stall (a hook timeout fails open).
 _AGENT_RULES_FS_BUDGET_S = 0.15
-_AGENT_RULES_FS_DEADLINE = [0.0]
+_AGENT_RULES_FS_DEADLINE = [None]
 
 
 def _agent_rules_fs_ok() -> bool:
+    # The clock starts at the FIRST filesystem call, not at rule entry: time
+    # spent walking large arguments must not use up the budget before the
+    # target path itself has been resolved (QA round 8).
+    if _AGENT_RULES_FS_DEADLINE[0] is None:
+        _AGENT_RULES_FS_DEADLINE[0] = time.monotonic() + _AGENT_RULES_FS_BUDGET_S
     return time.monotonic() < _AGENT_RULES_FS_DEADLINE[0]
 
 
@@ -1549,7 +1564,7 @@ def _agent_rules_source_hidden(ev: Event, names: list) -> list:
         if text:
             text = text[:budget]
             budget -= len(text)
-            hits = patterns.agent_rules_hidden_chars(text)
+            hits = _agent_rules_hidden(text)
             if hits:
                 return [f"{h} in {os.path.basename(fp)}" for h in hits[:6]]
     return []
@@ -1807,7 +1822,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     so ``mv notes.txt .cursorrules`` cannot launder a payload staged in
     notes.txt. Narrow and bounded on purpose: 16 files, the first 500 KB in
     total (in operand order), text only, never /proc|/sys|/dev or a UNC path, no directories, no globs, no
-    variables, no other commands' operands, and at most 150 ms of filesystem
+    variables, no other commands' operands, the first 64 distinct operands,
+    and at most 150 ms of filesystem
     work per call (symlink resolution included). Anything outside that is NOT
     inspected and only gets the ordinary ask.
 
@@ -1862,7 +1878,8 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     # before e.g. `permission-escalation` could deny (QA round 5).
     if ev.event != HookEvent.PRE_TOOL_USE:
         return None
-    _AGENT_RULES_FS_DEADLINE[0] = time.monotonic() + _AGENT_RULES_FS_BUDGET_S
+    _AGENT_RULES_FS_DEADLINE[0] = None
+    _AGENT_RULES_MARK_BUDGET[0] = patterns.AGENT_RULES_MAX_CONTEXT_MARKS
     cfg = getattr(policy, "agent_rules", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -1935,7 +1952,9 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
                          f"{why_it_matters}.{extra} {next_step}"))
 
     if _is_shell(ev):
-        cmd = _shell_scan(ev)
+        # Bounded surface: nested interpreter wrappers can blow a 20 KB command
+        # up ~50x; the raw command is always the first rendering.
+        cmd = _shell_scan(ev)[:60000]
         raw = _cmd(ev)
         why = _agent_rules_shell_write_hit(ev, cmd)
         if not why:
@@ -1944,12 +1963,12 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         found = []
         if hidden_mode != "off":
-            found = patterns.agent_rules_hidden_chars(raw[:200000])
+            found = _agent_rules_hidden(raw[:200000])
             if not found:                 # only in a decoded / inner-interpreter form
                 # (control characters are ignored there: base64-decoding an
                 # ordinary path segment yields them by accident)
                 found = sorted({f.split("@", 1)[0] + " (decoded)"
-                                for f in patterns.agent_rules_hidden_chars(cmd)
+                                for f in _agent_rules_hidden(cmd)
                                 if not f.startswith("U+00")})
             if not found:
                 m = _AGENT_RULES_ESCAPED_HIDDEN_RE.search(raw[:20000] + "\n" + cmd)
