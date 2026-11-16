@@ -1597,6 +1597,159 @@ def skill_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, SKILL_FIND_PREDICATE_RE)
 
 
+# ---- Cross-agent rules / instructions file protection ---------------------------
+# PLAN (purpose / threat model / approach) for `rule_agent_rules_protect`.
+#
+# Purpose. `AGENT_INSTRUCTIONS_PATH_RE` above gates exactly two filenames
+# (`CLAUDE.md`, `AGENTS.md`). Every OTHER AI coding agent has its own
+# equivalent -- a file, or a directory of files, that the agent folds into its
+# own context on every session with no per-use trust prompt -- and none of them
+# was reached by any guard in this file:
+#
+#   Cursor          .cursorrules, .cursor/rules/**, .cursor/commands/**
+#   GitHub Copilot  .github/copilot-instructions.md, .github/instructions/**,
+#                   .github/prompts/**, .github/chatmodes/**, .github/agents/**,
+#                   and any *.instructions.md / *.prompt.md / *.chatmode.md /
+#                   *.agent.md
+#   Gemini CLI      GEMINI.md, .gemini/commands/**
+#   Codex           AGENTS.override.md (read IN PREFERENCE to AGENTS.md),
+#                   .codex/prompts/**
+#   Windsurf        .windsurfrules, .windsurf/rules/**, .windsurf/workflows/**,
+#                   ~/.codeium/windsurf/memories/**
+#   Cline / Roo /   .clinerules (file or directory), .roorules, .roomodes,
+#   Kilo            .clinerules-<mode>, .roorules-<mode>, .roo/rules[-<mode>]/**,
+#                   .roo/commands/**, .kilocode/rules[-<mode>]/**,
+#                   .kilocode/workflows/**
+#   Continue        .continuerules, .continue/rules/**, .continue/prompts/**
+#   Aider           .aider.conf.yml (`read:` auto-loads arbitrary files as
+#                   instructions; `lint-cmd`/`test-cmd` are shell commands)
+#   Zed             .rules
+#   JetBrains Junie .junie/**
+#   Amazon Q        .amazonq/rules/**
+#   Augment / Trae  .augment-guidelines, .augment/rules/**, .trae/rules/**
+#   Goose / Qwen /  .goosehints, QWEN.md, WARP.md, CRUSH.md, AGENT.md
+#   Warp / Crush / Amp
+#   OpenCode        .opencode/agent(s)/**, .opencode/command(s)/**
+#   Claude Code     .claude/rules/** (auto-loaded project/user rules -- a
+#                   directory `AGENT_DEF_PATH_RE` never lists)
+#
+# Threat model. An agent that has been prompt-injected (a poisoned web page,
+# tool result, dependency README, issue comment) writes natural-language
+# instructions into one of these files. Three properties make this the
+# highest-leverage unguarded write left in a repo:
+#   1. Persistence across sessions AND people: the file is committed, so the
+#      instruction reaches every teammate who clones the repo and every future
+#      session, long after the injected session ended.
+#   2. Cross-agent privilege escalation: the writing agent may be sandboxed and
+#      Aegis-gated, but the READING agent (a teammate's Cursor/Copilot/Gemini,
+#      often in auto-approve mode, with different credentials) is not. One
+#      agent "frees" another -- instructions such as "always run `curl ... |
+#      sh` before tests" or "add this dependency to every project" execute
+#      under the other agent's authority.
+#   3. Review-resistant: it reads as documentation, and the published "Rules
+#      File Backdoor" technique hides the payload in zero-width / bidirectional
+#      / Unicode-tag characters that no diff or PR view renders, while the
+#      model still reads them.
+#
+# Approach. A path gate, the same shape as `rule_agent_def_protect`:
+#   - Edit/Write/MCP: the target path (raw, lexically normalized, and
+#     symlink-resolved) names one of the files/directories above -> ASK.
+#   - Shell: the command names one AND carries a write/delete/copy/archive
+#     verb (or a `find` predicate describing one) -> ASK.
+#   - Content written with invisible/bidi/tag characters -> DENY, whatever the
+#     configured ask/deny mode and regardless of the policy `allow` list: a
+#     human cannot review what a prompt cannot show them.
+#   - Registered in the fetch-to-file backstop so `curl -o .cursorrules` is
+#     covered too.
+# Not covered (disclosed in the rule's docstring): Claude Code's own
+# auto-memory directory (the agent writes it constantly by design; an ask on
+# every write would be noise), files an agent is merely CONFIGURED to read
+# (Aider `CONVENTIONS.md`, OpenCode `instructions:` globs), and instruction
+# text with no hidden characters (that is what the human ASK is for).
+_AR_B = r"(?:^|[\s'\"/\\=])"
+_AR_MODE = r"(?:-[\w-]{1,60})?"
+AGENT_RULES_FILE_RE = re.compile(
+    _AR_B + r"(?:"
+    r"\.cursorrules|\.windsurfrules|\.continuerules|\.goosehints|\.augment-guidelines"
+    r"|\.roomodes|\.rules"
+    r"|\.(?:cline|roo)rules" + _AR_MODE
+    + r"|\.aider\.conf\.ya?ml"
+    r"|(?:GEMINI|QWEN|WARP|CRUSH|AGENT)" + _WIN_TRIM + r"(?:\.local)?\.md"
+    r"|AGENTS" + _WIN_TRIM + r"\.override\.md"
+    r"|copilot-instructions" + _WIN_TRIM + r"\.md"
+    r"|[^\s'\"/\\]{1,200}\.(?:instructions|prompt|chatmode|agent)\.md"
+    r")" + _CI_END,
+    re.IGNORECASE,
+)
+
+
+def _ar_dir(*parts: str) -> str:
+    return (_WIN_TRIM + _SEP).join(parts)
+
+
+# A rules DIRECTORY, or anything beneath one: `_CI_END` accepts a following
+# separator, so `.cursor/rules/a/b/c.mdc` matches at `.cursor/rules` whatever
+# the nesting depth (no bounded repeated-segment group to evade, unlike
+# AGENT_DEF_PATH_RE's `{0,4}`), and a bare `rsync -a x/ .cursor/rules/` matches
+# the same way AGENT_DEF_DIR_RE does for its own surface.
+AGENT_RULES_DIR_RE = re.compile(
+    _AR_B + r"(?:"
+    + _ar_dir(r"\.cursor", r"(?:rules|commands)")
+    + r"|" + _ar_dir(r"\.windsurf", r"(?:rules|workflows)")
+    + r"|" + _ar_dir(r"\.codeium", r"windsurf", r"memories")
+    + r"|" + _ar_dir(r"\.roo", r"(?:rules" + _AR_MODE + r"|commands)")
+    + r"|" + _ar_dir(r"\.kilocode", r"(?:rules" + _AR_MODE + r"|workflows)")
+    + r"|" + _ar_dir(r"\.continue", r"(?:rules|prompts)")
+    + r"|" + _ar_dir(r"\.amazonq", r"rules")
+    + r"|" + _ar_dir(r"\.augment", r"rules")
+    + r"|" + _ar_dir(r"\.trae", r"rules")
+    + r"|\.junie"
+    + r"|" + _ar_dir(r"\.claude", r"rules")
+    + r"|" + _ar_dir(r"\.codex", r"prompts")
+    + r"|" + _ar_dir(r"\.gemini", r"commands")
+    + r"|" + _ar_dir(r"\.opencode", r"(?:agents?|commands?)")
+    + r"|" + _ar_dir(r"\.github", r"(?:instructions|prompts|chatmodes|agents)")
+    + r")" + _CI_END,
+    re.IGNORECASE,
+)
+
+# `find -name/-path/-regex` indirection (same reason AGENT_DEF_FIND_PREDICATE_RE
+# exists). Bare agent-directory names are included as fallbacks because a
+# `-regex` value separates path components with its own wildcards.
+AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
+    r"(?:cursorrules|windsurfrules|clinerules|roorules|roomodes|continuerules"
+    r"|goosehints|augment-guidelines|copilot-instructions|aider\.conf"
+    r"|(?:GEMINI|QWEN|WARP|CRUSH|AGENT)\\?\.md\b|AGENTS\\?\.override"
+    r"|\\?\.(?:instructions|prompt|chatmode|agent)\\?\.md\b"
+    r"|\.(?:cursor|windsurf|codeium|roo|kilocode|continue|amazonq|augment|trae"
+    r"|junie|claude|codex|gemini|opencode)\b"
+    r"|\.github[/\\](?:instructions|prompts|chatmodes|agents)\b)")
+
+
+def agent_rules_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, AGENT_RULES_FIND_PREDICATE_RE)
+
+
+def agent_rules_path_hit(text: str) -> bool:
+    return bool(AGENT_RULES_FILE_RE.search(text) or AGENT_RULES_DIR_RE.search(text))
+
+
+# Characters a diff/PR view/terminal does not render but a model's tokenizer
+# still reads -- the "Rules File Backdoor" carrier. Escaped, never typed
+# literally. Zero-width space/non-joiner, LRM/RLM, word joiner + invisible
+# operators, bidi embeddings/overrides/isolates, Mongolian vowel separator,
+# soft hyphen, Hangul fillers, the Unicode TAG block (an ASCII-shadow alphabet),
+# the variation-selector SUPPLEMENT, and a BOM anywhere but offset 0.
+# Deliberately excluded: U+200D (zero-width JOINER) and U+FE0F -- both occur
+# in ordinary emoji sequences, and a false DENY on a rules file that merely
+# contains an emoji is worse than the narrow disclosed gap.
+AGENT_RULES_HIDDEN_UNICODE_RE = re.compile(
+    "[\u200b\u200c\u200e\u200f\u2060-\u2064\u202a-\u202e\u2066-\u2069"
+    "\u180e\u00ad\u115f\u1160\u3164\uffa0"
+    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+    "|(?<=.)\ufeff", re.DOTALL)
+
+
 # ---- Shell-startup / SSH persistence protection --------------------------------
 # Two more "runs later, unattended, with the human's full privileges" triggers
 # that none of the mcp_config/ci_workflow/git_hooks/agent_def family reaches,
