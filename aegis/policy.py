@@ -174,9 +174,10 @@ class Policy:
     # (mode=ask) apply. Covers the auto-loaded rules files of OTHER coding
     # agents (.cursorrules, .cursor/rules/, .github/copilot-instructions.md,
     # GEMINI.md, .windsurfrules, .clinerules, .roo/rules/, AGENTS.override.md,
-    # .aider.conf.yml, ...) plus .claude/rules/. Content carrying invisible/
-    # bidi/Unicode-tag characters is denied whatever the mode (except off/
-    # monitor) and regardless of `allow`. See rules.rule_agent_rules_protect.
+    # .aider.conf.yml, ...) plus .claude/rules/. `hidden_chars` (deny|ask|
+    # off, default deny): added text carrying invisible/bidi/Unicode-tag
+    # characters is denied whatever the mode (except off/monitor) and
+    # regardless of `allow`. See rules.rule_agent_rules_protect.
     agent_rules: dict = field(default_factory=dict)
     # Claude Code Skill-definition protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.

@@ -1608,9 +1608,7 @@ def skill_find_hit(cmd: str) -> bool:
 #
 #   Cursor          .cursorrules, .cursor/rules/**, .cursor/commands/**
 #   GitHub Copilot  .github/copilot-instructions.md, .github/instructions/**,
-#                   .github/prompts/**, .github/chatmodes/**, .github/agents/**,
-#                   and any *.instructions.md / *.prompt.md / *.chatmode.md /
-#                   *.agent.md
+#                   .github/prompts/**, .github/chatmodes/**, .github/agents/**
 #   Gemini CLI      GEMINI.md, .gemini/commands/**
 #   Codex           AGENTS.override.md (read IN PREFERENCE to AGENTS.md),
 #                   .codex/prompts/**
@@ -1623,13 +1621,17 @@ def skill_find_hit(cmd: str) -> bool:
 #   Continue        .continuerules, .continue/rules/**, .continue/prompts/**
 #   Aider           .aider.conf.yml (`read:` auto-loads arbitrary files as
 #                   instructions; `lint-cmd`/`test-cmd` are shell commands)
-#   Zed             .rules
-#   JetBrains Junie .junie/**
+#   Zed             .rules (worktree root only)
+#   JetBrains Junie .junie/guidelines.md, .junie/guidelines/**
 #   Amazon Q        .amazonq/rules/**
 #   Augment / Trae  .augment-guidelines, .augment/rules/**, .trae/rules/**
-#   Goose / Qwen /  .goosehints, QWEN.md, WARP.md, CRUSH.md, AGENT.md
+#   Goose / Qwen /  .goosehints, QWEN.md, WARP.md, CRUSH.md, AGENT.md (root only)
 #   Warp / Crush / Amp
 #   OpenCode        .opencode/agent(s)/**, .opencode/command(s)/**
+#   Kiro / IDX /    .kiro/steering/**, .idx/airules.md, .aiassistant/rules/**,
+#   JetBrains AI /  .openhands/microagents/**, replit.md, .agent/rules|workflows/**,
+#   OpenHands / ... .agents/skills/**, .github/skills/**, .kilocodemodes,
+#                   .roo/system-prompt-<mode>
 #   Claude Code     .claude/rules/** (auto-loaded project/user rules -- a
 #                   directory `AGENT_DEF_PATH_RE` never lists)
 #
@@ -1656,9 +1658,12 @@ def skill_find_hit(cmd: str) -> bool:
 #     symlink-resolved) names one of the files/directories above -> ASK.
 #   - Shell: the command names one AND carries a write/delete/copy/archive
 #     verb (or a `find` predicate describing one) -> ASK.
-#   - Content written with invisible/bidi/tag characters -> DENY, whatever the
-#     configured ask/deny mode and regardless of the policy `allow` list: a
-#     human cannot review what a prompt cannot show them.
+#   - Content written with invisible/bidi/tag characters that have no
+#     legitimate reading in context -> DENY by default, whatever the ask/deny
+#     mode and regardless of the policy `allow` list: a human cannot review
+#     what a prompt cannot show them. `hidden_chars: ask|off` relaxes it.
+#   - Runs AFTER the hard-deny shell guards (remote-exec, destructive git/
+#     delete), so an ask here never masks a deny there.
 #   - Registered in the fetch-to-file backstop so `curl -o .cursorrules` is
 #     covered too.
 # Not covered (disclosed in the rule's docstring): Claude Code's own
@@ -1666,21 +1671,38 @@ def skill_find_hit(cmd: str) -> bool:
 # every write would be noise), files an agent is merely CONFIGURED to read
 # (Aider `CONVENTIONS.md`, OpenCode `instructions:` globs), and instruction
 # text with no hidden characters (that is what the human ASK is for).
-_AR_B = r"(?:^|[\s'\"/\\=])"
+# Boundaries. Wider than the `(?:^|[\s'"/\\=])` ... `_CI_END` pair the sibling
+# path patterns use: shell metacharacters are legal neighbours of a filename
+# with no space between (QA, bypass review: `echo x >.cursorrules`,
+# `cat<x>.cursorrules`, `cp x {.cursorrules,y}` all slipped past the narrower
+# pair -- and with the path unseen, the hidden-character deny never ran).
+_AR_LEFT = r"\s'\"=<>|&;({,:"
+_AR_B = r"(?:^|[" + _AR_LEFT + r"/\\])"
+_AR_E = _WIN_TRIM + r"(?=[/\\;&|)<>,}]|\s|['\"]|$)"
 _AR_MODE = r"(?:-[\w-]{1,60})?"
 AGENT_RULES_FILE_RE = re.compile(
     _AR_B + r"(?:"
     r"\.cursorrules|\.windsurfrules|\.continuerules|\.goosehints|\.augment-guidelines"
-    r"|\.roomodes|\.rules"
+    r"|\.roomodes|\.kilocodemodes|replit\.md"
     r"|\.(?:cline|roo)rules" + _AR_MODE
     + r"|\.aider\.conf\.ya?ml"
-    r"|(?:GEMINI|QWEN|WARP|CRUSH|AGENT)" + _WIN_TRIM + r"(?:\.local)?\.md"
+    r"|(?:GEMINI|QWEN|WARP|CRUSH)" + _WIN_TRIM + r"(?:\.local)?\.md"
     r"|AGENTS" + _WIN_TRIM + r"\.override\.md"
     r"|copilot-instructions" + _WIN_TRIM + r"\.md"
-    r"|[^\s'\"/\\]{1,200}\.(?:instructions|prompt|chatmode|agent)\.md"
-    r")" + _CI_END,
+    r")" + _AR_E,
     re.IGNORECASE,
 )
+
+# Two names too generic to gate at any depth: Zed's `.rules` and Amp's
+# `AGENT.md` are read from the worktree ROOT, while `semgrep/.rules` or
+# `docs/AGENT.md` deep in a tree are ordinary files (QA, design/false-positive
+# review: gating them everywhere asked on unrelated work). In shell text they
+# match only with no directory component (`.rules`, `./.rules`); for an
+# Edit/Write path the rule compares the parent directory with the session cwd.
+_AR_GENERIC = r"(?:\.rules|AGENT" + _WIN_TRIM + r"(?:\.local)?\.md)"
+AGENT_RULES_ROOT_FILE_RE = re.compile(
+    r"(?:^|[" + _AR_LEFT + r"])(?:\.[/\\]+)?" + _AR_GENERIC + _AR_E, re.IGNORECASE)
+AGENT_RULES_GENERIC_NAME_RE = re.compile(r"^" + _AR_GENERIC + _WIN_TRIM + r"$", re.IGNORECASE)
 
 
 def _ar_dir(*parts: str) -> str:
@@ -1697,33 +1719,42 @@ AGENT_RULES_DIR_RE = re.compile(
     + _ar_dir(r"\.cursor", r"(?:rules|commands)")
     + r"|" + _ar_dir(r"\.windsurf", r"(?:rules|workflows)")
     + r"|" + _ar_dir(r"\.codeium", r"windsurf", r"memories")
-    + r"|" + _ar_dir(r"\.roo", r"(?:rules" + _AR_MODE + r"|commands)")
+    + r"|" + _ar_dir(r"\.roo", r"(?:rules" + _AR_MODE + r"|commands|system-prompt" + _AR_MODE + r")")
     + r"|" + _ar_dir(r"\.kilocode", r"(?:rules" + _AR_MODE + r"|workflows)")
     + r"|" + _ar_dir(r"\.continue", r"(?:rules|prompts)")
     + r"|" + _ar_dir(r"\.amazonq", r"rules")
     + r"|" + _ar_dir(r"\.augment", r"rules")
     + r"|" + _ar_dir(r"\.trae", r"rules")
-    + r"|\.junie"
+    + r"|" + _ar_dir(r"\.junie", r"guidelines(?:\.md)?")
     + r"|" + _ar_dir(r"\.claude", r"rules")
     + r"|" + _ar_dir(r"\.codex", r"prompts")
     + r"|" + _ar_dir(r"\.gemini", r"commands")
     + r"|" + _ar_dir(r"\.opencode", r"(?:agents?|commands?)")
-    + r"|" + _ar_dir(r"\.github", r"(?:instructions|prompts|chatmodes|agents)")
-    + r")" + _CI_END,
+    + r"|" + _ar_dir(r"\.github", r"(?:instructions|prompts|chatmodes|agents|skills)")
+    + r"|" + _ar_dir(r"\.kiro", r"steering")
+    + r"|" + _ar_dir(r"\.idx", r"airules\.md")
+    + r"|" + _ar_dir(r"\.aiassistant", r"rules")
+    + r"|" + _ar_dir(r"\.openhands", r"microagents")
+    + r"|" + _ar_dir(r"\.agent", r"(?:rules|workflows)")
+    + r"|" + _ar_dir(r"\.agents", r"skills")
+    + r")" + _AR_E,
     re.IGNORECASE,
 )
 
 # `find -name/-path/-regex` indirection (same reason AGENT_DEF_FIND_PREDICATE_RE
-# exists). Bare agent-directory names are included as fallbacks because a
-# `-regex` value separates path components with its own wildcards.
+# exists). Bare agent-directory names are fallbacks because a `-regex` value
+# separates path components with its own wildcards -- limited to directory
+# names with no other common use (QA: `.claude`/`.codex`/`.gemini`/`.github`
+# as bare fallbacks asked on ordinary `find ... -prune` commands).
 AGENT_RULES_FIND_PREDICATE_RE = _find_predicate_re(
-    r"(?:cursorrules|windsurfrules|clinerules|roorules|roomodes|continuerules"
+    r"(?:cursorrules|windsurfrules|clinerules|roorules|roomodes|kilocodemodes|continuerules"
     r"|goosehints|augment-guidelines|copilot-instructions|aider\.conf"
-    r"|(?:GEMINI|QWEN|WARP|CRUSH|AGENT)\\?\.md\b|AGENTS\\?\.override"
-    r"|\\?\.(?:instructions|prompt|chatmode|agent)\\?\.md\b"
-    r"|\.(?:cursor|windsurf|codeium|roo|kilocode|continue|amazonq|augment|trae"
-    r"|junie|claude|codex|gemini|opencode)\b"
-    r"|\.github[/\\](?:instructions|prompts|chatmodes|agents)\b)")
+    r"|(?:GEMINI|QWEN|WARP|CRUSH)\\?\.md\b|AGENTS\\?\.override"
+    r"|\.(?:cursor|windsurf|roo|kilocode|amazonq|augment|trae|junie|kiro|aiassistant|openhands)\b"
+    r"|\.(?:claude|continue)\b[^'\"\s]{0,40}rules"
+    r"|\.(?:codex|continue)\b[^'\"\s]{0,40}prompts"
+    r"|\.gemini\b[^'\"\s]{0,40}commands"
+    r"|\.github\b[^'\"\s]{0,40}(?:instructions|prompts|chatmodes|agents)\b)")
 
 
 def agent_rules_find_hit(cmd: str) -> bool:
@@ -1731,23 +1762,110 @@ def agent_rules_find_hit(cmd: str) -> bool:
 
 
 def agent_rules_path_hit(text: str) -> bool:
+    """A rules file/directory named anywhere in ``text`` (depth-independent
+    names only; the two root-only generic names are separate)."""
     return bool(AGENT_RULES_FILE_RE.search(text) or AGENT_RULES_DIR_RE.search(text))
+
+
+# A shell fd duplication or a discard to /dev/null is not a file write; without
+# stripping these, `cat .cursorrules 2>/dev/null` reads as "names a rules file
+# + has a redirect" (QA, false-positive review).
+AGENT_RULES_FD_NOISE_RE = re.compile(r"[0-9&]*>>?\s*&[0-9-]+|[0-9&]*>>?\s*/dev/null\b")
+
+
+# Whole-directory placement: `cp -r /tmp/rules .cursor/`, `rsync -a x/ .cursor/`,
+# `tar xf a.tar -C .cursor`, `ln -s /tmp/evil .cursor` drop a rules directory
+# without ever naming it. Limited to agent directories with no other common
+# use; `.github`/`.claude`/`.codex`/`.gemini`/`.continue` are left out (QA,
+# bypass review found the gap; the false-positive review is why it is narrow).
+AGENT_RULES_PARENT_DIR_RE = re.compile(
+    _AR_B + r"\.(?:cursor|windsurf|roo|kilocode|amazonq|augment|trae|junie|kiro"
+    r"|aiassistant|openhands)" + _WIN_TRIM + r"(?:[/\\]+)?(?=[;&|)<>,}]|\s|['\"]|$)",
+    re.IGNORECASE)
+
+# Write verbs the shared verb patterns do not know (QA, bypass review -- each
+# reproduced as an allow while naming a rules file): git/patch rewriting a
+# tracked file, in-place tools, generic output flags, decompressors, editors
+# in batch mode, and file-write APIs of scripting runtimes. Used ONLY by this
+# guard, paired with a rules-path hit, and the result is an ask.
+AGENT_RULES_EXTRA_WRITE_VERB_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,200}?\b(?:checkout|restore|checkout-index|apply|am|clone|stash\s+(?:pop|apply))\b"
+    r"|\b(?:patch|touch|sponge|truncate|gunzip|bunzip2|unxz|uncompress|scp|sftp|degit|aria2c|axel"
+    r"|vim?|nvim|emacs|script)\b"
+    r"|\b(?:xz|zstd|gzip|bzip2)\b[^|;&\n]{0,60}?\s-[a-zA-Z]*d"
+    r"|(?:^|\s)--in-place\b|\b(?:yq|jq|sed|perl|ruby)\b[^|;&\n]{0,200}?\s-[a-zA-Z]*i\b"
+    r"|(?:^|\s)-(?-i:[A-Za-z]{0,8}[oO])(?=\s|=|['\"]|$)|(?:^|\s)--?out(?:put|file|-file)?\b"
+    r"|\bsed\b[^|;&\n]{0,200}?['\"\s;]w\s"
+    r"|file_put_contents|WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|Clear-Content"
+    r"|\bac\b|Start-BitsTransfer|write_text|write_bytes|writeFile|appendFile|write-region"
+    r"|\bopen\s*\(|\bexec\s+[0-9]*>",
+    re.IGNORECASE)
 
 
 # Characters a diff/PR view/terminal does not render but a model's tokenizer
 # still reads -- the "Rules File Backdoor" carrier. Escaped, never typed
-# literally. Zero-width space/non-joiner, LRM/RLM, word joiner + invisible
-# operators, bidi embeddings/overrides/isolates, Mongolian vowel separator,
-# soft hyphen, Hangul fillers, the Unicode TAG block (an ASCII-shadow alphabet),
-# the variation-selector SUPPLEMENT, and a BOM anywhere but offset 0.
-# Deliberately excluded: U+200D (zero-width JOINER) and U+FE0F -- both occur
-# in ordinary emoji sequences, and a false DENY on a rules file that merely
-# contains an emoji is worse than the narrow disclosed gap.
-AGENT_RULES_HIDDEN_UNICODE_RE = re.compile(
-    "[\u200b\u200c\u200e\u200f\u2060-\u2064\u202a-\u202e\u2066-\u2069"
-    "\u180e\u00ad\u115f\u1160\u3164\uffa0"
-    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
-    "|(?<=.)\ufeff", re.DOTALL)
+# literally. ONE table (`AGENT_RULES_HIDDEN_CPS`) feeds both the literal
+# matcher here and the shell-escape matcher in rules.py, so they cannot drift
+# (QA, bypass review: the first draft's two hand-written lists had).
+#   Always suspicious: zero-width space, word joiner + invisible operators,
+#   bidi embeddings/overrides/isolates, deprecated format controls, combining
+#   grapheme joiner, Mongolian vowel separator, Khmer inherent vowels, Hangul
+#   fillers, braille blank, interlinear-annotation / musical / shorthand
+#   format controls, a BOM anywhere but offset 0, and (handled as ranges) the
+#   TAG block and the variation-selector supplement.
+#   Suspicious unless in their legitimate context (QA, design review: a flat
+#   deny on these broke ordinary Persian/Hindi/Arabic/Hebrew/Japanese text and
+#   flag emoji):
+#     - ZWNJ U+200C, LRM U+200E, RLM U+200F, ALM U+061C: fine with a non-ASCII
+#       letter within two characters; suspicious in ASCII-only surroundings or
+#       in a run of two or more.
+#     - TAG block U+E0000-E007F: fine as an emoji tag sequence (U+1F3F4, tag
+#       characters, CANCEL TAG U+E007F -- the subdivision flags).
+#     - Variation selectors U+FE00-FE0E and U+E0100-E01EF: fine directly after
+#       a non-ASCII character (emoji/math/ideographic variation sequences);
+#       suspicious after ASCII or in a run.
+#   Not treated as hidden at all: U+200D (emoji ZWJ), U+FE0F (emoji
+#   presentation), U+00AD (soft hyphen -- common in copied prose), ordinary
+#   wide spaces and line/paragraph separators (visible as spacing).
+AGENT_RULES_HIDDEN_CPS = tuple(sorted(
+    {0x200b, 0x180e, 0x034f, 0x115f, 0x1160, 0x3164, 0xffa0, 0x2800, 0x17b4, 0x17b5, 0xfeff}
+    | set(range(0x2060, 0x2070)) | set(range(0x202a, 0x202f))
+    | set(range(0xfff9, 0xfffc)) | set(range(0x1d173, 0x1d17b)) | set(range(0x1bca0, 0x1bca4))))
+AGENT_RULES_CONTEXT_CPS = (0x200c, 0x200e, 0x200f, 0x061c)
+_AR_HIDDEN_ALWAYS_RE = re.compile(
+    "[" + "".join(chr(c) for c in AGENT_RULES_HIDDEN_CPS if c != 0xfeff)
+    + "\U000e0000-\U000e007f\U000e0100-\U000e01ef︀-︎]|(?<=.)﻿", re.DOTALL)
+_AR_CONTEXT_CHARS = "".join(chr(c) for c in AGENT_RULES_CONTEXT_CPS)
+_AR_HIDDEN_CONTEXT_RE = re.compile("[" + _AR_CONTEXT_CHARS + "]")
+_AR_EMOJI_TAG_SEQ_RE = re.compile("\U0001f3f4[\U000e0020-\U000e007e]{1,8}\U000e007f")
+_AR_IVS_RE = re.compile("(?<=[^\x00-\x7f︀-︎\U000e0100-\U000e01ef])"
+                        "[︀-︎\U000e0100-\U000e01ef]")
+
+
+def agent_rules_hidden_chars(text: str) -> list:
+    """Code points (``U+XXXX@offset``) of review-invisible characters in
+    ``text`` that have no legitimate reading in their context. Empty list ->
+    nothing suspicious."""
+    if not text:
+        return []
+    out = []
+    try:
+        # Blank out legitimate sequences with same-length filler so reported
+        # offsets still index the original text.
+        scan = _AR_EMOJI_TAG_SEQ_RE.sub(lambda m: "x" * len(m.group(0)), text)
+        scan = _AR_IVS_RE.sub("x", scan)
+        for m in _AR_HIDDEN_ALWAYS_RE.finditer(scan):
+            out.append((m.start(), ord(m.group(0))))
+        for m in _AR_HIDDEN_CONTEXT_RE.finditer(scan):
+            i = m.start()
+            near = scan[max(0, i - 2):i] + scan[i + 1:i + 3]
+            in_run = any(c in _AR_CONTEXT_CHARS for c in scan[max(0, i - 1):i] + scan[i + 1:i + 2])
+            if in_run or not any(ord(c) > 0x7f and c.isalpha() for c in near):
+                out.append((i, ord(m.group(0))))
+    except Exception:
+        return []
+    out.sort()
+    return [f"U+{cp:04X}@{i}" for i, cp in out]
 
 
 # ---- Shell-startup / SSH persistence protection --------------------------------
@@ -4921,9 +5039,9 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
 # original verb list alongside `Invoke-WebRequest`/`iwr`).
 FETCH_TO_FILE_VERB_RE = re.compile(
     r"\bcurl(?:\.exe)?\b[^|;&\n]{0,200}?"
-    r"(?:(?:^|\s)-(?-i:o)(?:\s+\S|\S)|--output(?:=|\s+)\S)"
+    r"(?:(?:^|\s)-[A-Za-z]{0,8}?(?-i:o)(?:\s+\S|\S)|--output(?:=|\s+)\S)"
     r"|\bwget\b[^|;&\n]{0,200}?"
-    r"(?:(?:^|\s)-(?-i:O)(?:\s+\S|\S)|--output-document(?:=|\s+)\S)"
+    r"(?:(?:^|\s)-[A-Za-z]{0,8}?(?-i:O)(?:\s+\S|\S)|--output-document(?:=|\s+)\S)"
     r"|\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|irm|curl|wget)\b"
     r"[^|;&\n]{0,200}?-OutFile\b"
     r"|\bStart-BitsTransfer\b[^|;&\n]{0,200}?-Destination\b"
