@@ -1756,7 +1756,8 @@ _AR_ANY_PATH = (r"['\"]?(?:[^\s'\"|;&<>]{0,200}[/\\])?(?:" + _AR_FILE_CORE + r"|
 AGENT_RULES_OPT_VALUE_RE = re.compile(
     r"(?:^|\s)(?:"
     r"-{1,2}[A-Za-z][A-Za-z-]{0,20}=?"                       # glued: -o<path>, --output=<path>
-    r"|(?:-(?-i:[A-Za-z]{0,8}[oO])|--?out(?:put|file|-file)?)\s+"   # output option, then path
+    r"|(?:-(?-i:[A-Za-z0-9#]{0,8}[oOP])|--?out(?:put|file|-file)?"   # output option, then path
+    r"|--(?:directory-prefix|output-dir(?:ectory)?|output-document))\s+"
     r")" + _AR_ANY_PATH,
     re.IGNORECASE)
 
@@ -1803,7 +1804,7 @@ AGENT_RULES_FD_NOISE_RE = re.compile(
 # use; `.github`/`.claude`/`.codex`/`.gemini`/`.continue` are left out.
 AGENT_RULES_PARENT_DIR_RE = re.compile(
     _AR_B + r"\.(?:cursor|windsurf|roo|kilocode|amazonq|augment|trae|junie|kiro"
-    r"|aiassistant|openhands)" + _WIN_TRIM + r"(?:[/\\]+)?(?=[;&|)<>,}]|\s|['\"]|$)",
+    r"|aiassistant|openhands|opencode|agents?|codeium|idx)" + _WIN_TRIM + r"(?:[/\\]+)?(?=[;&|)<>,}]|\s|['\"]|$)",
     re.IGNORECASE)
 AGENT_RULES_EXCLUDE_ARG_RE = re.compile(r"--exclude(?:-from)?(?:=|\s+)\S+", re.IGNORECASE)
 
@@ -1819,18 +1820,21 @@ _AR_CMD_PREFIX = (r"(?:^|[;&|({]|\b(?:sudo|doas|env|xargs|exec|command|nohup|tim
                   r"(?:\s+-\S+){0,4})\s*")
 AGENT_RULES_CMD_WRITE_VERB_RE = re.compile(
     _AR_CMD_PREFIX + r"(?:patch|touch|sponge|truncate|gunzip|bunzip2|unxz|uncompress|scp|sftp"
-    r"|degit|aria2c|axel|vim?|nvim|emacs|nano|ed|ex)\b"
+    r"|aria2c|axel|vim?|nvim|emacs|nano|ed|ex)(?=\s|$)"
+    # wget always writes a file unless told to print to stdout (`-O-`/`-qO -`)
+    r"|" + _AR_CMD_PREFIX + r"wget\b(?![^|;&\n]{0,200}\s-[A-Za-z]{0,8}O\s*-(?=\s|$))"
+    r"|" + _AR_CMD_PREFIX + r"curl\b(?=[^|;&\n]{0,200}(?:\s-(?-i:[A-Za-z0-9#]{0,8}O)\b|\s--remote-name))"
     r"|" + _AR_CMD_PREFIX + r"(?:xz|zstd|gzip|bzip2)\b[^|;&\n]{0,60}?\s-[a-zA-Z]{0,8}d"
     r"|" + _AR_CMD_PREFIX + r"(?:npx\s+)?(?:degit|tiged)\b",
     re.IGNORECASE)
 AGENT_RULES_API_WRITE_VERB_RE = re.compile(
-    r"\bgit\b(?![^|;&\n]{0,200}--(?:staged|cached)\b)[^|;&\n]{0,200}?"
-    r"\b(?:checkout|restore|checkout-index|apply|am|clone|stash\s+(?:pop|apply))\b"
+    r"\bgit(?:\s+(?:-[cC]\s*\S+|--?[\w-]+(?:=\S+)?)){0,6}\s+"
+    r"(?:checkout|restore|checkout-index|apply|am|clone|stash\s+(?:pop|apply))(?=\s|$)"
     r"|(?:^|\s)--in-place\b|\b(?:yq|jq|ruby)\b[^|;&\n]{0,200}?\s-[a-zA-Z]{0,8}i\b"
     r"|\bsed\b[^|;&\n]{0,200}?['\"\s;]w\s"
     r"|file_put_contents|WriteAll(?:Text|Lines|Bytes)|AppendAll(?:Text|Lines)|Clear-Content"
     r"|Start-BitsTransfer|write_text|write_bytes|writeFile|appendFile|write-region"
-    r"|\bopen\s*\(|\bexec\s+[0-9]{0,3}>",
+    r"|\bopen\s*\(\s*\w{1,40}\s*,\s*['\"]\s*\+?>|\bexec\s+[0-9]{0,3}>",
     re.IGNORECASE)
 AGENT_RULES_CMD_SEP_RE = re.compile(r"[|;&\n]")
 
@@ -1861,9 +1865,10 @@ AGENT_RULES_CMD_SEP_RE = re.compile(r"[|;&\n]")
 #       non-ASCII symbol or letter; U+E0100-E01EF: fine directly after a CJK
 #       ideograph. More than AGENT_RULES_MAX_SELECTORS exempted selectors in
 #       one text are all reported.
-#   Not treated as hidden at all: U+200D (emoji ZWJ) and U+FE0F (emoji
-#   presentation) on their own, U+00AD (soft hyphen), ordinary wide spaces
-#   and line/paragraph separators.
+#   Not treated as hidden: U+200D (emoji ZWJ), U+FE0F (emoji presentation)
+#   and U+00AD (soft hyphen) one at a time (a doubled one, or three of them
+#   in a row, is reported); ordinary wide spaces and line/paragraph
+#   separators.
 AGENT_RULES_HIDDEN_CPS = tuple(sorted(
     {0x180e, 0x180b, 0x180c, 0x180d, 0x180f, 0x034f, 0x115f, 0x1160, 0x3164, 0xffa0,
      0x2800, 0x17b4, 0x17b5, 0xfeff}
@@ -1885,6 +1890,10 @@ _AR_FLAG_TAG_SEQ_RE = re.compile(
     chr(0x1f3f4) + "(?:" + "|".join("".join(chr(0xe0000 + ord(ch)) for ch in name)
                                     for name in ("gbeng", "gbsct", "gbwls")) + ")" + chr(0xe007f))
 _AR_SELECTOR_RE = re.compile("[" + _AR_FE + _AR_IVS + "]")
+# U+200D / U+FE0F / U+00AD are legitimate one at a time (emoji joiner,
+# presentation selector, soft hyphen) -- never doubled, never three in a row.
+_AR_SOFT = chr(0x200d) + chr(0xfe0f) + chr(0xad)
+_AR_SOFT_RUN_RE = re.compile("([" + _AR_SOFT + "])\\1|[" + _AR_SOFT + "]{3,}")
 _AR_CJK_RE = re.compile("[" + chr(0x2e80) + "-" + chr(0x9fff) + chr(0xf900) + "-" + chr(0xfaff)
                         + chr(0x20000) + "-" + chr(0x3ffff) + "]")
 
@@ -1921,6 +1930,8 @@ def agent_rules_hidden_chars(text: str) -> list:
             scan = "".join(chars)
         for m in _AR_HIDDEN_ALWAYS_RE.finditer(scan):
             out.append((m.start(), ord(m.group(0))))
+        for m in _AR_SOFT_RUN_RE.finditer(scan):
+            out.append((m.start(), ord(m.group(0)[0])))
         for m in _AR_HIDDEN_CONTEXT_RE.finditer(scan):
             i = m.start()
             near = scan[max(0, i - 2):i] + scan[i + 1:i + 3]
@@ -5103,16 +5114,11 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
 # in ~0.2s. Also added `Invoke-RestMethod`/`irm` (both support `-OutFile`,
 # common in real PowerShell scripts, and were simply missing from the
 # original verb list alongside `Invoke-WebRequest`/`iwr`).
-# The clustered short-option form (`curl -sSLo <dest>`, `wget -qO<dest>`) was
-# an accepted residual gap of the original pattern. QA on agent-rules-protect
-# showed it reached the never-escapable tier (`curl -Lo .aegis/policy.yaml`),
-# so up to 8 flag letters are now accepted before the value-taking `o`/`O`
-# (rules._FETCH_DEST_TOKEN_RE mirrors this for the glued spelling).
 FETCH_TO_FILE_VERB_RE = re.compile(
     r"\bcurl(?:\.exe)?\b[^|;&\n]{0,200}?"
-    r"(?:(?:^|\s)-[A-Za-z]{0,8}?(?-i:o)(?:\s+\S|\S)|--output(?:=|\s+)\S)"
+    r"(?:(?:^|\s)-(?-i:o)(?:\s+\S|\S)|--output(?:=|\s+)\S)"
     r"|\bwget\b[^|;&\n]{0,200}?"
-    r"(?:(?:^|\s)-[A-Za-z]{0,8}?(?-i:O)(?:\s+\S|\S)|--output-document(?:=|\s+)\S)"
+    r"(?:(?:^|\s)-(?-i:O)(?:\s+\S|\S)|--output-document(?:=|\s+)\S)"
     r"|\b(?:Invoke-WebRequest|Invoke-RestMethod|iwr|irm|curl|wget)\b"
     r"[^|;&\n]{0,200}?-OutFile\b"
     r"|\bStart-BitsTransfer\b[^|;&\n]{0,200}?-Destination\b"
