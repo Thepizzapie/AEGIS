@@ -1172,6 +1172,9 @@ def rule_agent_def_protect(ev: Event, policy=None) -> Optional[Decision]:
 # Zero-width/direction marks still allowed a per-mark context check in this
 # evaluation -- one budget shared by every string scanned, reset at rule entry
 # (QA round 8: a per-string cap let 60 strings of 20,000 marks cost 1.8 s).
+# Module-level, like _AGENT_RULES_FS_DEADLINE: the hook evaluates one event
+# per process. Concurrent evaluate() calls in one process would share it; the
+# only effect found is a spurious deny, never a weaker decision.
 _AGENT_RULES_MARK_BUDGET = [patterns.AGENT_RULES_MAX_CONTEXT_MARKS]
 
 
@@ -1849,7 +1852,13 @@ def rule_agent_rules_protect(ev: Event, policy=None) -> Optional[Decision]:
     control characters written as escapes (``\\033[8m``, ``\\b``) -- only
     the literal characters are caught; a path spelled with a glob/brace/variable expansion
     (``.cursorrule[s]``, ``$N.md``); a command longer than the shared
-    20,000-character scan window; a tool whose name is neither a known
+    20,000-character scan window, or whose de-obfuscated surface (decoded
+    base64, inner interpreters) runs past 60,000 characters before the
+    rules path appears; one call carrying more than 20,000 zero-width/
+    direction marks in total (the per-mark context check stops there: later
+    strings are reported on their first mark, and an edit pair can no longer
+    be compared mark for mark); command verbs indented by more than 256
+    blanks; a tool whose name is neither a known
     edit/write tool nor ``mcp__*``; an MCP path split across two arguments; a
     shell command that builds the path across variables, or ``cd``s into the parent of a rules directory (or
     starts with its cwd inside one) and writes a relative path; an MCP tool
