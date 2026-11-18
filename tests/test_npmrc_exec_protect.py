@@ -637,6 +637,10 @@ P5 = "npm config set script-shell ./x"
     f"git submodule foreach '{P5}'",
     f"echo '{P5}' > /tmp/a.sh && sh /tmp/a.sh",
     f"echo '{P5}' > a.sh; bash a.sh",
+    f"git -c alias.z='!sh -c' z -m '{P5}'",
+    f"git -c alias.z='!bash -c' z -t '{P5}'",
+    f"git --config-env=alias.z=X z -m '{P5}'",
+    f"git z -m '{P5}'",
 ])
 def test_qa5_masking_cannot_hide_real_calls(cmd):
     d = _hit(_shell(cmd))
@@ -652,6 +656,8 @@ def test_qa5_masking_cannot_hide_real_calls(cmd):
     f"printf '%s\\n' 'tip: {P5}'",
     f"grep -rn '{P5}' docs/",
     f"cd app && git commit -m 'docs: {P5}' && git push",
+    f"git -C app commit -m 'docs: {P5}'",
+    f"gh issue create --title t --body 'run {P5}'",
 ])
 def test_qa5_data_mentions_still_allowed(cmd):
     assert _hit(_shell(cmd)) is None, cmd

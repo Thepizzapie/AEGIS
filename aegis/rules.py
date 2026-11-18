@@ -3463,6 +3463,15 @@ _NPMRC_VCS_CMDS = frozenset(("git", "gh", "glab", "hub"))
 _NPMRC_MSG_FLAGS = frozenset(("-m", "--message", "-b", "--body", "-t", "--title",
                               "--notes", "--description", "-d"))
 _NPMRC_MSG_EQ_RE = re.compile(r"^--(?:message|body|title|notes|description)=")
+# ...and only under a message-taking subcommand, with no `-c`/`--config-env`
+# before it: `git -c alias.z='!sh -c' z -m '...'` runs the `-m` value as a
+# shell script (QA round 6).
+_NPMRC_VCS_MSG_SUBCMDS = frozenset(("commit", "tag", "merge", "notes", "stash",
+                                    "pr", "issue", "release", "mr"))
+# Subcommands allowed elsewhere on a masked line; their own args never mask.
+_NPMRC_VCS_INERT_SUBCMDS = frozenset(("push", "pull", "fetch", "status", "log", "diff",
+                                      "add", "show", "view", "list"))
+_NPMRC_VCS_VALUE_OPTS = frozenset(("-C", "--git-dir", "--work-tree", "-R", "--repo"))
 # Masking also needs EVERY simple command on the line to be a data command or
 # an inert one, so a written-then-run script (`echo '...' > a.sh && sh a.sh`)
 # keeps its text visible (QA round 5).
@@ -3487,13 +3496,24 @@ def _npmrc_mask_data_spans(raw: str) -> str:
         toks = list(lex)
     except ValueError:
         return raw
-    out, changed, cmd, prev = [], False, None, ""
+    out, changed, cmd, prev, sub, skip = [], False, None, "", None, False
     for t in toks:
         last, prev = prev, t
         if t in _NPMRC_SEP_TOKENS or (t and set(t) <= set(";&|()")):
             out.append(t)
-            cmd = None
+            cmd, sub, skip = None, None, False
             continue
+        if cmd in _NPMRC_VCS_CMDS and sub is None:
+            if skip:
+                skip = False
+            elif t == "-c" or t.startswith("--config-env") or (t.startswith("-c") and len(t) > 2):
+                return raw
+            elif t in _NPMRC_VCS_VALUE_OPTS:
+                skip = True
+            elif not t.startswith("-"):
+                sub = t.lower()
+                if sub not in _NPMRC_VCS_MSG_SUBCMDS and sub not in _NPMRC_VCS_INERT_SUBCMDS:
+                    return raw
         if cmd is None:
             if re.match(r"^[A-Za-z_]\w*=", t):
                 out.append(shlex.quote(t))
@@ -3504,8 +3524,9 @@ def _npmrc_mask_data_spans(raw: str) -> str:
             out.append(shlex.quote(t))
             continue
         if (cmd in _NPMRC_DATA_CMDS and patterns.NPMRC_EXEC_CLI_RE.search(t)
-                and (cmd not in _NPMRC_VCS_CMDS or last in _NPMRC_MSG_FLAGS
-                     or _NPMRC_MSG_EQ_RE.match(t))):
+                and (cmd not in _NPMRC_VCS_CMDS
+                     or (sub in _NPMRC_VCS_MSG_SUBCMDS
+                         and (last in _NPMRC_MSG_FLAGS or _NPMRC_MSG_EQ_RE.match(t))))):
             out.append("--message=''" if _NPMRC_MSG_EQ_RE.match(t) else "''")
             changed = True
             continue
@@ -3893,7 +3914,12 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     message/body/title values, ``echo``, ``printf``, ``grep``; ``cd``,
     ``true``, ...), so a written-then-run script, ``find -exec``,
     ``nsenter``, ``strace``, ``git -c alias.x='!...'`` and ``rebase
-    --exec`` all stay visible; linear time. The surface is paired as well
+    --exec`` all stay visible; linear time. A sixth review APPROVED (no
+    high/medium issue) and noted one low gap, closed here: ``git -c
+    alias.z='!sh -c' z -m '...'`` runs the ``-m`` value as a script, so a
+    VCS message value is now masked only under a message-taking subcommand
+    (commit/tag/merge/notes/stash, gh pr/issue/release) and never when the
+    line carries ``-c``/``--config-env``. The surface is paired as well
     whenever it holds more occurrences than the visible text accounts for,
     so a visible decoy can't hide an obfuscated call.
 
