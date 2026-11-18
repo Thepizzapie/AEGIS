@@ -4200,6 +4200,92 @@ YARN_EXEC_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- npm-config exec hijack (.npmrc script-shell / node-options / ...) ---------
+# npm, pnpm and Yarn Classic all read a PROJECT-level config file with no trust
+# prompt of any kind, and several of its keys name a program or a Node.js module
+# the package manager itself runs on routine commands -- with no `scripts` entry,
+# no lifecycle-hook name, and no registry URL for `rule_package_manifest_protect`
+# to see:
+#
+#   - `script-shell` (npm/pnpm `.npmrc`, Yarn Classic `.yarnrc`, pnpm-workspace
+#     `scriptShell`): the binary EVERY `npm run`/`npm test`/`npm start`/`npx`
+#     and every dependency's install-time lifecycle script is exec'd through.
+#   - `node-options` (`nodeOptions`): exported as NODE_OPTIONS to every script
+#     npm spawns, so `--require ./x.js`/`--import`/`--loader`/`--inspect`/
+#     `--openssl-config` lands in every Node process a script starts.
+#   - `shell` (`npm exec`/`npm explore`), `git` (the binary run for every git
+#     dependency), `init-module` (`npm init`), `onload-script` (npm<=6, required
+#     on every npm start).
+#   - `yarn-path` (Yarn Classic `.yarnrc`): the v1 analog of Berry's `yarnPath`
+#     -- every bare `yarn` re-execs the named file as Node.js.
+#     `rule_yarn_exec_protect` only watches Berry's `.yarnrc.yml`.
+#
+# Path half: the project/user `.npmrc`, npm's global `{prefix}/etc/npmrc` and
+# builtin `.../npm/npmrc`, Yarn Classic's `.yarnrc` (NOT `.yarnrc.yml`), and
+# pnpm's `pnpm-workspace.yaml` (pnpm>=10 settings home).
+NPMRC_EXEC_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])\.npmrc" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.yarnrc" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pnpm-workspace\.yaml" + _CI_END
+    + r"|(?:^|[\s'\"/\\=])(?:etc|npm)" + _SEP + r"npmrc" + _CI_END,
+    re.IGNORECASE,
+)
+
+# Exec-bearing keys, normalized form (lower-case, `_`/`.` -> `-`, camelCase
+# split): `node-options` is value-gated (see NPMRC_NODE_OPTIONS_DANGER_RE);
+# `script-shell`/`shell`/`git` exempt a well-known system binary (see
+# NPMRC_SAFE_*); every other key is gated on any non-empty value.
+NPMRC_EXEC_KEYS = ("script-shell", "node-options", "shell", "git",
+                   "init-module", "onload-script", "yarn-path")
+_NPMRC_KEY_ALT = (r"script[-_]?shell|node[-_]?options|shell|git|init[-_.]?module"
+                  r"|onload[-_]?script|yarn[-_]?path")
+# Line form: one config entry per line, `key=value` (.npmrc/ini), `key "value"`
+# (.yarnrc), or `key: value` (pnpm-workspace.yaml). Bounded value span.
+NPMRC_EXEC_LINE_RE = re.compile(
+    r"^[ \t]*[\"']?(" + _NPMRC_KEY_ALT + r")[\"']?[ \t]*(?:[=:][ \t]*|[ \t]+)([^\r\n]{0,2000})$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Free-text form for a shell command's scan surface (echo/printf/heredoc/sed
+# payloads): the key, not glued to a preceding word/dash, then `=`/`:`/quote-
+# space, then the value up to a quote, newline, or command separator.
+NPMRC_EXEC_FREE_RE = re.compile(
+    r"(?<![\w.\-])(" + _NPMRC_KEY_ALT + r")[\"']?[ \t]*(?:=|:[ \t]|[ \t]+[\"'])[ \t]*"
+    r"([^\r\n'\"|;&]{0,500})",
+    re.IGNORECASE,
+)
+# `npm config set` / `npm c set` / `npm set` / `pnpm config set` / `yarn config
+# set` -- the subcommand IS the write (it edits the user/project/global npmrc).
+NPMRC_EXEC_CLI_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?\s+(?:(?:config|c)\s+set|set)\b([^|;&\n]{0,500})",
+    re.IGNORECASE,
+)
+# NODE_OPTIONS flags that load code or open a remote-control channel. Anything
+# else (`--max-old-space-size=4096`, `--no-warnings`, ...) is routine.
+NPMRC_NODE_OPTIONS_DANGER_RE = re.compile(
+    r"(?:^|[\s\"'=,\[])(?:--require|-r|--import|--loader|--experimental-loader"
+    r"|--inspect(?:-brk|-wait|-port|-publish-uid)?|--openssl-config|--openssl-shared-config"
+    r"|--experimental-policy|--policy-integrity|--env-file(?:-if-exists)?"
+    r"|--experimental-(?:default-)?config-file|--experimental-network-imports"
+    r"|--experimental-addon-modules|--snapshot-blob)(?![\w-])",
+    re.IGNORECASE,
+)
+# A bare or system-path shell / git -- a legitimate `script-shell=bash` (the
+# common Windows-Git-Bash setup) or `git=/usr/bin/git` stays ALLOW. A relative
+# path, a home-dir path, or anything else is not exempt.
+_NPMRC_SYS_DIR = r"(?:/usr(?:/local)?/bin/|/bin/|/opt/homebrew/bin/)"
+NPMRC_SAFE_SHELL_RE = re.compile(
+    r"^(?:" + _NPMRC_SYS_DIR + r")?(?:sh|bash|zsh|dash|ksh|mksh|fish|pwsh|powershell|cmd)(?:\.exe)?$"
+    r"|^[a-z]:[/\\]+(?:program files(?: \(x86\))?[/\\]+)?git[/\\]+(?:usr[/\\]+)?bin[/\\]+(?:bash|sh)\.exe$"
+    r"|^[a-z]:[/\\]+windows[/\\]+system32[/\\]+(?:cmd\.exe|windowspowershell[/\\]+v1\.0[/\\]+powershell\.exe)$"
+    r"|^[a-z]:[/\\]+program files[/\\]+powershell[/\\]+\d+[/\\]+pwsh\.exe$",
+    re.IGNORECASE,
+)
+NPMRC_SAFE_GIT_RE = re.compile(
+    r"^(?:" + _NPMRC_SYS_DIR + r")?git(?:\.exe)?$"
+    r"|^[a-z]:[/\\]+program files(?: \(x86\))?[/\\]+git[/\\]+(?:cmd|bin|mingw64[/\\]+bin)[/\\]+git\.exe$",
+    re.IGNORECASE,
+)
+
 # ---- Git-config credential/exec hijack protection ------------------------------
 # Two git-config-driven persistence/exfiltration primitives `git_hooks_protect`
 # doesn't reach (it only watches `core.hooksPath`): `credential.helper` and a

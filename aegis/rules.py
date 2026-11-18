@@ -3191,6 +3191,353 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+_NPMRC_KEY_CANON = {"scriptshell": "script-shell", "nodeoptions": "node-options",
+                    "shell": "shell", "git": "git", "initmodule": "init-module",
+                    "onloadscript": "onload-script", "yarnpath": "yarn-path"}
+_NPMRC_MAX_FILE = 256 * 1024
+_NPMRC_MAX_SOURCES = 8
+
+
+def _npmrc_canon_key(k: str) -> str:
+    return _NPMRC_KEY_CANON.get(re.sub(r"[-_.]", "", str(k).lower()), "")
+
+
+def _npmrc_clean_value(v: str) -> str:
+    v = str(v).strip()
+    # A printf/echo -e payload's literal `\n` ends the value it is written as.
+    v = re.split(r"\\[nrt]", v, maxsplit=1)[0].strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+    return v.strip("\"'").strip()
+
+
+def _npmrc_value_dangerous(key: str, value: str) -> bool:
+    v = _npmrc_clean_value(value)
+    if not v:
+        return False
+    if key == "node-options":
+        return bool(patterns.NPMRC_NODE_OPTIONS_DANGER_RE.search(v))
+    if key in ("script-shell", "shell"):
+        return not patterns.NPMRC_SAFE_SHELL_RE.match(v)
+    if key == "git":
+        return not patterns.NPMRC_SAFE_GIT_RE.match(v)
+    return True
+
+
+def _npmrc_findings(text: str, free: bool = False) -> list:
+    """(key, cleaned value) for every dangerous exec-key entry in ``text``.
+    Line mode skips `;`/`#` comment lines (they are inert to every parser
+    involved); free mode scans a shell command's whole scan surface."""
+    out = []
+    if not isinstance(text, str) or not text:
+        return out
+    rx = patterns.NPMRC_EXEC_FREE_RE if free else patterns.NPMRC_EXEC_LINE_RE
+    for m in rx.finditer(text[:_NPMRC_MAX_FILE * 2]):
+        key = _npmrc_canon_key(m.group(1))
+        if key and _npmrc_value_dangerous(key, m.group(2)):
+            out.append((key, _npmrc_clean_value(m.group(2))))
+            if len(out) >= 32:
+                break
+    return out
+
+
+def _npmrc_cli_findings(cmd: str) -> list:
+    """Dangerous `npm|pnpm|yarn config set <key> <value>` / `<key>=<value>` pairs."""
+    out = []
+    for m in patterns.NPMRC_EXEC_CLI_RE.finditer(cmd or ""):
+        tail = m.group(1)
+        try:
+            toks = shlex.split(tail, posix=True)
+        except ValueError:
+            toks = tail.split()
+        toks = [t for t in toks if t != "--"]
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if t.startswith("-"):
+                # `--location project` / `-L project` consume their value.
+                if t in ("--location", "-L", "--userconfig", "--globalconfig"):
+                    i += 1
+                i += 1
+                continue
+            if "=" in t:
+                k, _, v = t.partition("=")
+                i += 1
+            else:
+                k = t
+                v = toks[i + 1] if i + 1 < len(toks) else ""
+                i += 2
+            key = _npmrc_canon_key(k)
+            if not key:
+                continue
+            # A value-less `set <key>` with nothing after it is not a write;
+            # a value the CLI regex couldn't see (cut at a separator) is.
+            if v == "" and i - 1 >= len(toks):
+                if key != "node-options":
+                    out.append((key, "<unparsed>"))
+                continue
+            if _npmrc_value_dangerous(key, v):
+                out.append((key, _npmrc_clean_value(v)))
+    return out
+
+
+def _npmrc_resolve(ev: Event, p: str) -> Optional[str]:
+    try:
+        p = str(p)
+        if p.lower().startswith("file://"):
+            p = urllib.parse.unquote(p[7:])
+        p = os.path.expanduser(p)
+        if not os.path.isabs(p):
+            if not ev.cwd:
+                return None
+            p = os.path.join(str(ev.cwd), p)
+        return p
+    except Exception:
+        return None
+
+
+def _npmrc_read(ev: Event, p: str) -> Optional[str]:
+    fp = _npmrc_resolve(ev, p)
+    if not fp:
+        return None
+    try:
+        st = os.stat(fp)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _NPMRC_MAX_FILE:
+            return None
+        with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(_NPMRC_MAX_FILE)
+    except Exception:
+        return None
+
+
+def _npmrc_apply_edits(base: str, edits) -> Optional[str]:
+    """Apply Edit/MultiEdit/MCP edit_file replacements to ``base``; None when
+    any old string is absent (the edit would fail, or the file isn't the one
+    the hook can see)."""
+    out = base
+    for old, new, every in edits:
+        if not isinstance(old, str) or not isinstance(new, str):
+            return None
+        if old == "":
+            out = new + out
+            continue
+        if old not in out:
+            return None
+        out = out.replace(old, new) if every else out.replace(old, new, 1)
+    return out
+
+
+def _npmrc_edit_list(a: dict) -> list:
+    edits = []
+    if isinstance(a.get("old_string"), str) or isinstance(a.get("new_string"), str):
+        edits.append((a.get("old_string") or "", a.get("new_string") or "",
+                      bool(a.get("replace_all"))))
+    for e in (a.get("edits") or []) if isinstance(a.get("edits"), list) else []:
+        if not isinstance(e, dict):
+            continue
+        for ok, nk in (("old_string", "new_string"), ("oldText", "newText"),
+                       ("old_str", "new_str"), ("old", "new")):
+            if ok in e or nk in e:
+                edits.append((e.get(ok) or "", e.get(nk) or "", bool(e.get("replace_all"))))
+                break
+    return edits
+
+
+def _npmrc_new_findings(ev: Event, p: str) -> list:
+    """Dangerous entries the Edit/Write/MCP call would ADD to ``p`` -- the
+    post-change file minus what is already on disk, so re-saving a file that
+    already carries a reviewed entry doesn't re-ask."""
+    a = ev.args or {}
+    before = _npmrc_read(ev, p)
+    after = None
+    content = a.get("content")
+    if not isinstance(content, str):
+        content = a.get("contents") if isinstance(a.get("contents"), str) else a.get("text")
+    edits = _npmrc_edit_list(a)
+    if isinstance(content, str) and not edits:
+        after = content
+    elif edits:
+        if before is not None:
+            after = _npmrc_apply_edits(before, edits)
+        if after is None:
+            # File unreadable or old string absent: judge the new text alone,
+            # and treat nothing as pre-existing.
+            before = None
+            after = "\n".join(n for _, n, _ in edits)
+    if after is None:
+        after = "\n".join(_flatten_strings(a))
+        before = None
+    new = _npmrc_findings(after)
+    if before is None:
+        return new
+    old = list(_npmrc_findings(before))
+    added = []
+    for f in new:
+        if f in old:
+            old.remove(f)
+        else:
+            added.append(f)
+    return added
+
+
+def _npmrc_shell_source_findings(ev: Event, raw: str) -> list:
+    """Files a shell write copies/concatenates into an npm config path: read
+    any existing, non-config, small regular file the command names and scan
+    it in line mode (`cp evil .npmrc`, `cat x > .npmrc`, `install -m 644 x
+    ~/.npmrc`)."""
+    try:
+        toks = shlex.split(raw, posix=True)
+    except ValueError:
+        toks = raw.split()
+    out, seen = [], 0
+    for t in toks[:256]:
+        if seen >= _NPMRC_MAX_SOURCES or patterns.NPMRC_EXEC_PATH_RE.search(" " + t):
+            continue
+        t = t.lstrip("<>")
+        if not t or t.startswith("-") or len(t) > 4096:
+            continue
+        txt = _npmrc_read(ev, t)
+        if txt is None:
+            continue
+        seen += 1
+        out.extend(_npmrc_findings(txt))
+    return out
+
+
+def _npmrc_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _npmrc_describe(found: list) -> str:
+    return ", ".join(f"{k}={v!s:.60}" for k, v in found[:3])
+
+
+def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting an exec-bearing package-manager config entry: npm/pnpm
+    ``.npmrc``'s ``script-shell``/``node-options``/``shell``/``git``/
+    ``init-module``/``onload-script``, Yarn Classic ``.yarnrc``'s
+    ``script-shell``/``yarn-path``, or pnpm-workspace.yaml's
+    ``scriptShell``/``nodeOptions`` -- by file write, shell write, or
+    ``npm|pnpm|yarn config set``.
+
+    THREAT MODEL: npm, pnpm and Yarn Classic read a PROJECT-level config file
+    with no trust prompt, and these keys name a program or module the package
+    manager itself runs. ``script-shell=./tools/sh`` makes EVERY ``npm run``/
+    ``npm test``/``npm start``/``npx`` -- and every dependency's install-time
+    lifecycle script -- exec that file; ``node-options=--require ./x.js`` is
+    exported as NODE_OPTIONS into every Node process those scripts start.
+    ``npm test`` is the single command a coding agent (and its human, and CI)
+    runs most often, so the fuse is the next routine step, not a future
+    session. None of it is a ``scripts`` entry, a lifecycle-hook name, or a
+    registry URL, so ``rule_package_manifest_protect`` (registry redirect
+    only on ``.npmrc``) and ``rule_pnpmfile_exec_protect`` (``pnpmfile`` key
+    only) never see it; ``rule_claude_env_protect`` gates NODE_OPTIONS only
+    inside Claude Code's own settings env block. Yarn Classic's
+    ``yarn-path`` is the v1 analog of Berry's ``yarnPath``, which
+    ``rule_yarn_exec_protect`` covers only in ``.yarnrc.yml``.
+
+    Content-gated with narrowing, not path-gated: ``.npmrc`` routinely holds
+    registry/auth/``save-exact`` lines. ``node-options`` fires only on a
+    code-loading or remote-control flag (``--require``/``-r``/``--import``/
+    ``--loader``/``--experimental-loader``/``--inspect*``/
+    ``--openssl-config``/``--env-file``/...), never on
+    ``--max-old-space-size``; ``script-shell``/``shell``/``git`` exempt a
+    bare or system-path shell/git binary (the common
+    ``script-shell=bash`` Windows-Git-Bash setup); ``init-module``/
+    ``onload-script``/``yarn-path`` fire on any value. An Edit/Write is
+    judged by what it ADDS: the post-change file (Edit/MultiEdit/MCP
+    ``edits`` applied to the on-disk file) minus entries already on disk, so
+    a value-only Edit (``old_string='bash'``, ``new_string='./x.sh'``) is
+    seen, and re-saving an already-reviewed entry doesn't re-ask. Comment
+    lines (``;``/``#``) are skipped.
+
+    Config (``policy.npmrc_exec``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes on the path/command). Default ``ask``: some
+    repos legitimately pin a custom script shell. Escapable only by a
+    human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_NPMRC_EXEC=1`` set by the orchestrator before launch.
+
+    Honest scope: values assembled indirectly (``${VAR}`` interpolation
+    pointing at an env var set elsewhere) are judged as written -- a
+    ``${...}`` value is not exempt, so it fires; an inline env var
+    (``npm_config_script_shell=./x npm test``) is not gated -- it affects
+    only the command the agent itself is running, i.e. no more than running
+    ``./x`` directly, and persisting it into a shell rc is
+    ``rule_shell_persist_protect``'s surface; ``userconfig``/``globalconfig``
+    redirects to a differently named npmrc are not followed; a shell
+    ``sed`` replacement scans its pattern half too, so a sed that REPLACES
+    an exec entry with a safe value can over-fire ASK; a shell write whose
+    payload is neither in the command nor in a readable named file
+    (``curl -o .npmrc ...``) is closed by ``rule_fetch_to_file_protect``'s
+    backstop list, which this guard's path regex joins; the shared
+    ``_path()`` MCP key allowlist gap every sibling discloses applies."""
+    cfg = getattr(policy, "npmrc_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "npmrc-exec-protect-monitor")
+            return None
+        return would
+
+    tail = ("— npm/pnpm/yarn run it, unattended and with no trust prompt, on "
+            "the very next 'npm test'/'npm run'/'npm install' (every "
+            "script, and every dependency's lifecycle script) or bare "
+            "'yarn'. ")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.NPMRC_EXEC_PATH_RE.search(p):
+            return None
+        found = _npmrc_new_findings(ev, p)
+        if not found:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_NPMRC_EXEC")
+                or _npmrc_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "npmrc-exec-protect",
+                         f"'{p}' gains an exec-bearing package-manager "
+                         f"config entry ({_npmrc_describe(found)}) " + tail
+                         + "Review the change, then confirm with "
+                         "AEGIS_ALLOW_NPMRC_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        raw = _cmd(ev)
+        cmd = _shell_scan(ev)
+        found = _npmrc_cli_findings(cmd)
+        if not found:
+            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                               or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                               or patterns.INPLACE_WRITE_RE.search(cmd)
+                               or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                               or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd))
+            if write_verb and patterns.NPMRC_EXEC_PATH_RE.search(cmd):
+                found = (_npmrc_findings(cmd, free=True)
+                         or _npmrc_shell_source_findings(ev, raw))
+        if not found:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_NPMRC_EXEC")
+                or _npmrc_exec_allowed_by_policy(cfg, raw)):
+            return None
+        return _finish(Decision(action, "npmrc-exec-protect",
+                         "An exec-bearing package-manager config entry is "
+                         f"being set from a shell ({_npmrc_describe(found)}) "
+                         + tail + "A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_NPMRC_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 def _git_config_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -8688,6 +9035,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.PNPMFILE_PATH_RE, "pnpm's hook file"),
     (patterns.YARN_EXEC_PATH_RE, "Yarn Berry's own release/plugin bundle"),
     (patterns.YARNRC_YML_PATH_RE, "Yarn Berry's .yarnrc.yml exec-loader config"),
+    (patterns.NPMRC_EXEC_PATH_RE, "an npm/pnpm/Yarn Classic config file (script-shell/node-options)"),
     (patterns.GIT_CONFIG_FILE_PATH_RE, "a git config file"),
     (patterns.GIT_ATTRS_PATH_RE, "a .gitattributes file"),
     (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),
@@ -10446,6 +10794,7 @@ _CORE_RULES = (
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
     rule_yarn_exec_protect,
+    rule_npmrc_exec_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_gitmodules_protect,

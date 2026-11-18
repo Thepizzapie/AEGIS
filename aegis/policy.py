@@ -229,6 +229,8 @@ class Policy:
     # that rewrite either (`yarn set version ...`, `yarn plugin import ...`).
     # See rules.rule_yarn_exec_protect.
     yarn_exec: dict = field(default_factory=dict)
+    # See rules.rule_npmrc_exec_protect.
+    npmrc_exec: dict = field(default_factory=dict)
     # Git-config credential/exec-hijack protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers `credential.helper` redirection and any git-config key
