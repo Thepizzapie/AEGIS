@@ -3204,8 +3204,26 @@ _NPMRC_MAX_SOURCES = 8
 _NPMRC_OVERSIZE = ("<file>", "too large to inspect")
 
 
+def _npmrc_json_unquote(v: str) -> str:
+    """A double-quoted ini/lockfile token is JSON-decoded by npm's and Yarn's
+    parsers (`"script\\u002dshell"`), a single-quoted one taken literally."""
+    v = str(v)
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        try:
+            d = json.loads(v)
+            if isinstance(d, str):
+                return d
+        except Exception:
+            pass
+        return v[1:-1]
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1]
+    return v
+
+
 def _npmrc_canon_key(k: str) -> str:
-    return _NPMRC_KEY_CANON.get(re.sub(r"[-_.]", "", str(k).lower()), "")
+    k = _npmrc_json_unquote(str(k).strip())
+    return _NPMRC_KEY_CANON.get(re.sub(r"[-_.]", "", k.lower()), "")
 
 
 def _npmrc_kind(p: str) -> str:
@@ -3228,7 +3246,7 @@ def _npmrc_clean_value(v, kind: str = "free") -> str:
         v = re.split(r"\\[nrt]", v, maxsplit=1)[0].strip()
         v = v.replace('\\"', '"').replace("\\'", "'")
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-        return v[1:-1].strip()
+        return (_npmrc_json_unquote(v) if kind != "free" else v[1:-1]).strip()
     if kind == "ini":
         # npm's ini parser ends an unquoted value at the first unescaped `;`/`#`.
         out, esc = [], False
@@ -3296,29 +3314,51 @@ def _npmrc_yaml_entries(text: str) -> list:
     for m in patterns.NPMRC_YAML_FLOW_RE.finditer(text):
         out.append((m.group(1), m.group(2)))
     # Authoritative parse last (last-wins), when the file is valid YAML.
+    # Only the two settings are ever stringified, lists one level deep and
+    # scalars only, with a length cap -- never str() on a nested container,
+    # so an alias bomb stays the cheap shared-reference graph PyYAML builds
+    # (QA round 3: a 500-byte alias bomb once took 35 s / 9.6 GB here).
+    ok, data = _npmrc_yaml_load(text)
+    if ok and isinstance(data, dict):
+        for k, v in data.items():
+            if not isinstance(k, str) or _npmrc_canon_key(k) not in ("script-shell", "node-options"):
+                continue
+            if isinstance(v, (list, tuple)):
+                v = " ".join(str(x) for x in v[:64]
+                             if isinstance(x, (str, int, float)) and not isinstance(x, bool))
+            elif not isinstance(v, (str, int, float)) or isinstance(v, bool):
+                continue
+            out.append((k, str(v)[:4096]))
+    return out
+
+
+_NPMRC_YAML_MAX = 1024 * 1024
+_NPMRC_YAML_CACHE = {}
+
+
+def _npmrc_yaml_load(text: str):
+    """(parsed_ok, data), parsed at most once per distinct text per process
+    (one hook call evaluates one event; the cache is bounded)."""
+    key = hash(text)
+    hit = _NPMRC_YAML_CACHE.get(key)
+    if hit is not None and hit[0] == text:
+        return hit[1]
     try:
         import yaml as _yaml
-        data = _yaml.safe_load(text)
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, (list, tuple)):
-                    v = " ".join(str(x) for x in v)
-                if isinstance(k, str) and v is not None and not isinstance(v, dict):
-                    out.append((k, str(v)))
+        loader = getattr(_yaml, "CSafeLoader", None) or _yaml.SafeLoader
+        res = (True, _yaml.load(text, Loader=loader))
     except Exception:
-        pass
-    return out
+        res = (False, None)
+    if len(_NPMRC_YAML_CACHE) > 8:
+        _NPMRC_YAML_CACHE.clear()
+    _NPMRC_YAML_CACHE[key] = (text, res)
+    return res
 
 
 def _npmrc_yaml_parses(text: str) -> bool:
     if not text.strip():
         return True
-    try:
-        import yaml as _yaml
-        _yaml.safe_load(_npmrc_normalize(text))
-        return True
-    except Exception:
-        return False
+    return _npmrc_yaml_load(_npmrc_normalize(text))[0]
 
 
 def _npmrc_entries(text, kind: str) -> list:
@@ -3329,12 +3369,21 @@ def _npmrc_entries(text, kind: str) -> list:
         return [_NPMRC_OVERSIZE]
     if kind == "free":
         raw = []
-        for rx in patterns.NPMRC_EXEC_FREE_RES:
-            raw.extend((m.start(), m.group(1), m.group(2)) for m in rx.finditer(text))
+        texts = [text]
+        if "\\u" in text or "\\U" in text:
+            # A quoted key/value npm or Yarn will JSON-decode (`"script\\u002dshell"`).
+            texts.append(re.sub(r"\\[uU]([0-9a-fA-F]{4})",
+                                lambda m: chr(int(m.group(1), 16)), text))
+        for t in texts:
+            for rx in patterns.NPMRC_EXEC_FREE_RES:
+                raw.extend((m.start(), m.group(1), m.group(2)) for m in rx.finditer(t))
         raw = [(k, v) for _, k, v in sorted(raw)]
     else:
         text = _npmrc_normalize(text)
         if kind == "yaml":
+            if len(text) > _NPMRC_YAML_MAX:
+                # PyYAML costs ~8 s/MB: past 1 MB, ask rather than stall the hook.
+                return [_NPMRC_OVERSIZE]
             raw = _npmrc_yaml_entries(text)
         else:
             rx = patterns.NPMRC_YARN_LINE_RE if kind == "yarn" else patterns.NPMRC_EXEC_LINE_RE
@@ -3359,26 +3408,53 @@ def _npmrc_findings(text, kind: str = "ini") -> list:
     return out
 
 
-def _npmrc_cli_findings(cmd: str) -> list:
-    """Dangerous `npm|pnpm|yarn config set <key> <value>` / `<key>=<value>` pairs."""
-    out = []
-    for m in patterns.NPMRC_EXEC_CLI_RE.finditer(cmd or ""):
-        tail = m.group(1)
-        try:
-            toks = shlex.split(tail, posix=True)
-        except ValueError:
-            toks = tail.split()
-        toks = [t for t in toks if t != "--"]
-        # Every token position is tried as a key, so a value-taking flag the
-        # parser doesn't know (`--prefix /tmp`, `--dir .`) can't shift the
-        # key/value pairing (QA round 2).
-        for i, t in enumerate(toks):
-            if t.startswith("-"):
-                continue
-            if "=" in t:
-                k, _, v = t.partition("=")
+# Boolean flags that never take a value; any other bare `--flag` followed by
+# a non-flag token is treated as consuming it (`--prefix /tmp`, `--dir .`).
+_NPMRC_CLI_BOOL_FLAGS = frozenset(("-g", "--global", "--json", "-l", "--long",
+                                   "--no-global", "-y", "--yes", "--force", "-f"))
+
+
+def _npmrc_cli_pairs(tail: str) -> list:
+    try:
+        toks = shlex.split(tail, posix=True)
+    except ValueError:
+        toks = tail.split()
+    toks = [t for t in toks if t != "--"]
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("-"):
+            nxt = toks[i + 1] if i + 1 < len(toks) else None
+            if ("=" in t or t in _NPMRC_CLI_BOOL_FLAGS or nxt is None
+                    or nxt.startswith("-") or _npmrc_canon_key(nxt.partition("=")[0])):
+                i += 1
             else:
-                k, v = t, (toks[i + 1] if i + 1 < len(toks) else None)
+                i += 2
+            continue
+        if "=" in t:
+            k, _, v = t.partition("=")
+            i += 1
+        else:
+            k, v = t, (toks[i + 1] if i + 1 < len(toks) else None)
+            i += 2
+        out.append((k, v))
+    return out
+
+
+def _npmrc_cli_findings(raw: str, surface: str = "") -> list:
+    """Dangerous `npm|pnpm|yarn config set <key> <value>` / `<key>=<value>`
+    pairs. Paired from the RAW command's own quoting, at command position;
+    the de-obfuscated surface is used only when the raw text shows no
+    `config set` at all (a base64/quoted-program-name form), since its
+    quote-stripped copy splits a quoted value into fake keys (QA round 3)."""
+    out = []
+    raw = raw or ""
+    if patterns.NPMRC_EXEC_CLI_RE.search(raw):
+        tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_CMDPOS_RE.finditer(raw)]
+    else:
+        tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_RE.finditer(surface or "")]
+    for tail in tails:
+        for k, v in _npmrc_cli_pairs(tail):
             key = _npmrc_canon_key(k)
             if not key:
                 continue
@@ -3568,7 +3644,7 @@ def _npmrc_shell_source_findings(ev: Event, raw: str) -> list:
 
 
 def _npmrc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
-    found = _npmrc_cli_findings(cmd)
+    found = _npmrc_cli_findings(raw, cmd)
     if not found:
         write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                            or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
@@ -3588,7 +3664,7 @@ def _npmrc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
                     found.append((k, v))
             if not found:
                 found = _npmrc_shell_source_findings(ev, raw)
-            if not found and patterns.INPLACE_WRITE_RE.search(cmd):
+            if not found and patterns.NPMRC_INPLACE_EDITOR_RE.search(cmd):
                 found = _npmrc_inplace_findings(ev, raw)
     return found
 
@@ -3704,7 +3780,21 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``package.json``/README lines read as config when a shell command
     names them, nested ``git:``/``node-gyp:`` package names in a heredoc,
     ``git: bump`` commit messages, read-only ``grep ... .npmrc >
-    /dev/null``, and NixOS system shells.
+    /dev/null``, and NixOS system shells. A third independent verification
+    review confirmed every fix above held, and found (closed here): JSON
+    ``\\u`` escapes in a double-quoted key/value -- which npm's ini and
+    Yarn's lockfile parser decode -- hiding every entry (quoted keys are now
+    captured and JSON-decoded before canonicalizing; shell payloads are
+    also scanned with ``\\uXXXX`` decoded); a 500-byte YAML alias bomb
+    stalling the hook for 35 s / 9.6 GB (only the two settings are now
+    stringified, one level, scalars only, capped); multi-MB YAML parses
+    nearing a hook timeout (YAML over 1 MB now asks; CSafeLoader; one parse
+    per text); and CLI false positives from pairing over the quote-stripped
+    surface (``config set init-author-name 'Git Hub'``, a quoted Git-Bash
+    path) or matching inside a commit message (CLI pairs now come from the
+    raw command's quoting at command position), plus a ``cp .npmrc
+    .npmrc.bak`` ASK (the value-only check now needs a real in-place
+    editor).
 
     Honest scope: values assembled indirectly are judged as written -- a
     ``${VAR}`` ``script-shell``/``git``/``init-module`` value is not exempt

@@ -4274,13 +4274,17 @@ _NPMRC_YARN_KEY_ALT = r"script[-_]?shell|yarn[-_]?path"
 # Line forms (input normalized to `\n` line ends, BOMs removed, first):
 # `.npmrc` is ini -- `key=value`, optional quoted key and `key[]=` array
 # syntax, which npm honors (`node-options[]=--require ./x`).
+# A double-quoted key is JSON-decoded by npm's ini parser and Yarn's lockfile
+# parser (`"script\u002dshell"=./x` IS script-shell), so any quoted key is
+# captured here and canonicalized after decoding (QA round 3).
+_NPMRC_QKEY = r"\"(?:[^\"\\\n]|\\.){1,200}\"|'[^'\n]{1,200}'"
 NPMRC_EXEC_LINE_RE = re.compile(
-    r"^[ \t]*[\"']?(" + _NPMRC_INI_KEY_ALT + r")[\"']?(?:\[\])?[ \t]*=[ \t]*([^\n]*)$",
+    r"^[ \t]*(" + _NPMRC_QKEY + r"|" + _NPMRC_INI_KEY_ALT + r")(?:\[\])?[ \t]*=[ \t]*([^\n]*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 # `.yarnrc` is Yarn's lockfile syntax -- `key "value"` / `key value`.
 NPMRC_YARN_LINE_RE = re.compile(
-    r"^[ \t]*[\"']?(" + _NPMRC_YARN_KEY_ALT + r")[\"']?(?:[ \t]*=[ \t]*|[ \t]+)([^\n]*)$",
+    r"^[ \t]*(" + _NPMRC_QKEY + r"|" + _NPMRC_YARN_KEY_ALT + r")(?:[ \t]*=[ \t]*|[ \t]+)([^\n]*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 # Free-text forms for a shell command's scan surface (echo/printf/heredoc/sed
@@ -4309,6 +4313,22 @@ _NPMRC_CLI_FLAGS = r"(?:\s+-{1,2}[\w-]+(?:=\S*)?(?:\s+(?!(?:config|c|set)\b)[^\s
 NPMRC_EXEC_CLI_RE = re.compile(
     r"\b(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
     + r"\s+(?:(?:config|c)" + _NPMRC_CLI_FLAGS + r"\s+set|set)\b([^|;&\n]{0,500})",
+    re.IGNORECASE,
+)
+# The same, but only at COMMAND position in the raw command (start, after a
+# separator / `$(` / backtick, or as a `bash -c "..."` script), optionally
+# behind env assignments and sudo/npx/exec/env/... wrappers -- so `git commit
+# -m 'npm set git hooks'` is a commit message, not a config write (QA round 3).
+NPMRC_EXEC_CLI_CMDPOS_RE = re.compile(
+    r"(?:^|[;&|({\n`]|\$\(|\s-(?:c|Command|e)\s+[\"']?)\s*"
+    r"(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:sudo|npx|exec|command|env|time|nice|nohup)(?:\s+-\S+)*\s+)*"
+    r"(?:\S*[/\\])?(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
+    + r"\s+(?:(?:config|c)" + _NPMRC_CLI_FLAGS + r"\s+set|set)\b([^|;&\n]{0,500})",
+    re.IGNORECASE,
+)
+# In-place editors that can rewrite only a VALUE (`sed -i s/=bash$/=.\/x/`).
+NPMRC_INPLACE_EDITOR_RE = re.compile(
+    r"\b(?:g?sed|perl|ruby)\b[^|;&\n]{0,200}?\s-(?:[a-zA-Z]*i\b|-in-place\b)",
     re.IGNORECASE,
 )
 # Interpreter / PowerShell file-write idioms (`python -c "open(...).write()"`,

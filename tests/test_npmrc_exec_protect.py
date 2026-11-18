@@ -472,3 +472,83 @@ def test_qa2_shell_false_positives(cmd):
 
 def test_qa2_nixos_shell_allowed():
     assert _hit(_write(".npmrc", "script-shell=/run/current-system/sw/bin/bash\n")) is None
+
+
+# ---- QA round 3 (independent verification review) regressions -----------------
+@pytest.mark.parametrize("path,content", [
+    (".npmrc", '"script\\u002dshell"=./x.sh\n'),
+    (".npmrc", 'node-options="\\u002d\\u002drequire ./x.js"\n'),
+    (".npmrc", '"node-o\\u0070tions"=--require ./x.js\n'),
+    (".npmrc", '"node\\u002dgyp"=./g.js\n'),
+    (".yarnrc", '"yarn\\u002dpath" "./y.js"\n'),
+    (".yarnrc", '"script\\u002dshell" "./x.sh"\n'),
+])
+def test_qa3_json_escaped_keys_and_values(path, content):
+    assert _rule(_write(path, content)) == (RULE, Action.ASK), content
+
+
+def test_qa3_json_escapes_edit_and_shell():
+    assert _rule(_edit("/nonexistent/.npmrc", "", '"script\\u002dshell"=./x.sh\n')) == (RULE, Action.ASK)
+    assert _rule(_shell("echo '\"script\\u002dshell\"=./x.sh' >> .npmrc")) == (RULE, Action.ASK)
+    assert _rule(_shell("printf '\"script\\u002dshell\"=./x.sh\\n' >> .npmrc")) == (RULE, Action.ASK)
+
+
+def test_qa3_quoted_safe_key_still_allowed():
+    assert _hit(_write(".npmrc", '"save-exact"=true\n"script-shell"=bash\n')) is None
+
+
+def _alias_bomb(depth):
+    lines = ["scriptShell: ./x.sh", "l0: &l0 [x, x, x, x, x, x, x, x, x]"]
+    for i in range(1, depth + 1):
+        lines.append(f"l{i}: &l{i} [" + ", ".join([f"*l{i-1}"] * 9) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def test_qa3_yaml_alias_bomb_is_fast(tmp_path):
+    import time
+    t = time.monotonic()
+    assert _rule(_write("pnpm-workspace.yaml", _alias_bomb(9))) == (RULE, Action.ASK)
+    assert _rule(_write("pnpm-workspace.yaml", _alias_bomb(9).replace("scriptShell: ./x.sh\n", "")
+                        + "nodeOptions: *l9\n")) in ((None, Action.ALLOW), (RULE, Action.ASK))
+    (tmp_path / "tmpl").mkdir()
+    (tmp_path / "tmpl" / "ws.yaml").write_text(_alias_bomb(9))
+    _hit(_shell("cp tmpl/ws.yaml pnpm-workspace.yaml", tmp_path))
+    assert time.monotonic() - t < 3.0
+
+
+def test_qa3_large_yaml_asks_without_stalling():
+    import time
+    big = "packages:\n" + "".join(f"  - 'pkgs/p{i}'\n" for i in range(80000))
+    assert len(big) > 1024 * 1024
+    t = time.monotonic()
+    assert _rule(_write("pnpm-workspace.yaml", big + "scriptShell: ./x\n")) == (RULE, Action.ASK)
+    assert time.monotonic() - t < 3.0
+
+
+@pytest.mark.parametrize("cmd", [
+    'npm config set script-shell "C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe"',
+    "npm config set init-author-name 'Git Hub'",
+    "npm config set tag-version-prefix git",
+    "git commit -m 'chore: npm set git hooks via husky'",
+])
+def test_qa3_cli_false_positives(cmd):
+    assert _hit(_shell(cmd)) is None, cmd
+
+
+def test_qa3_cp_backup_of_reviewed_config_allowed(tmp_path):
+    (tmp_path / ".npmrc").write_text("script-shell=./tools/sh\n")
+    assert _hit(_shell("cp .npmrc .npmrc.bak", tmp_path)) is None
+    # ...while an in-place editor on it still asks.
+    assert _rule(_shell("sed -i 's/x/y/' .npmrc", tmp_path)) == (RULE, Action.ASK)
+
+
+@pytest.mark.parametrize("cmd", [
+    "bash -c \"npm config set script-shell ./x\"",
+    "'npm' config set script-shell ./x",
+    "FOO=1 sudo npm -g config set script-shell ./x",
+    "cd app && npm config set script-shell ./x",
+    "echo bnBtIGNvbmZpZyBzZXQgc2NyaXB0LXNoZWxsIC4veA== | base64 -d | sh",
+])
+def test_qa3_cli_still_caught(cmd):
+    d = _hit(_shell(cmd))
+    assert d is not None and d.action == Action.ASK, cmd
