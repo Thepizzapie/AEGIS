@@ -601,3 +601,67 @@ def test_qa4_cli_and_escape_forms(cmd):
 ])
 def test_qa4_data_mentions_allowed(cmd):
     assert _hit(_shell(cmd)) is None, cmd
+
+
+# ---- QA round 5 (independent review of the masking) regressions -----------------
+P5 = "npm config set script-shell ./x"
+
+
+@pytest.mark.parametrize("cmd", [
+    f"echo hi # don't worry\n{P5}\necho 'ok'",
+    f"true # '\n{P5}",
+    f"ls # it's fine\n{P5} # won't hurt",
+    f"cat > notes.txt <<EOF\nDon't forget\nEOF\n{P5}\necho 'done'",
+    f"echo $'a\\'b' ; {P5} ; echo 'c'",
+    f"FOO='a;b' sh -c '{P5}'",
+    f"env 'A=x|y' bash -c '{P5}'",
+    f"sudo --prompt='(pw)' sh -c '{P5}'",
+    f'X="a&b" bash -c "{P5}"',
+    f"echo '{P5}' | $SHELL",
+    f"echo '{P5}' | ${{SHELL}}",
+    f"echo '{P5}' |& sh",
+    f"echo '{P5}' | env sh",
+    f"echo '{P5}' | busybox sh",
+    f"echo '{P5}' | sudo -u root sh",
+    f"echo '{P5}' | timeout 5 sh",
+    f"echo '{P5}' | fish",
+    f"echo '{P5}' > >(sh)",
+    f"echo \"import os;os.system('{P5}')\" | python3",
+    f"find . -exec sh -c '{P5}' \;",
+    f"nsenter -t 1 sh -c '{P5}'",
+    f"strace -f sh -c '{P5}'",
+    f"npm exec -c '{P5}'",
+    f"pnpm exec sh -c '{P5}'",
+    f"git -c alias.x='!{P5}' x",
+    f"git rebase -i HEAD~3 --exec '{P5}'",
+    f"git submodule foreach '{P5}'",
+    f"echo '{P5}' > /tmp/a.sh && sh /tmp/a.sh",
+    f"echo '{P5}' > a.sh; bash a.sh",
+])
+def test_qa5_masking_cannot_hide_real_calls(cmd):
+    d = _hit(_shell(cmd))
+    assert d is not None and d.action == Action.ASK, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    f"git commit -m 'docs: run {P5} to configure'",
+    f"git commit -m \"it's fine: {P5}\"",
+    f"git commit --message='{P5}'",
+    f"gh pr create --title t --body '{P5} is now required'",
+    f"echo 'tip: {P5}' > NOTES.md",
+    f"printf '%s\\n' 'tip: {P5}'",
+    f"grep -rn '{P5}' docs/",
+    f"cd app && git commit -m 'docs: {P5}' && git push",
+])
+def test_qa5_data_mentions_still_allowed(cmd):
+    assert _hit(_shell(cmd)) is None, cmd
+
+
+def test_qa5_masking_is_linear():
+    import time
+    for n in (5000, 40000):
+        cmd = "echo " + "'npm set a b' " * n + "; " + P5
+        t = time.monotonic()
+        d = _hit(_shell(cmd))
+        assert d is not None and d.action == Action.ASK
+        assert time.monotonic() - t < 3.0, n

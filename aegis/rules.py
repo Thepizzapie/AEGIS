@@ -3446,69 +3446,71 @@ def _npmrc_cli_pairs(tail: str) -> list:
     return out
 
 
-# Commands that execute (or hand to something that executes) a quoted
-# argument: a `npm config set` inside their quotes is a real call. Inside any
-# other command's quotes (`git commit -m '...'`, `echo '...'`) it is data.
-_NPMRC_EXEC_WRAPPERS = frozenset((
-    "bash", "sh", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox",
-    "pwsh", "powershell", "cmd", "node", "deno", "bun", "python", "python3",
-    "perl", "ruby", "php", "ssh", "wsl", "eval", "su", "sudo", "doas", "runuser",
-    "env", "timeout", "nice", "nohup", "stdbuf", "watch", "xargs", "parallel",
-    "exec", "command", "time", "setsid", "chroot", "flock", "script", "sg",
-    "docker", "podman", "kubectl", "corepack", "npx", "pnpx", "bunx", "make",
-    "just", "task", "source", ".", "if", "then", "do", "else", "while", "until",
-    "!", "{", "(",
-))
-# Constructs that can turn ANY command's output or argument into a command.
-_NPMRC_EXEC_CONSTRUCT_RE = re.compile(
-    r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k|mk|c|tc)?sh\b|\|\s*(?:pwsh|powershell|cmd|xargs|source)\b"
-    r"|\$\(|`|\beval\b|<\(|\bsource\b", re.IGNORECASE)
-
-
-def _npmrc_quoted_spans(raw: str) -> list:
-    """(start, end) of each quoted region's interior, shell-style."""
-    spans, i, n = [], 0, len(raw)
-    while i < n:
-        ch = raw[i]
-        if ch == "\\":
-            i += 2
-            continue
-        if ch in "'\"":
-            j = i + 1
-            while j < n and raw[j] != ch:
-                j += 2 if (ch == '"' and raw[j] == "\\") else 1
-            spans.append((i + 1, min(j, n)))
-            i = j + 1
-            continue
-        i += 1
-    return spans
-
-
-def _npmrc_segment_cmd(raw: str, pos: int) -> str:
-    """Basename of the first word of the simple command containing ``pos``."""
-    seg = re.split(r"[;&|\n(){}]", raw[:pos])[-1]
-    for w in seg.split():
-        w = w.strip("'\"")
-        if re.match(r"^[A-Za-z_]\w*=", w):
-            continue
-        return re.split(r"[/\\]", w)[-1].lower().removesuffix(".exe")
-    return ""
+# Masking quoted DATA only ever REDUCES false positives, so it is allowed only
+# where it is verifiable (QA round 5 broke a deny-list design four ways):
+#   - a short command with no newline, comment, heredoc, pipe, `$`, backtick,
+#     process substitution, `eval`/`source` -- anything that could make text
+#     run or make a naive scan misread quoting; otherwise nothing is masked;
+#   - tokenized by Python's own POSIX shell lexer (separators as tokens);
+#   - a token is masked only when its simple command is a known DATA command
+#     (an ALLOW-list: a commit/PR message, an echo), never "anything not on a
+#     wrapper list" -- `find -exec sh -c`, `nsenter`, `strace` all keep theirs.
+_NPMRC_DATA_CMDS = frozenset(("git", "gh", "glab", "hub", "echo", "printf",
+                              "grep", "egrep", "fgrep", "rg", "ag"))
+# git/gh can execute arguments (`git -c alias.x='!...'`, `rebase --exec`,
+# `submodule foreach`), so for them only a message/body/title value is data.
+_NPMRC_VCS_CMDS = frozenset(("git", "gh", "glab", "hub"))
+_NPMRC_MSG_FLAGS = frozenset(("-m", "--message", "-b", "--body", "-t", "--title",
+                              "--notes", "--description", "-d"))
+_NPMRC_MSG_EQ_RE = re.compile(r"^--(?:message|body|title|notes|description)=")
+# Masking also needs EVERY simple command on the line to be a data command or
+# an inert one, so a written-then-run script (`echo '...' > a.sh && sh a.sh`)
+# keeps its text visible (QA round 5).
+_NPMRC_INERT_CMDS = frozenset(("cd", "pushd", "popd", "true", "false", "pwd", "ls",
+                               "test", "[", "mkdir", "touch"))
+_NPMRC_MASK_MAX = 8192
+_NPMRC_NO_MASK_RE = re.compile(r"[\n\r#|`$]|<<|<\(|>\(|\beval\b|\bsource\b")
+_NPMRC_SEP_TOKENS = frozenset((";", "&", "&&", "|", "||", "(", ")", ";;", "&|"))
 
 
 def _npmrc_mask_data_spans(raw: str) -> str:
-    """Blank out quoted strings that are DATA (a commit message, an echo
-    argument) and that contain a `config set` -- so they neither count as
-    calls nor, by being visible, switch off the de-obfuscated fallback."""
-    if _NPMRC_EXEC_CONSTRUCT_RE.search(raw):
+    """The command with quoted DATA tokens that mention a `config set`
+    replaced by an empty argument, or the command unchanged when masking
+    can't be done safely (see above). Linear in the command length."""
+    if (not raw or len(raw) > _NPMRC_MASK_MAX or _NPMRC_NO_MASK_RE.search(raw)
+            or not patterns.NPMRC_EXEC_CLI_RE.search(raw)):
         return raw
-    out = raw
-    for a, b in _npmrc_quoted_spans(raw):
-        if not patterns.NPMRC_EXEC_CLI_RE.search(raw[a:b]):
+    try:
+        lex = shlex.shlex(raw, posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        toks = list(lex)
+    except ValueError:
+        return raw
+    out, changed, cmd, prev = [], False, None, ""
+    for t in toks:
+        last, prev = prev, t
+        if t in _NPMRC_SEP_TOKENS or (t and set(t) <= set(";&|()")):
+            out.append(t)
+            cmd = None
             continue
-        if _npmrc_segment_cmd(raw, a) in _NPMRC_EXEC_WRAPPERS:
+        if cmd is None:
+            if re.match(r"^[A-Za-z_]\w*=", t):
+                out.append(shlex.quote(t))
+                continue
+            cmd = re.split(r"[/\\]", t)[-1].lower()
+            if cmd not in _NPMRC_DATA_CMDS and cmd not in _NPMRC_INERT_CMDS:
+                return raw
+            out.append(shlex.quote(t))
             continue
-        out = out[:a] + " " * (b - a) + out[b:]
-    return out
+        if (cmd in _NPMRC_DATA_CMDS and patterns.NPMRC_EXEC_CLI_RE.search(t)
+                and (cmd not in _NPMRC_VCS_CMDS or last in _NPMRC_MSG_FLAGS
+                     or _NPMRC_MSG_EQ_RE.match(t))):
+            out.append("--message=''" if _NPMRC_MSG_EQ_RE.match(t) else "''")
+            changed = True
+            continue
+        out.append(shlex.quote(t))
+    return " ".join(out) if changed else raw
 
 
 def _npmrc_cli_findings(raw: str, surface: str = "") -> list:
@@ -3523,9 +3525,14 @@ def _npmrc_cli_findings(raw: str, surface: str = "") -> list:
     out = []
     masked = _npmrc_mask_data_spans(raw or "")
     tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_RE.finditer(masked)]
-    if not tails:
-        surf = normalize.scan_surface(masked) if masked != (raw or "") else (surface or "")
-        tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_RE.finditer(surf)]
+    surf = normalize.scan_surface(masked) if masked != (raw or "") else (surface or "")
+    stails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_RE.finditer(surf)]
+    # The surface is the command plus its quote-stripped copy (plus decoded
+    # layers), so it normally holds exactly twice the visible occurrences.
+    # More than that means one is hidden (`"npm" config`, `n''pm`, base64)
+    # even if a visible decoy exists: pair the surface too (QA rounds 4-5).
+    if len(stails) > 2 * len(tails):
+        tails = tails + stails
     for tail in tails:
         for k, v in _npmrc_cli_pairs(tail):
             key = _npmrc_canon_key(k)
@@ -3873,14 +3880,22 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``xargs``/``corepack``/``doas``/``bash -lc``/``cmd /c``/``ssh`` ...)
     and that one visible decoy ``npm set`` switched off the de-obfuscated
     fallback. Closed by pairing EVERY visible occurrence with the raw
-    quoting, after masking only quoted DATA -- a quoted string holding a
-    ``config set`` that is an argument of a command not on the
-    ``_NPMRC_EXEC_WRAPPERS`` list (``git commit -m``, ``echo``), with no
-    pipe-to-shell/``$(``/``eval`` construct in the command -- and falling
-    back to the masked command's de-obfuscated surface. Also closed: a
-    ``npm@10``/``pnpm@9`` version suffix (found re-running that review's
-    scripts) and printf ``\\\\u`` / ``echo -e`` ``\\x`` escapes in shell
-    payloads.
+    quoting; also closed a ``npm@10`` version suffix and printf ``\\\\u``/
+    ``echo -e`` ``\\x`` escapes in shell payloads. A fifth review then
+    broke that round's deny-list masking of quoted data four ways (a quote
+    in a comment/heredoc/``$'...'`` masking a real call; a quoted separator
+    hiding a ``sh -c`` wrapper; pipe-to-``$SHELL``/``|&``/``>(sh)``/
+    ``| python3`` forms; and quadratic time on many quoted spans). Masking
+    was redesigned as an allow-list: only on a short line with no newline,
+    comment, heredoc, pipe, ``$``, backtick, process substitution or
+    ``eval``/``source``; tokenized by Python's POSIX shell lexer; only when
+    EVERY simple command is a known data/inert command (``git``/``gh``
+    message/body/title values, ``echo``, ``printf``, ``grep``; ``cd``,
+    ``true``, ...), so a written-then-run script, ``find -exec``,
+    ``nsenter``, ``strace``, ``git -c alias.x='!...'`` and ``rebase
+    --exec`` all stay visible; linear time. The surface is paired as well
+    whenever it holds more occurrences than the visible text accounts for,
+    so a visible decoy can't hide an obfuscated call.
 
     Honest scope: values assembled indirectly are judged as written -- a
     ``${VAR}`` ``script-shell``/``git``/``init-module`` value is not exempt
@@ -3888,8 +3903,10 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     a shell payload assembled at run time (``printf '%s=%s' script-shell
     ./x``, ``k=script-shell; echo "$k=..."``, a backslash inside the key, a
     glob target like ``.np?rc``) is not reconstructed; a ``config set``
-    quoted inside an argument of a command that is not on
-    ``_NPMRC_EXEC_WRAPPERS`` but still executes it is treated as data; ``cp -r dir/. .``
+    written into a script file and run by a LATER command is not seen (the
+    same as any script); masking leaves some data mentions visible (a
+    commit message on a line that also runs ``npm test``), which can
+    over-fire ASK; ``cp -r dir/. .``
     (no config filename in the command) is missed; an inline env var
     (``npm_config_script_shell=./x npm test``) is not gated -- it affects
     only the command the agent itself is running, i.e. no more than running
