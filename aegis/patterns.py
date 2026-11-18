@@ -4200,6 +4200,189 @@ YARN_EXEC_CLI_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---- npm-config exec hijack (.npmrc script-shell / node-options / ...) ---------
+# npm, pnpm and Yarn Classic all read a PROJECT-level config file with no trust
+# prompt of any kind, and several of its keys name a program or a Node.js module
+# the package manager itself runs on routine commands -- with no `scripts` entry,
+# no lifecycle-hook name, and no registry URL for `rule_package_manifest_protect`
+# to see:
+#
+#   - `script-shell` (npm/pnpm `.npmrc`, Yarn Classic `.yarnrc`, pnpm-workspace
+#     `scriptShell`): the binary EVERY `npm run`/`npm test`/`npm start`/`npx`
+#     and every dependency's install-time lifecycle script is exec'd through.
+#   - `node-options` (`nodeOptions`): exported as NODE_OPTIONS to every script
+#     npm spawns, so `--require ./x.js`/`--import`/`--loader`/`--inspect`/
+#     `--openssl-config` lands in every Node process a script starts.
+#   - `shell` (`npm exec`/`npm explore`), `git` (the binary run for every git
+#     dependency), `init-module` (`npm init`), `onload-script` (npm<=6, required
+#     on every npm start).
+#   - `yarn-path` (Yarn Classic `.yarnrc`): the v1 analog of Berry's `yarnPath`
+#     -- every bare `yarn` re-execs the named file as Node.js.
+#     `rule_yarn_exec_protect` only watches Berry's `.yarnrc.yml`.
+#
+# Path half: the project/user `.npmrc`, npm's global `{prefix}/etc/npmrc` and
+# builtin `.../npm/npmrc`, Yarn Classic's `.yarnrc` (NOT `.yarnrc.yml`), and
+# pnpm's `pnpm-workspace.yaml` (pnpm>=10 settings home).
+# An NTFS alternate-data-stream suffix (`.npmrc::$DATA`) names the same file.
+_NPMRC_ADS = r"(?::{1,2}\$?\w*)?"
+# Prefix class includes `>`/`{`/`,` so a glued redirect (`>>.npmrc`) or a
+# brace list (`cp t/{.npmrc,x} .`) still names the file (QA round 2).
+_NPMRC_END = r"(?:" + _CI_END + r"|(?=[,}]))"
+_NPMRC_PRE = r"(?:^|[\s'\"/\\=>{,])"
+NPMRC_EXEC_PATH_RE = re.compile(
+    _NPMRC_PRE + r"\.npmrc" + _NPMRC_ADS + _NPMRC_END
+    + r"|" + _NPMRC_PRE + r"\.yarnrc" + _NPMRC_ADS + _NPMRC_END
+    + r"|" + _NPMRC_PRE + r"pnpm-workspace\.yaml" + _NPMRC_ADS + _NPMRC_END
+    + r"|" + _NPMRC_PRE + r"(?:etc|npm)" + _SEP + r"npmrc" + _NPMRC_ADS + _NPMRC_END
+    # pnpm's global rc: ~/.config/pnpm/rc, macOS Library/Preferences/pnpm/rc,
+    # Windows %LOCALAPPDATA%/pnpm/config/rc.
+    + r"|" + _NPMRC_PRE + r"pnpm" + _SEP + r"(?:config" + _SEP + r")?rc" + _NPMRC_ADS + _NPMRC_END,
+    re.IGNORECASE,
+)
+# pnpm-workspace.yaml is YAML whose nested maps (`catalog:`, `overrides:`,
+# `packageExtensions:`) are keyed by PACKAGE NAME -- `git`/`shell` are real
+# packages -- so only its own two top-level settings count there.
+NPMRC_YAML_PATH_RE = re.compile(r"pnpm-workspace\.yaml" + _NPMRC_ADS + _CI_END, re.IGNORECASE)
+# Top-level setting line in pnpm-workspace.yaml (column 0; nested package-name
+# maps never match). The value may be empty or a block indicator (`|`, `>-`),
+# in which case the caller gathers the indented continuation lines.
+NPMRC_YAML_LINE_RE = re.compile(
+    r"^[\"']?(script[-_]?shell|node[-_]?options)[\"']?[ \t]*:(?:[ \t]+([^\n]*))?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Flow-map form (`{scriptShell: ./x, packages: [a]}`).
+NPMRC_YAML_FLOW_RE = re.compile(
+    r"[{,][ \t\n]*[\"']?(script[-_]?shell|node[-_]?options)[\"']?[ \t]*:[ \t]*([^,}\n]{0,2000})",
+    re.IGNORECASE,
+)
+
+# Exec-bearing keys, normalized form (lower-case, `_`/`.` -> `-`, camelCase
+# split): `node-options` is value-gated (see NPMRC_NODE_OPTIONS_DANGER_RE);
+# `script-shell`/`shell`/`git` exempt a well-known system binary (see
+# NPMRC_SAFE_*); every other key is gated on any non-empty value.
+NPMRC_EXEC_KEYS = ("script-shell", "node-options", "shell", "git", "node-gyp",
+                   "init-module", "onload-script", "yarn-path")
+_NPMRC_KEY_ALT = (r"script[-_]?shell|node[-_]?options|shell|git|node[-_]?gyp"
+                  r"|init[-_.]?module|onload[-_]?script|yarn[-_]?path")
+# Keys per file kind. Yarn Classic's `.yarnrc` only has `script-shell` and
+# `yarn-path`; npm/pnpm `.npmrc` has the rest. Keeping them apart stops a
+# README `git clone ...` or package.json `"node-gyp": "^10"` line being read
+# as a config entry when a shell scan inspects a named source file.
+_NPMRC_INI_KEY_ALT = (r"script[-_]?shell|node[-_]?options|shell|git|node[-_]?gyp"
+                      r"|init[-_.]?module|onload[-_]?script")
+_NPMRC_YARN_KEY_ALT = r"script[-_]?shell|yarn[-_]?path"
+# Line forms (input normalized to `\n` line ends, BOMs removed, first):
+# `.npmrc` is ini -- `key=value`, optional quoted key and `key[]=` array
+# syntax, which npm honors (`node-options[]=--require ./x`).
+# A double-quoted key is JSON-decoded by npm's ini parser and Yarn's lockfile
+# parser (`"script\u002dshell"=./x` IS script-shell), so any quoted key is
+# captured here and canonicalized after decoding (QA round 3).
+_NPMRC_QKEY = r"\"(?:[^\"\\\n]|\\.){1,200}\"|'[^'\n]{1,200}'"
+NPMRC_EXEC_LINE_RE = re.compile(
+    r"^[ \t]*(" + _NPMRC_QKEY + r"|" + _NPMRC_INI_KEY_ALT + r")(?:\[\])?[ \t]*=[ \t]*([^\n]*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# `.yarnrc` is Yarn's lockfile syntax -- `key "value"` / `key value`.
+NPMRC_YARN_LINE_RE = re.compile(
+    r"^[ \t]*(" + _NPMRC_QKEY + r"|" + _NPMRC_YARN_KEY_ALT + r")(?:[ \t]*=[ \t]*|[ \t]+)([^\n]*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Free-text forms for a shell command's scan surface (echo/printf/heredoc/sed
+# payloads), each key family with only its own file's separator: ini keys
+# with `=`, yarn keys with `=` or space+quote, the two pnpm-workspace keys with
+# `: `. The value runs to an unescaped quote, newline, or command separator;
+# a backslash-escaped quote (`echo "node-options=\"--require x\""`) is kept.
+_NPMRC_FREE_VAL = r"((?:\\.|[^\r\n'\"|;&\\]){0,500})"
+NPMRC_EXEC_FREE_RES = (
+    re.compile(r"(?<![\w.\-])(" + _NPMRC_INI_KEY_ALT + r"|" + _NPMRC_YARN_KEY_ALT
+               + r")\\?[\"']?(?:\[\])?[ \t]*=[ \t]*\\?[\"']?" + _NPMRC_FREE_VAL, re.IGNORECASE),
+    re.compile(r"(?<![\w.\-])(" + _NPMRC_YARN_KEY_ALT + r")\\?[\"']?[ \t]+\\?[\"']" + _NPMRC_FREE_VAL,
+               re.IGNORECASE),
+    re.compile(r"(?<![\w.\-])(scriptShell|nodeOptions)\\?[\"']?[ \t]*:[ \t]+" + _NPMRC_FREE_VAL),
+    # Next-line / block-scalar value, newline real or a printf `\n` escape.
+    re.compile(r"(?<![\w.\-])(scriptShell|nodeOptions)\\?[\"']?[ \t]*:[ \t]*(?:[|>][-+0-9]*)?[ \t]*"
+               r"(?:\\n|\n)(?:[ \t]|\\t)+" + _NPMRC_FREE_VAL),
+)
+# `npm config set` / `npm c set` / `npm set` / `pnpm config set` / `yarn config
+# set` -- the subcommand IS the write (it edits the user/project/global npmrc).
+# Global flags may precede the subcommand or sit between `config` and `set`
+# (`npm --location=project config set`, `npm config -g set`, `npm -g set`):
+# up to six, each optionally followed by one non-flag value token that isn't
+# the subcommand itself.
+_NPMRC_CLI_FLAGS = r"(?:\s+-{1,2}[\w-]+(?:=\S*)?(?:\s+(?!(?:config|c|set)\b)[^\s\-|;&]\S*)?){0,6}"
+NPMRC_EXEC_CLI_RE = re.compile(
+    r"\b(?:npm|pnpm|yarn)(?:@[\w.^~<>=*+-]{1,40})?(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
+    + r"\s+(?:(?:config|c)" + _NPMRC_CLI_FLAGS + r"\s+set|set)\b([^|;&\n]{0,500})",
+    re.IGNORECASE,
+)
+# The same, but only at COMMAND position in the raw command (start, after a
+# separator / `$(` / backtick, or as a `bash -c "..."` script), optionally
+# behind env assignments and sudo/npx/exec/env/... wrappers -- so `git commit
+# -m 'npm set git hooks'` is a commit message, not a config write (QA round 3).
+NPMRC_EXEC_CLI_CMDPOS_RE = re.compile(
+    r"(?:^|[;&|({\n`]|\$\(|\s-(?:c|Command|e)\s+[\"']?)\s*"
+    r"(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:sudo|npx|exec|command|env|time|nice|nohup)(?:\s+-\S+)*\s+)*"
+    r"(?:\S*[/\\])?(?:npm|pnpm|yarn)(?:@[\w.^~<>=*+-]{1,40})?(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
+    + r"\s+(?:(?:config|c)" + _NPMRC_CLI_FLAGS + r"\s+set|set)\b([^|;&\n]{0,500})",
+    re.IGNORECASE,
+)
+# In-place editors that can rewrite only a VALUE (`sed -i s/=bash$/=.\/x/`).
+NPMRC_INPLACE_EDITOR_RE = re.compile(
+    r"\b(?:g?sed|perl|ruby)\b[^|;&\n]{0,200}?\s-(?:[a-zA-Z]*i\b|-in-place\b)",
+    re.IGNORECASE,
+)
+# Interpreter / PowerShell file-write idioms (`python -c "open(...).write()"`,
+# `node -e "fs.appendFileSync()"`, `Set-Content`) and `ln` (any link, not only
+# `-f`): none are on the shared write-verb lists, but each writes the config.
+NPMRC_EXTRA_WRITE_RE = re.compile(
+    r"\.write\s*\(|\bwrite_(?:text|bytes)\b|\b(?:write|append)File(?:Sync)?\b"
+    r"|\bcreateWriteStream\b|\b(?:Set|Add)-Content\b|\bOut-File\b"
+    r"|\b(?:Write|Append)All(?:Text|Lines|Bytes)\b|\bfile_put_contents\b"
+    r"|\b(?:File|IO)\.(?:write|binwrite|open)\b|\bln\b",
+    re.IGNORECASE,
+)
+# NODE_OPTIONS flags that load code or open a remote-control channel. Anything
+# else (`--max-old-space-size=4096`, `--no-warnings`, ...) is routine.
+NPMRC_NODE_OPTIONS_DANGER_RE = re.compile(
+    r"(?:^|[\s\"'=,\[])(?:--require|-r|--import|--loader|--experimental-loader"
+    r"|--inspect(?:-brk|-wait|-port|-publish-uid)?|--openssl-config|--openssl-shared-config"
+    r"|--experimental-policy|--policy-integrity|--env-file(?:-if-exists)?"
+    r"|--experimental-(?:default-)?config-file|--experimental-network-imports"
+    r"|--experimental-addon-modules|--snapshot-blob|--test-reporter(?:-destination)?"
+    r"|--test-global-setup)(?![\w-])",
+    re.IGNORECASE,
+)
+# The same set as exact flag names, matched after tokenizing the value the
+# way Node reads NODE_OPTIONS (quotes and backslash escapes removed, `_` in a
+# flag name read as `-`), so `--re"quire"` / `--experimental_loader` count.
+NPMRC_NODE_DANGER_FLAGS = frozenset((
+    "--require", "-r", "--import", "--loader", "--experimental-loader",
+    "--inspect", "--inspect-brk", "--inspect-wait", "--inspect-port",
+    "--inspect-publish-uid", "--openssl-config", "--openssl-shared-config",
+    "--experimental-policy", "--policy-integrity", "--env-file",
+    "--env-file-if-exists", "--experimental-config-file",
+    "--experimental-default-config-file", "--experimental-network-imports",
+    "--experimental-addon-modules", "--snapshot-blob", "--test-reporter",
+    "--test-reporter-destination", "--test-global-setup",
+))
+# A bare or system-path shell / git -- a legitimate `script-shell=bash` (the
+# common Windows-Git-Bash setup) or `git=/usr/bin/git` stays ALLOW. A relative
+# path, a home-dir path, or anything else is not exempt.
+_NPMRC_SYS_DIR = (r"(?:/usr(?:/local)?/bin/|/bin/|/opt/homebrew/bin/"
+                  r"|/run/current-system/sw/bin/|/nix/var/nix/profiles/default/bin/)")
+NPMRC_SAFE_SHELL_RE = re.compile(
+    r"^(?:" + _NPMRC_SYS_DIR + r")?(?:sh|bash|zsh|dash|ksh|mksh|fish|pwsh|powershell|cmd)(?:\.exe)?$"
+    r"|^[a-z]:[/\\]+(?:program files(?: \(x86\))?[/\\]+)?git[/\\]+(?:usr[/\\]+)?bin[/\\]+(?:bash|sh)\.exe$"
+    r"|^[a-z]:[/\\]+windows[/\\]+system32[/\\]+(?:cmd\.exe|windowspowershell[/\\]+v1\.0[/\\]+powershell\.exe)$"
+    r"|^[a-z]:[/\\]+program files[/\\]+powershell[/\\]+\d+[/\\]+pwsh\.exe$",
+    re.IGNORECASE,
+)
+NPMRC_SAFE_GIT_RE = re.compile(
+    r"^(?:" + _NPMRC_SYS_DIR + r")?git(?:\.exe)?$"
+    r"|^[a-z]:[/\\]+program files(?: \(x86\))?[/\\]+git[/\\]+(?:cmd|bin|mingw64[/\\]+bin)[/\\]+git\.exe$",
+    re.IGNORECASE,
+)
+
 # ---- Git-config credential/exec hijack protection ------------------------------
 # Two git-config-driven persistence/exfiltration primitives `git_hooks_protect`
 # doesn't reach (it only watches `core.hooksPath`): `credential.helper` and a
