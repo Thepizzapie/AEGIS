@@ -3195,29 +3195,75 @@ _NPMRC_KEY_CANON = {"scriptshell": "script-shell", "nodeoptions": "node-options"
                     "shell": "shell", "git": "git", "nodegyp": "node-gyp",
                     "initmodule": "init-module",
                     "onloadscript": "onload-script", "yarnpath": "yarn-path"}
-_NPMRC_MAX_FILE = 256 * 1024
+# npm reads the whole file; so does this guard, up to a size no real config
+# approaches. Anything larger is reported as uninspectable rather than
+# scanned partially (QA: a 512 KB comment pad once pushed a payload past the
+# old scan cap).
+_NPMRC_MAX_FILE = 8 * 1024 * 1024
 _NPMRC_MAX_SOURCES = 8
+_NPMRC_OVERSIZE = ("<file>", "too large to inspect")
 
 
 def _npmrc_canon_key(k: str) -> str:
     return _NPMRC_KEY_CANON.get(re.sub(r"[-_.]", "", str(k).lower()), "")
 
 
-def _npmrc_clean_value(v: str) -> str:
+def _npmrc_kind(p: str) -> str:
+    if patterns.NPMRC_YAML_PATH_RE.search(p):
+        return "yaml"
+    if re.search(r"\.yarnrc" + r"(?::{1,2}\$?\w*)?[ .]*$", p.strip().strip("'\""), re.I):
+        return "yarn"
+    return "ini"
+
+
+def _npmrc_normalize(text: str) -> str:
+    # npm splits on [\r\n]+; a BOM is ignored by every parser involved.
+    return text.replace("﻿", "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _npmrc_clean_value(v, kind: str = "free") -> str:
     v = str(v).strip()
-    # A printf/echo -e payload's literal `\n` ends the value it is written as.
-    v = re.split(r"\\[nrt]", v, maxsplit=1)[0].strip()
+    if kind == "free":
+        # A printf/echo -e payload's literal `\n` ends the value it is written as.
+        v = re.split(r"\\[nrt]", v, maxsplit=1)[0].strip()
+        v = v.replace('\\"', '"').replace("\\'", "'")
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-        v = v[1:-1].strip()
-    return v.strip("\"'").strip()
+        return v[1:-1].strip()
+    if kind == "ini":
+        # npm's ini parser ends an unquoted value at the first unescaped `;`/`#`.
+        out, esc = [], False
+        for ch in v:
+            if esc:
+                # npm's ini unescapes only `\\`, `\;`, `\#`; any other
+                # backslash (a Windows path) is kept as written.
+                out.append(ch if ch in "\\;#" else "\\" + ch)
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch in ";#":
+                break
+            else:
+                out.append(ch)
+        if esc:
+            out.append("\\")
+        v = "".join(out)
+    else:
+        v = re.split(r"[ \t]+[#;]", v, maxsplit=1)[0]
+    return v.strip().strip("\"'").strip()
 
 
-def _npmrc_value_dangerous(key: str, value: str) -> bool:
-    v = _npmrc_clean_value(value)
+def _npmrc_value_dangerous(key: str, v: str) -> bool:
     if not v:
         return False
     if key == "node-options":
-        return bool(patterns.NPMRC_NODE_OPTIONS_DANGER_RE.search(v))
+        if patterns.NPMRC_NODE_OPTIONS_DANGER_RE.search(v.replace("\\", " ")):
+            return True
+        flat = re.sub(r"\\(.)", r"\1", v).replace('"', "").replace("'", "")
+        for tok in re.split(r"[\s,\[\]]+", flat):
+            if tok.startswith("-") and (tok.split("=", 1)[0].replace("_", "-").lower()
+                                        in patterns.NPMRC_NODE_DANGER_FLAGS):
+                return True
+        return False
     if key in ("script-shell", "shell"):
         return not patterns.NPMRC_SAFE_SHELL_RE.match(v)
     if key == "git":
@@ -3225,21 +3271,89 @@ def _npmrc_value_dangerous(key: str, value: str) -> bool:
     return True
 
 
-def _npmrc_findings(text: str, free: bool = False, yaml: bool = False) -> list:
-    """(key, cleaned value) for every dangerous exec-key entry in ``text``.
-    Line mode skips `;`/`#` comment lines (they are inert to every parser
-    involved); free mode scans a shell command's whole scan surface; yaml
-    mode (pnpm-workspace.yaml) only counts its top-level scriptShell/
-    nodeOptions settings."""
+def _npmrc_yaml_entries(text: str) -> list:
     out = []
+    lines = text.split("\n")
+    pos = {}
+    off = 0
+    for i, ln in enumerate(lines):
+        pos[off] = i
+        off += len(ln) + 1
+    for m in patterns.NPMRC_YAML_LINE_RE.finditer(text):
+        val = (m.group(2) or "").strip()
+        if val == "" or re.match(r"^[|>][-+0-9]*(?:[ \t]+#.*)?$", val):
+            # Next-line or block-scalar value: the indented lines that follow.
+            i = pos.get(m.start(), -1) + 1
+            parts = []
+            while 0 < i < len(lines) and (not lines[i].strip() or lines[i][:1] in " \t"):
+                if lines[i].strip():
+                    parts.append(lines[i].strip())
+                i += 1
+                if len(parts) > 200:
+                    break
+            val = " ".join(parts)
+        out.append((m.group(1), val))
+    for m in patterns.NPMRC_YAML_FLOW_RE.finditer(text):
+        out.append((m.group(1), m.group(2)))
+    # Authoritative parse last (last-wins), when the file is valid YAML.
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(text)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, (list, tuple)):
+                    v = " ".join(str(x) for x in v)
+                if isinstance(k, str) and v is not None and not isinstance(v, dict):
+                    out.append((k, str(v)))
+    except Exception:
+        pass
+    return out
+
+
+def _npmrc_yaml_parses(text: str) -> bool:
+    if not text.strip():
+        return True
+    try:
+        import yaml as _yaml
+        _yaml.safe_load(_npmrc_normalize(text))
+        return True
+    except Exception:
+        return False
+
+
+def _npmrc_entries(text, kind: str) -> list:
+    """Every exec-key entry (canonical key, cleaned value), in file order."""
     if not isinstance(text, str) or not text:
-        return out
-    rx = (patterns.NPMRC_EXEC_FREE_RE if free else
-          patterns.NPMRC_YAML_LINE_RE if yaml else patterns.NPMRC_EXEC_LINE_RE)
-    for m in rx.finditer(text[:_NPMRC_MAX_FILE * 2]):
-        key = _npmrc_canon_key(m.group(1))
-        if key and _npmrc_value_dangerous(key, m.group(2)):
-            out.append((key, _npmrc_clean_value(m.group(2))))
+        return []
+    if len(text) > _NPMRC_MAX_FILE:
+        return [_NPMRC_OVERSIZE]
+    if kind == "free":
+        raw = []
+        for rx in patterns.NPMRC_EXEC_FREE_RES:
+            raw.extend((m.start(), m.group(1), m.group(2)) for m in rx.finditer(text))
+        raw = [(k, v) for _, k, v in sorted(raw)]
+    else:
+        text = _npmrc_normalize(text)
+        if kind == "yaml":
+            raw = _npmrc_yaml_entries(text)
+        else:
+            rx = patterns.NPMRC_YARN_LINE_RE if kind == "yarn" else patterns.NPMRC_EXEC_LINE_RE
+            raw = [(m.group(1), m.group(2)) for m in rx.finditer(text)]
+    out = []
+    for k, v in raw:
+        key = _npmrc_canon_key(k)
+        if key:
+            out.append((key, _npmrc_clean_value(v, "ini" if kind == "ini" else
+                                                ("free" if kind == "free" else "other"))))
+    return out
+
+
+def _npmrc_findings(text, kind: str = "ini") -> list:
+    """(key, value) for every dangerous exec-key entry in ``text``."""
+    out = []
+    for e in _npmrc_entries(text, kind):
+        if e == _NPMRC_OVERSIZE or _npmrc_value_dangerous(*e):
+            out.append(e)
             if len(out) >= 32:
                 break
     return out
@@ -3255,33 +3369,27 @@ def _npmrc_cli_findings(cmd: str) -> list:
         except ValueError:
             toks = tail.split()
         toks = [t for t in toks if t != "--"]
-        i = 0
-        while i < len(toks):
-            t = toks[i]
+        # Every token position is tried as a key, so a value-taking flag the
+        # parser doesn't know (`--prefix /tmp`, `--dir .`) can't shift the
+        # key/value pairing (QA round 2).
+        for i, t in enumerate(toks):
             if t.startswith("-"):
-                # `--location project` / `-L project` consume their value.
-                if t in ("--location", "-L", "--userconfig", "--globalconfig"):
-                    i += 1
-                i += 1
                 continue
             if "=" in t:
                 k, _, v = t.partition("=")
-                i += 1
             else:
-                k = t
-                v = toks[i + 1] if i + 1 < len(toks) else ""
-                i += 2
+                k, v = t, (toks[i + 1] if i + 1 < len(toks) else None)
             key = _npmrc_canon_key(k)
             if not key:
                 continue
-            # A value-less `set <key>` with nothing after it is not a write;
-            # a value the CLI regex couldn't see (cut at a separator) is.
-            if v == "" and i - 1 >= len(toks):
+            if v is None:
+                # The value was cut off by a separator the regex stops at.
                 if key != "node-options":
                     out.append((key, "<unparsed>"))
                 continue
+            v = _npmrc_clean_value(v, "other")
             if _npmrc_value_dangerous(key, v):
-                out.append((key, _npmrc_clean_value(v)))
+                out.append((key, v))
     return out
 
 
@@ -3290,6 +3398,11 @@ def _npmrc_resolve(ev: Event, p: str) -> Optional[str]:
         p = str(p)
         if p.lower().startswith("file://"):
             p = urllib.parse.unquote(p[7:])
+        if "$" in p:
+            env = dict(os.environ)
+            if ev.cwd:
+                env["PWD"] = str(ev.cwd)
+            p = re.sub(r"\$\{?(\w+)\}?", lambda m: env.get(m.group(1), m.group(0)), p)
         p = os.path.expanduser(p)
         if not os.path.isabs(p):
             if not ev.cwd:
@@ -3308,7 +3421,7 @@ def _npmrc_read(ev: Event, p: str) -> Optional[str]:
         st = os.stat(fp)
         if not stat.S_ISREG(st.st_mode) or st.st_size > _NPMRC_MAX_FILE:
             return None
-        with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+        with open(fp, "r", encoding="utf-8", errors="replace", newline="") as fh:
             return fh.read(_NPMRC_MAX_FILE)
     except Exception:
         return None
@@ -3331,10 +3444,18 @@ def _npmrc_apply_edits(base: str, edits) -> Optional[str]:
     return out
 
 
+def _npmrc_str(v) -> str:
+    if isinstance(v, str):
+        return v
+    if v is None:
+        return ""
+    return "\n".join(_flatten_strings(v))
+
+
 def _npmrc_edit_list(a: dict) -> list:
     edits = []
-    if isinstance(a.get("old_string"), str) or isinstance(a.get("new_string"), str):
-        edits.append((a.get("old_string") or "", a.get("new_string") or "",
+    if "old_string" in a or "new_string" in a:
+        edits.append((_npmrc_str(a.get("old_string")), _npmrc_str(a.get("new_string")),
                       bool(a.get("replace_all"))))
     for e in (a.get("edits") or []) if isinstance(a.get("edits"), list) else []:
         if not isinstance(e, dict):
@@ -3342,27 +3463,41 @@ def _npmrc_edit_list(a: dict) -> list:
         for ok, nk in (("old_string", "new_string"), ("oldText", "newText"),
                        ("old_str", "new_str"), ("old", "new")):
             if ok in e or nk in e:
-                edits.append((e.get(ok) or "", e.get(nk) or "", bool(e.get("replace_all"))))
+                edits.append((_npmrc_str(e.get(ok)), _npmrc_str(e.get(nk)),
+                              bool(e.get("replace_all"))))
                 break
     return edits
 
 
 def _npmrc_new_findings(ev: Event, p: str) -> list:
-    """Dangerous entries the Edit/Write/MCP call would ADD to ``p`` -- the
-    post-change file minus what is already on disk, so re-saving a file that
-    already carries a reviewed entry doesn't re-ask."""
+    """Dangerous entries the Edit/Write/MCP call would ADD to ``p``: the
+    post-change file's dangerous entries minus those already on disk
+    (multiset), plus any key whose EFFECTIVE (last-wins) value becomes
+    dangerous -- so deleting a later safe override that was masking an
+    earlier dangerous entry counts too."""
     a = ev.args or {}
+    kind = _npmrc_kind(p)
     before = _npmrc_read(ev, p)
+    if before is None:
+        fp = _npmrc_resolve(ev, p)
+        try:
+            if fp and os.path.isfile(fp) and os.path.getsize(fp) > _NPMRC_MAX_FILE:
+                return [_NPMRC_OVERSIZE]   # fail closed, never diff a truncation
+        except Exception:
+            pass
     after = None
     content = a.get("content")
     if not isinstance(content, str):
         content = a.get("contents") if isinstance(a.get("contents"), str) else a.get("text")
     edits = _npmrc_edit_list(a)
+    full = False
     if isinstance(content, str) and not edits:
         after = content
+        full = True
     elif edits:
         if before is not None:
             after = _npmrc_apply_edits(before, edits)
+            full = after is not None
         if after is None:
             # File unreadable or old string absent: judge the new text alone,
             # and treat nothing as pre-existing.
@@ -3371,33 +3506,55 @@ def _npmrc_new_findings(ev: Event, p: str) -> list:
     if after is None:
         after = "\n".join(_flatten_strings(a))
         before = None
-    yaml = bool(patterns.NPMRC_YAML_PATH_RE.search(p))
-    new = _npmrc_findings(after, yaml=yaml)
+    new = _npmrc_findings(after, kind)
+    if kind == "yaml" and not new and full and not _npmrc_yaml_parses(after):
+        # A whole pnpm-workspace.yaml the guard can't parse can't be cleared.
+        return [("<file>", "not parseable as YAML")]
     if before is None:
         return new
-    old = list(_npmrc_findings(before, yaml=yaml))
+    old = list(_npmrc_findings(before, kind))
     added = []
     for f in new:
         if f in old:
             old.remove(f)
         else:
             added.append(f)
+    eff_before = dict(_npmrc_entries(before, kind))
+    for key, val in dict(_npmrc_entries(after, kind)).items():
+        if (val != eff_before.get(key) and _npmrc_value_dangerous(key, val)
+                and (key, val) not in added):
+            added.append((key, val))
     return added
 
 
 def _npmrc_shell_source_findings(ev: Event, raw: str) -> list:
     """Files a shell write copies/concatenates into an npm config path: read
-    any existing, non-config, small regular file the command names and scan
-    it in line mode (`cp evil .npmrc`, `cat x > .npmrc`, `install -m 644 x
-    ~/.npmrc`)."""
+    any existing, non-config, regular file the command names and scan it in
+    each file kind's own syntax (`cp evil .npmrc`, `cat x > .npmrc`,
+    `install -m 644 x ~/.npmrc`)."""
     try:
         toks = shlex.split(raw, posix=True)
     except ValueError:
         toks = raw.split()
-    out, seen = [], 0
+    # Expand a simple `{a,b}` brace list the way the shell would.
+    exp = []
     for t in toks[:256]:
-        if seen >= _NPMRC_MAX_SOURCES or patterns.NPMRC_EXEC_PATH_RE.search(" " + t):
+        m = re.match(r"^([^{}]*)\{([^{}]*,[^{}]*)\}([^{}]*)$", t)
+        exp.extend([m.group(1) + x + m.group(3) for x in m.group(2).split(",")[:16]]
+                   if m else [t])
+    copy_verb = bool(patterns.COPY_WRITE_VERB_RE.search(raw)
+                     or patterns.DELETE_OR_MOVE_VERB_RE.search(raw)
+                     or re.search(r"\bln\b", raw))
+    out, seen = [], 0
+    for t in exp:
+        if seen >= _NPMRC_MAX_SOURCES:
             continue
+        if patterns.NPMRC_EXEC_PATH_RE.search(" " + t):
+            # A config file is read as a SOURCE only when it is copied in from
+            # another directory (`cp tmpl/.npmrc .`); the file being appended
+            # to in place is judged by what the command adds.
+            if not (copy_verb and re.search(r"[/\\]", t.rstrip("/\\"))):
+                continue
         t = t.lstrip("<>")
         if not t or t.startswith("-") or len(t) > 4096:
             continue
@@ -3405,9 +3562,52 @@ def _npmrc_shell_source_findings(ev: Event, raw: str) -> list:
         if txt is None:
             continue
         seen += 1
-        out.extend(_npmrc_findings(txt))
-        out.extend(_npmrc_findings(txt, yaml=True))
+        for kind in ("ini", "yarn", "yaml"):
+            out.extend(f for f in _npmrc_findings(txt, kind) if f != _NPMRC_OVERSIZE)
     return out
+
+
+def _npmrc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
+    found = _npmrc_cli_findings(cmd)
+    if not found:
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                           or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd)
+                           or patterns.NPMRC_EXTRA_WRITE_RE.search(cmd))
+        if write_verb and patterns.NPMRC_EXEC_PATH_RE.search(cmd):
+            # A "value" that is itself the config path or a redirect is a
+            # read (`grep -q 'git=' .npmrc > /dev/null`), not a payload.
+            found = []
+            for k, v in _npmrc_findings(cmd, "free"):
+                v = re.split(r"\s*\d*>", v, maxsplit=1)[0].strip()
+                if (v and not patterns.NPMRC_EXEC_PATH_RE.search(" " + v)
+                        and _npmrc_value_dangerous(k, v)):
+                    found.append((k, v))
+            if not found:
+                found = _npmrc_shell_source_findings(ev, raw)
+            if not found and patterns.INPLACE_WRITE_RE.search(cmd):
+                found = _npmrc_inplace_findings(ev, raw)
+    return found
+
+
+def _npmrc_inplace_findings(ev: Event, raw: str) -> list:
+    """An in-place editor (`sed -i`, `perl -pi`) can rewrite just the VALUE of
+    an existing entry (`s/=bash$/=.\\/x/`), which no command text shows.
+    Ask when it targets a config file that already holds an exec-key entry."""
+    try:
+        toks = shlex.split(raw, posix=True)
+    except ValueError:
+        toks = raw.split()
+    for t in toks[:256]:
+        if not patterns.NPMRC_EXEC_PATH_RE.search(" " + t):
+            continue
+        txt = _npmrc_read(ev, t)
+        if txt and _npmrc_entries(txt, _npmrc_kind(t)):
+            return [("<in-place edit>", t)]
+    return []
 
 
 def _npmrc_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
@@ -3464,8 +3664,19 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     judged by what it ADDS: the post-change file (Edit/MultiEdit/MCP
     ``edits`` applied to the on-disk file) minus entries already on disk, so
     a value-only Edit (``old_string='bash'``, ``new_string='./x.sh'``) is
-    seen, and re-saving an already-reviewed entry doesn't re-ask. Comment
-    lines (``;``/``#``) are skipped.
+    seen, re-saving an already-reviewed entry doesn't re-ask, and a key whose
+    EFFECTIVE (last-wins) value turns dangerous -- e.g. deleting a later safe
+    override -- counts too. Parsing follows each file's real reader: CRLF/CR
+    line ends and a BOM are normalized; ``.npmrc`` accepts ``key[]=`` and
+    strips an unquoted ``;``/``#`` inline comment like npm's ini parser;
+    pnpm-workspace.yaml is also ``yaml.safe_load``-ed (flow maps, next-line
+    and block-scalar values, escapes, aliases), and an unparseable whole
+    file asks; ``node-options`` is tokenized the way Node reads
+    NODE_OPTIONS (quotes/escapes removed, ``_`` in flag names read as
+    ``-``). Files over 8 MB are never scanned partially: they ask.
+    Rule-internal exceptions on a matched config path ask instead of failing
+    open. Placed after every hard-DENY shell guard in ``_CORE_RULES`` so its
+    ASK never pre-empts a DENY on the same command.
 
     Config (``policy.npmrc_exec``): ``mode`` (deny|ask|monitor|off, default
     ask), ``allow`` (regexes on the path/command). Default ``ask``: some
@@ -3473,18 +3684,35 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     human: a trailing ``# aegis-allow`` on the shell form, or
     ``AEGIS_ALLOW_NPMRC_EXEC=1`` set by the orchestrator before launch.
 
-    Hardening history (author self-review, each verified by a repro against
-    the first commit): global flags before the subcommand (``npm
-    --location=project config set``, ``npm -g set``) escaped the CLI regex;
-    the ``node-gyp`` key was missing; an NTFS ``.npmrc::$DATA`` path suffix
-    escaped the path regex; and indented ``git:``/``shell:`` package names
-    under pnpm-workspace.yaml's ``catalog:``/``overrides:`` false-positived
-    (closed by the top-level-only YAML mode). Interpreter writes and ``ln``
-    were already caught; the extra write-idiom list is defence in depth.
+    QA history: an initial author self-review closed global flags before
+    ``config``, the ``node-gyp`` key, an NTFS ``::$DATA`` suffix, and a
+    nested-package-name YAML false positive. Then two independent reviews
+    (one design/wiring, one adversarial), each confirming its bypasses
+    against real npm 10.9 / pnpm 10.28 / Yarn 1.22, found and this guard now
+    closes: CRLF/CR line ends and a leading BOM hiding every entry; values
+    past a 2000-char cap and files past a 512 KB scan cap; ``key[]=``
+    array syntax; pnpm-workspace.yaml flow-map/next-line/block-scalar/
+    escaped/aliased values; ``node-options`` evasions (a quoted value, a
+    literal ``\\n``, ``--re"quire"``, ``--experimental_loader``, the
+    missing ``--test-reporter``); flags between ``config`` and ``set`` and
+    value-taking flags (``--prefix /tmp``) shifting the CLI key/value
+    pairing; pnpm's global ``rc`` path; a glued ``>>.npmrc`` redirect; a
+    ``$PWD``-prefixed or brace-listed copy source; a value-only ``sed -i``;
+    a fail-open TypeError on a non-string edit; deletion of a masking
+    last-wins override; and an ASK pre-empting a later destructive-delete/
+    remote-exec DENY. False positives closed: inline comments,
+    ``package.json``/README lines read as config when a shell command
+    names them, nested ``git:``/``node-gyp:`` package names in a heredoc,
+    ``git: bump`` commit messages, read-only ``grep ... .npmrc >
+    /dev/null``, and NixOS system shells.
 
-    Honest scope: values assembled indirectly (``${VAR}`` interpolation
-    pointing at an env var set elsewhere) are judged as written -- a
-    ``${...}`` value is not exempt, so it fires; an inline env var
+    Honest scope: values assembled indirectly are judged as written -- a
+    ``${VAR}`` ``script-shell``/``git``/``init-module`` value is not exempt
+    and fires, but ``node-options=${VAR}`` names no flag and stays allowed;
+    a shell payload assembled at run time (``printf '%s=%s' script-shell
+    ./x``, ``k=script-shell; echo "$k=..."``, a backslash inside the key, a
+    glob target like ``.np?rc``) is not reconstructed; ``cp -r dir/. .``
+    (no config filename in the command) is missed; an inline env var
     (``npm_config_script_shell=./x npm test``) is not gated -- it affects
     only the command the agent itself is running, i.e. no more than running
     ``./x`` directly, and persisting it into a shell rc is
@@ -3495,9 +3723,10 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     bins -- ``rule_path_hijack_protect``'s surface); the shell write check
     adds interpreter/PowerShell write idioms (``.write(``,
     ``writeFileSync``, ``Set-Content``, ...) and any ``ln`` to the shared
-    write-verb lists, but a write via a tool none of them name is missed; a shell
-    ``sed`` replacement scans its pattern half too, so a sed that REPLACES
-    an exec entry with a safe value can over-fire ASK; a shell write whose
+    write-verb lists, but a write via a tool none of them name is missed; a
+    ``sed -i``/``perl -pi`` on a config that already holds any exec-key
+    entry asks even when the edit is harmless (value-only edits can't be
+    seen otherwise), and a sed's pattern half is scanned too; a shell write whose
     payload is neither in the command nor in a readable named file
     (``curl -o .npmrc ...``) is closed by ``rule_fetch_to_file_protect``'s
     backstop list, which this guard's path regex joins; the shared
@@ -3524,7 +3753,11 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         p = _path(ev)
         if not p or not patterns.NPMRC_EXEC_PATH_RE.search(p):
             return None
-        found = _npmrc_new_findings(ev, p)
+        try:
+            found = _npmrc_new_findings(ev, p)
+        except Exception:
+            # Rules fail open; on a confirmed config path, fail to ASK instead.
+            found = [("<file>", "could not be inspected")]
         if not found:
             return None
         if (os.environ.get("AEGIS_ALLOW_NPMRC_EXEC")
@@ -3539,18 +3772,12 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         raw = _cmd(ev)
         cmd = _shell_scan(ev)
-        found = _npmrc_cli_findings(cmd)
-        if not found:
-            write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
-                               or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
-                               or patterns.INPLACE_WRITE_RE.search(cmd)
-                               or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                               or patterns.COPY_WRITE_VERB_RE.search(cmd)
-                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd)
-                               or patterns.NPMRC_EXTRA_WRITE_RE.search(cmd))
-            if write_verb and patterns.NPMRC_EXEC_PATH_RE.search(cmd):
-                found = (_npmrc_findings(cmd, free=True)
-                         or _npmrc_shell_source_findings(ev, raw))
+        try:
+            found = _npmrc_shell_findings(ev, raw, cmd)
+        except Exception:
+            found = ([("<command>", "could not be inspected")]
+                     if (patterns.NPMRC_EXEC_CLI_RE.search(cmd)
+                         or patterns.NPMRC_EXEC_PATH_RE.search(cmd)) else [])
         if not found:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_NPMRC_EXEC")
@@ -10820,7 +11047,6 @@ _CORE_RULES = (
     rule_package_manifest_protect,
     rule_pnpmfile_exec_protect,
     rule_yarn_exec_protect,
-    rule_npmrc_exec_protect,
     rule_git_config_exec_protect,
     rule_git_attributes_exec_protect,
     rule_gitmodules_protect,
@@ -10856,6 +11082,10 @@ _CORE_RULES = (
     rule_destructive_delete,
     rule_install_review,
     rule_branch_strands,
+    # After every hard-DENY shell guard: a content-gated ASK here must never
+    # pre-empt a later DENY (destructive-delete, remote-exec, ...) on the same
+    # command (QA round 1). agent_rules_protect stays last for the same reason.
+    rule_npmrc_exec_protect,
     rule_agent_rules_protect,
 )
 
