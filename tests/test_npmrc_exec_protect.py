@@ -552,3 +552,52 @@ def test_qa3_cp_backup_of_reviewed_config_allowed(tmp_path):
 def test_qa3_cli_still_caught(cmd):
     d = _hit(_shell(cmd))
     assert d is not None and d.action == Action.ASK, cmd
+
+
+# ---- QA round 4 (independent final review) regressions --------------------------
+@pytest.mark.parametrize("cmd", [
+    "timeout 30 npm config set script-shell ./x",
+    "sudo -u me npm config set script-shell ./x",
+    "nice -n 5 npm config set script-shell ./x",
+    "env FOO=1 npm config set script-shell ./x",
+    "env -u X npm config set script-shell ./x",
+    "if true; then npm config set script-shell ./x; fi",
+    "for i in 1; do npm config set script-shell ./x; done",
+    "! npm config set script-shell ./x",
+    "corepack npm config set script-shell ./x",
+    "corepack pnpm config set script-shell ./x",
+    "doas npm config set script-shell ./x",
+    "stdbuf -oL npm config set script-shell ./x",
+    "watch -n1 npm config set script-shell ./x",
+    "exec -a foo npm config set script-shell ./x",
+    "xargs npm config set script-shell <<< ./x",
+    "echo ./x | xargs npm config set script-shell",
+    "bash -lc 'npm config set script-shell ./x'",
+    "sh -xc 'npm config set script-shell ./x'",
+    "bash -c -- 'npm config set script-shell ./x'",
+    "cmd /c npm config set script-shell ./x",
+    "wsl npm config set script-shell ./x",
+    "ssh localhost npm config set script-shell ./x",
+    "node -e \"require('child_process').execSync('npm config set script-shell ./x')\"",
+    "echo 'npm set foo' ; \"npm\" config set script-shell ./x",
+    "git commit -m 'npm config set x'; n''pm config set script-shell ./x",
+    "echo 'npm config set script-shell ./x' | sh",
+    "printf '\"script\\\\u002dshell\"=./x\\n' >> .npmrc",
+    "npx -y npm@10 config set script-shell ./x",
+    "npx pnpm@9.1.0 config set script-shell ./x",
+    "echo -e 'script\\x2dshell=./x' >> .npmrc",
+])
+def test_qa4_cli_and_escape_forms(cmd):
+    d = _hit(_shell(cmd))
+    assert d is not None and d.action == Action.ASK, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git commit -m 'chore: npm set git hooks via husky'",
+    "git commit -m 'docs: run npm config set script-shell ./x to configure'",
+    "echo 'tip: npm config set script-shell ./x' > NOTES.md",
+    'npm config set script-shell "C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe"',
+    "npm config set init-author-name 'Git Hub'",
+])
+def test_qa4_data_mentions_allowed(cmd):
+    assert _hit(_shell(cmd)) is None, cmd

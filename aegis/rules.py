@@ -3370,10 +3370,15 @@ def _npmrc_entries(text, kind: str) -> list:
     if kind == "free":
         raw = []
         texts = [text]
-        if "\\u" in text or "\\U" in text:
-            # A quoted key/value npm or Yarn will JSON-decode (`"script\\u002dshell"`).
-            texts.append(re.sub(r"\\[uU]([0-9a-fA-F]{4})",
-                                lambda m: chr(int(m.group(1), 16)), text))
+        if "\\" in text:
+            # A quoted key/value npm or Yarn will JSON-decode
+            # (`"script\\u002dshell"`), or an `echo -e`/printf escape
+            # (`script\\x2dshell`, printf's `\\\\u...`): scan decoded too.
+            t2 = text.replace("\\\\", "\\")
+            t2 = re.sub(r"\\[uU]([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), t2)
+            t2 = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), t2)
+            if t2 != text:
+                texts.append(t2)
         for t in texts:
             for rx in patterns.NPMRC_EXEC_FREE_RES:
                 raw.extend((m.start(), m.group(1), m.group(2)) for m in rx.finditer(t))
@@ -3441,18 +3446,86 @@ def _npmrc_cli_pairs(tail: str) -> list:
     return out
 
 
+# Commands that execute (or hand to something that executes) a quoted
+# argument: a `npm config set` inside their quotes is a real call. Inside any
+# other command's quotes (`git commit -m '...'`, `echo '...'`) it is data.
+_NPMRC_EXEC_WRAPPERS = frozenset((
+    "bash", "sh", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox",
+    "pwsh", "powershell", "cmd", "node", "deno", "bun", "python", "python3",
+    "perl", "ruby", "php", "ssh", "wsl", "eval", "su", "sudo", "doas", "runuser",
+    "env", "timeout", "nice", "nohup", "stdbuf", "watch", "xargs", "parallel",
+    "exec", "command", "time", "setsid", "chroot", "flock", "script", "sg",
+    "docker", "podman", "kubectl", "corepack", "npx", "pnpx", "bunx", "make",
+    "just", "task", "source", ".", "if", "then", "do", "else", "while", "until",
+    "!", "{", "(",
+))
+# Constructs that can turn ANY command's output or argument into a command.
+_NPMRC_EXEC_CONSTRUCT_RE = re.compile(
+    r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k|mk|c|tc)?sh\b|\|\s*(?:pwsh|powershell|cmd|xargs|source)\b"
+    r"|\$\(|`|\beval\b|<\(|\bsource\b", re.IGNORECASE)
+
+
+def _npmrc_quoted_spans(raw: str) -> list:
+    """(start, end) of each quoted region's interior, shell-style."""
+    spans, i, n = [], 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in "'\"":
+            j = i + 1
+            while j < n and raw[j] != ch:
+                j += 2 if (ch == '"' and raw[j] == "\\") else 1
+            spans.append((i + 1, min(j, n)))
+            i = j + 1
+            continue
+        i += 1
+    return spans
+
+
+def _npmrc_segment_cmd(raw: str, pos: int) -> str:
+    """Basename of the first word of the simple command containing ``pos``."""
+    seg = re.split(r"[;&|\n(){}]", raw[:pos])[-1]
+    for w in seg.split():
+        w = w.strip("'\"")
+        if re.match(r"^[A-Za-z_]\w*=", w):
+            continue
+        return re.split(r"[/\\]", w)[-1].lower().removesuffix(".exe")
+    return ""
+
+
+def _npmrc_mask_data_spans(raw: str) -> str:
+    """Blank out quoted strings that are DATA (a commit message, an echo
+    argument) and that contain a `config set` -- so they neither count as
+    calls nor, by being visible, switch off the de-obfuscated fallback."""
+    if _NPMRC_EXEC_CONSTRUCT_RE.search(raw):
+        return raw
+    out = raw
+    for a, b in _npmrc_quoted_spans(raw):
+        if not patterns.NPMRC_EXEC_CLI_RE.search(raw[a:b]):
+            continue
+        if _npmrc_segment_cmd(raw, a) in _NPMRC_EXEC_WRAPPERS:
+            continue
+        out = out[:a] + " " * (b - a) + out[b:]
+    return out
+
+
 def _npmrc_cli_findings(raw: str, surface: str = "") -> list:
     """Dangerous `npm|pnpm|yarn config set <key> <value>` / `<key>=<value>`
-    pairs. Paired from the RAW command's own quoting, at command position;
-    the de-obfuscated surface is used only when the raw text shows no
-    `config set` at all (a base64/quoted-program-name form), since its
-    quote-stripped copy splits a quoted value into fake keys (QA round 3)."""
+    pairs. Each visible occurrence in the raw command is paired using the
+    command's own quoting (so a quoted value is one token); quoted DATA
+    containing a `config set` is masked first. Only when no occurrence is
+    visible in the masked command is the de-obfuscated surface of the
+    masked command paired instead (base64, `n''pm`, `"npm"` forms) -- its
+    quote-stripped copy would split a quoted value into fake keys
+    (QA rounds 3-4)."""
     out = []
-    raw = raw or ""
-    if patterns.NPMRC_EXEC_CLI_RE.search(raw):
-        tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_CMDPOS_RE.finditer(raw)]
-    else:
-        tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_RE.finditer(surface or "")]
+    masked = _npmrc_mask_data_spans(raw or "")
+    tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_RE.finditer(masked)]
+    if not tails:
+        surf = normalize.scan_surface(masked) if masked != (raw or "") else (surface or "")
+        tails = [m.group(1) for m in patterns.NPMRC_EXEC_CLI_RE.finditer(surf)]
     for tail in tails:
         for k, v in _npmrc_cli_pairs(tail):
             key = _npmrc_canon_key(k)
@@ -3794,14 +3867,29 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     path) or matching inside a commit message (CLI pairs now come from the
     raw command's quoting at command position), plus a ``cp .npmrc
     .npmrc.bak`` ASK (the value-only check now needs a real in-place
-    editor).
+    editor). A fourth independent review confirmed those held but found
+    the round-3 command-position anchoring had reopened ~25 ordinary forms
+    round 2 caught (``timeout 30 npm config set``, ``if ...; then npm ...``,
+    ``xargs``/``corepack``/``doas``/``bash -lc``/``cmd /c``/``ssh`` ...)
+    and that one visible decoy ``npm set`` switched off the de-obfuscated
+    fallback. Closed by pairing EVERY visible occurrence with the raw
+    quoting, after masking only quoted DATA -- a quoted string holding a
+    ``config set`` that is an argument of a command not on the
+    ``_NPMRC_EXEC_WRAPPERS`` list (``git commit -m``, ``echo``), with no
+    pipe-to-shell/``$(``/``eval`` construct in the command -- and falling
+    back to the masked command's de-obfuscated surface. Also closed: a
+    ``npm@10``/``pnpm@9`` version suffix (found re-running that review's
+    scripts) and printf ``\\\\u`` / ``echo -e`` ``\\x`` escapes in shell
+    payloads.
 
     Honest scope: values assembled indirectly are judged as written -- a
     ``${VAR}`` ``script-shell``/``git``/``init-module`` value is not exempt
     and fires, but ``node-options=${VAR}`` names no flag and stays allowed;
     a shell payload assembled at run time (``printf '%s=%s' script-shell
     ./x``, ``k=script-shell; echo "$k=..."``, a backslash inside the key, a
-    glob target like ``.np?rc``) is not reconstructed; ``cp -r dir/. .``
+    glob target like ``.np?rc``) is not reconstructed; a ``config set``
+    quoted inside an argument of a command that is not on
+    ``_NPMRC_EXEC_WRAPPERS`` but still executes it is treated as data; ``cp -r dir/. .``
     (no config filename in the command) is missed; an inline env var
     (``npm_config_script_shell=./x npm test``) is not gated -- it affects
     only the command the agent itself is running, i.e. no more than running

@@ -4311,7 +4311,7 @@ NPMRC_EXEC_FREE_RES = (
 # the subcommand itself.
 _NPMRC_CLI_FLAGS = r"(?:\s+-{1,2}[\w-]+(?:=\S*)?(?:\s+(?!(?:config|c|set)\b)[^\s\-|;&]\S*)?){0,6}"
 NPMRC_EXEC_CLI_RE = re.compile(
-    r"\b(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
+    r"\b(?:npm|pnpm|yarn)(?:@[\w.^~<>=*+-]{1,40})?(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
     + r"\s+(?:(?:config|c)" + _NPMRC_CLI_FLAGS + r"\s+set|set)\b([^|;&\n]{0,500})",
     re.IGNORECASE,
 )
@@ -4322,7 +4322,7 @@ NPMRC_EXEC_CLI_RE = re.compile(
 NPMRC_EXEC_CLI_CMDPOS_RE = re.compile(
     r"(?:^|[;&|({\n`]|\$\(|\s-(?:c|Command|e)\s+[\"']?)\s*"
     r"(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:sudo|npx|exec|command|env|time|nice|nohup)(?:\s+-\S+)*\s+)*"
-    r"(?:\S*[/\\])?(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
+    r"(?:\S*[/\\])?(?:npm|pnpm|yarn)(?:@[\w.^~<>=*+-]{1,40})?(?:\.cmd|\.exe)?" + _NPMRC_CLI_FLAGS
     + r"\s+(?:(?:config|c)" + _NPMRC_CLI_FLAGS + r"\s+set|set)\b([^|;&\n]{0,500})",
     re.IGNORECASE,
 )
