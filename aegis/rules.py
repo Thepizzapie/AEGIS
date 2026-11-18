@@ -3192,7 +3192,8 @@ def rule_yarn_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
 
 
 _NPMRC_KEY_CANON = {"scriptshell": "script-shell", "nodeoptions": "node-options",
-                    "shell": "shell", "git": "git", "initmodule": "init-module",
+                    "shell": "shell", "git": "git", "nodegyp": "node-gyp",
+                    "initmodule": "init-module",
                     "onloadscript": "onload-script", "yarnpath": "yarn-path"}
 _NPMRC_MAX_FILE = 256 * 1024
 _NPMRC_MAX_SOURCES = 8
@@ -3224,14 +3225,17 @@ def _npmrc_value_dangerous(key: str, value: str) -> bool:
     return True
 
 
-def _npmrc_findings(text: str, free: bool = False) -> list:
+def _npmrc_findings(text: str, free: bool = False, yaml: bool = False) -> list:
     """(key, cleaned value) for every dangerous exec-key entry in ``text``.
     Line mode skips `;`/`#` comment lines (they are inert to every parser
-    involved); free mode scans a shell command's whole scan surface."""
+    involved); free mode scans a shell command's whole scan surface; yaml
+    mode (pnpm-workspace.yaml) only counts its top-level scriptShell/
+    nodeOptions settings."""
     out = []
     if not isinstance(text, str) or not text:
         return out
-    rx = patterns.NPMRC_EXEC_FREE_RE if free else patterns.NPMRC_EXEC_LINE_RE
+    rx = (patterns.NPMRC_EXEC_FREE_RE if free else
+          patterns.NPMRC_YAML_LINE_RE if yaml else patterns.NPMRC_EXEC_LINE_RE)
     for m in rx.finditer(text[:_NPMRC_MAX_FILE * 2]):
         key = _npmrc_canon_key(m.group(1))
         if key and _npmrc_value_dangerous(key, m.group(2)):
@@ -3367,10 +3371,11 @@ def _npmrc_new_findings(ev: Event, p: str) -> list:
     if after is None:
         after = "\n".join(_flatten_strings(a))
         before = None
-    new = _npmrc_findings(after)
+    yaml = bool(patterns.NPMRC_YAML_PATH_RE.search(p))
+    new = _npmrc_findings(after, yaml=yaml)
     if before is None:
         return new
-    old = list(_npmrc_findings(before))
+    old = list(_npmrc_findings(before, yaml=yaml))
     added = []
     for f in new:
         if f in old:
@@ -3401,6 +3406,7 @@ def _npmrc_shell_source_findings(ev: Event, raw: str) -> list:
             continue
         seen += 1
         out.extend(_npmrc_findings(txt))
+        out.extend(_npmrc_findings(txt, yaml=True))
     return out
 
 
@@ -3421,7 +3427,7 @@ def _npmrc_describe(found: list) -> str:
 def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Block planting an exec-bearing package-manager config entry: npm/pnpm
     ``.npmrc``'s ``script-shell``/``node-options``/``shell``/``git``/
-    ``init-module``/``onload-script``, Yarn Classic ``.yarnrc``'s
+    ``node-gyp``/``init-module``/``onload-script``, Yarn Classic ``.yarnrc``'s
     ``script-shell``/``yarn-path``, or pnpm-workspace.yaml's
     ``scriptShell``/``nodeOptions`` -- by file write, shell write, or
     ``npm|pnpm|yarn config set``.
@@ -3449,8 +3455,12 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``--openssl-config``/``--env-file``/...), never on
     ``--max-old-space-size``; ``script-shell``/``shell``/``git`` exempt a
     bare or system-path shell/git binary (the common
-    ``script-shell=bash`` Windows-Git-Bash setup); ``init-module``/
-    ``onload-script``/``yarn-path`` fire on any value. An Edit/Write is
+    ``script-shell=bash`` Windows-Git-Bash setup); ``node-gyp`` (run for
+    every native-addon dependency's install)/``init-module``/
+    ``onload-script``/``yarn-path`` fire on any value. pnpm-workspace.yaml
+    counts only its top-level ``scriptShell``/``nodeOptions`` -- its nested
+    ``catalog:``/``overrides:`` maps are keyed by package name, and ``git``/
+    ``shell`` are real packages. An Edit/Write is
     judged by what it ADDS: the post-change file (Edit/MultiEdit/MCP
     ``edits`` applied to the on-disk file) minus entries already on disk, so
     a value-only Edit (``old_string='bash'``, ``new_string='./x.sh'``) is
@@ -3463,6 +3473,15 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     human: a trailing ``# aegis-allow`` on the shell form, or
     ``AEGIS_ALLOW_NPMRC_EXEC=1`` set by the orchestrator before launch.
 
+    Hardening history (author self-review, each verified by a repro against
+    the first commit): global flags before the subcommand (``npm
+    --location=project config set``, ``npm -g set``) escaped the CLI regex;
+    the ``node-gyp`` key was missing; an NTFS ``.npmrc::$DATA`` path suffix
+    escaped the path regex; and indented ``git:``/``shell:`` package names
+    under pnpm-workspace.yaml's ``catalog:``/``overrides:`` false-positived
+    (closed by the top-level-only YAML mode). Interpreter writes and ``ln``
+    were already caught; the extra write-idiom list is defence in depth.
+
     Honest scope: values assembled indirectly (``${VAR}`` interpolation
     pointing at an env var set elsewhere) are judged as written -- a
     ``${...}`` value is not exempt, so it fires; an inline env var
@@ -3470,7 +3489,13 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     only the command the agent itself is running, i.e. no more than running
     ``./x`` directly, and persisting it into a shell rc is
     ``rule_shell_persist_protect``'s surface; ``userconfig``/``globalconfig``
-    redirects to a differently named npmrc are not followed; a shell
+    redirects to a differently named npmrc are not followed, and
+    ``editor``/``browser``/``viewer``/``prefix`` are not gated (they run
+    only on an explicit ``npm edit``/``docs``/``help``, or relocate global
+    bins -- ``rule_path_hijack_protect``'s surface); the shell write check
+    adds interpreter/PowerShell write idioms (``.write(``,
+    ``writeFileSync``, ``Set-Content``, ...) and any ``ln`` to the shared
+    write-verb lists, but a write via a tool none of them name is missed; a shell
     ``sed`` replacement scans its pattern half too, so a sed that REPLACES
     an exec entry with a safe value can over-fire ASK; a shell write whose
     payload is neither in the command nor in a readable named file
@@ -3521,7 +3546,8 @@ def rule_npmrc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                                or patterns.INPLACE_WRITE_RE.search(cmd)
                                or patterns.FORCED_LINK_WRITE_RE.search(cmd)
                                or patterns.COPY_WRITE_VERB_RE.search(cmd)
-                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd))
+                               or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd)
+                               or patterns.NPMRC_EXTRA_WRITE_RE.search(cmd))
             if write_verb and patterns.NPMRC_EXEC_PATH_RE.search(cmd):
                 found = (_npmrc_findings(cmd, free=True)
                          or _npmrc_shell_source_findings(ev, raw))

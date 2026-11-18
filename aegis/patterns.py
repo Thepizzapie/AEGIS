@@ -4223,22 +4223,32 @@ YARN_EXEC_CLI_RE = re.compile(
 # Path half: the project/user `.npmrc`, npm's global `{prefix}/etc/npmrc` and
 # builtin `.../npm/npmrc`, Yarn Classic's `.yarnrc` (NOT `.yarnrc.yml`), and
 # pnpm's `pnpm-workspace.yaml` (pnpm>=10 settings home).
+# An NTFS alternate-data-stream suffix (`.npmrc::$DATA`) names the same file.
+_NPMRC_ADS = r"(?::{1,2}\$?\w*)?"
 NPMRC_EXEC_PATH_RE = re.compile(
-    r"(?:^|[\s'\"/\\=])\.npmrc" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])\.yarnrc" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])pnpm-workspace\.yaml" + _CI_END
-    + r"|(?:^|[\s'\"/\\=])(?:etc|npm)" + _SEP + r"npmrc" + _CI_END,
+    r"(?:^|[\s'\"/\\=])\.npmrc" + _NPMRC_ADS + _CI_END
+    + r"|(?:^|[\s'\"/\\=])\.yarnrc" + _NPMRC_ADS + _CI_END
+    + r"|(?:^|[\s'\"/\\=])pnpm-workspace\.yaml" + _NPMRC_ADS + _CI_END
+    + r"|(?:^|[\s'\"/\\=])(?:etc|npm)" + _SEP + r"npmrc" + _NPMRC_ADS + _CI_END,
     re.IGNORECASE,
+)
+# pnpm-workspace.yaml is YAML whose nested maps (`catalog:`, `overrides:`,
+# `packageExtensions:`) are keyed by PACKAGE NAME -- `git`/`shell` are real
+# packages -- so only its own two top-level settings count there.
+NPMRC_YAML_PATH_RE = re.compile(r"pnpm-workspace\.yaml" + _NPMRC_ADS + _CI_END, re.IGNORECASE)
+NPMRC_YAML_LINE_RE = re.compile(
+    r"^[\"']?(script[-_]?shell|node[-_]?options)[\"']?[ \t]*:[ \t]*([^\r\n]{0,2000})$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Exec-bearing keys, normalized form (lower-case, `_`/`.` -> `-`, camelCase
 # split): `node-options` is value-gated (see NPMRC_NODE_OPTIONS_DANGER_RE);
 # `script-shell`/`shell`/`git` exempt a well-known system binary (see
 # NPMRC_SAFE_*); every other key is gated on any non-empty value.
-NPMRC_EXEC_KEYS = ("script-shell", "node-options", "shell", "git",
+NPMRC_EXEC_KEYS = ("script-shell", "node-options", "shell", "git", "node-gyp",
                    "init-module", "onload-script", "yarn-path")
-_NPMRC_KEY_ALT = (r"script[-_]?shell|node[-_]?options|shell|git|init[-_.]?module"
-                  r"|onload[-_]?script|yarn[-_]?path")
+_NPMRC_KEY_ALT = (r"script[-_]?shell|node[-_]?options|shell|git|node[-_]?gyp"
+                  r"|init[-_.]?module|onload[-_]?script|yarn[-_]?path")
 # Line form: one config entry per line, `key=value` (.npmrc/ini), `key "value"`
 # (.yarnrc), or `key: value` (pnpm-workspace.yaml). Bounded value span.
 NPMRC_EXEC_LINE_RE = re.compile(
@@ -4255,8 +4265,23 @@ NPMRC_EXEC_FREE_RE = re.compile(
 )
 # `npm config set` / `npm c set` / `npm set` / `pnpm config set` / `yarn config
 # set` -- the subcommand IS the write (it edits the user/project/global npmrc).
+# Global flags may precede the subcommand (`npm --location=project config set`,
+# `npm -g set`, `npm --userconfig ./rc config set`): up to six, each optionally
+# followed by one non-flag value token that isn't the subcommand itself.
 NPMRC_EXEC_CLI_RE = re.compile(
-    r"\b(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?\s+(?:(?:config|c)\s+set|set)\b([^|;&\n]{0,500})",
+    r"\b(?:npm|pnpm|yarn)(?:\.cmd|\.exe)?"
+    r"(?:\s+-{1,2}[\w-]+(?:=\S*)?(?:\s+(?!(?:config|c|set)\b)[^\s\-|;&]\S*)?){0,6}"
+    r"\s+(?:(?:config|c)\s+set|set)\b([^|;&\n]{0,500})",
+    re.IGNORECASE,
+)
+# Interpreter / PowerShell file-write idioms (`python -c "open(...).write()"`,
+# `node -e "fs.appendFileSync()"`, `Set-Content`) and `ln` (any link, not only
+# `-f`): none are on the shared write-verb lists, but each writes the config.
+NPMRC_EXTRA_WRITE_RE = re.compile(
+    r"\.write\s*\(|\bwrite_(?:text|bytes)\b|\b(?:write|append)File(?:Sync)?\b"
+    r"|\bcreateWriteStream\b|\b(?:Set|Add)-Content\b|\bOut-File\b"
+    r"|\b(?:Write|Append)All(?:Text|Lines|Bytes)\b|\bfile_put_contents\b"
+    r"|\b(?:File|IO)\.(?:write|binwrite|open)\b|\bln\b",
     re.IGNORECASE,
 )
 # NODE_OPTIONS flags that load code or open a remote-control channel. Anything

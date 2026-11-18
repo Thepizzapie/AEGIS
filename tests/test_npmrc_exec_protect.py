@@ -293,3 +293,34 @@ def test_redos_bounded():
     _hit(_shell("echo " + "script-shell=" * 5000 + " >> .npmrc"))
     _hit(_shell("npm config set " + "a " * 5000))
     assert time.monotonic() - t < 3.0
+
+
+# ---- hardening regressions ------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "npm --location=project config set script-shell ./x",
+    "npm -g config set script-shell ./x",
+    "npm --global set script-shell ./x",
+    "npm --userconfig ./rc config set node-options '--require ./h.js'",
+])
+def test_cli_global_flags_before_subcommand(cmd):
+    assert _rule(_shell(cmd)) == (RULE, Action.ASK), cmd
+
+
+def test_node_gyp_key_and_ads_path():
+    assert _rule(_write(".npmrc", "node-gyp=./evil.js\n")) == (RULE, Action.ASK)
+    assert _rule(_write(".npmrc::$DATA", "script-shell=./x\n")) == (RULE, Action.ASK)
+
+
+@pytest.mark.parametrize("content", [
+    "catalog:\n  git: ^2.0.0\n",
+    "overrides:\n  shell: 1.2.3\n",
+    "packageExtensions:\n  foo:\n    dependencies:\n      shell: ^1\n",
+    "  scriptShell: ./nested-not-a-setting\n",
+])
+def test_pnpm_workspace_nested_package_names_allowed(content):
+    assert _hit(_write("pnpm-workspace.yaml", content)) is None
+
+
+def test_interpreter_writes_caught():
+    assert _rule(_shell("python3 -c \"open('.npmrc','a').write('script-shell=./x\\n')\"")) == (RULE, Action.ASK)
+    assert _rule(_shell("node -e \"require('fs').appendFileSync('.npmrc','script-shell=./x')\"")) == (RULE, Action.ASK)
