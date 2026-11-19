@@ -288,6 +288,9 @@ class Policy:
     # silences VS Code's one-time confirmation prompt for the former). See
     # rules.rule_vscode_tasks_protect.
     vscode_tasks_exec: dict = field(default_factory=dict)
+    # Exec-bearing VS Code settings (git.path, php.validate.executablePath,
+    # terminal profiles/env, ...). See rules.rule_vscode_settings_exec_protect.
+    vscode_settings_exec: dict = field(default_factory=dict)
     # JetBrains File Watcher auto-exec protection: {mode: deny|ask|monitor|
     # off, allow: [regex on path/command]}. Empty -> defaults (mode=ask)
     # apply. Covers .idea/watcherTasks.xml carrying a File Watcher task's
