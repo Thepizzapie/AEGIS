@@ -826,3 +826,36 @@ def test_qa6_head_restore_from_subdir(tmp_path):
     assert _hit(_shell(cmd, tmp_path)) is None
     assert _rule(_shell(cmd, sub)) == (RULE, Action.ASK)
     assert _hit(_shell("git show HEAD:./.vscode/settings.json > .vscode/settings.json", sub)) is None
+
+
+# ---- QA round 7 regressions ----------------------------------------------------------
+def test_qa7_git_option_run_not_exponential(tmp_path):
+    import time
+    (tmp_path / ".git").mkdir()
+    t = time.monotonic()
+    _hit(_shell("git " + "-c " * 60 + "x > .vscode/settings.json", tmp_path))
+    _hit(_shell("git " + "-c " * 5000 + "x > .vscode/settings.json", tmp_path))
+    assert time.monotonic() - t < 1.0
+
+
+@pytest.mark.parametrize("cmd", [
+    "git --git-dir=/tmp/e.git show HEAD:.vscode/settings.json > .vscode/settings.json",
+    "git --work-tree=. --git-dir=/tmp/e.git show @:.vscode/settings.json | tee .vscode/settings.json",
+    "git --git-dir=/tmp/e.git --work-tree=. checkout HEAD -- .vscode/settings.json",
+    "git --git-dir=/tmp/e.git --work-tree=. restore .vscode/settings.json",
+    "GIT_DIR=/tmp/e.git git checkout -- .vscode/settings.json",
+    "cd sub && git show HEAD:.vscode/settings.json > .vscode/settings.json",
+])
+def test_qa7_foreign_repo_and_cd(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _rule(_shell(cmd, tmp_path))[1] in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git --no-pager show HEAD:.vscode/settings.json > .vscode/settings.json",
+    "git -c color.ui=never show HEAD:.vscode/settings.json > .vscode/settings.json",
+    "git checkout -- .vscode/settings.json",
+])
+def test_qa7_restore_still_benign(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _hit(_shell(cmd, tmp_path)) is None

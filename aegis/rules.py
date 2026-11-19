@@ -6507,17 +6507,28 @@ _VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|
 _VSC_OPAQUE_RE = re.compile(
     r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
     r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)"
-    r"|git\s+(?:(?:-c\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*(?:show\s+(?:-\S+\s+)*\S+|cat-file|archive)"
+    r"|git\s+(?:(?:-c\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+)*(?:show\s+(?:-\S+\s+)*\S+|cat-file|archive)"
     r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
     re.IGNORECASE,
 )
 _VSC_IMPLICIT_WRITE_RE = re.compile(
     # another revision (`git checkout evil -- f`, `git restore -s evil f`);
     # restoring from HEAD/the index is not new content.
-    r"\bgit\s+(?:(?:-c\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*checkout\s+(?:-\w+\s+)*(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
+    r"\bgit\s+(?:(?:-c\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+)*checkout\s+(?:-\w+\s+)*(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
     r"|\bgit\s+restore\b[^;&|\n]*(?:--source|\s-s\b)"
     r"|\b(?:bs)?tar\s+-?\w*x\w*\b"
     r"|\bunzip\b|\b7z\s+[xe]\b",
+    re.IGNORECASE,
+)
+# Reading from ANOTHER repository (`--git-dir=`, `GIT_DIR=`, ...) is never a
+# restore of this one's committed content.
+_VSC_FOREIGN_REPO_RE = re.compile(
+    # Bounded gaps: an unbounded `[^;&|\n]*` after every `git` on one long
+    # line is quadratic.
+    r"\bgit\s(?:[^;&|\n]{0,300}?\s)?--(?:git-dir|work-tree|namespace|exec-path)\b"
+    r"[^;&|\n]{0,300}?\b(?:checkout|restore|show)\b"
+    r"|\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE)="
+    r"[^;&|\n]{0,300}?\bgit\s[^;&|\n]{0,300}?\b(?:checkout|restore|show)\b",
     re.IGNORECASE,
 )
 _VSC_PRINTF_ESC_RE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|0?([0-7]{1,3}))")
@@ -6579,7 +6590,8 @@ def _vsc_opaque_variants(raw: str) -> list:
 
 
 _VSC_GIT_RESTORE_RE = re.compile(
-    r"^\s*git\s+(?:(?:-c\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*show\s+(?:HEAD|@)?:([^\s;&|<>]+)"
+    r"^\s*git\s+(?:(?:--no-pager|-P|--no-replace-objects|-c\s+(?!core\.|include|alias)[\w.-]+=\S*)\s+)*"
+    r"show\s+(?:HEAD|@)?:([^\s;&|<>]+)"
     r"\s*(?:>\|?|\|\s*tee)\s*([^\s;&|<>]+)\s*$")
 
 
@@ -6589,7 +6601,7 @@ def _vsc_is_head_restore(seg: str, cwd=None) -> bool:
     the redirect cwd-relative, so outside the repo root only the
     cwd-relative ``HEAD:./f`` form counts."""
     m = _VSC_GIT_RESTORE_RE.match(seg)
-    if not m:
+    if not m or _VSC_FOREIGN_REPO_RE.search(seg):
         return False
     if (cwd and not m.group(1).startswith("./")
             and not os.path.exists(os.path.join(str(cwd), ".git"))):
@@ -6604,6 +6616,8 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     per `;`/`&&`/`||`/newline segment (pipes stay in one segment). A
     producer in one segment staged into a settings file by a copy/move in
     another (`curl .. > /tmp/s; mv /tmp/s .vscode/settings.json`) counts."""
+    # A `cd`/`pushd` anywhere changes what a cwd-relative restore writes.
+    chdir = bool(re.search(r"\b(?:cd|pushd|chdir|set-location|sl)\b", raw[:200000], re.IGNORECASE))
     for v in _vsc_opaque_variants(raw):
         segs = _VSC_SEGMENT_SPLIT_RE.split(v)
         producer = None
@@ -6612,13 +6626,13 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
             spaced = re.sub(r"[<>|]", " ", seg)   # `>.vscode/settings.json`
             hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(spaced)
                        or (dir_dest and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(spaced)))
-            m = _VSC_IMPLICIT_WRITE_RE.search(seg)
+            m = _VSC_IMPLICIT_WRITE_RE.search(seg) or _VSC_FOREIGN_REPO_RE.search(seg)
             if m and not _VSC_LISTING_RE.search(seg):
                 if hit:
                     return [("<opaque write>", m.group(0))]
                 producer = producer or m.group(0)
             m = _VSC_OPAQUE_RE.search(seg)
-            if m and _vsc_is_head_restore(seg, cwd):
+            if m and not chdir and _vsc_is_head_restore(seg, cwd):
                 m = None
             if m:
                 if hit and (_vsc_sink_is_settings(seg, dir_dest)
@@ -6704,6 +6718,19 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
     if not found and patterns.NPMRC_INPLACE_EDITOR_RE.search(cmd):
         found = _vsc_inplace_findings(ev, raw)
     return found
+
+
+_VSC_SHELL_HINT_RE = re.compile(r"settings|code-workspace|devcontainer|vscode", re.IGNORECASE)
+_VSC_SHELL_ENCODED_RE = re.compile(r"\\[xX0-7]|base64|frombase64|-e(?:nc(?:odedcommand)?)?\s|\$'|\$\(|`")
+
+
+def _vsc_shell_may_touch(raw: str) -> bool:
+    """Cheap pre-filter before the shared (costly) scan surface: a command
+    that never names a settings file -- even with quotes/backslashes
+    removed -- and carries no encoded/computed part can't plant one."""
+    if _VSC_SHELL_ENCODED_RE.search(raw):
+        return True
+    return bool(_VSC_SHELL_HINT_RE.search(re.sub(r"[\"'\\\s]", "", raw[:_NPMRC_MAX_FILE])))
 
 
 def _vscode_settings_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
@@ -6828,7 +6855,8 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     ``/usr/local/bin`` and ``/opt/homebrew/bin`` are not exempt (asks) --
     except image paths (``/usr/local/{bin,py-utils/bin,python}``) inside a
     devcontainer's settings; very large or complex content (over 20k text
-    keys, 100k leaves, or the 4 MiB decode budget, e.g. a >1.5 MB heredoc)
+    keys, 100k leaves, the 4 MiB decode budget, e.g. a >1.5 MB heredoc, or
+    JSONC -- comments/trailing commas -- over 2 MiB)
     fails closed to ASK; a download/decode in one segment plus an unrelated
     redirect into settings in another asks (staging heuristic); ``git
     apply``/``patch``/``stash pop``/``git -C``, ``tar -C .vscode -x`` and
@@ -6906,7 +6934,15 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     (``--no-pager``, ``-c k=v``) before ``show``/``checkout``, and a
     ``HEAD:f > f`` restore run from a subdirectory (a different file).
     Plain JSON is now parsed without stripping, and JSONC over 2 MiB is not
-    tokenized: the text fallback fails closed (ASK) on it instead."""
+    tokenized: the text fallback fails closed (ASK) on it instead. Round 7
+    (verification) found the new git global-option group backtracked
+    exponentially on a run of ``-c`` tokens (alternatives now disjoint), and
+    that ``--git-dir=``/``GIT_DIR=`` let another repository's HEAD pass the
+    restore exemption (foreign-repo reads now always count as opaque writes;
+    the restore form accepts only content-neutral globals, and never after
+    a ``cd``). Shell commands that name no settings file (quotes and
+    backslashes removed) and carry no encoded/computed part now skip the
+    shared scan surface entirely (a cheap pre-filter)."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -6949,6 +6985,8 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
 
     if _is_shell(ev):
         raw = _cmd(ev)
+        if not _vsc_shell_may_touch(raw):
+            return None
         cmd = _shell_scan(ev)
         try:
             found = _vsc_shell_findings(ev, raw, cmd)
