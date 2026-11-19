@@ -1022,3 +1022,32 @@ def test_qa11_glued_and_show_flags(cmd, tmp_path):
 def test_qa11_benign(cmd, tmp_path):
     (tmp_path / ".git").mkdir()
     assert _hit(_shell(cmd, tmp_path)) is None
+
+
+# ---- QA round 12 regressions ---------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "git checkout @{u} -- .vscode/settings.json",
+    "git checkout @{-1} -- .vscode/settings.json",
+    "git checkout @{1} -- .vscode/settings.json",
+    "git checkout @{push} .vscode/settings.json",
+    "git -c a=b checkout -q @{u} -- .vscode/settings.json",
+    "git show @{u}:.vscode/settings.json > .vscode/settings.json",
+    "set -a; : ${GIT_DIR:=/evil}; git checkout -- .vscode/settings.json",
+    "set -a; : ${GIT_DIR=/evil}; git show HEAD:.vscode/settings.json > .vscode/settings.json",
+    'env --unset=PAGER GIT_DIR=/evil sh -c "git status; git show HEAD:.vscode/settings.json > .vscode/settings.json"',
+    "export unset=1 GIT_DIR=/evil; git checkout -- .vscode/settings.json",
+    "(git checkout -q evil -- .vscode/settings.json)",
+], ids=lambda c: c[:40])
+def test_qa12_revisions_and_env(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _rule(_shell(cmd, tmp_path))[1] in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "unset GIT_DIR GIT_WORK_TREE; git checkout -- .vscode/settings.json",
+    "unset -v GIT_DIR && git restore .vscode/settings.json",
+    "echo ${GIT_DIR}; git checkout -- .vscode/settings.json",
+])
+def test_qa12_benign(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _hit(_shell(cmd, tmp_path)) is None

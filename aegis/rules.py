@@ -6549,12 +6549,14 @@ def _vsc_git_norm(seg: str) -> str:
     as-is (its `--source` is matched directly)."""
     if "git" not in seg.lower():
         return seg
-    toks = re.sub(r"[()`{}!|;&]", " ", seg).split()
+    # Split only on pipes; other punctuation is trimmed from a token's ends
+    # (so revision syntax like `@{u}`/`@{-1}` inside a token survives).
+    toks = seg.replace("|", " ").split()
     out, i, n = [], 0, len(toks)
     while i < n:
         t = toks[i]
         i += 1
-        if not _VSC_GIT_TOKEN_RE.fullmatch(t.lstrip("$")):
+        if not _VSC_GIT_TOKEN_RE.fullmatch(t.lstrip("($`{!").rstrip(")`};&")):
             out.append(t)
             continue
         out.append("git")
@@ -6695,7 +6697,12 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     # variable kept missing some, so a `GIT_DIR=x git status; git restore f`
     # prefix-only use asks too (rare, recoverable).
     # (`unset GIT_DIR`, `$GIT_DIR`/`${GIT_DIR}`/`%GIT_DIR%` reads don't set it.)
-    _env_text = re.sub(r"\bunset\b[^;&|\n]*|\$\{?GIT_\w+\}?|%GIT_\w+%", " ", raw[:200000])
+    # Only pure reads (`$GIT_DIR`, `${GIT_DIR}`, `%GIT_DIR%`) and an `unset`
+    # command's own name list are dropped -- `${GIT_DIR:=x}` assigns.
+    _env_text = re.sub(
+        r"(?:^|(?<=[;&|\n(]))\s*unset(?:\s+-[fvn]+)*(?:\s+[A-Za-z_]\w*)+(?=\s*(?:$|[;&|\n)]))"
+        r"|\$GIT_\w+(?![\w{])|\$\{GIT_\w+\}|%GIT_\w+%",
+        " ", raw[:200000])
     foreign_env = bool(_VSC_FOREIGN_ENV_RE.search(_env_text))
     for v in _vsc_opaque_variants(raw):
         segs = _VSC_SEGMENT_SPLIT_RE.split(v)
@@ -6971,8 +6978,9 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     forms are not matched; and JetBrains/Zed/Neovim settings are other
     surfaces.
 
-    QA history (three independent reviews -- design/false-positive,
-    coverage, and robustness -- matching this codebase's process): round 1
+    QA history (twelve independent review rounds -- design/false-positive,
+    coverage and robustness first, then verification passes over each round
+    of fixes -- matching this codebase's process): round 1
     found a leaf-cap padding bypass (now fails closed), a quadratic text
     fallback (now span-skipping with a decode budget that fails closed), the
     ``task.allowAutomaticTasks`` ownership split dropping forms the tasks
@@ -7070,7 +7078,12 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     value (option values are now per subcommand; punctuation is split off;
     ``git.EXE`` matches case-insensitively); ``unset GIT_DIR`` and
     ``$GIT_DIR`` reads no longer count as assignments; ``--conflict`` takes
-    a value."""
+    a value. Round 12 (verification) found that punctuation split broke
+    ``@{u}``/``@{-1}`` revisions (now only pipes split; other punctuation is
+    trimmed from token ends), that the read-stripping ate
+    ``${GIT_DIR:=x}`` assignments (only pure ``$X``/``${X}`` reads are
+    dropped now), and that ``unset`` stripping ran to the segment end and
+    matched ``--unset=`` (now only an ``unset`` command's name list)."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
