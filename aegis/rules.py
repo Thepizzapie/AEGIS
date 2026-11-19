@@ -5798,6 +5798,579 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+_VSC_MAX_LEAVES = 20000
+_VSC_COSMETIC = frozenset(("icon", "color", "overridename", "hidden", "source", "istransient"))
+_VSC_SAFE_SYSTEM_RE = re.compile(
+    r"/(?:usr/)?s?bin/[\w.+-]{1,100}"
+    r"|[a-z]:[\\/]+(?:windows[\\/]+system32|program files(?: \(x86\))?)[\\/][^\"'\n]{1,200}",
+    re.IGNORECASE,
+)
+_VSC_BARE_RE = re.compile(r"[A-Za-z0-9][\w.+-]{0,100}")
+_VSC_SCRIPT_EXT_RE = re.compile(
+    r"\.(?:js|cjs|mjs|ts|sh|bash|zsh|py|pyw|rb|pl|ps1|psm1|bat|cmd|com|exe|vbs|jar|so|dll|dylib)$",
+    re.IGNORECASE,
+)
+_VSC_DATA_EXT_RE = re.compile(
+    r"\.(?:txt|json|jsonc|md|ya?ml|toml|xml|html?|css|dic|aff|code-snippets|csv|ini)$",
+    re.IGNORECASE,
+)
+_VSC_UNKNOWN = "<unparsed>"
+_VSC_OVERSIZE = ("<file>", "too large to inspect")
+
+
+def _vsc_strip_jsonc(text: str) -> str:
+    """JSONC -> JSON the way VS Code's own parser reads settings: drop ``//``
+    and ``/* */`` comments and trailing commas, never inside a string."""
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        elif c == "/" and text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+            continue
+        out.append(c)
+        i += 1
+    s = "".join(out)
+    # Trailing commas, string-aware second pass.
+    out, i, n, in_str = [], 0, len(s), False
+    while i < n:
+        c = s[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == ",":
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j < n and s[j] in "}]":
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _vsc_parse(text: str):
+    try:
+        obj = json.loads(_vsc_strip_jsonc(text.lstrip("\ufeff")))
+    except (ValueError, RecursionError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _vsc_leaves(obj, prefix: str = "", out=None, _depth: int = 0) -> list:
+    """Flatten a settings object to ``(dotted.key, value)`` leaves. Nested
+    objects are equivalent to dotted keys in VS Code's configuration model,
+    and a ``"[lang]"`` override block contributes its keys unprefixed."""
+    if out is None:
+        out = []
+    if _depth > 40 or len(out) > _VSC_MAX_LEAVES:
+        return out
+    if isinstance(obj, dict):
+        if not obj and prefix:
+            out.append((prefix, obj))
+        for k, v in obj.items():
+            k = str(k)
+            if k.startswith("[") and k.endswith("]"):
+                _vsc_leaves(v, prefix, out, _depth + 1)
+                continue
+            _vsc_leaves(v, f"{prefix}.{k}" if prefix else k, out, _depth + 1)
+    else:
+        out.append((prefix, obj))
+    return out
+
+
+def _vsc_path_safe(v, generic: bool = False) -> bool:
+    """A value naming a program is safe when it is unset, a bare command name
+    (resolved on PATH), or an absolute system-binary path."""
+    if v is None or isinstance(v, (bool, int, float)):
+        return True
+    if isinstance(v, list):
+        return len(v) <= 64 and all(_vsc_path_safe(x, generic) for x in v)
+    if isinstance(v, dict):
+        return all(_vsc_path_safe(x, generic) for x in list(v.values())[:64]) and len(v) <= 64
+    if not isinstance(v, str) or v == _VSC_UNKNOWN:
+        return False
+    s = v.strip()
+    if not s:
+        return True
+    if ".." in s:
+        return False
+    if _VSC_BARE_RE.fullmatch(s) and not _VSC_SCRIPT_EXT_RE.search(s):
+        return True
+    if _VSC_SAFE_SYSTEM_RE.fullmatch(s):
+        return True
+    return bool(generic and _VSC_DATA_EXT_RE.search(s))
+
+
+def _vsc_nonempty(v) -> bool:
+    return v not in (None, "", [], {}) and v is not False
+
+
+def _vsc_dangerous(key: str, v, shell_text: str = "") -> bool:
+    k = key.lower()
+    segs = k.split(".")
+    if k in patterns.VSCODE_SETTINGS_TOGGLES:
+        bad = patterns.VSCODE_SETTINGS_TOGGLES[k]
+        if v == _VSC_UNKNOWN:
+            low = shell_text.lower()
+            return any((re.search(r"\b" + re.escape(str(b).lower()) + r"\b", low)
+                        if isinstance(b, str) else
+                        re.search(r"\b" + str(b).lower() + r"\b", low)) for b in bad)
+        if isinstance(v, str):
+            return v.strip().lower() in [b for b in bad if isinstance(b, str)]
+        return any(v is b for b in bad if isinstance(b, bool))
+    orig_last = key.split(".")[-1]
+    if (len(segs) >= 2 and any(s in patterns.VSCODE_ENV_CONTAINER_SEG for s in segs[:-1])
+            and patterns.VSCODE_DANGEROUS_ENV_RE.match(orig_last)):
+        return _vsc_nonempty(v)
+    if patterns.VSCODE_EXEC_STRUCT_KEY_RE.match(k):
+        last = segs[-1]
+        if last in _VSC_COSMETIC:
+            return False
+        if "args" in last or k.startswith("terminal.integrated.shellargs"):
+            return _vsc_nonempty(v)
+        return not _vsc_path_safe(v)
+    if patterns.VSCODE_EXEC_PATH_KEY_RE.match(k):
+        return not _vsc_path_safe(v)
+    if patterns.VSCODE_EXEC_PATH_SUFFIX_RE.search(k):
+        return not _vsc_path_safe(v, generic=True)
+    return False
+
+
+def _vsc_rep(v) -> str:
+    try:
+        return json.dumps(v, sort_keys=True)[:200]
+    except (TypeError, ValueError):
+        return str(v)[:200]
+
+
+def _vsc_struct_findings(obj: dict, kind: str) -> list:
+    root = obj
+    out = []
+    if kind == "workspace":
+        root = obj.get("settings") if isinstance(obj.get("settings"), dict) else {}
+        tasks = obj.get("tasks")
+        tl = tasks.get("tasks") if isinstance(tasks, dict) else None
+        for t in (tl if isinstance(tl, list) else [])[:256]:
+            ro = t.get("runOptions") if isinstance(t, dict) else None
+            if (isinstance(ro, dict) and isinstance(ro.get("runOn"), str)
+                    and ro["runOn"].strip().lower() == "folderopen"):
+                out.append(("tasks.runoptions.runon",
+                            _vsc_rep({"label": t.get("label"), "command": t.get("command")})))
+    for k, v in _vsc_leaves(root):
+        if k and _vsc_dangerous(k, v):
+            out.append((k.lower(), _vsc_rep(v)))
+    return out
+
+
+def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
+    """Regex fallback for text that isn't a parseable JSONC document (an Edit
+    fragment, a shell heredoc/echo): every quoted ``"key":`` is classified
+    with the JSON value that follows it (decoded with ``raw_decode``; an
+    object value is flattened under the key). A value that can't be decoded
+    counts as unknown -- dangerous for an exec key."""
+    text = _claude_env_normalize(text) if "\\u" in text else text
+    dec = json.JSONDecoder()
+    seen, out = set(), []
+
+    def _add(k, v):
+        if k and _vsc_dangerous(k, v, text):
+            f = (k.lower(), _vsc_rep(v))
+            if f not in seen:
+                seen.add(f)
+                out.append(f)
+
+    keyed = list(patterns.VSCODE_SETTINGS_KEY_TEXT_RE.finditer(text))
+    if shell:
+        keyed += list(re.finditer(r"(?:^|[{,\s])([A-Za-z_][\w./-]{0,300})\s*:(?!//)", text))
+    for m in keyed[:4096]:
+        key = m.group(1)
+        if kind == "workspace" and key.lower().startswith("settings."):
+            key = key[9:]
+        j = m.end()
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        try:
+            val, _ = dec.raw_decode(text, j)
+        except (ValueError, RecursionError):
+            val = _VSC_UNKNOWN
+            if shell:
+                # De-quoted shell surface (`{git.path: git}`): the value is
+                # the bare token up to the next delimiter.
+                bm = re.match(r"[^\s,}{\[\]\"';&|]{1,400}", text[j:j + 400])
+                if bm and not text.startswith(("{", "["), j):
+                    val = bm.group(0)
+        if key == "settings" and kind == "workspace" and isinstance(val, dict):
+            for k2, v2 in _vsc_leaves(val):
+                _add(k2, v2)
+            continue
+        if isinstance(val, dict):
+            for k2, v2 in _vsc_leaves(val, key):
+                _add(k2, v2)
+            if not val:
+                _add(key, val)
+            continue
+        _add(key, val)
+        # A dangerous env var as a bare key in a fragment (its env-map
+        # container is outside the fragment).
+        if key.isupper() and patterns.VSCODE_DANGEROUS_ENV_RE.match(key) and _vsc_nonempty(val):
+            f = ("<env>." + key, _vsc_rep(val))
+            if f not in seen:
+                seen.add(f)
+                out.append(f)
+    if kind == "workspace" and patterns.VSCODE_TASKS_RUNON_RE.search(text):
+        out.append(("tasks.runoptions.runon", '"folderOpen"'))
+    return out
+
+
+def _vsc_findings(text: str, kind: str) -> list:
+    if len(text) > _NPMRC_MAX_FILE:
+        return [_VSC_OVERSIZE]
+    obj = _vsc_parse(text)
+    if obj is None:
+        return _vsc_text_findings(text, kind)
+    return _vsc_struct_findings(obj, kind)
+
+
+def _vsc_kind(p: str) -> str:
+    return "workspace" if patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(p) else "settings"
+
+
+def _vsc_new_findings(ev: Event, p: str) -> list:
+    """Dangerous settings the Edit/Write/MCP call would ADD to ``p``: the
+    post-change file's findings minus those already on disk (multiset)."""
+    a = ev.args or {}
+    kind = _vsc_kind(p)
+    before = _npmrc_read(ev, p)
+    if before is None:
+        fp = _npmrc_resolve(ev, p)
+        try:
+            if fp and os.path.isfile(fp) and os.path.getsize(fp) > _NPMRC_MAX_FILE:
+                return [_VSC_OVERSIZE]
+        except Exception:
+            pass
+    content = a.get("content")
+    if not isinstance(content, str):
+        content = a.get("contents") if isinstance(a.get("contents"), str) else a.get("text")
+    edits = _npmrc_edit_list(a)
+    after = None
+    fragment = False
+    if isinstance(content, str) and not edits:
+        after = content
+    elif edits:
+        if before is not None:
+            after = _npmrc_apply_edits(before, edits)
+        if after is None:
+            before = None
+            after = "\n".join(n for _, n, _ in edits)
+            fragment = True
+    if after is None:
+        after = "\n".join(_flatten_strings(a))
+        before = None
+        fragment = True
+    if len(after) > _NPMRC_MAX_FILE:
+        return [_VSC_OVERSIZE]
+    if fragment:
+        return _vsc_text_findings(after, kind)
+    after_obj = _vsc_parse(after)
+    before_obj = _vsc_parse(before) if before is not None else None
+    if after_obj is not None and (before is None or before_obj is not None):
+        new = _vsc_struct_findings(after_obj, kind)
+        old = _vsc_struct_findings(before_obj, kind) if before_obj is not None else []
+    else:
+        # Either side unparseable: compare both in the same (text) mode so the
+        # finding shapes line up.
+        new = _vsc_text_findings(after, kind)
+        old = _vsc_text_findings(before, kind) if before is not None else []
+    added = []
+    for f in new:
+        if f in old:
+            old.remove(f)
+        else:
+            added.append(f)
+    return added
+
+
+def _vsc_jq_findings(cmd: str) -> list:
+    """Keys a jq/yq assignment names: ``.["git.path"]``, ``.git.path``,
+    ``."terminal.integrated.env.linux".LD_PRELOAD``. The value is not
+    evaluated (unknown), so any exec key asks; a toggle asks only when its
+    dangerous value appears in the same command."""
+    if not (patterns.VSCODE_SETTINGS_JQ_ANY_RE.search(cmd)
+            and re.search(patterns._VSCODE_JQ_ASSIGN_OP, cmd)):
+        return []
+    out = []
+    # Whole jq paths (`.a.b["c.d"].e`) joined into one dotted key, plus each
+    # quoted string on its own.
+    for m in re.finditer(r"(?:\.(?:\[\s*)?(?:\"[^\"\n]{1,300}\"|'[^'\n]{1,300}'|[A-Za-z_][\w-]*)(?:\s*\])?)+", cmd):
+        parts = re.findall(r"\"([^\"\n]{1,300})\"|'([^'\n]{1,300})'|([A-Za-z_][\w-]*)", m.group(0))
+        key = ".".join(a or b or c for a, b, c in parts)
+        for cand in {key, (parts[-1][0] or parts[-1][1] or parts[-1][2]) if parts else ""}:
+            if cand and (_vsc_dangerous(cand, _VSC_UNKNOWN, cmd)
+                         or (cand.isupper() and patterns.VSCODE_DANGEROUS_ENV_RE.match(cand))):
+                out.append((cand.lower(), "<jq>"))
+    return out
+
+
+def _vsc_shell_source_findings(ev: Event, raw: str) -> list:
+    """A settings file copied/concatenated in from elsewhere (`cp x.json
+    .vscode/settings.json`, `cat x > ...`): read each existing regular file
+    the command names and judge it in both settings shapes."""
+    try:
+        toks = shlex.split(raw, posix=True)
+    except ValueError:
+        toks = raw.split()
+    out, seen = [], 0
+    for t in toks[:256]:
+        t = t.lstrip("<>")
+        if not t or t.startswith("-") or len(t) > 4096 or seen >= _NPMRC_MAX_SOURCES:
+            continue
+        if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + t) and not re.search(
+                r"\b(?:cp|copy|copy-item|cpi|install|ln|mv|move|rsync|cat|tee|dd)\b", raw):
+            continue
+        txt = _npmrc_read(ev, t)
+        if txt is None:
+            continue
+        seen += 1
+        if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + t):
+            # The destination itself: only what it ALREADY holds is not new.
+            continue
+        for kind in ("settings", "workspace"):
+            out.extend(f for f in _vsc_findings(txt, kind) if f != _VSC_OVERSIZE)
+    return out
+
+
+def _vsc_inplace_findings(ev: Event, raw: str) -> list:
+    """`sed -i 's#/usr/bin/git#./x#' .vscode/settings.json` rewrites only a
+    VALUE; ask when the in-place target already holds an exec-bearing key."""
+    try:
+        toks = shlex.split(raw, posix=True)
+    except ValueError:
+        toks = raw.split()
+    for t in toks[:256]:
+        if not patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + t):
+            continue
+        txt = _npmrc_read(ev, t)
+        if not txt:
+            continue
+        obj = _vsc_parse(txt)
+        kind = _vsc_kind(t)
+        leaves = _vsc_leaves((obj.get("settings") if kind == "workspace" and obj else obj) or {})
+        if any(_vsc_dangerous(k, _VSC_UNKNOWN) for k, _ in leaves) or (
+                obj is None and _vsc_text_findings(txt, kind)):
+            return [("<in-place edit>", t)]
+    return []
+
+
+def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
+    path_hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(cmd)
+                    or (patterns.VSCODE_CD_RE.search(cmd)
+                        and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd)))
+    if not path_hit:
+        return []
+    kind = "workspace" if patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(cmd) else "settings"
+    write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                      or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                      or patterns.INPLACE_WRITE_RE.search(cmd)
+                      or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                      or patterns.COPY_WRITE_VERB_RE.search(cmd)
+                      or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd)
+                      or patterns.NPMRC_EXTRA_WRITE_RE.search(cmd))
+    found = _vsc_jq_findings(cmd)
+    if found or not write_verb:
+        return found
+    surface = cmd + "\n" + re.sub(r"\\+([\"'])", r"\1", cmd)
+    found = _vsc_text_findings(surface, kind, shell=True)
+    # A shell-written settings value that is itself the settings path is a
+    # read, not a payload.
+    found = [f for f in found if not patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + f[1].strip('"'))]
+    if not found:
+        found = _vsc_shell_source_findings(ev, raw)
+    if not found and patterns.NPMRC_INPLACE_EDITOR_RE.search(cmd):
+        found = _vsc_inplace_findings(ev, raw)
+    return found
+
+
+def _vscode_settings_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _vsc_owned_by_tasks_guard(text: str, found: list) -> list:
+    """``task.allowAutomaticTasks`` in ``.vscode/settings.json`` is
+    `rule_vscode_tasks_protect`'s finding (and escape hatch); keep it here
+    only for the .code-workspace / user-settings files that guard doesn't
+    cover."""
+    if (patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(text)
+            or patterns.VSCODE_USER_SETTINGS_PATH_RE.search(text)):
+        return found
+    return [f for f in found if f[0] != "task.allowautomatictasks"]
+
+
+def _vsc_describe(found: list) -> str:
+    return ", ".join(f"{k}={v!s:.60}" for k, v in found[:3])
+
+
+def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a VS Code (or fork: Cursor, Windsurf, VSCodium,
+    Positron) setting that names a program the editor or a stock extension
+    spawns on its own -- in ``.vscode/settings.json``, a ``*.code-workspace``
+    file's ``"settings"``, or a per-user / per-profile / remote-server
+    ``settings.json``.
+
+    THREAT MODEL ("IDEsaster" class): a prompt-injected coding agent edits
+    workspace settings so the IDE runs an attacker file the moment the folder
+    is (re)opened or a file is saved -- ``php.validate.executablePath:
+    "./x"`` (PHP validation runs on file open), ``git.path`` (the Git
+    extension spawns it on folder open), ``python.defaultInterpreterPath``
+    (the Python extension execs the interpreter to discover environments),
+    ``eslint.runtime``/``typescript.tsserver.nodePath``, rust-analyzer's
+    ``check.overrideCommand`` (on every save), ``jest.jestCommandLine``, a
+    ``terminal.integrated.profiles.*`` path/args or legacy ``shell``/
+    ``shellArgs`` (every new terminal -- including the agent's own in an
+    agentic IDE), or a ``terminal.integrated.env.<os>`` / ``*.extraEnv`` /
+    ``*.toolsEnvVars`` map carrying ``LD_PRELOAD``/``NODE_OPTIONS``/
+    ``BASH_ENV``/``PATH``/``GIT_SSH_COMMAND``/... Toggles that remove the
+    human checkpoint are gated too: ``security.workspace.trust.enabled:
+    false``, ``terminal.integrated.allowWorkspaceConfiguration: true``,
+    ``task.allowAutomaticTasks: "on"``, and (in a ``.code-workspace``) a
+    ``runOn: "folderOpen"`` task -- the multi-root gap
+    `rule_vscode_tasks_protect` disclosed. Workspace settings are routinely
+    committed and read as harmless editor preferences in review; user-scope
+    settings are never subject to Workspace Trust at all. Nothing here is a
+    ``tasks.json`` task, so `rule_vscode_tasks_protect` never saw it.
+
+    Content-gated with narrowing, judged by what a call ADDS (the
+    post-change file, with Edit/MultiEdit/MCP edits applied to the on-disk
+    file, minus findings already on disk), so re-saving a reviewed setting
+    doesn't re-ask. Settings are parsed as JSONC (comments, trailing
+    commas, BOM); nested objects and ``"[lang]"`` override blocks are
+    flattened to dotted keys the way VS Code's configuration model does.
+    An executable-path value is exempt when unset, a bare command name
+    (``"git"``, ``"python3"``; not a bare script file like ``x.sh``), or an
+    absolute system-binary path (``/usr/bin``, ``/bin``, ``/sbin``,
+    ``C:\\Program Files``, ``C:\\Windows\\System32``) with no ``..``;
+    anything relative, ``${workspaceFolder}``-based, ``~``, or elsewhere
+    asks. Long-tail extension keys are recognised by their naming
+    convention (``*.path``, ``*ExecutablePath``, ``*InterpreterPath``,
+    ``*NodePath``, ``*ServerPath``, ``*CommandLine``, ``tool.toolPath``),
+    where a data-file value (``.txt``/``.json``/``.dic``/...) is also exempt.
+    Unparseable content falls back to a quoted-key scan with
+    ``raw_decode`` values (a value it can't decode is unknown: asks).
+    Shell: a settings path plus a write verb and a dangerous key in the
+    command text, a jq/yq assignment naming one, a copied-in source file
+    that holds one, or an in-place editor (``sed -i``) on a settings file
+    that already holds an exec key.
+
+    Config (``policy.vscode_settings_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command). Escapable only by
+    a human: '# aegis-allow' on the shell form, or
+    ``AEGIS_ALLOW_VSCODE_SETTINGS_EXEC=1`` set before launch.
+
+    Honest scope: a denylist of known exec-bearing keys -- an extension's
+    setting that spawns a program under an unrecognised name is missed; a
+    bare command name is trusted to resolve on PATH (PATH itself is
+    `rule_path_hijack_protect`'s surface); ``/usr/local/bin`` and
+    ``/opt/homebrew/bin`` are not exempt (asks); a value assembled
+    indirectly (a script that writes the JSON, a Python ``json.dump``) is
+    not caught; an Edit fragment whose env-map container lies outside the
+    fragment is caught only for a bare upper-case dangerous variable key
+    when the on-disk file can't be read; ``PYTHONPATH``/``NODE_PATH`` are
+    not on the env list (too common in benign settings);
+    ``typescript.tsdk`` is excluded (VS Code itself prompts before using a
+    workspace TypeScript); and JetBrains/Zed/Neovim settings are other
+    surfaces."""
+    cfg = getattr(policy, "vscode_settings_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "vscode-settings-exec-protect-monitor")
+            return None
+        return would
+
+    tail = ("— VS Code (or Cursor/Windsurf/VSCodium) and its extensions run "
+            "it on their own, the next time the folder is opened, a file is "
+            "opened or saved, or a terminal starts. ")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if not p or not patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(p):
+            return None
+        try:
+            found = _vsc_new_findings(ev, p)
+        except Exception:
+            found = [("<file>", "could not be inspected")]
+        found = _vsc_owned_by_tasks_guard(p, found)
+        if not found:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_VSCODE_SETTINGS_EXEC")
+                or _vscode_settings_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "vscode-settings-exec-protect",
+                         f"'{p}' gains an exec-bearing editor setting "
+                         f"({_vsc_describe(found)}) " + tail
+                         + "Review the change, then confirm with "
+                         "AEGIS_ALLOW_VSCODE_SETTINGS_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        raw = _cmd(ev)
+        cmd = _shell_scan(ev)
+        try:
+            found = _vsc_shell_findings(ev, raw, cmd)
+        except Exception:
+            found = ([("<command>", "could not be inspected")]
+                     if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(cmd) else [])
+        found = _vsc_owned_by_tasks_guard(cmd, found)
+        if not found:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_VSCODE_SETTINGS_EXEC")
+                or _vscode_settings_exec_allowed_by_policy(cfg, raw)):
+            return None
+        return _finish(Decision(action, "vscode-settings-exec-protect",
+                         "An exec-bearing editor setting is being written to a "
+                         f"VS Code settings file from a shell ({_vsc_describe(found)}) "
+                         + tail + "A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_VSCODE_SETTINGS_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 def _jetbrains_watcher_allowed_by_policy(cfg: dict, text: str) -> bool:
     for pat in (cfg.get("allow") or []):
         try:
@@ -9520,6 +10093,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
     (patterns.VSCODE_TASKS_PATH_RE, "a VS Code auto-run task config"),
     (patterns.VSCODE_SETTINGS_PATH_RE, "VS Code's task auto-run confirmation gate"),
+    (patterns.VSCODE_WORKSPACE_FILE_PATH_RE, "a VS Code multi-root .code-workspace file"),
+    (patterns.VSCODE_USER_SETTINGS_PATH_RE, "a VS Code user/profile/remote settings.json"),
     (patterns.JETBRAINS_WATCHER_PATH_RE, "a JetBrains File Watcher config"),
     (patterns.JETBRAINS_RUNCONFIG_PATH_RE, "a JetBrains run configuration"),
     (patterns.JETBRAINS_TOOLS_PATH_RE, "a JetBrains External Tools definition"),
@@ -11307,6 +11882,7 @@ _CORE_RULES = (
     # pre-empt a later DENY (destructive-delete, remote-exec, ...) on the same
     # command (QA round 1). agent_rules_protect stays last for the same reason.
     rule_npmrc_exec_protect,
+    rule_vscode_settings_exec_protect,
     rule_agent_rules_protect,
 )
 

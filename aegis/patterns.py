@@ -2932,6 +2932,105 @@ VSCODE_SETTINGS_JQ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# VS Code (and fork) settings that name a program the editor or an extension
+# spawns on its own -- see `rule_vscode_settings_exec_protect`. Three file
+# shapes carry the same settings: the workspace `.vscode/settings.json`
+# (VSCODE_SETTINGS_PATH_RE above), a multi-root `*.code-workspace` file (its
+# top-level "settings" object), and a per-user/per-profile or remote-server
+# `settings.json` (VS Code, Insiders, OSS, VSCodium, Cursor, Windsurf,
+# Positron) -- user/machine scope is never subject to Workspace Trust at all.
+VSCODE_WORKSPACE_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=])[^\s'\"/\;&|]{0,200}\.code-workspace" + _CI_END,
+    re.IGNORECASE,
+)
+VSCODE_USER_SETTINGS_PATH_RE = re.compile(
+    r"(?:(?:^|[\s'\"/\\=])(?:Code(?: - (?:Insiders|OSS))?|VSCodium|Cursor|Windsurf|Positron)"
+    + _WIN_TRIM + _SEP + r"User" + _SEP
+    + r"(?:profiles" + _SEP + r"[^/\\'\"\n]{1,200}" + _SEP + r")?"
+    + r"|(?:^|[\s'\"/\\=])\.?(?:vscode|vscodium|cursor|windsurf)-server" + _SEP + r"data"
+    + _SEP + r"(?:Machine|User)" + _SEP + r")"
+    + r"settings\.json" + _CI_END,
+    re.IGNORECASE,
+)
+VSCODE_SETTINGS_EXEC_PATH_RE = re.compile(
+    "|".join(p.pattern for p in (VSCODE_SETTINGS_PATH_RE,
+                                 VSCODE_WORKSPACE_FILE_PATH_RE,
+                                 VSCODE_USER_SETTINGS_PATH_RE)),
+    re.IGNORECASE,
+)
+
+# Settings whose VALUE is a program/command the editor or a stock extension
+# spawns without a further click (on folder open, on save, on file open, or
+# when the integrated terminal / a task starts). Matched on the FULL dotted
+# key, lower-cased, after nested-object and `[language]`-override flattening.
+VSCODE_EXEC_PATH_KEY_RE = re.compile(
+    r"^(?:git\.path"
+    r"|php\.(?:validate\.)?executablepath"
+    r"|python\.(?:defaultinterpreterpath|pythonpath|condapath|poetrypath|pipenvpath"
+    r"|pixitoolpath|interpreter)"
+    r"|python\.(?:linting|formatting|sortimports)\.\w+"
+    r"|(?:black-formatter|autopep8|pylint|flake8|mypy-type-checker|isort|ruff"
+    r"|pyright|basedpyright|debugpy)\.(?:path|interpreter)"
+    r"|typescript\.(?:tsserver\.nodepath|npm)|js/ts\.tsserver\.node\.path"
+    r"|eslint\.(?:runtime|nodepath|execargv)"
+    r"|jest\.(?:jestcommandline|shell)|vitest\.(?:commandline|nodeexecutable)"
+    r"|deno\.path|bun\.runtime"
+    r"|rust-analyzer\.(?:server\.path|check\.overridecommand"
+    r"|cargo\.buildscripts\.overridecommand|runnables\.command)"
+    r"|clangd\.path|c_cpp\.clang_format_path|cmake\.cmakepath"
+    r"|go\.(?:goroot|gopath|toolsgopath)"
+    r"|java\.(?:home|jdt\.ls\.java\.home)"
+    r"|r\.(?:rterm|rpath)\.\w+|ruby\.interpreter\.commandpath"
+    r"|powershell\.powershelladditionalexepaths(?:\.\S+)?"
+    r"|remote\.ssh\.path)$"
+)
+# Generic extension naming conventions for the same thing (the long tail of
+# third-party extensions): a last key segment that names an executable.
+VSCODE_EXEC_PATH_SUFFIX_RE = re.compile(
+    r"\.(?:path|\w*(?:executablepath|executable|exepath|interpreterpath|commandpath"
+    r"|commandline|overridecommand|nodepath|nodeexecutable|serverpath"
+    r"|binarypath|sdkpath|toolpath))$"
+    r"|^([\w-]+)\.\1path$"
+)
+# Any leaf under these keys defines a shell/command line the terminal, tasks
+# or a language extension launches (profile path/args, legacy shell/shellArgs,
+# the tasks automation shell, go.alternateTools' tool->binary map).
+VSCODE_EXEC_STRUCT_KEY_RE = re.compile(
+    r"^(?:terminal\.integrated\.(?:profiles|automationprofile|shell|shellargs"
+    r"|automationshell)|go\.alternatetools)(?:\.|$)"
+)
+# Env-injection: a dangerous variable set inside an env-like map (VS Code's
+# terminal.integrated.env.<os>, and the extension conventions *.env /
+# *.extraEnv / *.toolsEnvVars / *.environment / *.nodeEnv). Variable names
+# are compared upper-cased.
+VSCODE_ENV_CONTAINER_SEG = frozenset((
+    "env", "extraenv", "toolsenvvars", "envvars", "environment",
+    "environmentvariables", "nodeenv", "envs",
+))
+VSCODE_DANGEROUS_ENV_RE = re.compile(
+    r"^(?:BASH_ENV|ENV|NODE_OPTIONS|PERL5OPT|PERL5LIB|PERLLIB|RUBYOPT|RUBYLIB"
+    r"|PYTHONSTARTUP|PYTHONHOME|PYTHONINSPECT|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT"
+    r"|DYLD_\w+|PATH|PROMPT_COMMAND|ZDOTDIR|PS4|SHELLOPTS|BASHOPTS"
+    r"|GIT_SSH|GIT_SSH_COMMAND|GIT_EXEC_PATH|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND"
+    r"|GIT_EXTERNAL_DIFF|GIT_CONFIG_\w+|GIT_PAGER|PAGER|GIT_EDITOR|EDITOR|VISUAL"
+    r"|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|MAVEN_OPTS|GRADLE_OPTS"
+    r"|DOTNET_STARTUP_HOOKS|CORECLR_PROFILER\w*|COR_PROFILER\w*|AEGIS_\w+)$",
+    re.IGNORECASE,
+)
+# Toggles that remove the human checkpoint gating everything above.
+VSCODE_SETTINGS_TOGGLES = {
+    "task.allowautomatictasks": ("on",),
+    "security.workspace.trust.enabled": (False, "false"),
+    "terminal.integrated.allowworkspaceconfiguration": (True, "true"),
+}
+# A quoted JSON key (as text, not parsed) -- the regex fallback for content
+# that isn't parseable JSONC (an Edit fragment, a shell heredoc).
+VSCODE_SETTINGS_KEY_TEXT_RE = re.compile(
+    r"[\"']((?:[^\"'\\\n]|\\.){1,300})[\"']\s*:"
+)
+# jq-scripted edit of a settings file: `jq '.["git.path"]="./x"'`.
+VSCODE_SETTINGS_JQ_ANY_RE = re.compile(r"\b(?:jq|gojq|jaq|yq)\b", re.IGNORECASE)
+
 # JetBrains File Watchers auto-exec-on-save: `.idea/watcherTasks.xml` — the
 # "Before launch"/External-Tools family of JetBrains auto-run primitives
 # (`rule_vscode_tasks_protect`'s own docstring disclosed a JetBrains
