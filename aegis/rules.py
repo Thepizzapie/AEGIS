@@ -6512,19 +6512,53 @@ _VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|
 _VSC_OPAQUE_RE = re.compile(
     r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
     r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)"
-    r"|git\s+(?:(?:-c\s+[^\s-]\S*|--(?:git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+){0,16}(?:show\s+(?:-\S+\s+){0,16}\S+|cat-file|archive)"
+    # git options are removed by _vsc_git_norm before this runs.
+    r"|git\s+(?:show\s+\S+|cat-file|archive)"
     r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
     re.IGNORECASE,
 )
 _VSC_IMPLICIT_WRITE_RE = re.compile(
     # another revision (`git checkout evil -- f`, `git restore -s evil f`);
     # restoring from HEAD/the index is not new content.
-    r"\bgit\s+(?:(?:-c\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+){0,16}checkout\s+(?:-\w+\s+){0,16}(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
+    r"\bgit\s+checkout\s+(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
     r"|\bgit\s+restore\b[^;&|\n]*(?:--source|\s-s\b)"
     r"|\b(?:bs)?tar\s+-?\w*x\w*\b"
     r"|\bunzip\b|\b7z\s+[xe]\b",
     re.IGNORECASE,
 )
+_VSC_GIT_VALUE_OPTS = frozenset((
+    "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+    "--super-prefix", "--config-env", "--list-cmds",
+))
+_VSC_GIT_SUB_VALUE_OPTS = frozenset(("-s", "--source", "-b", "-B", "--orphan", "--format", "-U"))
+
+
+def _vsc_git_norm(seg: str) -> str:
+    """``seg`` with git's global options and the checkout/restore/show
+    options removed (token walk, no regex repetition -- any number of
+    options): `git -c a=b --no-pager checkout -q rev -- f` ->
+    `git checkout rev -- f`. `--source`/`-s` values are kept for restore."""
+    if "git" not in seg:
+        return seg
+    toks = seg.split()
+    out, i, n = [], 0, len(toks)
+    while i < n:
+        t = toks[i]
+        out.append(t)
+        i += 1
+        if t == "git" or t.endswith(("/git", "\\git", "git.exe")):
+            while i < n and toks[i].startswith("-") and toks[i] != "--":
+                o = toks[i].split("=", 1)[0]
+                i += 2 if (o in _VSC_GIT_VALUE_OPTS and "=" not in toks[i]) else 1
+            if i < n and toks[i].lower() in ("checkout", "show", "switch"):
+                out.append(toks[i])
+                i += 1
+                while i < n and toks[i].startswith("-") and toks[i] != "--":
+                    o = toks[i].split("=", 1)[0]
+                    i += 2 if (o in _VSC_GIT_SUB_VALUE_OPTS and "=" not in toks[i]) else 1
+    return " ".join(out)
+
+
 # Reading from ANOTHER repository (`--git-dir=`, `GIT_DIR=`, an exported
 # GIT_DIR, ...) is never a restore of this one's committed content. Three
 # cheap, independent searches per segment (a nested bounded regex was
@@ -6643,12 +6677,11 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     # every later git command in the same shell.
     # (A `GIT_DIR=x cmd` prefix applies to that one command only; that case
     # is _vsc_foreign_repo's own per-segment check.)
-    _gv = r"GIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE)\b"
-    foreign_env = bool(re.search(
-        r"\b(?:export|declare\s+-x|typeset\s+-x|set)\s+(?:-\w+\s+)*" + _gv
-        + r"|(?:^|[;&|\n])\s*" + _gv + r"\s*=\S*\s*(?=$|[;&\n]|\|\|)"
-        + r"|\$env:" + _gv,
-        raw[:200000], re.IGNORECASE))
+    # Any mention at all (export/declare/set -a/setx/$env:/a bare
+    # assignment statement...): enumerating the shell's ways to set a
+    # variable kept missing some, so a `GIT_DIR=x git status; git restore f`
+    # prefix-only use asks too (rare, recoverable).
+    foreign_env = bool(_VSC_FOREIGN_ENV_RE.search(raw[:200000]))
     for v in _vsc_opaque_variants(raw):
         segs = _VSC_SEGMENT_SPLIT_RE.split(v)
         producer = None
@@ -6657,7 +6690,8 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
             spaced = re.sub(r"[<>|]", " ", seg)   # `>.vscode/settings.json`
             hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(spaced)
                        or (dir_dest and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(spaced)))
-            m = _VSC_IMPLICIT_WRITE_RE.search(seg)
+            nseg = _vsc_git_norm(seg)
+            m = _VSC_IMPLICIT_WRITE_RE.search(nseg)
             fr = _vsc_foreign_repo(seg, foreign_env)
             if fr is not None:
                 if fr.group(0).lower() != "show":
@@ -6670,7 +6704,7 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
                 if hit:
                     return [("<opaque write>", m.group(0))]
                 producer = producer or m.group(0)
-            m = _VSC_OPAQUE_RE.search(seg)
+            m = _VSC_OPAQUE_RE.search(nseg)
             if m and not chdir and not foreign_env and _vsc_is_head_restore(seg, cwd):
                 m = None
             if m:
@@ -6996,7 +7030,8 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     surface strips (``.vs$""code``, cmd ``^`` carets -- it now does), the
     foreign-repo regex was n*300*300 on long lines (now three cheap
     searches), an exported ``GIT_DIR``/``GIT_INDEX_FILE`` in an earlier
-    segment escaped it (now any GIT_* assignment in the command counts),
+    segment escaped it (any mention of a GIT_* repo variable in the command
+    now counts -- see round 10),
     read-only foreign ``show``/``--show-signature`` false positives (a
     foreign ``show`` now needs a settings sink), and a case-sensitive
     ``-c core.`` exclusion. Round 9 (verification) confirmed the
@@ -7006,7 +7041,14 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     that went quadratic (now bounded and only run when the segment names a
     settings file), a ``GIT_DIR=x cmd`` prefix wrongly treated as exported,
     space-separated ``--git-dir x`` / ``cat-file`` in the opaque check, a
-    backslash-newline inside a path word, and cmd ``^`` in copy sources."""
+    backslash-newline inside a path word, and cmd ``^`` in copy sources.
+    Round 10 (verification) found the narrowed export check missed
+    ``export FOO=1 GIT_DIR=..``/``declare -gx``/``set -a``/cmd ``set`` and
+    was quadratic, and the ``{0,16}`` option bounds let 17+ repeated
+    options through: git options are now removed by a token walk
+    (`_vsc_git_norm`, any count, linear) before matching, and any mention
+    of a repo-redirecting GIT_* variable counts as foreign (a prefix-only
+    ``GIT_DIR=x git status`` alongside a restore now asks -- accepted)."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

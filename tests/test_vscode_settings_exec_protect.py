@@ -929,7 +929,9 @@ def test_qa9_caret_copy_source(tmp_path):
     "GIT_DIR=.git git status && git checkout -- .vscode/settings.json",
 ])
 def test_qa9_prefix_assignment_not_exported(cmd):
-    assert _hit(_shell(cmd)) is None
+    # Round 10: any mention of a repo-redirecting GIT_* variable counts as
+    # foreign (enumerating export forms kept missing some) -- accepted ASK.
+    assert _rule(_shell(cmd))[1] == Action.ASK
 
 
 def test_qa9_tee_sink_perf():
@@ -939,3 +941,50 @@ def test_qa9_tee_sink_perf():
         t = time.monotonic()
         _hit(_shell(c))
         assert time.monotonic() - t < 1.5
+
+
+# ---- QA round 10 regressions ---------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "export FOO=1 GIT_DIR=/tmp/evil/.git; git checkout -- .vscode/settings.json",
+    "export FOO=1 GIT_DIR=/tmp/evil/.git; git restore .vscode/settings.json",
+    "declare -gx GIT_DIR=/tmp/e; git checkout -- .vscode/settings.json",
+    "typeset -gx GIT_DIR=/tmp/e; git checkout -- .vscode/settings.json",
+    "local -x GIT_DIR=/tmp/e; git checkout -- .vscode/settings.json",
+    "export -- GIT_DIR=/tmp/e; git checkout -- .vscode/settings.json",
+    "export 'GIT_DIR=/tmp/e'; git checkout -- .vscode/settings.json",
+    'export "GIT_DIR"=/tmp/e; git checkout -- .vscode/settings.json',
+    "set -a; GIT_DIR=/tmp/evil GIT_WORK_TREE=.; git checkout -- .vscode/settings.json",
+    "GIT_DIR=x\tGIT_WORK_TREE=.\ngit checkout -- .vscode/settings.json",
+    'set "GIT_DIR=C:\\evil" & git checkout -- .vscode/settings.json',
+    "setx GIT_DIR C:\\evil & git checkout -- .vscode/settings.json",
+    "git " + "-c a.b=1 " * 17 + "checkout evil -- .vscode/settings.json",
+    "git checkout " + "-q " * 17 + "evil -- .vscode/settings.json",
+    "git " + "-p " * 17 + "show evil:x > /tmp/s | cat; mv /tmp/s .vscode/settings.json",
+    "git " + "--no-pager " * 17 + "show evil:x > .vscode/settings.json",
+    "git " + "--no-pager " * 17 + "checkout evil -- .vscode/settings.json",
+], ids=lambda c: c[:40])
+def test_qa10_env_forms_and_option_runs(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _rule(_shell(cmd, tmp_path))[1] in (Action.ASK, Action.DENY)
+
+
+def test_qa10_option_and_export_runs_linear():
+    import time
+    for c in ("export " + "-export " * 40000 + "\n.vscode/settings.json",
+              "set " + "-set " * 10000 + "; .vscode/settings.json",
+              "git " + "-c a=b " * 40000 + "checkout x -- .vscode/settings.json",
+              "git checkout " + "-q " * 50000 + "x -- .vscode/settings.json"):
+        t = time.monotonic()
+        _hit(_shell(c))
+        assert time.monotonic() - t < 1.5, c[:30]
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout -- .vscode/settings.json",
+    "git -c color.ui=never checkout -- .vscode/settings.json",
+    "git --no-pager show HEAD:.vscode/settings.json > .vscode/settings.json",
+    "git checkout -q HEAD -- .vscode/settings.json",
+])
+def test_qa10_restores_still_benign(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _hit(_shell(cmd, tmp_path)) is None
