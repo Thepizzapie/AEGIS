@@ -7099,8 +7099,10 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     swallow a ``;``-glued ``GIT_DIR=`` statement (targets now stop at shell
     metacharacters) and that treating ``${GIT_X:-WORD}`` as a read hid
     names/assignments inside WORD -- only plain ``$X``/``${X}``/``%X%``
-    reads are exempt now (``echo ${GIT_DIR:-none}`` before a restore asks;
-    accepted)."""
+    reads are exempt now (``echo ${GIT_DIR:-none}``, ``${GIT_DIR+x}``,
+    ``${GIT_DIR:+set}`` or ``${GIT_DIR%/.git}`` before a restore ask;
+    accepted). Round 15 (verification): PASS -- no regressions,
+    differential fuzz of the stripping change found no new false-ALLOW."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
