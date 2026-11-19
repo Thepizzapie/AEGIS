@@ -2944,18 +2944,22 @@ VSCODE_WORKSPACE_FILE_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 VSCODE_USER_SETTINGS_PATH_RE = re.compile(
-    r"(?:(?:^|[\s'\"/\\=])(?:Code(?: - (?:Insiders|OSS))?|VSCodium|Cursor|Windsurf|Positron)"
+    r"(?:(?:^|[\s'\"/\\=])(?:Code(?: - (?:Insiders|OSS))?|VSCodium(?: - Insiders)?|Cursor"
+    r"|Windsurf(?: - Next)?|Positron|Trae|Kiro|Void|Antigravity|code-server|user-data)"
     + _WIN_TRIM + _SEP + r"User" + _SEP
     + r"(?:profiles" + _SEP + r"[^/\\'\"\n]{1,200}" + _SEP + r")?"
-    + r"|(?:^|[\s'\"/\\=])\.?(?:vscode|vscodium|cursor|windsurf)-server" + _SEP + r"data"
-    + _SEP + r"(?:Machine|User)" + _SEP + r")"
+    + r"|(?:^|[\s'\"/\\=])\.?[\w-]{0,40}(?:vscode|vscodium|cursor|windsurf)[\w-]{0,40}"
+    r"-(?:server|remote)(?:-insiders)?" + _SEP + r"data"
+    + _SEP + r"(?:Machine|User)" + _SEP
+    + r"|(?:^|[\s'\"/\\=])code-server" + _SEP + r"Machine" + _SEP + r")"
     + r"settings\.json" + _CI_END,
     re.IGNORECASE,
 )
 VSCODE_SETTINGS_EXEC_PATH_RE = re.compile(
     "|".join(p.pattern for p in (VSCODE_SETTINGS_PATH_RE,
                                  VSCODE_WORKSPACE_FILE_PATH_RE,
-                                 VSCODE_USER_SETTINGS_PATH_RE)),
+                                 VSCODE_USER_SETTINGS_PATH_RE,
+                                 DEVCONTAINER_PATH_RE)),
     re.IGNORECASE,
 )
 
@@ -2978,7 +2982,11 @@ VSCODE_EXEC_PATH_KEY_RE = re.compile(
     r"|rust-analyzer\.(?:server\.path|check\.overridecommand"
     r"|cargo\.buildscripts\.overridecommand|runnables\.command)"
     r"|clangd\.path|c_cpp\.clang_format_path|c_cpp\.default\.compilerpath|cmake\.cmakepath"
-    r"|biome\.lspbin|rust-analyzer\.procmacro\.server"
+    r"|biome\.lspbin|biome\.lsp\.bin|rust-analyzer\.procmacro\.server"
+    r"|latex-workshop\.latex\.tools\.command|emeraldwalk\.runonsave\.commands\.cmd"
+    r"|runonsave\.commands\.(?:command|cmd)|intelephense\.runtime|phpstan\.binpath"
+    r"|java\.import\.gradle\.(?:java\.)?home|java\.configuration\.runtimes\.path"
+    r"|omnisharp\.dotnetpath|ruby\.rubocop\.executepath|mcp\.servers\.[^.]+\.command"
     r"|go\.(?:goroot|gopath|toolsgopath)"
     r"|java\.(?:home|jdt\.ls\.java\.home)"
     r"|r\.(?:rterm|rpath)\.\w+|ruby\.interpreter\.commandpath"
@@ -2990,7 +2998,7 @@ VSCODE_EXEC_PATH_KEY_RE = re.compile(
 VSCODE_EXEC_PATH_SUFFIX_RE = re.compile(
     r"\.(?:path|\w*(?:executablepath|executable|exepath|interpreterpath|commandpath"
     r"|commandline|cmdline|overridecommand|nodepath|nodeexecutable|serverpath"
-    r"|binarypath|sdkpath|toolpath))$"
+    r"|binarypath|sdkpath|toolpath|binpath))$|-path$"
     r"|^([\w-]+)\.\1path$"
 )
 # Any leaf under these keys defines a shell/command line the terminal, tasks
@@ -3004,11 +3012,9 @@ VSCODE_EXEC_STRUCT_KEY_RE = re.compile(
 # terminal.integrated.env.<os>, and the extension conventions *.env /
 # *.extraEnv / *.toolsEnvVars / *.environment / *.nodeEnv). Variable names
 # are compared upper-cased.
-VSCODE_ENV_CONTAINER_SEG = frozenset((
-    "env", "extraenv", "toolsenvvars", "envvars", "environment",
-    "environmentvariables", "nodeenv", "envs", "configureenvironment",
-    "buildenvironment", "testenvironment",
-))
+VSCODE_ENV_CONTAINER_SEG_RE = re.compile(
+    r"^[\w-]{0,40}(?:env|envs|envvars|environment|environmentvariables)$"
+)
 VSCODE_DANGEROUS_ENV_RE = re.compile(
     r"^(?:BASH_ENV|(?-i:ENV)|NODE_OPTIONS|PERL5OPT|PERL5LIB|PERLLIB|RUBYOPT|RUBYLIB"
     r"|PYTHONSTARTUP|PYTHONHOME|PYTHONINSPECT|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT"
@@ -3016,7 +3022,8 @@ VSCODE_DANGEROUS_ENV_RE = re.compile(
     r"|GIT_SSH|GIT_SSH_COMMAND|GIT_EXEC_PATH|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND"
     r"|GIT_EXTERNAL_DIFF|GIT_CONFIG_\w+|GIT_PAGER|PAGER|GIT_EDITOR|EDITOR|VISUAL"
     r"|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|MAVEN_OPTS|GRADLE_OPTS"
-    r"|DOTNET_STARTUP_HOOKS|CORECLR_PROFILER\w*|COR_PROFILER\w*|AEGIS_\w+)$",
+    r"|DOTNET_STARTUP_HOOKS|CORECLR_PROFILER\w*|COR_PROFILER\w*|GOFLAGS|RUSTC_WRAPPER"
+    r"|RUSTC_WORKSPACE_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER|AEGIS_\w+)$",
     re.IGNORECASE,
 )
 # Toggles that remove the human checkpoint gating everything above.

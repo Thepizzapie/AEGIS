@@ -5800,6 +5800,7 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
 
 _VSC_MAX_LEAVES = 100000
 _VSC_DECODE_BUDGET = 4 * 1024 * 1024
+_VSC_MAX_TEXT_KEYS = 20000
 _VSC_COSMETIC = frozenset(("icon", "color", "overridename", "hidden", "source", "istransient"))
 # Root-owned system locations: a binary path, or a JDK/SDK home directory.
 # The Windows branch is path-only (no whitespace or ':' inside a segment, so
@@ -5827,7 +5828,8 @@ _VSC_RISKY_FLAGS = frozenset((
 ))
 _VSC_BARE_RE = re.compile(r"[A-Za-z0-9][\w.+-]{0,100}")
 _VSC_SCRIPT_EXT_RE = re.compile(
-    r"\.(?:js|cjs|mjs|ts|sh|bash|zsh|py|pyw|rb|pl|ps1|psm1|bat|cmd|com|exe|vbs|jar|so|dll|dylib)$",
+    r"\.(?:js|cjs|mjs|ts|sh|bash|zsh|py|pyw|pyz|pex|rb|pl|ps1|psm1|bat|cmd|com|exe|scr|vbs"
+    r"|jar|so|dll|dylib|appimage|run|bin|elf|out)$",
     re.IGNORECASE,
 )
 _VSC_DATA_EXT_RE = re.compile(
@@ -5927,6 +5929,12 @@ def _vsc_leaves(obj, prefix: str = "", out=None, _depth: int = 0) -> list:
             _vsc_leaves(v, f"{prefix}.{k}" if prefix else k, out, _depth + 1)
     else:
         out.append((prefix, obj))
+        if isinstance(obj, list):
+            # A command nested in a list of objects (`latex.tools[].command`,
+            # `runtimes[].path`) is flattened under the list's own key.
+            for x in obj[:1024]:
+                if isinstance(x, (dict, list)):
+                    _vsc_leaves(x, prefix, out, _depth + 1)
     return out
 
 
@@ -6041,7 +6049,7 @@ def _vsc_dangerous(key: str, v, shell_text: str = "") -> bool:
         # Agent auto-approve maps: an entry approving a command/tool.
         return v is True or (isinstance(v, str) and v.strip().lower() == "true")
     orig_last = key.split(".")[-1]
-    if (len(segs) >= 2 and any(s in patterns.VSCODE_ENV_CONTAINER_SEG for s in segs[:-1])
+    if (len(segs) >= 2 and any(patterns.VSCODE_ENV_CONTAINER_SEG_RE.match(s) for s in segs[:-1])
             and patterns.VSCODE_DANGEROUS_ENV_RE.match(orig_last)):
         return v == _VSC_UNKNOWN or _vsc_env_value_dangerous(orig_last, v)
     if patterns.VSCODE_EXEC_STRUCT_KEY_RE.match(k):
@@ -6053,6 +6061,13 @@ def _vsc_dangerous(key: str, v, shell_text: str = "") -> bool:
         return not _vsc_path_safe(v)
     if _VSC_CMDLINE_KEY_RE.search(k):
         return not _vsc_cmdline_safe(v)
+    if k in _VSC_MODULE_PATH_KEYS:
+        # Resolved against the workspace, so a bare name is a workspace file.
+        return _vsc_nonempty(v) and not (isinstance(v, str) and _VSC_SAFE_SYSTEM_RE.fullmatch(v.strip()))
+    if k in ("java.jdt.ls.vmargs", "java.test.config.vmargs"):
+        return isinstance(v, str) and bool(_VSC_JVM_AGENT_RE.search(v)) or v == _VSC_UNKNOWN
+    if k in _VSC_EXTRA_CMDLINE_KEYS:
+        return not _vsc_cmdline_safe(v)
     if patterns.VSCODE_EXEC_PATH_KEY_RE.match(k):
         return not _vsc_path_safe(v)
     if patterns.VSCODE_EXEC_PATH_SUFFIX_RE.search(k):
@@ -6060,6 +6075,15 @@ def _vsc_dangerous(key: str, v, shell_text: str = "") -> bool:
     return False
 
 
+_VSC_MODULE_PATH_KEYS = frozenset((
+    "prettier.prettierpath", "stylelint.stylelintpath", "eslint.nodepath",
+))
+_VSC_EXTRA_CMDLINE_KEYS = frozenset((
+    "rubylsp.customrubycommand", "python.testing.pytestpath", "phpstan.bincommand",
+))
+_VSC_JVM_AGENT_RE = re.compile(
+    r"-(?:javaagent|agentpath|agentlib|Xbootclasspath)|-D(?:java\.system\.class\.loader|"
+    r"jdk\.internal|java\.security\.manager)|@\S", re.IGNORECASE)
 _VSC_CMDLINE_KEY_RE = re.compile(r"(?:commandline|cmdline|overridecommand|runnables\.command)$")
 
 
@@ -6073,6 +6097,14 @@ def _vsc_rep(v) -> str:
 def _vsc_struct_findings(obj: dict, kind: str) -> list:
     root = obj
     out = []
+    if kind == "devcontainer":
+        cust = obj.get("customizations")
+        vs = cust.get("vscode") if isinstance(cust, dict) else None
+        roots = [r for r in (vs.get("settings") if isinstance(vs, dict) else None,
+                             obj.get("settings")) if isinstance(r, dict)]
+        for r in roots:
+            out.extend(_vsc_struct_findings(r, "settings"))
+        return out
     if kind == "workspace":
         root = obj.get("settings") if isinstance(obj.get("settings"), dict) else {}
         tasks = obj.get("tasks")
@@ -6106,13 +6138,19 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
     seen, out = set(), []
     budget = [_VSC_DECODE_BUDGET]
 
-    def _add(k, v):
+    def _add(k, v, ctx=""):
         if (k, v) == _VSC_TRUNC:
             if _VSC_TRUNC not in seen:
                 seen.add(_VSC_TRUNC)
                 out.append(_VSC_TRUNC)
             return
-        if k and _vsc_dangerous(k, v, text):
+        if k and kind in ("workspace", "devcontainer"):
+            kl = k.lower()
+            for pre in ("customizations.vscode.settings.", "settings."):
+                if kl.startswith(pre):
+                    k = k[len(pre):]
+                    break
+        if k and _vsc_dangerous(k, v, ctx):
             f = (k.lower(), _vsc_rep(v))
             if f not in seen:
                 seen.add(f)
@@ -6120,14 +6158,15 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
 
     def _scan(matches, bare_mode: bool, decoded_keys: set):
         covered_end = -1
-        for m in matches[:4096]:
+        if len(matches) > _VSC_MAX_TEXT_KEYS:
+            _add(*_VSC_TRUNC)
+            return
+        for m in matches:
             if m.start() < covered_end:
                 continue
             key = m.group(1)
             if bare_mode and key.lower() in decoded_keys:
                 continue
-            if kind == "workspace" and key.lower().startswith("settings."):
-                key = key[9:]
             j = m.end()
             while j < len(text) and text[j] in " \t\r\n":
                 j += 1
@@ -6150,8 +6189,10 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
                         val = bm.group(0)
             if not bare_mode:
                 decoded_keys.add(key.lower())
-            if key == "settings" and kind == "workspace" and isinstance(val, dict):
-                for leaf in _vsc_leaves(val):
+            ctx = text[j:j + 200]
+            if (key in ("settings", "customizations") and kind in ("workspace", "devcontainer")
+                    and isinstance(val, dict)):
+                for leaf in _vsc_leaves(val, key):
                     _add(*leaf)
                 continue
             if isinstance(val, dict):
@@ -6160,7 +6201,7 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
                 if not val:
                     _add(key, val)
                 continue
-            _add(key, val)
+            _add(key, val, ctx)
             # A dangerous env var as a bare key in an Edit fragment (its
             # env-map container is outside the fragment). Not on shell text,
             # where unrelated `PATH:`-like words are common.
@@ -6176,6 +6217,12 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
     if shell:
         _scan(list(re.finditer(r"(?:^|[{,\s])([A-Za-z_][\w./-]{0,300})\s*:(?!//)", text)),
               True, decoded)
+    if ("//" in text or "/*" in text or re.search(r",\s*[}\]]", text)) and budget[0] > 0:
+        # JSONC comments / trailing commas make raw_decode fail on a nested
+        # object; scan a stripped copy too (union -- the original is kept,
+        # since a `//` in a shell URL would strip real content).
+        text = _vsc_strip_jsonc(text)
+        _scan(list(patterns.VSCODE_SETTINGS_KEY_TEXT_RE.finditer(text)), False, set())
     if kind == "workspace" and patterns.VSCODE_TASKS_RUNON_RE.search(text):
         out.append(("tasks.runoptions.runon", '"folderOpen"'))
     return out
@@ -6191,7 +6238,30 @@ def _vsc_findings(text: str, kind: str) -> list:
 
 
 def _vsc_kind(p: str) -> str:
-    return "workspace" if patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(p) else "settings"
+    if patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(p):
+        return "workspace"
+    if patterns.DEVCONTAINER_PATH_RE.search(p):
+        return "devcontainer"
+    return "settings"
+
+
+def _vsc_target_form(ev: Event, p: str) -> Optional[str]:
+    """The form of ``p`` that names a settings file: as given, normalized
+    (`.vscode/sub/../settings.json`), or symlink-resolved."""
+    if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(p):
+        return p
+    try:
+        n = os.path.normpath(p)
+        if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(n):
+            return n
+        fp = _npmrc_resolve(ev, p)
+        if fp:
+            r = os.path.realpath(fp)
+            if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(r):
+                return r
+    except Exception:
+        return None
+    return None
 
 
 def _vsc_new_findings(ev: Event, p: str) -> list:
@@ -6258,9 +6328,11 @@ def _vsc_jq_findings(cmd: str) -> list:
     evaluated (unknown), so any exec key asks; a toggle asks only when its
     dangerous value appears in the same command."""
     if not (patterns.VSCODE_SETTINGS_JQ_ANY_RE.search(cmd)
-            and re.search(patterns._VSCODE_JQ_ASSIGN_OP, cmd)):
+            and (re.search(patterns._VSCODE_JQ_ASSIGN_OP, cmd)
+                 or re.search(r"\bsetpath\s*\(|[+*]\s*\{", cmd))):
         return []
     out = []
+    judged = set()
     # Whole jq paths (`.a.b["c.d"].e`) joined into one dotted key, plus each
     # quoted string on its own.
     for m in re.finditer(r"(?:\.(?:\[\s*)?(?:\"[^\"\n]{1,300}\"|'[^'\n]{1,300}'|[A-Za-z_][\w-]*)(?:\s*\])?)+", cmd):
@@ -6269,10 +6341,27 @@ def _vsc_jq_findings(cmd: str) -> list:
         tail = cmd[m.end():m.end() + 200]
         vm = re.match(r"\s*(?:\|=|\+=|=(?!=))\s*(\"[^\"\n]{0,200}\"|'[^'\n]{0,200}'|[^\s|)}]{1,200})", tail)
         assigned = vm.group(1).strip("\"'") if vm else ""
+        if not assigned or assigned.startswith("$"):
+            # `--arg`/`--argjson` variable or no literal: judge the whole
+            # command (the value is somewhere in it).
+            assigned = cmd[:20000]
         for cand in {key, (parts[-1][0] or parts[-1][1] or parts[-1][2]) if parts else ""}:
+            judged.add(cand.lower())
             if cand and (_vsc_dangerous(cand, _VSC_UNKNOWN, assigned)
                          or (cand.isupper() and patterns.VSCODE_DANGEROUS_ENV_RE.match(cand))):
                 out.append((cand.lower(), "<jq>"))
+        if len(out) > 64:
+            break
+    if not out:
+        # Keys passed as data (`--arg k git.path '.[$k]=...'`,
+        # `setpath(["git.path"]; ...)`): every quoted/argument token.
+        body = cmd[:20000]
+        cands = (re.findall(r"\"([^\"\n]{1,300})\"", body)[:2048]
+                 + re.findall(r"(?<![\w./-])([A-Za-z_][\w./-]{1,300})(?![\w./-])", body)[:4096])
+        for cand in cands:
+            if cand.lower() not in judged and _vsc_dangerous(cand, _VSC_UNKNOWN, body):
+                out.append((cand.lower(), "<jq>"))
+                break
     return out
 
 
@@ -6287,6 +6376,8 @@ def _vsc_shell_source_findings(ev: Event, raw: str) -> list:
     out, seen = [], 0
     for t in toks[:256]:
         t = t.lstrip("<>")
+        if t[:3].lower() in ("if=", "of="):
+            t = t[3:]
         if not t or t.startswith("-") or len(t) > 4096 or seen >= _NPMRC_MAX_SOURCES:
             continue
         if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + t) and not re.search(
@@ -6333,13 +6424,49 @@ def _vsc_inplace_findings(ev: Event, raw: str) -> list:
     return []
 
 
+_VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|)]|$)", re.IGNORECASE)
+_VSC_OPAQUE_RE = re.compile(
+    r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
+    r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)|git\s+(?:checkout|restore)"
+    r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
+    re.IGNORECASE,
+)
+_VSC_IMPLICIT_WRITE_RE = re.compile(
+    # another revision (`git checkout evil -- f`, `git restore -s evil f`);
+    # restoring from HEAD/the index is not new content.
+    r"\bgit\s+checkout\s+(?:-\w+\s+)*(?!--|HEAD\b|@\s)[^\s-]\S*\s+--"
+    r"|\bgit\s+restore\b[^;&|\n]*(?:--source|\s-s\b)"
+    r"|\b(?:bs)?tar\s+-?\w*x\w*\b"
+    r"|\bunzip\b|\b7z\s+[xe]\b",
+    re.IGNORECASE,
+)
+_VSC_PRINTF_ESC_RE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|0?([0-7]{1,3}))")
+
+
+def _vsc_decode_printf(cmd: str) -> str:
+    """`printf '{"git\\x2epath"...}'` / `echo -e` escapes, decoded."""
+    def _d(m):
+        try:
+            return chr(int(m.group(1), 16)) if m.group(1) else chr(int(m.group(2), 8))
+        except ValueError:
+            return m.group(0)
+    return _VSC_PRINTF_ESC_RE.sub(_d, cmd)
+
+
 def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
-    path_hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(cmd)
+    if _VSC_PRINTF_ESC_RE.search(cmd):
+        cmd = cmd + "\n" + _vsc_decode_printf(cmd)
+    dir_dest = bool(_VSC_DIR_DEST_RE.search(cmd)
+                    and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd))
+    path_hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(cmd) or dir_dest
                     or (patterns.VSCODE_CD_RE.search(cmd)
                         and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd)))
     if not path_hit:
         return []
-    kind = "workspace" if patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(cmd) else "settings"
+    kind = ("workspace" if patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(cmd)
+            else "devcontainer" if (patterns.DEVCONTAINER_PATH_RE.search(cmd)
+                                    and not patterns.VSCODE_SETTINGS_PATH_RE.search(cmd))
+            else "settings")
     write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
                       or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
                       or patterns.INPLACE_WRITE_RE.search(cmd)
@@ -6348,7 +6475,14 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
                       or patterns.GIT_HOOKS_ARCHIVE_VERB_RE.search(cmd)
                       or patterns.NPMRC_EXTRA_WRITE_RE.search(cmd))
     found = _vsc_jq_findings(cmd)
-    if found or not write_verb:
+    if found:
+        return found
+    implicit = _VSC_IMPLICIT_WRITE_RE.search(cmd)
+    if implicit and kind != "devcontainer":
+        # Writes whose content the command doesn't show: another git
+        # revision, an archive extraction.
+        return [("<opaque write>", implicit.group(0))]
+    if not write_verb:
         return found
     surface = cmd + "\n" + re.sub(r"\\+([\"'])", r"\1", cmd)
     found = _vsc_text_findings(surface, kind, shell=True)
@@ -6359,6 +6493,10 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
         found = _vsc_shell_source_findings(ev, raw)
     if not found and patterns.NPMRC_INPLACE_EDITOR_RE.search(cmd):
         found = _vsc_inplace_findings(ev, raw)
+    if not found and _VSC_OPAQUE_RE.search(cmd) and kind != "devcontainer":
+        # Content the command doesn't show (download, decode, archive,
+        # another git revision) landing in a settings file.
+        found = [("<opaque write>", _VSC_OPAQUE_RE.search(cmd).group(0))]
     return found
 
 
@@ -6475,18 +6613,45 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     ``AEGIS_ALLOW_VSCODE_SETTINGS_EXEC=1`` set before launch.
 
     Honest scope: a denylist of known exec-bearing keys -- an extension's
-    setting that spawns a program under an unrecognised name is missed; a
-    bare command name is trusted to resolve on PATH (PATH itself is
-    `rule_path_hijack_protect`'s surface); ``/usr/local/bin`` and
-    ``/opt/homebrew/bin`` are not exempt (asks); a value assembled
-    indirectly (a script that writes the JSON, a Python ``json.dump``) is
-    not caught; an Edit fragment whose env-map container lies outside the
-    fragment is caught only for a bare upper-case dangerous variable key
-    when the on-disk file can't be read; ``PYTHONPATH``/``NODE_PATH`` are
-    not on the env list (too common in benign settings);
-    ``typescript.tsdk`` is excluded (VS Code itself prompts before using a
-    workspace TypeScript); and JetBrains/Zed/Neovim settings are other
-    surfaces."""
+    setting that spawns a program under an unrecognised name is missed
+    (e.g. ``pylint.args`` ``--load-plugins``, ``rust-analyzer.check.command``,
+    and click-to-run keys like ``code-runner.executorMap``); a bare command
+    name is trusted to resolve on PATH (PATH itself is
+    `rule_path_hijack_protect`'s surface) except on module-path keys
+    (``prettier.prettierPath`` etc.), which resolve against the workspace;
+    ``/usr/local/bin`` and ``/opt/homebrew/bin`` are not exempt (asks); a
+    value assembled indirectly (shell variables, ``printf '%s'`` arguments,
+    PowerShell ``ConvertTo-Json``, a script that writes the JSON) is not
+    caught; shell path forms built from a variable, glob, brace list,
+    ``find -exec``, or a ``cd`` into a user-settings directory, and a shell
+    write through a symlinked path, are not recognised; an Edit fragment
+    with no key in it (a bare value) is judged only via the on-disk file;
+    ``PYTHONPATH``/``NODE_PATH`` are not on the env list (too common in
+    benign settings); ``typescript.tsdk`` is excluded (VS Code itself
+    prompts before using a workspace TypeScript); Windows ADS/8.3 path
+    forms are not matched; and JetBrains/Zed/Neovim settings are other
+    surfaces.
+
+    QA history (three independent reviews -- design/false-positive,
+    coverage, and robustness -- matching this codebase's process): round 1
+    found a leaf-cap padding bypass (now fails closed), a quadratic text
+    fallback (now span-skipping with a decode budget that fails closed), the
+    ``task.allowAutomaticTasks`` ownership split dropping forms the tasks
+    guard can't see (now only dropped when its own detector fires), a
+    Windows system-path exemption that let trailing arguments through
+    (now path-only), the data-extension exemption applying to real exec
+    keys, relative symlink targets, and shell-surface false positives; plus
+    benign-value narrowing (flag-only shell args, bare-tool command lines,
+    non-loading ``NODE_OPTIONS``, ``EDITOR=code --wait``, JDK/Go/.NET homes).
+    Round 2 found a per-key whole-text scan DoS on undecodable toggle values
+    (now a 200-char window), a silent 4096-key text cap (now fails closed),
+    a jq ``--arg``/``--argjson``/``setpath`` regression, commands nested in
+    lists of objects (now flattened), more exec keys, user-data
+    directories (code-server, openvscode, Codespaces, portable, forks),
+    ``..``/symlinked target paths, devcontainer ``customizations.vscode.
+    settings``, opaque writes (decode/archive/another git revision),
+    printf/``echo -e`` escapes in keys, and JSONC comments inside a nested
+    text-mode object."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -6506,7 +6671,10 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
-        if not p or not patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(p):
+        if not p:
+            return None
+        p = _vsc_target_form(ev, str(p))
+        if not p:
             return None
         try:
             found = _vsc_new_findings(ev, p)

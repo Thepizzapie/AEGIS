@@ -460,3 +460,134 @@ def test_qa1_shell_false_positives(cmd):
 def test_qa1_jq_toggle_value_still_caught():
     cmd = """jq '.["security.workspace.trust.enabled"] = false' .vscode/settings.json | sponge .vscode/settings.json"""
     assert _rule(_shell(cmd)) == (RULE, Action.ASK)
+
+
+# ---- QA round 2 regressions ----------------------------------------------------------
+def test_qa2_toggle_unknown_value_not_quadratic():
+    import time
+    body = "{" + ",".join('"security.workspace.trust.enabled": @' for _ in range(4096))
+    body += ',"git.path":"./tool"}' + " " * (1 << 20)
+    t = time.monotonic()
+    assert _rule(_write(S, body)) == (RULE, Action.ASK)
+    assert time.monotonic() - t < 5.0
+
+
+def test_qa2_text_key_cap_fails_closed():
+    body = "{" + ",".join(f'"k{i}": @' for i in range(20001)) + ',"git.path":"./tool"}'
+    assert _rule(_write(S, body)) == (RULE, Action.ASK)
+    body = "{" + ",".join(f'"k{i}":1' for i in range(4100)) + ' "x" ,"git.path":"./tool"}'
+    assert _rule(_write(S, body)) == (RULE, Action.ASK)
+
+
+@pytest.mark.parametrize("settings", [
+    {"java.jdt.ls.vmargs": "-XX:+UseParallelGC -javaagent:./tool.jar"},
+    {"latex-workshop.latex.tools": [{"name": "x", "command": "./tool"}]},
+    {"emeraldwalk.runonsave": {"commands": [{"match": ".*", "cmd": "./tool"}]}},
+    {"runOnSave.commands": [{"command": "./tool"}]},
+    {"rubyLsp.customRubyCommand": "./tool"},
+    {"python.testing.pytestPath": "./tool"},
+    {"mcp": {"servers": {"x": {"command": "./tool"}}}},
+    {"biome.lsp.bin": "./tool"},
+    {"intelephense.runtime": "./tool"},
+    {"phpstan.binPath": "./tool"},
+    {"phpstan.binCommand": ["./tool"]},
+    {"java.import.gradle.home": "./g"},
+    {"java.configuration.runtimes": [{"name": "JavaSE-17", "path": "./jdk"}]},
+    {"omnisharp.dotnetPath": "./d"},
+    {"vs-kubernetes": {"vs-kubernetes.kubectl-path": "./k"}},
+    {"ruby.rubocop.executePath": "./r"},
+    {"go.toolsEnvVars": {"GOFLAGS": "-toolexec=./tool"}},
+    {"swift.swiftEnvironmentVariables": {"LD_PRELOAD": "./x.so"}},
+    {"prettier.prettierPath": "tool"},
+    {"eslint.nodePath": "tool"},
+    {"git.path": "tool.AppImage"},
+])
+def test_qa2_dangerous(settings):
+    assert _rule(_write(S, settings)) == (RULE, Action.ASK)
+
+
+@pytest.mark.parametrize("settings", [
+    {"java.jdt.ls.vmargs": "-XX:+UseParallelGC -Xmx2G"},
+    {"latex-workshop.latex.tools": [{"name": "latexmk", "command": "latexmk", "args": ["-pdf"]}]},
+    {"java.configuration.runtimes": [{"name": "JavaSE-17", "path": "/usr/lib/jvm/java-17"}]},
+    {"python.testing.pytestPath": "pytest"},
+    {"cmake.cmakePath": "cmake"},
+])
+def test_qa2_benign(settings):
+    assert _hit(_write(S, settings)) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    """jq --argjson f false '."security.workspace.trust.enabled"=$f' ~/.config/Code/User/settings.json | sponge ~/.config/Code/User/settings.json""",
+    """jq --arg k git.path '.[$k]="./tool"' .vscode/settings.json | sponge .vscode/settings.json""",
+    """jq 'setpath(["git.path"]; "./tool")' .vscode/settings.json | sponge .vscode/settings.json""",
+    """printf '{"git\\x2epath": "./tool"}' > .vscode/settings.json""",
+    """printf '{"git\\056path": "./tool"}' > .vscode/settings.json""",
+    """cat > .vscode/settings.json <<EOF\n{"python": { // venv\n "defaultInterpreterPath": "./tool"}}\nEOF""",
+    """cat > .vscode/settings.json <<EOF\n{"git": {"path": "./tool",},}\nEOF""",
+    "base64 -d evil.b64 > .vscode/settings.json",
+    "git checkout evil -- .vscode/settings.json",
+    "git restore --source=evil .vscode/settings.json",
+    "tar xf x.tar .vscode/settings.json",
+    """echo '{"customizations":{"vscode":{"settings":{"git.path":"./tool"}}}}' > .devcontainer/devcontainer.json""",
+])
+def test_qa2_shell_dangerous(cmd):
+    assert _rule(_shell(cmd))[1] == Action.ASK
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout -- .vscode/settings.json",
+    "git checkout HEAD -- .vscode/settings.json",
+    "git restore .vscode/settings.json",
+    "git diff .vscode/settings.json",
+])
+def test_qa2_shell_benign(cmd):
+    assert _hit(_shell(cmd)) is None
+
+
+def test_qa2_shell_copy_forms(tmp_path):
+    (tmp_path / ".vscode").mkdir()
+    (tmp_path / "x").mkdir()
+    (tmp_path / "x" / "settings.json").write_text('{"git.path": "./x"}')
+    (tmp_path / "evil.json").write_text('{"git.path": "./x"}')
+    for c in ("dd if=evil.json of=.vscode/settings.json", "cp x/settings.json .vscode/",
+              "cp -t .vscode x/settings.json"):
+        assert _rule(_shell(c, tmp_path)) == (RULE, Action.ASK), c
+
+
+@pytest.mark.parametrize("path", [
+    "/home/u/.local/share/code-server/User/settings.json",
+    "/home/u/.local/share/code-server/Machine/settings.json",
+    "/home/u/.openvscode-server/data/Machine/settings.json",
+    "/home/u/.vscode-remote/data/Machine/settings.json",
+    "/home/u/.vscode-server-insiders/data/Machine/settings.json",
+    "/opt/VSCode/data/user-data/User/settings.json",
+    "/home/u/.config/VSCodium - Insiders/User/settings.json",
+    "/home/u/.config/Windsurf - Next/User/settings.json",
+    "/home/u/.config/Kiro/User/settings.json",
+])
+def test_qa2_paths(path):
+    assert _rule(_write(path, {"git.path": "./x"})) == (RULE, Action.ASK)
+
+
+def test_qa2_path_normalization_and_symlinks(tmp_path):
+    proj = tmp_path / "p"
+    (proj / ".vscode").mkdir(parents=True)
+    tgt = proj / ".vscode" / "settings.json"
+    tgt.write_text("{}")
+    assert _rule(_write(str(proj / ".vscode" / "sub" / ".." / "settings.json"),
+                        {"git.path": "./x"})) == (RULE, Action.ASK)
+    lnk = tmp_path / "s.json"
+    lnk.symlink_to(tgt)
+    assert _rule(_write(str(lnk), {"git.path": "./x"})) == (RULE, Action.ASK)
+    (proj / "vs").symlink_to(proj / ".vscode")
+    assert _rule(_write("vs/settings.json", {"git.path": "./x"}, cwd=proj)) == (RULE, Action.ASK)
+
+
+def test_qa2_devcontainer_settings():
+    d = {"image": "x", "customizations": {"vscode": {"settings": {"git.path": "./tool"}}}}
+    assert _rule(_write(".devcontainer/devcontainer.json", d)) == (RULE, Action.ASK)
+    assert _rule(_write(".devcontainer.json", {"settings": {"git.path": "./t"}})) == (RULE, Action.ASK)
+    ok = {"image": "x", "customizations": {"vscode": {"settings": {"editor.tabSize": 2},
+                                                      "extensions": ["ms-python.python"]}}}
+    assert _hit(_write(".devcontainer/devcontainer.json", ok)) is None
