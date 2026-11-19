@@ -5844,62 +5844,21 @@ _VSC_UNKNOWN = "<unparsed>"
 _VSC_OVERSIZE = ("<file>", "too large to inspect")
 
 
+_VSC_JSONC_TOK_RE = re.compile(r'"(?:[^"\\\n]|\\.)*(?:"|$)|//[^\n]*|/\*.*?(?:\*/|\Z)', re.DOTALL | re.MULTILINE)
+_VSC_TRAIL_TOK_RE = re.compile(r'"(?:[^"\\\n]|\\.)*(?:"|$)|,(?=\s*[}\]])', re.MULTILINE)
+
+
 def _vsc_strip_jsonc(text: str) -> str:
     """JSONC -> JSON the way VS Code's own parser reads settings: drop ``//``
-    and ``/* */`` comments and trailing commas, never inside a string."""
-    out, i, n, in_str = [], 0, len(text), False
-    while i < n:
-        c = text[i]
-        if in_str:
-            out.append(c)
-            if c == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if c == '"':
-                in_str = False
-            i += 1
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "/" and text.startswith("//", i):
-            j = text.find("\n", i)
-            i = n if j < 0 else j
-            continue
-        elif c == "/" and text.startswith("/*", i):
-            j = text.find("*/", i + 2)
-            i = n if j < 0 else j + 2
-            out.append(" ")
-            continue
-        out.append(c)
-        i += 1
-    s = "".join(out)
-    # Trailing commas, string-aware second pass.
-    out, i, n, in_str = [], 0, len(s), False
-    while i < n:
-        c = s[i]
-        if in_str:
-            out.append(c)
-            if c == "\\" and i + 1 < n:
-                out.append(s[i + 1])
-                i += 2
-                continue
-            if c == '"':
-                in_str = False
-            i += 1
-            continue
-        if c == '"':
-            in_str = True
-        elif c == ",":
-            j = i + 1
-            while j < n and s[j] in " \t\r\n":
-                j += 1
-            if j < n and s[j] in "}]":
-                i += 1
-                continue
-        out.append(c)
-        i += 1
-    return "".join(out)
+    and ``/* */`` comments and trailing commas, never inside a string.
+    Regex-tokenized (linear, C speed)."""
+    if "/" in text:
+        text = _VSC_JSONC_TOK_RE.sub(
+            lambda m: m.group(0) if m.group(0).startswith('"') else " ", text)
+    if "," in text:
+        text = _VSC_TRAIL_TOK_RE.sub(
+            lambda m: m.group(0) if m.group(0).startswith('"') else "", text)
+    return text
 
 
 def _vsc_parse(text: str):
@@ -6108,7 +6067,7 @@ _VSC_EXTRA_CMDLINE_KEYS = frozenset((
 ))
 # An MCP server defined inside settings: any command/args/env it is given
 # (the `.vscode/mcp.json` equivalent is mcp-config-protect's).
-_VSC_MCP_SERVER_RE = re.compile(r"^mcp\.servers\.[^.]+\.(?:command|args|env(?:\..+)?|envfile|url)$")
+_VSC_MCP_SERVER_RE = re.compile(r"^mcp\.servers\..+\.(?:command|args|env(?:\..+)?|envfile|url)$")
 _VSC_JVM_AGENT_RE = re.compile(
     r"-(?:javaagent|agentpath|agentlib|Xbootclasspath)|-D(?:java\.system\.class\.loader|"
     r"jdk\.internal|java\.security\.manager)|@\S", re.IGNORECASE)
@@ -6520,7 +6479,7 @@ _VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|
 _VSC_OPAQUE_RE = re.compile(
     r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
     r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)"
-    r"|git\s+show\s+(?:-\S+\s+)*(?!HEAD:|@:|:)\S+|git\s+(?:cat-file|archive)"
+    r"|git\s+show\s+(?:-\S+\s+)*\S+|git\s+(?:cat-file|archive)"
     r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
     re.IGNORECASE,
 )
@@ -6565,7 +6524,9 @@ def _vsc_stages_into_settings(seg: str, dir_dest: bool) -> bool:
         return True
     if not _VSC_STAGE_RE.search(seg):
         return False
-    toks = [t.strip("'\"") for t in seg.split()]
+    body = re.sub(r"(?:^|\s)#.*$", " ", seg)                    # trailing comment
+    body = re.sub(r"\d*[<>]{1,2}[&|]?\s*\S+", " ", body)        # redirections
+    toks = [t.strip("'\"") for t in body.split()]
     if not toks:
         return False
     cands = [toks[-1]] + [toks[i + 1] for i, t in enumerate(toks[:-1]) if t in ("-t", "--target-directory")]
@@ -6589,6 +6550,20 @@ def _vsc_opaque_variants(raw: str) -> list:
     return out
 
 
+_VSC_GIT_RESTORE_RE = re.compile(
+    r"^\s*git\s+show\s+(?:HEAD|@)?:([^\s;&|<>]+)\s*(?:>\|?|\|\s*tee)\s*([^\s;&|<>]+)\s*$")
+
+
+def _vsc_is_head_restore(seg: str) -> bool:
+    """`git show HEAD:f > f`: one committed object written back to its own
+    path (not another file's content)."""
+    m = _VSC_GIT_RESTORE_RE.match(seg)
+    if not m:
+        return False
+    a, b = (os.path.normpath(x.strip("'\"")) for x in m.groups())
+    return a == b
+
+
 def _vsc_opaque_findings(raw: str, dir_dest: bool) -> list:
     """Content the command doesn't show -- a download, a decode, an archive
     extraction, another git revision -- landing in a settings file, judged
@@ -6609,6 +6584,8 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool) -> list:
                     return [("<opaque write>", m.group(0))]
                 producer = producer or m.group(0)
             m = _VSC_OPAQUE_RE.search(seg)
+            if m and _vsc_is_head_restore(seg):
+                m = None
             if m:
                 if hit and (_vsc_sink_is_settings(seg, dir_dest)
                             or re.search(r"\bof=", seg) and _vsc_stages_into_settings(seg, dir_dest)):
@@ -6643,7 +6620,11 @@ def _vsc_sink_is_settings(seg: str, dir_dest: bool) -> bool:
 
 
 def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
-    if len(raw) > 20000 and patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(raw[:_NPMRC_MAX_FILE]):
+    if len(raw) > 20000 and (
+            patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(raw[:_NPMRC_MAX_FILE])
+            or ((patterns.VSCODE_CD_RE.search(raw[:_NPMRC_MAX_FILE])
+                 or _VSC_DIR_DEST_RE.search(raw[:_NPMRC_MAX_FILE]))
+                and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(raw[:_NPMRC_MAX_FILE]))):
         # The shared scan surface stops at 20k chars; a large heredoc's
         # tail would otherwise never be read.
         cmd = cmd + "\n" + raw[:_NPMRC_MAX_FILE]
@@ -6877,7 +6858,13 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     quadratic heredoc stripper and key scan (both linear now), raw-command
     appending on unrelated large commands, ``GOFLAGS -extld``, the
     devcontainer image-path exemption applying to env vars, and ``git show
-    HEAD:f > f`` (a restore) asking."""
+    HEAD:f > f`` (a restore) asking. Round 5 (verification) found that fix
+    exempted any HEAD object (``git show HEAD:payload.json > settings``;
+    now only one object written back to its own path), that a ``cd
+    .vscode`` heredoc past the 20k scan surface went unread, that a dotted
+    MCP server name (``io.github.foo/srv``) escaped the MCP check, that a
+    trailing redirect/comment hid a staged copy's destination, and that the
+    per-character JSONC stripper took ~3 s on 8 MB (now regex-tokenized)."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

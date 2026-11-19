@@ -735,3 +735,55 @@ def test_qa4_perf_paths():
 ])
 def test_qa4_opaque_spacing_and_backslash(cmd):
     assert _rule(_shell(cmd))[1] in (Action.ASK, Action.DENY)
+
+
+# ---- QA round 5 regressions ----------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "git show HEAD:payload.json > .vscode/settings.json",
+    "git show HEAD:payload.json | tee .vscode/settings.json",
+    "git show HEAD:empty evil:.vscode/settings.json > .vscode/settings.json",
+    "base64 -d p.b64 > /tmp/s; cp /tmp/s .vscode/settings.json 2>/dev/null",
+    "base64 -d p.b64 > /tmp/s; cp /tmp/s .vscode/settings.json # x",
+    "git show evil:.vscode/settings.json > /tmp/s; cp /tmp/s .vscode/settings.json 2>/dev/null",
+    "base64 --decode p.b64 > /tmp/s && mv -v /tmp/s .vscode/settings.json >/dev/null",
+    "base64 -d p.b64 | tee /tmp/s >/dev/null; cp /tmp/s .vscode/settings.json 2>&1",
+])
+def test_qa5_opaque(cmd):
+    assert _rule(_shell(cmd))[1] in (Action.ASK, Action.DENY)
+
+
+def test_qa5_head_restore_same_file_still_benign():
+    assert _hit(_shell("git show HEAD:.vscode/settings.json > .vscode/settings.json")) is None
+    assert _hit(_shell("git show :.vscode/settings.json > ./.vscode/settings.json")) is None
+
+
+def test_qa5_cd_large_heredoc():
+    body = "\n".join(f'"k{i}": "v",' for i in range(2500))
+    cmd = "cd .vscode && cat > settings.json <<'EOF'\n{\n" + body + '\n"git.path": "./tool"\n}\nEOF'
+    assert len(cmd) > 20000
+    assert _rule(_shell(cmd)) == (RULE, Action.ASK)
+    cmd = ("pushd .vscode; tee settings.json >/dev/null <<'EOF'\n{\n" + body
+           + '\n"terminal.integrated.env.linux": {"LD_PRELOAD": "./x.so"}\n}\nEOF')
+    assert _rule(_shell(cmd)) == (RULE, Action.ASK)
+
+
+@pytest.mark.parametrize("name", ["my.srv", "io.github.foo/srv", "a.b"])
+def test_qa5_mcp_dotted_server_names(name):
+    assert _rule(_write(S, {"mcp": {"servers": {name: {"command": "./tool"}}}})) == (RULE, Action.ASK)
+    assert _rule(_edit("/nx/.vscode/settings.json", "x",
+                       '"mcp": {"servers": {"' + name + '": {"command": "./tool"}}}')) == (RULE, Action.ASK)
+
+
+def test_qa5_large_key_dense_write_fast():
+    import time
+    for body in ('"a":' * (2 * 1024 * 1024 - 10), '"a" :' * (1600000), '"a":\n' * 1600000):
+        t = time.monotonic()
+        _hit(_write(S, body))
+        assert time.monotonic() - t < 2.5
+
+
+def test_qa5_jsonc_strip_semantics():
+    from aegis.rules import _vsc_strip_jsonc
+    assert json.loads(_vsc_strip_jsonc('{"u": "http://a//b", /* c */ "x": [1,2,], // t\n}')) \
+        == {"u": "http://a//b", "x": [1, 2]}
+    assert json.loads(_vsc_strip_jsonc('{"s": "a,]", "q": "\\" // x"}')) == {"s": "a,]", "q": '" // x'}
