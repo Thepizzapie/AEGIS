@@ -6707,8 +6707,8 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     # command's own name list are dropped -- `${GIT_DIR:=x}` assigns.
     _env_text = re.sub(
         r"(?:^|[;&|\n({!]|\b(?:then|do|else)\b)\s*unset(?:\s+-[fvn]+)*(?:\s+[A-Za-z_]\w*)+"
-        r"(?:\s+\d*[<>]{1,2}&?\s*\S+)*(?=\s*(?:$|[;&|\n)}]))"
-        r"|\$GIT_\w+(?![\w{])|\$\{GIT_\w+(?::?[-+][^}\n]{0,200})?\}|%GIT_\w+%",
+        r"(?:\s+\d*[<>]{1,2}&?\s*[^\s;&|()<>]+)*(?=\s*(?:$|[;&|\n)}]))"
+        r"|\$GIT_\w+(?![\w{])|\$\{GIT_\w+\}|%GIT_\w+%",
         " ", raw[:200000])
     foreign_env = bool(_VSC_FOREIGN_ENV_RE.search(_env_text))
     for v in _vsc_opaque_variants(raw):
@@ -6985,7 +6985,7 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     forms are not matched; and JetBrains/Zed/Neovim settings are other
     surfaces.
 
-    QA history (twelve independent review rounds -- design/false-positive,
+    QA history (fourteen independent review rounds -- design/false-positive,
     coverage and robustness first, then verification passes over each round
     of fixes -- matching this codebase's process): round 1
     found a leaf-cap padding bypass (now fails closed), a quadratic text
@@ -7095,7 +7095,12 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     glued before it (``<(git``, ``x=$(git``, ``if(git``; now recognised
     after the token's last metacharacter), and narrowed the ``unset``/read
     stripping's false positives (redirects after the names, ``then``/``{``
-    contexts, ``${GIT_DIR:-x}`` default reads)."""
+    contexts). Round 14 (verification) found an unset redirect target could
+    swallow a ``;``-glued ``GIT_DIR=`` statement (targets now stop at shell
+    metacharacters) and that treating ``${GIT_X:-WORD}`` as a read hid
+    names/assignments inside WORD -- only plain ``$X``/``${X}``/``%X%``
+    reads are exempt now (``echo ${GIT_DIR:-none}`` before a restore asks;
+    accepted)."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

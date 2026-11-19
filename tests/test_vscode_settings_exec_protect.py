@@ -1073,7 +1073,6 @@ def test_qa13_glued_prefix(cmd, tmp_path):
     "unset GIT_DIR 2>/dev/null; git checkout -- .vscode/settings.json",
     "if true; then unset GIT_DIR; fi; git checkout -- .vscode/settings.json",
     "{ unset GIT_DIR; }; git checkout -- .vscode/settings.json",
-    "echo ${GIT_DIR:-none}; git checkout -- .vscode/settings.json",
 ])
 def test_qa13_benign(cmd, tmp_path):
     (tmp_path / ".git").mkdir()
@@ -1085,3 +1084,18 @@ def test_qa13_assignment_expansions_still_count(tmp_path):
     for c in ("set -a; : ${GIT_DIR:=/evil}; git checkout -- .vscode/settings.json",
               "unset X; export GIT_DIR=/evil; git checkout -- .vscode/settings.json"):
         assert _rule(_shell(c, tmp_path))[1] == Action.ASK, c
+
+
+# ---- QA round 14 regressions ---------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "set -a;unset X 2>/dev/null;GIT_DIR=/evil;git checkout -- .vscode/settings.json",
+    "set -a;unset X 2>/dev/null; GIT_WORK_TREE=/evil; git checkout -- .vscode/settings.json",
+    "set -a;unset X >/dev/null;GIT_INDEX_FILE=/tmp/i;git show HEAD:.vscode/settings.json > .vscode/settings.json",
+    "export ${GIT_X:-GIT_DIR}=/evil; git checkout -- .vscode/settings.json",
+    "export ${GIT_X:-GIT_DIR=/evil}; git checkout -- .vscode/settings.json",
+    "set -a; : ${GIT_X:-${GIT_DIR:=/evil}}; git checkout -- .vscode/settings.json",
+    "echo ${GIT_DIR:-none}; git checkout -- .vscode/settings.json",   # accepted FP
+], ids=lambda c: c[:40])
+def test_qa14_env_stripping(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _rule(_shell(cmd, tmp_path))[1] in (Action.ASK, Action.DENY)
