@@ -1051,3 +1051,37 @@ def test_qa12_revisions_and_env(cmd, tmp_path):
 def test_qa12_benign(cmd, tmp_path):
     (tmp_path / ".git").mkdir()
     assert _hit(_shell(cmd, tmp_path)) is None
+
+
+# ---- QA round 13 regressions ---------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cat <(git -c a=b show evil:.vscode/settings.json) > .vscode/settings.json",
+    "cat <(git --no-pager show evil:.vscode/settings.json) > .vscode/settings.json",
+    "tee .vscode/settings.json < <(git -c a=b show evil:.vscode/settings.json)",
+    "x=$(git -c a=b checkout -q evil -- .vscode/settings.json)",
+    "if(git -c a=b checkout -q evil -- .vscode/settings.json);then :;fi",
+    "time(git -c a=b checkout -q evil -- .vscode/settings.json)",
+    "echo $((1))$(git -c a=b checkout -q evil -- .vscode/settings.json)",
+    "git checkout @{u} -- .vscode/settings.json",
+], ids=lambda c: c[:40])
+def test_qa13_glued_prefix(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _rule(_shell(cmd, tmp_path))[1] in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "unset GIT_DIR 2>/dev/null; git checkout -- .vscode/settings.json",
+    "if true; then unset GIT_DIR; fi; git checkout -- .vscode/settings.json",
+    "{ unset GIT_DIR; }; git checkout -- .vscode/settings.json",
+    "echo ${GIT_DIR:-none}; git checkout -- .vscode/settings.json",
+])
+def test_qa13_benign(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _hit(_shell(cmd, tmp_path)) is None
+
+
+def test_qa13_assignment_expansions_still_count(tmp_path):
+    (tmp_path / ".git").mkdir()
+    for c in ("set -a; : ${GIT_DIR:=/evil}; git checkout -- .vscode/settings.json",
+              "unset X; export GIT_DIR=/evil; git checkout -- .vscode/settings.json"):
+        assert _rule(_shell(c, tmp_path))[1] == Action.ASK, c

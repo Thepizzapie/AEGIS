@@ -6537,6 +6537,7 @@ _VSC_GIT_SUB_VALUE_OPTS = {
     "switch": frozenset(("-c", "-C", "--orphan", "--conflict")),
     "show": frozenset(),
 }
+_VSC_SHELL_PUNCT_RE = re.compile(r"[()`{}!;&<>=$]")
 _VSC_GIT_TOKEN_RE = re.compile(r"(?:\S*[/\\])?git(?:\.exe)?", re.IGNORECASE)
 
 
@@ -6544,9 +6545,11 @@ def _vsc_git_norm(seg: str) -> str:
     """``seg`` with git's global options and the checkout/switch/show
     options removed (token walk, no regex repetition -- any number of
     options): `(git -c a=b --no-pager checkout -q rev -- f` ->
-    `git checkout rev -- f`. Shell punctuation glued to the command word
-    (`(git`, `$(git`, `|git`, `!git`) is split off first; restore is left
-    as-is (its `--source` is matched directly)."""
+    `git checkout rev -- f`. The command word is recognised after a token's
+    last shell metacharacter (`(git`, `<(git`, `x=$(git`, `!git`; pipes
+    split tokens), while the token itself is kept so revision syntax like
+    `@{u}` survives; restore is left as-is (its `--source` is matched
+    directly)."""
     if "git" not in seg.lower():
         return seg
     # Split only on pipes; other punctuation is trimmed from a token's ends
@@ -6556,7 +6559,10 @@ def _vsc_git_norm(seg: str) -> str:
     while i < n:
         t = toks[i]
         i += 1
-        if not _VSC_GIT_TOKEN_RE.fullmatch(t.lstrip("($`{!").rstrip(")`};&")):
+        # The command word is what follows the token's LAST shell
+        # metacharacter (`<(git`, `x=$(git`, `if(git`, `$((1))$(git`).
+        parts = [x for x in _VSC_SHELL_PUNCT_RE.split(t) if x]
+        if not (parts and _VSC_GIT_TOKEN_RE.fullmatch(parts[-1])):
             out.append(t)
             continue
         out.append("git")
@@ -6700,8 +6706,9 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     # Only pure reads (`$GIT_DIR`, `${GIT_DIR}`, `%GIT_DIR%`) and an `unset`
     # command's own name list are dropped -- `${GIT_DIR:=x}` assigns.
     _env_text = re.sub(
-        r"(?:^|(?<=[;&|\n(]))\s*unset(?:\s+-[fvn]+)*(?:\s+[A-Za-z_]\w*)+(?=\s*(?:$|[;&|\n)]))"
-        r"|\$GIT_\w+(?![\w{])|\$\{GIT_\w+\}|%GIT_\w+%",
+        r"(?:^|[;&|\n({!]|\b(?:then|do|else)\b)\s*unset(?:\s+-[fvn]+)*(?:\s+[A-Za-z_]\w*)+"
+        r"(?:\s+\d*[<>]{1,2}&?\s*\S+)*(?=\s*(?:$|[;&|\n)}]))"
+        r"|\$GIT_\w+(?![\w{])|\$\{GIT_\w+(?::?[-+][^}\n]{0,200})?\}|%GIT_\w+%",
         " ", raw[:200000])
     foreign_env = bool(_VSC_FOREIGN_ENV_RE.search(_env_text))
     for v in _vsc_opaque_variants(raw):
@@ -7083,7 +7090,12 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     trimmed from token ends), that the read-stripping ate
     ``${GIT_DIR:=x}`` assignments (only pure ``$X``/``${X}`` reads are
     dropped now), and that ``unset`` stripping ran to the segment end and
-    matched ``--unset=`` (now only an ``unset`` command's name list)."""
+    matched ``--unset=`` (now only an ``unset`` command's name list).
+    Round 13 (verification) found the command word was missed with text
+    glued before it (``<(git``, ``x=$(git``, ``if(git``; now recognised
+    after the token's last metacharacter), and narrowed the ``unset``/read
+    stripping's false positives (redirects after the names, ``then``/``{``
+    contexts, ``${GIT_DIR:-x}`` default reads)."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
