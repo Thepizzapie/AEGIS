@@ -6003,12 +6003,27 @@ def _vsc_env_value_dangerous(name: str, v) -> bool:
     if up == "NODE_OPTIONS":
         return _npmrc_value_dangerous("node-options", v)
     if up == "GOFLAGS":
-        return bool(re.search(r"-(?:toolexec|exec|overlay|modfile|pgo)\b", v, re.IGNORECASE))
+        return bool(re.search(r"-(?:toolexec|exec|overlay|modfile|pgo|extld|extldflags|compiler)\b"
+                              r"|gccgoflags|asmflags|gcflags=\S*-[DI]\b", v, re.IGNORECASE))
     if up in ("EDITOR", "VISUAL", "GIT_EDITOR", "PAGER", "GIT_PAGER"):
         return not _vsc_cmdline_safe(v) and not (
             _VSC_BARE_RE.fullmatch(v.split()[0]) and v.split()[0].lower() == "code"
             and all(_VSC_SAFE_FLAG_RE.fullmatch(t) for t in v.split()[1:]))
     return True
+
+
+_VSC_WIN_EXE_SEG_RE = re.compile(r"\.(?:exe|cmd|bat|com|ps1|vbs|msc|cpl)(?:\s|$)", re.IGNORECASE)
+
+
+def _vsc_win_has_args(s: str) -> bool:
+    """A Windows path whose middle segment hides arguments: a program name
+    that isn't the last segment (`cmd.exe/c.\\x.bat`, `node.exe .\\x.js`),
+    or whitespace followed by an option/path character."""
+    segs = re.split(r"[\\/]+", s)
+    for seg in segs[:-1]:
+        if _VSC_WIN_EXE_SEG_RE.search(seg) or re.search(r"\s[-/.@~$%]", seg):
+            return True
+    return False
 
 
 def _vsc_path_safe(v, generic: bool = False) -> bool:
@@ -6029,7 +6044,7 @@ def _vsc_path_safe(v, generic: bool = False) -> bool:
         return False
     if _VSC_BARE_RE.fullmatch(s) and not _VSC_SCRIPT_EXT_RE.search(s):
         return True
-    if _VSC_SAFE_SYSTEM_RE.fullmatch(s):
+    if _VSC_SAFE_SYSTEM_RE.fullmatch(s) and not _vsc_win_has_args(s):
         return True
     return bool(generic == "data" and _VSC_DATA_EXT_RE.search(s))
 
@@ -6074,6 +6089,8 @@ def _vsc_dangerous(key: str, v, shell_text: str = "") -> bool:
         return isinstance(v, str) and bool(_VSC_JVM_AGENT_RE.search(v)) or v == _VSC_UNKNOWN
     if k in _VSC_EXTRA_CMDLINE_KEYS:
         return not _vsc_cmdline_safe(v)
+    if _VSC_MCP_SERVER_RE.match(k):
+        return _vsc_nonempty(v)
     if patterns.VSCODE_EXEC_PATH_KEY_RE.match(k):
         return not _vsc_path_safe(v)
     if patterns.VSCODE_EXEC_PATH_SUFFIX_RE.search(k):
@@ -6086,7 +6103,12 @@ _VSC_MODULE_PATH_KEYS = frozenset((
 ))
 _VSC_EXTRA_CMDLINE_KEYS = frozenset((
     "rubylsp.customrubycommand", "python.testing.pytestpath", "phpstan.bincommand",
+    "latex-workshop.latex.tools.command", "emeraldwalk.runonsave.commands.cmd",
+    "runonsave.commands.command", "runonsave.commands.cmd",
 ))
+# An MCP server defined inside settings: any command/args/env it is given
+# (the `.vscode/mcp.json` equivalent is mcp-config-protect's).
+_VSC_MCP_SERVER_RE = re.compile(r"^mcp\.servers\.[^.]+\.(?:command|args|env(?:\..+)?|envfile|url)$")
 _VSC_JVM_AGENT_RE = re.compile(
     r"-(?:javaagent|agentpath|agentlib|Xbootclasspath)|-D(?:java\.system\.class\.loader|"
     r"jdk\.internal|java\.security\.manager)|@\S", re.IGNORECASE)
@@ -6106,7 +6128,11 @@ _VSC_IMAGE_PATH_RE = re.compile(r'"/usr/local/(?:bin|py-utils/bin|python/bin|pyt
 def _vsc_devcontainer_filter(found: list) -> list:
     """Inside a container image /usr/local/{bin,py-utils/bin,python} is
     root-owned image content (Microsoft's stock templates point there)."""
-    return [f for f in found if not _VSC_IMAGE_PATH_RE.fullmatch(f[1])]
+    return [f for f in found
+            if not (_VSC_IMAGE_PATH_RE.fullmatch(f[1])
+                    and not f[0].startswith("<env>")
+                    and not any(patterns.VSCODE_ENV_CONTAINER_SEG_RE.match(x)
+                                for x in f[0].split(".")[:-1]))]
 
 
 def _vsc_struct_findings(obj: dict, kind: str) -> list:
@@ -6401,14 +6427,34 @@ def _vsc_jq_findings(cmd: str) -> list:
     return out
 
 
-_VSC_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w{1,64})\1[^\n]*\n.*?(?:\n\2\b|\Z)", re.DOTALL)
+_VSC_HEREDOC_OP_RE = re.compile(r"<<-?\s*(['\"]?)(\w{1,64})\1")
+
+
+def _vsc_strip_heredocs(raw: str) -> str:
+    """Drop heredoc bodies (linear: each body is skipped once)."""
+    out, i, n = [], 0, len(raw)
+    while i < n:
+        m = _VSC_HEREDOC_OP_RE.search(raw, i)
+        if not m:
+            out.append(raw[i:])
+            break
+        nl = raw.find("\n", m.end())
+        if nl < 0:
+            out.append(raw[i:])
+            break
+        out.append(raw[i:nl + 1])
+        end = raw.find("\n" + m.group(2), nl)
+        if end < 0:
+            break
+        i = end + 1 + len(m.group(2))
+    return "".join(out)
 
 
 def _vsc_tokens(raw: str) -> list:
     """Command words for source/target lookup. Heredoc bodies are data, not
     words, and shlex is per-character slow, so it only sees a bounded,
     body-stripped command."""
-    head = _VSC_HEREDOC_RE.sub(" ", raw[:262144])[:16384]
+    head = _vsc_strip_heredocs(raw[:262144])[:16384]
     try:
         return shlex.split(head, posix=True)
     except ValueError:
@@ -6473,7 +6519,8 @@ def _vsc_inplace_findings(ev: Event, raw: str) -> list:
 _VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|)]|$)", re.IGNORECASE)
 _VSC_OPAQUE_RE = re.compile(
     r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
-    r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)|git\s+(?:show|cat-file|archive)"
+    r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)"
+    r"|git\s+show\s+(?:-\S+\s+)*(?!HEAD:|@:|:)\S+|git\s+(?:cat-file|archive)"
     r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
     re.IGNORECASE,
 )
@@ -6505,39 +6552,98 @@ _VSC_SINK_RE = re.compile(r">|\btee\b|\bsponge\b|\bof=|\s-\w*[oO]\b|-OutFile\b|\
 _VSC_LISTING_RE = re.compile(r"\btar\s+-?\w*t|\bunzip\s+-\w*[lvZ]|\b7z\s+l\b", re.IGNORECASE)
 
 
-def _vsc_opaque_findings(cmd: str, dir_dest: bool) -> list:
+_VSC_STAGE_RE = re.compile(
+    r"\b(?:cp|mv|install|ln|rsync|copy|copy-item|cpi|move|move-item|mi)\b",
+    re.IGNORECASE,
+)
+
+
+def _vsc_stages_into_settings(seg: str, dir_dest: bool) -> bool:
+    """A copy/move whose DESTINATION is a settings file (last argument, or
+    `-t <dir>`), a `dd of=`, or a redirect/tee into one."""
+    if _vsc_sink_is_settings(seg, dir_dest):
+        return True
+    if not _VSC_STAGE_RE.search(seg):
+        return False
+    toks = [t.strip("'\"") for t in seg.split()]
+    if not toks:
+        return False
+    cands = [toks[-1]] + [toks[i + 1] for i, t in enumerate(toks[:-1]) if t in ("-t", "--target-directory")]
+    return any(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + c)
+               or (dir_dest and re.search(r"(?:^|[/\\])\.vscode[/\\]?$", c, re.I)) for c in cands)
+
+
+def _vsc_opaque_variants(raw: str) -> list:
+    """The raw command (continued lines joined) and its quote-stripped /
+    ANSI-C-decoded form, each segmented on its own."""
+    try:
+        base = normalize._LINE_CONT_RE.sub(" ", raw[:200000])
+        out = [base, normalize._QUOTE_SPLIT_RE.sub(
+            "", normalize._ANSIC_MARKER_RE.sub("", normalize._decode_ansic(base)))]
+    except Exception:
+        out = [raw[:200000]]
+    if "\\" in base:
+        out.append(re.sub(r"\\(?=\w)", "", base))   # `c\url` -> `curl`
+    if any(_VSC_PRINTF_ESC_RE.search(v) for v in out):
+        out += [_vsc_decode_printf(v) for v in out]
+    return out
+
+
+def _vsc_opaque_findings(raw: str, dir_dest: bool) -> list:
     """Content the command doesn't show -- a download, a decode, an archive
     extraction, another git revision -- landing in a settings file, judged
-    per `;`/`&&`/`||`/newline segment (pipes stay in one segment)."""
-    for seg in _VSC_SEGMENT_SPLIT_RE.split(cmd[:200000]):
-        if not (patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(seg)
-                or (dir_dest and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(seg))):
-            continue
-        m = _VSC_IMPLICIT_WRITE_RE.search(seg)
-        if m and not _VSC_LISTING_RE.search(seg):
-            return [("<opaque write>", m.group(0))]
-        m = _VSC_OPAQUE_RE.search(seg)
-        if m and _vsc_sink_is_settings(seg, dir_dest):
-            return [("<opaque write>", m.group(0))]
+    per `;`/`&&`/`||`/newline segment (pipes stay in one segment). A
+    producer in one segment staged into a settings file by a copy/move in
+    another (`curl .. > /tmp/s; mv /tmp/s .vscode/settings.json`) counts."""
+    for v in _vsc_opaque_variants(raw):
+        segs = _VSC_SEGMENT_SPLIT_RE.split(v)
+        producer = None
+        staged = False
+        for seg in segs:
+            spaced = re.sub(r"[<>|]", " ", seg)   # `>.vscode/settings.json`
+            hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(spaced)
+                       or (dir_dest and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(spaced)))
+            m = _VSC_IMPLICIT_WRITE_RE.search(seg)
+            if m and not _VSC_LISTING_RE.search(seg):
+                if hit:
+                    return [("<opaque write>", m.group(0))]
+                producer = producer or m.group(0)
+            m = _VSC_OPAQUE_RE.search(seg)
+            if m:
+                if hit and (_vsc_sink_is_settings(seg, dir_dest)
+                            or re.search(r"\bof=", seg) and _vsc_stages_into_settings(seg, dir_dest)):
+                    return [("<opaque write>", m.group(0))]
+                if _VSC_SINK_RE.search(seg):
+                    producer = producer or m.group(0)
+            if hit and _vsc_stages_into_settings(seg, dir_dest):
+                staged = True
+        if producer and staged:
+            return [("<opaque write>", producer + " (staged)")]
     return []
 
 
 def _vsc_sink_is_settings(seg: str, dir_dest: bool) -> bool:
     """Is a redirect / tee / sponge / -o / of= target in ``seg`` a settings
-    file (not `git show x:.vscode/settings.json > /tmp/a`)?"""
+    file (not `git show x:.vscode/settings.json > /tmp/a`)? Every argument
+    of `tee` counts."""
+    def _is(tok):
+        return bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + tok) or (
+            dir_dest and re.search(r"(?:^|[/\\])(?:\.vscode[/\\]?|settings\.json)$", tok, re.I)))
     for m in _VSC_SINK_RE.finditer(seg):
-        tm = re.match(r"\s*(?:-\w+\s+)*[\"']?([^\s'\";&|]{1,4096})", seg[m.end():m.end() + 4200])
-        if not tm:
+        rest = seg[m.end():m.end() + 4200]
+        if m.group(0).lower() == "tee":
+            toks = re.findall(r"[^\s'\";&|()<>]{1,4096}", rest.split("|", 1)[0])
+            if any(_is(t) for t in toks[:64]):
+                return True
             continue
-        tok = tm.group(1)
-        if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + tok) or (
-                dir_dest and re.search(r"(?:^|[/\\])(?:\.vscode[/\\]?|settings\.json)$", tok, re.I)):
+        tm = re.match(r"\|?\s*(?:-\w+\s+)*[\"']?([^\s'\";&|]{1,4096})", rest)
+        if tm and _is(tm.group(1)):
             return True
     return False
 
 
 def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
-    if len(raw) > 20000:
+    if len(raw) > 20000 and patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(raw[:_NPMRC_MAX_FILE]):
         # The shared scan surface stops at 20k chars; a large heredoc's
         # tail would otherwise never be read.
         cmd = cmd + "\n" + raw[:_NPMRC_MAX_FILE]
@@ -6546,6 +6652,7 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
     dir_dest = bool(_VSC_DIR_DEST_RE.search(cmd)
                     and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd))
     path_hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(cmd) or dir_dest
+                    or patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(re.sub(r"[<>|]", " ", cmd))
                     or (patterns.VSCODE_CD_RE.search(cmd)
                         and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(cmd)))
     if not path_hit:
@@ -6567,8 +6674,7 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
     if kind != "devcontainer":
         # Segment on the raw command: the scan surface concatenates its
         # de-obfuscated variants, which would splice segments together.
-        op = _vsc_opaque_findings(raw if not _VSC_PRINTF_ESC_RE.search(raw)
-                                  else _vsc_decode_printf(raw), dir_dest)
+        op = _vsc_opaque_findings(raw, dir_dest)
         if op:
             return op
     if not write_verb:
@@ -6704,7 +6810,14 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     name is trusted to resolve on PATH (PATH itself is
     `rule_path_hijack_protect`'s surface) except on module-path keys
     (``prettier.prettierPath`` etc.), which resolve against the workspace;
-    ``/usr/local/bin`` and ``/opt/homebrew/bin`` are not exempt (asks); a
+    ``/usr/local/bin`` and ``/opt/homebrew/bin`` are not exempt (asks) --
+    except image paths (``/usr/local/{bin,py-utils/bin,python}``) inside a
+    devcontainer's settings; very large or complex content (over 20k text
+    keys, 100k leaves, or the 4 MiB decode budget, e.g. a >1.5 MB heredoc)
+    fails closed to ASK; a download/decode in one segment plus an unrelated
+    redirect into settings in another asks (staging heuristic); ``git
+    apply``/``patch``/``stash pop``/``git -C``, ``tar -C .vscode -x`` and
+    ``checkout rev -- .vscode/`` (a directory) are not recognised; a
     value assembled indirectly (shell variables, ``printf '%s'`` arguments,
     PowerShell ``ConvertTo-Json``, a script that writes the JSON) is not
     caught; shell path forms built from a variable, glob, brace list,
@@ -6752,7 +6865,19 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     devcontainer's ``/usr/local/{bin,py-utils/bin,python}`` image paths are
     exempt (Microsoft's stock templates). Checking out a settings file from
     another revision (``git checkout main -- f``) asks by design; from
-    HEAD/the index it doesn't."""
+    HEAD/the index it doesn't. Round 4 (verification) found a middle Windows
+    path segment could still hide arguments (``bash.exe -c ./x``,
+    ``cmd.exe/c.\\x.bat`` -- now refused, and shell-command keys like
+    runOnSave/latex-workshop are judged as command lines), MCP servers in
+    settings (any command/args/env now asks), staged opaque writes split
+    across segments (``curl .. > /tmp/s; mv /tmp/s .vscode/settings.json``
+    -- a producer plus a copy/redirect INTO a settings file now asks),
+    ``tee`` with several files, ``>|``, ``>file`` with no space, quote/
+    backslash-obfuscated verbs and continued lines in the opaque check, a
+    quadratic heredoc stripper and key scan (both linear now), raw-command
+    appending on unrelated large commands, ``GOFLAGS -extld``, the
+    devcontainer image-path exemption applying to env vars, and ``git show
+    HEAD:f > f`` (a restore) asking."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

