@@ -859,3 +859,46 @@ def test_qa7_foreign_repo_and_cd(cmd, tmp_path):
 def test_qa7_restore_still_benign(cmd, tmp_path):
     (tmp_path / ".git").mkdir()
     assert _hit(_shell(cmd, tmp_path)) is None
+
+
+# ---- QA round 8 regressions ----------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    """echo '{"git.path":"./tool"}' > .vs$""code/sett$""ings.json""",
+    """echo '{"git.path":"./tool"}' | tee .vs$""code/settings.json""",
+    """cd .vs$""code && echo '{"git.path":"./tool"}' > sett$""ings.json""",
+    """echo '{"settings":{"git.path":"./t"}}' > x.code-work$""space""",
+    """cmd //c 'echo {"git.path":"./tool"} > .vs^code\\set^tings.json'""",
+], ids=["locale-quote", "tee", "cd", "workspace", "caret"])
+def test_qa8_prefilter_matches_scan_surface(cmd):
+    assert _rule(_shell(cmd))[1] in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "export GIT_DIR=/p/e.git; git show HEAD:.vscode/settings.json > .vscode/settings.json",
+    "GIT_DIR=x; export GIT_DIR; git show HEAD:.vscode/settings.json > .vscode/settings.json",
+    "export GIT_DIR=/p/e.git && git checkout HEAD -- .vscode/settings.json",
+    "export GIT_INDEX_FILE=/tmp/i; git show :.vscode/settings.json > .vscode/settings.json",
+    "git -c Core.attributesFile=/tmp/a show HEAD:.vscode/settings.json > .vscode/settings.json",
+])
+def test_qa8_foreign_env_anywhere(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _rule(_shell(cmd, tmp_path))[1] in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git --work-tree=. --git-dir=.git show --stat HEAD -- .vscode/settings.json",
+    "git --git-dir=../other/.git log --show-signature -- .vscode/settings.json",
+    "git --git-dir=$HOME/.dotfiles --work-tree=$HOME show HEAD:.config/Code/User/settings.json",
+])
+def test_qa8_foreign_readonly_benign(cmd):
+    assert _hit(_shell(cmd)) is None
+
+
+def test_qa8_foreign_regex_perf():
+    import time
+    for cmd in ("git --git-dir " * 20000 + "> .vscode/settings.json",
+                "GIT_DIR= git " * 20000 + "> .vscode/settings.json",
+                "echo git --namespace " * 15000 + "> .vscode/settings.json"):
+        t = time.monotonic()
+        _hit(_shell(cmd))
+        assert time.monotonic() - t < 1.5, cmd[:30]

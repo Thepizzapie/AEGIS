@@ -6520,17 +6520,32 @@ _VSC_IMPLICIT_WRITE_RE = re.compile(
     r"|\bunzip\b|\b7z\s+[xe]\b",
     re.IGNORECASE,
 )
-# Reading from ANOTHER repository (`--git-dir=`, `GIT_DIR=`, ...) is never a
-# restore of this one's committed content.
-_VSC_FOREIGN_REPO_RE = re.compile(
-    # Bounded gaps: an unbounded `[^;&|\n]*` after every `git` on one long
-    # line is quadratic.
-    r"\bgit\s(?:[^;&|\n]{0,300}?\s)?--(?:git-dir|work-tree|namespace|exec-path)\b"
-    r"[^;&|\n]{0,300}?\b(?:checkout|restore|show)\b"
-    r"|\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE)="
-    r"[^;&|\n]{0,300}?\bgit\s[^;&|\n]{0,300}?\b(?:checkout|restore|show)\b",
-    re.IGNORECASE,
-)
+# Reading from ANOTHER repository (`--git-dir=`, `GIT_DIR=`, an exported
+# GIT_DIR, ...) is never a restore of this one's committed content. Three
+# cheap, independent searches per segment (a nested bounded regex was
+# n*300*300 on long lines).
+_VSC_FOREIGN_OPT_RE = re.compile(r"\s--(?:git-dir|work-tree|namespace|exec-path)\b", re.IGNORECASE)
+_VSC_FOREIGN_ENV_RE = re.compile(
+    r"\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE)\b\s*=?",
+    re.IGNORECASE)
+_VSC_GIT_WORD_RE = re.compile(r"\bgit\s")
+_VSC_GIT_READ_VERB_RE = re.compile(r"(?<![-\w])(?:checkout|restore|show)\b", re.IGNORECASE)
+
+
+def _vsc_foreign_repo(seg: str, env_anywhere: bool):
+    """Return the git verb when ``seg`` reads another repository's content
+    (a repo-redirecting global option or GIT_* variable in this segment,
+    or a GIT_* variable assigned/exported anywhere in the command)."""
+    if not _VSC_GIT_WORD_RE.search(seg):
+        return None
+    v = _VSC_GIT_READ_VERB_RE.search(seg)
+    if not v:
+        return None
+    if env_anywhere or _VSC_FOREIGN_OPT_RE.search(seg) or _VSC_FOREIGN_ENV_RE.search(seg):
+        return v
+    return None
+
+
 _VSC_PRINTF_ESC_RE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|0?([0-7]{1,3}))")
 
 
@@ -6590,7 +6605,7 @@ def _vsc_opaque_variants(raw: str) -> list:
 
 
 _VSC_GIT_RESTORE_RE = re.compile(
-    r"^\s*git\s+(?:(?:--no-pager|-P|--no-replace-objects|-c\s+(?!core\.|include|alias)[\w.-]+=\S*)\s+)*"
+    r"^\s*git\s+(?:(?:--no-pager|-P|--no-replace-objects|-c\s+(?!(?i:core\.|include|alias))[\w.-]+=\S*)\s+)*"
     r"show\s+(?:HEAD|@)?:([^\s;&|<>]+)"
     r"\s*(?:>\|?|\|\s*tee)\s*([^\s;&|<>]+)\s*$")
 
@@ -6601,7 +6616,7 @@ def _vsc_is_head_restore(seg: str, cwd=None) -> bool:
     the redirect cwd-relative, so outside the repo root only the
     cwd-relative ``HEAD:./f`` form counts."""
     m = _VSC_GIT_RESTORE_RE.match(seg)
-    if not m or _VSC_FOREIGN_REPO_RE.search(seg):
+    if not m or _vsc_foreign_repo(seg, False):
         return False
     if (cwd and not m.group(1).startswith("./")
             and not os.path.exists(os.path.join(str(cwd), ".git"))):
@@ -6618,6 +6633,11 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     another (`curl .. > /tmp/s; mv /tmp/s .vscode/settings.json`) counts."""
     # A `cd`/`pushd` anywhere changes what a cwd-relative restore writes.
     chdir = bool(re.search(r"\b(?:cd|pushd|chdir|set-location|sl)\b", raw[:200000], re.IGNORECASE))
+    # A GIT_DIR/GIT_INDEX_FILE/... assigned or exported anywhere redirects
+    # every later git command in the same shell.
+    foreign_env = bool(re.search(
+        r"\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE)\s*=",
+        raw[:200000], re.IGNORECASE))
     for v in _vsc_opaque_variants(raw):
         segs = _VSC_SEGMENT_SPLIT_RE.split(v)
         producer = None
@@ -6626,13 +6646,17 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
             spaced = re.sub(r"[<>|]", " ", seg)   # `>.vscode/settings.json`
             hit = bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(spaced)
                        or (dir_dest and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(spaced)))
-            m = _VSC_IMPLICIT_WRITE_RE.search(seg) or _VSC_FOREIGN_REPO_RE.search(seg)
+            m = _VSC_IMPLICIT_WRITE_RE.search(seg)
+            fr = _vsc_foreign_repo(seg, foreign_env)
+            if fr is not None and (fr.group(0).lower() != "show"
+                                   or _vsc_sink_is_settings(seg, dir_dest)):
+                m = m or fr
             if m and not _VSC_LISTING_RE.search(seg):
                 if hit:
                     return [("<opaque write>", m.group(0))]
                 producer = producer or m.group(0)
             m = _VSC_OPAQUE_RE.search(seg)
-            if m and not chdir and _vsc_is_head_restore(seg, cwd):
+            if m and not chdir and not foreign_env and _vsc_is_head_restore(seg, cwd):
                 m = None
             if m:
                 if hit and (_vsc_sink_is_settings(seg, dir_dest)
@@ -6721,7 +6745,8 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
 
 
 _VSC_SHELL_HINT_RE = re.compile(r"settings|code-workspace|devcontainer|vscode", re.IGNORECASE)
-_VSC_SHELL_ENCODED_RE = re.compile(r"\\[xX0-7]|base64|frombase64|-e(?:nc(?:odedcommand)?)?\s|\$'|\$\(|`")
+_VSC_SHELL_ENCODED_RE = re.compile(
+    r"\\[xX0-7uU]|base64|frombase64|-e(?:nc(?:odedcommand)?)?\s|-ec\b|\$['\"(]|`", re.IGNORECASE)
 
 
 def _vsc_shell_may_touch(raw: str) -> bool:
@@ -6730,7 +6755,10 @@ def _vsc_shell_may_touch(raw: str) -> bool:
     removed -- and carries no encoded/computed part can't plant one."""
     if _VSC_SHELL_ENCODED_RE.search(raw):
         return True
-    return bool(_VSC_SHELL_HINT_RE.search(re.sub(r"[\"'\\\s]", "", raw[:_NPMRC_MAX_FILE])))
+    # Strip at least what normalize.scan_surface strips: quotes, `$` before
+    # a quote ($"..." / $'...'), backslashes, cmd carets, whitespace.
+    flat = re.sub(r"\$(?=[\"'])|[\"'\\\s^`]", "", raw[:_NPMRC_MAX_FILE])
+    return bool(_VSC_SHELL_HINT_RE.search(flat))
 
 
 def _vscode_settings_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
@@ -6942,7 +6970,15 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     the restore form accepts only content-neutral globals, and never after
     a ``cd``). Shell commands that name no settings file (quotes and
     backslashes removed) and carry no encoded/computed part now skip the
-    shared scan surface entirely (a cheap pre-filter)."""
+    shared scan surface entirely (a cheap pre-filter). Round 8
+    (verification) found that pre-filter did not strip what the scan
+    surface strips (``.vs$""code``, cmd ``^`` carets -- it now does), the
+    foreign-repo regex was n*300*300 on long lines (now three cheap
+    searches), an exported ``GIT_DIR``/``GIT_INDEX_FILE`` in an earlier
+    segment escaped it (now any GIT_* assignment in the command counts),
+    read-only foreign ``show``/``--show-signature`` false positives (a
+    foreign ``show`` now needs a settings sink), and a case-sensitive
+    ``-c core.`` exclusion."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
