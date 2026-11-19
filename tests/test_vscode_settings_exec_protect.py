@@ -902,3 +902,40 @@ def test_qa8_foreign_regex_perf():
         t = time.monotonic()
         _hit(_shell(cmd))
         assert time.monotonic() - t < 1.5, cmd[:30]
+
+
+# ---- QA round 9 regressions ----------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "git --git-dir /tmp/evil show HEAD:x > /tmp/s; mv /tmp/s .vscode/settings.json",
+    "git --git-dir /tmp/evil show HEAD:x > /tmp/s && cp /tmp/s .vscode/settings.json",
+    "git --git-dir /tmp/evil show HEAD:x | tee /tmp/s\nmv /tmp/s .vscode/settings.json",
+    "git --namespace n show HEAD:x > /tmp/s; mv /tmp/s .vscode/settings.json",
+    "git --git-dir /tmp/evil cat-file blob HEAD:x > /tmp/s; mv /tmp/s .vscode/settings.json",
+    """echo '{"git.path":"./tool"}' > .vs\\\ncode/settings.json""",
+], ids=["mv", "cp", "tee-nl", "namespace", "cat-file", "line-cont"])
+def test_qa9_staged_foreign_and_linecont(cmd):
+    assert _rule(_shell(cmd))[1] in (Action.ASK, Action.DENY)
+
+
+def test_qa9_caret_copy_source(tmp_path):
+    (tmp_path / ".vscode").mkdir()
+    (tmp_path / "evil.json").write_text('{"git.path": "./x"}')
+    assert _rule(_shell("cmd //c 'type evil.json > .vs^code\\\\set^tings.json'", tmp_path))[1] \
+        in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "GIT_DIR=.git git status; git restore .vscode/settings.json",
+    "GIT_DIR=.git git status && git checkout -- .vscode/settings.json",
+])
+def test_qa9_prefix_assignment_not_exported(cmd):
+    assert _hit(_shell(cmd)) is None
+
+
+def test_qa9_tee_sink_perf():
+    import time
+    for c in ("GIT_DIR=x git show " + "tee " * 50000 + "; echo .vscode/settings.json",
+              "git --git-dir=x show " + "tee " * 50000 + "; echo .vscode/settings.json"):
+        t = time.monotonic()
+        _hit(_shell(c))
+        assert time.monotonic() - t < 1.5

@@ -6442,10 +6442,15 @@ def _vsc_tokens(raw: str) -> list:
     words, and shlex is per-character slow, so it only sees a bounded,
     body-stripped command."""
     head = _vsc_strip_heredocs(raw[:262144])[:16384]
+    if "^" in head:
+        head = head + " " + head.replace("^", "")     # cmd caret escapes
     try:
-        return shlex.split(head, posix=True)
+        toks = shlex.split(head, posix=True)
     except ValueError:
-        return head.split()
+        toks = head.split()
+    # An inner command passed as one quoted word (`cmd /c '...'`,
+    # `bash -c "..."`) contributes its own words too.
+    return toks + [w for t in toks[:256] if " " in t for w in t.split()][:1024]
 
 
 def _vsc_shell_source_findings(ev: Event, raw: str) -> list:
@@ -6507,14 +6512,14 @@ _VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|
 _VSC_OPAQUE_RE = re.compile(
     r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
     r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)"
-    r"|git\s+(?:(?:-c\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+)*(?:show\s+(?:-\S+\s+)*\S+|cat-file|archive)"
+    r"|git\s+(?:(?:-c\s+[^\s-]\S*|--(?:git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+){0,16}(?:show\s+(?:-\S+\s+){0,16}\S+|cat-file|archive)"
     r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
     re.IGNORECASE,
 )
 _VSC_IMPLICIT_WRITE_RE = re.compile(
     # another revision (`git checkout evil -- f`, `git restore -s evil f`);
     # restoring from HEAD/the index is not new content.
-    r"\bgit\s+(?:(?:-c\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+)*checkout\s+(?:-\w+\s+)*(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
+    r"\bgit\s+(?:(?:-c\s+[^\s-]\S*|-(?!c\s)-?[\w-]+(?:=\S+)?)\s+){0,16}checkout\s+(?:-\w+\s+){0,16}(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
     r"|\bgit\s+restore\b[^;&|\n]*(?:--source|\s-s\b)"
     r"|\b(?:bs)?tar\s+-?\w*x\w*\b"
     r"|\bunzip\b|\b7z\s+[xe]\b",
@@ -6592,7 +6597,8 @@ def _vsc_opaque_variants(raw: str) -> list:
     """The raw command (continued lines joined) and its quote-stripped /
     ANSI-C-decoded form, each segmented on its own."""
     try:
-        base = normalize._LINE_CONT_RE.sub(" ", raw[:200000])
+        base = raw[:200000].replace("\\\n", "")
+        base = normalize._LINE_CONT_RE.sub(" ", base)
         out = [base, normalize._QUOTE_SPLIT_RE.sub(
             "", normalize._ANSIC_MARKER_RE.sub("", normalize._decode_ansic(base)))]
     except Exception:
@@ -6635,8 +6641,13 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     chdir = bool(re.search(r"\b(?:cd|pushd|chdir|set-location|sl)\b", raw[:200000], re.IGNORECASE))
     # A GIT_DIR/GIT_INDEX_FILE/... assigned or exported anywhere redirects
     # every later git command in the same shell.
+    # (A `GIT_DIR=x cmd` prefix applies to that one command only; that case
+    # is _vsc_foreign_repo's own per-segment check.)
+    _gv = r"GIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE)\b"
     foreign_env = bool(re.search(
-        r"\bGIT_(?:DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|NAMESPACE)\s*=",
+        r"\b(?:export|declare\s+-x|typeset\s+-x|set)\s+(?:-\w+\s+)*" + _gv
+        + r"|(?:^|[;&|\n])\s*" + _gv + r"\s*=\S*\s*(?=$|[;&\n]|\|\|)"
+        + r"|\$env:" + _gv,
         raw[:200000], re.IGNORECASE))
     for v in _vsc_opaque_variants(raw):
         segs = _VSC_SEGMENT_SPLIT_RE.split(v)
@@ -6648,9 +6659,13 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
                        or (dir_dest and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(spaced)))
             m = _VSC_IMPLICIT_WRITE_RE.search(seg)
             fr = _vsc_foreign_repo(seg, foreign_env)
-            if fr is not None and (fr.group(0).lower() != "show"
-                                   or _vsc_sink_is_settings(seg, dir_dest)):
-                m = m or fr
+            if fr is not None:
+                if fr.group(0).lower() != "show":
+                    m = m or fr
+                elif hit and _vsc_sink_is_settings(seg, dir_dest):
+                    m = m or fr
+                elif _VSC_SINK_RE.search(seg):
+                    producer = producer or fr.group(0)
             if m and not _VSC_LISTING_RE.search(seg):
                 if hit:
                     return [("<opaque write>", m.group(0))]
@@ -6678,7 +6693,9 @@ def _vsc_sink_is_settings(seg: str, dir_dest: bool) -> bool:
     def _is(tok):
         return bool(patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + tok) or (
             dir_dest and re.search(r"(?:^|[/\\])(?:\.vscode[/\\]?|settings\.json)$", tok, re.I)))
-    for m in _VSC_SINK_RE.finditer(seg):
+    for n, m in enumerate(_VSC_SINK_RE.finditer(seg)):
+        if n >= 64:
+            return True     # pathological: fail closed
         rest = seg[m.end():m.end() + 4200]
         if m.group(0).lower() == "tee":
             toks = re.findall(r"[^\s'\";&|()<>]{1,4096}", rest.split("|", 1)[0])
@@ -6700,6 +6717,10 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
         # The shared scan surface stops at 20k chars; a large heredoc's
         # tail would otherwise never be read.
         cmd = cmd + "\n" + raw[:_NPMRC_MAX_FILE]
+    if "\\\n" in raw:
+        # bash deletes a backslash-newline inside a word (the shared surface
+        # turns it into a space): `.vs\<newline>code/settings.json`.
+        cmd = cmd + "\n" + raw[:_NPMRC_MAX_FILE].replace("\\\n", "")
     if _VSC_PRINTF_ESC_RE.search(cmd):
         cmd = cmd + "\n" + _vsc_decode_printf(cmd)
     dir_dest = bool(_VSC_DIR_DEST_RE.search(cmd)
@@ -6978,7 +6999,14 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     segment escaped it (now any GIT_* assignment in the command counts),
     read-only foreign ``show``/``--show-signature`` false positives (a
     foreign ``show`` now needs a settings sink), and a case-sensitive
-    ``-c core.`` exclusion."""
+    ``-c core.`` exclusion. Round 9 (verification) confirmed the
+    pre-filter is now a superset of the scan surface's de-obfuscation, and
+    found a foreign ``show`` redirected to a temp file then moved into
+    settings had lost its staging role, a per-``tee`` sink re-scan
+    that went quadratic (now bounded and only run when the segment names a
+    settings file), a ``GIT_DIR=x cmd`` prefix wrongly treated as exported,
+    space-separated ``--git-dir x`` / ``cat-file`` in the opaque check, a
+    backslash-newline inside a path word, and cmd ``^`` in copy sources."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
