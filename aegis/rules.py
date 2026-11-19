@@ -6530,32 +6530,45 @@ _VSC_GIT_VALUE_OPTS = frozenset((
     "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
     "--super-prefix", "--config-env", "--list-cmds",
 ))
-_VSC_GIT_SUB_VALUE_OPTS = frozenset(("-s", "--source", "-b", "-B", "--orphan", "--format", "-U"))
+# Per-subcommand options that take a separate value (`show` has none that
+# matter here: `-s`/`-b`/`-U`/`--source` are flags for it).
+_VSC_GIT_SUB_VALUE_OPTS = {
+    "checkout": frozenset(("-b", "-B", "--orphan", "--conflict", "--pathspec-from-file")),
+    "switch": frozenset(("-c", "-C", "--orphan", "--conflict")),
+    "show": frozenset(),
+}
+_VSC_GIT_TOKEN_RE = re.compile(r"(?:\S*[/\\])?git(?:\.exe)?", re.IGNORECASE)
 
 
 def _vsc_git_norm(seg: str) -> str:
-    """``seg`` with git's global options and the checkout/restore/show
+    """``seg`` with git's global options and the checkout/switch/show
     options removed (token walk, no regex repetition -- any number of
-    options): `git -c a=b --no-pager checkout -q rev -- f` ->
-    `git checkout rev -- f`. `--source`/`-s` values are kept for restore."""
-    if "git" not in seg:
+    options): `(git -c a=b --no-pager checkout -q rev -- f` ->
+    `git checkout rev -- f`. Shell punctuation glued to the command word
+    (`(git`, `$(git`, `|git`, `!git`) is split off first; restore is left
+    as-is (its `--source` is matched directly)."""
+    if "git" not in seg.lower():
         return seg
-    toks = seg.split()
+    toks = re.sub(r"[()`{}!|;&]", " ", seg).split()
     out, i, n = [], 0, len(toks)
     while i < n:
         t = toks[i]
-        out.append(t)
         i += 1
-        if t == "git" or t.endswith(("/git", "\\git", "git.exe")):
+        if not _VSC_GIT_TOKEN_RE.fullmatch(t.lstrip("$")):
+            out.append(t)
+            continue
+        out.append("git")
+        while i < n and toks[i].startswith("-") and toks[i] != "--":
+            o = toks[i].split("=", 1)[0]
+            i += 2 if (o in _VSC_GIT_VALUE_OPTS and "=" not in toks[i]) else 1
+        if i < n and toks[i].lower() in _VSC_GIT_SUB_VALUE_OPTS:
+            sub = toks[i].lower()
+            out.append(sub)
+            i += 1
+            vals = _VSC_GIT_SUB_VALUE_OPTS[sub]
             while i < n and toks[i].startswith("-") and toks[i] != "--":
                 o = toks[i].split("=", 1)[0]
-                i += 2 if (o in _VSC_GIT_VALUE_OPTS and "=" not in toks[i]) else 1
-            if i < n and toks[i].lower() in ("checkout", "show", "switch"):
-                out.append(toks[i])
-                i += 1
-                while i < n and toks[i].startswith("-") and toks[i] != "--":
-                    o = toks[i].split("=", 1)[0]
-                    i += 2 if (o in _VSC_GIT_SUB_VALUE_OPTS and "=" not in toks[i]) else 1
+                i += 2 if (o in vals and "=" not in toks[i]) else 1
     return " ".join(out)
 
 
@@ -6681,7 +6694,9 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     # assignment statement...): enumerating the shell's ways to set a
     # variable kept missing some, so a `GIT_DIR=x git status; git restore f`
     # prefix-only use asks too (rare, recoverable).
-    foreign_env = bool(_VSC_FOREIGN_ENV_RE.search(raw[:200000]))
+    # (`unset GIT_DIR`, `$GIT_DIR`/`${GIT_DIR}`/`%GIT_DIR%` reads don't set it.)
+    _env_text = re.sub(r"\bunset\b[^;&|\n]*|\$\{?GIT_\w+\}?|%GIT_\w+%", " ", raw[:200000])
+    foreign_env = bool(_VSC_FOREIGN_ENV_RE.search(_env_text))
     for v in _vsc_opaque_variants(raw):
         segs = _VSC_SEGMENT_SPLIT_RE.split(v)
         producer = None
@@ -7048,7 +7063,14 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     options through: git options are now removed by a token walk
     (`_vsc_git_norm`, any count, linear) before matching, and any mention
     of a repo-redirecting GIT_* variable counts as foreign (a prefix-only
-    ``GIT_DIR=x git status`` alongside a restore now asks -- accepted)."""
+    ``GIT_DIR=x git status`` alongside a restore now asks -- accepted).
+    Round 11 (verification) found that normalizer missed git glued to shell
+    punctuation (``(git``, ``$(git``, ``|git``) and treated ``show``'s
+    ``-s``/``-b``/``-U``/``--source`` flags as taking the revision as a
+    value (option values are now per subcommand; punctuation is split off;
+    ``git.EXE`` matches case-insensitively); ``unset GIT_DIR`` and
+    ``$GIT_DIR`` reads no longer count as assignments; ``--conflict`` takes
+    a value."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

@@ -988,3 +988,37 @@ def test_qa10_option_and_export_runs_linear():
 def test_qa10_restores_still_benign(cmd, tmp_path):
     (tmp_path / ".git").mkdir()
     assert _hit(_shell(cmd, tmp_path)) is None
+
+
+# ---- QA round 11 regressions ---------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "(git checkout -q evil -- .vscode/settings.json)",
+    "(git -c a=b checkout evil -- .vscode/settings.json)",
+    "(git --no-pager show evil:.vscode/settings.json > .vscode/settings.json)",
+    "$(git checkout -q evil -- .vscode/settings.json)",
+    "echo $(git -c a=b checkout evil -- .vscode/settings.json)",
+    "[ -d .git ] && (git checkout -f evil -- .vscode/settings.json)",
+    "echo x |git -c a=b checkout evil -- .vscode/settings.json",
+    "!git -c a=b checkout evil -- .vscode/settings.json",
+    "git show -s evil:.vscode/settings.json > .vscode/settings.json",
+    "git show -b evil:.vscode/settings.json > .vscode/settings.json",
+    "git show -U evil:.vscode/settings.json | tee .vscode/settings.json",
+    "git show --source evil:x > /tmp/s; mv /tmp/s .vscode/settings.json",
+    "git -C . show -s evil:.vscode/settings.json > .vscode/settings.json",
+    "C:\\\\Git\\\\bin\\\\git.EXE checkout -q evil -- .vscode/settings.json",
+], ids=lambda c: c[:40])
+def test_qa11_glued_and_show_flags(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _rule(_shell(cmd, tmp_path))[1] in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("cmd", [
+    "unset GIT_DIR GIT_WORK_TREE; git checkout -- .vscode/settings.json",
+    "echo $GIT_DIR; git checkout -- .vscode/settings.json",
+    "env | grep ${GIT_DIR}; git restore .vscode/settings.json",
+    "git checkout --conflict merge -- .vscode/settings.json",
+    "git -c a=b checkout --conflict merge -- .vscode/settings.json",
+])
+def test_qa11_benign(cmd, tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert _hit(_shell(cmd, tmp_path)) is None
