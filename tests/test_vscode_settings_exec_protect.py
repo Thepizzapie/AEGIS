@@ -591,3 +591,86 @@ def test_qa2_devcontainer_settings():
     ok = {"image": "x", "customizations": {"vscode": {"settings": {"editor.tabSize": 2},
                                                       "extensions": ["ms-python.python"]}}}
     assert _hit(_write(".devcontainer/devcontainer.json", ok)) is None
+
+
+# ---- QA round 3 regressions ----------------------------------------------------------
+@pytest.mark.parametrize("settings", [
+    {"emeraldwalk.runonsave": {"commands": [{"match": ".*", "cmd": "C:\\Windows\\System32\\cmd.exe /c tool.bat"}]}},
+    {"runOnSave.commands": [{"command": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -File tool.ps1"}]},
+    {"git.path": "C:\\Windows\\System32\\cmd.exe /c x"},
+    {"terminal.integrated.profiles.windows": {"x": {"path": "C:\\Program Files\\nodejs\\node.exe x.js"}}},
+])
+def test_qa3_windows_path_with_args_asks(settings):
+    assert _rule(_write(S, settings)) == (RULE, Action.ASK)
+
+
+def test_qa3_windows_spaced_dirs_still_exempt():
+    assert _hit(_write(S, {"git.path": "C:\\Program Files\\Microsoft VS Code\\bin\\git.exe"})) is None
+
+
+def test_qa3_decode_error_newline_count_not_quadratic():
+    import time
+    body = "x" * (7 << 20) + '"security.workspace.trust.enabled": @\n' * 19000
+    t = time.monotonic()
+    _hit(_write(S, body))
+    assert time.monotonic() - t < 5.0
+
+
+def test_qa3_large_heredoc_shlex_bounded():
+    import time
+    cmd = "cat > .vscode/settings.json <<'EOF'\n{\"editor.fontFamily\": \"" + "a" * (1 << 20) + "\"}\nEOF"
+    t = time.monotonic()
+    assert _hit(_shell(cmd)) is None
+    assert time.monotonic() - t < 5.0
+    cmd = "cat > .vscode/settings.json <<'EOF'\n{\"x\": \"" + "a" * (1 << 20) + "\", \"git.path\": \"./t\"}\nEOF"
+    assert _rule(_shell(cmd)) == (RULE, Action.ASK)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout -b fix && echo 'note' > notes.txt && git add .vscode/settings.json",
+    "git checkout main && cp .vscode/settings.json /tmp/settings.bak",
+    "git restore . && cat .vscode/settings.json > /tmp/x.json",
+    "curl -sSf https://example.com/health > /tmp/h.txt; cat .vscode/settings.json",
+    "git checkout feature/x -- src/ && cat .vscode/settings.json",
+    "git stash && git checkout main -- package.json && git diff .vscode/settings.json",
+    "tar xzf deps.tgz -C vendor && cat .vscode/settings.json",
+    "unzip -o assets.zip -d public && ls .vscode/settings.json",
+    "base64 -d <<< e30= > /tmp/x; cat .vscode/settings.json",
+    "tar tzf x.tgz | grep .vscode/settings.json",
+    "unzip -l x.zip .vscode/settings.json",
+    "git show HEAD:.vscode/settings.json > /tmp/a.json",
+])
+def test_qa3_compound_command_false_positives(cmd):
+    assert _hit(_shell(cmd)) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout evil .vscode/settings.json",
+    "git checkout HEAD~1 .vscode/settings.json",
+    "git show evil:.vscode/settings.json > .vscode/settings.json",
+    "curl -s https://x.example/s | tee .vscode/settings.json",
+])
+def test_qa3_git_revision_writes(cmd):
+    assert _rule(_shell(cmd))[1] in (Action.ASK, Action.DENY)
+
+
+@pytest.mark.parametrize("settings", [
+    {"go.toolsEnvVars": {"GOFLAGS": "-mod=mod"}},
+    {"go.testEnvVars": {"GOFLAGS": "-tags=integration"}},
+    {"gopls": {"build.env": {"GOFLAGS": "-tags=e2e"}}},
+])
+def test_qa3_goflags_benign(settings):
+    assert _hit(_write(S, settings)) is None
+
+
+def test_qa3_goflags_toolexec_asks():
+    assert _rule(_write(S, {"go.toolsEnvVars": {"GOFLAGS": "-toolexec=./t"}})) == (RULE, Action.ASK)
+
+
+def test_qa3_devcontainer_stock_template():
+    d = {"customizations": {"vscode": {"settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.linting.pylintPath": "/usr/local/py-utils/bin/pylint"}}}}
+    assert _hit(_write(".devcontainer/devcontainer.json", d)) is None
+    # outside a devcontainer, /usr/local/bin still asks (documented)
+    assert _rule(_write(S, {"python.defaultInterpreterPath": "/usr/local/bin/python"}))[0] == RULE

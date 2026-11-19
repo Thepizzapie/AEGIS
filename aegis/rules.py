@@ -5801,17 +5801,21 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
 _VSC_MAX_LEAVES = 100000
 _VSC_DECODE_BUDGET = 4 * 1024 * 1024
 _VSC_MAX_TEXT_KEYS = 20000
+_VSC_JSON_START = frozenset('{["-0123456789tfnNI')
 _VSC_COSMETIC = frozenset(("icon", "color", "overridename", "hidden", "source", "istransient"))
 # Root-owned system locations: a binary path, or a JDK/SDK home directory.
-# The Windows branch is path-only (no whitespace or ':' inside a segment, so
-# no trailing arguments) and refuses the user-writable System32 subfolders.
+# The Windows branch is path-only -- a segment may not start or end with
+# whitespace and the last may contain none, so no trailing arguments
+# (`cmd.exe /c x`) -- and refuses the user-writable System32 subfolders.
 _VSC_SAFE_SYSTEM_RE = re.compile(
     r"/(?:usr/)?s?bin/[\w.+-]{1,100}"
     r"|(?:/usr/lib/jvm|/usr/lib/go|/usr/local/go|/usr/share/dotnet"
     r"|/Library/Java/JavaVirtualMachines)(?:/[\w.+-]{1,100}){0,8}/?"
     r"|[a-z]:[\\/]+(?:windows[\\/]+system32|program files(?: \(x86\))?)"
     r"(?![^\n]*[\\/](?:spool|tasks|temp|tmp|com)[\\/])"
-    r"(?:[\\/]+[^\\/\"'\n|&;<>:]{1,100}){1,8}",
+    # Each segment: no leading/trailing whitespace; the last: none at all.
+    r"(?:[\\/]+[^\\/\"'\n|&;<>:\s](?:[^\\/\"'\n|&;<>:]{0,98}[^\\/\"'\n|&;<>:\s])?){0,7}"
+    r"[\\/]+[^\\/\"'\n|&;<>:\s]{1,100}",
     re.IGNORECASE,
 )
 _VSC_TRUNC = ("<file>", "too many keys / too complex to inspect")
@@ -5998,6 +6002,8 @@ def _vsc_env_value_dangerous(name: str, v) -> bool:
         return True
     if up == "NODE_OPTIONS":
         return _npmrc_value_dangerous("node-options", v)
+    if up == "GOFLAGS":
+        return bool(re.search(r"-(?:toolexec|exec|overlay|modfile|pgo)\b", v, re.IGNORECASE))
     if up in ("EDITOR", "VISUAL", "GIT_EDITOR", "PAGER", "GIT_PAGER"):
         return not _vsc_cmdline_safe(v) and not (
             _VSC_BARE_RE.fullmatch(v.split()[0]) and v.split()[0].lower() == "code"
@@ -6094,6 +6100,15 @@ def _vsc_rep(v) -> str:
         return str(v)[:200]
 
 
+_VSC_IMAGE_PATH_RE = re.compile(r'"/usr/local/(?:bin|py-utils/bin|python/bin|python/current/bin)/[\w.+-]{1,100}"')
+
+
+def _vsc_devcontainer_filter(found: list) -> list:
+    """Inside a container image /usr/local/{bin,py-utils/bin,python} is
+    root-owned image content (Microsoft's stock templates point there)."""
+    return [f for f in found if not _VSC_IMAGE_PATH_RE.fullmatch(f[1])]
+
+
 def _vsc_struct_findings(obj: dict, kind: str) -> list:
     root = obj
     out = []
@@ -6104,7 +6119,7 @@ def _vsc_struct_findings(obj: dict, kind: str) -> list:
                              obj.get("settings")) if isinstance(r, dict)]
         for r in roots:
             out.extend(_vsc_struct_findings(r, "settings"))
-        return out
+        return _vsc_devcontainer_filter(out)
     if kind == "workspace":
         root = obj.get("settings") if isinstance(obj.get("settings"), dict) else {}
         tasks = obj.get("tasks")
@@ -6174,12 +6189,31 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
                 _add(*_VSC_TRUNC)
                 return
             try:
-                val, vend = dec.raw_decode(text, j)
+                if j >= len(text) or text[j] not in _VSC_JSON_START:
+                    raise ValueError("not a JSON value")
+                # Decode a bounded slice first (a JSONDecodeError counts
+                # newlines from the start of the string it was given), and
+                # the whole remainder only while the budget lasts.
+                sl = text[j:j + 65536]
+                try:
+                    val, vend = dec.raw_decode(sl)
+                    vend += j
+                except ValueError:
+                    if len(sl) < 65536 or budget[0] <= 0:
+                        raise
+                    # Each full-remainder attempt costs at least one slice,
+                    # bounding how often a failing one can recount lines.
+                    budget[0] -= 65536
+                    try:
+                        val, vend = dec.raw_decode(text, j)
+                    except ValueError as e2:
+                        budget[0] -= max(0, getattr(e2, "pos", len(text)) - j)
+                        raise
                 budget[0] -= vend - j
                 if isinstance(val, dict):
                     covered_end = vend
             except (ValueError, RecursionError) as e:
-                budget[0] -= max(1, getattr(e, "pos", len(text)) - j)
+                budget[0] -= 1
                 val = _VSC_UNKNOWN
                 if bare_mode:
                     # De-quoted shell surface (`{git.path: git}`): the value
@@ -6223,9 +6257,11 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
         # since a `//` in a shell URL would strip real content).
         text = _vsc_strip_jsonc(text)
         _scan(list(patterns.VSCODE_SETTINGS_KEY_TEXT_RE.finditer(text)), False, set())
+    if budget[0] <= 0 and _VSC_TRUNC not in out:
+        out.append(_VSC_TRUNC)
     if kind == "workspace" and patterns.VSCODE_TASKS_RUNON_RE.search(text):
         out.append(("tasks.runoptions.runon", '"folderOpen"'))
-    return out
+    return _vsc_devcontainer_filter(out) if kind == "devcontainer" else out
 
 
 def _vsc_findings(text: str, kind: str) -> list:
@@ -6365,14 +6401,28 @@ def _vsc_jq_findings(cmd: str) -> list:
     return out
 
 
+_VSC_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w{1,64})\1[^\n]*\n.*?(?:\n\2\b|\Z)", re.DOTALL)
+
+
+def _vsc_tokens(raw: str) -> list:
+    """Command words for source/target lookup. Heredoc bodies are data, not
+    words, and shlex is per-character slow, so it only sees a bounded,
+    body-stripped command."""
+    head = _VSC_HEREDOC_RE.sub(" ", raw[:262144])[:16384]
+    try:
+        return shlex.split(head, posix=True)
+    except ValueError:
+        return head.split()
+
+
 def _vsc_shell_source_findings(ev: Event, raw: str) -> list:
     """A settings file copied/concatenated in from elsewhere (`cp x.json
     .vscode/settings.json`, `cat x > ...`): read each existing regular file
     the command names and judge it in both settings shapes."""
-    try:
-        toks = shlex.split(raw, posix=True)
-    except ValueError:
-        toks = raw.split()
+    toks = _vsc_tokens(raw)
+    head = " ".join(toks[:256])
+    copyish = bool(re.search(r"\b(?:cp|copy|copy-item|cpi|install|ln|mv|move|rsync|cat|tee|dd)\b", head))
+    has_ln = bool(re.search(r"\bln\b", head))
     out, seen = [], 0
     for t in toks[:256]:
         t = t.lstrip("<>")
@@ -6380,11 +6430,10 @@ def _vsc_shell_source_findings(ev: Event, raw: str) -> list:
             t = t[3:]
         if not t or t.startswith("-") or len(t) > 4096 or seen >= _NPMRC_MAX_SOURCES:
             continue
-        if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + t) and not re.search(
-                r"\b(?:cp|copy|copy-item|cpi|install|ln|mv|move|rsync|cat|tee|dd)\b", raw):
+        if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + t) and not copyish:
             continue
         txt = _npmrc_read(ev, t)
-        if txt is None and re.search(r"\bln\b", raw) and not os.path.isabs(t):
+        if txt is None and has_ln and not os.path.isabs(t):
             # A relative symlink target resolves against the LINK's folder.
             for d in toks[:256]:
                 if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + d):
@@ -6405,10 +6454,7 @@ def _vsc_shell_source_findings(ev: Event, raw: str) -> list:
 def _vsc_inplace_findings(ev: Event, raw: str) -> list:
     """`sed -i 's#/usr/bin/git#./x#' .vscode/settings.json` rewrites only a
     VALUE; ask when the in-place target already holds an exec-bearing key."""
-    try:
-        toks = shlex.split(raw, posix=True)
-    except ValueError:
-        toks = raw.split()
+    toks = _vsc_tokens(raw)
     for t in toks[:256]:
         if not patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + t):
             continue
@@ -6427,14 +6473,14 @@ def _vsc_inplace_findings(ev: Event, raw: str) -> list:
 _VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|)]|$)", re.IGNORECASE)
 _VSC_OPAQUE_RE = re.compile(
     r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
-    r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)|git\s+(?:checkout|restore)"
+    r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)|git\s+(?:show|cat-file|archive)"
     r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
     re.IGNORECASE,
 )
 _VSC_IMPLICIT_WRITE_RE = re.compile(
     # another revision (`git checkout evil -- f`, `git restore -s evil f`);
     # restoring from HEAD/the index is not new content.
-    r"\bgit\s+checkout\s+(?:-\w+\s+)*(?!--|HEAD\b|@\s)[^\s-]\S*\s+--"
+    r"\bgit\s+checkout\s+(?:-\w+\s+)*(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
     r"|\bgit\s+restore\b[^;&|\n]*(?:--source|\s-s\b)"
     r"|\b(?:bs)?tar\s+-?\w*x\w*\b"
     r"|\bunzip\b|\b7z\s+[xe]\b",
@@ -6453,7 +6499,48 @@ def _vsc_decode_printf(cmd: str) -> str:
     return _VSC_PRINTF_ESC_RE.sub(_d, cmd)
 
 
+_VSC_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\n|(?<![|>])&(?![>&])")
+_VSC_SINK_RE = re.compile(r">|\btee\b|\bsponge\b|\bof=|\s-\w*[oO]\b|-OutFile\b|\bSet-Content\b|\bOut-File\b",
+                          re.IGNORECASE)
+_VSC_LISTING_RE = re.compile(r"\btar\s+-?\w*t|\bunzip\s+-\w*[lvZ]|\b7z\s+l\b", re.IGNORECASE)
+
+
+def _vsc_opaque_findings(cmd: str, dir_dest: bool) -> list:
+    """Content the command doesn't show -- a download, a decode, an archive
+    extraction, another git revision -- landing in a settings file, judged
+    per `;`/`&&`/`||`/newline segment (pipes stay in one segment)."""
+    for seg in _VSC_SEGMENT_SPLIT_RE.split(cmd[:200000]):
+        if not (patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(seg)
+                or (dir_dest and patterns.VSCODE_SETTINGS_BARE_FILENAME_RE.search(seg))):
+            continue
+        m = _VSC_IMPLICIT_WRITE_RE.search(seg)
+        if m and not _VSC_LISTING_RE.search(seg):
+            return [("<opaque write>", m.group(0))]
+        m = _VSC_OPAQUE_RE.search(seg)
+        if m and _vsc_sink_is_settings(seg, dir_dest):
+            return [("<opaque write>", m.group(0))]
+    return []
+
+
+def _vsc_sink_is_settings(seg: str, dir_dest: bool) -> bool:
+    """Is a redirect / tee / sponge / -o / of= target in ``seg`` a settings
+    file (not `git show x:.vscode/settings.json > /tmp/a`)?"""
+    for m in _VSC_SINK_RE.finditer(seg):
+        tm = re.match(r"\s*(?:-\w+\s+)*[\"']?([^\s'\";&|]{1,4096})", seg[m.end():m.end() + 4200])
+        if not tm:
+            continue
+        tok = tm.group(1)
+        if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + tok) or (
+                dir_dest and re.search(r"(?:^|[/\\])(?:\.vscode[/\\]?|settings\.json)$", tok, re.I)):
+            return True
+    return False
+
+
 def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
+    if len(raw) > 20000:
+        # The shared scan surface stops at 20k chars; a large heredoc's
+        # tail would otherwise never be read.
+        cmd = cmd + "\n" + raw[:_NPMRC_MAX_FILE]
     if _VSC_PRINTF_ESC_RE.search(cmd):
         cmd = cmd + "\n" + _vsc_decode_printf(cmd)
     dir_dest = bool(_VSC_DIR_DEST_RE.search(cmd)
@@ -6477,11 +6564,13 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
     found = _vsc_jq_findings(cmd)
     if found:
         return found
-    implicit = _VSC_IMPLICIT_WRITE_RE.search(cmd)
-    if implicit and kind != "devcontainer":
-        # Writes whose content the command doesn't show: another git
-        # revision, an archive extraction.
-        return [("<opaque write>", implicit.group(0))]
+    if kind != "devcontainer":
+        # Segment on the raw command: the scan surface concatenates its
+        # de-obfuscated variants, which would splice segments together.
+        op = _vsc_opaque_findings(raw if not _VSC_PRINTF_ESC_RE.search(raw)
+                                  else _vsc_decode_printf(raw), dir_dest)
+        if op:
+            return op
     if not write_verb:
         return found
     surface = cmd + "\n" + re.sub(r"\\+([\"'])", r"\1", cmd)
@@ -6493,10 +6582,6 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
         found = _vsc_shell_source_findings(ev, raw)
     if not found and patterns.NPMRC_INPLACE_EDITOR_RE.search(cmd):
         found = _vsc_inplace_findings(ev, raw)
-    if not found and _VSC_OPAQUE_RE.search(cmd) and kind != "devcontainer":
-        # Content the command doesn't show (download, decode, archive,
-        # another git revision) landing in a settings file.
-        found = [("<opaque write>", _VSC_OPAQUE_RE.search(cmd).group(0))]
     return found
 
 
@@ -6651,7 +6736,23 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     ``..``/symlinked target paths, devcontainer ``customizations.vscode.
     settings``, opaque writes (decode/archive/another git revision),
     printf/``echo -e`` escapes in keys, and JSONC comments inside a nested
-    text-mode object."""
+    text-mode object. Round 3 (verification) found the Windows system-path
+    branch still let ``cmd.exe /c x`` through (segments now may not start
+    or end with whitespace, the last none at all), that a JSONDecodeError
+    recounts newlines from the start of the text on every failed decode
+    (decodes now run on a bounded 64 KiB slice; whole-remainder decodes are
+    budgeted), that shlex on a large heredoc was quadratic (tokens now come
+    from a bounded, heredoc-stripped command), that the shared 20k-char
+    scan surface hid a large heredoc's tail (the raw command is scanned
+    too), and that the opaque-write check spanned unrelated commands (now
+    per ``;``/``&&``/``||`` segment, with the settings file as the sink or
+    checkout pathspec; ``tar -t``/``unzip -l`` excluded; ``git show
+    rev:f > f`` and ``git checkout rev f`` added). ``GOFLAGS`` now asks only
+    on ``-toolexec``/``-exec``/``-overlay``/``-modfile``/``-pgo``, and a
+    devcontainer's ``/usr/local/{bin,py-utils/bin,python}`` image paths are
+    exempt (Microsoft's stock templates). Checking out a settings file from
+    another revision (``git checkout main -- f``) asks by design; from
+    HEAD/the index it doesn't."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
