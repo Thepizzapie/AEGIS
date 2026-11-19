@@ -5798,13 +5798,33 @@ def rule_vscode_tasks_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
-_VSC_MAX_LEAVES = 20000
+_VSC_MAX_LEAVES = 100000
+_VSC_DECODE_BUDGET = 4 * 1024 * 1024
 _VSC_COSMETIC = frozenset(("icon", "color", "overridename", "hidden", "source", "istransient"))
+# Root-owned system locations: a binary path, or a JDK/SDK home directory.
+# The Windows branch is path-only (no whitespace or ':' inside a segment, so
+# no trailing arguments) and refuses the user-writable System32 subfolders.
 _VSC_SAFE_SYSTEM_RE = re.compile(
     r"/(?:usr/)?s?bin/[\w.+-]{1,100}"
-    r"|[a-z]:[\\/]+(?:windows[\\/]+system32|program files(?: \(x86\))?)[\\/][^\"'\n]{1,200}",
+    r"|(?:/usr/lib/jvm|/usr/lib/go|/usr/local/go|/usr/share/dotnet"
+    r"|/Library/Java/JavaVirtualMachines)(?:/[\w.+-]{1,100}){0,8}/?"
+    r"|[a-z]:[\\/]+(?:windows[\\/]+system32|program files(?: \(x86\))?)"
+    r"(?![^\n]*[\\/](?:spool|tasks|temp|tmp|com)[\\/])"
+    r"(?:[\\/]+[^\\/\"'\n|&;<>:]{1,100}){1,8}",
     re.IGNORECASE,
 )
+_VSC_TRUNC = ("<file>", "too many keys / too complex to inspect")
+_VSC_SHELL_META_RE = re.compile(r"[|&;<>$`()\\{}*?!]")
+_VSC_INTERPRETERS = frozenset((
+    "node", "nodejs", "python", "python2", "python3", "py", "sh", "bash", "zsh", "dash",
+    "ksh", "fish", "pwsh", "powershell", "cmd", "perl", "ruby", "deno", "bun", "env",
+    "npx", "bunx", "pnpx", "uvx", "pipx", "eval", "exec", "xargs", "curl", "wget",
+))
+_VSC_SAFE_FLAG_RE = re.compile(r"-{1,2}[A-Za-z][\w-]{0,40}")
+_VSC_RISKY_FLAGS = frozenset((
+    "-c", "--command", "--rcfile", "--init-file", "-command", "-file", "-encodedcommand",
+    "-e", "-ec", "-enc", "--eval", "-x", "--login-command", "-r", "--require", "--import",
+))
 _VSC_BARE_RE = re.compile(r"[A-Za-z0-9][\w.+-]{0,100}")
 _VSC_SCRIPT_EXT_RE = re.compile(
     r"\.(?:js|cjs|mjs|ts|sh|bash|zsh|py|pyw|rb|pl|ps1|psm1|bat|cmd|com|exe|vbs|jar|so|dll|dylib)$",
@@ -5890,7 +5910,11 @@ def _vsc_leaves(obj, prefix: str = "", out=None, _depth: int = 0) -> list:
     and a ``"[lang]"`` override block contributes its keys unprefixed."""
     if out is None:
         out = []
-    if _depth > 40 or len(out) > _VSC_MAX_LEAVES:
+    if len(out) > _VSC_MAX_LEAVES:
+        if out[-1] is not _VSC_TRUNC:
+            out.append(_VSC_TRUNC)
+        return out
+    if _depth > 40:
         return out
     if isinstance(obj, dict):
         if not obj and prefix:
@@ -5904,6 +5928,73 @@ def _vsc_leaves(obj, prefix: str = "", out=None, _depth: int = 0) -> list:
     else:
         out.append((prefix, obj))
     return out
+
+
+def _vsc_cmdline_safe(v) -> bool:
+    """A command line is safe when it is a bare, non-interpreter program name
+    followed only by plain words/flags: no paths, no shell metacharacters
+    (`npm test --`, `yarn jest`, `cargo clippy --message-format=json`)."""
+    if v is None or v == "" or v == []:
+        return True
+    if isinstance(v, list):
+        if not all(isinstance(x, str) for x in v) or len(v) > 64:
+            return False
+        toks = list(v)
+    elif isinstance(v, str):
+        if v == _VSC_UNKNOWN:
+            return False
+        toks = v.split()
+    else:
+        return isinstance(v, bool)
+    if not toks:
+        return True
+    first = toks[0]
+    if (not _VSC_BARE_RE.fullmatch(first) or _VSC_SCRIPT_EXT_RE.search(first)
+            or first.lower() in _VSC_INTERPRETERS):
+        return False
+    for t in toks[1:]:
+        if (_VSC_SHELL_META_RE.search(t) or "/" in t or "\\" in t or ".." in t
+                or not re.fullmatch(r"[\w@.=:+,-]{1,200}", t)
+                or _vsc_risky_flag(t)):
+            return False
+    return True
+
+
+def _vsc_risky_flag(t: str) -> bool:
+    f = t.strip().split("=", 1)[0]
+    # Short flags are case-sensitive (`less -R` is not node's `-r`).
+    return (f if len(f) <= 2 else f.lower()) in _VSC_RISKY_FLAGS
+
+
+def _vsc_args_safe(v) -> bool:
+    """Shell args are safe when they are only ordinary flags (`-l`,
+    `--login`, `-NoLogo`) -- never a command/rc-file/eval flag."""
+    if v in (None, "", []):
+        return True
+    vals = v if isinstance(v, list) else [v]
+    if len(vals) > 64:
+        return False
+    for x in vals:
+        if not isinstance(x, str) or not _VSC_SAFE_FLAG_RE.fullmatch(x.strip()):
+            return False
+        if _vsc_risky_flag(x):
+            return False
+    return True
+
+
+def _vsc_env_value_dangerous(name: str, v) -> bool:
+    if not _vsc_nonempty(v):
+        return False
+    up = name.upper()
+    if not isinstance(v, str):
+        return True
+    if up == "NODE_OPTIONS":
+        return _npmrc_value_dangerous("node-options", v)
+    if up in ("EDITOR", "VISUAL", "GIT_EDITOR", "PAGER", "GIT_PAGER"):
+        return not _vsc_cmdline_safe(v) and not (
+            _VSC_BARE_RE.fullmatch(v.split()[0]) and v.split()[0].lower() == "code"
+            and all(_VSC_SAFE_FLAG_RE.fullmatch(t) for t in v.split()[1:]))
+    return True
 
 
 def _vsc_path_safe(v, generic: bool = False) -> bool:
@@ -5926,7 +6017,7 @@ def _vsc_path_safe(v, generic: bool = False) -> bool:
         return True
     if _VSC_SAFE_SYSTEM_RE.fullmatch(s):
         return True
-    return bool(generic and _VSC_DATA_EXT_RE.search(s))
+    return bool(generic == "data" and _VSC_DATA_EXT_RE.search(s))
 
 
 def _vsc_nonempty(v) -> bool:
@@ -5946,22 +6037,30 @@ def _vsc_dangerous(key: str, v, shell_text: str = "") -> bool:
         if isinstance(v, str):
             return v.strip().lower() in [b for b in bad if isinstance(b, str)]
         return any(v is b for b in bad if isinstance(b, bool))
+    if patterns.VSCODE_AUTOAPPROVE_STRUCT_KEY_RE.match(k):
+        # Agent auto-approve maps: an entry approving a command/tool.
+        return v is True or (isinstance(v, str) and v.strip().lower() == "true")
     orig_last = key.split(".")[-1]
     if (len(segs) >= 2 and any(s in patterns.VSCODE_ENV_CONTAINER_SEG for s in segs[:-1])
             and patterns.VSCODE_DANGEROUS_ENV_RE.match(orig_last)):
-        return _vsc_nonempty(v)
+        return v == _VSC_UNKNOWN or _vsc_env_value_dangerous(orig_last, v)
     if patterns.VSCODE_EXEC_STRUCT_KEY_RE.match(k):
         last = segs[-1]
         if last in _VSC_COSMETIC:
             return False
         if "args" in last or k.startswith("terminal.integrated.shellargs"):
-            return _vsc_nonempty(v)
+            return v == _VSC_UNKNOWN or not _vsc_args_safe(v)
         return not _vsc_path_safe(v)
+    if _VSC_CMDLINE_KEY_RE.search(k):
+        return not _vsc_cmdline_safe(v)
     if patterns.VSCODE_EXEC_PATH_KEY_RE.match(k):
         return not _vsc_path_safe(v)
     if patterns.VSCODE_EXEC_PATH_SUFFIX_RE.search(k):
-        return not _vsc_path_safe(v, generic=True)
+        return not _vsc_path_safe(v, generic="data" if segs[-1] == "path" else False)
     return False
+
+
+_VSC_CMDLINE_KEY_RE = re.compile(r"(?:commandline|cmdline|overridecommand|runnables\.command)$")
 
 
 def _vsc_rep(v) -> str:
@@ -5984,7 +6083,11 @@ def _vsc_struct_findings(obj: dict, kind: str) -> list:
                     and ro["runOn"].strip().lower() == "folderopen"):
                 out.append(("tasks.runoptions.runon",
                             _vsc_rep({"label": t.get("label"), "command": t.get("command")})))
-    for k, v in _vsc_leaves(root):
+    for leaf in _vsc_leaves(root):
+        if leaf is _VSC_TRUNC:
+            out.append(_VSC_TRUNC)
+            continue
+        k, v = leaf
         if k and _vsc_dangerous(k, v):
             out.append((k.lower(), _vsc_rep(v)))
     return out
@@ -5995,56 +6098,84 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
     fragment, a shell heredoc/echo): every quoted ``"key":`` is classified
     with the JSON value that follows it (decoded with ``raw_decode``; an
     object value is flattened under the key). A value that can't be decoded
-    counts as unknown -- dangerous for an exec key."""
+    counts as unknown -- dangerous for an exec key. Keys inside a span
+    already decoded are skipped (flattened with their parent), and the total
+    bytes scanned by the decoder are budgeted -- running out fails closed."""
     text = _claude_env_normalize(text) if "\\u" in text else text
     dec = json.JSONDecoder()
     seen, out = set(), []
+    budget = [_VSC_DECODE_BUDGET]
 
     def _add(k, v):
+        if (k, v) == _VSC_TRUNC:
+            if _VSC_TRUNC not in seen:
+                seen.add(_VSC_TRUNC)
+                out.append(_VSC_TRUNC)
+            return
         if k and _vsc_dangerous(k, v, text):
             f = (k.lower(), _vsc_rep(v))
             if f not in seen:
                 seen.add(f)
                 out.append(f)
 
-    keyed = list(patterns.VSCODE_SETTINGS_KEY_TEXT_RE.finditer(text))
+    def _scan(matches, bare_mode: bool, decoded_keys: set):
+        covered_end = -1
+        for m in matches[:4096]:
+            if m.start() < covered_end:
+                continue
+            key = m.group(1)
+            if bare_mode and key.lower() in decoded_keys:
+                continue
+            if kind == "workspace" and key.lower().startswith("settings."):
+                key = key[9:]
+            j = m.end()
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if budget[0] <= 0:
+                _add(*_VSC_TRUNC)
+                return
+            try:
+                val, vend = dec.raw_decode(text, j)
+                budget[0] -= vend - j
+                if isinstance(val, dict):
+                    covered_end = vend
+            except (ValueError, RecursionError) as e:
+                budget[0] -= max(1, getattr(e, "pos", len(text)) - j)
+                val = _VSC_UNKNOWN
+                if bare_mode:
+                    # De-quoted shell surface (`{git.path: git}`): the value
+                    # is the bare token up to the next delimiter.
+                    bm = re.match(r"[^\s,}{\[\]\"';&|]{1,400}", text[j:j + 400])
+                    if bm and not text.startswith(("{", "["), j):
+                        val = bm.group(0)
+            if not bare_mode:
+                decoded_keys.add(key.lower())
+            if key == "settings" and kind == "workspace" and isinstance(val, dict):
+                for leaf in _vsc_leaves(val):
+                    _add(*leaf)
+                continue
+            if isinstance(val, dict):
+                for leaf in _vsc_leaves(val, key):
+                    _add(*leaf)
+                if not val:
+                    _add(key, val)
+                continue
+            _add(key, val)
+            # A dangerous env var as a bare key in an Edit fragment (its
+            # env-map container is outside the fragment). Not on shell text,
+            # where unrelated `PATH:`-like words are common.
+            if (not shell and key.isupper() and patterns.VSCODE_DANGEROUS_ENV_RE.match(key)
+                    and (val == _VSC_UNKNOWN or _vsc_env_value_dangerous(key, val))):
+                f = ("<env>." + key, _vsc_rep(val))
+                if f not in seen:
+                    seen.add(f)
+                    out.append(f)
+
+    decoded = set()
+    _scan(list(patterns.VSCODE_SETTINGS_KEY_TEXT_RE.finditer(text)), False, decoded)
     if shell:
-        keyed += list(re.finditer(r"(?:^|[{,\s])([A-Za-z_][\w./-]{0,300})\s*:(?!//)", text))
-    for m in keyed[:4096]:
-        key = m.group(1)
-        if kind == "workspace" and key.lower().startswith("settings."):
-            key = key[9:]
-        j = m.end()
-        while j < len(text) and text[j] in " \t\r\n":
-            j += 1
-        try:
-            val, _ = dec.raw_decode(text, j)
-        except (ValueError, RecursionError):
-            val = _VSC_UNKNOWN
-            if shell:
-                # De-quoted shell surface (`{git.path: git}`): the value is
-                # the bare token up to the next delimiter.
-                bm = re.match(r"[^\s,}{\[\]\"';&|]{1,400}", text[j:j + 400])
-                if bm and not text.startswith(("{", "["), j):
-                    val = bm.group(0)
-        if key == "settings" and kind == "workspace" and isinstance(val, dict):
-            for k2, v2 in _vsc_leaves(val):
-                _add(k2, v2)
-            continue
-        if isinstance(val, dict):
-            for k2, v2 in _vsc_leaves(val, key):
-                _add(k2, v2)
-            if not val:
-                _add(key, val)
-            continue
-        _add(key, val)
-        # A dangerous env var as a bare key in a fragment (its env-map
-        # container is outside the fragment).
-        if key.isupper() and patterns.VSCODE_DANGEROUS_ENV_RE.match(key) and _vsc_nonempty(val):
-            f = ("<env>." + key, _vsc_rep(val))
-            if f not in seen:
-                seen.add(f)
-                out.append(f)
+        _scan(list(re.finditer(r"(?:^|[{,\s])([A-Za-z_][\w./-]{0,300})\s*:(?!//)", text)),
+              True, decoded)
     if kind == "workspace" and patterns.VSCODE_TASKS_RUNON_RE.search(text):
         out.append(("tasks.runoptions.runon", '"folderOpen"'))
     return out
@@ -6109,6 +6240,9 @@ def _vsc_new_findings(ev: Event, p: str) -> list:
         # finding shapes line up.
         new = _vsc_text_findings(after, kind)
         old = _vsc_text_findings(before, kind) if before is not None else []
+    if _VSC_TRUNC in new:
+        # Never diff a file the guard couldn't fully inspect.
+        return [_VSC_TRUNC]
     added = []
     for f in new:
         if f in old:
@@ -6132,8 +6266,11 @@ def _vsc_jq_findings(cmd: str) -> list:
     for m in re.finditer(r"(?:\.(?:\[\s*)?(?:\"[^\"\n]{1,300}\"|'[^'\n]{1,300}'|[A-Za-z_][\w-]*)(?:\s*\])?)+", cmd):
         parts = re.findall(r"\"([^\"\n]{1,300})\"|'([^'\n]{1,300})'|([A-Za-z_][\w-]*)", m.group(0))
         key = ".".join(a or b or c for a, b, c in parts)
+        tail = cmd[m.end():m.end() + 200]
+        vm = re.match(r"\s*(?:\|=|\+=|=(?!=))\s*(\"[^\"\n]{0,200}\"|'[^'\n]{0,200}'|[^\s|)}]{1,200})", tail)
+        assigned = vm.group(1).strip("\"'") if vm else ""
         for cand in {key, (parts[-1][0] or parts[-1][1] or parts[-1][2]) if parts else ""}:
-            if cand and (_vsc_dangerous(cand, _VSC_UNKNOWN, cmd)
+            if cand and (_vsc_dangerous(cand, _VSC_UNKNOWN, assigned)
                          or (cand.isupper() and patterns.VSCODE_DANGEROUS_ENV_RE.match(cand))):
                 out.append((cand.lower(), "<jq>"))
     return out
@@ -6156,6 +6293,13 @@ def _vsc_shell_source_findings(ev: Event, raw: str) -> list:
                 r"\b(?:cp|copy|copy-item|cpi|install|ln|mv|move|rsync|cat|tee|dd)\b", raw):
             continue
         txt = _npmrc_read(ev, t)
+        if txt is None and re.search(r"\bln\b", raw) and not os.path.isabs(t):
+            # A relative symlink target resolves against the LINK's folder.
+            for d in toks[:256]:
+                if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(" " + d):
+                    txt = _npmrc_read(ev, os.path.join(os.path.dirname(d.rstrip("/\\")) or ".", t))
+                    if txt is not None:
+                        break
         if txt is None:
             continue
         seen += 1
@@ -6228,13 +6372,44 @@ def _vscode_settings_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
-def _vsc_owned_by_tasks_guard(text: str, found: list) -> list:
+def _vsc_tasks_guard_sees(ev: Event) -> bool:
+    """Would `rule_vscode_tasks_protect`'s own detector flag this event's
+    ``task.allowAutomaticTasks: "on"``? (Its literal-text detector, not its
+    escapes/mode.)"""
+    a = ev.args or {}
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else " ".join(_flatten_strings(a))
+        if patterns.VSCODE_ALLOW_AUTOTASKS_RE.search(content or ""):
+            return True
+        return ev.action == ActionClass.MCP and bool(
+            _vscode_struct_kv_hit(a, "task.allowautomatictasks", "on")
+            or _vscode_mcp_bareword_kv_hit(a, "task.allowautomatictasks", "on"))
+    cmd = _shell_scan(ev)
+    write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                      or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                      or patterns.INPLACE_WRITE_RE.search(cmd)
+                      or patterns.FORCED_LINK_WRITE_RE.search(cmd))
+    return bool(patterns.VSCODE_SETTINGS_JQ_RE.search(cmd)
+                or (write_verb and patterns.VSCODE_ALLOW_AUTOTASKS_RE.search(cmd)))
+
+
+def _vsc_owned_by_tasks_guard(ev: Event, text: str, found: list) -> list:
     """``task.allowAutomaticTasks`` in ``.vscode/settings.json`` is
-    `rule_vscode_tasks_protect`'s finding (and escape hatch); keep it here
-    only for the .code-workspace / user-settings files that guard doesn't
-    cover."""
+    `rule_vscode_tasks_protect`'s finding (and escape hatch) -- but only for
+    the forms its detector actually sees; nested/commented/escaped forms it
+    misses stay here, as do the .code-workspace / user-settings files it
+    doesn't cover."""
     if (patterns.VSCODE_WORKSPACE_FILE_PATH_RE.search(text)
             or patterns.VSCODE_USER_SETTINGS_PATH_RE.search(text)):
+        return found
+    if not any(f[0] == "task.allowautomatictasks" for f in found):
+        return found
+    try:
+        sees = _vsc_tasks_guard_sees(ev)
+    except Exception:
+        sees = False
+    if not sees:
         return found
     return [f for f in found if f[0] != "task.allowautomatictasks"]
 
@@ -6337,7 +6512,7 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
             found = _vsc_new_findings(ev, p)
         except Exception:
             found = [("<file>", "could not be inspected")]
-        found = _vsc_owned_by_tasks_guard(p, found)
+        found = _vsc_owned_by_tasks_guard(ev, p, found)
         if not found:
             return None
         if (os.environ.get("AEGIS_ALLOW_VSCODE_SETTINGS_EXEC")
@@ -6357,7 +6532,7 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
         except Exception:
             found = ([("<command>", "could not be inspected")]
                      if patterns.VSCODE_SETTINGS_EXEC_PATH_RE.search(cmd) else [])
-        found = _vsc_owned_by_tasks_guard(cmd, found)
+        found = _vsc_owned_by_tasks_guard(ev, cmd, found)
         if not found:
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_VSCODE_SETTINGS_EXEC")

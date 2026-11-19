@@ -2977,7 +2977,8 @@ VSCODE_EXEC_PATH_KEY_RE = re.compile(
     r"|deno\.path|bun\.runtime"
     r"|rust-analyzer\.(?:server\.path|check\.overridecommand"
     r"|cargo\.buildscripts\.overridecommand|runnables\.command)"
-    r"|clangd\.path|c_cpp\.clang_format_path|cmake\.cmakepath"
+    r"|clangd\.path|c_cpp\.clang_format_path|c_cpp\.default\.compilerpath|cmake\.cmakepath"
+    r"|biome\.lspbin|rust-analyzer\.procmacro\.server"
     r"|go\.(?:goroot|gopath|toolsgopath)"
     r"|java\.(?:home|jdt\.ls\.java\.home)"
     r"|r\.(?:rterm|rpath)\.\w+|ruby\.interpreter\.commandpath"
@@ -2988,7 +2989,7 @@ VSCODE_EXEC_PATH_KEY_RE = re.compile(
 # third-party extensions): a last key segment that names an executable.
 VSCODE_EXEC_PATH_SUFFIX_RE = re.compile(
     r"\.(?:path|\w*(?:executablepath|executable|exepath|interpreterpath|commandpath"
-    r"|commandline|overridecommand|nodepath|nodeexecutable|serverpath"
+    r"|commandline|cmdline|overridecommand|nodepath|nodeexecutable|serverpath"
     r"|binarypath|sdkpath|toolpath))$"
     r"|^([\w-]+)\.\1path$"
 )
@@ -3005,10 +3006,11 @@ VSCODE_EXEC_STRUCT_KEY_RE = re.compile(
 # are compared upper-cased.
 VSCODE_ENV_CONTAINER_SEG = frozenset((
     "env", "extraenv", "toolsenvvars", "envvars", "environment",
-    "environmentvariables", "nodeenv", "envs",
+    "environmentvariables", "nodeenv", "envs", "configureenvironment",
+    "buildenvironment", "testenvironment",
 ))
 VSCODE_DANGEROUS_ENV_RE = re.compile(
-    r"^(?:BASH_ENV|ENV|NODE_OPTIONS|PERL5OPT|PERL5LIB|PERLLIB|RUBYOPT|RUBYLIB"
+    r"^(?:BASH_ENV|(?-i:ENV)|NODE_OPTIONS|PERL5OPT|PERL5LIB|PERLLIB|RUBYOPT|RUBYLIB"
     r"|PYTHONSTARTUP|PYTHONHOME|PYTHONINSPECT|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT"
     r"|DYLD_\w+|PATH|PROMPT_COMMAND|ZDOTDIR|PS4|SHELLOPTS|BASHOPTS"
     r"|GIT_SSH|GIT_SSH_COMMAND|GIT_EXEC_PATH|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND"
@@ -3022,7 +3024,16 @@ VSCODE_SETTINGS_TOGGLES = {
     "task.allowautomatictasks": ("on",),
     "security.workspace.trust.enabled": (False, "false"),
     "terminal.integrated.allowworkspaceconfiguration": (True, "true"),
+    # Agent-mode (Copilot/Cursor-style) blanket tool/terminal auto-approval.
+    "chat.tools.autoapprove": (True, "true"),
+    "chat.tools.global.autoapprove": (True, "true"),
+    "chat.tools.terminal.enableautoapprove": (True, "true"),
 }
+# Per-command / per-tool auto-approve maps: any entry set to true.
+VSCODE_AUTOAPPROVE_STRUCT_KEY_RE = re.compile(
+    r"^(?:chat\.tools\.terminal\.autoapprove|chat\.agent\.terminal\.allowlist"
+    r"|github\.copilot\.chat\.agent\.terminal\.allowlist|chat\.tools\.urls\.autoapprove)\."
+)
 # A quoted JSON key (as text, not parsed) -- the regex fallback for content
 # that isn't parseable JSONC (an Edit fragment, a shell heredoc).
 VSCODE_SETTINGS_KEY_TEXT_RE = re.compile(
