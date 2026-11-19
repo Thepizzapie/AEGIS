@@ -787,3 +787,42 @@ def test_qa5_jsonc_strip_semantics():
     assert json.loads(_vsc_strip_jsonc('{"u": "http://a//b", /* c */ "x": [1,2,], // t\n}')) \
         == {"u": "http://a//b", "x": [1, 2]}
     assert json.loads(_vsc_strip_jsonc('{"s": "a,]", "q": "\\" // x"}')) == {"s": "a,]", "q": '" // x'}
+
+
+# ---- QA round 6 regressions ----------------------------------------------------------
+def test_qa6_lone_cr_ends_line_comment():
+    body = '{"editor.tabSize": 2 // fmt\r, "git.path": "./tool"}\n}'
+    assert _rule(_write(S, body)) == (RULE, Action.ASK)
+    body = ('{"x": 1 // c\r, "terminal.integrated.env.linux": {"LD_PRELOAD": "./x.so"}}\n}')
+    assert _rule(_write("/root/.config/Code/User/settings.json", body)) == (RULE, Action.ASK)
+    # ordinary CRLF JSONC stays fine
+    assert _hit(_write(S, '{\r\n  // c\r\n  "editor.tabSize": 2,\r\n}\r\n')) is None
+
+
+@pytest.mark.parametrize("body", [
+    '"a//b",' * ((8 << 20) // 7), '"/",' * ((8 << 20) // 4), ',}' * ((8 << 20) // 2),
+    '//\n' * ((8 << 20) // 3),
+], ids=["slashes-in-strings", "slash-strings", "trailing-commas", "comments"])
+def test_qa6_jsonc_dense_fast(body):
+    import time
+    t = time.monotonic()
+    _hit(_write(S, body))
+    assert time.monotonic() - t < 1.5
+
+
+@pytest.mark.parametrize("cmd", [
+    "git --no-pager show evil:.vscode/settings.json > .vscode/settings.json",
+    "git -c core.pager=cat show evil:.vscode/settings.json > .vscode/settings.json",
+])
+def test_qa6_git_global_options(cmd):
+    assert _rule(_shell(cmd)) == (RULE, Action.ASK)
+
+
+def test_qa6_head_restore_from_subdir(tmp_path):
+    (tmp_path / ".git").mkdir()
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    cmd = "git show HEAD:.vscode/settings.json > .vscode/settings.json"
+    assert _hit(_shell(cmd, tmp_path)) is None
+    assert _rule(_shell(cmd, sub)) == (RULE, Action.ASK)
+    assert _hit(_shell("git show HEAD:./.vscode/settings.json > .vscode/settings.json", sub)) is None

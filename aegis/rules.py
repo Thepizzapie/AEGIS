@@ -5844,28 +5844,52 @@ _VSC_UNKNOWN = "<unparsed>"
 _VSC_OVERSIZE = ("<file>", "too large to inspect")
 
 
-_VSC_JSONC_TOK_RE = re.compile(r'"(?:[^"\\\n]|\\.)*(?:"|$)|//[^\n]*|/\*.*?(?:\*/|\Z)', re.DOTALL | re.MULTILINE)
-_VSC_TRAIL_TOK_RE = re.compile(r'"(?:[^"\\\n]|\\.)*(?:"|$)|,(?=\s*[}\]])', re.MULTILINE)
+# A line comment ends at CR or LF, the way VS Code's jsonc-parser reads it
+# (a lone CR would otherwise extend the comment over real keys).
+_VSC_JSONC_TOK_RE = re.compile(
+    r'("(?:[^"\\\r\n]|\\.)*(?:"|$))|//[^\r\n]*|/\*.*?(?:\*/|\Z)', re.DOTALL | re.MULTILINE)
+_VSC_TRAIL_TOK_RE = re.compile(r'("(?:[^"\\\r\n]|\\.)*(?:"|$))|,(?=\s*[}\]])', re.MULTILINE)
+_vsc_strip_memo = [None, None]
 
 
 def _vsc_strip_jsonc(text: str) -> str:
     """JSONC -> JSON the way VS Code's own parser reads settings: drop ``//``
     and ``/* */`` comments and trailing commas, never inside a string.
-    Regex-tokenized (linear, C speed)."""
-    if "/" in text:
-        text = _VSC_JSONC_TOK_RE.sub(
-            lambda m: m.group(0) if m.group(0).startswith('"') else " ", text)
-    if "," in text:
-        text = _VSC_TRAIL_TOK_RE.sub(
-            lambda m: m.group(0) if m.group(0).startswith('"') else "", text)
-    return text
+    Regex-tokenized with a group-template substitution (no per-match Python
+    callback); the last result is memoized since the parse and the text
+    fallback strip the same text."""
+    if _vsc_strip_memo[0] is text:
+        return _vsc_strip_memo[1]
+    out = text
+    if "/" in out:
+        out = _VSC_JSONC_TOK_RE.sub(r"\1", out)
+    if "," in out:
+        out = _VSC_TRAIL_TOK_RE.sub(r"\1", out)
+    _vsc_strip_memo[0], _vsc_strip_memo[1] = text, out
+    return out
+
+
+_VSC_STRIP_MAX = 2 * 1024 * 1024
+_VSC_JSONC_HINT_RE = re.compile(r"//|/\*|,\s*[}\]]")
+
+
+def _vsc_needs_strip(text: str) -> bool:
+    return bool(_VSC_JSONC_HINT_RE.search(text))
 
 
 def _vsc_parse(text: str):
+    text = text.lstrip("\ufeff")
     try:
-        obj = json.loads(_vsc_strip_jsonc(text.lstrip("\ufeff")))
+        obj = json.loads(text)          # plain JSON: no stripping needed
     except (ValueError, RecursionError, TypeError):
-        return None
+        obj = None
+        # Tokenizing JSONC costs a Python step per string token; past 2 MiB
+        # leave it to the text fallback, which fails closed on such input.
+        if len(text) <= _VSC_STRIP_MAX and _vsc_needs_strip(text):
+            try:
+                obj = json.loads(_vsc_strip_jsonc(text))
+            except (ValueError, RecursionError, TypeError):
+                obj = None
     return obj if isinstance(obj, dict) else None
 
 
@@ -6236,7 +6260,11 @@ def _vsc_text_findings(text: str, kind: str, shell: bool = False) -> list:
     if shell:
         _scan(list(re.finditer(r"(?:^|[{,\s])([A-Za-z_][\w./-]{0,300})\s*:(?!//)", text)),
               True, decoded)
-    if ("//" in text or "/*" in text or re.search(r",\s*[}\]]", text)) and budget[0] > 0:
+    if len(text) > _VSC_STRIP_MAX and _vsc_needs_strip(text):
+        # Too large to JSONC-tokenize cheaply: a nested key behind a comment
+        # could be missed, so fail closed.
+        _add(*_VSC_TRUNC)
+    elif _vsc_needs_strip(text) and budget[0] > 0:
         # JSONC comments / trailing commas make raw_decode fail on a nested
         # object; scan a stripped copy too (union -- the original is kept,
         # since a `//` in a shell URL would strip real content).
@@ -6479,14 +6507,14 @@ _VSC_DIR_DEST_RE = re.compile(r"(?:^|[\s'\"/\\=])\.vscode[ .]*[/\\]?(?=[\s'\";&|
 _VSC_OPAQUE_RE = re.compile(
     r"\b(?:curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod|xxd\s+-r|uudecode"
     r"|base64\s+(?:-\w*d|--decode)|openssl\s+(?:base64|enc)"
-    r"|git\s+show\s+(?:-\S+\s+)*\S+|git\s+(?:cat-file|archive)"
+    r"|git\s+(?:(?:-c\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*(?:show\s+(?:-\S+\s+)*\S+|cat-file|archive)"
     r"|tar\s|bsdtar|unzip|7z|gunzip|zcat|gzip\s+-d)\b",
     re.IGNORECASE,
 )
 _VSC_IMPLICIT_WRITE_RE = re.compile(
     # another revision (`git checkout evil -- f`, `git restore -s evil f`);
     # restoring from HEAD/the index is not new content.
-    r"\bgit\s+checkout\s+(?:-\w+\s+)*(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
+    r"\bgit\s+(?:(?:-c\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*checkout\s+(?:-\w+\s+)*(?!--\s|HEAD\s|@\s)[^\s-]\S*\s+(?:--\s+)?[^\s-]"
     r"|\bgit\s+restore\b[^;&|\n]*(?:--source|\s-s\b)"
     r"|\b(?:bs)?tar\s+-?\w*x\w*\b"
     r"|\bunzip\b|\b7z\s+[xe]\b",
@@ -6551,20 +6579,26 @@ def _vsc_opaque_variants(raw: str) -> list:
 
 
 _VSC_GIT_RESTORE_RE = re.compile(
-    r"^\s*git\s+show\s+(?:HEAD|@)?:([^\s;&|<>]+)\s*(?:>\|?|\|\s*tee)\s*([^\s;&|<>]+)\s*$")
+    r"^\s*git\s+(?:(?:-c\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*show\s+(?:HEAD|@)?:([^\s;&|<>]+)"
+    r"\s*(?:>\|?|\|\s*tee)\s*([^\s;&|<>]+)\s*$")
 
 
-def _vsc_is_head_restore(seg: str) -> bool:
+def _vsc_is_head_restore(seg: str, cwd=None) -> bool:
     """`git show HEAD:f > f`: one committed object written back to its own
-    path (not another file's content)."""
+    path (not another file's content). ``HEAD:f`` is repo-root-relative and
+    the redirect cwd-relative, so outside the repo root only the
+    cwd-relative ``HEAD:./f`` form counts."""
     m = _VSC_GIT_RESTORE_RE.match(seg)
     if not m:
+        return False
+    if (cwd and not m.group(1).startswith("./")
+            and not os.path.exists(os.path.join(str(cwd), ".git"))):
         return False
     a, b = (os.path.normpath(x.strip("'\"")) for x in m.groups())
     return a == b
 
 
-def _vsc_opaque_findings(raw: str, dir_dest: bool) -> list:
+def _vsc_opaque_findings(raw: str, dir_dest: bool, cwd=None) -> list:
     """Content the command doesn't show -- a download, a decode, an archive
     extraction, another git revision -- landing in a settings file, judged
     per `;`/`&&`/`||`/newline segment (pipes stay in one segment). A
@@ -6584,7 +6618,7 @@ def _vsc_opaque_findings(raw: str, dir_dest: bool) -> list:
                     return [("<opaque write>", m.group(0))]
                 producer = producer or m.group(0)
             m = _VSC_OPAQUE_RE.search(seg)
-            if m and _vsc_is_head_restore(seg):
+            if m and _vsc_is_head_restore(seg, cwd):
                 m = None
             if m:
                 if hit and (_vsc_sink_is_settings(seg, dir_dest)
@@ -6655,7 +6689,7 @@ def _vsc_shell_findings(ev: Event, raw: str, cmd: str) -> list:
     if kind != "devcontainer":
         # Segment on the raw command: the scan surface concatenates its
         # de-obfuscated variants, which would splice segments together.
-        op = _vsc_opaque_findings(raw, dir_dest)
+        op = _vsc_opaque_findings(raw, dir_dest, ev.cwd)
         if op:
             return op
     if not write_verb:
@@ -6864,7 +6898,15 @@ def rule_vscode_settings_exec_protect(ev: Event, policy=None) -> Optional[Decisi
     .vscode`` heredoc past the 20k scan surface went unread, that a dotted
     MCP server name (``io.github.foo/srv``) escaped the MCP check, that a
     trailing redirect/comment hid a staged copy's destination, and that the
-    per-character JSONC stripper took ~3 s on 8 MB (now regex-tokenized)."""
+    per-character JSONC stripper took ~3 s on 8 MB. Round 6 (verification)
+    found that regex rewrite still paid a Python callback per string token
+    (now a group-template substitution, memoized between the parse and the
+    text fallback), that a lone CR did not end a ``//`` comment the way VS
+    Code's parser ends it (hiding a following key), git global options
+    (``--no-pager``, ``-c k=v``) before ``show``/``checkout``, and a
+    ``HEAD:f > f`` restore run from a subdirectory (a different file).
+    Plain JSON is now parsed without stripping, and JSONC over 2 MiB is not
+    tokenized: the text fallback fails closed (ASK) on it instead."""
     cfg = getattr(policy, "vscode_settings_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
