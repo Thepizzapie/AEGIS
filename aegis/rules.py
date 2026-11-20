@@ -10878,25 +10878,36 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     `python`/LLDB `script` blocks); `system()`/`system2()`/`pipe()`/
     `processx::`/`download.file()`/remote `source()` for R; backticks/
     `%x`/`system`/`exec`/`spawn`/`IO.popen`/`Open3` for Ruby; `:!`/`:cmd`/
-    `System.Process` for GHCi; `shell`/`!`/`pipe`/`|` for gdb; `platform
-    shell`/`shell` for LLDB; `\\!`, `\\o |cmd`, `\\copy ... program`,
-    `COPY ... PROGRAM`, a pager/editor `\\setenv`/`\\pset pager` for psql;
-    `.system`/`.shell`/`.load`/`.once |cmd` for sqlite3; `run(`/backtick
+    `System.Process` for GHCi; `shell`/`!`/`pipe`/`|`, an `alias` to one
+    of those, and `target remote | CMD` for gdb; `platform shell` (any
+    unique prefix, `pla sh`), `shell`, `process launch`/`run` and `target
+    create <shell>` for LLDB; `\\!`, `\\o |cmd`, `\\copy ... program`,
+    `COPY ... PROGRAM`, backquoted text in any backslash command (`\\set x
+    `cmd``), a `%`cmd`` prompt escape, and a pager/editor `\\setenv` not
+    naming a known plain pager/editor for psql; `.system`/`.shell`/`.load`/
+    `.once |cmd`/`load_extension()` for sqlite3; `run(`/backtick
     `Cmd`/`ccall`/`Meta.parse`/`download(` for Julia. Two gate-DISABLE
     shapes are gated too, the "switch off the tool's own trust check"
     class `rule_vscode_settings_exec_protect` gates for VS Code: gdb's
-    auto-load safe-path widened to `/`/`~`/`$HOME` (every repo's `.gdbinit`
-    then auto-loads) and LLDB's `target.load-cwd-lldbinit true`. Full-line
-    comments are stripped first. A routine rc file (pdb aliases,
+    auto-load safe-path widened to `/`, `/*`, a single top-level directory
+    (`/tmp`, `/home/*`), `~`, `$HOME` or `*` -- every repo under it then
+    auto-loads its `.gdbinit` -- or reset with a bare `set auto-load
+    safe-path`; and LLDB's `target.load-cwd-lldbinit true`. Full-line
+    comments are stripped first (Ruby `#{...}` interpolation lines are not
+    comments and are kept; GHCi `:def` macro lines are dropped, since a
+    macro body only runs when invoked -- the hoogle `:def` idiom stays
+    allowed). A routine rc file (pdb aliases,
     `options(repos=...)`, `source("renv/activate.R")`, IRB prompt config,
     `:set prompt`, a gdb pretty-printer `python import ...`, psql `\\set`
-    variables, `.mode column`, `using Revise`) stays allowed.
+    variables without backquotes, `\\setenv PAGER less`, `.mode column`,
+    `using Revise`, `reticulate::use_python(...)`) stays allowed.
 
     Config (`policy.repl_rc_exec`): `mode` (deny|ask|monitor|off, default
     ask), `allow` (regexes on the path/command that skip the gate).
     Defaults to `ask` for the same reason every sibling `*_protect` guard
-    does: a legitimate rc file can shell out (a gdb `shell clear`, a psql
-    `\\setenv PAGER less`) -- it just needs a human to look at it once.
+    does: a legitimate rc file can shell out (a gdb `shell clear`, a
+    pwndbg/GEF guide's `set auto-load safe-path /`) -- it just needs a
+    human to look at it once.
 
     Escapable only by a human: a trailing '# aegis-allow' on the shell
     form, or `AEGIS_ALLOW_REPL_RC_EXEC=1` set by the orchestrator/human
@@ -10914,9 +10925,15 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     is outside this guard's path set; gdb's `define` user commands and
     psql/LLDB aliases are scanned as text, so a shell call inside one is
     gated even though it only runs when invoked (a disclosed, deliberate
-    over-approximation); env-var relocation of the rc file (`PDBRC`-style
-    `R_PROFILE_USER`, `IRBRC`, `PSQLRC`, `SQLITE_HISTORY`, `JULIA_DEPOT_
-    PATH`, `GHCi -ghci-script`) is the same "computed indirectly" class
+    over-approximation; GHCi `:def` lines are the one exemption, above); a
+    shell-branch scan reads the WHOLE command, so an unrelated backtick/
+    `eval`/`!` elsewhere in a command that also writes an rc file ASKs (the
+    same whole-command trade-off every sibling's shell branch makes); a
+    single-line shell plant's quote-adjacent "line start" can false-ASK on
+    a quoted value that begins with a command word (LLDB `settings set
+    prompt "shell> "`); relocating the rc file by env var or flag
+    (`R_PROFILE_USER`, `IRBRC`, `PSQLRC`, `JULIA_DEPOT_PATH`, sqlite3
+    `-init`, GHCi `-ghci-script`) is the same "computed indirectly" class
     `rule_ipython_startup_protect`'s `IPYTHONDIR` gap accepts; a shell
     plant that COPIES a payload from another file (`cp /tmp/x ~/.gdbinit`)
     carries no content to inspect and is not gated, and a direct
@@ -10926,7 +10943,33 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     possible unique prefix; the shared `_path()` helper only reads
     top-level MCP argument keys (nested `edits[]` content IS scanned via
     `_flatten_strings`), the same shared-infrastructure gap every sibling
-    discloses."""
+    discloses.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the convention every guard in this
+    file follows; the bypass hunter checked against real gdb 15.1, lldb
+    18.1.3, ruby 3.3.6, pdb and psql). Round 1 found and closed: (1) rule
+    ORDER -- placed beside `rule_ipython_startup_protect` its shell-branch
+    ASK pre-empted a later hard DENY on the same command (`... >
+    .Rprofile; rm -rf ~` gave ASK); moved to the tail block beside
+    `rule_npmrc_exec_protect`, with a regression test; (2) Ruby comment
+    stripping deleted a `#{system(...)}` interpolation line inside a
+    multi-line string -- verified to execute in real irb; (3) the gdb
+    safe-path gate-disable missed `/*` and `/tmp`, both verified to make a
+    cwd `.gdbinit` auto-load; (4) idiomatic exec forms missed: Ruby
+    `%x"..."`/`%x^...^` and `Kernel::system`/`Process::spawn`, LLDB `pla
+    sh`/`platform she` and `target create /bin/sh` + `process launch`, gdb
+    `alias xx = shell` and `target remote | CMD`, pdb `asyncio.create_
+    subprocess_exec`, sqlite3 `load_extension()`, psql backquotes and the
+    `%`cmd`` prompt escape (the docstring had wrongly called every `\\set`
+    benign); (5) false ASKs on common config: whole R package namespaces
+    (`reticulate::use_python`, `rstudioapi::isAvailable`) narrowed to their
+    exec functions, GHCi's hoogle `:def`, `\\setenv PAGER less`, and the
+    never-a-command `\\pset pager` value; (6) missing paths: Pry XDG
+    `pry/pryrc`, system `/etc/psqlrc`, gdb `gdbinit.d/*`; (7) wiring: the
+    `skills.py` rule-ID remediation row, a README Known-gaps entry, and the
+    docstring's env-var list (`PDBRC`/`SQLITE_HISTORY` are not rc
+    relocations)."""
     cfg = getattr(policy, "repl_rc_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

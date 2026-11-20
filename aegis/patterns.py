@@ -5398,11 +5398,13 @@ _RC_B = r"(?:^|[\s'\"/\\=])"
 _REPL_RC_KINDS = (
     ("pdb", r"\.pdbrc"),
     ("r", r"(?:\.Rprofile|Rprofile\.site)"),
-    ("ruby", r"(?:[._]irbrc|irb\.rc|irb" + _SEP + r"irbrc|\.pryrc)"),
+    ("ruby", r"(?:[._]irbrc|irb\.rc|irb" + _SEP + r"irbrc|\.pryrc|pry" + _SEP + r"pryrc)"),
     ("ghci", r"(?:\.ghci|ghci\.conf)"),
-    ("gdb", r"(?:\.gdbinit|\.gdbearlyinit|gdb" + _SEP + r"gdb(?:early)?init|gdb\.ini)"),
+    ("gdb", r"(?:\.gdbinit|\.gdbearlyinit|gdb" + _SEP + r"gdb(?:early)?init|gdb\.ini"
+            r"|gdbinit\.d" + _SEP + r"[\w.\-]+)"),
     ("lldb", r"\.lldbinit(?:-[\w.\-]+)?"),
-    ("psql", r"(?:\.psqlrc(?:-[\w.\-]+)?|postgresql" + _SEP + r"psqlrc\.conf)"),
+    ("psql", r"(?:\.psqlrc(?:-[\w.\-]+)?|postgresql" + _SEP + r"psqlrc\.conf"
+             r"|etc" + _SEP + r"(?:postgresql(?:-common)?" + _SEP + r")?psqlrc(?:-[\w.\-]+)?)"),
     ("sqlite", r"(?:\.sqliterc|sqlite3" + _SEP + r"sqliterc)"),
     ("julia", r"\.julia" + _SEP + r"config" + _SEP + r"startup\.jl"),
 )
@@ -5437,6 +5439,7 @@ _RC_LS = r"(?:^|['\"]|\\[nr])[ \t]*"
 _RC_PY_EXEC = (
     r"(?<![\w.])(?:" + _CONFTEST_EXEC_CALL
     + r"|subprocess\.(?:getoutput|getstatusoutput)|os\.(?:exec|spawn|posix_spawn)\w*"
+    + r"|asyncio\.create_subprocess_(?:exec|shell)"
     + r"|os\.startfile|runpy\.run_\w+|ctypes\.(?:CDLL|cdll|WinDLL)|urllib\.request\.\w+)\s*[(.]"
 )
 _RC_SHELL_PY = re.compile(_RC_PY_EXEC, re.IGNORECASE)
@@ -5445,15 +5448,18 @@ _REPL_RC_DANGER = {
     "pdb": (_RC_SHELL_PY,),
     "r": (re.compile(
         r"(?<![\w.])(?:base::)?(?:system2?|shell|shell\.exec|pipe|dyn\.load|socketConnection)\s*\("
-        r"|\b(?:processx|sys|callr|rstudioapi|curl|httr2?|RCurl|reticulate)::"
+        r"|\bprocessx::(?:run|process)\b|\bsys::exec_\w+|\bcallr::(?:r|r_bg|r_safe|rscript|r_process|rcmd\w*)\b"
+        r"|\brstudioapi::(?:terminalExecute|terminalCreate|terminalSend|jobRunScript|sendToConsole)\b"
+        r"|\bcurl::curl(?:_download|_fetch_\w+|_echo)?\s*\(|\bhttr2?::(?:GET|POST|PUT|request)\b|\bRCurl::getURL\w*"
+        r"|\breticulate::(?:py_run_\w+|source_python|py_eval)\b"
         r"|(?<![\w.])(?:utils::)?download\.file\s*\("
         r"|(?<![\w.])(?:eval|evalq)\s*\(\s*(?:base::)?(?:parse|str2lang|str2expression)\s*\("
         r"|(?<![\w.])(?:source|sys\.source)\s*\(\s*(?:file\s*=\s*)?(?:url\s*\(|['\"](?:https?|ftp)://)"
         r"|(?<![\w.])url\s*\(\s*['\"](?:https?|ftp)://",
         re.IGNORECASE),),
     "ruby": (re.compile(
-        r"`[^`\n]+`|%x\s*[\[({<|!/]"
-        r"|(?<![\w.:])(?:Kernel\s*\.\s*|Process\s*\.\s*)?(?:system|exec|spawn|syscall)\s*(?:\(|[ \t]+['\"%$@\w\[])"
+        r"`[^`\n]+`|%x\s*[^\w\s]"
+        r"|(?<![\w.])(?:(?:Kernel|Process)\s*(?:\.|::)\s*)?(?:system|exec|spawn|syscall)\s*(?:\(|[ \t]+['\"%$@\w\[])"
         r"|\b(?:IO|Open3|PTY)\s*\.\s*\w+|\bNet::HTTP\b|\bURI\s*\.\s*open\b"
         r"|(?<![\w.])(?:Kernel\s*\.\s*)?open\s*\(?\s*['\"]\|"
         r"|(?<![\w.])(?:eval|instance_eval|class_eval|module_eval)\s*(?:\(|[ \t]+['\"%$@\w])"
@@ -5466,7 +5472,11 @@ _REPL_RC_DANGER = {
         r"|runInteractiveProcess|runProcess|unsafePerformIO)\b"
         r"|(?<![\w.'])system\s+\"", re.MULTILINE),),
     "gdb": (re.compile(
-        _RC_LS + r"(?:!|\||she(?:l(?:l)?)?\b|pipe\b|gu(?:i(?:l(?:e)?)?)?\b[^\n]*\bsystem\b)",
+        _RC_LS + r"(?:!|\||she(?:l(?:l)?)?\b|pipe\b|gu(?:i(?:l(?:e)?)?)?\b[^\n]*\bsystem\b)"
+        # `alias xx = shell` (QA round 1: the alias target is mid-line) and
+        # `target [extended-]remote | CMD` (gdb spawns CMD as the remote).
+        r"|\balias\s+(?:-a\s+)?(?:--\s+)?\S+\s*=\s*(?:she\w*|pipe|!|\||py\w*|pi\b|gu\w*)"
+        r"|\btar\w*\s+(?:ext\w*-)?rem\w*\s*\|",
         re.IGNORECASE | re.MULTILINE),
         _RC_SHELL_PY,
         # Gate-disable shape: widening gdb's auto-load safe-path to `/`,
@@ -5476,11 +5486,19 @@ _REPL_RC_DANGER = {
         # protect` gates for VS Code's task auto-run gate.
         re.compile(
             r"(?:set\s+auto-load\s+safe-path|add-auto-load-safe-path|set\s+auto-load\s+scripts-directory)"
-            r"\s+['\"]?(?:[^\s:'\"]*:)*(?:/+|~/?|\$HOME/?)['\"]?(?=[:\s'\"]|$)"
+            # `/`, `/*`, a single top-level dir (`/tmp`, `/home/*`), `~`,
+            # `$HOME`, or a bare `*` -- QA round 1 verified `/*` and `/tmp`
+            # both make a repo's `.gdbinit` auto-load in real gdb 15.
+            r"\s+['\"]?(?:[^\s:'\"]*:)*(?:/+[^\s:'\"/]*/?\*?|~/?\*?|\$HOME/?\*?|\*)['\"]?(?=[:\s'\"]|$)"
             r"|set\s+auto-load\s+safe-path\s*['\"]?\s*$",
             re.IGNORECASE | re.MULTILINE),),
     "lldb": (re.compile(
-        r"\bplatform\s+shell\b|" + _RC_LS + r"(?:shell|_regexp-shell)\b"
+        # LLDB accepts any unique prefix (`pla sh`, `platform she`) --
+        # QA round 1 verified both run in real lldb 18.
+        r"\bpla(?:t(?:f(?:o(?:r(?:m)?)?)?)?)?\s+sh(?:e(?:l(?:l)?)?)?\b"
+        r"|" + _RC_LS + r"(?:sh(?:e(?:l(?:l)?)?)?|_regexp-shell)\b"
+        r"|" + _RC_LS + r"(?:pro(?:c(?:e(?:s(?:s)?)?)?)?\s+la\w*|r(?:un)?)\b"
+        r"|\bta\w*\s+cr\w*\s+['\"]?\S*\b(?:sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh|python\d*(?:\.\d+)?|perl|ruby|node|osascript)\b"
         r"|settings\s+set\s+(?:-\w\s+)*target\.load-cwd-lldbinit\s+['\"]?true\b",
         re.IGNORECASE | re.MULTILINE),
         _RC_SHELL_PY,),
@@ -5489,12 +5507,17 @@ _REPL_RC_DANGER = {
         r"|\\(?:o|out|g|gx|w|write)\b[ \t]*\|"
         r"|\\copy\b[^\n]*\bprogram\b"
         r"|\bCOPY\b[^\n;]*\bPROGRAM\b"
+        # psql runs backquoted text inside any backslash command (`\set x
+        # `cmd``) and `%`cmd`` in a prompt on every prompt (QA round 1).
+        r"|\\[a-z]\w*[^\n]*`[^`\n]*`|%`"
+        # A pager/editor env var naming a known plain pager stays allowed.
         r"|\\setenv\s+(?:PAGER|PSQL_PAGER|PSQL_WATCH_PAGER|PSQL_EDITOR|EDITOR|VISUAL|SHELL)\b"
-        r"|\\pset\s+pager\s+['\"]?(?!on\b|off\b|always\b)\S",
+        r"(?!\s+['\"]?(?:less|more|most|pspg|bat|vim?|nvim|nano|emacs|code)\b[\w \t.=+-]*['\"]?[ \t]*(?:$|\n))",
         re.IGNORECASE),),
     "sqlite": (re.compile(
         _RC_LS + r"\.(?:system|shell|load)\b"
-        r"|" + _RC_LS + r"\.(?:once|output|import|read)\s+(?:-\S+\s+)*['\"]?\|",
+        r"|" + _RC_LS + r"\.(?:once|output|import|read)\s+(?:-\S+\s+)*['\"]?\|"
+        r"|\bload_extension\s*\(",
         re.IGNORECASE | re.MULTILINE),),
     "julia": (re.compile(
         r"(?<![\w.])(?:Base\.)?(?:run|success|pipeline|readchomp|readlines|readline|eachline|read|open"
@@ -5512,8 +5535,12 @@ _REPL_RC_DANGER = {
 _REPL_RC_COMMENT = {
     "pdb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
     "r": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
-    "ruby": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
-    "ghci": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
+    # `#{...}` starting a physical line is string interpolation inside a
+    # multi-line string/heredoc, executed -- never a comment (QA round 1).
+    "ruby": re.compile(r"^[ \t]*#(?!\{).*$", re.MULTILINE),
+    # `:def` macro bodies only run when invoked by name; the ubiquitous
+    # `:def hoogle \s -> return $ ":! hoogle " ++ s` idiom stays allowed.
+    "ghci": re.compile(r"^[ \t]*(?:--|:def\b).*$", re.MULTILINE),
     "gdb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
     "lldb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
     "psql": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
