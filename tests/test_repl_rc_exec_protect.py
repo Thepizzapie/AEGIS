@@ -249,3 +249,104 @@ def test_qa1_fetch_backstop_rule_and_shell_modes():
     cmd = "printf 'shell id\\n' >> ~/.gdbinit"
     assert evaluate(_shell(cmd), DENY).action == Action.DENY
     assert _rule(evaluate(_shell(cmd), Policy(repl_rc_exec={"allow": [r"gdbinit"]}))) != RULE
+
+
+# ---- QA round 2 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("path,bad", [
+    ("/home/u/.gdbinit", 'file /bin/sh\nrun -c "echo PWNED"\n'),
+    ("/home/u/.gdbinit", "file /bin/true\nrun $(touch pw1)\n"),
+    ("/home/u/.gdbinit", "file /bin/true\nset exec-wrapper touch pw2;\nrun\n"),
+    ("/home/u/.gdbinit", "set auto-load safe-path /home/alice\n"),
+    ("/home/u/.gdbinit", "add-auto-load-safe-pat /\n"),
+    ("/home/u/.gdbinit", "tar ext | id\n"),
+    (".ghci", ':def x \\_ -> return ":! id"\n:x\n'),
+    (".ghci", ':{\n:def x \\_ -> return ":! id"\n:}\n:x\n'),
+    (".ghci", ':def x \\_ -> System.Process.callCommand "id" >> return ""\n'),
+    (".ghci", ':def xyz \\_ -> return ":! id"\n:xy\n'),
+    ("/home/u/.psqlrc", "select 1 \\g (format=unaligned) |id\n"),
+    ("/home/u/.psqlrc", "\\gx (tuples_only=on) |id\n"),
+    ("/home/u/.psqlrc", "COPY (select 1)\nTO PROGRAM 'id';\n"),
+    ("/home/u/.psqlrc", "\\setenv PAGER 'sh -c id'\n"),
+    (".irbrc", 'IO::popen("id")\n'),
+    (".irbrc", 'Open3::capture2("id")\n'),
+    (".irbrc", "x = `\necho PWNED\n`\n"),
+    (".lldbinit", "set se target.load-cwd-lldbinit true\n"),
+    ("/home/u/.sqliterc", ".sys id\n"),
+    ("/home/u/.sqliterc", ".she id\n"),
+    ("/home/u/.sqliterc", ".o |id\n"),
+    ("/home/u/.sqliterc", ".lo /tmp/x.so\n"),
+])
+def test_qa2_bypasses_gated(path, bad):
+    assert _rule(evaluate(_write(path, bad), EMPTY)) == RULE
+
+
+@pytest.mark.parametrize("cmd", [
+    "sed -i '$a shell id' ~/.gdbinit",
+    "sed -i '$a .system id' ~/.sqliterc",
+    "printf 'file /bin/sh\\nrun -c id\\n' > ~/.gdbinit",
+])
+def test_qa2_shell_plants_gated(cmd):
+    assert _rule(evaluate(_shell(cmd), EMPTY)) == RULE
+
+
+@pytest.mark.parametrize("path,good", [
+    ("/home/u/.psqlrc", "\\setenv PAGER /usr/bin/less\n"),
+    ("/home/u/.psqlrc", "\\setenv PAGER '/usr/local/bin/pspg -s 6'\n"),
+    ("/home/u/.psqlrc", "\\setenv EDITOR /usr/bin/vim\n"),
+    ("/home/u/.psqlrc", "\\setenv PAGER cat\n"),
+    ("/home/u/.psqlrc", "\\setenv PAGER less\r\n\\timing on\r\n"),
+    ("/home/u/.psqlrc", "\\set PROMPT1 '%n@%/%R%# '\n\\x auto\n"),
+    (".ghci", ':def hoogle \\s -> return $ ":! hoogle --count=15 " ++ s\n:set prompt "> "\n'),
+    ("/home/u/.gdbinit", "file ./build/app\nset print pretty on\n"),
+    ("/home/u/.gdbinit", "add-auto-load-safe-path /home/u/src/proj/.gdbinit\n"),
+    ("/home/u/.sqliterc", ".open my.db\n.headers on\n"),
+    ("/home/u/.lldbinit", "settings set target.load-cwd-lldbinit false\n"),
+])
+def test_qa2_benign_allowed(path, good):
+    assert evaluate(_write(path, good), EMPTY).action == Action.ALLOW
+
+
+ADVERSARIAL = {
+    "pdb": ["os.system " * 10000, "(" * 100000],
+    "r": ["source(" * 15000, "system " * 15000],
+    "ruby": ["`" + "a" * 100000, "%x" * 50000, "system " * 15000],
+    "ghci": [":def a " * 15000, ":" * 100000, '"' * 100000],
+    "gdb": ["gu " * 30000, "run " * 25000, "set auto-load safe-path " + "a:" * 50000,
+            "alias " * 15000, "file " * 20000],
+    "lldb": ["pla " * 25000, "ta cr " * 15000, "se se " * 15000],
+    "psql": ["\\copy " * 16666, "COPY " * 20000, "\\a" * 50000,
+             "\\setenv PAGER less" + " a" * 50000, "\\g (" * 25000],
+    "sqlite": [".o " * 30000, ". " * 50000],
+    "julia": ["run " * 25000, "read(" * 20000],
+}
+
+
+@pytest.mark.parametrize("kind", sorted(ADVERSARIAL))
+def test_qa2_no_quadratic_per_kind(kind):
+    for blob in ADVERSARIAL[kind]:
+        t = time.time()
+        patterns.repl_rc_dangerous_hit(blob, (kind,))
+        assert time.time() - t < 1.0, (kind, blob[:20])
+
+
+def test_qa2_large_psqlrc_write_fast():
+    content = "\\copy " * (200000 // 6) + "\n\\! id\n"
+    t = time.time()
+    d = evaluate(_write("/home/u/.psqlrc", content), EMPTY)
+    assert time.time() - t < 5.0
+    assert d.rule == RULE
+
+
+def test_qa2_ghci_many_macros_fast():
+    body = "".join(f":def m{i} \\_ -> return \"\"\n" for i in range(20000))
+    body += "".join(f":set x{i}\n" for i in range(20000))
+    t = time.time()
+    patterns.repl_rc_dangerous_hit(body, ("ghci",))
+    assert time.time() - t < 2.0
+
+
+def test_qa2_ghci_long_macro_name_invocation_gated():
+    name = "m" * 80
+    body = f':def {name} \\_ -> return ":! id"\n:{name}\n'
+    assert _rule(evaluate(_write(".ghci", body), EMPTY)) == RULE

@@ -5430,7 +5430,20 @@ def repl_rc_kinds(text: str) -> tuple:
 # the position right after the echoed argument's opening quote or a literal
 # `\n` escape, the same quote-adjacency trade-off `IPYTHON_BANG_ANY_RE`
 # documents.
-_RC_LS = r"(?:^|['\"]|\\[nr])[ \t]*"
+_RC_LS = (
+    r"(?:^|['\"]"
+    # `sed -i '$a shell id' ~/.gdbinit` / `sed -i '1i .system id'`: the text
+    # after sed's own a/i/c command is the line being inserted (QA round 2).
+    r"(?:(?:\$|\d{1,9}|/[^/\n]{0,200}/)?[aic]\\?(?=[ \t]))?"
+    r"|\\[nr])[ \t]*"
+)
+
+# Program names that make a debugger's "launch the inferior" step a plain
+# shell exec (`file /bin/sh` + `run -c ...`).
+_RC_SHELL_PROG = (
+    r"(?:\S*[/\\])?(?:sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh|python\d*(?:\.\d+)?"
+    r"|perl|ruby|node|osascript|env)(?:\.exe)?['\"]?(?=\s|$|\\[nr])"
+)
 
 # Python vocabulary (pdb executes every non-pdb-command line as a Python
 # statement, `!`-prefixed or not, at any indentation; gdb `python`/LLDB
@@ -5444,6 +5457,10 @@ _RC_PY_EXEC = (
 )
 _RC_SHELL_PY = re.compile(_RC_PY_EXEC, re.IGNORECASE)
 
+# Every intra-line gap below is bounded (`{0,N}`) or tempered so no pattern
+# re-scans the rest of a long line from every start position -- QA round 2
+# measured an unbounded `\\copy\b[^\n]*\bprogram\b` at 65s on a 200KB
+# `.psqlrc` Write, past the runtime's hook timeout (a fail-open bypass).
 _REPL_RC_DANGER = {
     "pdb": (_RC_SHELL_PY,),
     "r": (re.compile(
@@ -5458,10 +5475,11 @@ _REPL_RC_DANGER = {
         r"|(?<![\w.])url\s*\(\s*['\"](?:https?|ftp)://",
         re.IGNORECASE),),
     "ruby": (re.compile(
-        r"`[^`\n]+`|%x\s*[^\w\s]"
+        # Backticks may span lines (QA round 2: a multi-line `...` runs).
+        r"`[^`]{1,4096}`|%x\s*[^\w\s]"
         r"|(?<![\w.])(?:(?:Kernel|Process)\s*(?:\.|::)\s*)?(?:system|exec|spawn|syscall)\s*(?:\(|[ \t]+['\"%$@\w\[])"
-        r"|\b(?:IO|Open3|PTY)\s*\.\s*\w+|\bNet::HTTP\b|\bURI\s*\.\s*open\b"
-        r"|(?<![\w.])(?:Kernel\s*\.\s*)?open\s*\(?\s*['\"]\|"
+        r"|\b(?:IO|Open3|PTY)\s*(?:\.|::)\s*\w+|\bNet::HTTP\b|\bURI\s*(?:\.|::)\s*open\b"
+        r"|(?<![\w.])(?:Kernel\s*(?:\.|::)\s*)?open\s*\(?\s*['\"]\|"
         r"|(?<![\w.])(?:eval|instance_eval|class_eval|module_eval)\s*(?:\(|[ \t]+['\"%$@\w])"
         r"|\bFiddle\b"),),
     "ghci": (re.compile(
@@ -5472,51 +5490,70 @@ _REPL_RC_DANGER = {
         r"|runInteractiveProcess|runProcess|unsafePerformIO)\b"
         r"|(?<![\w.'])system\s+\"", re.MULTILINE),),
     "gdb": (re.compile(
-        _RC_LS + r"(?:!|\||she(?:l(?:l)?)?\b|pipe\b|gu(?:i(?:l(?:e)?)?)?\b[^\n]*\bsystem\b)"
+        _RC_LS + r"(?:!|\||she(?:l(?:l)?)?\b|pipe\b|gu(?:i(?:l(?:e)?)?)?\b[^\n]{0,2000}?\bsystem\b)"
         # `alias xx = shell` (QA round 1: the alias target is mid-line) and
         # `target [extended-]remote | CMD` (gdb spawns CMD as the remote).
         r"|\balias\s+(?:-a\s+)?(?:--\s+)?\S+\s*=\s*(?:she\w*|pipe|!|\||py\w*|pi\b|gu\w*)"
-        r"|\btar\w*\s+(?:ext\w*-)?rem\w*\s*\|",
+        r"|\btar\w*\s+(?:ext\w*(?:-rem\w*)?|rem\w*)\s*\|"
+        # Inferior launch as exec (QA round 2, verified in gdb 15): `run`
+        # args are expanded by a shell (startup-with-shell is the default),
+        # an exec-wrapper runs before the program, and `file /bin/sh` +
+        # `run -c ...` is a plain shell.
+        r"|" + _RC_LS + r"(?:r|ru|run|start|starti)\b[^\n`$]{0,2000}(?:\$\(|`)"
+        r"|\bset\s+exec-w\w*"
+        r"|" + _RC_LS + r"(?:fil|file|exec-f\w*|exe)\s+['\"]?" + _RC_SHELL_PROG,
         re.IGNORECASE | re.MULTILINE),
         _RC_SHELL_PY,
-        # Gate-disable shape: widening gdb's auto-load safe-path to `/`,
-        # `~`, or `$HOME` makes every repo's `.gdbinit` (and every
-        # `*-gdb.py` beside a binary) auto-load -- the same "switch off
-        # the tool's own trust prompt" class `rule_vscode_settings_exec_
-        # protect` gates for VS Code's task auto-run gate.
+        # Gate-disable shape: widening gdb's auto-load safe-path makes
+        # every repo under it auto-load its `.gdbinit` (and every
+        # `*-gdb.py` beside a binary) -- the same "switch off the tool's
+        # own trust prompt" class `rule_vscode_settings_exec_protect` gates
+        # for VS Code's task auto-run gate.
         re.compile(
-            r"(?:set\s+auto-load\s+safe-path|add-auto-load-safe-path|set\s+auto-load\s+scripts-directory)"
-            # `/`, `/*`, a single top-level dir (`/tmp`, `/home/*`), `~`,
-            # `$HOME`, or a bare `*` -- QA round 1 verified `/*` and `/tmp`
-            # both make a repo's `.gdbinit` auto-load in real gdb 15.
-            r"\s+['\"]?(?:[^\s:'\"]*:)*(?:/+[^\s:'\"/]*/?\*?|~/?\*?|\$HOME/?\*?|\*)['\"]?(?=[:\s'\"]|$)"
-            r"|set\s+auto-load\s+safe-path\s*['\"]?\s*$",
+            r"(?:set\s+auto-load\s+safe-p\w*|add-auto-load-safe-p\w*|set\s+auto-load\s+scripts-d\w*)"
+            # `/`, `/*`, a single top-level dir (`/tmp`, `/home/*`), a
+            # literal home dir (`/home/u`, `/Users/u`), `~`, `$HOME`, or a
+            # bare `*` -- QA rounds 1-2 verified `/*`, `/tmp` and a literal
+            # home dir all make a repo's `.gdbinit` auto-load in gdb 15.
+            r"\s+['\"]?(?:[^\s:'\"]*:){0,50}(?:/+(?:home|Users)/+[^\s:'\"/]+/?\*?|/+[^\s:'\"/]*/?\*?"
+            r"|~/?\*?|\$HOME/?\*?|\*)['\"]?(?=[:\s'\"]|$)"
+            r"|set\s+auto-load\s+safe-p\w*[ \t]*['\"]?[ \t]*$",
             re.IGNORECASE | re.MULTILINE),),
     "lldb": (re.compile(
-        # LLDB accepts any unique prefix (`pla sh`, `platform she`) --
-        # QA round 1 verified both run in real lldb 18.
+        # LLDB accepts any unique prefix (`pla sh`, `platform she`, `set se`)
+        # -- QA rounds 1-2 verified these run in real lldb 18.
         r"\bpla(?:t(?:f(?:o(?:r(?:m)?)?)?)?)?\s+sh(?:e(?:l(?:l)?)?)?\b"
         r"|" + _RC_LS + r"(?:sh(?:e(?:l(?:l)?)?)?|_regexp-shell)\b"
         r"|" + _RC_LS + r"(?:pro(?:c(?:e(?:s(?:s)?)?)?)?\s+la\w*|r(?:un)?)\b"
-        r"|\bta\w*\s+cr\w*\s+['\"]?\S*\b(?:sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh|python\d*(?:\.\d+)?|perl|ruby|node|osascript)\b"
-        r"|settings\s+set\s+(?:-\w\s+)*target\.load-cwd-lldbinit\s+['\"]?true\b",
+        r"|\bta\w*\s+cr\w*\s+(?:-\S+\s+){0,10}['\"]?" + _RC_SHELL_PROG
+        + r"|\bse\w*\s+se\w*\s+(?:-\w\s+){0,5}target\.load-cwd-lldbinit\s+['\"]?(?:true|yes|on|1)\b",
         re.IGNORECASE | re.MULTILINE),
         _RC_SHELL_PY,),
     "psql": (re.compile(
         r"\\!"
-        r"|\\(?:o|out|g|gx|w|write)\b[ \t]*\|"
-        r"|\\copy\b[^\n]*\bprogram\b"
-        r"|\bCOPY\b[^\n;]*\bPROGRAM\b"
+        # `\g (format=unaligned) |cmd` -- `\g`/`\gx` take an options group
+        # before the pipe target (QA round 2).
+        r"|\\(?:o|out|g|gx|w|write)\b[ \t]*(?:\([^)\n]{0,500}\)[ \t]*)?\|"
+        r"|\\copy\b(?:(?!\\copy\b)[^\n]){0,2000}?\bprogram\b"
+        # SQL `COPY ... PROGRAM` may span lines up to the statement's `;`.
+        r"|\bCOPY\b(?:(?!\bCOPY\b)[^;]){0,2000}?\bPROGRAM\b"
         # psql runs backquoted text inside any backslash command (`\set x
         # `cmd``) and `%`cmd`` in a prompt on every prompt (QA round 1).
-        r"|\\[a-z]\w*[^\n]*`[^`\n]*`|%`"
-        # A pager/editor env var naming a known plain pager stays allowed.
+        # Backquotes have no other meaning in a psqlrc (not SQL syntax).
+        r"|`[^`\n]{1,4096}`|%`"
+        # A pager/editor env var naming a known plain pager/editor (bare or
+        # by absolute path, args limited to plain flag characters) stays
+        # allowed.
         r"|\\setenv\s+(?:PAGER|PSQL_PAGER|PSQL_WATCH_PAGER|PSQL_EDITOR|EDITOR|VISUAL|SHELL)\b"
-        r"(?!\s+['\"]?(?:less|more|most|pspg|bat|vim?|nvim|nano|emacs|code)\b[\w \t.=+-]*['\"]?[ \t]*(?:$|\n))",
+        r"(?![ \t]+['\"]?(?:[\w.\-]*[/\\]){0,20}(?:less|more|most|moar|ov|pspg|bat|cat|vim?|nvim|nano|emacs"
+        r"|code|subl|micro|hx|helix|kak|joe|ne|mcedit|gedit|kate|notepad(?:\.exe)?)\b"
+        r"[\w \t.=+,/-]{0,200}['\"]?[ \t]*\r?(?:\n|$))",
         re.IGNORECASE),),
     "sqlite": (re.compile(
-        _RC_LS + r"\.(?:system|shell|load)\b"
-        r"|" + _RC_LS + r"\.(?:once|output|import|read)\s+(?:-\S+\s+)*['\"]?\|"
+        # sqlite3's shell matches dot-commands by prefix (`.sys`, `.she`,
+        # `.lo`) -- the same unique-prefix class as LLDB (QA round 2).
+        _RC_LS + r"\.(?:sy(?:s(?:t(?:e(?:m)?)?)?)?|sh(?:e(?:l(?:l)?)?)?|lo(?:a(?:d)?)?)\b"
+        r"|" + _RC_LS + r"\.(?:on\w*|ou\w*|o|imp\w*|im|i|rea\w*|re|r)\s+(?:-\S+\s+){0,10}['\"]?\|"
         r"|\bload_extension\s*\(",
         re.IGNORECASE | re.MULTILINE),),
     "julia": (re.compile(
@@ -5538,15 +5575,40 @@ _REPL_RC_COMMENT = {
     # `#{...}` starting a physical line is string interpolation inside a
     # multi-line string/heredoc, executed -- never a comment (QA round 1).
     "ruby": re.compile(r"^[ \t]*#(?!\{).*$", re.MULTILINE),
-    # `:def` macro bodies only run when invoked by name; the ubiquitous
-    # `:def hoogle \s -> return $ ":! hoogle " ++ s` idiom stays allowed.
-    "ghci": re.compile(r"^[ \t]*(?:--|:def\b).*$", re.MULTILINE),
+    "ghci": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
     "gdb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
     "lldb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
     "psql": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
     "sqlite": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
     "julia": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
 }
+
+# GHCi `:def` macros: a macro body only runs when the macro is invoked, so
+# the string literals on a `:def` line (the ubiquitous hoogle idiom,
+# `:def hoogle \s -> return $ ":! hoogle " ++ s`) are blanked -- but ONLY
+# when nothing in the same file invokes a defined macro (GHCi resolves a
+# command by unique prefix, so `:x`/`:hoo` count) and only the string
+# literals, so a real `System.Process`/`callCommand` call on the line stays
+# visible (QA round 2: stripping the whole line hid both).
+_GHCI_DEF_RE = re.compile(r"^[ \t]*:def!?[ \t]+([\w'\-]+)", re.MULTILINE)
+_GHCI_DEF_LINE_RE = re.compile(r"^([ \t]*:def!?[ \t][^\n]*)$", re.MULTILINE)
+_GHCI_STR_RE = re.compile(r"\"(?:[^\"\\\n]|\\.){0,4096}\"")
+_GHCI_CMD_RE = re.compile(r"(?:^|['\"]|\\[nr])[ \t]*:([\w'\-]+)", re.MULTILINE)
+
+
+def _ghci_mask_defs(body: str) -> str:
+    names = set(_GHCI_DEF_RE.findall(body))
+    if not names:
+        return body
+    # Every prefix of every defined name, so the invocation check stays
+    # linear in the file size however many macros/commands it holds.
+    prefixes = {n[:i] for n in names for i in range(1, min(len(n), 64) + 1)}
+    for cmd in _GHCI_CMD_RE.findall(body):
+        if cmd == "def":
+            continue
+        if cmd in prefixes or (len(cmd) > 64 and any(n.startswith(cmd) for n in names)):
+            return body
+    return _GHCI_DEF_LINE_RE.sub(lambda m: _GHCI_STR_RE.sub('""', m.group(1)), body)
 
 
 def repl_rc_dangerous_hit(content: str, kinds) -> bool:
@@ -5556,6 +5618,8 @@ def repl_rc_dangerous_hit(content: str, kinds) -> bool:
         return False
     for kind in kinds or ():
         body = _REPL_RC_COMMENT[kind].sub("", content)
+        if kind == "ghci":
+            body = _ghci_mask_defs(body)
         for rx in _REPL_RC_DANGER[kind]:
             if rx.search(body):
                 return True
