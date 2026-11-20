@@ -10835,6 +10835,281 @@ def rule_ipython_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+def _repl_rc_exec_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Block planting a process/code-exec shape in a debugger/REPL startup
+    rc file: `.pdbrc`, `.Rprofile`/`Rprofile.site`, `.irbrc`/`.pryrc`,
+    `.ghci`/`ghci.conf`, `.gdbinit`/`gdbearlyinit`, `.lldbinit[-<prog>]`,
+    `.psqlrc[-<ver>]`, `.sqliterc`, `.julia/config/startup.jl`.
+
+    THREAT MODEL: each of these interactive tools reads its rc file on EVERY
+    launch and executes it as code/commands -- no opt-in, no trust prompt,
+    no import. Several read it from the CURRENT DIRECTORY, so a file
+    committed to a repo fires for every teammate who opens a REPL or
+    debugger there: pdb runs `./.pdbrc` (after `~/.pdbrc`) the moment a
+    breakpoint is hit -- `breakpoint()`, `pytest --pdb`, `python -m pdb`,
+    an unhandled exception under `pdb.post_mortem` -- and pdb executes any
+    line that is not a pdb command as a Python statement; R sources
+    `./.Rprofile` on every `R`/`Rscript`/RStudio session start in the
+    project; IRB and Pry load `./.irbrc`/`./.pryrc`; GHCi loads `./.ghci`.
+    The rest are per-user persistence files (the same class
+    `rule_shell_persist_protect` gates for shell rc files): `~/.gdbinit`,
+    `~/.lldbinit`, `~/.psqlrc`, `~/.sqliterc`, `~/.julia/config/startup.jl`
+    fire on the next `gdb`/`lldb`/`psql`/`sqlite3`/`julia` launch, by this
+    agent, a human, or CI. A debugger session is also exactly the moment a
+    developer is least likely to be watching for side effects. Before this
+    guard, an Edit/Write/MCP write of any of them was ALLOWED outright; only
+    a shell plant whose payload happened to contain a `curl | sh` shape was
+    caught, incidentally, by `rule_remote_exec`.
+
+    Gated by SHAPE, not by the bare file: the path regex
+    (`patterns.REPL_RC_PATH_RE`) identifies WHICH tool the file belongs to
+    and `patterns.repl_rc_dangerous_hit` applies only that tool's own exec
+    vocabulary -- Python process/eval/network calls for pdb (and gdb
+    `python`/LLDB `script` blocks); `system()`/`system2()`/`pipe()`/
+    `processx::`/`download.file()`/remote `source()` for R; backticks/
+    `%x`/`system`/`exec`/`spawn`/`IO.popen`/`Open3` for Ruby; `:!`/`:cmd`/
+    `System.Process` for GHCi; `shell`/`!`/`pipe`/`|`, an `alias` to one
+    of those, `target remote | CMD`, an inferior launch that is itself an
+    exec (`run`/`start`/`set args` with a shell metacharacter -- `$(...)`,
+    backticks, `|`, a lone `&`, `>(...)`/`<(...)` -- since gdb starts the
+    program through `$SHELL` by default; `set exec-wrapper`; `file
+    /bin/sh`), and `call`/`print`/`compile` of a libc `system()`/`popen()`/
+    `exec*()` for gdb (LLDB `expr`/`p`/`po` likewise); `platform shell` (any
+    unique prefix, `pla sh`), `shell`, `process launch`/`run` and `target
+    create <shell>` for LLDB; `\\!`, `\\o |cmd`, `\\copy ... program`,
+    `COPY ... PROGRAM`, backquoted text in any backslash command (`\\set x
+    `cmd``), a `%`cmd`` prompt escape, and a pager/editor `\\setenv` not
+    naming a known plain pager/editor for psql; `.system`/`.shell`/`.load`/
+    `.once |cmd`/`load_extension()`/`edit()` for sqlite3, including the unique-
+    prefix forms (`.sys`, `.she`, `.lo`, `.o |cmd`) sqlite3's shell accepts
+    (from its `shell.c` prefix matching; not run against a real sqlite3); `run(`/backtick
+    `Cmd`/`ccall`/`Meta.parse`/`download(` for Julia. Two gate-DISABLE
+    shapes are gated too, the "switch off the tool's own trust check"
+    class `rule_vscode_settings_exec_protect` gates for VS Code: gdb's
+    auto-load safe-path widened to `/`, `/*`, a single top-level directory
+    (`/tmp`, `/home/*`), a literal home directory (`/home/alice`,
+    `/Users/alice`), `~`, `$HOME` or `*` -- every repo under it then
+    auto-loads its `.gdbinit` -- or reset with a bare `set auto-load
+    safe-path`; and LLDB's `target.load-cwd-lldbinit true`. Full-line
+    comments are stripped first (Ruby `#{...}` interpolation lines are not
+    comments and are kept). GHCi `:def` lines have their string literals
+    blanked -- the hoogle `:def ... ":! hoogle " ++ s` idiom stays allowed
+    -- but only when the same file never invokes a defined macro (by full
+    name or any prefix GHCi would resolve to it); any `System.Process`/
+    `callCommand` call outside a string on a `:def` line is still gated,
+    and `:def!` (which may shadow a built-in such as `:r`, so the human
+    invokes it) is never exempt. GHCi `-pgm*` program overrides in `:set`
+    are gated too. A
+    routine rc file (pdb aliases,
+    `options(repos=...)`, `source("renv/activate.R")`, IRB prompt config,
+    `:set prompt`, a gdb pretty-printer `python import ...`, psql `\\set`
+    variables without backquotes, `\\setenv PAGER less`, `.mode column`,
+    `using Revise`, `reticulate::use_python(...)`) stays allowed.
+
+    Config (`policy.repl_rc_exec`): `mode` (deny|ask|monitor|off, default
+    ask), `allow` (regexes on the path/command that skip the gate).
+    Defaults to `ask` for the same reason every sibling `*_protect` guard
+    does: a legitimate rc file can shell out (a gdb `shell clear`, a
+    pwndbg/GEF guide's `set auto-load safe-path /`) -- it just needs a
+    human to look at it once.
+
+    Escapable only by a human: a trailing '# aegis-allow' on the shell
+    form, or `AEGIS_ALLOW_REPL_RC_EXEC=1` set by the orchestrator/human
+    before launch for the Edit/Write/MCP form. A spawned agent cannot set
+    its own env for a hook invocation it doesn't control.
+
+    Honest scope, the same denylist trade-offs every guard in this file
+    discloses: a call assembled indirectly (string concatenation, an
+    aliased import, a wrapper function, `getattr(os, 'sys'+'tem')`) defeats
+    the vocabulary checks; a rc file that merely INCLUDES another file
+    (R `source("x.R")` of a local file -- renv's own activation line --
+    gdb `source`, LLDB `command script import`, psql `\\i`, sqlite3 `.read
+    file`, GHCi `:script`/`:load`, Julia `include`) is not gated, since
+    that is the normal way these files are organised and the included file
+    is outside this guard's path set; gdb's `define` user commands and
+    psql/LLDB aliases are scanned as text, so a shell call inside one is
+    gated even though it only runs when invoked (a disclosed, deliberate
+    over-approximation; GHCi `:def` lines are the one exemption, above); a
+    shell-branch scan reads the WHOLE command, so an unrelated backtick/
+    `eval`/`!` elsewhere in a command that also writes an rc file ASKs (the
+    same whole-command trade-off every sibling's shell branch makes); a
+    quote-adjacent "line start" (needed for single-line shell plants, and
+    also applied to Write content) can false-ASK on a quoted value that
+    begins with a command word (LLDB `settings set prompt "shell> "`, a gdb
+    `printf "| %d |\\n", 1`); the psql pager/editor allowlist trusts a
+    known pager NAME, not its arguments or environment (`\\setenv PAGER
+    bat --pager=bash`, `\\setenv LESS +!cmd`); the shell branch scans
+    `normalize.scan_surface`'s output, which is capped in length for every
+    guard alike, so a heredoc padded past that cap is not inspected (a
+    shared limit, not specific to this guard); GHCi `:set editor <cmd>`
+    (runs on `:e`) is not gated, since setting an editor is routine; a gdb
+    `file ./python`/`file node` (a plausible interpreter-debugging setup)
+    ASKs, since `run -c` would make it an exec; backquoted text inside a
+    psql `/* ... */` comment ASKs; relocating the rc file by env var or flag
+    (`R_PROFILE_USER`, `IRBRC`, `PSQLRC`, `JULIA_DEPOT_PATH`, sqlite3
+    `-init`, GHCi `-ghci-script`) is the same "computed indirectly" class
+    `rule_ipython_startup_protect`'s `IPYTHONDIR` gap accepts; a shell
+    plant that COPIES a payload from another file (`cp /tmp/x ~/.gdbinit`)
+    carries no content to inspect and is not gated, and a direct
+    fetch-to-file write is covered instead by `rule_fetch_to_file_protect`,
+    whose backstop list includes this path set; tool-specific abbreviation
+    of gdb commands is matched for `shell` (`she`/`shel`) but not for every
+    possible unique prefix; the shared `_path()` helper only reads
+    top-level MCP argument keys (nested `edits[]` content IS scanned via
+    `_flatten_strings`), the same shared-infrastructure gap every sibling
+    discloses.
+
+    QA history (two independent agents, bypass-hunting and design/
+    consistency, run in parallel -- the convention every guard in this
+    file follows; the bypass hunter checked against real gdb 15.1, lldb
+    18.1.3, ruby 3.3.6, pdb and psql). Round 1 found and closed: (1) rule
+    ORDER -- placed beside `rule_ipython_startup_protect` its shell-branch
+    ASK pre-empted a later hard DENY on the same command (`... >
+    .Rprofile; rm -rf ~` gave ASK); moved to the tail block beside
+    `rule_npmrc_exec_protect`, with a regression test; (2) Ruby comment
+    stripping deleted a `#{system(...)}` interpolation line inside a
+    multi-line string -- verified to execute in real irb; (3) the gdb
+    safe-path gate-disable missed `/*` and `/tmp`, both verified to make a
+    cwd `.gdbinit` auto-load; (4) idiomatic exec forms missed: Ruby
+    `%x"..."`/`%x^...^` and `Kernel::system`/`Process::spawn`, LLDB `pla
+    sh`/`platform she` and `target create /bin/sh` + `process launch`, gdb
+    `alias xx = shell` and `target remote | CMD`, pdb `asyncio.create_
+    subprocess_exec`, sqlite3 `load_extension()`, psql backquotes and the
+    `%`cmd`` prompt escape (the docstring had wrongly called every `\\set`
+    benign); (5) false ASKs on common config: whole R package namespaces
+    (`reticulate::use_python`, `rstudioapi::isAvailable`) narrowed to their
+    exec functions, GHCi's hoogle `:def`, `\\setenv PAGER less`, and the
+    never-a-command `\\pset pager` value; (6) missing paths: Pry XDG
+    `pry/pryrc`, system `/etc/psqlrc`, gdb `gdbinit.d/*`; (7) wiring: the
+    `skills.py` rule-ID remediation row, a README Known-gaps entry, and the
+    docstring's env-var list (`PDBRC`/`SQLITE_HISTORY` are not rc
+    relocations). Round 2 (one fresh agent covering both angles) found and
+    closed: (1) PERF -- unbounded `\\copy ... program`, `COPY ...
+    PROGRAM` and backslash-backquote patterns were quadratic, measured at
+    65s on a 200KB `.psqlrc` Write (past the runtime's hook timeout, a
+    fail-open bypass); every intra-line gap is now bounded or tempered,
+    with a per-kind adversarial-input test; (2) gdb inferior-launch exec
+    (`run $(cmd)`, `set exec-wrapper`, `file /bin/sh` + `run -c`), verified
+    in gdb 15; (3) the GHCi `:def` exemption dropped whole lines, hiding a
+    same-file invocation (`:def x ... ":! id"` then `:x`) and real
+    `System.Process` calls -- now string-literal-only and void when a
+    macro is invoked; (4) a safe-path of a literal home dir (`/home/alice`)
+    and `add-auto-load-safe-pat`; (5) psql `\\g (opts) |cmd` and a
+    multi-line `COPY ... PROGRAM`, Ruby `IO::popen`/`Open3::` and
+    multi-line backticks, LLDB `set se target.load-cwd-lldbinit`, `sed -i
+    '$a ...'` shell plants, gdb `tar ext |`, sqlite3 dot-command prefixes;
+    (6) false ASKs on `\\setenv PAGER /usr/bin/less`, `cat`, editor names
+    and CRLF line endings. Design/consistency (wiring, ordering against 19
+    chained-DENY suffixes) was verified clean. Round 3 (fresh agent,
+    verified in gdb 15 and GNU sed) found and closed: (1) the round-2 `run`
+    rule only saw `$(`/backticks and never `set args` -- now any shell
+    metacharacter in `run`/`start`/`set args`; (2) GNU sed `$a\\text`, `$ a
+    text`, `1i\\\\text` insert forms -- the sed rewrite now runs on the shell
+    branch only, which also removed a round-2 false ASK on quoted Write
+    text beginning `a `/`i `/`c `; (3) `:def!` shadowing a built-in; (4)
+    PERF -- `{0,2000}` gaps anchored at every quote cost >1s on quote-dense
+    200KB gdb content; these "command word, later on the line" shapes now
+    use `patterns._windowed_hit`, a linear scan; (5) gdb `call
+    (int)system(...)`, LLDB `expr`, sqlite3 `edit()`, GHCi `-pgmF`.
+    Round 4 (code review, fuzzed `_windowed_hit` against a naive per-start
+    search) found and closed: the round-3 400-char window was a padding
+    bypass (`run` + 400 spaces + `$(...)`) and its 2-char resume overlap
+    lost matches longer than 2 chars (`system(`); the scan now runs to the
+    end of each line, still linear, with a randomised equivalence test.
+    Also closed a false ASK on gdb `python` block assignments (`r = a |
+    b`): round 5 found the first fix -- a lookahead exempting `run`
+    followed by `=`/`.`/`,`/`[` -- was itself a bypass (`run =$(id)` is
+    valid shell), so it was replaced by blanking `python ... end` block
+    bodies for the gdb-command checks only (the Python vocabulary still
+    scans them). Round 6 (sign-off) found gdb's `\\`-newline line
+    continuation could hide a command behind a fake block start (`echo hi
+    \\` then `python` then `run $(...)`) and split command words (`ru\\`
+    then `n $(...)`); gdb content is now continuation-joined before every
+    check. Round 7 (sign-off): PASS on the join; its one
+    note -- rc-grammar comment stripping on the SHELL scan surface, where
+    `scan_surface` has already joined `\\`-newlines, let a bash `# note \\`
+    line swallow the real write after it -- was closed by not stripping
+    comments on the shell branch (only adds ASKs). Final: PASS. Accepted, disclosed false ASKs: a quoted metacharacter in `set
+    args --filter 'a|b'` (the shell never sees it), sqlite3 prose such as
+    `.print 'edit (the schema)'`, and a shell `printf 'a shell...'` whose
+    quoted text the sed a/i/c rewrite reads as an insert."""
+    cfg = getattr(policy, "repl_rc_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "repl-rc-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        literal = a.get("content") or a.get("new_string")
+        content = literal if isinstance(literal, str) and literal else "\n".join(_flatten_strings(a))
+        if not p or not content:
+            return None
+        kinds = patterns.repl_rc_kinds(p)
+        if not kinds:
+            return None
+        if not patterns.repl_rc_dangerous_hit(content, kinds):
+            return None
+        if (os.environ.get("AEGIS_ALLOW_REPL_RC_EXEC")
+                or _repl_rc_exec_allowed_by_policy(cfg, p)):
+            return None
+        return _finish(Decision(action, "repl-rc-exec-protect",
+                         f"'{p}' is being written with a process/code-exec "
+                         "shape in a debugger/REPL startup rc file -- the "
+                         "tool runs it on its very next launch (a pdb "
+                         "breakpoint, an R/IRB/GHCi session in this "
+                         "directory, the next gdb/lldb/psql/sqlite3/julia "
+                         "start), by this agent, a teammate, or CI, with no "
+                         "prompt. Review the change, then confirm with "
+                         "AEGIS_ALLOW_REPL_RC_EXEC=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.DELETE_OR_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+        kinds = patterns.repl_rc_kinds(cmd)
+        if not kinds:
+            return None
+        if not patterns.repl_rc_dangerous_hit(cmd, kinds, shell=True):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_REPL_RC_EXEC")
+                or _repl_rc_exec_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "repl-rc-exec-protect",
+                         "A process/code-exec shape is being planted in a "
+                         "debugger/REPL startup rc file from a shell -- the "
+                         "tool runs it on its very next launch, by this "
+                         "agent, a teammate, or CI, with no prompt. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_REPL_RC_EXEC=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 # ---- fetch-to-file backstop: closes the "curl -o"/"wget -O" gap every ----------
 # ---- *_protect guard above discloses ------------------------------------------
 
@@ -10899,6 +11174,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.PYSITE_CUSTOMIZE_PATH_RE, "a Python interpreter-startup file"),
     (patterns.PYSITE_PTH_PATH_RE, "a site-packages .pth file"),
     (patterns.IPYTHON_STARTUP_PATH_RE, "an IPython/Jupyter startup file"),
+    (patterns.REPL_RC_PATH_RE, "a debugger/REPL startup rc file"),
     (patterns.AWS_CONFIG_PATH_RE, "an AWS CLI config/credentials file"),
     (patterns.KUBE_CONFIG_PATH_RE, "a Kubernetes kubeconfig"),
     (patterns.DOCKER_CONFIG_PATH_RE, "a Docker credential-helper config"),
@@ -12679,6 +12955,9 @@ _CORE_RULES = (
     # command (QA round 1). agent_rules_protect stays last for the same reason.
     rule_npmrc_exec_protect,
     rule_vscode_settings_exec_protect,
+    # Same reason (QA round 1 of repl_rc_exec): its shell-branch ASK must not
+    # pre-empt `rm -rf ~` / `| sh` / force-push DENYs chained onto a plant.
+    rule_repl_rc_exec_protect,
     rule_agent_rules_protect,
 )
 

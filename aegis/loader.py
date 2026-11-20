@@ -63,7 +63,7 @@ def load_policy(path) -> Policy:
         "path_hijack": {}, "claude_hooks": {}, "statusline": {}, "permission_bypass": {},
         "claude_env": {}, "claude_cred_helper": {}, "claude_mcp_autoapprove": {},
         "conftest": {}, "pysite": {},
-        "ipython_startup": {}, "cloud_cred_exec": {}, "docker_cred_helper": {},
+        "ipython_startup": {}, "repl_rc_exec": {}, "cloud_cred_exec": {}, "docker_cred_helper": {},
         "terraform_exec": {}, "build_tool_exec": {}, "fetch_to_file": {},
         "inject": {}, "failures": {},
         "completion": {},
@@ -124,6 +124,7 @@ def load_policy(path) -> Policy:
                   conftest=st["conftest"],
                   pysite=st["pysite"],
                   ipython_startup=st["ipython_startup"],
+                  repl_rc_exec=st["repl_rc_exec"],
                   cloud_cred_exec=st["cloud_cred_exec"],
                   docker_cred_helper=st["docker_cred_helper"],
                   terraform_exec=st["terraform_exec"],
@@ -166,7 +167,7 @@ def _merge_file(data: dict, fname: str, st: dict) -> None:
                 "vscode_tasks_exec", "vscode_settings_exec", "jetbrains_watcher_exec", "jetbrains_run_config",
                 "path_hijack", "claude_hooks", "statusline",
                 "permission_bypass", "claude_env", "claude_cred_helper", "claude_mcp_autoapprove", "conftest", "pysite",
-                "ipython_startup", "cloud_cred_exec", "docker_cred_helper", "terraform_exec", "build_tool_exec",
+                "ipython_startup", "repl_rc_exec", "cloud_cred_exec", "docker_cred_helper", "terraform_exec", "build_tool_exec",
                 "fetch_to_file",
                 "inject", "failures", "completion"):
         if isinstance(data.get(key), dict):
