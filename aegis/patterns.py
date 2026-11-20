@@ -5633,7 +5633,11 @@ _RC_CALL_EXEC = re.compile(
     r"\b(?:system|popen|exec[lv]p?e?|posix_spawnp?|dlopen|WinExec|ShellExecute\w*)\s*\(")
 _RC_WINDOWED = {
     "gdb": (
-        (re.compile(_RC_LS + r"(?:r|ru|run|start|starti|set\s+args)\b", re.IGNORECASE | re.MULTILINE),
+        # Not when followed by `=`/`.`/`(`/`[`/`,`: that is a Python
+        # assignment/attribute in a gdb `python ... end` block (`r = a | b`,
+        # QA round 4), not a gdb command.
+        (re.compile(_RC_LS + r"(?:r|ru|run|start|starti|set\s+args)\b(?![ \t]*(?:[=.(\[,]|[-+|&]=))",
+                    re.IGNORECASE | re.MULTILINE),
          _RC_RUN_META),
         (re.compile(_RC_LS + r"gu(?:i(?:l(?:e)?)?)?\b", re.IGNORECASE | re.MULTILINE),
          re.compile(r"\bsystem\b")),
@@ -5647,23 +5651,25 @@ _RC_WINDOWED = {
          _RC_CALL_EXEC),
     ),
 }
-_RC_WINDOW = 400
 
 
 def _windowed_hit(body: str, start_re, meta_re) -> bool:
-    """True if `meta_re` matches within `_RC_WINDOW` chars after a
-    `start_re` match, on the same line. Each body character is searched at
-    most once (plus a 2-char overlap), so the scan is linear however many
-    candidate starts the body holds."""
-    scanned = 0
+    """True if `meta_re` matches anywhere after a `start_re` match on the
+    same line. Once one start has searched its line to the end, every later
+    start on that line is skipped, so each character is searched at most
+    once -- linear however many candidate starts the body holds, with no
+    window cap to pad past (QA round 4: an earlier 400-char window plus a
+    2-char overlap both lost matches)."""
+    scanned = -1
     for m in start_re.finditer(body):
         lo = m.end()
+        if lo < scanned:
+            continue
         nl = body.find("\n", lo)
-        hi = min(lo + _RC_WINDOW, len(body) if nl < 0 else nl)
-        frm = max(lo, scanned - 2)
-        if frm < hi and meta_re.search(body, frm, hi):
+        hi = len(body) if nl < 0 else nl
+        if meta_re.search(body, lo, hi):
             return True
-        scanned = max(scanned, hi) if frm <= scanned else hi
+        scanned = hi
     return False
 
 

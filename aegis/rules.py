@@ -11020,7 +11020,17 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     PERF -- `{0,2000}` gaps anchored at every quote cost >1s on quote-dense
     200KB gdb content; these "command word, later on the line" shapes now
     use `patterns._windowed_hit`, a linear scan; (5) gdb `call
-    (int)system(...)`, LLDB `expr`, sqlite3 `edit()`, GHCi `-pgmF`."""
+    (int)system(...)`, LLDB `expr`, sqlite3 `edit()`, GHCi `-pgmF`.
+    Round 4 (code review, fuzzed `_windowed_hit` against a naive per-start
+    search) found and closed: the round-3 400-char window was a padding
+    bypass (`run` + 400 spaces + `$(...)`) and its 2-char resume overlap
+    lost matches longer than 2 chars (`system(`); the scan now runs to the
+    end of each line, still linear, with a randomised equivalence test.
+    Also closed a false ASK on gdb `python` block assignments (`r = a |
+    b`). Accepted, disclosed false ASKs: a quoted metacharacter in `set
+    args --filter 'a|b'` (the shell never sees it), sqlite3 prose such as
+    `.print 'edit (the schema)'`, and a shell `printf 'a shell...'` whose
+    quoted text the sed a/i/c rewrite reads as an insert."""
     cfg = getattr(policy, "repl_rc_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

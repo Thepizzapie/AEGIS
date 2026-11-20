@@ -408,3 +408,39 @@ def test_qa3_quote_dense_gdb_fast(blob):
     t = time.time()
     patterns.repl_rc_dangerous_hit(blob, ("lldb",))
     assert time.time() - t < 1.0
+
+
+# ---- QA round 4 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("content", [
+    "run " + " " * 3000 + "$(id)\n",
+    "set args " + "x" * 3000 + " | id\n",
+    "call " + " " * 3000 + '(int)system("id")\n',
+    "guile " + " " * 3000 + '(system "id")\n',
+    "call f('p', " + "x" * 385 + ' system("id")\n',
+])
+def test_qa4_padding_and_overlap_gated(content):
+    assert _rule(evaluate(_write("/home/u/.gdbinit", content), EMPTY)) == RULE
+
+
+def test_qa4_windowed_matches_naive_search():
+    import random
+    rnd = random.Random(4)
+    toks = ["run ", "set args ", '"', "\n", "$(", "|", "&", ">&", "<(", "x", " ", "system(", "call "]
+    for start_re, meta_re in patterns._RC_WINDOWED["gdb"]:
+        for _ in range(3000):
+            body = "".join(rnd.choice(toks) for _ in range(rnd.randint(1, 40)))
+            naive = False
+            for m in start_re.finditer(body):
+                nl = body.find("\n", m.end())
+                if meta_re.search(body, m.end(), len(body) if nl < 0 else nl):
+                    naive = True
+                    break
+            assert patterns._windowed_hit(body, start_re, meta_re) == naive, body
+
+
+@pytest.mark.parametrize("good", [
+    "python\nr = a | b\nstart = flags | MASK\nr &= 3\nend\n",
+])
+def test_qa4_python_block_assignments_allowed(good):
+    assert evaluate(_write("/home/u/.gdbinit", good), EMPTY).action == Action.ALLOW
