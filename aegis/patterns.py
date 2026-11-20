@@ -5633,11 +5633,7 @@ _RC_CALL_EXEC = re.compile(
     r"\b(?:system|popen|exec[lv]p?e?|posix_spawnp?|dlopen|WinExec|ShellExecute\w*)\s*\(")
 _RC_WINDOWED = {
     "gdb": (
-        # Not when followed by `=`/`.`/`(`/`[`/`,`: that is a Python
-        # assignment/attribute in a gdb `python ... end` block (`r = a | b`,
-        # QA round 4), not a gdb command.
-        (re.compile(_RC_LS + r"(?:r|ru|run|start|starti|set\s+args)\b(?![ \t]*(?:[=.(\[,]|[-+|&]=))",
-                    re.IGNORECASE | re.MULTILINE),
+        (re.compile(_RC_LS + r"(?:r|ru|run|start|starti|set\s+args)\b", re.IGNORECASE | re.MULTILINE),
          _RC_RUN_META),
         (re.compile(_RC_LS + r"gu(?:i(?:l(?:e)?)?)?\b", re.IGNORECASE | re.MULTILINE),
          re.compile(r"\bsystem\b")),
@@ -5651,6 +5647,22 @@ _RC_WINDOWED = {
          _RC_CALL_EXEC),
     ),
 }
+
+
+# Bodies of gdb multi-line `python`/`py`/`pi` ... `end` blocks (to end of
+# file when unterminated, as gdb itself would read it) are blanked for the
+# windowed gdb-COMMAND checks only -- a Python line such as `r = a | b` is
+# not a gdb `run` (QA rounds 4-5). `_RC_SHELL_PY` still scans the block.
+# Round 5 rejected an earlier lookahead exemption on the `run` word itself
+# (`run =$(id)` slipped through it).
+_GDB_PY_BLOCK_RE = re.compile(
+    r"^[ \t]*(?:python-interactive|python|py|pi)[ \t\r]*$(?:.*?^[ \t]*end[ \t\r]*$|.*\Z)",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+
+
+def _gdb_mask_python_blocks(body: str) -> str:
+    return _GDB_PY_BLOCK_RE.sub(lambda m: "\n" * m.group(0).count("\n"), body)
 
 
 def _windowed_hit(body: str, start_re, meta_re) -> bool:
@@ -5688,8 +5700,9 @@ def repl_rc_dangerous_hit(content: str, kinds, *, shell: bool = False) -> bool:
         for rx in _REPL_RC_DANGER[kind]:
             if rx.search(body):
                 return True
+        wbody = _gdb_mask_python_blocks(body) if kind == "gdb" else body
         for start_re, meta_re in _RC_WINDOWED.get(kind, ()):
-            if _windowed_hit(body, start_re, meta_re):
+            if _windowed_hit(wbody, start_re, meta_re):
                 return True
     return False
 

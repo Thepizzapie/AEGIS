@@ -444,3 +444,27 @@ def test_qa4_windowed_matches_naive_search():
 ])
 def test_qa4_python_block_assignments_allowed(good):
     assert evaluate(_write("/home/u/.gdbinit", good), EMPTY).action == Action.ALLOW
+
+
+# ---- QA round 5 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("content", [
+    "run =$(id)\n", "run = $(id)\n", "run .$(id)\n", "run ,$(id)\n", "run [$(id)]\n",
+    "set args .`id`\n", "start ,$(id)\n", "r =1 & id\n", "starti [x] | id\n",
+    "run += | id\n", "run -=x|id\n",
+    "python\nx = 1\nend\nrun $(id)\n",
+    "python\nimport os\nos.system('id')\nend\n",
+])
+def test_qa5_gated(content):
+    assert _rule(evaluate(_write("/home/u/.gdbinit", content), EMPTY)) == RULE
+
+
+def test_qa5_python_block_masking_is_linear():
+    blob = "python\n" + "r = a | b\n" * 40000
+    t = time.time()
+    assert not patterns.repl_rc_dangerous_hit(blob, ("gdb",))
+    assert time.time() - t < 1.0
+    blob = "python\nend\n" * 30000
+    t = time.time()
+    patterns.repl_rc_dangerous_hit(blob, ("gdb",))
+    assert time.time() - t < 1.0
