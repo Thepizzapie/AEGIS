@@ -12818,7 +12818,6 @@ _CORE_RULES = (
     rule_conftest_protect,
     rule_pysite_protect,
     rule_ipython_startup_protect,
-    rule_repl_rc_exec_protect,
     rule_cloud_cred_exec_protect,
     rule_docker_cred_helper_protect,
     rule_terraform_exec_protect,
@@ -12840,6 +12839,9 @@ _CORE_RULES = (
     # command (QA round 1). agent_rules_protect stays last for the same reason.
     rule_npmrc_exec_protect,
     rule_vscode_settings_exec_protect,
+    # Same reason (QA round 1 of repl_rc_exec): its shell-branch ASK must not
+    # pre-empt `rm -rf ~` / `| sh` / force-push DENYs chained onto a plant.
+    rule_repl_rc_exec_protect,
     rule_agent_rules_protect,
 )
 
