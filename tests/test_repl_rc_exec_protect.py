@@ -350,3 +350,61 @@ def test_qa2_ghci_long_macro_name_invocation_gated():
     name = "m" * 80
     body = f':def {name} \\_ -> return ":! id"\n:{name}\n'
     assert _rule(evaluate(_write(".ghci", body), EMPTY)) == RULE
+
+
+# ---- QA round 3 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("path,bad", [
+    ("/home/u/.gdbinit", "set args $(id)\nrun\n"),
+    ("/home/u/.gdbinit", "set args > >(id)\nrun\n"),
+    ("/home/u/.gdbinit", "run $HOME $(id)\n"),
+    ("/home/u/.gdbinit", 'run "$HOME" `id`\n'),
+    ("/home/u/.gdbinit", "run | id\n"),
+    ("/home/u/.gdbinit", "run & id\n"),
+    ("/home/u/.gdbinit", "run < <(id)\n"),
+    ("/home/u/.gdbinit", "guile (system \"id\")\n"),
+    ("/home/u/.gdbinit", 'break exit\nrun\ncall (int)system("id")\n'),
+    ("/home/u/.lldbinit", 'expr (int)system("id")\n'),
+    (".ghci", ':def! r \\_ -> return ":! id"\n'),
+    (".ghci", ":set -F -pgmF /tmp/pp\n"),
+    ("/home/u/.sqliterc", "SELECT edit('', 'id');\n"),
+])
+def test_qa3_bypasses_gated(path, bad):
+    assert _rule(evaluate(_write(path, bad), EMPTY)) == RULE
+
+
+@pytest.mark.parametrize("cmd", [
+    "sed -i '$a\\shell id' ~/.gdbinit",
+    "sed -i '$ a shell id' ~/.gdbinit",
+    "sed -i '1i\\\\shell id' ~/.gdbinit",
+    "sed -i '$a\\.system id' ~/.sqliterc",
+    "echo 'set args $(id)' >> ~/.gdbinit",
+    "echo 'run | id' >> ~/.gdbinit",
+])
+def test_qa3_shell_plants_gated(cmd):
+    assert _rule(evaluate(_shell(cmd), EMPTY)) == RULE
+
+
+@pytest.mark.parametrize("path,good", [
+    ("/home/u/.gdbinit", "run < input.txt\n"),
+    ("/home/u/.gdbinit", "r > out.log 2>&1\n"),
+    ("/home/u/.gdbinit", "set args -n 3 < in.txt\n"),
+    ("/home/u/.gdbinit", 'printf "a | b\\n"\n'),
+    ("/home/u/.gdbinit", "print sizeof(struct foo)\n"),
+    ("/home/u/.lldbinit", 'command alias -h "A run helper" myrun process launch\n'),
+    ("/home/u/.sqliterc", '.prompt "a .shell> "\n'),
+    (".ghci", ':def hoogle \\s -> return $ ":! hoogle " ++ s\n:def doc \\s -> return $ ":! hoogle --info " ++ s\n:set prompt "> "\n:m + Data.List\n'),
+])
+def test_qa3_benign_allowed(path, good):
+    assert evaluate(_write(path, good), EMPTY).action == Action.ALLOW
+
+
+@pytest.mark.parametrize("blob", ['"gu ' * 50000, '"r ' * 66666, "\\ngu " * 40000,
+                                  '"call ' * 40000, '"set args ' * 25000])
+def test_qa3_quote_dense_gdb_fast(blob):
+    t = time.time()
+    patterns.repl_rc_dangerous_hit(blob, ("gdb",))
+    assert time.time() - t < 1.0
+    t = time.time()
+    patterns.repl_rc_dangerous_hit(blob, ("lldb",))
+    assert time.time() - t < 1.0

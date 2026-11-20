@@ -5430,12 +5430,14 @@ def repl_rc_kinds(text: str) -> tuple:
 # the position right after the echoed argument's opening quote or a literal
 # `\n` escape, the same quote-adjacency trade-off `IPYTHON_BANG_ANY_RE`
 # documents.
-_RC_LS = (
-    r"(?:^|['\"]"
-    # `sed -i '$a shell id' ~/.gdbinit` / `sed -i '1i .system id'`: the text
-    # after sed's own a/i/c command is the line being inserted (QA round 2).
-    r"(?:(?:\$|\d{1,9}|/[^/\n]{0,200}/)?[aic]\\?(?=[ \t]))?"
-    r"|\\[nr])[ \t]*"
+_RC_LS = r"(?:^|['\"]|\\[nr])[ \t]*"
+
+# Shell branch only: `sed -i '$a\shell id' ~/.gdbinit`, `sed '1i .system x'`
+# -- the text after sed's own a/i/c command is the line being inserted, so
+# it is rewritten to a real line start before scanning (QA rounds 2-3; kept
+# off Write content, where it false-ASKed on ordinary quoted text).
+_SED_INSERT_RE = re.compile(
+    r"(['\"])(?:\$|\d{1,9}(?:,(?:\d{1,9}|\$))?|/[^/\n]{0,200}/)?[ \t]*(?-i:[aic])(?:\\{1,2}[ \t]*|[ \t]+)"
 )
 
 # Program names that make a debugger's "launch the inferior" step a plain
@@ -5488,19 +5490,20 @@ _REPL_RC_DANGER = {
         r"|\b(?:callCommand|callProcess|readProcess(?:WithExitCode)?|readCreateProcess(?:WithExitCode)?"
         r"|createProcess|spawnCommand|spawnProcess|rawSystem|runCommand|runInteractiveCommand"
         r"|runInteractiveProcess|runProcess|unsafePerformIO)\b"
-        r"|(?<![\w.'])system\s+\"", re.MULTILINE),),
+        r"|(?<![\w.'])system\s+\""
+        # Option-based exec (QA round 3): a preprocessor/literate/compiler
+        # program override runs on the next `:load`.
+        r"|" + _RC_LS + r":set?\s+(?:-\S+\s+){0,10}-pgm\w+", re.MULTILINE),),
     "gdb": (re.compile(
-        _RC_LS + r"(?:!|\||she(?:l(?:l)?)?\b|pipe\b|gu(?:i(?:l(?:e)?)?)?\b[^\n]{0,2000}?\bsystem\b)"
+        _RC_LS + r"(?:!|\||she(?:l(?:l)?)?\b|pipe\b)"
         # `alias xx = shell` (QA round 1: the alias target is mid-line) and
         # `target [extended-]remote | CMD` (gdb spawns CMD as the remote).
         r"|\balias\s+(?:-a\s+)?(?:--\s+)?\S+\s*=\s*(?:she\w*|pipe|!|\||py\w*|pi\b|gu\w*)"
-        r"|\btar\w*\s+(?:ext\w*(?:-rem\w*)?|rem\w*)\s*\|"
-        # Inferior launch as exec (QA round 2, verified in gdb 15): `run`
-        # args are expanded by a shell (startup-with-shell is the default),
-        # an exec-wrapper runs before the program, and `file /bin/sh` +
-        # `run -c ...` is a plain shell.
-        r"|" + _RC_LS + r"(?:r|ru|run|start|starti)\b[^\n`$]{0,2000}(?:\$\(|`)"
         r"|\bset\s+exec-w\w*"
+        r"|\btar\w*\s+(?:ext\w*(?:-rem\w*)?|rem\w*)\s*\|"
+        # `file /bin/sh` + `run -c ...` is a plain shell (QA round 2); the
+        # `run`/`set args` metacharacter and `call system(...)` forms are
+        # checked by `_RC_WINDOWED` below.
         r"|" + _RC_LS + r"(?:fil|file|exec-f\w*|exe)\s+['\"]?" + _RC_SHELL_PROG,
         re.IGNORECASE | re.MULTILINE),
         _RC_SHELL_PY,
@@ -5554,7 +5557,10 @@ _REPL_RC_DANGER = {
         # `.lo`) -- the same unique-prefix class as LLDB (QA round 2).
         _RC_LS + r"\.(?:sy(?:s(?:t(?:e(?:m)?)?)?)?|sh(?:e(?:l(?:l)?)?)?|lo(?:a(?:d)?)?)\b"
         r"|" + _RC_LS + r"\.(?:on\w*|ou\w*|o|imp\w*|im|i|rea\w*|re|r)\s+(?:-\S+\s+){0,10}['\"]?\|"
-        r"|\bload_extension\s*\(",
+        r"|\bload_extension\s*\("
+        # shell.c's `edit(text, editor)` SQL function passes `editor` to
+        # system() (QA round 3).
+        r"|\bedit\s*\(",
         re.IGNORECASE | re.MULTILINE),),
     "julia": (re.compile(
         r"(?<![\w.])(?:Base\.)?(?:run|success|pipeline|readchomp|readlines|readline|eachline|read|open"
@@ -5591,7 +5597,9 @@ _REPL_RC_COMMENT = {
 # literals, so a real `System.Process`/`callCommand` call on the line stays
 # visible (QA round 2: stripping the whole line hid both).
 _GHCI_DEF_RE = re.compile(r"^[ \t]*:def!?[ \t]+([\w'\-]+)", re.MULTILINE)
-_GHCI_DEF_LINE_RE = re.compile(r"^([ \t]*:def!?[ \t][^\n]*)$", re.MULTILINE)
+# `:def!` is excluded: it may shadow a built-in (`:def! r ...` runs on the
+# human's next `:r`), so the file never needs to invoke it (QA round 3).
+_GHCI_DEF_LINE_RE = re.compile(r"^([ \t]*:def[ \t][^\n]*)$", re.MULTILINE)
 _GHCI_STR_RE = re.compile(r"\"(?:[^\"\\\n]|\\.){0,4096}\"")
 _GHCI_CMD_RE = re.compile(r"(?:^|['\"]|\\[nr])[ \t]*:([\w'\-]+)", re.MULTILINE)
 
@@ -5611,17 +5619,71 @@ def _ghci_mask_defs(body: str) -> str:
     return _GHCI_DEF_LINE_RE.sub(lambda m: _GHCI_STR_RE.sub('""', m.group(1)), body)
 
 
-def repl_rc_dangerous_hit(content: str, kinds) -> bool:
+# "Command word ... later on the same line" shapes, checked by a linear
+# windowed scan rather than a `{0,N}` regex gap (QA round 3 measured the
+# regex form at >1s on quote-dense 200KB gdb content, since every quote is
+# a candidate line start).
+#
+# gdb starts the inferior through `$SHELL` by default, so a shell
+# metacharacter in `run`/`start` args or in `set args` runs code (QA round
+# 3, verified in gdb 15: `$(...)`, backticks, `|`, a lone `&`, `>(...)`/
+# `<(...)`); a plain `< in.txt`/`> out.log 2>&1` redirect stays allowed.
+_RC_RUN_META = re.compile(r"\$\(|`|\||(?<![<>&])&(?![>&])|[<>]\(")
+_RC_CALL_EXEC = re.compile(
+    r"\b(?:system|popen|exec[lv]p?e?|posix_spawnp?|dlopen|WinExec|ShellExecute\w*)\s*\(")
+_RC_WINDOWED = {
+    "gdb": (
+        (re.compile(_RC_LS + r"(?:r|ru|run|start|starti|set\s+args)\b", re.IGNORECASE | re.MULTILINE),
+         _RC_RUN_META),
+        (re.compile(_RC_LS + r"gu(?:i(?:l(?:e)?)?)?\b", re.IGNORECASE | re.MULTILINE),
+         re.compile(r"\bsystem\b")),
+        # `call (int)system("...")` / `print popen(...)` evaluate a libc call
+        # in the inferior (QA round 3, verified in gdb 15).
+        (re.compile(_RC_LS + r"(?:call|ca|print|p|output|compile)\b", re.IGNORECASE | re.MULTILINE),
+         _RC_CALL_EXEC),
+    ),
+    "lldb": (
+        (re.compile(_RC_LS + r"(?:expr\w*|e|p|po|call)\b", re.IGNORECASE | re.MULTILINE),
+         _RC_CALL_EXEC),
+    ),
+}
+_RC_WINDOW = 400
+
+
+def _windowed_hit(body: str, start_re, meta_re) -> bool:
+    """True if `meta_re` matches within `_RC_WINDOW` chars after a
+    `start_re` match, on the same line. Each body character is searched at
+    most once (plus a 2-char overlap), so the scan is linear however many
+    candidate starts the body holds."""
+    scanned = 0
+    for m in start_re.finditer(body):
+        lo = m.end()
+        nl = body.find("\n", lo)
+        hi = min(lo + _RC_WINDOW, len(body) if nl < 0 else nl)
+        frm = max(lo, scanned - 2)
+        if frm < hi and meta_re.search(body, frm, hi):
+            return True
+        scanned = max(scanned, hi) if frm <= scanned else hi
+    return False
+
+
+def repl_rc_dangerous_hit(content: str, kinds, *, shell: bool = False) -> bool:
     """True if `content` carries an exec shape in the rc-file grammar of ANY
-    tool kind in `kinds` (see `repl_rc_kinds`)."""
+    tool kind in `kinds` (see `repl_rc_kinds`). ``shell`` marks `content` as
+    a shell command's scan surface, enabling the sed a/i/c rewrite."""
     if not content:
         return False
+    if shell:
+        content = _SED_INSERT_RE.sub(lambda m: m.group(1) + "\n", content)
     for kind in kinds or ():
         body = _REPL_RC_COMMENT[kind].sub("", content)
         if kind == "ghci":
             body = _ghci_mask_defs(body)
         for rx in _REPL_RC_DANGER[kind]:
             if rx.search(body):
+                return True
+        for start_re, meta_re in _RC_WINDOWED.get(kind, ()):
+            if _windowed_hit(body, start_re, meta_re):
                 return True
     return False
 

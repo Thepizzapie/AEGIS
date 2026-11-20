@@ -10879,23 +10879,26 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     `processx::`/`download.file()`/remote `source()` for R; backticks/
     `%x`/`system`/`exec`/`spawn`/`IO.popen`/`Open3` for Ruby; `:!`/`:cmd`/
     `System.Process` for GHCi; `shell`/`!`/`pipe`/`|`, an `alias` to one
-    of those, `target remote | CMD`, and an inferior launch that is itself
-    an exec (`run` args with `$(...)`/backticks -- gdb starts the program
-    through a shell by default -- `set exec-wrapper`, `file /bin/sh`) for
-    gdb; `platform shell` (any
+    of those, `target remote | CMD`, an inferior launch that is itself an
+    exec (`run`/`start`/`set args` with a shell metacharacter -- `$(...)`,
+    backticks, `|`, a lone `&`, `>(...)`/`<(...)` -- since gdb starts the
+    program through `$SHELL` by default; `set exec-wrapper`; `file
+    /bin/sh`), and `call`/`print`/`compile` of a libc `system()`/`popen()`/
+    `exec*()` for gdb (LLDB `expr`/`p`/`po` likewise); `platform shell` (any
     unique prefix, `pla sh`), `shell`, `process launch`/`run` and `target
     create <shell>` for LLDB; `\\!`, `\\o |cmd`, `\\copy ... program`,
     `COPY ... PROGRAM`, backquoted text in any backslash command (`\\set x
     `cmd``), a `%`cmd`` prompt escape, and a pager/editor `\\setenv` not
     naming a known plain pager/editor for psql; `.system`/`.shell`/`.load`/
-    `.once |cmd`/`load_extension()` for sqlite3, including the unique-
+    `.once |cmd`/`load_extension()`/`edit()` for sqlite3, including the unique-
     prefix forms (`.sys`, `.she`, `.lo`, `.o |cmd`) sqlite3's shell accepts
     (from its `shell.c` prefix matching; not run against a real sqlite3); `run(`/backtick
     `Cmd`/`ccall`/`Meta.parse`/`download(` for Julia. Two gate-DISABLE
     shapes are gated too, the "switch off the tool's own trust check"
     class `rule_vscode_settings_exec_protect` gates for VS Code: gdb's
     auto-load safe-path widened to `/`, `/*`, a single top-level directory
-    (`/tmp`, `/home/*`), `~`, `$HOME` or `*` -- every repo under it then
+    (`/tmp`, `/home/*`), a literal home directory (`/home/alice`,
+    `/Users/alice`), `~`, `$HOME` or `*` -- every repo under it then
     auto-loads its `.gdbinit` -- or reset with a bare `set auto-load
     safe-path`; and LLDB's `target.load-cwd-lldbinit true`. Full-line
     comments are stripped first (Ruby `#{...}` interpolation lines are not
@@ -10903,7 +10906,10 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     blanked -- the hoogle `:def ... ":! hoogle " ++ s` idiom stays allowed
     -- but only when the same file never invokes a defined macro (by full
     name or any prefix GHCi would resolve to it); any `System.Process`/
-    `callCommand` call outside a string on a `:def` line is still gated. A
+    `callCommand` call outside a string on a `:def` line is still gated,
+    and `:def!` (which may shadow a built-in such as `:r`, so the human
+    invokes it) is never exempt. GHCi `-pgm*` program overrides in `:set`
+    are gated too. A
     routine rc file (pdb aliases,
     `options(repos=...)`, `source("renv/activate.R")`, IRB prompt config,
     `:set prompt`, a gdb pretty-printer `python import ...`, psql `\\set`
@@ -10945,7 +10951,11 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     bat --pager=bash`, `\\setenv LESS +!cmd`); the shell branch scans
     `normalize.scan_surface`'s output, which is capped in length for every
     guard alike, so a heredoc padded past that cap is not inspected (a
-    shared limit, not specific to this guard); relocating the rc file by env var or flag
+    shared limit, not specific to this guard); GHCi `:set editor <cmd>`
+    (runs on `:e`) is not gated, since setting an editor is routine; a gdb
+    `file ./python`/`file node` (a plausible interpreter-debugging setup)
+    ASKs, since `run -c` would make it an exec; backquoted text inside a
+    psql `/* ... */` comment ASKs; relocating the rc file by env var or flag
     (`R_PROFILE_USER`, `IRBRC`, `PSQLRC`, `JULIA_DEPOT_PATH`, sqlite3
     `-init`, GHCi `-ghci-script`) is the same "computed indirectly" class
     `rule_ipython_startup_protect`'s `IPYTHONDIR` gap accepts; a shell
@@ -11000,7 +11010,17 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     '$a ...'` shell plants, gdb `tar ext |`, sqlite3 dot-command prefixes;
     (6) false ASKs on `\\setenv PAGER /usr/bin/less`, `cat`, editor names
     and CRLF line endings. Design/consistency (wiring, ordering against 19
-    chained-DENY suffixes) was verified clean."""
+    chained-DENY suffixes) was verified clean. Round 3 (fresh agent,
+    verified in gdb 15 and GNU sed) found and closed: (1) the round-2 `run`
+    rule only saw `$(`/backticks and never `set args` -- now any shell
+    metacharacter in `run`/`start`/`set args`; (2) GNU sed `$a\\text`, `$ a
+    text`, `1i\\\\text` insert forms -- the sed rewrite now runs on the shell
+    branch only, which also removed a round-2 false ASK on quoted Write
+    text beginning `a `/`i `/`c `; (3) `:def!` shadowing a built-in; (4)
+    PERF -- `{0,2000}` gaps anchored at every quote cost >1s on quote-dense
+    200KB gdb content; these "command word, later on the line" shapes now
+    use `patterns._windowed_hit`, a linear scan; (5) gdb `call
+    (int)system(...)`, LLDB `expr`, sqlite3 `edit()`, GHCi `-pgmF`."""
     cfg = getattr(policy, "repl_rc_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -11052,7 +11072,7 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         kinds = patterns.repl_rc_kinds(cmd)
         if not kinds:
             return None
-        if not patterns.repl_rc_dangerous_hit(cmd, kinds):
+        if not patterns.repl_rc_dangerous_hit(cmd, kinds, shell=True):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_REPL_RC_EXEC")
                 or _repl_rc_exec_allowed_by_policy(cfg, _cmd(ev))):
