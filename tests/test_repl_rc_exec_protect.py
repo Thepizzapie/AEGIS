@@ -468,3 +468,23 @@ def test_qa5_python_block_masking_is_linear():
     t = time.time()
     patterns.repl_rc_dangerous_hit(blob, ("gdb",))
     assert time.time() - t < 1.0
+
+
+# ---- QA round 6 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("content", [
+    "echo hi \\\npython\nrun $(id)\nend\n",
+    "# note \\\npython\nrun $(id)\nend\n",
+    "echo hi \\\npython\ncall (int)system(\"id\")\nend\n",
+    "ru\\\nn $(id)\n",
+    "run \\\n$(id)\n",
+    "call (int)sys\\\ntem(\"id\")\n",
+    "she\\\nll id\n",
+])
+def test_qa6_line_continuation_gated(content):
+    assert _rule(evaluate(_write("/home/u/.gdbinit", content), EMPTY)) == RULE
+
+
+def test_qa6_python_block_still_masked():
+    good = "# setup\npython\nr = a | b\nend\nset print pretty on\n"
+    assert evaluate(_write("/home/u/.gdbinit", good), EMPTY).action == Action.ALLOW

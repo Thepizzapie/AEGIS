@@ -5661,6 +5661,12 @@ _GDB_PY_BLOCK_RE = re.compile(
 )
 
 
+# gdb joins a physical line ending in `\` onto the next before parsing
+# anything, sourced files included -- so `ru\<NL>n $(id)` is `run $(id)`,
+# and `echo hi \<NL>python` never starts a Python block (QA round 6).
+_GDB_CONT_RE = re.compile(r"\\\r?\n")
+
+
 def _gdb_mask_python_blocks(body: str) -> str:
     return _GDB_PY_BLOCK_RE.sub(lambda m: "\n" * m.group(0).count("\n"), body)
 
@@ -5694,7 +5700,8 @@ def repl_rc_dangerous_hit(content: str, kinds, *, shell: bool = False) -> bool:
     if shell:
         content = _SED_INSERT_RE.sub(lambda m: m.group(1) + "\n", content)
     for kind in kinds or ():
-        body = _REPL_RC_COMMENT[kind].sub("", content)
+        src = _GDB_CONT_RE.sub("", content) if kind == "gdb" else content
+        body = _REPL_RC_COMMENT[kind].sub("", src)
         if kind == "ghci":
             body = _ghci_mask_defs(body)
         for rx in _REPL_RC_DANGER[kind]:

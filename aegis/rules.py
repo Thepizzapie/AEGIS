@@ -11031,7 +11031,11 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     followed by `=`/`.`/`,`/`[` -- was itself a bypass (`run =$(id)` is
     valid shell), so it was replaced by blanking `python ... end` block
     bodies for the gdb-command checks only (the Python vocabulary still
-    scans them). Accepted, disclosed false ASKs: a quoted metacharacter in `set
+    scans them). Round 6 (sign-off) found gdb's `\\`-newline line
+    continuation could hide a command behind a fake block start (`echo hi
+    \\` then `python` then `run $(...)`) and split command words (`ru\\`
+    then `n $(...)`); gdb content is now continuation-joined before every
+    check. Accepted, disclosed false ASKs: a quoted metacharacter in `set
     args --filter 'a|b'` (the shell never sees it), sqlite3 prose such as
     `.print 'edit (the schema)'`, and a shell `printf 'a shell...'` whose
     quoted text the sed a/i/c rewrite reads as an insert."""
