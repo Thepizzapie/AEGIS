@@ -11035,7 +11035,11 @@ def rule_repl_rc_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     continuation could hide a command behind a fake block start (`echo hi
     \\` then `python` then `run $(...)`) and split command words (`ru\\`
     then `n $(...)`); gdb content is now continuation-joined before every
-    check. Accepted, disclosed false ASKs: a quoted metacharacter in `set
+    check. Round 7 (sign-off): PASS on the join; its one
+    note -- rc-grammar comment stripping on the SHELL scan surface, where
+    `scan_surface` has already joined `\\`-newlines, let a bash `# note \\`
+    line swallow the real write after it -- was closed by not stripping
+    comments on the shell branch (only adds ASKs). Final: PASS. Accepted, disclosed false ASKs: a quoted metacharacter in `set
     args --filter 'a|b'` (the shell never sees it), sqlite3 prose such as
     `.print 'edit (the schema)'`, and a shell `printf 'a shell...'` whose
     quoted text the sed a/i/c rewrite reads as an insert."""

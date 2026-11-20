@@ -5701,7 +5701,10 @@ def repl_rc_dangerous_hit(content: str, kinds, *, shell: bool = False) -> bool:
         content = _SED_INSERT_RE.sub(lambda m: m.group(1) + "\n", content)
     for kind in kinds or ():
         src = _GDB_CONT_RE.sub("", content) if kind == "gdb" else content
-        body = _REPL_RC_COMMENT[kind].sub("", src)
+        # Not on a shell scan surface: `normalize.scan_surface` has already
+        # joined `\`-newlines, so a shell `# note \` line would swallow the
+        # real command after it, which bash itself runs (QA round 7).
+        body = src if shell else _REPL_RC_COMMENT[kind].sub("", src)
         if kind == "ghci":
             body = _ghci_mask_defs(body)
         for rx in _REPL_RC_DANGER[kind]:

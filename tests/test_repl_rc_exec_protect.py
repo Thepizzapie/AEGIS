@@ -488,3 +488,8 @@ def test_qa6_line_continuation_gated(content):
 def test_qa6_python_block_still_masked():
     good = "# setup\npython\nr = a | b\nend\nset print pretty on\n"
     assert evaluate(_write("/home/u/.gdbinit", good), EMPTY).action == Action.ALLOW
+
+
+def test_qa7_shell_comment_continuation_not_swallowed():
+    cmd = "# note \\\necho 'run $(id)' >> ~/.gdbinit"
+    assert _rule(evaluate(_shell(cmd), EMPTY)) == RULE
