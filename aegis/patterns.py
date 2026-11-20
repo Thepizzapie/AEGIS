@@ -5373,6 +5373,169 @@ def ipython_startup_dangerous_hit(content: str, *, is_ipy: bool = False,
 
 
 # ---------------------------------------------------------------------------
+# Debugger/REPL startup rc auto-exec (`rules.rule_repl_rc_exec_protect`).
+#
+# A family of interactive tools reads a per-user and/or per-DIRECTORY startup
+# file on every launch and executes it as code/commands, with no opt-in, no
+# trust prompt and no import: pdb (`.pdbrc`, home AND cwd), R (`.Rprofile`,
+# project cwd first, then home; `Rprofile.site`), IRB/Pry (`.irbrc`/`.pryrc`,
+# home and cwd), GHCi (`.ghci` in cwd, `ghci.conf`), gdb (`~/.gdbinit`,
+# `gdbearlyinit`, cwd `.gdbinit` when the auto-load safe-path allows it),
+# LLDB (`~/.lldbinit[-<prog>]`, cwd `.lldbinit` when
+# `target.load-cwd-lldbinit` is on), psql (`~/.psqlrc[-<ver>]`), sqlite3
+# (`~/.sqliterc`) and Julia (`~/.julia/config/startup.jl`). None of these
+# was covered by any sibling guard: `PYSITE_CUSTOMIZE_PATH_RE`/
+# `IPYTHON_STARTUP_PATH_RE` gate their own literal filenames only.
+#
+# Each tool speaks a different language, so the path regex below captures
+# WHICH tool the file belongs to, and `repl_rc_dangerous_hit` applies only
+# that tool's exec vocabulary -- the same "gate the SHAPE, not the bare
+# file" trade-off `ipython_startup_dangerous_hit` makes. A routine rc file
+# (pdb aliases, `options(repos=...)`, `source("renv/activate.R")`, IRB
+# prompt tweaks, `:set prompt`, gdb pretty-printer `python import ...`,
+# `\set` psql variables, `.mode column`, `using Revise`) stays allowed.
+_RC_B = r"(?:^|[\s'\"/\\=])"
+_REPL_RC_KINDS = (
+    ("pdb", r"\.pdbrc"),
+    ("r", r"(?:\.Rprofile|Rprofile\.site)"),
+    ("ruby", r"(?:[._]irbrc|irb\.rc|irb" + _SEP + r"irbrc|\.pryrc)"),
+    ("ghci", r"(?:\.ghci|ghci\.conf)"),
+    ("gdb", r"(?:\.gdbinit|\.gdbearlyinit|gdb" + _SEP + r"gdb(?:early)?init|gdb\.ini)"),
+    ("lldb", r"\.lldbinit(?:-[\w.\-]+)?"),
+    ("psql", r"(?:\.psqlrc(?:-[\w.\-]+)?|postgresql" + _SEP + r"psqlrc\.conf)"),
+    ("sqlite", r"(?:\.sqliterc|sqlite3" + _SEP + r"sqliterc)"),
+    ("julia", r"\.julia" + _SEP + r"config" + _SEP + r"startup\.jl"),
+)
+_REPL_RC_KIND_RES = tuple(
+    (kind, re.compile(_RC_B + body + _CI_END, re.IGNORECASE))
+    for kind, body in _REPL_RC_KINDS
+)
+REPL_RC_PATH_RE = re.compile(
+    _RC_B + r"(?:" + r"|".join(body for _, body in _REPL_RC_KINDS) + r")" + _CI_END,
+    re.IGNORECASE,
+)
+
+
+def repl_rc_kinds(text: str) -> tuple:
+    """Every tool kind whose rc-file path appears in `text` (a path, or a
+    whole shell command that may name several)."""
+    return tuple(kind for kind, rx in _REPL_RC_KIND_RES if rx.search(text or ""))
+
+
+# "Start of a command line" for the line-oriented rc grammars (gdb, LLDB,
+# GHCi, sqlite3): a real line start, OR -- for a single-line shell plant
+# (`echo '.system x' > ~/.sqliterc`, `printf 'shell x\n' > ~/.gdbinit`) --
+# the position right after the echoed argument's opening quote or a literal
+# `\n` escape, the same quote-adjacency trade-off `IPYTHON_BANG_ANY_RE`
+# documents.
+_RC_LS = r"(?:^|['\"]|\\[nr])[ \t]*"
+
+# Python vocabulary (pdb executes every non-pdb-command line as a Python
+# statement, `!`-prefixed or not, at any indentation; gdb `python`/LLDB
+# `script` blocks are Python too). `_CONFTEST_EXEC_CALL` plus the process
+# primitives it does not list.
+_RC_PY_EXEC = (
+    r"(?<![\w.])(?:" + _CONFTEST_EXEC_CALL
+    + r"|subprocess\.(?:getoutput|getstatusoutput)|os\.(?:exec|spawn|posix_spawn)\w*"
+    + r"|os\.startfile|runpy\.run_\w+|ctypes\.(?:CDLL|cdll|WinDLL)|urllib\.request\.\w+)\s*[(.]"
+)
+_RC_SHELL_PY = re.compile(_RC_PY_EXEC, re.IGNORECASE)
+
+_REPL_RC_DANGER = {
+    "pdb": (_RC_SHELL_PY,),
+    "r": (re.compile(
+        r"(?<![\w.])(?:base::)?(?:system2?|shell|shell\.exec|pipe|dyn\.load|socketConnection)\s*\("
+        r"|\b(?:processx|sys|callr|rstudioapi|curl|httr2?|RCurl|reticulate)::"
+        r"|(?<![\w.])(?:utils::)?download\.file\s*\("
+        r"|(?<![\w.])(?:eval|evalq)\s*\(\s*(?:base::)?(?:parse|str2lang|str2expression)\s*\("
+        r"|(?<![\w.])(?:source|sys\.source)\s*\(\s*(?:file\s*=\s*)?(?:url\s*\(|['\"](?:https?|ftp)://)"
+        r"|(?<![\w.])url\s*\(\s*['\"](?:https?|ftp)://",
+        re.IGNORECASE),),
+    "ruby": (re.compile(
+        r"`[^`\n]+`|%x\s*[\[({<|!/]"
+        r"|(?<![\w.:])(?:Kernel\s*\.\s*|Process\s*\.\s*)?(?:system|exec|spawn|syscall)\s*(?:\(|[ \t]+['\"%$@\w\[])"
+        r"|\b(?:IO|Open3|PTY)\s*\.\s*\w+|\bNet::HTTP\b|\bURI\s*\.\s*open\b"
+        r"|(?<![\w.])(?:Kernel\s*\.\s*)?open\s*\(?\s*['\"]\|"
+        r"|(?<![\w.])(?:eval|instance_eval|class_eval|module_eval)\s*(?:\(|[ \t]+['\"%$@\w])"
+        r"|\bFiddle\b"),),
+    "ghci": (re.compile(
+        _RC_LS + r":!" + r"|" + _RC_LS + r":(?:cmd|sh(?:ell)?)\b"
+        r"|\bSystem\.(?:Process|Cmd)\b"
+        r"|\b(?:callCommand|callProcess|readProcess(?:WithExitCode)?|readCreateProcess(?:WithExitCode)?"
+        r"|createProcess|spawnCommand|spawnProcess|rawSystem|runCommand|runInteractiveCommand"
+        r"|runInteractiveProcess|runProcess|unsafePerformIO)\b"
+        r"|(?<![\w.'])system\s+\"", re.MULTILINE),),
+    "gdb": (re.compile(
+        _RC_LS + r"(?:!|\||she(?:l(?:l)?)?\b|pipe\b|gu(?:i(?:l(?:e)?)?)?\b[^\n]*\bsystem\b)",
+        re.IGNORECASE | re.MULTILINE),
+        _RC_SHELL_PY,
+        # Gate-disable shape: widening gdb's auto-load safe-path to `/`,
+        # `~`, or `$HOME` makes every repo's `.gdbinit` (and every
+        # `*-gdb.py` beside a binary) auto-load -- the same "switch off
+        # the tool's own trust prompt" class `rule_vscode_settings_exec_
+        # protect` gates for VS Code's task auto-run gate.
+        re.compile(
+            r"(?:set\s+auto-load\s+safe-path|add-auto-load-safe-path|set\s+auto-load\s+scripts-directory)"
+            r"\s+['\"]?(?:[^\s:'\"]*:)*(?:/+|~/?|\$HOME/?)['\"]?(?=[:\s'\"]|$)"
+            r"|set\s+auto-load\s+safe-path\s*['\"]?\s*$",
+            re.IGNORECASE | re.MULTILINE),),
+    "lldb": (re.compile(
+        r"\bplatform\s+shell\b|" + _RC_LS + r"(?:shell|_regexp-shell)\b"
+        r"|settings\s+set\s+(?:-\w\s+)*target\.load-cwd-lldbinit\s+['\"]?true\b",
+        re.IGNORECASE | re.MULTILINE),
+        _RC_SHELL_PY,),
+    "psql": (re.compile(
+        r"\\!"
+        r"|\\(?:o|out|g|gx|w|write)\b[ \t]*\|"
+        r"|\\copy\b[^\n]*\bprogram\b"
+        r"|\bCOPY\b[^\n;]*\bPROGRAM\b"
+        r"|\\setenv\s+(?:PAGER|PSQL_PAGER|PSQL_WATCH_PAGER|PSQL_EDITOR|EDITOR|VISUAL|SHELL)\b"
+        r"|\\pset\s+pager\s+['\"]?(?!on\b|off\b|always\b)\S",
+        re.IGNORECASE),),
+    "sqlite": (re.compile(
+        _RC_LS + r"\.(?:system|shell|load)\b"
+        r"|" + _RC_LS + r"\.(?:once|output|import|read)\s+(?:-\S+\s+)*['\"]?\|",
+        re.IGNORECASE | re.MULTILINE),),
+    "julia": (re.compile(
+        r"(?<![\w.])(?:Base\.)?(?:run|success|pipeline|readchomp|readlines|readline|eachline|read|open"
+        r"|process_running)\s*\(\s*`"
+        r"|(?<![\w.])(?:Base\.)?run\s*\("
+        r"|\|>\s*run\b"
+        r"|(?<![\w.])@?ccall\b|\bLibc\.(?:system|dlopen)\b|\bLibdl\.dlopen\b"
+        r"|\bMeta\.parse\b|\binclude_string\s*\(|\bevalfile\s*\("
+        r"|(?<![\w.])(?:Downloads\.|Base\.)?download\s*\(",
+        re.IGNORECASE),),
+}
+
+# Full-line comments are inert in every grammar above; dropped before the
+# scan so a commented-out example (`# system("...")`) never gates.
+_REPL_RC_COMMENT = {
+    "pdb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
+    "r": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
+    "ruby": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
+    "ghci": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
+    "gdb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
+    "lldb": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
+    "psql": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
+    "sqlite": re.compile(r"^[ \t]*--.*$", re.MULTILINE),
+    "julia": re.compile(r"^[ \t]*#.*$", re.MULTILINE),
+}
+
+
+def repl_rc_dangerous_hit(content: str, kinds) -> bool:
+    """True if `content` carries an exec shape in the rc-file grammar of ANY
+    tool kind in `kinds` (see `repl_rc_kinds`)."""
+    if not content:
+        return False
+    for kind in kinds or ():
+        body = _REPL_RC_COMMENT[kind].sub("", content)
+        for rx in _REPL_RC_DANGER[kind]:
+            if rx.search(body):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Fetch-to-file write verb: curl/wget/PowerShell/certutil writing a remote
 # response DIRECTLY to a target path. Every `*_protect` guard above gates its
 # shell branch on a fixed write-verb set (`WRITE_REDIRECT_RE` /

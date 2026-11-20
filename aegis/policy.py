@@ -404,6 +404,14 @@ class Policy:
     # `ipython`/Jupyter-kernel launch, no opt-in needed. See
     # rules.rule_ipython_startup_protect.
     ipython_startup: dict = field(default_factory=dict)
+    # Debugger/REPL startup rc auto-exec protection: {mode:
+    # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
+    # defaults (mode=ask) apply. Covers a process/code-exec shape in
+    # `.pdbrc`, `.Rprofile`, `.irbrc`/`.pryrc`, `.ghci`, `.gdbinit`,
+    # `.lldbinit`, `.psqlrc`, `.sqliterc`, `.julia/config/startup.jl` --
+    # each tool runs its rc file on every launch, no opt-in needed. See
+    # rules.rule_repl_rc_exec_protect.
+    repl_rc_exec: dict = field(default_factory=dict)
     # Cloud-credential-provider exec hijack protection: {mode:
     # deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers an AWS CLI/SDK `credential_process`
