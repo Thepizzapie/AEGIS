@@ -477,3 +477,79 @@ def test_qa1_more_writers(cmd):
 
 def test_qa1_over_scan_window_asks():
     assert _only(_shell("echo " + "x" * 25000 + " > .cursor/hooks.json")) is not None
+
+
+# ---- QA round 1 (design / false-positive review) regressions -------------------
+def test_qa1_hidden_char_deny_not_downgraded():
+    ev = _write("/repo/.clinerules/hooks/PreToolUse", content="echo hi ‮\U000e0041\U000e0042")
+    d = evaluate(ev, EMPTY)
+    assert d.action == Action.DENY and d.rule == "agent-rules-protect"
+
+
+def test_qa1_disk_check_uses_strong_keys_only(tmp_path):
+    (tmp_path / ".zed").mkdir()
+    f = tmp_path / ".zed" / "settings.json"
+    f.write_text('{"formatter": "auto", "terminal": {"env": {"A": "1"}}, "buffer_font_size": 14}')
+    assert _only(_edit(str(f), old='"buffer_font_size": 14', new='"buffer_font_size": 15',
+                       cwd=str(tmp_path))) is None
+
+
+@pytest.mark.parametrize("path,content", [
+    ("/r/.codex/config.toml", "[tools]\nweb_search = true"),
+    ("/r/.continue/config.yaml", "models:\n  - name: x\n    env: {}"),
+    ("/r/opencode.json", '{"agent": {"plan": {"tools": {"write": false}}}}'),
+])
+def test_qa1_benign_broad_keys_silent(path, content):
+    assert _only(_write(path, content=content)) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "npm --prefix packages/copilot-mcp install",
+    "pnpm -C packages/goose-mcp install",
+    "yarn workspace amp-mcp add zod",
+    'grep -rn "gemini extensions install" docs/',
+    "git commit -m 'docs: gemini extensions install guide'",
+    'gh pr create --title "docs: how to run qwen mcp add"',
+    "echo 'use copilot mcp add later' > notes.txt",
+    "grep -n code .cursor/hooks.json",
+    'grep -rn "exit code" .github/hooks/',
+    "grep -rn touch .github/hooks",
+    "git log --patch -- .cursor/hooks.json",
+    "git format-patch -1 -- .github/hooks",
+    "git diff HEAD~1 -- .gemini/settings.json > /tmp/patch.diff",
+    "git restore --staged .cursor/hooks.json",
+    "python -c 'print(open(\".cursor/hooks.json\").read())'",
+    "node -e 'console.log(require(\"./opencode.json\"))'",
+])
+def test_qa1_false_positives_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "npx @google/gemini-cli extensions install https://x",
+    "npx -y opencode mcp add",
+    "sudo copilot mcp add evil",
+    "bash -c 'qwen mcp add evil npx x'",
+    "git restore --source evil .cursor/hooks.json",
+    "git restore --staged --worktree --source evil .cursor/hooks.json",
+    "vim .cursor/hooks.json",
+    "python -c \"open('.cursor/hooks.json', 'w').write('x')\"",
+    "python3 -c \"import pathlib; pathlib.Path('.zed/settings.json').write_text('x')\"",
+    "node -e \"require('fs').writeFileSync('.cursor/hooks.json','x')\"",
+])
+def test_qa1_still_caught(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("path", [
+    "/repo/packages/opencode/tool/bash.ts",
+    "/repo/src/opencode/tools/x.ts",
+])
+def test_qa1_undotted_opencode_not_gated(path):
+    assert _only(_write(path)) is None
+
+
+def test_qa1_shell_allow_does_not_cover_second_target():
+    pol = Policy(agent_exec_config={"allow": [r"\.zed/settings\.json"]})
+    assert _only(_shell("cp a .zed/settings.json"), pol) is None
+    assert _only(_shell("cp a .zed/settings.json; cp evil.json .cursor/hooks.json"), pol) is not None

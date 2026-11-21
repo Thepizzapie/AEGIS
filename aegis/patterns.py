@@ -6944,7 +6944,7 @@ _AX_DEDICATED_CORE = (
     + r"|" + _ax(r"\.clinerules", r"hooks")
     + r"|" + _ax(r"\.continue", r"mcpServers")
     + r"|" + _ax(r"\.opencode", r"(?:plugins?|tools?)")
-    + r"|" + _ax(r"opencode", r"(?:plugins?|tools?)")          # ~/.config/opencode/plugin
+    + r"|" + _ax(r"\.config", r"opencode", r"(?:plugins?|tools?)")   # ~/.config/opencode/plugin
     + r"|" + _ax(r"\.(?:gemini|qwen)", r"extensions")
     + r"|" + _ax(r"\.junie", r"mcp")
     + r"|" + _ax(r"\.factory", r"(?:hooks|mcp\.json)")
@@ -6958,8 +6958,8 @@ _AX_MIXED_CORE = (
     + r"|" + _ax(r"\.continue", r"config\.(?:ya?ml|json)")
     + r"|" + _ax(r"\.copilot", r"config\.json")
     + r"|" + _ax(r"\.(?:amp|augment|factory)", r"settings\.json")
-    + r"|" + _ax(r"amp", r"settings\.json")                      # ~/.config/amp/settings.json
-    + r"|" + _ax(r"goose", r"config\.ya?ml")                     # ~/.config/goose/config.yaml
+    + r"|" + _ax(r"\.config", r"amp", r"settings\.json")         # ~/.config/amp/settings.json
+    + r"|" + _ax(r"\.config", r"goose", r"config\.ya?ml")        # ~/.config/goose/config.yaml
     + r"|\.?crush\.json"
     + r"|opencode\.jsonc?"
     + r")")
@@ -6987,11 +6987,11 @@ AGENT_EXEC_BARE_NAME_RE = re.compile(
 # Quoted-or-bare key followed by `:`/`=`, or a TOML table header.
 _AX_KEYS = (
     r"mcpServers|mcp_servers|mcp|context_servers|hooks?|notify|discoveryCommand|callCommand"
-    r"|command|cmd|args|plugins?|extensions|lsp|formatter|binary|env"
+    r"|command|cmd|args|plugins?|extensions|lsp|formatter|binary"
     r"|approval_policy|\w{0,30}approval_?mode|ask_for_approval|sandbox\w{0,30}|autoAccept|yolo"
     r"|writable_roots|network_access|trust_level|projects|program|node|shell"
     r"|dangerously[A-Za-z_]*|always_allow[A-Za-z_]*|allowlist|allowList|allowed|allowedTools"
-    r"|trusted_folders|trustedFolders|folderTrust|trust|permissions?|tools"
+    r"|trusted_folders|trustedFolders|folderTrust|trust|permissions?"
     r"|shell_environment_policy|experimental_instructions_file|model_providers")
 AGENT_EXEC_CONFIG_KEY_RE = re.compile(
     r"(?:[\"'](?:[\w.-]{0,60}\.)?(?:" + _AX_KEYS + r")[\"']\s*:"     # JSON "key":
@@ -7001,14 +7001,28 @@ AGENT_EXEC_CONFIG_KEY_RE = re.compile(
 
 # CLI registration of an MCP server / extension for agents MCP_CLI_ADD_RE's
 # vendor list does not name.
+# Command position only (QA round 1: an unanchored vendor word matched
+# `npm --prefix packages/copilot-mcp install` and commit messages).
+_AX_CMD_POS = (r"(?:^|[;&|\n(`]|\$\()\s*(?:sudo\s+|env\s+(?:\w+=\S*\s+)*)?"
+               r"(?:(?:npx|bunx|pnpx|pnpm\s+dlx|yarn\s+dlx|uvx)\s+(?:-y\s+|--yes\s+)?)?"
+               r"(?:@[\w.-]{1,60}/)?(?:\S{0,200}/)?")
 AGENT_EXEC_CLI_RE = re.compile(
-    r"\b(?:qwen|amp|opencode|copilot|kiro-cli|droid|goose|auggie|crush|cline|cursor-agent)\b"
-    r"[^|;&\n]{0,200}\bmcp\b[^|;&\n]{0,200}\b(?:add|add-json|install|import)\b"
-    r"|(?:^|[;&|\n(]\s*)(?:sudo\s+)?q\s+mcp\s+(?:add|import)\b"
-    r"|\b(?:gemini|qwen)\b[^|;&\n]{0,200}\bextensions?\s+(?:install|link|update|new)\b",
+    _AX_CMD_POS + r"(?:qwen|amp|opencode|copilot|kiro-cli|kiro|droid|goose|auggie|crush|cline"
+    r"|cursor-agent|q)(?:-cli|-code)?\s+(?:[^|;&\n'\"]{0,200}\s)?mcp\s+(?:add|add-json|install|import)\b"
+    r"|" + _AX_CMD_POS + r"(?:gemini|qwen)(?:-cli|-code)?\s+(?:[^|;&\n'\"]{0,200}\s)?"
+    r"extensions?\s+(?:install|link|update|new)\b",
     re.IGNORECASE)
 
 
+# The narrow set used against a file ALREADY on disk (QA round 1: the full
+# list made any edit of a Zed settings file that sets `formatter` ask).
+AGENT_EXEC_STRONG_KEY_RE = re.compile(
+    r"[\"']?(?:[\w.-]{0,60}\.)?(?:mcpServers|mcp_servers|mcp|context_servers|hooks?|notify"
+    r"|discoveryCommand|callCommand|command|plugins?|extensions|\w{0,30}approval_?\w{0,10}"
+    r"|sandbox\w{0,30}|autoAccept|yolo|dangerously\w*|always_allow\w*|trusted_?folders"
+    r"|folderTrust|trust_level)[\"']?\s*[:=]|^\s*\[\[?\s*[\"']?(?:mcp_servers|hooks|projects"
+    r"|sandbox\w*)\b",
+    re.IGNORECASE | re.MULTILINE)
 _AX_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 _AX_LINE_COMMENT_RE = re.compile(r"//[^\n]*|(?m:^[ \t]*#[^\n]*)")
 

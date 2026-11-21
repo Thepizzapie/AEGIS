@@ -134,7 +134,7 @@ The cross-agent executable-config guard (`agent-exec-config-protect`, default `a
 agent_exec_config:
   mode: ask                    # deny | ask | monitor | off
   allow:                       # regexes on the path/command that skip the ask
-    - "\\.zed/settings\\.json$"
+    - "\\.zed/settings\\.json"
 ```
 
 Escapes: `AEGIS_ALLOW_AGENT_EXEC_CONFIG=1` at launch, or `# aegis-allow` on the shell command (human only).

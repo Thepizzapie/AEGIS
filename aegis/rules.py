@@ -12905,11 +12905,28 @@ def _lifecycle_rules() -> tuple:
 # Plan, threat model and surface list sit above `patterns.AGENT_EXEC_DEDICATED_RE`.
 _AXC_DISK_MAX = 262_144
 _AXC_GIT_WRITE_RE = re.compile(
-    r"\bgit\b[^|;&\n]{0,200}\b(?:checkout|restore|apply|am|cherry-pick|merge|pull|stash\s+(?:pop|apply)"
+    r"\bgit\b[^|;&\n]{0,200}\s(?:checkout|apply|am|cherry-pick|merge|pull|stash\s+(?:pop|apply)"
     r"|reset\s+--hard|read-tree|checkout-index|worktree\s+add)\b"
-    r"|\bpatch\b|\b(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl)\b|\btouch\b|\btruncate\b"
-    r"|\bsponge\b|\b(?:Write|Append)All(?:Text|Bytes|Lines)\b|\[(?:System\.)?IO\.File\]::\w+"
+    # `git restore --staged` only unstages (QA round 1); with -W/--worktree it writes
+    r"|\bgit\b[^|;&\n]{0,200}\srestore\b(?:(?![^|;&\n]*\s--staged\b)|(?=[^|;&\n]*\s(?:-W|--worktree)\b))"
+    # editors / patch / touch / sponge only in command position (the clause is
+    # one simple command already)
+    r"|^\s*[({]?\s*(?:sudo\s+|env\s+(?:\w+=\S*\s+)*|command\s+)?(?:\S{0,200}/)?"
+    r"(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl|patch|touch|truncate|sponge)\b"
+    r"|\b(?:Write|Append)All(?:Text|Bytes|Lines)\b|\[(?:System\.)?IO\.File\]::\w+"
     r"|\b(?:New-Item|ni|Copy-Item|Move-Item)\b",
+    re.IGNORECASE)
+# In-place editors (the shared INPLACE_WRITE_RE also counts every `node -e`).
+_AXC_INPLACE_RE = re.compile(
+    r"\bsed\b[^|;&\n]*\s-[a-zA-Z]*i|\bsed\b[^|;&\n]*\s--in-place\b|\bperl\b[^|;&\n]*\s-[a-zA-Z]*i"
+    r"|\bawk\b[^|;&\n]*-i\s*inplace\b|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
+    r"|^\s*ed\b", re.IGNORECASE)
+# What makes an interpreter one-liner a WRITE (not `print(open(p).read())`).
+_AXC_INTERP_WRITE_RE = re.compile(
+    r"open\s*\([^)]{0,300},\s*(?:mode\s*=\s*)?['\"][rbt+]*[wax]|\.write(?:_text|_bytes|lines)?\s*\("
+    r"|write\w*Sync\s*\(|\bwriteFile\w*|appendFile\w*|copyFile\w*|\brename\w*\s*\(|symlink\w*\s*\("
+    r"|shutil\.\w+|os\.replace|Set-Content|Out-File|File\.(?:write|open)\b|IO\.write|fs\.\w*write"
+    r"|Deno\.write\w*|Bun\.write|file_put_contents|fopen\s*\([^)]{0,300}['\"][wax]",
     re.IGNORECASE)
 # Something that can carry a target from one simple command into another.
 _AXC_JOINED_RE = re.compile(r"<<|\bxargs\b|\bfor\s|\bwhile\s|\$\(|`|<\(|\bparallel\b", re.IGNORECASE)
@@ -12920,7 +12937,7 @@ _AXC_CHDIR_RE = re.compile(
 _AXC_CLAUSE_RE = re.compile(r"[|;&\n]")
 # A redirect / tee / -o-style option whose operand is the target.
 _AXC_OUT_OP_RE = re.compile(
-    r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)-(?:o|O|t|d|C)|--(?:output|target-directory"
+    r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)(?-i:-[oOtdC])|--(?:output|target-directory"
     r"|output-document|directory)=?|\bof=)\s*['\"]?$", re.IGNORECASE)
 _AXC_COPY_CMD_RE = re.compile(
     r"(?:^|[\s/\\!])(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|cpi|mi|scp|ditto)(?=\s|$)",
@@ -13006,7 +13023,11 @@ def _agent_exec_disk_one(form: str) -> bool:
             os.close(fd)
         except Exception:
             pass
-    return patterns.agent_exec_key_hit(data.decode("utf-8", "replace"))
+    text = data.decode("utf-8", "replace")
+    if patterns.AGENT_EXEC_STRONG_KEY_RE.search(text):
+        return True
+    return bool(patterns.AGENT_EXEC_STRONG_KEY_RE.search(
+        patterns._ax_strip_comments(patterns._AX_UESC_RE.sub(lambda m: chr(int(m.group(1), 16)), text))))
 
 
 def _agent_exec_mixed_relevant(ev: Event, forms) -> bool:
@@ -13068,7 +13089,7 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
         # `> path`, `>>path`, `tee -a path`, `-o path`, `--output=path`, `of=path`
         if _AXC_OUT_OP_RE.search(clause[:s]):
             return True
-    if (patterns.INPLACE_WRITE_RE.search(re.sub(r"\b(?:cp|copy|dd)\b", " ", clause))
+    if (_AXC_INPLACE_RE.search(clause)
             or patterns.FORCED_LINK_WRITE_RE.search(clause)
             or patterns.DESTRUCTIVE_DELETE_RE.search(clause)
             or patterns.ARCHIVE_SYNC_VERB_RE.search(clause)
@@ -13099,8 +13120,7 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
         # the target is written unless it is only the (first) source operand
         return any(names_re.search(" " + t + " ") for t in ops[1:]) or len(ops) == 1
     if re.search(r"\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell)\b", clause, re.IGNORECASE) \
-            and re.search(r"open\s*\(|write|Set-Content|Out-File|copy|move|rename|symlink|>\s*", clause,
-                          re.IGNORECASE):
+            and _AXC_INTERP_WRITE_RE.search(clause):
         return True
     return False
 
@@ -13117,7 +13137,13 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     if inside:
         names.append(patterns.AGENT_EXEC_BARE_NAME_RE)
     joined = bool(_AXC_JOINED_RE.search(noise))
+    # An interpreter one-liner's own code may contain `;` (split into clauses
+    # below), so test it against the whole command.
+    interp = bool(re.search(r"\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell)\b",
+                            noise, re.IGNORECASE) and _AXC_INTERP_WRITE_RE.search(noise))
     for names_re in names:
+        if interp and names_re.search(noise):
+            return kind or "dedicated"
         if joined and names_re.search(noise) and (
                 patterns.WRITE_REDIRECT_RE.search(noise) or patterns.COPY_WRITE_VERB_RE.search(noise)
                 or patterns.DELETE_OR_MOVE_VERB_RE.search(noise) or patterns.INPLACE_WRITE_RE.search(noise)
@@ -13127,6 +13153,35 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
             if _agent_exec_clause_write(clause, names_re, parent_ok=(names_re is names[0])):
                 return kind or "dedicated"
     return ""
+
+
+def _agent_exec_defer_to_rules(ev: Event, policy) -> bool:
+    """A path on both this surface and agent-rules-protect's (`.clinerules/
+    hooks/`) whose content agent-rules hard-DENIES (hidden characters): stay
+    silent so the later DENY is not downgraded to this ASK (QA round 1)."""
+    try:
+        d = rule_agent_rules_protect(ev, policy)
+    except Exception:
+        return False
+    return bool(d is not None and d.action == Action.DENY)
+
+
+def _agent_exec_shell_allowed(ev: Event, cfg: dict, raw: str) -> bool:
+    """Shell `allow`: blank out every allow-regex match, then re-check. The
+    command is allowed only if nothing it still writes is a target -- an
+    allow-listed path elsewhere in the command does not wave through a second,
+    unlisted target (QA round 1)."""
+    text = raw[:normalize._MAX]
+    hit = False
+    for pat in (cfg.get("allow") or []):
+        try:
+            text, n = re.subn(str(pat), " ", text, flags=re.IGNORECASE)
+        except re.error:
+            continue
+        hit = hit or n > 0
+    if not hit:
+        return False
+    return not _agent_exec_shell_hit(ev, normalize.scan_surface(text, sep="\n"))
 
 
 def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -13182,7 +13237,17 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
     the dedicated directories (writing it is not recognized as exec-
     relevant). Shell matching is textual: ``cat .cursor/hooks.json > /tmp/x``
     does not ask (the redirect target is elsewhere), but some reads phrased
-    with write-capable tools (``vim .cursor/hooks.json`` to view) do. Shell
+    with write-capable tools (``vim .cursor/hooks.json`` to view) do, as does
+    any command that names a target and also runs an interpreter one-liner
+    that writes SOMEWHERE (the one-liner's code is matched as a whole). Shell
+    ``allow`` regexes are blanked out of the command and the rest re-checked,
+    so an allow-listed path does not wave through a second target. A path on
+    both this surface and agent-rules-protect's (``.clinerules/hooks/``)
+    defers to agent-rules' hidden-character DENY. Against a file already on
+    disk only the strong exec keys count (``mcpServers``, ``hooks``,
+    ``notify``, ``command``, approval/sandbox/trust switches), so a
+    ``formatter`` or ``env`` setting elsewhere in the file does not make
+    every later edit ask. Shell
     writes under ``.claude/``/``.vscode/``/``.mcp.json`` belong to other
     guards and are not repeated here."""
     if ev.event != HookEvent.PRE_TOOL_USE:
@@ -13224,6 +13289,8 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
             return None
         if _agent_exec_allowed_by_policy(cfg, [target] + [f for f in forms if f]):
             return None
+        if _agent_exec_defer_to_rules(ev, policy):
+            return None
         what = ("an exec/approval setting in agent config" if kind == "mixed"
                 else "agent exec config")
         return _finish(Decision(action, "agent-exec-config-protect",
@@ -13244,7 +13311,9 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
             return None
         if _override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_EXEC_CONFIG"):
             return None
-        if _agent_exec_allowed_by_policy(cfg, [_cmd(ev)]):
+        if cfg.get("allow") and not cli and _agent_exec_shell_allowed(ev, cfg, raw):
+            return None
+        if _agent_exec_defer_to_rules(ev, policy):
             return None
         what = ("registers an MCP server / extension for another coding agent from its CLI"
                 if cli else "writes another coding agent's exec config from a shell")
