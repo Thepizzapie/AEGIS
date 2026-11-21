@@ -102,8 +102,9 @@ def _b64(s, utf16=False):
         return ""
 
 
-def scan_surface(cmd, _depth=0) -> str:
-    """The command plus its de-obfuscated forms, for pattern matching."""
+def scan_surface(cmd, _depth=0, sep=" ") -> str:
+    """The command plus its de-obfuscated forms, for pattern matching. ``sep``
+    joins the renderings (a newline keeps them separate simple commands)."""
     if not cmd or _depth > 3:
         return cmd or ""
     cmd = str(cmd)[:_MAX]
@@ -113,15 +114,15 @@ def scan_surface(cmd, _depth=0) -> str:
     for m in _PS_ENC_RE.finditer(cmd):           # PowerShell encoded command
         dec = _b64(m.group(1), utf16=True) or _b64(m.group(1))
         if dec:
-            parts.append(scan_surface(dec, _depth + 1))
+            parts.append(scan_surface(dec, _depth + 1, sep))
     if _B64_DECODE_HINT.search(cmd):             # base64 -d / FromBase64String pipelines
         for tok in _B64_TOKEN_RE.findall(cmd):
             dec = _b64(tok)
             if dec:
-                parts.append(scan_surface(dec, _depth + 1))
+                parts.append(scan_surface(dec, _depth + 1, sep))
     for rx in _INTERP_RES:                        # inner interpreter code
         for m in rx.finditer(cmd):
             inner = m.group(m.lastindex)
             if inner:
-                parts.append(scan_surface(inner, _depth + 1))
-    return " ".join(p for p in parts if p)
+                parts.append(scan_surface(inner, _depth + 1, sep))
+    return sep.join(p for p in parts if p)

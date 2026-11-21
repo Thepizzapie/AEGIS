@@ -6846,3 +6846,239 @@ MCP_CRED_READ_INSTRUCTION_RE = re.compile(
     r"output|answer|chat)\b|\btell\s+(?:the\s+)?(?:user|me)\b)",
     re.IGNORECASE,
 )
+
+
+# ---- Cross-agent EXECUTABLE config protection ---------------------------------
+# PLAN (purpose / threat model / approach) for `rule_agent_exec_config_protect`.
+#
+# Purpose. `rule_agent_rules_protect` gates other coding agents' auto-loaded
+# INSTRUCTION files (text the other agent reads). `rule_mcp_config_protect`
+# gates seven MCP server-definition files (`.mcp.json`, `~/.claude.json`,
+# Claude Desktop, `.cursor/mcp.json`, `.vscode/mcp.json`, Windsurf). The Claude-
+# specific guards (claude-hooks, statusline, permission-bypass, claude-env,
+# claude-mcp-autoapprove) gate Claude Code's own settings. Nothing gated the
+# files where every OTHER agent keeps the things it EXECUTES or the switches
+# that turn off its own approval prompts:
+#
+#   Cursor        .cursor/hooks.json, .cursor/hooks/** (hook commands run on
+#                 every agent step), .cursor/environment.json (background-agent
+#                 install/start commands), .cursor/cli.json /
+#                 cli-config.json (CLI permission allow-list)
+#   Windsurf      .windsurf/hooks.json, .windsurf/hooks/**
+#   Copilot       .github/hooks/** (coding-agent / CLI hooks),
+#                 .copilot/mcp-config.json; .copilot/config.json (mixed:
+#                 trusted_folders)
+#   Kiro          .kiro/hooks/** (agent hooks with runCommand),
+#                 .kiro/settings/mcp.json
+#   Amazon Q      .amazonq/mcp.json, .amazonq/agents/**, .amazonq/cli-agents/**,
+#                 ~/.aws/amazonq/** (agent configs carry hooks + mcpServers)
+#   Cline/Roo/Kilo .roo/mcp.json, .kilocode/mcp.json, cline_mcp_settings.json,
+#                 mcp_settings.json, .clinerules/hooks/**
+#   Continue      .continue/mcpServers/**; .continue/config.{yaml,json} (mixed)
+#   OpenCode      .opencode/plugin(s)/**, .opencode/tool(s)/** (JS/TS loaded
+#                 and run in-process at startup); opencode.json(c) (mixed)
+#   Gemini / Qwen .gemini/extensions/**, .qwen/extensions/** (an extension's
+#                 manifest declares MCP servers); .gemini/settings.json,
+#                 .qwen/settings.json (mixed: mcpServers, hooks,
+#                 tools.discoveryCommand/callCommand, autoAccept/yolo)
+#   Codex         .codex/config.toml (mixed: mcp_servers, notify,
+#                 approval_policy, sandbox_mode)
+#   Zed           .zed/settings.json (mixed: context_servers, lsp binaries,
+#                 always_allow_tool_actions)
+#   Junie         .junie/mcp/**
+#   Factory       .factory/hooks/**, .factory/mcp.json; .factory/settings.json
+#                 (mixed)
+#   OpenHands     .openhands/setup.sh, .openhands/pre-commit.sh (run
+#                 automatically at session start / before commit)
+#   Amp / Augment / Crush / Goose  .amp/settings.json, .augment/settings.json,
+#                 crush.json / .crush.json, goose/config.yaml (mixed)
+#
+# Threat model. A prompt-injected agent (poisoned page, issue, tool result,
+# dependency README) that Aegis gates writes one of these files. Unlike an
+# instructions file, nothing has to persuade the other agent: the next time a
+# teammate (or the same human) opens the repo in Cursor/Copilot/Gemini/Codex/
+# Kiro/..., that agent's runtime itself spawns the planted command -- as a
+# hook on every tool call, as an MCP server at startup, as an in-process
+# plugin -- or silently drops its approval prompts. It runs with that human's
+# credentials, outside every Aegis hook, and the file is committed, so it
+# reaches everyone who clones. This is the executable twin of the cross-agent
+# rules-file escalation, and strictly worse: no model has to comply.
+#
+# Approach. Two path tiers, one content check, the shell/MCP/CLI forms:
+#   - DEDICATED files/dirs (above, no "(mixed)"): their only purpose is
+#     exec/approval, so any Edit/Write/MCP write asks.
+#   - MIXED settings files: also carry theme/model/editor preferences, so an
+#     Edit/Write asks only when the new text, the text it replaces, or the
+#     file already on disk carries an exec/approval key
+#     (`AGENT_EXEC_CONFIG_KEY_RE`). A theme change in a settings file that
+#     defines no servers/hooks stays silent.
+#   - Shell: a write verb (redirect/tee/in-place/copy/move/link/archive/git
+#     checkout/patch/editor) aimed at a path of either tier -> ask. No content
+#     gate here: the content can be staged in another file.
+#   - CLI registration the MCP-config guard's own vendor list misses
+#     (`qwen|amp|opencode|copilot|kiro-cli|droid|goose|auggie mcp add`,
+#     `gemini|qwen extensions install|link`).
+#   - Registered in the fetch-to-file backstop (`curl -o .cursor/hooks.json`).
+# Default `ask` (siblings' convention for files a human may legitimately ask
+# the agent to set up). Escapes: `AEGIS_ALLOW_AGENT_EXEC_CONFIG=1`, trailing
+# `# aegis-allow` (human only), policy `agent_exec_config.allow`.
+_AX_B = r"(?:^|[\s'\"/\\=<>(:,;&|])"
+_AX_E = _WIN_TRIM + r"(?=[/\;&|)<>]|\s|['\"]|$)"
+
+
+def _ax(*parts: str) -> str:
+    return (_WIN_TRIM + _SEP).join(parts)
+
+
+_AX_DEDICATED_CORE = (
+    r"(?:" + _ax(r"\.cursor", r"(?:(?:hooks|environment|cli|cli-config|worktrees)\.json|hooks)")
+    + r"|" + _ax(r"\.windsurf", r"(?:hooks\.json|hooks)")
+    + r"|" + _ax(r"\.codeium", r"windsurf", r"(?:hooks\.json|hooks)")
+    + r"|" + _ax(r"\.github", r"hooks")
+    + r"|" + _ax(r"\.copilot", r"mcp-config\.json")
+    + r"|" + _ax(r"\.kiro", r"(?:hooks|agents|" + _ax(r"settings", r"mcp\.json") + r")")
+    + r"|" + _ax(r"\.amazonq", r"(?:mcp\.json|agents|cli-agents)")
+    + r"|" + _ax(r"\.aws", r"amazonq")
+    + r"|" + _ax(r"\.(?:roo|kilocode|trae|cursor-server)", r"mcp\.json")
+    + r"|(?:cline_mcp_settings|mcp_settings)\.json"
+    + r"|" + _ax(r"\.clinerules", r"hooks")
+    + r"|" + _ax(r"\.continue", r"mcpServers")
+    + r"|" + _ax(r"\.opencode", r"(?:plugins?|tools?)")
+    + r"|" + _ax(r"\.config", r"opencode", r"(?:plugins?|tools?)")   # ~/.config/opencode/plugin
+    + r"|" + _ax(r"\.(?:gemini|qwen)", r"extensions")
+    + r"|" + _ax(r"\.junie", r"mcp")
+    + r"|" + _ax(r"\.factory", r"(?:hooks|mcp\.json)")
+    + r"|" + _ax(r"\.openhands", r"(?:setup|pre-commit)\.sh")
+    + r")")
+_AX_MIXED_CORE = (
+    r"(?:" + _ax(r"\.(?:gemini|qwen)", r"settings\.json")
+    + r"|" + _ax(r"\.codex", r"config\.toml")
+    + r"|" + _ax(r"\.zed", r"settings\.json")
+    + r"|" + _ax(r"\.config", r"zed", r"settings\.json")            # Zed global config
+    + r"|" + _ax(r"\.continue", r"config\.(?:ya?ml|json)")
+    + r"|" + _ax(r"\.copilot", r"config\.json")
+    + r"|" + _ax(r"\.(?:amp|augment|factory)", r"settings\.json")
+    + r"|" + _ax(r"\.config", r"amp", r"settings\.json")         # ~/.config/amp/settings.json
+    + r"|" + _ax(r"\.config", r"goose", r"config\.ya?ml")        # ~/.config/goose/config.yaml
+    + r"|\.?crush\.json"
+    + r"|opencode\.jsonc?"
+    + r")")
+AGENT_EXEC_DEDICATED_RE = re.compile(_AX_B + _AX_DEDICATED_CORE + _AX_E, re.IGNORECASE)
+AGENT_EXEC_MIXED_RE = re.compile(_AX_B + _AX_MIXED_CORE + _AX_E, re.IGNORECASE)
+
+# Agent config DIRECTORIES: a `cd` into one (or a session cwd inside one)
+# makes a bare `hooks.json`/`settings.json` relative path a target, and a
+# copy/extract whose destination is the directory itself drops files into it.
+_AX_PARENT_CORE = (r"(?:\.(?:cursor|windsurf|kiro|amazonq|roo|kilocode|continue|opencode|gemini|qwen"
+    r"|codex|zed|junie|factory|openhands|amp|augment|copilot|clinerules|trae)"
+    r"|" + _ax(r"\.github", r"hooks") + r"|" + _ax(r"\.aws", r"amazonq")
+    + r"|" + _ax(r"\.config", r"(?:opencode|amp|goose|zed)")
+    + r"|" + _ax(r"\.codeium", r"windsurf") + r")" )
+AGENT_EXEC_PARENT_DIR_RE = re.compile(_AX_B + _AX_PARENT_CORE + _AX_E, re.IGNORECASE)
+# the parent directory as a WHOLE operand (a placement destination)
+AGENT_EXEC_PARENT_OPERAND_RE = re.compile(r"^(?:.{0,1000}[/\\\\])?" + _AX_PARENT_CORE + _WIN_TRIM + r"[/\\\\]*$", re.IGNORECASE)
+# Basenames that are a target when the command (or cwd) is inside a parent dir.
+AGENT_EXEC_BARE_NAME_RE = re.compile(
+    r"(?:^|[\s'\"=<>])(?:\.[/\\]+)?(?:(?:hooks|mcp|settings|environment|cli|cli-config"
+    r"|mcp-config|config|opencode)\.(?:json|jsonc|toml|ya?ml)|(?:setup|pre-commit)\.sh"
+    r"|hooks|plugins?|tools?|extensions|mcpServers|agents|cli-agents|\.[/\\]?)" + _AX_E,
+    re.IGNORECASE)
+
+# Keys in a MIXED settings file that make the edit exec- or approval-relevant.
+# Quoted-or-bare key followed by `:`/`=`, or a TOML table header.
+_AX_KEYS = (
+    r"mcpServers|mcp_servers|mcp|context_servers|hooks?|notify|discoveryCommand|callCommand"
+    r"|command|cmd|args|plugins?|extensions|lsp|formatter|binary"
+    r"|approval_policy|\w{0,30}approval_?mode|ask_for_approval|sandbox\w{0,30}|autoAccept|yolo"
+    r"|writable_roots|network_access|trust_level|projects|program|node|shell"
+    r"|dangerously[A-Za-z_]*|always_allow[A-Za-z_]*|allowlist|allowList|allowed|allowedTools"
+    r"|trusted_folders|trustedFolders|folderTrust|trust|permissions?"
+    r"|shell_environment_policy|experimental_instructions_file|model_providers")
+AGENT_EXEC_CONFIG_KEY_RE = re.compile(
+    r"(?:[\"'](?:[\w.-]{0,60}\.)?(?:" + _AX_KEYS + r")[\"']\s*:"     # JSON "key":
+    r"|(?:^|[\s{,])(?:[\w.-]{0,60}\.)?(?:" + _AX_KEYS + r")\s*[:=]"   # TOML/YAML key = / key:
+    r"|^[ \t﻿]*\[\[?[ \t]*(?:" + _AX_KEYS + r")\b)",                          # TOML [mcp_servers.x]
+    re.IGNORECASE | re.MULTILINE)
+
+# CLI registration of an MCP server / extension for agents MCP_CLI_ADD_RE's
+# vendor list does not name. The vendor must be a whole TOKEN (QA round 1:
+# `packages/copilot-mcp` and `amp-mcp` matched on `\b`). Not command-position
+# anchored (QA round 2: every wrapper -- nohup, timeout, `then`, `{`,
+# `$(which qwen)` -- bypassed an anchored form) and matched as plain text on
+# every rendering, like MCP_CLI_ADD_RE (QA round 3: blanking quoted strings
+# hid `eval '...'` / `| sh`), so a commit message quoting it asks too.
+_AX_TOK_L = r"(?:^|[\s/\\(`{!=;&|'\"]|\$\()"
+_AX_TOK_R = r"(?:-cli|-code|-ai)?(?:@[\w.^~-]{0,60})?[)`'\"]?\s+(?:[^|;&\n]{0,200}\s)?"
+AGENT_EXEC_CLI_RE = re.compile(
+    _AX_TOK_L + r"(?:qwen|amp|opencode|copilot|kiro-cli|kiro|droid|goose|auggie|crush|cline"
+    r"|cursor-agent|q)" + _AX_TOK_R + r"mcp\s+(?:add|add-json|install|import)\b"
+    r"|" + _AX_TOK_L + r"(?:gemini|qwen)" + _AX_TOK_R + r"extensions?\s+(?:install|link|update|new)\b",
+    re.IGNORECASE)
+# The narrow set used against a file ALREADY on disk (QA round 1: the full
+# list made any edit of a Zed settings file that sets `formatter` ask).
+AGENT_EXEC_STRONG_KEY_RE = re.compile(
+    r"[\"']?(?:[\w.-]{0,60}\.)?(?:mcpServers|mcp_servers|mcp|context_servers|hooks?|notify"
+    r"|discoveryCommand|callCommand|command|plugins?|extensions|\w{0,30}approval_?\w{0,10}"
+    r"|sandbox\w{0,30}|autoAccept|yolo|dangerously\w*|always_allow\w*|trusted_?folders"
+    r"|folderTrust|trust_level)[\"']?\s*[:=]|^[ \t﻿]*\[\[?[ \t]*[\"']?(?:mcp_servers|hooks|projects"
+    r"|sandbox\w*)\b",
+    re.IGNORECASE | re.MULTILINE)
+_AX_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+
+
+def ax_unescape(text: str) -> str:
+    """Decode JSON/TOML `\\uXXXX` / `\\UXXXXXXXX` escapes and drop BOMs."""
+    def _c(m):
+        try:
+            return chr(int(m.group(1) or m.group(2), 16))
+        except (ValueError, OverflowError):
+            return m.group(0)
+    if "\\" in text:
+        text = _AX_UESC_RE.sub(_c, text)
+    return text.replace("\ufeff", "")
+_AX_LINE_COMMENT_RE = re.compile(r"//[^\n]*|(?m:^[ \t]*#[^\n]*)")
+
+
+def _ax_strip_comments(t: str) -> str:
+    """Drop `/* */` blocks (linear: one forward pass with str.find) and `//`/
+    `#` line comments."""
+    out, i = [], 0
+    while True:
+        j = t.find("/*", i)
+        if j < 0:
+            out.append(t[i:])
+            break
+        out.append(t[i:j])
+        k = t.find("*/", j + 2)
+        if k < 0:
+            break
+        out.append(" ")
+        i = k + 2
+    return _AX_LINE_COMMENT_RE.sub(" ", "".join(out))
+_AX_QUOTE_RE = re.compile(r"[\"']")
+
+
+def agent_exec_key_hit(text: str) -> bool:
+    """An exec/approval key in mixed-settings text -- also after decoding JSON
+    `\\uXXXX` escapes, dropping JSONC/YAML/TOML comments and dropping key
+    quotes (TOML `"notify" = ...`, `["mcp_servers".x]`): every form a config
+    parser reads as the same key."""
+    if AGENT_EXEC_CONFIG_KEY_RE.search(text):
+        return True
+    t = ax_unescape(text)
+    unq = _AX_QUOTE_RE.sub("", t)
+    if AGENT_EXEC_CONFIG_KEY_RE.search(t) or AGENT_EXEC_CONFIG_KEY_RE.search(unq):
+        return True
+    if "/" in t or "#" in t:
+        if AGENT_EXEC_CONFIG_KEY_RE.search(_AX_QUOTE_RE.sub("", _ax_strip_comments(t))):
+            return True
+    return False
+
+
+def agent_exec_path_hit(text: str) -> str:
+    """'dedicated' / 'mixed' / '' for the first agent exec-config path in text."""
+    if AGENT_EXEC_DEDICATED_RE.search(text):
+        return "dedicated"
+    if AGENT_EXEC_MIXED_RE.search(text):
+        return "mixed"
+    return ""
