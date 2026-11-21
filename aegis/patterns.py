@@ -6975,9 +6975,6 @@ _AX_PARENT_CORE = (r"(?:\.(?:cursor|windsurf|kiro|amazonq|roo|kilocode|continue|
     + r"|" + _ax(r"\.config", r"(?:opencode|amp|goose|zed)")
     + r"|" + _ax(r"\.codeium", r"windsurf") + r")" )
 AGENT_EXEC_PARENT_DIR_RE = re.compile(_AX_B + _AX_PARENT_CORE + _AX_E, re.IGNORECASE)
-# (prefix, config dir) split of a path ending in an agent config dir
-AGENT_EXEC_PARENT_SPLIT_RE = re.compile(r"^(.{0,2000}?)[/\\]*(?<![^/\\])" + _AX_PARENT_CORE + _WIN_TRIM
-                                        + r"[/\\]*$", re.IGNORECASE)
 # the parent directory as a WHOLE operand (a placement destination)
 AGENT_EXEC_PARENT_OPERAND_RE = re.compile(r"^(?:.{0,1000}[/\\\\])?" + _AX_PARENT_CORE + _WIN_TRIM + r"[/\\\\]*$", re.IGNORECASE)
 # Basenames that are a target when the command (or cwd) is inside a parent dir.

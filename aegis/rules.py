@@ -13411,22 +13411,61 @@ def _agent_exec_place_dest_ok(ev: Event, dest: str) -> bool:
     return bool(cwd and cwd not in ("/", "/tmp") and (d == cwd or d.startswith(cwd + "/")))
 
 
+_AXC_CONFIG_DIR_NAMES = frozenset((
+    ".cursor", ".windsurf", ".kiro", ".amazonq", ".roo", ".kilocode", ".continue", ".opencode",
+    ".gemini", ".qwen", ".codex", ".zed", ".junie", ".factory", ".openhands", ".amp", ".augment",
+    ".copilot", ".clinerules", ".trae"))
+_AXC_CONFIG_DIR_PAIRS = frozenset((
+    (".github", "hooks"), (".aws", "amazonq"), (".config", "opencode"), (".config", "amp"),
+    (".config", "goose"), (".config", "zed"), (".codeium", "windsurf")))
+
+
+def _agent_exec_norm_path(p: str) -> list:
+    """Path components, with `~`/$HOME as /home/_h, `.` and empty parts dropped
+    and `..` applied -- bounded, no regex backtracking (QA round 13)."""
+    p = re.sub(r"^(?:~|\$\{?HOME\}?)(?=[/\\]|$)", "/home/_h", p[:4096])
+    absolute = p.startswith(("/", "\\"))
+    out = []
+    for c in re.split(r"[/\\]+", p)[:512]:
+        c = c.rstrip(" .") if c not in (".", "..") else c
+        if c in ("", "."):
+            continue
+        if c == ".." and out and out[-1] != "..":
+            out.pop()
+            continue
+        out.append(c)
+    return (["/"] if absolute else []) + out
+
+
 def _agent_exec_effective_hit(dest: str, src: str, cwd: str = "") -> bool:
     """`dest/basename(src)` (a copy INTO a directory), or dest itself, is a
     dedicated path, or an agent config dir sitting where an agent loads it:
     the home dir, the project root (cwd), or `~/.config` for the XDG ones --
     not `~/backups/x/.codex` (QA round 12)."""
-    cwd = cwd.rstrip("/\\")
-    for eff in (dest.rstrip("/\\") + "/" + re.split(r"[/\\]", src.rstrip("/\\"))[-1], dest):
-        e = re.sub(r"^(?:~|\$\{?HOME\}?)(?=[/\\]|$)", "/home/_h", eff)
-        e = re.sub(r"(?:^|(?<=[/\\]))\.(?:[/\\]+|$)", "", e) or "."
-        if patterns.AGENT_EXEC_DEDICATED_RE.search(" " + e + " "):
+    cwd_parts = _agent_exec_norm_path(cwd) if cwd else None
+    base = _agent_exec_norm_path(dest)
+    name = _agent_exec_norm_path(src)[-1:] if src else []
+    for parts in ((base + name) if name and name != ["/"] else base, base):
+        if not parts or parts == ["/"]:
+            continue
+        flat = ("/" if parts[0] == "/" else "") + "/".join(x for x in parts if x != "/")
+        if patterns.AGENT_EXEC_DEDICATED_RE.search(" " + flat + " "):
             return True
-        m = patterns.AGENT_EXEC_PARENT_SPLIT_RE.match(e)
-        if m:
-            pre = m.group(1).rstrip("/\\")
-            if pre in ("", ".") or (cwd and pre == cwd) or _AXC_HOME_ROOT_RE.match(pre):
-                return True
+        low = [x.lower() for x in parts]
+        if len(low) >= 2 and (low[-2], low[-1]) in _AXC_CONFIG_DIR_PAIRS:
+            pre = parts[:-2]
+        elif low[-1] in _AXC_CONFIG_DIR_NAMES:
+            pre = parts[:-1]
+        else:
+            continue
+        real = [x for x in pre if x != "/"]
+        if not pre:
+            return True                                  # relative: the project root
+        if cwd_parts and pre == cwd_parts:
+            return True
+        if pre and pre[0] == "/" and (
+                (len(real) == 2 and real[0] in ("home", "Users")) or real == ["root"]):
+            return True
     return False
 
 
@@ -13444,13 +13483,25 @@ def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base: str = "") -> b
     except Exception:
         return False
     if clone:
-        ops = [t for t in toks[toks.index("clone") + 1:] if not t.startswith("-")] if "clone" in toks else []
+        ops, rest, k = [], toks[toks.index("clone") + 1:] if "clone" in toks else [], 0
+        while k < len(rest):
+            t = rest[k]
+            if t in ("--depth", "-b", "--branch", "-o", "--origin", "-c", "--config", "--reference",
+                     "-j", "--jobs", "--filter", "--template", "--separate-git-dir", "-u",
+                     "--upload-pack", "--shallow-since", "--shallow-exclude", "--reference-if-able",
+                     "--server-option", "--bundle-uri"):
+                k += 2
+                continue
+            if not t.startswith("-"):
+                ops.append(t)
+            k += 1
         if not ops:
             return False
         dest = ops[1] if len(ops) > 1 else re.sub(r"\.git$", "", ops[0].rstrip("/").rsplit("/", 1)[-1])
-        if base and not dest.startswith(("/", "~", "$")):
-            dest = base.rstrip("/") + "/" + dest
-        return _agent_exec_place_dest_ok(ev, dest) and _agent_exec_effective_hit(dest, dest, str(ev.cwd or ""))
+        if not dest.startswith(("/", "~", "$")):
+            root = base or str(ev.cwd or "")
+            dest = (root.rstrip("/") + "/" + dest) if root else dest
+        return _agent_exec_place_dest_ok(ev, dest) and _agent_exec_effective_hit(dest, "", str(ev.cwd or ""))
     idx = next((i for i, t in enumerate(toks)
                 if re.fullmatch(r"(?:.*[/\\])?(?:cp|mv|ln|install|rsync|copy|move|copy-item"
                                 r"|move-item|cpi|mi|scp|ditto)", t, re.IGNORECASE)), None)
@@ -13479,7 +13530,9 @@ def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base: str = "") -> b
         dest = base.rstrip("/") + "/" + dest
     if not _agent_exec_place_dest_ok(ev, dest):
         return False
-    return any(_agent_exec_effective_hit(dest, src, str(ev.cwd or "")) for src in srcs[:64])
+    names = list(dict.fromkeys(_agent_exec_norm_path(x)[-1] if _agent_exec_norm_path(x) else ""
+                               for x in srcs[:64]))
+    return any(_agent_exec_effective_hit(dest, n, str(ev.cwd or "")) for n in names if n)
 
 
 def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
@@ -13503,12 +13556,26 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     noise = patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", cmd)
     # copy/move/clone into place, resolved by destination (QA round 12: this
     # must not depend on a config-dir NAME appearing in the command text)
-    bases = [(m.group(1) or m.group(2) or m.group(3) or "") for m in _AXC_CHDIR_RE.finditer(cmd[:20000])]
-    base = bases[-1] if bases else ""
     if _AXC_COPY_CMD_RE.search(noise) or re.search(r"\bclone\b", noise):
-        for clause in _AXC_CLAUSE_RE.split(noise[:200_000])[:4096]:
-            if _agent_exec_copy_dir_into_place(ev, clause, base):
-                return kind or "dedicated"
+        for rendering in noise[:200_000].split("\n")[:64]:
+            base = ""                    # the `cd` in effect BEFORE each clause (QA round 13)
+            for clause in _AXC_CLAUSE_RE.split(rendering)[:4096]:
+                cdm = re.match(r"^\s*[({]?\s*(?:cd|pushd|chdir)\s+(?:--\s+)?(\S{1,1024})\s*[)}]?\s*$",
+                               clause)
+                if cdm:
+                    d = cdm.group(1).strip("'\"")
+                    if d == "-":
+                        base = ""
+                    elif d.startswith(("/", "~", "$")):
+                        base = d
+                    else:
+                        base = ((base or str(ev.cwd or "")).rstrip("/") + "/" + d) if (base or ev.cwd) else d
+                    continue
+                if re.match(r"^\s*(?:cd|pushd|popd)\s*$", clause):
+                    base = ""
+                    continue
+                if _agent_exec_copy_dir_into_place(ev, clause, base):
+                    return kind or "dedicated"
     if not kind and not inside and not patterns.AGENT_EXEC_PARENT_DIR_RE.search(noise):
         return ""
     names = [patterns.AGENT_EXEC_DEDICATED_RE, patterns.AGENT_EXEC_MIXED_RE]
@@ -13610,7 +13677,10 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
     monthly); a path built from variables, globs or brace expansion; a write
     through a program this guard does not recognize as writing; a git
     operation that brings these files in without naming them (``git pull``
-    of a branch that adds ``.cursor/hooks.json``); a mixed settings-file edit
+    of a branch that adds ``.cursor/hooks.json``); a content-blind copy or
+    extract whose payload's file names never appear in the command
+    (``cp -a /tmp/d/. ~/``, ``cp -r /tmp/d/.config ~/``, ``tar xzf p.tgz -C
+    ~``, ``rsync -a /tmp/d/ ./``); a mixed settings-file edit
     whose new, old and on-disk text all lack an exec key (a value-only edit
     inside an array when the file is not on disk where the hook runs); a
     script that an existing hook/MCP entry already points at, living outside

