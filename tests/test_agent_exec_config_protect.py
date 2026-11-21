@@ -507,10 +507,6 @@ def test_qa1_benign_broad_keys_silent(path, content):
     "npm --prefix packages/copilot-mcp install",
     "pnpm -C packages/goose-mcp install",
     "yarn workspace amp-mcp add zod",
-    'grep -rn "gemini extensions install" docs/',
-    "git commit -m 'docs: gemini extensions install guide'",
-    'gh pr create --title "docs: how to run qwen mcp add"',
-    "echo 'use copilot mcp add later' > notes.txt",
     "grep -n code .cursor/hooks.json",
     'grep -rn "exit code" .github/hooks/',
     "grep -rn touch .github/hooks",
@@ -604,7 +600,6 @@ def test_qa2_write_forms(cmd):
     "grep -n code .cursor/hooks.json",
     "git log --patch -- .cursor/hooks.json",
     "npm --prefix packages/copilot-mcp install",
-    "git commit -m 'docs: gemini extensions install guide'",
 ])
 def test_qa2_reads_still_silent(cmd):
     assert _only(_shell(cmd)) is None, cmd
@@ -635,3 +630,62 @@ def test_qa2_bounded_time(payload):
 ])
 def test_qa2_toml_escape_and_bom(content):
     assert _only(_write("/r/.codex/config.toml", content=content)) is not None
+
+
+# ---- QA round 3 regressions -----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "a=1;qwen mcp add x", "true&&qwen mcp add x", "x|q mcp add y", "a=1;gemini extensions install x",
+    "eval 'qwen mcp add x'", "echo 'qwen mcp add x' | sh", "sh <<< 'qwen mcp add x'",
+    "su -c 'qwen mcp add x'", "script -qc 'qwen mcp add x'", "watch 'qwen mcp add x'",
+    'bash -lc "cd x; qwen mcp add y"', "npx opencode-ai mcp add x", "q\\wen mcp add x",
+    "qwen${IFS}mcp${IFS}add x",
+])
+def test_qa3_cli_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    # Deliberate trade-off, same as MCP_CLI_ADD_RE for `claude mcp add`: quoted
+    # mentions ask, because blanking quotes hid `eval '...'` / `| sh` (QA round 3).
+    "git commit -m 'docs: gemini extensions install guide'",
+    'gh pr create --title "docs: how to run qwen mcp add"',
+])
+def test_qa3_quoted_mentions_ask_by_design(cmd):
+    assert _only(_shell(cmd)) is not None
+
+
+@pytest.mark.parametrize("cmd", [
+    "nice" + " -n 1" * 22 + " cp evil.json .cursor/hooks.json",
+    "sudo" + " -u" * 26 + " cat .cursor/hooks.json",
+    "echo " + '"\\' * 9990,
+    "bash -c 'echo x > .cursor/hooks.json' " + '"\\' * 9000,
+    "nice " + "-n 1 " * 3000 + "vim .cursor/hooks.json",
+])
+def test_qa3_no_redos(cmd):
+    t = time.time()
+    _only(_shell(cmd))
+    assert time.time() - t < 0.5
+
+
+@pytest.mark.parametrize("cmd", [
+    "git restore --staged --work -s evil .cursor/hooks.json",
+    "git restore -sSTABLE .cursor/hooks.json",
+    "sudo -S git restore -s evil .cursor/hooks.json",
+    "TERM=x vim .cursor/hooks.json", "FOO=1 BAR=2 patch .cursor/hooks.json p",
+    "(patch .cursor/hooks.json p)", "timeout -s KILL 5 patch .cursor/hooks.json p",
+    "vim.basic .cursor/hooks.json", "vim.tiny .cursor/hooks.json",
+    "nice" + " -n 1" * 22 + " cp evil.json .cursor/hooks.json",
+])
+def test_qa3_write_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -n 'spawn(' .opencode/plugin/x.ts && node --version",
+    "rg 'subprocess' .opencode/plugin/ ; python3 -m pytest -q",
+    "git restore --staged .cursor/hooks.json",
+    "git restore --stag .cursor/hooks.json",
+    "sudo -n cat .cursor/hooks.json",
+])
+def test_qa3_reads_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd

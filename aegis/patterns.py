@@ -7001,23 +7001,18 @@ AGENT_EXEC_CONFIG_KEY_RE = re.compile(
 
 # CLI registration of an MCP server / extension for agents MCP_CLI_ADD_RE's
 # vendor list does not name. The vendor must be a whole TOKEN (QA round 1:
-# `packages/copilot-mcp` and `amp-mcp` matched on `\b`), and rules.py matches
-# this against renderings whose quoted strings containing whitespace are
-# blanked (commit messages, grep patterns), never the quote-stripped one.
-# Not command-position anchored (QA round 2: every wrapper -- nohup, timeout,
-# `then`, `{`, `$(which qwen)` -- was a bypass of an anchored form).
-_AX_TOK_L = r"(?:^|[\s/\\(`{!=]|\$\()"
-_AX_TOK_R = r"(?:-cli|-code)?(?:@[\w.^~-]{0,60})?[)`'\"]?\s+(?:[^|;&\n]{0,200}\s)?"
+# `packages/copilot-mcp` and `amp-mcp` matched on `\b`). Not command-position
+# anchored (QA round 2: every wrapper -- nohup, timeout, `then`, `{`,
+# `$(which qwen)` -- bypassed an anchored form) and matched as plain text on
+# every rendering, like MCP_CLI_ADD_RE (QA round 3: blanking quoted strings
+# hid `eval '...'` / `| sh`), so a commit message quoting it asks too.
+_AX_TOK_L = r"(?:^|[\s/\\(`{!=;&|'\"]|\$\()"
+_AX_TOK_R = r"(?:-cli|-code|-ai)?(?:@[\w.^~-]{0,60})?[)`'\"]?\s+(?:[^|;&\n]{0,200}\s)?"
 AGENT_EXEC_CLI_RE = re.compile(
     _AX_TOK_L + r"(?:qwen|amp|opencode|copilot|kiro-cli|kiro|droid|goose|auggie|crush|cline"
     r"|cursor-agent|q)" + _AX_TOK_R + r"mcp\s+(?:add|add-json|install|import)\b"
     r"|" + _AX_TOK_L + r"(?:gemini|qwen)" + _AX_TOK_R + r"extensions?\s+(?:install|link|update|new)\b",
     re.IGNORECASE)
-# Wrappers that may precede a command word (QA round 2).
-AX_WRAP = (r"(?:(?:sudo|doas|env|command|builtin|exec|nohup|time|nice|ionice|timeout|stdbuf|xargs"
-           r"|busybox|chrt|taskset|unbuffer|caffeinate|then|do|else|elif|!|\{|\()"
-           r"(?:\s+-[ugCDprn]\s+\S+|\s+-{1,2}[\w-]+(?:=\S*)?|\s+\w+=\S*|\s+\d[\w.]*)*\s+){0,8}")
-
 # The narrow set used against a file ALREADY on disk (QA round 1: the full
 # list made any edit of a Zed settings file that sets `formatter` ask).
 AGENT_EXEC_STRONG_KEY_RE = re.compile(

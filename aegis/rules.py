@@ -12907,10 +12907,6 @@ _AXC_DISK_MAX = 262_144
 _AXC_GIT_WRITE_RE = re.compile(
     r"\bgit\b[^|;&\n]{0,200}\s(?:checkout|apply|am|cherry-pick|merge|pull|stash\s+(?:pop|apply)"
     r"|reset\s+--hard|read-tree|checkout-index|worktree\s+add)\b"
-    # editors / patch / touch / sponge only in command position (the clause is
-    # one simple command already), after any wrappers (QA round 2)
-    r"|^\s*" + patterns.AX_WRAP + r"\\?(?:\S{0,200}/)?"
-    r"(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl|patch|touch|truncate|sponge)(?=\s|$)"
     r"|\b(?:Write|Append)All(?:Text|Bytes|Lines)\b|\[(?:System\.)?IO\.File\]::\w+"
     r"|\b(?:New-Item|ni|Copy-Item|Move-Item)\b",
     re.IGNORECASE)
@@ -13069,38 +13065,111 @@ _AXC_RESTORE_RE = re.compile(r"\bgit\b[^|;&\n]{0,200}\srestore\b", re.IGNORECASE
 
 
 def _agent_exec_restore_writes(clause: str) -> bool:
-    """`git restore` writes the worktree unless `--staged`/`-S` is given as
-    a real option (a whole token before `--`, not in a comment) without
-    `--worktree`/`-W` (QA round 2: `... # --staged` and `-- --staged`)."""
+    """`git restore` writes the worktree unless `--staged`/`-S` is given
+    without `--worktree`/`-W`. Only tokens after `restore` and before `--`
+    count; long options by unique prefix (git accepts `--work`); a short
+    cluster stops at `-s`, which takes a value (QA rounds 2-3)."""
     if not _AXC_RESTORE_RE.search(clause):
         return False
     try:
         toks = shlex.split(clause, comments=True, posix=True)
     except Exception:
         return True
+    if "restore" not in toks:
+        return True
+    toks = toks[toks.index("restore") + 1:]
     if "--" in toks:
         toks = toks[:toks.index("--")]
-    opts = [t for t in toks if t.startswith("-")]
-    short = "".join(t[1:] for t in opts if not t.startswith("--"))
-    staged = "--staged" in opts or "S" in short
-    worktree = "--worktree" in opts or "W" in short
+    staged = worktree = False
+    for t in toks:
+        if t.startswith("--"):
+            name = t.split("=", 1)[0]
+            if len(name) >= 4 and "--staged".startswith(name) and "=" not in t:
+                staged = True
+            elif len(name) >= 3 and "--worktree".startswith(name):
+                worktree = True
+        elif t.startswith("-") and len(t) > 1:
+            for ch in t[1:]:
+                if ch == "S":
+                    staged = True
+                elif ch == "W":
+                    worktree = True
+                elif ch == "s":
+                    break                 # -s<tree>: the rest is its value
     return worktree or not staged
 
 
-def _agent_exec_cli_hit(raw: str) -> bool:
-    """CLI registration (``patterns.AGENT_EXEC_CLI_RE``) in the raw command or
-    any decoded / inner-interpreter rendering, each with its whitespace-
-    bearing quoted strings blanked (a commit message or grep pattern is not a
-    command); quotes around a single word are dropped (``"qwen" mcp add``)."""
-    parts = normalize.scan_surface(raw, sep="\x1e").split("\x1e")
-    cands = [parts[0]] + parts[2:]
-    for c in cands:
-        c = re.sub(r"'[^'\n]{0,4000}'|\"(?:[^\"\\\n]|\\.){0,4000}\"",
-                   lambda m: (" " * len(m.group(0))) if re.search(r"\s", m.group(0))
-                   else m.group(0)[1:-1], c)
-        if patterns.AGENT_EXEC_CLI_RE.search(c):
+_AXC_EDITOR_RE = re.compile(
+    r"(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl|patch|touch|truncate|sponge|vim\.\w+|vi\.\w+)",
+    re.IGNORECASE)
+_AXC_WRAPPERS = frozenset((
+    "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice",
+    "timeout", "stdbuf", "xargs", "busybox", "chrt", "taskset", "unbuffer", "caffeinate",
+    "then", "do", "else", "elif", "!", "{", "(", "if", "while", "until"))
+# wrapper options whose value is the next token, per wrapper
+_AXC_VALUE_OPTS = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D", "-R", "--user", "--group"},
+    "doas": {"-u", "-C"}, "env": {"-u", "-C", "-S", "--unset", "--chdir"},
+    "nice": {"-n", "--adjustment"}, "ionice": {"-c", "-n", "-p", "-P", "-u"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"}, "stdbuf": {"-i", "-o", "-e"},
+    "chrt": {"-p"}, "taskset": {"-p", "-c"}, "xargs": {"-I", "-n", "-P", "-d", "-a", "-E", "-L", "-s"},
+}
+
+
+def _agent_exec_editor_cmd(clause: str) -> bool:
+    """The simple command's own command word (after variable assignments and
+    wrappers like sudo/timeout/nice/then) is an editor / patch / touch /
+    sponge. Token-based and linear (QA round 3: a regex form backtracked
+    exponentially on `nice -n 1 -n 1 ...`)."""
+    toks = clause[:4000].split()
+    i, n = 0, min(len(toks), 256)
+    while i < n:
+        t = toks[i].lstrip("({!\\")
+        if not t:
+            i += 1
+            continue
+        if re.match(r"^\w+=", t):
+            i += 1
+            continue
+        base = t.rsplit("/", 1)[-1].lower()
+        if base in _AXC_WRAPPERS:
+            vopts = _AXC_VALUE_OPTS.get(base, ())
+            i += 1
+            while i < n and (toks[i].startswith("-") or re.fullmatch(r"\d[\w.]*", toks[i])
+                             or re.match(r"^\w+=", toks[i])):
+                i += 2 if (toks[i] in vopts and i + 1 < n) else 1
+            continue
+        return bool(_AXC_EDITOR_RE.fullmatch(base))
+    return False
+
+
+# An interpreter's own inline-code argument (QA round 3: matching the whole
+# command asked on `grep 'spawn(' .opencode/plugin/x.ts && node --version`).
+_AXC_INTERP_CODE_RE = re.compile(
+    r"\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell|osascript)\b"
+    r"[^|;&\n]{0,200}?\s(?:-[a-zA-Z]{0,4}[ceErp]|--eval|--print|-Command|eval)(?=\s)",
+    re.IGNORECASE)
+
+
+def _agent_exec_interp_write(noise: str, names_re) -> bool:
+    for m in _AXC_INTERP_CODE_RE.finditer(noise[:200_000]):
+        code = noise[m.end():m.end() + 20_000]
+        if _AXC_INTERP_WRITE_RE.search(code) and names_re.search(code):
             return True
     return False
+
+
+def _agent_exec_cli_hit(raw: str) -> bool:
+    """CLI registration (``patterns.AGENT_EXEC_CLI_RE``) in the command or any
+    de-obfuscated rendering -- as text, the same lenient trade-off
+    ``MCP_CLI_ADD_RE`` makes for ``claude mcp add``: a commit message that
+    quotes `qwen mcp add` asks too (QA round 3: blanking quoted strings hid
+    `eval '...'`, `echo '...' | sh`, `su -c '...'`). Backslashes before
+    letters and `${IFS}` are normalized away first."""
+    c = normalize.scan_surface(raw, sep="\n")
+    c = re.sub(r"\\(?=\w)", "", c)
+    c = re.sub(r"\$\{?IFS\}?", " ", c)
+    return bool(patterns.AGENT_EXEC_CLI_RE.search(c))
 
 
 def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
@@ -13138,6 +13207,7 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
             or patterns.ARCHIVE_SYNC_VERB_RE.search(clause)
             or _AXC_GIT_WRITE_RE.search(clause)
             or _agent_exec_restore_writes(clause)
+            or _agent_exec_editor_cmd(clause)
             or re.search(r"\b(?:set-content|out-file|add-content|sc)\b", clause, re.IGNORECASE)
             or re.search(r"\bof=", clause)):
         return True
@@ -13183,10 +13253,8 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     joined = bool(_AXC_JOINED_RE.search(noise))
     # An interpreter one-liner's own code may contain `;` (split into clauses
     # below), so test it against the whole command.
-    interp = bool(re.search(r"\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell)\b",
-                            noise, re.IGNORECASE) and _AXC_INTERP_WRITE_RE.search(noise))
     for names_re in names:
-        if interp and names_re.search(noise):
+        if _agent_exec_interp_write(noise, names_re):
             return kind or "dedicated"
         if joined and names_re.search(noise) and (
                 patterns.WRITE_REDIRECT_RE.search(noise) or patterns.COPY_WRITE_VERB_RE.search(noise)
@@ -13283,9 +13351,16 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
     the dedicated directories (writing it is not recognized as exec-
     relevant). Shell matching is textual: ``cat .cursor/hooks.json > /tmp/x``
     does not ask (the redirect target is elsewhere), but some reads phrased
-    with write-capable tools (``vim .cursor/hooks.json`` to view) do, as does
-    any command that names a target and also runs an interpreter one-liner
-    that writes SOMEWHERE (the one-liner's code is matched as a whole). Shell
+    with write-capable tools (``vim .cursor/hooks.json`` to view) do. An
+    interpreter one-liner counts when its own ``-c``/``-e`` code both names a
+    target and calls a write API (any ``;`` inside that code included); a
+    script file the interpreter runs is not read. CLI registration is matched
+    as text on every rendering, so a commit message or grep pattern that
+    quotes ``qwen mcp add`` asks too (the trade-off ``MCP_CLI_ADD_RE`` makes
+    for ``claude mcp add``; blanking quoted text hid ``eval '...'``). Editor/
+    patch/touch/sponge count only as the simple command's own command word,
+    found by skipping variable assignments and known wrappers (sudo, env,
+    timeout, nice, then, ...); an unknown wrapper hides it. Shell
     ``allow`` regexes are blanked out of the command and the rest re-checked,
     so an allow-listed path does not wave through a second target. A path on
     both this surface and agent-rules-protect's (``.clinerules/hooks/``)
