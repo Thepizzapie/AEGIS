@@ -6969,13 +6969,14 @@ AGENT_EXEC_MIXED_RE = re.compile(_AX_B + _AX_MIXED_CORE + _AX_E, re.IGNORECASE)
 # Agent config DIRECTORIES: a `cd` into one (or a session cwd inside one)
 # makes a bare `hooks.json`/`settings.json` relative path a target, and a
 # copy/extract whose destination is the directory itself drops files into it.
-AGENT_EXEC_PARENT_DIR_RE = re.compile(
-    _AX_B + r"(?:\.(?:cursor|windsurf|kiro|amazonq|roo|kilocode|continue|opencode|gemini|qwen"
+_AX_PARENT_CORE = (r"(?:\.(?:cursor|windsurf|kiro|amazonq|roo|kilocode|continue|opencode|gemini|qwen"
     r"|codex|zed|junie|factory|openhands|amp|augment|copilot|clinerules|trae)"
     r"|" + _ax(r"\.github", r"hooks") + r"|" + _ax(r"\.aws", r"amazonq")
     + r"|" + _ax(r"\.config", r"(?:opencode|amp|goose|zed)")
-    + r"|" + _ax(r"\.codeium", r"windsurf") + r")" + _AX_E,
-    re.IGNORECASE)
+    + r"|" + _ax(r"\.codeium", r"windsurf") + r")" )
+AGENT_EXEC_PARENT_DIR_RE = re.compile(_AX_B + _AX_PARENT_CORE + _AX_E, re.IGNORECASE)
+# the parent directory as a WHOLE operand (a placement destination)
+AGENT_EXEC_PARENT_OPERAND_RE = re.compile(r"^(?:.{0,1000}[/\\\\])?" + _AX_PARENT_CORE + _WIN_TRIM + r"[/\\\\]*$", re.IGNORECASE)
 # Basenames that are a target when the command (or cwd) is inside a parent dir.
 AGENT_EXEC_BARE_NAME_RE = re.compile(
     r"(?:^|[\s'\"=<>])(?:\.[/\\]+)?(?:(?:hooks|mcp|settings|environment|cli|cli-config"

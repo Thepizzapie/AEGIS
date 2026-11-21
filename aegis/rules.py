@@ -12939,8 +12939,22 @@ _AXC_CHDIR_RE = re.compile(
 _AXC_CLAUSE_RE = re.compile(r"(?<!>)\||(?<!>)&(?!>)|[;\n]")
 # A redirect / tee / -o-style option whose operand is the target.
 _AXC_OUT_OP_RE = re.compile(
-    r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)(?-i:-[oOtdC])|--(?:output|target-directory"
-    r"|output-document|directory)=?|\bof=)\s*['\"]?$", re.IGNORECASE)
+    # a bundled short option ending in o/O/t/d/C/P (`curl -fsSLo`, `wget -qO`,
+    # `wget -P`) -- QA round 7
+    r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)(?-i:-[a-zA-Z]{0,8}[oOtdCP])"
+    r"|--(?:output|target-directory|output-document|directory|output-dir|directory-prefix)=?"
+    r"|\bof=)\s*['\"]?$", re.IGNORECASE)
+# A glued output option: `-o.cursor/hooks.json`, `-sLo.cursor/...`
+_AXC_GLUED_OUT_RE = re.compile(r"(?-i:-[a-zA-Z]{0,8}[oOP])\S")
+# Commands whose -o/-d/-t/-P options are NOT output destinations
+_AXC_READONLY_WORDS = frozenset(("ls", "ll", "dir", "test", "[", "[[", "grep", "egrep", "fgrep", "rg",
+                                 "ag", "find", "stat", "file", "du", "jq", "yq", "cat", "less", "head",
+                                 "tail", "diff", "wc", "sort", "uniq", "awk", "cut", "tr"))
+# Fetch / clone verbs that place files at a path operand (QA round 7)
+_AXC_PLACE_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,200}\s(?:clone|submodule\s+add|worktree\s+add)\b|\bgh\s+repo\s+clone\b"
+    r"|\bsvn\s+(?:co|checkout|export)\b|\b(?:wget|aria2c)\b|\bcurl\b[^|;&\n]{0,400}--output-dir\b",
+    re.IGNORECASE)
 _AXC_COPY_CMD_RE = re.compile(
     r"(?:^|[\s/\\!])(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|cpi|mi|scp|ditto)(?=\s|$)",
     re.IGNORECASE)
@@ -13052,6 +13066,24 @@ def _agent_exec_mixed_relevant(ev: Event, forms) -> bool:
     return _agent_exec_disk_has_key(forms)
 
 
+def _agent_exec_inside_dedicated(ev: Event, cmd: str) -> bool:
+    """The cwd, or a `cd` target in the command, is itself a DEDICATED path
+    (`.opencode/plugin`, `.kiro/hooks`): every relative operand is a target
+    (QA round 7)."""
+    if ev.cwd and patterns.AGENT_EXEC_DEDICATED_RE.search(str(ev.cwd).rstrip("/\\") + " "):
+        return True
+    for m in _AXC_CHDIR_RE.finditer(cmd):
+        d = (m.group(1) or m.group(2) or m.group(3) or "").rstrip("/\\")
+        if d and patterns.AGENT_EXEC_DEDICATED_RE.search(" " + d + " "):
+            return True
+    return False
+
+
+# Any relative operand (not an option, absolute path, ~, variable or /dev/...)
+_AXC_REL_OPERAND_RE = re.compile(
+    r"(?:^|[\s'\"=<>])(?![-/~$\\])(?:\.{1,2}[/\\])?[\w@.][^\s'\"<>|;&]{0,1000}(?=[\s'\"<>|;&)]|$)")
+
+
 def _agent_exec_inside_parent(ev: Event, cmd: str) -> bool:
     if ev.cwd and patterns.AGENT_EXEC_PARENT_DIR_RE.search(str(ev.cwd).rstrip("/\\") + " "):
         return True
@@ -13106,7 +13138,10 @@ _AXC_EDITOR_RE = re.compile(
 _AXC_WRAPPERS = frozenset((
     "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice",
     "timeout", "stdbuf", "xargs", "busybox", "chrt", "taskset", "unbuffer", "caffeinate",
-    "then", "do", "else", "elif", "!", "{", "(", "if", "while", "until"))
+    "then", "do", "else", "elif", "!", "{", "(", "if", "while", "until",
+    # launchers (QA round 7): `uv run python -`, `npx tsx`, `pnpm exec node`
+    "uv", "uvx", "poetry", "pipenv", "pdm", "hatch", "rye", "run", "npx", "bunx", "pnpx", "pnpm",
+    "yarn", "dlx", "exec", "conda", "mamba", "micromamba"))
 # wrapper options whose value is the next token, per wrapper
 _AXC_VALUE_OPTS = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-D", "-R", "--user", "--group"},
@@ -13125,7 +13160,7 @@ def _agent_exec_command_word(clause: str):
     toks = clause[:4000].split()
     i, n = 0, min(len(toks), 256)
     while i < n:
-        t = toks[i].lstrip("({!\\")
+        t = toks[i].lstrip("({!\\").rstrip(")}")
         if not t:
             i += 1
             continue
@@ -13188,7 +13223,8 @@ def _agent_exec_code_arg(text: str, pos: int) -> str:
 
 # An interpreter reading its program from stdin: `python3 - <<EOF`, `| node`.
 _AXC_INTERP_NAME_RE = re.compile(
-    r"(?:python[0-9.]*|node|nodejs|deno|bun|ruby|perl|php|pwsh|powershell|osascript)", re.IGNORECASE)
+    r"(?:python[0-9.]*|pypy[0-9.]*|ipython[0-9.]*|node|nodejs|tsx|ts-node|deno|bun|ruby|perl|php|pwsh"
+    r"|powershell|osascript)", re.IGNORECASE)
 _AXC_STAGE_SPLIT_RE = re.compile(r"(\|&|\|\|?|&&|(?<!>)&(?!>)|;|\n)")
 # Each interpreter's own inline-code flags (QA round 6: python's -E and
 # node/ruby's -r are not inline code).
@@ -13262,6 +13298,10 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
         if not parent_ok:
             return False
         # whole-directory placement: `cp -r x .cursor/`, `tar xf a -C .cursor`
+        if _AXC_PLACE_RE.search(clause) and any(
+                patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(t.strip("'\"").split("=", 1)[-1])
+                for t in clause[:20000].split()):
+            return True
         if not (_AXC_COPY_CMD_RE.search(clause) or patterns.ARCHIVE_SYNC_VERB_RE.search(clause)):
             return False
         try:
@@ -13282,14 +13322,18 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
         while s > 0 and clause[s - 1] not in " \t<>|;&=":
             s -= 1
         # `> path`, `>>path`, `tee -a path`, `-o path`, `--output=path`, `of=path`
-        if _AXC_OUT_OP_RE.search(clause[:s]):
-            return True
+        lead = clause[:s]
+        if _AXC_OUT_OP_RE.search(lead) or _AXC_GLUED_OUT_RE.match(clause, s):
+            if re.search(r">|\btee\b|\bof=", lead[-400:]) or \
+                    _agent_exec_command_word(clause)[0] not in _AXC_READONLY_WORDS:
+                return True
     if (_AXC_INPLACE_RE.search(clause)
             or patterns.FORCED_LINK_WRITE_RE.search(clause)
             or patterns.DESTRUCTIVE_DELETE_RE.search(clause)
             or patterns.ARCHIVE_SYNC_VERB_RE.search(clause)
             or _AXC_GIT_WRITE_RE.search(clause)
             or _agent_exec_restore_writes(clause)
+            or _AXC_PLACE_RE.search(clause)
             or _agent_exec_editor_cmd(clause)
             or re.search(r"\b(?:set-content|out-file|add-content|sc)\b", clause, re.IGNORECASE)
             or re.search(r"\bof=", clause)):
@@ -13325,6 +13369,9 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
 def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     """'' or the tier ('dedicated'/'mixed') of the agent exec-config path this
     shell command writes. ``cmd`` is the de-obfuscated scan surface."""
+    # `-o.cursor/hooks.json` / `-sLo.x`: give a glued output operand the same
+    # boundary a spaced one has (QA round 7)
+    cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}[oOP]))(?=[.~\w])", r"\1 ", cmd)
     kind = patterns.agent_exec_path_hit(cmd)
     inside = _agent_exec_inside_parent(ev, cmd)
     noise = patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", cmd)
@@ -13333,6 +13380,8 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     names = [patterns.AGENT_EXEC_DEDICATED_RE, patterns.AGENT_EXEC_MIXED_RE]
     if inside:
         names.append(patterns.AGENT_EXEC_BARE_NAME_RE)
+        if _agent_exec_inside_dedicated(ev, cmd):
+            names.append(_AXC_REL_OPERAND_RE)
     joined = bool(_AXC_JOINED_RE.search(noise))
     # An interpreter one-liner's own code may contain `;` (split into clauses
     # below), so test it against the whole command.
@@ -13493,7 +13542,9 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
             return None
         if _agent_exec_allowed_by_policy(cfg, [target] + [f for f in forms if f]):
             return None
-        if _agent_exec_defer_to_rules(ev, policy):
+        if (patterns.agent_rules_path_hit(_cmd(ev)[:normalize._MAX] + " " + " ".join(
+                str(x)[:4096] for x in _flatten_strings(ev.args or {})[:256]))
+                and _agent_exec_defer_to_rules(ev, policy)):
             return None
         what = ("an exec/approval setting in agent config" if kind == "mixed"
                 else "agent exec config")
@@ -13517,7 +13568,9 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
             return None
         if cfg.get("allow") and not cli and _agent_exec_shell_allowed(ev, cfg, raw):
             return None
-        if _agent_exec_defer_to_rules(ev, policy):
+        if (patterns.agent_rules_path_hit(_cmd(ev)[:normalize._MAX] + " " + " ".join(
+                str(x)[:4096] for x in _flatten_strings(ev.args or {})[:256]))
+                and _agent_exec_defer_to_rules(ev, policy)):
             return None
         what = ("registers an MCP server / extension for another coding agent from its CLI"
                 if cli else "writes another coding agent's exec config from a shell")
