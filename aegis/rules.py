@@ -13013,6 +13013,15 @@ def _agent_exec_target(ev: Event):
         kind, forms = _agent_exec_classify(ev, c)
         if kind:
             return c, kind, forms
+    if ev.action == ActionClass.MCP:
+        # a move/copy whose DESTINATION is a whole agent config directory
+        # (`move_file /tmp/t/.codex -> ~/.codex`) -- QA round 10
+        for k, v in list(args.items())[:256]:
+            if (isinstance(k, str) and isinstance(v, str) and len(v) <= 4096
+                    and re.search(r"dest|target|^to$|^new|output", k, re.IGNORECASE)):
+                for form in _agent_rules_path_forms(ev, v):
+                    if form and patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(form):
+                        return v, "dedicated", [form]
     return "", "", []
 
 
@@ -13374,6 +13383,47 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
     return False
 
 
+_AXC_HOME_DEST_RE = re.compile(
+    r"^(?:\.|~|\$\{?HOME\}?|/root|/home/[^/\s]{1,64}|/Users/[^/\s]{1,64}|[A-Za-z]:\\Users\\[^\\\s]{1,64})[/\\]*$")
+
+
+def _agent_exec_copy_dir_into_place(ev: Event, clause: str) -> bool:
+    """`cp -r /tmp/t/.codex ~/`, `mv /tmp/x/.gemini .`, `cp -a /tmp/e/.github/hooks
+    .github/`: a copy/move whose SOURCE is a staged agent config directory
+    (with a directory prefix) and whose destination is the home dir, the
+    cwd, or the directory that holds that config dir (QA round 10)."""
+    if not _AXC_COPY_CMD_RE.search(clause):
+        return False
+    try:
+        toks = shlex.split(clause, posix=True)
+    except Exception:
+        return False
+    ops = [t for t in toks if not t.startswith("-")]
+    idx = next((i for i, t in enumerate(ops)
+                if re.fullmatch(r"(?:.*[/\\])?(?:cp|mv|ln|install|rsync|copy|move|copy-item"
+                                r"|move-item|cpi|mi|scp|ditto)", t, re.IGNORECASE)), None)
+    if idx is None:
+        return False
+    ops = ops[idx + 1:]
+    if len(ops) < 2:
+        return False
+    dest = ops[-1].rstrip("/\\") or "/"
+    cwd = str(ev.cwd or "").rstrip("/\\")
+    for src in ops[:-1][:64]:
+        src = src.rstrip("/\\")
+        if "/" not in src and "\\" not in src:
+            continue
+        if not patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(src):
+            continue
+        holder = re.split(r"[/\\]", src)
+        holder_name = holder[-2] if len(holder) >= 2 else ""
+        if (_AXC_HOME_DEST_RE.match(dest) or (cwd and dest == cwd)
+                or (holder_name.startswith(".") and len(holder_name) > 1
+                    and re.split(r"[/\\]", dest)[-1] == holder_name)):
+            return True
+    return False
+
+
 def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     """'' or the tier ('dedicated'/'mixed') of the agent exec-config path this
     shell command writes. ``cmd`` is the de-obfuscated scan surface."""
@@ -13381,9 +13431,17 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     # boundary a spaced one has (QA round 7)
     # -- only when the glued text is path-like, so `openssl ... -out PATH`
     # stays one option (QA round 9)
-    cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}[oOP]))(?=[.~/\\]|[\w-]{0,200}[./\\])", r"\1 ", cmd)
+    cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}?[oOP]))(?=[.~/\\]|[\w-]{0,200}[./\\])", r"\1 ", cmd)
     kind = patterns.agent_exec_path_hit(cmd)
     inside = _agent_exec_inside_parent(ev, cmd)
+    if inside:
+        # `cd .cursor && curl -ohooks.json URL`, `cd .opencode && curl -sLoplugin`
+        cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}?[oOP]))(?=(?:hooks|mcp|settings|environment|cli"
+                     r"|cli-config|mcp-config|config|opencode|setup|pre-commit|plugins?|tools?"
+                     r"|extensions|mcpServers|agents|cli-agents)\b)", r"\1 ", cmd)
+        if _agent_exec_inside_dedicated(ev, cmd):
+            cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}?[oOP]))(?=[\w@][\w@.-]{0,200}\.\w{1,10}(?:\s|$))",
+                         r"\1 ", cmd)
     noise = patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", cmd)
     if not kind and not inside and not patterns.AGENT_EXEC_PARENT_DIR_RE.search(noise):
         return ""
@@ -13405,6 +13463,8 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
             return kind or "dedicated"
         for clause in _AXC_CLAUSE_RE.split(noise[:200_000])[:4096]:
             if _agent_exec_clause_write(clause, names_re, parent_ok=(names_re is names[0])):
+                return kind or "dedicated"
+            if names_re is names[0] and _agent_exec_copy_dir_into_place(ev, clause):
                 return kind or "dedicated"
     return ""
 
@@ -13540,6 +13600,21 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         target, kind, forms = _agent_exec_target(ev)
+        if not target and ev.action == ActionClass.MCP:
+            # a shell-type MCP tool (`start_process`, `run_command`, ...):
+            # judge its command string as a shell command (QA round 10)
+            a = ev.args or {}
+            for key in ("command", "cmd", "script", "shell_command", "commandLine", "command_line"):
+                v = a.get(key)
+                if isinstance(v, str) and v.strip():
+                    sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": v},
+                                     cwd=a.get("cwd") or a.get("workdir") or ev.cwd)
+                    d = rule_agent_exec_config_protect(sub, policy)
+                    if d is not None:
+                        return Decision(d.action, d.rule,
+                                        d.message.replace("This command", f"MCP tool '{ev.tool}' runs a command that", 1))
+                    break
+            return None
         if not target:
             return None
         if os.environ.get("AEGIS_ALLOW_AGENT_EXEC_CONFIG"):
