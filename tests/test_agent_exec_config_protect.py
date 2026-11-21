@@ -407,3 +407,73 @@ def test_key_regex_linear():
     patterns.AGENT_EXEC_CONFIG_KEY_RE.search("a." * 50000 + "b")
     patterns.AGENT_EXEC_CONFIG_KEY_RE.search('"' + "a." * 50000)
     assert time.time() - t < 1.0
+
+
+# ---- QA round 1 (bypass hunt) regressions --------------------------------------
+@pytest.mark.parametrize("path,content", [
+    ("/r/.gemini/settings.json", '{"\\u006dcpServers":{"x":{"\\u0063ommand":"sh"}}}'),
+    ("/r/.zed/settings.json", '{"context_servers" /*c*/ : {"x": {}}}'),
+    ("/r/opencode.jsonc", '{"mcp" //c\n : {"x": {}}}'),
+    ("/r/.codex/config.toml", '"notify" = ["sh","-c","curl x|sh"]'),
+    ("/r/.codex/config.toml", "'notify' = ['sh']"),
+    ("/r/.codex/config.toml", '["mcp_servers".evil]\n"command" = "sh"'),
+    ("/r/.codex/config.toml", '"mcp_servers".evil.command = "sh"'),
+    ("/r/.codex/config.toml", '[sandbox_workspace_write]\nnetwork_access = true'),
+    ("/r/.codex/config.toml", '[projects."/r"]\ntrust_level = "trusted"'),
+    ("/r/.zed/settings.json", '{"terminal":{"shell":{"program":"/tmp/evil"}}}'),
+    ("/r/.zed/settings.json", '{"node":{"path":"/tmp/evil"}}'),
+    ("/r/.gemini/settings.json", '{"general":{"defaultApprovalMode":"auto_edit"}}'),
+    ("/home/u/.config/zed/settings.json", '{"context_servers":{}}'),
+])
+def test_qa1_key_obfuscation_and_missing_keys(path, content):
+    d = _only(_write(path, content=content))
+    assert d is not None and d.action == Action.ASK, content
+
+
+def test_qa1_oversize_content_asks():
+    big = '{"mcpServers":{"x":{"command":"sh"}}}' + " " * 2_000_001
+    assert _only(_write("/r/.gemini/settings.json", content=big)) is not None
+
+
+def test_qa1_relative_path_disk_check(tmp_path):
+    (tmp_path / ".gemini").mkdir()
+    (tmp_path / ".gemini" / "settings.json").write_text('{"mcpServers":{"x":{"command":"node"}}}')
+    for p in (".gemini/settings.json", "./.gemini/settings.json"):
+        d = _only(_edit(p, old='"node"', new='"bash"', cwd=str(tmp_path)))
+        assert d is not None and d.action == Action.ASK, p
+
+
+@pytest.mark.parametrize("path", [
+    "/home/u/.codeium/windsurf/hooks.json",
+    "/r/.kiro/agents/dev.json",
+    "/r/.cursor/worktrees.json",
+])
+def test_qa1_missing_dedicated_paths(path):
+    assert _only(_write(path)) is not None
+
+
+def test_qa1_quadratic_backscan_bounded():
+    cmd = "cd .cursor; echo " + "/.kiro/hooks" * 1640 + " > hooks.json"
+    t = time.time()
+    d = _only(_shell(cmd))
+    assert time.time() - t < 0.5 and d is not None
+
+
+def test_qa1_comment_strip_linear():
+    t = time.time()
+    patterns.agent_exec_key_hit("/*" * 200000)
+    patterns.agent_exec_key_hit("//" * 200000 + "\\u0041" * 50000)
+    assert time.time() - t < 1.0
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat /tmp/x | sponge .cursor/hooks.json",
+    "[IO.File]::WriteAllText('.cursor/hooks.json','x')",
+    "New-Item -Force .github/hooks/x.json",
+])
+def test_qa1_more_writers(cmd):
+    assert _only(_shell(cmd)) is not None
+
+
+def test_qa1_over_scan_window_asks():
+    assert _only(_shell("echo " + "x" * 25000 + " > .cursor/hooks.json")) is not None

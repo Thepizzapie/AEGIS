@@ -6931,11 +6931,12 @@ def _ax(*parts: str) -> str:
 
 
 _AX_DEDICATED_CORE = (
-    r"(?:" + _ax(r"\.cursor", r"(?:(?:hooks|environment|cli|cli-config)\.json|hooks)")
+    r"(?:" + _ax(r"\.cursor", r"(?:(?:hooks|environment|cli|cli-config|worktrees)\.json|hooks)")
     + r"|" + _ax(r"\.windsurf", r"(?:hooks\.json|hooks)")
+    + r"|" + _ax(r"\.codeium", r"windsurf", r"(?:hooks\.json|hooks)")
     + r"|" + _ax(r"\.github", r"hooks")
     + r"|" + _ax(r"\.copilot", r"mcp-config\.json")
-    + r"|" + _ax(r"\.kiro", r"(?:hooks|" + _ax(r"settings", r"mcp\.json") + r")")
+    + r"|" + _ax(r"\.kiro", r"(?:hooks|agents|" + _ax(r"settings", r"mcp\.json") + r")")
     + r"|" + _ax(r"\.amazonq", r"(?:mcp\.json|agents|cli-agents)")
     + r"|" + _ax(r"\.aws", r"amazonq")
     + r"|" + _ax(r"\.(?:roo|kilocode|trae|cursor-server)", r"mcp\.json")
@@ -6953,6 +6954,7 @@ _AX_MIXED_CORE = (
     r"(?:" + _ax(r"\.(?:gemini|qwen)", r"settings\.json")
     + r"|" + _ax(r"\.codex", r"config\.toml")
     + r"|" + _ax(r"\.zed", r"settings\.json")
+    + r"|" + _ax(r"\.config", r"zed", r"settings\.json")            # Zed global config
     + r"|" + _ax(r"\.continue", r"config\.(?:ya?ml|json)")
     + r"|" + _ax(r"\.copilot", r"config\.json")
     + r"|" + _ax(r"\.(?:amp|augment|factory)", r"settings\.json")
@@ -6971,7 +6973,8 @@ AGENT_EXEC_PARENT_DIR_RE = re.compile(
     _AX_B + r"(?:\.(?:cursor|windsurf|kiro|amazonq|roo|kilocode|continue|opencode|gemini|qwen"
     r"|codex|zed|junie|factory|openhands|amp|augment|copilot|clinerules|trae)"
     r"|" + _ax(r"\.github", r"hooks") + r"|" + _ax(r"\.aws", r"amazonq")
-    + r"|" + _ax(r"\.config", r"(?:opencode|amp|goose)") + r")" + _AX_E,
+    + r"|" + _ax(r"\.config", r"(?:opencode|amp|goose|zed)")
+    + r"|" + _ax(r"\.codeium", r"windsurf") + r")" + _AX_E,
     re.IGNORECASE)
 # Basenames that are a target when the command (or cwd) is inside a parent dir.
 AGENT_EXEC_BARE_NAME_RE = re.compile(
@@ -6985,7 +6988,8 @@ AGENT_EXEC_BARE_NAME_RE = re.compile(
 _AX_KEYS = (
     r"mcpServers|mcp_servers|mcp|context_servers|hooks?|notify|discoveryCommand|callCommand"
     r"|command|cmd|args|plugins?|extensions|lsp|formatter|binary|env"
-    r"|approval_policy|approvalMode|ask_for_approval|sandbox_mode|sandbox|autoAccept|yolo"
+    r"|approval_policy|\w{0,30}approval_?mode|ask_for_approval|sandbox\w{0,30}|autoAccept|yolo"
+    r"|writable_roots|network_access|trust_level|projects|program|node|shell"
     r"|dangerously[A-Za-z_]*|always_allow[A-Za-z_]*|allowlist|allowList|allowed|allowedTools"
     r"|trusted_folders|trustedFolders|folderTrust|trust|permissions?|tools"
     r"|shell_environment_policy|experimental_instructions_file|model_providers")
@@ -7003,6 +7007,46 @@ AGENT_EXEC_CLI_RE = re.compile(
     r"|(?:^|[;&|\n(]\s*)(?:sudo\s+)?q\s+mcp\s+(?:add|import)\b"
     r"|\b(?:gemini|qwen)\b[^|;&\n]{0,200}\bextensions?\s+(?:install|link|update|new)\b",
     re.IGNORECASE)
+
+
+_AX_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_AX_LINE_COMMENT_RE = re.compile(r"//[^\n]*|(?m:^[ \t]*#[^\n]*)")
+
+
+def _ax_strip_comments(t: str) -> str:
+    """Drop `/* */` blocks (linear: one forward pass with str.find) and `//`/
+    `#` line comments."""
+    out, i = [], 0
+    while True:
+        j = t.find("/*", i)
+        if j < 0:
+            out.append(t[i:])
+            break
+        out.append(t[i:j])
+        k = t.find("*/", j + 2)
+        if k < 0:
+            break
+        out.append(" ")
+        i = k + 2
+    return _AX_LINE_COMMENT_RE.sub(" ", "".join(out))
+_AX_QUOTE_RE = re.compile(r"[\"']")
+
+
+def agent_exec_key_hit(text: str) -> bool:
+    """An exec/approval key in mixed-settings text -- also after decoding JSON
+    `\\uXXXX` escapes, dropping JSONC/YAML/TOML comments and dropping key
+    quotes (TOML `"notify" = ...`, `["mcp_servers".x]`): every form a config
+    parser reads as the same key."""
+    if AGENT_EXEC_CONFIG_KEY_RE.search(text):
+        return True
+    t = _AX_UESC_RE.sub(lambda m: chr(int(m.group(1), 16)), text) if "\\u" in text else text
+    unq = _AX_QUOTE_RE.sub("", t)
+    if AGENT_EXEC_CONFIG_KEY_RE.search(t) or AGENT_EXEC_CONFIG_KEY_RE.search(unq):
+        return True
+    if "/" in t or "#" in t:
+        if AGENT_EXEC_CONFIG_KEY_RE.search(_AX_QUOTE_RE.sub("", _ax_strip_comments(t))):
+            return True
+    return False
 
 
 def agent_exec_path_hit(text: str) -> str:

@@ -12907,7 +12907,9 @@ _AXC_DISK_MAX = 262_144
 _AXC_GIT_WRITE_RE = re.compile(
     r"\bgit\b[^|;&\n]{0,200}\b(?:checkout|restore|apply|am|cherry-pick|merge|pull|stash\s+(?:pop|apply)"
     r"|reset\s+--hard|read-tree|checkout-index|worktree\s+add)\b"
-    r"|\bpatch\b|\b(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl)\b|\btouch\b|\btruncate\b",
+    r"|\bpatch\b|\b(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl)\b|\btouch\b|\btruncate\b"
+    r"|\bsponge\b|\b(?:Write|Append)All(?:Text|Bytes|Lines)\b|\[(?:System\.)?IO\.File\]::\w+"
+    r"|\b(?:New-Item|ni|Copy-Item|Move-Item)\b",
     re.IGNORECASE)
 # Something that can carry a target from one simple command into another.
 _AXC_JOINED_RE = re.compile(r"<<|\bxargs\b|\bfor\s|\bwhile\s|\$\(|`|<\(|\bparallel\b", re.IGNORECASE)
@@ -12943,10 +12945,11 @@ def _agent_exec_classify(ev: Event, p: str):
         return "", ""
     if re.match(r"^[a-z][a-z0-9+.-]*://", p, re.IGNORECASE) and not p.lower().startswith("file://"):
         return "", ""
-    for form in _agent_rules_path_forms(ev, p):
+    forms = _agent_rules_path_forms(ev, p)
+    for form in forms:
         kind = patterns.agent_exec_path_hit(form) if form else ""
         if kind:
-            return kind, form
+            return kind, forms
     return "", ""
 
 
@@ -12969,15 +12972,23 @@ def _agent_exec_target(ev: Event):
         spent += len(c)
         if spent > 262144:
             break
-        kind, form = _agent_exec_classify(ev, c)
+        kind, forms = _agent_exec_classify(ev, c)
         if kind:
-            return c, kind, form
-    return "", "", ""
+            return c, kind, forms
+    return "", "", []
 
 
-def _agent_exec_disk_has_key(form: str) -> bool:
+def _agent_exec_disk_has_key(forms) -> bool:
     """The mixed settings file as it is on disk already defines an exec/
-    approval key (bounded, regular files only, never blocks)."""
+    approval key (bounded, regular files only, never blocks). Tries every
+    absolute form of the path (cwd-anchored, symlink-resolved)."""
+    for form in dict.fromkeys(f for f in forms if f):
+        if _agent_exec_disk_one(form):
+            return True
+    return False
+
+
+def _agent_exec_disk_one(form: str) -> bool:
     try:
         if not form.startswith("/") or form.startswith("//") or form.startswith(("/proc/", "/sys/", "/dev/")):
             return False
@@ -12995,17 +13006,19 @@ def _agent_exec_disk_has_key(form: str) -> bool:
             os.close(fd)
         except Exception:
             pass
-    return bool(patterns.AGENT_EXEC_CONFIG_KEY_RE.search(data.decode("utf-8", "replace")))
+    return patterns.agent_exec_key_hit(data.decode("utf-8", "replace"))
 
 
-def _agent_exec_mixed_relevant(ev: Event, form: str) -> bool:
+def _agent_exec_mixed_relevant(ev: Event, forms) -> bool:
     """A MIXED settings-file write counts when the new text, the text it
     replaces, or the file already on disk carries an exec/approval key. A
     tool call with no recognizable content field (an MCP move/copy, a
     notebook-style edit) counts too -- the safe direction."""
     a = ev.args or {}
     texts = [x for x in _flatten_strings(a) if isinstance(x, str)]
-    if any(patterns.AGENT_EXEC_CONFIG_KEY_RE.search(t) for t in texts if len(t) <= 2_000_000):
+    if any(len(t) > 2_000_000 for t in texts):
+        return True                      # too large to scan: the safe direction
+    if any(patterns.agent_exec_key_hit(t) for t in texts):
         return True
     has_content = any(k in a for k in ("content", "new_string", "old_string", "edits", "text",
                                        "newText", "oldText", "new_str", "old_str", "data", "contents"))
@@ -13013,7 +13026,7 @@ def _agent_exec_mixed_relevant(ev: Event, form: str) -> bool:
         return True
     if ev.action == ActionClass.WRITE:
         return False                     # whole-file replacement: the new text is all there is
-    return _agent_exec_disk_has_key(form)
+    return _agent_exec_disk_has_key(forms)
 
 
 def _agent_exec_inside_parent(ev: Event, cmd: str) -> bool:
@@ -13045,6 +13058,8 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
                        r"(?:\s-[Cdt]|--(?:directory|target-directory)=?)\s*['\"]?\S*"
                        + r"(?:\.(?:cursor|windsurf|kiro|amazonq|opencode|gemini|qwen|codex|github))",
                        clause, re.IGNORECASE))
+    if len(hits) > 64:
+        return True                      # pathological: bounded work, the safe direction
     for m in hits:
         # start of the whole operand the match sits in (`/r/.cursor/hooks.json`)
         s = m.start() + (1 if clause[m.start():m.start() + 1] in " \t'\"/\\=" else 0)
@@ -13196,7 +13211,7 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
               "AEGIS_ALLOW_AGENT_EXEC_CONFIG=1 after review -- a spawned agent cannot.")
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
-        target, kind, form = _agent_exec_target(ev)
+        target, kind, forms = _agent_exec_target(ev)
         if not target:
             return None
         if os.environ.get("AEGIS_ALLOW_AGENT_EXEC_CONFIG"):
@@ -13205,9 +13220,9 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
             op = re.sub(r"^git[_-]", "", str(ev.tool or "").split("__")[-1], flags=re.IGNORECASE)
             if _AGENT_RULES_READ_TOOL_RE.match(op) and not _AGENT_RULES_WRITE_WORD_RE.search(op):
                 return None
-        if kind == "mixed" and not _agent_exec_mixed_relevant(ev, form):
+        if kind == "mixed" and not _agent_exec_mixed_relevant(ev, forms):
             return None
-        if _agent_exec_allowed_by_policy(cfg, [target, form]):
+        if _agent_exec_allowed_by_policy(cfg, [target] + [f for f in forms if f]):
             return None
         what = ("an exec/approval setting in agent config" if kind == "mixed"
                 else "agent exec config")
@@ -13215,9 +13230,16 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
                                 f"Writing {what} '{target}' -- {why}. {remedy}"))
 
     if _is_shell(ev):
-        cmd = normalize.scan_surface(_cmd(ev), sep="\n")
+        raw = _cmd(ev)
+        cmd = normalize.scan_surface(raw, sep="\n")
         cli = bool(patterns.AGENT_EXEC_CLI_RE.search(cmd))
         kind = "" if cli else _agent_exec_shell_hit(ev, cmd)
+        if not (cli or kind) and len(raw) > normalize._MAX and (
+                patterns.agent_exec_path_hit(raw[:2_000_000])
+                or patterns.AGENT_EXEC_PARENT_DIR_RE.search(raw[:2_000_000])):
+            # past the shared scan window: the write can sit beyond what the
+            # clause scan sees, so naming a target at all is enough
+            kind = "dedicated"
         if not (cli or kind):
             return None
         if _override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_EXEC_CONFIG"):
