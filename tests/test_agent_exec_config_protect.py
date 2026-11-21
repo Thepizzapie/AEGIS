@@ -689,3 +689,43 @@ def test_qa3_write_forms(cmd):
 ])
 def test_qa3_reads_silent(cmd):
     assert _only(_shell(cmd)) is None, cmd
+
+
+# ---- QA round 4 regressions -----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "echo .cursor; " + "node -e x " * 1990,
+    "cat evil > .cursor/hooks.json # " + "node -e x " * 1000,
+    "node -e '" + "a" * 19000 + "' .cursor/hooks.json",
+    "python3 -c " + "'x' " * 5000,
+])
+def test_qa4_interp_bounded(cmd):
+    t = time.time()
+    _only(_shell(cmd))
+    assert time.time() - t < 0.5
+
+
+@pytest.mark.parametrize("cmd", [
+    "python3 - <<'EOF2'\nopen('.cursor/hooks.json','w').write('x')\nEOF2",
+    "echo \"open('.cursor/hooks.json','w').write('x')\" | python3",
+    "printf '%s' \"require('fs').writeFileSync('.cursor/hooks.json','x')\" | node",
+    "cat evil >.cursor/hooks.json",
+    "echo x>.cursor/hooks.json",
+    "cat evil >.opencode/plugin/x.ts",
+    "echo x 1>.cursor/hooks.json",
+    "echo x &>.cursor/hooks.json",
+    "cat evil >|.opencode/plugin/x.ts",
+    "cat evil >| .opencode/plugin/x.ts",
+    "cat evil > .cursor/hooks.json # " + "node -e x " * 1000,
+])
+def test_qa4_write_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat .cursor/hooks.json && python3 -c 'import subprocess'",
+    "grep 'spawn(' .opencode/plugin/x.ts && node -e 'console.log(1)'",
+    "cat .cursor/hooks.json 2>&1 | head",
+    "cat .cursor/hooks.json | python3 -m json.tool",
+])
+def test_qa4_reads_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd

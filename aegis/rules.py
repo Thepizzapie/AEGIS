@@ -12935,7 +12935,8 @@ _AXC_CHDIR_RE = re.compile(
     r"(?:\b(?:cd|pushd|chdir|Set-Location)|(?-i:\s-C)|--(?:directory|work-tree|prefix))[ \t=]{1,8}"
     r"(?:--[ \t]{1,8})?(?:\"([^\"\n]{1,1024})\"|'([^'\n]{1,1024})'|(\S{1,1024}))",
     re.IGNORECASE)
-_AXC_CLAUSE_RE = re.compile(r"[|;&\n]")
+# `>|` (noclobber override) and `&>` are redirects, not separators (QA round 4)
+_AXC_CLAUSE_RE = re.compile(r"(?<!>)\||(?<![>0-9])&(?!>)|[;\n]")
 # A redirect / tee / -o-style option whose operand is the target.
 _AXC_OUT_OP_RE = re.compile(
     r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)(?-i:-[oOtdC])|--(?:output|target-directory"
@@ -13151,11 +13152,59 @@ _AXC_INTERP_CODE_RE = re.compile(
     re.IGNORECASE)
 
 
-def _agent_exec_interp_write(noise: str, names_re) -> bool:
-    for m in _AXC_INTERP_CODE_RE.finditer(noise[:200_000]):
-        code = noise[m.end():m.end() + 20_000]
-        if _AXC_INTERP_WRITE_RE.search(code) and names_re.search(code):
+def _agent_exec_code_arg(text: str, pos: int) -> str:
+    """The single shell argument starting at ``pos`` (after blanks): a quoted
+    string up to its closing quote (backslash-escaped quotes skipped inside
+    double quotes; an unterminated one runs to the end of the line), else one
+    bare token. Bounded: never more than 20,000 characters."""
+    n = len(text)
+    while pos < n and text[pos] in " \t":
+        pos += 1
+    if pos >= n:
+        return ""
+    q = text[pos]
+    if q in "'\"":
+        k = pos + 1
+        end = min(n, pos + 20_000)
+        while k < end:
+            c = text[k]
+            if c == "\\" and q == '"':
+                k += 2
+                continue
+            if c == q or c == "\n":
+                break
+            k += 1
+        return text[pos + 1:k]
+    m = re.match(r"\S{1,20000}", text[pos:pos + 20_000])
+    return m.group(0) if m else ""
+
+
+# An interpreter reading its program from stdin: `python3 - <<EOF`, `| node`.
+_AX_INTERP_WORD = (r"(?:sudo\s+|env\s+(?:\w+=\S*\s+)*)?(?:\S{0,200}/)?"
+                   r"(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell)")
+_AXC_INTERP_STDIN_RE = re.compile(
+    r"\|\s*" + _AX_INTERP_WORD + r"(?:\s+-[\w-]{0,20}){0,8}\s*(?=$|[|;&\n)])"      # ... | python3
+    r"|(?:^|[;&\n(]\s*)" + _AX_INTERP_WORD + r"(?:\s+-[\w-]{0,20}){0,8}\s*<"       # python3 <<EOF / < f
+    r"|(?:^|[|;&\n(]\s*)" + _AX_INTERP_WORD + r"(?:\s+-[\w-]{1,20}){0,8}\s+-(?=\s|$)",  # python3 -
+    re.IGNORECASE)
+
+
+def _agent_exec_interp_write(raw: str, noise: str, names_re) -> bool:
+    """An interpreter's own inline code (its ``-c``/``-e`` argument), or a
+    program it reads from stdin (heredoc / pipe), both names a target and
+    calls a write API. Bounded work: at most 64 interpreter occurrences, each
+    scanning one argument (QA round 4: a 20 KB window per match was quadratic
+    and ran into the next rendering of the command)."""
+    for idx, m in enumerate(_AXC_INTERP_CODE_RE.finditer(noise[:200_000])):
+        if idx >= 64:
+            return bool(names_re.search(noise))       # pathological: the safe direction
+        code = _agent_exec_code_arg(noise, m.end())
+        if code and _AXC_INTERP_WRITE_RE.search(code) and names_re.search(code):
             return True
+    head = raw[:normalize._MAX]
+    if _AXC_INTERP_STDIN_RE.search(head) and _AXC_INTERP_WRITE_RE.search(head) \
+            and names_re.search(head):
+        return True
     return False
 
 
@@ -13195,7 +13244,7 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
         return True                      # pathological: bounded work, the safe direction
     for m in hits:
         # start of the whole operand the match sits in (`/r/.cursor/hooks.json`)
-        s = m.start() + (1 if clause[m.start():m.start() + 1] in " \t'\"/\\=" else 0)
+        s = m.start() + (1 if clause[m.start():m.start() + 1] in " \t'\"/\\=<>(:,;&|" else 0)
         while s > 0 and clause[s - 1] not in " \t<>|;&=":
             s -= 1
         # `> path`, `>>path`, `tee -a path`, `-o path`, `--output=path`, `of=path`
@@ -13254,7 +13303,7 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     # An interpreter one-liner's own code may contain `;` (split into clauses
     # below), so test it against the whole command.
     for names_re in names:
-        if _agent_exec_interp_write(noise, names_re):
+        if _agent_exec_interp_write(_cmd(ev), noise, names_re):
             return kind or "dedicated"
         if joined and names_re.search(noise) and (
                 patterns.WRITE_REDIRECT_RE.search(noise) or patterns.COPY_WRITE_VERB_RE.search(noise)
