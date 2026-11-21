@@ -13016,11 +13016,17 @@ def _agent_exec_target(ev: Event):
     if ev.action == ActionClass.MCP:
         # a move/copy whose DESTINATION is a whole agent config directory
         # (`move_file /tmp/t/.codex -> ~/.codex`) -- QA round 10
+        srcs = [v for k, v in list(args.items())[:256]
+                if isinstance(k, str) and isinstance(v, str) and len(v) <= 4096
+                and re.search(r"src|source|^from$|^old|origin", k, re.IGNORECASE)]
         for k, v in list(args.items())[:256]:
             if (isinstance(k, str) and isinstance(v, str) and len(v) <= 4096
-                    and re.search(r"dest|target|^to$|^new|output", k, re.IGNORECASE)):
+                    and re.search(r"dest|dst|target|^to$|^new|output|^out$", k, re.IGNORECASE)):
                 for form in _agent_rules_path_forms(ev, v):
                     if form and patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(form):
+                        return v, "dedicated", [form]
+                    if form and _agent_exec_place_dest_ok(ev, form) and any(
+                            _agent_exec_effective_hit(form, src) for src in srcs[:16]):
                         return v, "dedicated", [form]
     return "", "", []
 
@@ -13387,41 +13393,68 @@ _AXC_HOME_DEST_RE = re.compile(
     r"^(?:\.|~|\$\{?HOME\}?|/root|/home/[^/\s]{1,64}|/Users/[^/\s]{1,64}|[A-Za-z]:\\Users\\[^\\\s]{1,64})[/\\]*$")
 
 
+def _agent_exec_place_dest_ok(ev: Event, dest: str) -> bool:
+    """A copy destination that someone's agent will load from: the home dir,
+    the cwd, a relative path, or an absolute path under the cwd -- not /tmp
+    or a backup location elsewhere."""
+    d = dest.rstrip("/\\") or "/"
+    if _AXC_HOME_DEST_RE.match(d) or re.match(r"^(?:~|\$\{?HOME\}?)[/\\]", d):
+        return True
+    if not d.startswith(("/", "\\")) and not re.match(r"^[A-Za-z]:", d):
+        return not d.startswith("..")
+    cwd = str(ev.cwd or "").rstrip("/\\")
+    return bool(cwd and cwd not in ("/", "/tmp") and (d == cwd or d.startswith(cwd + "/")))
+
+
+def _agent_exec_effective_hit(dest: str, src: str) -> bool:
+    """`dest/basename(src)` (a copy INTO a directory), or dest itself, names an
+    agent config dir or a dedicated path."""
+    for eff in (dest.rstrip("/\\") + "/" + re.split(r"[/\\]", src.rstrip("/\\"))[-1], dest):
+        e = re.sub(r"^(?:~|\$\{?HOME\}?)(?=[/\\]|$)", "/home/_h", eff)
+        if patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(e) or \
+                patterns.AGENT_EXEC_DEDICATED_RE.search(" " + e + " "):
+            return True
+    return False
+
+
 def _agent_exec_copy_dir_into_place(ev: Event, clause: str) -> bool:
-    """`cp -r /tmp/t/.codex ~/`, `mv /tmp/x/.gemini .`, `cp -a /tmp/e/.github/hooks
-    .github/`: a copy/move whose SOURCE is a staged agent config directory
-    (with a directory prefix) and whose destination is the home dir, the
-    cwd, or the directory that holds that config dir (QA round 10)."""
+    """A copy/move/link whose effective destination -- ``dest/basename(src)``
+    -- is an agent config dir or dedicated path, where dest is the home dir,
+    the cwd or inside it: `cp -r .codex ~/`, `cp -r /tmp/t/.gemini/extensions
+    ~/.gemini`, `cp /tmp/x/hooks.json .cursor/` (QA rounds 10-11)."""
     if not _AXC_COPY_CMD_RE.search(clause):
         return False
     try:
         toks = shlex.split(clause, posix=True)
     except Exception:
         return False
-    ops = [t for t in toks if not t.startswith("-")]
-    idx = next((i for i, t in enumerate(ops)
+    idx = next((i for i, t in enumerate(toks)
                 if re.fullmatch(r"(?:.*[/\\])?(?:cp|mv|ln|install|rsync|copy|move|copy-item"
                                 r"|move-item|cpi|mi|scp|ditto)", t, re.IGNORECASE)), None)
     if idx is None:
         return False
-    ops = ops[idx + 1:]
-    if len(ops) < 2:
+    toks = toks[idx + 1:idx + 1 + 256]
+    target_dir, ops, k = None, [], 0
+    while k < len(toks):
+        t = toks[k]
+        if t in ("-t", "--target-directory") and k + 1 < len(toks):
+            target_dir = toks[k + 1]
+            k += 2
+            continue
+        if t.startswith("--target-directory="):
+            target_dir = t.split("=", 1)[1]
+        elif not t.startswith("-"):
+            ops.append(t)
+        k += 1
+    if target_dir is not None:
+        dest, srcs = target_dir, ops
+    elif len(ops) >= 2:
+        dest, srcs = ops[-1], ops[:-1]
+    else:
         return False
-    dest = ops[-1].rstrip("/\\") or "/"
-    cwd = str(ev.cwd or "").rstrip("/\\")
-    for src in ops[:-1][:64]:
-        src = src.rstrip("/\\")
-        if "/" not in src and "\\" not in src:
-            continue
-        if not patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(src):
-            continue
-        holder = re.split(r"[/\\]", src)
-        holder_name = holder[-2] if len(holder) >= 2 else ""
-        if (_AXC_HOME_DEST_RE.match(dest) or (cwd and dest == cwd)
-                or (holder_name.startswith(".") and len(holder_name) > 1
-                    and re.split(r"[/\\]", dest)[-1] == holder_name)):
-            return True
-    return False
+    if not _agent_exec_place_dest_ok(ev, dest):
+        return False
+    return any(_agent_exec_effective_hit(dest, src) for src in srcs[:64])
 
 
 def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
@@ -13604,11 +13637,24 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
             # a shell-type MCP tool (`start_process`, `run_command`, ...):
             # judge its command string as a shell command (QA round 10)
             a = ev.args or {}
+            if isinstance(a.get("args"), dict) and not any(
+                    k in a for k in ("command", "cmd", "script")):
+                a = a["args"]                        # one level of nesting
             for key in ("command", "cmd", "script", "shell_command", "commandLine", "command_line"):
                 v = a.get(key)
+                if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+                    v = shlex.join(list(v)[:256])
+                    if re.match(r"^\S*(?:ba|z|da|k)?sh\s+-\w*c\s", v):
+                        try:
+                            v = shlex.split(v)[2] if len(shlex.split(v)) > 2 else v
+                        except Exception:
+                            pass
                 if isinstance(v, str) and v.strip():
+                    wd = next((a.get(x) for x in ("cwd", "workdir", "working_directory",
+                                                  "workingDirectory", "dir", "directory")
+                               if isinstance(a.get(x), str) and a.get(x)), None)
                     sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": v},
-                                     cwd=a.get("cwd") or a.get("workdir") or ev.cwd)
+                                     cwd=wd or ev.cwd)
                     d = rule_agent_exec_config_protect(sub, policy)
                     if d is not None:
                         return Decision(d.action, d.rule,

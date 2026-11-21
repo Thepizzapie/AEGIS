@@ -947,3 +947,44 @@ def test_qa10_shell_mcp_tool():
     d = _only(ev)
     assert d is not None and d.action == Action.ASK
     assert _only(_ev("mcp__desktop-commander__start_process", command="ls -la")) is None
+
+
+# ---- QA round 11 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cd /tmp/t && cp -r .codex ~/", "/repo"),
+    ("cp -r .codex ~", "/tmp/t"),
+    ("cp -r /tmp/t/.gemini/extensions ~/.gemini", "/repo"),
+    ("cp /tmp/t/.cursor/hooks.json .cursor/", "/repo"),
+    ("cp -r /tmp/t/.opencode/plugin .opencode/", "/repo"),
+    ("cp -r /tmp/t/extensions ~/.gemini", "/repo"),
+    ("cp -rt ~ /tmp/t/.codex", "/repo"),
+    ("rsync -a /tmp/t/.codex/ ~/.codex/", "/repo"),
+    ("cp -r /tmp/t/.codex /repo", "/repo"),
+])
+def test_qa11_copy_into_place(cmd, cwd):
+    assert _only(_shell(cmd, cwd=cwd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp -r ~/.gemini /tmp",
+    "cp -r ~/.codex /tmp/backup/",
+    "cp -r .cursor /tmp/cursor-bak",
+    "mv build ~",
+    "cp -r /tmp/t/.git .",
+])
+def test_qa11_copy_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd
+
+
+def test_qa11_mcp_dst_and_into_home():
+    assert _only(_ev("mcp__fs__move_file", src="/tmp/t/.codex", dst="/home/u/.codex")) is not None
+    assert _only(_ev("mcp__fs__move_file", source="/tmp/t/.codex", destination="~",
+                     cwd="/repo")) is not None
+    assert _only(_ev("mcp__fs__move_file", source="/repo/a/.gemini", destination="/tmp/x")) is None
+
+
+def test_qa11_shell_mcp_shapes():
+    assert _only(_ev("mcp__x__run", command=["bash", "-c", "echo x > .cursor/hooks.json"])) is not None
+    assert _only(_ev("mcp__x__run", args={"command": "echo x > .cursor/hooks.json"})) is not None
+    assert _only(_ev("mcp__x__run", command="echo x > hooks.json",
+                     working_directory="/repo/.cursor")) is not None
