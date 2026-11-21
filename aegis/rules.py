@@ -12938,6 +12938,8 @@ _AXC_CHDIR_RE = re.compile(
     r"(?:--[ \t]{1,8})?(?:\"([^\"\n]{1,1024})\"|'([^'\n]{1,1024})'|(\S{1,1024}))",
     re.IGNORECASE)
 # `>|` (noclobber override) and `&>` are redirects, not separators (QA round 4)
+# clause splitter that keeps each separator (`&&` distinct from `;`/`|`/`&`)
+_AXC_SEP_KEEP_RE = re.compile(r"(&&|\|\||\|&|(?<!>)\||(?<!>)&(?!>)|;|\n)")
 _AXC_CLAUSE_RE = re.compile(r"(?<!>)\||(?<!>)&(?!>)|[;\n]")
 # A redirect / tee / -o-style option whose operand is the target.
 _AXC_OUT_OP_RE = re.compile(
@@ -13397,18 +13399,29 @@ _AXC_HOME_ROOT_RE = re.compile(
     r"^(?:/home/_h|/root|/home/[^/\\\s]{1,64}|/Users/[^/\\\s]{1,64}|[A-Za-z]:\\Users\\[^\\\s]{1,64})$")
 
 
+def _agent_exec_abs_parts(ev: Event, dest: str) -> list:
+    """Normalized components of dest, joined onto the cwd when relative."""
+    parts = _agent_exec_norm_path(dest)
+    if (not parts or parts[0] != "/") and ev.cwd and str(ev.cwd).startswith("/"):
+        parts = _agent_exec_norm_path(str(ev.cwd).rstrip("/") + "/" + dest)
+    return parts
+
+
 def _agent_exec_place_dest_ok(ev: Event, dest: str) -> bool:
-    """A copy destination that someone's agent will load from: the home dir,
-    the cwd, a relative path, or an absolute path under the cwd -- not /tmp
-    or a backup location elsewhere."""
-    d = dest.rstrip("/\\") or "/"
-    if _AXC_HOME_DEST_RE.match(d) or re.match(r"^(?:~|\$\{?HOME\}?)[/\\]", d) or \
-            re.match(r"^(?:/root|/home/[^/\s]{1,64}|/Users/[^/\s]{1,64})/", d):
+    """A copy destination that someone's agent will load from: under the home
+    dir, the cwd, or a relative path -- not /tmp or a backup location
+    elsewhere. Judged on normalized components (QA round 14: `//home/u`,
+    `/../root`, `../`)."""
+    parts = _agent_exec_abs_parts(ev, dest)
+    if not parts:
         return True
-    if not d.startswith(("/", "\\")) and not re.match(r"^[A-Za-z]:", d):
-        return not d.startswith("..")
-    cwd = str(ev.cwd or "").rstrip("/\\")
-    return bool(cwd and cwd not in ("/", "/tmp") and (d == cwd or d.startswith(cwd + "/")))
+    if parts[0] != "/":
+        return parts[0] != ".."
+    real = parts[1:]
+    if real[:1] == ["root"] or (len(real) >= 2 and real[0] in ("home", "Users")):
+        return True
+    cwd = _agent_exec_norm_path(str(ev.cwd)) if ev.cwd else []
+    return bool(cwd and len(cwd) > 1 and cwd[1:2] != ["tmp"] and parts[:len(cwd)] == cwd)
 
 
 _AXC_CONFIG_DIR_NAMES = frozenset((
@@ -13424,6 +13437,7 @@ def _agent_exec_norm_path(p: str) -> list:
     """Path components, with `~`/$HOME as /home/_h, `.` and empty parts dropped
     and `..` applied -- bounded, no regex backtracking (QA round 13)."""
     p = re.sub(r"^(?:~|\$\{?HOME\}?)(?=[/\\]|$)", "/home/_h", p[:4096])
+    p = re.sub(r"^~([\w.-]{1,64})(?=[/\\]|$)", r"/home/\1", p)
     absolute = p.startswith(("/", "\\"))
     out = []
     for c in re.split(r"[/\\]+", p)[:512]:
@@ -13433,6 +13447,8 @@ def _agent_exec_norm_path(p: str) -> list:
         if c == ".." and out and out[-1] != "..":
             out.pop()
             continue
+        if c == ".." and not out and absolute:
+            continue                                      # `/..` is `/`
         out.append(c)
     return (["/"] if absolute else []) + out
 
@@ -13528,6 +13544,9 @@ def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base: str = "") -> b
         return False
     if base and not dest.startswith(("/", "~", "$", "\\")) and not re.match(r"^[A-Za-z]:", dest):
         dest = base.rstrip("/") + "/" + dest
+    absd = _agent_exec_abs_parts(ev, dest)
+    if absd and absd[0] == "/":
+        dest = "/" + "/".join(absd[1:])
     if not _agent_exec_place_dest_ok(ev, dest):
         return False
     names = list(dict.fromkeys(_agent_exec_norm_path(x)[-1] if _agent_exec_norm_path(x) else ""
@@ -13558,23 +13577,32 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     # must not depend on a config-dir NAME appearing in the command text)
     if _AXC_COPY_CMD_RE.search(noise) or re.search(r"\bclone\b", noise):
         for rendering in noise[:200_000].split("\n")[:64]:
-            base = ""                    # the `cd` in effect BEFORE each clause (QA round 13)
-            for clause in _AXC_CLAUSE_RE.split(rendering)[:4096]:
-                cdm = re.match(r"^\s*[({]?\s*(?:cd|pushd|chdir)\s+(?:--\s+)?(\S{1,1024})\s*[)}]?\s*$",
+            # every `cd` base that MAY be in effect before each clause: a cd
+            # replaces the bases only when chained with `&&` outside a
+            # subshell; after `;`/`||`/`|`/`&`, or in `( )`, it may not have
+            # happened, so the old bases stay too (QA round 14)
+            bases = [""]
+            pieces = _AXC_SEP_KEEP_RE.split(rendering)[:8192]
+            for pi in range(0, len(pieces), 2):
+                clause = pieces[pi]
+                sep = pieces[pi + 1] if pi + 1 < len(pieces) else ""
+                cdm = re.match(r"^\s*([({]?)\s*(?:cd|pushd|chdir)(?:\s+(?:--\s+)?(\S{1,1024}))?\s*[)}]?\s*$",
                                clause)
                 if cdm:
-                    d = cdm.group(1).strip("'\"")
-                    if d == "-":
-                        base = ""
-                    elif d.startswith(("/", "~", "$")):
-                        base = d
+                    d = (cdm.group(2) or "").strip("'\"")
+                    new = []
+                    for b in bases:
+                        if d in ("", "-", "~") or d.startswith(("/", "~", "$")):
+                            new.append("" if d in ("", "-") else d)
+                        else:
+                            root = b or str(ev.cwd or "")
+                            new.append((root.rstrip("/") + "/" + d) if root else d)
+                    if sep == "&&" and not cdm.group(1):
+                        bases = list(dict.fromkeys(new))[:16]
                     else:
-                        base = ((base or str(ev.cwd or "")).rstrip("/") + "/" + d) if (base or ev.cwd) else d
+                        bases = list(dict.fromkeys(bases + new))[:16]
                     continue
-                if re.match(r"^\s*(?:cd|pushd|popd)\s*$", clause):
-                    base = ""
-                    continue
-                if _agent_exec_copy_dir_into_place(ev, clause, base):
+                if any(_agent_exec_copy_dir_into_place(ev, clause, b) for b in bases):
                     return kind or "dedicated"
     if not kind and not inside and not patterns.AGENT_EXEC_PARENT_DIR_RE.search(noise):
         return ""

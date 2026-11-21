@@ -1062,3 +1062,50 @@ def test_qa13_clone_cd_forms(cmd, cwd):
 ])
 def test_qa13_silent(cmd, cwd):
     assert _only(_shell(cmd, cwd=cwd)) is None, cmd
+
+
+# ---- QA round 14 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cd /zzz; cp -r /tmp/p/.codex .",
+    "(cd /tmp); cp -r /tmp/p/.codex .",
+    "cd /tmp | true; cp -r /tmp/p/.codex .",
+    "cd /tmp & cp -r /tmp/p/.codex .",
+    "false && cd /tmp; cp -r /tmp/p/.codex .",
+    "cd /tmp || true; cp -r /tmp/p/.codex .",
+    "cd /zzz; rsync -a /tmp/p/.gemini .",
+    "cd /zzz; ln -s /tmp/p/.gemini .",
+])
+def test_qa14_cd_not_trusted(cmd):
+    assert _only(_shell(cmd, cwd="/repo")) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cp -r /tmp/p/.codex /home//user/proj", "/home/user/proj"),
+    ("cp -r /tmp/p/.codex //home/user/proj/", "/home/user/proj"),
+    ("cp -r /tmp/p/.codex /./home/user/", "/repo"),
+    ("cp -r /tmp/p/.codex /../home/user/proj/", "/home/user/proj"),
+    ("cp -r /tmp/p/.codex /../root/", "/repo"),
+    ("cp -r /tmp/p/.codex //root", "/repo"),
+    ("cp -r /tmp/p/.gemini ../", "/home/user/proj"),
+    ("cp -r /tmp/p/.gemini ../../user/", "/home/user/proj"),
+    ("cp -r /tmp/p/.gemini ~user/", "/repo"),
+])
+def test_qa14_dest_normalized(cmd, cwd):
+    assert _only(_shell(cmd, cwd=cwd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cd /tmp/work && cp -r /tmp/p/.codex .", "/repo"),
+    ("cp -r ~/.codex /tmp/bak", "/repo"),
+    ("cd build && cp -r out ../dist", "/repo"),
+    ("cp -r /tmp/p/.codex ../other", "/tmp/x"),
+])
+def test_qa14_silent(cmd, cwd):
+    assert _only(_shell(cmd, cwd=cwd)) is None, cmd
+
+
+def test_qa14_many_cd_bounded():
+    t = time.time()
+    _only(_shell(("cd a; " * 3000 + "cp -r /tmp/p/.codex .")[:20000], cwd="/repo"))
+    _only(_shell(("cd /x && " * 2000 + "cp -r /tmp/p/.codex .")[:20000], cwd="/repo"))
+    assert time.time() - t < 0.5
