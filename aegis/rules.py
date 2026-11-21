@@ -13189,7 +13189,18 @@ def _agent_exec_code_arg(text: str, pos: int) -> str:
 # An interpreter reading its program from stdin: `python3 - <<EOF`, `| node`.
 _AXC_INTERP_NAME_RE = re.compile(
     r"(?:python[0-9.]*|node|nodejs|deno|bun|ruby|perl|php|pwsh|powershell|osascript)", re.IGNORECASE)
-_AXC_STAGE_SPLIT_RE = re.compile(r"(\|\|?|&&?|;|\n)")
+_AXC_STAGE_SPLIT_RE = re.compile(r"(\|&|\|\|?|&&|(?<!>)&(?!>)|;|\n)")
+# Each interpreter's own inline-code flags (QA round 6: python's -E and
+# node/ruby's -r are not inline code).
+_AXC_INLINE_FLAGS = (
+    (re.compile(r"python[0-9.]*", re.I), re.compile(r"-[a-zA-Z]{0,6}c\S*")),
+    (re.compile(r"node|nodejs|deno|bun", re.I), re.compile(r"-[a-zA-Z]{0,6}[ep]\S*|--eval\S*|--print\S*")),
+    (re.compile(r"ruby", re.I), re.compile(r"-[a-zA-Z]{0,6}e\S*")),
+    (re.compile(r"perl", re.I), re.compile(r"-[a-zA-Z]{0,6}[eE]\S*")),
+    (re.compile(r"php", re.I), re.compile(r"-[a-zA-Z]{0,6}r\S*")),
+    (re.compile(r"pwsh|powershell", re.I), re.compile(r"-(?:c|Command|EncodedCommand|e)\b\S*", re.I)),
+    (re.compile(r"osascript", re.I), re.compile(r"-e\S*")),
+)
 
 
 def _agent_exec_stdin_interp(raw: str) -> bool:
@@ -13204,8 +13215,10 @@ def _agent_exec_stdin_interp(raw: str) -> bool:
             continue
         word, rest = _agent_exec_command_word(part)
         if word and _AXC_INTERP_NAME_RE.fullmatch(word):
-            inline = any(re.fullmatch(r"-[a-zA-Z]{0,4}[ceErp]|--eval|--print|-Command", t) for t in rest)
-            if not inline and (prev == "|" or "<" in part or "-" in rest or "/dev/stdin" in rest):
+            explicit = "-" in rest or "/dev/stdin" in rest
+            flags_re = next((f for w, f in _AXC_INLINE_FLAGS if w.fullmatch(word)), None)
+            inline = bool(flags_re and any(flags_re.fullmatch(t) for t in rest if t.startswith("-")))
+            if explicit or (not inline and (prev in ("|", "|&") or "<" in part)):
                 return True
         prev = ""
     return False

@@ -780,3 +780,28 @@ def test_qa5_mixed_content_newline_runs_linear():
     _only(_write("/r/.codex/config.toml", content="\n" * 20000 + "[mcp_servers.x]"))
     assert time.time() - t < 0.5
     assert _only(_write("/r/.codex/config.toml", content="\n" * 500 + "  [mcp_servers.x]")) is not None
+
+
+# ---- QA round 6 regressions -----------------------------------------------------
+_W = "open('.cursor/hooks.json','w').write('x')"
+
+
+@pytest.mark.parametrize("cmd", [
+    f'echo "{_W}" | python3 -E',
+    f"python3 -Ep - <<'EOF'\n{_W}\nEOF",
+    "node -r ts-node/register <<'EOF'\nrequire('fs').writeFileSync('.cursor/hooks.json','x')\nEOF",
+    "ruby -r json - <<'EOF'\nFile.write('.cursor/hooks.json','x')\nEOF",
+    f"python3 2>&1 <<'EOF'\n{_W}\nEOF",
+    f'echo "{_W}" |& python3',
+])
+def test_qa6_stdin_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat .cursor/hooks.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+    "cat .cursor/hooks.json | node -e 'process.stdin.pipe(process.stdout)'",
+    "cat .cursor/hooks.json | python3 -m json.tool",
+])
+def test_qa6_inline_reads_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd
