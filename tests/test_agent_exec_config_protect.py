@@ -1099,6 +1099,7 @@ def test_qa14_dest_normalized(cmd, cwd):
     ("cp -r ~/.codex /tmp/bak", "/repo"),
     ("cd build && cp -r out ../dist", "/repo"),
     ("cp -r /tmp/p/.codex ../other", "/tmp/x"),
+    ("cp -r ~/.codex /tmp", "/"),
 ])
 def test_qa14_silent(cmd, cwd):
     assert _only(_shell(cmd, cwd=cwd)) is None, cmd
@@ -1108,4 +1109,26 @@ def test_qa14_many_cd_bounded():
     t = time.time()
     _only(_shell(("cd a; " * 3000 + "cp -r /tmp/p/.codex .")[:20000], cwd="/repo"))
     _only(_shell(("cd /x && " * 2000 + "cp -r /tmp/p/.codex .")[:20000], cwd="/repo"))
+    assert time.time() - t < 0.5
+
+
+# ---- QA round 15 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cp -r /tmp/x/.codex .", "/tmp/work"),
+    ("cp -r /tmp/x/.codex ./", "/tmp/work"),
+    ("cp -r /tmp/x/.cursor .", "/tmp"),
+    ("cp -r /tmp/x/.opencode ./", "/"),
+    ("cd sub && cp -r /tmp/x/.codex ..", "/tmp/work"),
+])
+def test_qa15_tmp_and_root_cwd(cmd, cwd):
+    assert _only(_shell(cmd, cwd=cwd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "".join(f"cd d{i}; " for i in range(16)) + "cp a b; " * 2400,
+    "".join(f"cd d{i}; " for i in range(16)) + ("cp -t ~ " + "a " * 17 + "; ") * 450,
+])
+def test_qa15_multi_base_bounded(cmd):
+    t = time.time()
+    _only(_shell(cmd[:20000], cwd="/repo"))
     assert time.time() - t < 0.5

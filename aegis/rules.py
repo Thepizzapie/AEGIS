@@ -13420,8 +13420,10 @@ def _agent_exec_place_dest_ok(ev: Event, dest: str) -> bool:
     real = parts[1:]
     if real[:1] == ["root"] or (len(real) >= 2 and real[0] in ("home", "Users")):
         return True
+    # at or under the cwd -- whatever the cwd is, /tmp and / included: the
+    # project-root config dir is what the agent loads there (QA round 15)
     cwd = _agent_exec_norm_path(str(ev.cwd)) if ev.cwd else []
-    return bool(cwd and len(cwd) > 1 and cwd[1:2] != ["tmp"] and parts[:len(cwd)] == cwd)
+    return bool(cwd and parts[:len(cwd)] == cwd)
 
 
 _AXC_CONFIG_DIR_NAMES = frozenset((
@@ -13485,11 +13487,14 @@ def _agent_exec_effective_hit(dest: str, src: str, cwd: str = "") -> bool:
     return False
 
 
-def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base: str = "") -> bool:
+def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base="") -> bool:
     """A copy/move/link whose effective destination -- ``dest/basename(src)``
     -- is an agent config dir or dedicated path, where dest is the home dir,
     the cwd or inside it: `cp -r .codex ~/`, `cp -r /tmp/t/.gemini/extensions
-    ~/.gemini`, `cp /tmp/x/hooks.json .cursor/` (QA rounds 10-11)."""
+    ~/.gemini`, `cp /tmp/x/hooks.json .cursor/` (QA rounds 10-11). ``base`` is
+    one cd base or a list of them; the clause is parsed once for all (QA
+    round 15)."""
+    bases = list(base) if isinstance(base, (list, tuple)) else [base]
     clause = re.sub(r"\$\(|[()`]", " ", clause)       # `(cp ...)`, `$(cp ...)` (QA round 12)
     clone = re.search(r"\bgit\b[^|;&\n]{0,200}\sclone\b", clause, re.IGNORECASE)
     if not (_AXC_COPY_CMD_RE.search(clause) or clone):
@@ -13514,10 +13519,14 @@ def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base: str = "") -> b
         if not ops:
             return False
         dest = ops[1] if len(ops) > 1 else re.sub(r"\.git$", "", ops[0].rstrip("/").rsplit("/", 1)[-1])
-        if not dest.startswith(("/", "~", "$")):
-            root = base or str(ev.cwd or "")
-            dest = (root.rstrip("/") + "/" + dest) if root else dest
-        return _agent_exec_place_dest_ok(ev, dest) and _agent_exec_effective_hit(dest, "", str(ev.cwd or ""))
+        for b in bases:
+            d = dest
+            if not d.startswith(("/", "~", "$")):
+                root = b or str(ev.cwd or "")
+                d = (root.rstrip("/") + "/" + d) if root else d
+            if _agent_exec_place_dest_ok(ev, d) and _agent_exec_effective_hit(d, "", str(ev.cwd or "")):
+                return True
+        return False
     idx = next((i for i, t in enumerate(toks)
                 if re.fullmatch(r"(?:.*[/\\])?(?:cp|mv|ln|install|rsync|copy|move|copy-item"
                                 r"|move-item|cpi|mi|scp|ditto)", t, re.IGNORECASE)), None)
@@ -13542,16 +13551,23 @@ def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base: str = "") -> b
         dest, srcs = ops[-1], ops[:-1]
     else:
         return False
-    if base and not dest.startswith(("/", "~", "$", "\\")) and not re.match(r"^[A-Za-z]:", dest):
-        dest = base.rstrip("/") + "/" + dest
-    absd = _agent_exec_abs_parts(ev, dest)
-    if absd and absd[0] == "/":
-        dest = "/" + "/".join(absd[1:])
-    if not _agent_exec_place_dest_ok(ev, dest):
-        return False
     names = list(dict.fromkeys(_agent_exec_norm_path(x)[-1] if _agent_exec_norm_path(x) else ""
                                for x in srcs[:64]))
-    return any(_agent_exec_effective_hit(dest, n, str(ev.cwd or "")) for n in names if n)
+    raw_dest = dest
+    if dest.startswith(("/", "~", "$", "\\")) or re.match(r"^[A-Za-z]:", dest):
+        bases = bases[:1]                  # an absolute destination ignores the cd base
+    for b in bases:
+        dest = raw_dest
+        if b and not dest.startswith(("/", "~", "$", "\\")) and not re.match(r"^[A-Za-z]:", dest):
+            dest = b.rstrip("/") + "/" + dest
+        absd = _agent_exec_abs_parts(ev, dest)
+        if absd and absd[0] == "/":
+            dest = "/" + "/".join(absd[1:])
+        if not _agent_exec_place_dest_ok(ev, dest):
+            continue
+        if any(_agent_exec_effective_hit(dest, n, str(ev.cwd or "")) for n in names if n):
+            return True
+    return False
 
 
 def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
@@ -13576,6 +13592,7 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     # copy/move/clone into place, resolved by destination (QA round 12: this
     # must not depend on a config-dir NAME appearing in the command text)
     if _AXC_COPY_CMD_RE.search(noise) or re.search(r"\bclone\b", noise):
+        seen, budget = set(), [3000]
         for rendering in noise[:200_000].split("\n")[:64]:
             # every `cd` base that MAY be in effect before each clause: a cd
             # replaces the bases only when chained with `&&` outside a
@@ -13598,11 +13615,18 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
                             root = b or str(ev.cwd or "")
                             new.append((root.rstrip("/") + "/" + d) if root else d)
                     if sep == "&&" and not cdm.group(1):
-                        bases = list(dict.fromkeys(new))[:16]
+                        bases = list(dict.fromkeys(new))[:4]
                     else:
-                        bases = list(dict.fromkeys(bases + new))[:16]
+                        bases = list(dict.fromkeys(bases + new))[-4:]
                     continue
-                if any(_agent_exec_copy_dir_into_place(ev, clause, b) for b in bases):
+                key = (clause.strip(), tuple(bases))
+                if key in seen:
+                    continue
+                seen.add(key)
+                budget[0] -= len(bases)
+                if budget[0] < 0:
+                    return kind or "dedicated"   # pathological: bounded work, the safe direction
+                if _agent_exec_copy_dir_into_place(ev, clause, bases):
                     return kind or "dedicated"
     if not kind and not inside and not patterns.AGENT_EXEC_PARENT_DIR_RE.search(noise):
         return ""
