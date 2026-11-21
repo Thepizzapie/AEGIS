@@ -179,6 +179,14 @@ class Policy:
     # characters is denied whatever the mode (except off/monitor) and
     # regardless of `allow`. See rules.rule_agent_rules_protect.
     agent_rules: dict = field(default_factory=dict)
+    # Cross-agent EXECUTABLE config protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
+    # Covers the hooks / MCP-server / plugin / extension / setup-script files
+    # and approval switches of OTHER coding agents (.cursor/hooks.json,
+    # .github/hooks/, .kiro/hooks/, .gemini/settings.json, .codex/config.toml,
+    # .opencode/plugin/, .amazonq/mcp.json, ...). See
+    # rules.rule_agent_exec_config_protect.
+    agent_exec_config: dict = field(default_factory=dict)
     # Claude Code Skill-definition protection: {mode: deny|ask|monitor|off,
     # allow: [regex on path/command]}. Empty -> defaults (mode=ask) apply.
     # Covers .claude/skills/<name>/SKILL.md, project- or user-scoped — a

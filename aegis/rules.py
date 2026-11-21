@@ -11140,6 +11140,8 @@ _FETCH_NEVER_ESCAPABLE = (
 # is worth, so it stays a known, disclosed gap of this guard instead.
 _FETCH_HUMAN_ESCAPABLE = (
     (patterns.MCP_CONFIG_PATH_RE, "an MCP server config"),
+    (patterns.AGENT_EXEC_DEDICATED_RE, "another coding agent's exec config (hooks/MCP/plugins)"),
+    (patterns.AGENT_EXEC_MIXED_RE, "another coding agent's settings file"),
     (patterns.CI_WORKFLOW_PATH_RE, "a CI/CD pipeline definition"),
     (patterns.GIT_HOOKS_PATH_RE, "a git hook"),
     (patterns.AGENT_DEF_PATH_RE, "an agent/command/output-style definition"),
@@ -12899,6 +12901,336 @@ def _lifecycle_rules() -> tuple:
         return ()
 
 
+# ---- cross-agent EXECUTABLE config protection: escapable with human ----------
+# Plan, threat model and surface list sit above `patterns.AGENT_EXEC_DEDICATED_RE`.
+_AXC_DISK_MAX = 262_144
+_AXC_GIT_WRITE_RE = re.compile(
+    r"\bgit\b[^|;&\n]{0,200}\b(?:checkout|restore|apply|am|cherry-pick|merge|pull|stash\s+(?:pop|apply)"
+    r"|reset\s+--hard|read-tree|checkout-index|worktree\s+add)\b"
+    r"|\bpatch\b|\b(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl)\b|\btouch\b|\btruncate\b",
+    re.IGNORECASE)
+# Something that can carry a target from one simple command into another.
+_AXC_JOINED_RE = re.compile(r"<<|\bxargs\b|\bfor\s|\bwhile\s|\$\(|`|<\(|\bparallel\b", re.IGNORECASE)
+_AXC_CHDIR_RE = re.compile(
+    r"(?:\b(?:cd|pushd|chdir|Set-Location)|(?-i:\s-C)|--(?:directory|work-tree|prefix))[ \t=]{1,8}"
+    r"(?:--[ \t]{1,8})?(?:\"([^\"\n]{1,1024})\"|'([^'\n]{1,1024})'|(\S{1,1024}))",
+    re.IGNORECASE)
+_AXC_CLAUSE_RE = re.compile(r"[|;&\n]")
+# A redirect / tee / -o-style option whose operand is the target.
+_AXC_OUT_OP_RE = re.compile(
+    r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)-(?:o|O|t|d|C)|--(?:output|target-directory"
+    r"|output-document|directory)=?|\bof=)\s*['\"]?$", re.IGNORECASE)
+_AXC_COPY_CMD_RE = re.compile(
+    r"(?:^|[\s/\\!])(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|cpi|mi|scp|ditto)(?=\s|$)",
+    re.IGNORECASE)
+
+
+def _agent_exec_allowed_by_policy(cfg: dict, texts) -> bool:
+    for pat in (cfg.get("allow") or []):
+        for t in texts:
+            try:
+                if re.search(str(pat), t, re.IGNORECASE):
+                    return True
+            except re.error:
+                break
+    return False
+
+
+def _agent_exec_classify(ev: Event, p: str):
+    """('dedicated'|'mixed'|'', form) for a path argument -- as written,
+    normalized, cwd-anchored and symlink-resolved (agent-rules' path forms)."""
+    if not p or len(p) > 4096 or "\n" in p:
+        return "", ""
+    if re.match(r"^[a-z][a-z0-9+.-]*://", p, re.IGNORECASE) and not p.lower().startswith("file://"):
+        return "", ""
+    for form in _agent_rules_path_forms(ev, p):
+        kind = patterns.agent_exec_path_hit(form) if form else ""
+        if kind:
+            return kind, form
+    return "", ""
+
+
+def _agent_exec_target(ev: Event):
+    """(path as written, tier, matched form) for the first argument naming an
+    agent exec-config path."""
+    cands = []
+    p = _path(ev)
+    if p:
+        cands.append(p)
+    args = ev.args or {}
+    for leaf in _agent_rules_keyed_strings(args, _AGENT_RULES_PATH_KEY_RE):
+        cands.append(leaf)
+    if ev.action == ActionClass.MCP:
+        for leaf in _flatten_strings(args):
+            if leaf and len(leaf) <= 4096 and not re.search(r"\s", leaf):
+                cands.append(leaf)
+    spent = 0
+    for c in list(dict.fromkeys(cands))[:2048]:
+        spent += len(c)
+        if spent > 262144:
+            break
+        kind, form = _agent_exec_classify(ev, c)
+        if kind:
+            return c, kind, form
+    return "", "", ""
+
+
+def _agent_exec_disk_has_key(form: str) -> bool:
+    """The mixed settings file as it is on disk already defines an exec/
+    approval key (bounded, regular files only, never blocks)."""
+    try:
+        if not form.startswith("/") or form.startswith("//") or form.startswith(("/proc/", "/sys/", "/dev/")):
+            return False
+        fd = os.open(form, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0))
+    except Exception:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        data = os.read(fd, _AXC_DISK_MAX)
+    except Exception:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    return bool(patterns.AGENT_EXEC_CONFIG_KEY_RE.search(data.decode("utf-8", "replace")))
+
+
+def _agent_exec_mixed_relevant(ev: Event, form: str) -> bool:
+    """A MIXED settings-file write counts when the new text, the text it
+    replaces, or the file already on disk carries an exec/approval key. A
+    tool call with no recognizable content field (an MCP move/copy, a
+    notebook-style edit) counts too -- the safe direction."""
+    a = ev.args or {}
+    texts = [x for x in _flatten_strings(a) if isinstance(x, str)]
+    if any(patterns.AGENT_EXEC_CONFIG_KEY_RE.search(t) for t in texts if len(t) <= 2_000_000):
+        return True
+    has_content = any(k in a for k in ("content", "new_string", "old_string", "edits", "text",
+                                       "newText", "oldText", "new_str", "old_str", "data", "contents"))
+    if not has_content:
+        return True
+    if ev.action == ActionClass.WRITE:
+        return False                     # whole-file replacement: the new text is all there is
+    return _agent_exec_disk_has_key(form)
+
+
+def _agent_exec_inside_parent(ev: Event, cmd: str) -> bool:
+    if ev.cwd and patterns.AGENT_EXEC_PARENT_DIR_RE.search(str(ev.cwd).rstrip("/\\") + " "):
+        return True
+    for m in _AXC_CHDIR_RE.finditer(cmd):
+        d = (m.group(1) or m.group(2) or m.group(3) or "").rstrip("/\\")
+        if d and patterns.AGENT_EXEC_PARENT_DIR_RE.search(" " + d + " "):
+            return True
+    return False
+
+
+def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
+    """True when this simple command WRITES a path ``names_re`` matches."""
+    hits = list(names_re.finditer(clause))
+    if not hits:
+        if not parent_ok:
+            return False
+        # whole-directory placement: `cp -r x .cursor/`, `tar xf a -C .cursor`
+        if not (_AXC_COPY_CMD_RE.search(clause) or patterns.ARCHIVE_SYNC_VERB_RE.search(clause)):
+            return False
+        try:
+            toks = shlex.split(clause, posix=True)
+        except Exception:
+            return True
+        ops = [t for t in toks[1:] if not t.startswith("-")]
+        return any(patterns.AGENT_EXEC_PARENT_DIR_RE.search(" " + t.rstrip("/\\") + " ")
+                   for t in ops[1:]) or bool(re.search(
+                       r"(?:\s-[Cdt]|--(?:directory|target-directory)=?)\s*['\"]?\S*"
+                       + r"(?:\.(?:cursor|windsurf|kiro|amazonq|opencode|gemini|qwen|codex|github))",
+                       clause, re.IGNORECASE))
+    for m in hits:
+        # start of the whole operand the match sits in (`/r/.cursor/hooks.json`)
+        s = m.start() + (1 if clause[m.start():m.start() + 1] in " \t'\"/\\=" else 0)
+        while s > 0 and clause[s - 1] not in " \t<>|;&=":
+            s -= 1
+        # `> path`, `>>path`, `tee -a path`, `-o path`, `--output=path`, `of=path`
+        if _AXC_OUT_OP_RE.search(clause[:s]):
+            return True
+    if (patterns.INPLACE_WRITE_RE.search(re.sub(r"\b(?:cp|copy|dd)\b", " ", clause))
+            or patterns.FORCED_LINK_WRITE_RE.search(clause)
+            or patterns.DESTRUCTIVE_DELETE_RE.search(clause)
+            or patterns.ARCHIVE_SYNC_VERB_RE.search(clause)
+            or _AXC_GIT_WRITE_RE.search(clause)
+            or re.search(r"\b(?:set-content|out-file|add-content|sc)\b", clause, re.IGNORECASE)
+            or re.search(r"\bof=", clause)):
+        return True
+    if _AXC_COPY_CMD_RE.search(clause) or re.search(r"\b(?:rm|unlink|shred|del|erase|remove-item|ri)\b",
+                                                     clause, re.IGNORECASE):
+        if re.search(r"\b(?:rm|unlink|shred|del|erase|remove-item|ri)\b", clause, re.IGNORECASE):
+            return True
+        try:
+            toks = shlex.split(clause, posix=True)
+        except Exception:
+            return True
+        ops = [t for t in toks if not t.startswith("-")]
+        # drop the command word (and wrappers) up to the copy verb
+        idx = next((i for i, t in enumerate(ops)
+                    if re.fullmatch(r"(?:.*[/\\])?(?:cp|mv|ln|install|rsync|copy|move|copy-item"
+                                    r"|move-item|cpi|mi|scp|ditto)", t, re.IGNORECASE)), None)
+        if idx is None:
+            return True
+        ops = ops[idx + 1:]
+        if not ops:
+            return False
+        if re.search(r"(?:^|\s)(?:-t|--target-directory)(?:\s|=)", clause):
+            return True
+        # the target is written unless it is only the (first) source operand
+        return any(names_re.search(" " + t + " ") for t in ops[1:]) or len(ops) == 1
+    if re.search(r"\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell)\b", clause, re.IGNORECASE) \
+            and re.search(r"open\s*\(|write|Set-Content|Out-File|copy|move|rename|symlink|>\s*", clause,
+                          re.IGNORECASE):
+        return True
+    return False
+
+
+def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
+    """'' or the tier ('dedicated'/'mixed') of the agent exec-config path this
+    shell command writes. ``cmd`` is the de-obfuscated scan surface."""
+    kind = patterns.agent_exec_path_hit(cmd)
+    inside = _agent_exec_inside_parent(ev, cmd)
+    noise = patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", cmd)
+    if not kind and not inside and not patterns.AGENT_EXEC_PARENT_DIR_RE.search(noise):
+        return ""
+    names = [patterns.AGENT_EXEC_DEDICATED_RE, patterns.AGENT_EXEC_MIXED_RE]
+    if inside:
+        names.append(patterns.AGENT_EXEC_BARE_NAME_RE)
+    joined = bool(_AXC_JOINED_RE.search(noise))
+    for names_re in names:
+        if joined and names_re.search(noise) and (
+                patterns.WRITE_REDIRECT_RE.search(noise) or patterns.COPY_WRITE_VERB_RE.search(noise)
+                or patterns.DELETE_OR_MOVE_VERB_RE.search(noise) or patterns.INPLACE_WRITE_RE.search(noise)
+                or patterns.ARCHIVE_SYNC_VERB_RE.search(noise) or _AXC_GIT_WRITE_RE.search(noise)):
+            return kind or "dedicated"
+        for clause in _AXC_CLAUSE_RE.split(noise[:200_000])[:4096]:
+            if _agent_exec_clause_write(clause, names_re, parent_ok=(names_re is names[0])):
+                return kind or "dedicated"
+    return ""
+
+
+def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate writes to ANOTHER coding agent's EXECUTABLE configuration: the
+    files where Cursor, Windsurf, Copilot, Kiro, Amazon Q, Cline/Roo/Kilo,
+    Continue, OpenCode, Gemini/Qwen, Codex, Zed, Junie, Factory, OpenHands,
+    Amp, Augment, Crush and Goose keep the hooks, MCP servers, plugins,
+    extensions and setup scripts their runtime spawns by itself -- and the
+    switches that turn off their own approval prompts. The full plan, threat
+    model and surface list sit above ``patterns.AGENT_EXEC_DEDICATED_RE``.
+
+    Why it matters: ``rule_agent_rules_protect`` covers the files another
+    agent READS; this covers the files another agent RUNS. A planted
+    ``.cursor/hooks.json`` / ``.kiro/hooks/*.kiro.hook`` / ``.codex/config.toml``
+    ``notify`` / ``.opencode/plugin/*.ts`` / ``.gemini/settings.json``
+    ``mcpServers`` executes with the next human's credentials the moment they
+    open the repo in that agent -- outside every Aegis hook, with no model
+    needing to be persuaded, and for everyone who clones.
+
+    Decisions (``ask`` by default):
+      - Edit/Write/MCP on a DEDICATED path (hooks files/dirs, non-Claude MCP
+        server files, plugin/tool/extension dirs, setup scripts, CLI
+        permission files);
+      - Edit/Write/MCP on a MIXED settings file when the new text, the replaced
+        text, or the file already on disk carries an exec/approval key
+        (``mcpServers``, ``hooks``, ``notify``, ``command``, ``approval_policy``,
+        ``sandbox_mode``, ``autoAccept``, ``always_allow_tool_actions``,
+        ``trusted_folders``, ... -- ``patterns.AGENT_EXEC_CONFIG_KEY_RE``);
+      - a shell command that writes either tier (redirect, tee, in-place edit,
+        copy/move/link/delete, archive extract or copy into the agent's config
+        directory, git checkout/apply, patch, editors, interpreter one-liners),
+        including a relative name after a ``cd`` into, or from a cwd inside,
+        one of those directories;
+      - CLI registration MCP-config-protect's vendor list does not name
+        (``qwen|amp|opencode|copilot|kiro-cli|droid|goose|auggie|q mcp add``,
+        ``gemini|qwen extensions install|link``).
+
+    Config (``policy.agent_exec_config``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path / command that skip the
+    gate). Human escape: ``AEGIS_ALLOW_AGENT_EXEC_CONFIG=1`` set before launch,
+    or a trailing ``# aegis-allow`` on the shell form; a spawned agent can use
+    neither.
+
+    Honest scope -- a path-string denylist like its siblings. Known gaps: an
+    agent or config location not in the list above (new agents appear
+    monthly); a path built from variables, globs or brace expansion; a write
+    through a program this guard does not recognize as writing; a git
+    operation that brings these files in without naming them (``git pull``
+    of a branch that adds ``.cursor/hooks.json``); a mixed settings-file edit
+    whose new, old and on-disk text all lack an exec key (a value-only edit
+    inside an array when the file is not on disk where the hook runs); a
+    script that an existing hook/MCP entry already points at, living outside
+    the dedicated directories (writing it is not recognized as exec-
+    relevant). Shell matching is textual: ``cat .cursor/hooks.json > /tmp/x``
+    does not ask (the redirect target is elsewhere), but some reads phrased
+    with write-capable tools (``vim .cursor/hooks.json`` to view) do. Shell
+    writes under ``.claude/``/``.vscode/``/``.mcp.json`` belong to other
+    guards and are not repeated here."""
+    if ev.event != HookEvent.PRE_TOOL_USE:
+        return None
+    cfg = getattr(policy, "agent_exec_config", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "agent-exec-config-protect-monitor")
+            return None
+        return would
+
+    why = ("another coding agent's runtime (Cursor, Copilot, Gemini, Codex, Kiro, Windsurf, "
+           "OpenCode, ...) EXECUTES what this file defines -- hook commands, MCP servers, "
+           "plugins, setup scripts -- or drops its own approval prompts because of it, the next "
+           "time anyone opens this repo in that agent, outside every Aegis hook")
+    remedy = ("Review the change before approving; a human can pre-approve by launching with "
+              "AEGIS_ALLOW_AGENT_EXEC_CONFIG=1 -- a spawned agent cannot."
+              if action == Action.ASK else
+              "Blocked by policy (`agent_exec_config.mode: deny`); a human can launch with "
+              "AEGIS_ALLOW_AGENT_EXEC_CONFIG=1 after review -- a spawned agent cannot.")
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        target, kind, form = _agent_exec_target(ev)
+        if not target:
+            return None
+        if os.environ.get("AEGIS_ALLOW_AGENT_EXEC_CONFIG"):
+            return None
+        if ev.action == ActionClass.MCP:
+            op = re.sub(r"^git[_-]", "", str(ev.tool or "").split("__")[-1], flags=re.IGNORECASE)
+            if _AGENT_RULES_READ_TOOL_RE.match(op) and not _AGENT_RULES_WRITE_WORD_RE.search(op):
+                return None
+        if kind == "mixed" and not _agent_exec_mixed_relevant(ev, form):
+            return None
+        if _agent_exec_allowed_by_policy(cfg, [target, form]):
+            return None
+        what = ("an exec/approval setting in agent config" if kind == "mixed"
+                else "agent exec config")
+        return _finish(Decision(action, "agent-exec-config-protect",
+                                f"Writing {what} '{target}' -- {why}. {remedy}"))
+
+    if _is_shell(ev):
+        cmd = normalize.scan_surface(_cmd(ev), sep="\n")
+        cli = bool(patterns.AGENT_EXEC_CLI_RE.search(cmd))
+        kind = "" if cli else _agent_exec_shell_hit(ev, cmd)
+        if not (cli or kind):
+            return None
+        if _override_allowed(ev) or os.environ.get("AEGIS_ALLOW_AGENT_EXEC_CONFIG"):
+            return None
+        if _agent_exec_allowed_by_policy(cfg, [_cmd(ev)]):
+            return None
+        what = ("registers an MCP server / extension for another coding agent from its CLI"
+                if cli else "writes another coding agent's exec config from a shell")
+        return _finish(Decision(action, "agent-exec-config-protect",
+                                f"This command {what} -- {why}. {remedy}"))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -12958,6 +13290,7 @@ _CORE_RULES = (
     # Same reason (QA round 1 of repl_rc_exec): its shell-branch ASK must not
     # pre-empt `rm -rf ~` / `| sh` / force-push DENYs chained onto a plant.
     rule_repl_rc_exec_protect,
+    rule_agent_exec_config_protect,
     rule_agent_rules_protect,
 )
 
