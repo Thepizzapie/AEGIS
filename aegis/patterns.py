@@ -7000,19 +7000,23 @@ AGENT_EXEC_CONFIG_KEY_RE = re.compile(
     re.IGNORECASE | re.MULTILINE)
 
 # CLI registration of an MCP server / extension for agents MCP_CLI_ADD_RE's
-# vendor list does not name.
-# Command position only (QA round 1: an unanchored vendor word matched
-# `npm --prefix packages/copilot-mcp install` and commit messages).
-_AX_CMD_POS = (r"(?:^|[;&|\n(`]|\$\()\s*(?:sudo\s+|env\s+(?:\w+=\S*\s+)*)?"
-               r"(?:(?:npx|bunx|pnpx|pnpm\s+dlx|yarn\s+dlx|uvx)\s+(?:-y\s+|--yes\s+)?)?"
-               r"(?:@[\w.-]{1,60}/)?(?:\S{0,200}/)?")
+# vendor list does not name. The vendor must be a whole TOKEN (QA round 1:
+# `packages/copilot-mcp` and `amp-mcp` matched on `\b`), and rules.py matches
+# this against renderings whose quoted strings containing whitespace are
+# blanked (commit messages, grep patterns), never the quote-stripped one.
+# Not command-position anchored (QA round 2: every wrapper -- nohup, timeout,
+# `then`, `{`, `$(which qwen)` -- was a bypass of an anchored form).
+_AX_TOK_L = r"(?:^|[\s/\\(`{!=]|\$\()"
+_AX_TOK_R = r"(?:-cli|-code)?(?:@[\w.^~-]{0,60})?[)`'\"]?\s+(?:[^|;&\n]{0,200}\s)?"
 AGENT_EXEC_CLI_RE = re.compile(
-    _AX_CMD_POS + r"(?:qwen|amp|opencode|copilot|kiro-cli|kiro|droid|goose|auggie|crush|cline"
-    r"|cursor-agent|q)(?:-cli|-code)?\s+(?:[^|;&\n'\"]{0,200}\s)?mcp\s+(?:add|add-json|install|import)\b"
-    r"|" + _AX_CMD_POS + r"(?:gemini|qwen)(?:-cli|-code)?\s+(?:[^|;&\n'\"]{0,200}\s)?"
-    r"extensions?\s+(?:install|link|update|new)\b",
+    _AX_TOK_L + r"(?:qwen|amp|opencode|copilot|kiro-cli|kiro|droid|goose|auggie|crush|cline"
+    r"|cursor-agent|q)" + _AX_TOK_R + r"mcp\s+(?:add|add-json|install|import)\b"
+    r"|" + _AX_TOK_L + r"(?:gemini|qwen)" + _AX_TOK_R + r"extensions?\s+(?:install|link|update|new)\b",
     re.IGNORECASE)
-
+# Wrappers that may precede a command word (QA round 2).
+AX_WRAP = (r"(?:(?:sudo|doas|env|command|builtin|exec|nohup|time|nice|ionice|timeout|stdbuf|xargs"
+           r"|busybox|chrt|taskset|unbuffer|caffeinate|then|do|else|elif|!|\{|\()"
+           r"(?:\s+-[ugCDprn]\s+\S+|\s+-{1,2}[\w-]+(?:=\S*)?|\s+\w+=\S*|\s+\d[\w.]*)*\s+){0,8}")
 
 # The narrow set used against a file ALREADY on disk (QA round 1: the full
 # list made any edit of a Zed settings file that sets `formatter` ask).
@@ -7023,7 +7027,19 @@ AGENT_EXEC_STRONG_KEY_RE = re.compile(
     r"|folderTrust|trust_level)[\"']?\s*[:=]|^\s*\[\[?\s*[\"']?(?:mcp_servers|hooks|projects"
     r"|sandbox\w*)\b",
     re.IGNORECASE | re.MULTILINE)
-_AX_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_AX_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+
+
+def ax_unescape(text: str) -> str:
+    """Decode JSON/TOML `\\uXXXX` / `\\UXXXXXXXX` escapes and drop BOMs."""
+    def _c(m):
+        try:
+            return chr(int(m.group(1) or m.group(2), 16))
+        except (ValueError, OverflowError):
+            return m.group(0)
+    if "\\" in text:
+        text = _AX_UESC_RE.sub(_c, text)
+    return text.replace("\ufeff", "")
 _AX_LINE_COMMENT_RE = re.compile(r"//[^\n]*|(?m:^[ \t]*#[^\n]*)")
 
 
@@ -7053,7 +7069,7 @@ def agent_exec_key_hit(text: str) -> bool:
     parser reads as the same key."""
     if AGENT_EXEC_CONFIG_KEY_RE.search(text):
         return True
-    t = _AX_UESC_RE.sub(lambda m: chr(int(m.group(1), 16)), text) if "\\u" in text else text
+    t = ax_unescape(text)
     unq = _AX_QUOTE_RE.sub("", t)
     if AGENT_EXEC_CONFIG_KEY_RE.search(t) or AGENT_EXEC_CONFIG_KEY_RE.search(unq):
         return True

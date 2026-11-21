@@ -553,3 +553,85 @@ def test_qa1_shell_allow_does_not_cover_second_target():
     pol = Policy(agent_exec_config={"allow": [r"\.zed/settings\.json"]})
     assert _only(_shell("cp a .zed/settings.json"), pol) is None
     assert _only(_shell("cp a .zed/settings.json; cp evil.json .cursor/hooks.json"), pol) is not None
+
+
+# ---- QA round 2 regressions -----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "command qwen mcp add evil x", "nohup qwen mcp add evil x", "time qwen mcp add evil x",
+    "exec qwen mcp add evil x", "nice qwen mcp add evil x", "timeout 5 qwen mcp add evil x",
+    "stdbuf -o0 qwen mcp add evil x", "env -i qwen mcp add evil x", "env -u FOO qwen mcp add x",
+    "sudo -E qwen mcp add evil x", "echo x | xargs qwen mcp add",
+    "if true; then qwen mcp add evil x; fi", "{ qwen mcp add evil x; }", "\\qwen mcp add x",
+    "$(which qwen) mcp add evil x", "`which qwen` mcp add evil x",
+    "npx @qwen-code/qwen-code@latest mcp add evil x", "bunx --bun amp mcp add x",
+    "npm exec -- qwen mcp add x", '"qwen" mcp add x', "bash -c 'qwen mcp add evil x'",
+    "env X=1 qwen mcp add x", "(cd x && amp mcp add y)",
+])
+def test_qa2_cli_wrappers(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "timeout 10 patch .cursor/hooks.json evil.patch", "nice patch .cursor/hooks.json p",
+    "if true; then patch .cursor/hooks.json p; fi", "sudo -n patch .cursor/hooks.json p",
+    "sudo -u root vim .cursor/hooks.json", "\\patch .cursor/hooks.json p",
+    "exec patch .cursor/hooks.json p", "! patch .cursor/hooks.json p",
+    "time sponge .cursor/hooks.json < x", "doas vim .cursor/hooks.json",
+    "busybox vi .cursor/hooks.json", "command -p vim .cursor/hooks.json",
+    "git restore -s evil .cursor/hooks.json # --staged",
+    "git restore -s evil .cursor/hooks.json -- --staged",
+    "git restore --staged=x -s evil .cursor/hooks.json",
+    "git restore -SW -s evil .cursor/hooks.json",
+    "node -e \"require('fs').createWriteStream('.cursor/hooks.json').end('x')\"",
+    "node -e \"require('fs').cpSync('x','.cursor/hooks.json')\"",
+    "node -e \"require('fs').openSync('.cursor/hooks.json','w')\"",
+    "ruby -e \"IO.binwrite('.cursor/hooks.json','x')\"",
+    "ruby -e \"require 'fileutils'; FileUtils.cp('x','.cursor/hooks.json')\"",
+    "perl -e 'open(F,\">.cursor/hooks.json\"); print F 1'",
+    "php -r \"copy('x','.cursor/hooks.json');\"",
+    "python3 -c \"import os; os.link('x','.cursor/hooks.json')\"",
+    "python3 -c \"import os; os.system('cp x .cursor/hooks.json')\"",
+    "python3 -c \"import subprocess; subprocess.run(['cp','x','.cursor/hooks.json'])\"",
+    "python3 -c \"open('.cursor/hooks.json',\\\"w\\\").write('x')\"",
+])
+def test_qa2_write_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git restore --staged .cursor/hooks.json",
+    "git restore -S .cursor/hooks.json",
+    "grep -n code .cursor/hooks.json",
+    "git log --patch -- .cursor/hooks.json",
+    "npm --prefix packages/copilot-mcp install",
+    "git commit -m 'docs: gemini extensions install guide'",
+])
+def test_qa2_reads_still_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd
+
+
+def test_qa2_allow_never_applies_past_scan_window():
+    pol = Policy(agent_exec_config={"allow": [r"\.zed/settings\.json"]})
+    cmd = "cp a .zed/settings.json; echo " + "x" * 20010 + "; cp evil .cursor/hooks.json"
+    assert _only(_shell(cmd), pol) is not None
+
+
+@pytest.mark.parametrize("payload", [
+    "cat .cursor/hooks.json " + "sed -" * 3700,
+    "cat .cursor/hooks.json " + "perl " * 3700,
+    "cat .cursor/hooks.json " + "awk -" * 4000,
+    "cat .cursor/hooks.json " + "'a b' " * 3000,
+    "qwen " * 4000,
+])
+def test_qa2_bounded_time(payload):
+    t = time.time()
+    _only(_shell(payload))
+    assert time.time() - t < 0.5
+
+
+@pytest.mark.parametrize("content", [
+    '"not\\U00000069fy" = ["sh"]',
+    '﻿notify = ["sh"]',
+])
+def test_qa2_toml_escape_and_bom(content):
+    assert _only(_write("/r/.codex/config.toml", content=content)) is not None

@@ -12907,26 +12907,31 @@ _AXC_DISK_MAX = 262_144
 _AXC_GIT_WRITE_RE = re.compile(
     r"\bgit\b[^|;&\n]{0,200}\s(?:checkout|apply|am|cherry-pick|merge|pull|stash\s+(?:pop|apply)"
     r"|reset\s+--hard|read-tree|checkout-index|worktree\s+add)\b"
-    # `git restore --staged` only unstages (QA round 1); with -W/--worktree it writes
-    r"|\bgit\b[^|;&\n]{0,200}\srestore\b(?:(?![^|;&\n]*\s--staged\b)|(?=[^|;&\n]*\s(?:-W|--worktree)\b))"
     # editors / patch / touch / sponge only in command position (the clause is
-    # one simple command already)
-    r"|^\s*[({]?\s*(?:sudo\s+|env\s+(?:\w+=\S*\s+)*|command\s+)?(?:\S{0,200}/)?"
-    r"(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl|patch|touch|truncate|sponge)\b"
+    # one simple command already), after any wrappers (QA round 2)
+    r"|^\s*" + patterns.AX_WRAP + r"\\?(?:\S{0,200}/)?"
+    r"(?:vim?|nvim|nano|emacs|micro|helix|hx|code|subl|patch|touch|truncate|sponge)(?=\s|$)"
     r"|\b(?:Write|Append)All(?:Text|Bytes|Lines)\b|\[(?:System\.)?IO\.File\]::\w+"
     r"|\b(?:New-Item|ni|Copy-Item|Move-Item)\b",
     re.IGNORECASE)
 # In-place editors (the shared INPLACE_WRITE_RE also counts every `node -e`).
 _AXC_INPLACE_RE = re.compile(
-    r"\bsed\b[^|;&\n]*\s-[a-zA-Z]*i|\bsed\b[^|;&\n]*\s--in-place\b|\bperl\b[^|;&\n]*\s-[a-zA-Z]*i"
-    r"|\bawk\b[^|;&\n]*-i\s*inplace\b|\b(?:vim?|nvim|ex)\b[^|;&\n]*-c\s*['\"]?(?:wq!?|w\b|write)"
+    r"\bsed\b[^|;&\n]{0,300}?\s-[a-zA-Z]{0,8}i|\bsed\b[^|;&\n]{0,300}?\s--in-place\b"
+    r"|\bperl\b[^|;&\n]{0,300}?\s-[a-zA-Z]{0,8}i"
+    r"|\bawk\b[^|;&\n]{0,300}?-i\s*inplace\b|\b(?:vim?|nvim|ex)\b[^|;&\n]{0,300}?-c\s*['\"]?(?:wq!?|w\b|write)"
     r"|^\s*ed\b", re.IGNORECASE)
 # What makes an interpreter one-liner a WRITE (not `print(open(p).read())`).
 _AXC_INTERP_WRITE_RE = re.compile(
     r"open\s*\([^)]{0,300},\s*(?:mode\s*=\s*)?['\"][rbt+]*[wax]|\.write(?:_text|_bytes|lines)?\s*\("
     r"|write\w*Sync\s*\(|\bwriteFile\w*|appendFile\w*|copyFile\w*|\brename\w*\s*\(|symlink\w*\s*\("
     r"|shutil\.\w+|os\.replace|Set-Content|Out-File|File\.(?:write|open)\b|IO\.write|fs\.\w*write"
-    r"|Deno\.write\w*|Bun\.write|file_put_contents|fopen\s*\([^)]{0,300}['\"][wax]",
+    r"|Deno\.write\w*|Bun\.write|file_put_contents|fopen\s*\([^)]{0,300}['\"][wax]"
+    # QA round 2
+    r"|open\s*\([^)]{0,300},\s*\\?['\"][rbt+]{0,3}[wax]|open\s*\([^)]{0,300}['\"]\s*(?:>|\+<|\|)"
+    r"|createWriteStream|\bcpSync|\bcp\s*\(|openSync\s*\([^)]{0,300}['\"][wa]|binwrite|FileUtils\."
+    r"|\bcopy\s*\(|\bos\.(?:link|truncate|system|popen|exec\w*|spawn\w*)|\bsubprocess\b|\bsystem\s*\("
+    r"|\bexec(?:Sync|File\w*)?\s*\(|\bspawn(?:Sync)?\s*\(|\bIO\.(?:write|copy_stream)"
+    r"|\bFile\.(?:write|binwrite|symlink|rename)|\bmove\s*\(|\bpassthru\b|\bshell_exec\b",
     re.IGNORECASE)
 # Something that can carry a target from one simple command into another.
 _AXC_JOINED_RE = re.compile(r"<<|\bxargs\b|\bfor\s|\bwhile\s|\$\(|`|<\(|\bparallel\b", re.IGNORECASE)
@@ -13027,7 +13032,7 @@ def _agent_exec_disk_one(form: str) -> bool:
     if patterns.AGENT_EXEC_STRONG_KEY_RE.search(text):
         return True
     return bool(patterns.AGENT_EXEC_STRONG_KEY_RE.search(
-        patterns._ax_strip_comments(patterns._AX_UESC_RE.sub(lambda m: chr(int(m.group(1), 16)), text))))
+        patterns._ax_strip_comments(patterns.ax_unescape(text))))
 
 
 def _agent_exec_mixed_relevant(ev: Event, forms) -> bool:
@@ -13056,6 +13061,44 @@ def _agent_exec_inside_parent(ev: Event, cmd: str) -> bool:
     for m in _AXC_CHDIR_RE.finditer(cmd):
         d = (m.group(1) or m.group(2) or m.group(3) or "").rstrip("/\\")
         if d and patterns.AGENT_EXEC_PARENT_DIR_RE.search(" " + d + " "):
+            return True
+    return False
+
+
+_AXC_RESTORE_RE = re.compile(r"\bgit\b[^|;&\n]{0,200}\srestore\b", re.IGNORECASE)
+
+
+def _agent_exec_restore_writes(clause: str) -> bool:
+    """`git restore` writes the worktree unless `--staged`/`-S` is given as
+    a real option (a whole token before `--`, not in a comment) without
+    `--worktree`/`-W` (QA round 2: `... # --staged` and `-- --staged`)."""
+    if not _AXC_RESTORE_RE.search(clause):
+        return False
+    try:
+        toks = shlex.split(clause, comments=True, posix=True)
+    except Exception:
+        return True
+    if "--" in toks:
+        toks = toks[:toks.index("--")]
+    opts = [t for t in toks if t.startswith("-")]
+    short = "".join(t[1:] for t in opts if not t.startswith("--"))
+    staged = "--staged" in opts or "S" in short
+    worktree = "--worktree" in opts or "W" in short
+    return worktree or not staged
+
+
+def _agent_exec_cli_hit(raw: str) -> bool:
+    """CLI registration (``patterns.AGENT_EXEC_CLI_RE``) in the raw command or
+    any decoded / inner-interpreter rendering, each with its whitespace-
+    bearing quoted strings blanked (a commit message or grep pattern is not a
+    command); quotes around a single word are dropped (``"qwen" mcp add``)."""
+    parts = normalize.scan_surface(raw, sep="\x1e").split("\x1e")
+    cands = [parts[0]] + parts[2:]
+    for c in cands:
+        c = re.sub(r"'[^'\n]{0,4000}'|\"(?:[^\"\\\n]|\\.){0,4000}\"",
+                   lambda m: (" " * len(m.group(0))) if re.search(r"\s", m.group(0))
+                   else m.group(0)[1:-1], c)
+        if patterns.AGENT_EXEC_CLI_RE.search(c):
             return True
     return False
 
@@ -13094,6 +13137,7 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
             or patterns.DESTRUCTIVE_DELETE_RE.search(clause)
             or patterns.ARCHIVE_SYNC_VERB_RE.search(clause)
             or _AXC_GIT_WRITE_RE.search(clause)
+            or _agent_exec_restore_writes(clause)
             or re.search(r"\b(?:set-content|out-file|add-content|sc)\b", clause, re.IGNORECASE)
             or re.search(r"\bof=", clause)):
         return True
@@ -13171,7 +13215,9 @@ def _agent_exec_shell_allowed(ev: Event, cfg: dict, raw: str) -> bool:
     command is allowed only if nothing it still writes is a target -- an
     allow-listed path elsewhere in the command does not wave through a second,
     unlisted target (QA round 1)."""
-    text = raw[:normalize._MAX]
+    if len(raw) > normalize._MAX:
+        return False                     # past the scan window: never allow by policy (QA round 2)
+    text = raw
     hit = False
     for pat in (cfg.get("allow") or []):
         try:
@@ -13299,7 +13345,7 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
     if _is_shell(ev):
         raw = _cmd(ev)
         cmd = normalize.scan_surface(raw, sep="\n")
-        cli = bool(patterns.AGENT_EXEC_CLI_RE.search(cmd))
+        cli = _agent_exec_cli_hit(raw)
         kind = "" if cli else _agent_exec_shell_hit(ev, cmd)
         if not (cli or kind) and len(raw) > normalize._MAX and (
                 patterns.agent_exec_path_hit(raw[:2_000_000])
