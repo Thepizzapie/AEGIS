@@ -12936,7 +12936,7 @@ _AXC_CHDIR_RE = re.compile(
     r"(?:--[ \t]{1,8})?(?:\"([^\"\n]{1,1024})\"|'([^'\n]{1,1024})'|(\S{1,1024}))",
     re.IGNORECASE)
 # `>|` (noclobber override) and `&>` are redirects, not separators (QA round 4)
-_AXC_CLAUSE_RE = re.compile(r"(?<!>)\||(?<![>0-9])&(?!>)|[;\n]")
+_AXC_CLAUSE_RE = re.compile(r"(?<!>)\||(?<!>)&(?!>)|[;\n]")
 # A redirect / tee / -o-style option whose operand is the target.
 _AXC_OUT_OP_RE = re.compile(
     r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)(?-i:-[oOtdC])|--(?:output|target-directory"
@@ -13117,11 +13117,11 @@ _AXC_VALUE_OPTS = {
 }
 
 
-def _agent_exec_editor_cmd(clause: str) -> bool:
-    """The simple command's own command word (after variable assignments and
-    wrappers like sudo/timeout/nice/then) is an editor / patch / touch /
-    sponge. Token-based and linear (QA round 3: a regex form backtracked
-    exponentially on `nice -n 1 -n 1 ...`)."""
+def _agent_exec_command_word(clause: str):
+    """(command word, its following tokens) of a simple command, after
+    variable assignments and known wrappers (sudo/env/timeout/nice/then/...)
+    with their options. Token-based and linear (QA round 3: a regex form
+    backtracked exponentially on `nice -n 1 -n 1 ...`)."""
     toks = clause[:4000].split()
     i, n = 0, min(len(toks), 256)
     while i < n:
@@ -13140,8 +13140,15 @@ def _agent_exec_editor_cmd(clause: str) -> bool:
                              or re.match(r"^\w+=", toks[i])):
                 i += 2 if (toks[i] in vopts and i + 1 < n) else 1
             continue
-        return bool(_AXC_EDITOR_RE.fullmatch(base))
-    return False
+        return base, toks[i + 1:n]
+    return "", []
+
+
+def _agent_exec_editor_cmd(clause: str) -> bool:
+    """The simple command's own command word is an editor / patch / touch /
+    sponge."""
+    word, _ = _agent_exec_command_word(clause)
+    return bool(word and _AXC_EDITOR_RE.fullmatch(word))
 
 
 # An interpreter's own inline-code argument (QA round 3: matching the whole
@@ -13180,13 +13187,28 @@ def _agent_exec_code_arg(text: str, pos: int) -> str:
 
 
 # An interpreter reading its program from stdin: `python3 - <<EOF`, `| node`.
-_AX_INTERP_WORD = (r"(?:sudo\s+|env\s+(?:\w+=\S*\s+)*)?(?:\S{0,200}/)?"
-                   r"(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell)")
-_AXC_INTERP_STDIN_RE = re.compile(
-    r"\|\s*" + _AX_INTERP_WORD + r"(?:\s+-[\w-]{0,20}){0,8}\s*(?=$|[|;&\n)])"      # ... | python3
-    r"|(?:^|[;&\n(]\s*)" + _AX_INTERP_WORD + r"(?:\s+-[\w-]{0,20}){0,8}\s*<"       # python3 <<EOF / < f
-    r"|(?:^|[|;&\n(]\s*)" + _AX_INTERP_WORD + r"(?:\s+-[\w-]{1,20}){0,8}\s+-(?=\s|$)",  # python3 -
-    re.IGNORECASE)
+_AXC_INTERP_NAME_RE = re.compile(
+    r"(?:python[0-9.]*|node|nodejs|deno|bun|ruby|perl|php|pwsh|powershell|osascript)", re.IGNORECASE)
+_AXC_STAGE_SPLIT_RE = re.compile(r"(\|\|?|&&?|;|\n)")
+
+
+def _agent_exec_stdin_interp(raw: str) -> bool:
+    """Some simple command's own command word is an interpreter reading its
+    program from stdin: piped into (`... | timeout 5 python3 -X utf8`), fed
+    by `<`/heredoc, or told so (`-`, `/dev/stdin`). Linear token scan (QA
+    round 5: a regex form was quadratic on runs of newlines)."""
+    prev = ""
+    for part in _AXC_STAGE_SPLIT_RE.split(raw[:normalize._MAX])[:4096]:
+        if _AXC_STAGE_SPLIT_RE.fullmatch(part):
+            prev = part
+            continue
+        word, rest = _agent_exec_command_word(part)
+        if word and _AXC_INTERP_NAME_RE.fullmatch(word):
+            inline = any(re.fullmatch(r"-[a-zA-Z]{0,4}[ceErp]|--eval|--print|-Command", t) for t in rest)
+            if not inline and (prev == "|" or "<" in part or "-" in rest or "/dev/stdin" in rest):
+                return True
+        prev = ""
+    return False
 
 
 def _agent_exec_interp_write(raw: str, noise: str, names_re) -> bool:
@@ -13202,8 +13224,7 @@ def _agent_exec_interp_write(raw: str, noise: str, names_re) -> bool:
         if code and _AXC_INTERP_WRITE_RE.search(code) and names_re.search(code):
             return True
     head = raw[:normalize._MAX]
-    if _AXC_INTERP_STDIN_RE.search(head) and _AXC_INTERP_WRITE_RE.search(head) \
-            and names_re.search(head):
+    if _AXC_INTERP_WRITE_RE.search(head) and names_re.search(head) and _agent_exec_stdin_interp(head):
         return True
     return False
 

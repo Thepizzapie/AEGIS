@@ -6996,7 +6996,7 @@ _AX_KEYS = (
 AGENT_EXEC_CONFIG_KEY_RE = re.compile(
     r"(?:[\"'](?:[\w.-]{0,60}\.)?(?:" + _AX_KEYS + r")[\"']\s*:"     # JSON "key":
     r"|(?:^|[\s{,])(?:[\w.-]{0,60}\.)?(?:" + _AX_KEYS + r")\s*[:=]"   # TOML/YAML key = / key:
-    r"|^\s*\[\[?\s*(?:" + _AX_KEYS + r")\b)",                          # TOML [mcp_servers.x]
+    r"|^[ \t﻿]*\[\[?[ \t]*(?:" + _AX_KEYS + r")\b)",                          # TOML [mcp_servers.x]
     re.IGNORECASE | re.MULTILINE)
 
 # CLI registration of an MCP server / extension for agents MCP_CLI_ADD_RE's
@@ -7019,7 +7019,7 @@ AGENT_EXEC_STRONG_KEY_RE = re.compile(
     r"[\"']?(?:[\w.-]{0,60}\.)?(?:mcpServers|mcp_servers|mcp|context_servers|hooks?|notify"
     r"|discoveryCommand|callCommand|command|plugins?|extensions|\w{0,30}approval_?\w{0,10}"
     r"|sandbox\w{0,30}|autoAccept|yolo|dangerously\w*|always_allow\w*|trusted_?folders"
-    r"|folderTrust|trust_level)[\"']?\s*[:=]|^\s*\[\[?\s*[\"']?(?:mcp_servers|hooks|projects"
+    r"|folderTrust|trust_level)[\"']?\s*[:=]|^[ \t﻿]*\[\[?[ \t]*[\"']?(?:mcp_servers|hooks|projects"
     r"|sandbox\w*)\b",
     re.IGNORECASE | re.MULTILINE)
 _AX_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")

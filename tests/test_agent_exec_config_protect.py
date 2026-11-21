@@ -729,3 +729,54 @@ def test_qa4_write_forms(cmd):
 ])
 def test_qa4_reads_silent(cmd):
     assert _only(_shell(cmd)) is None, cmd
+
+
+# ---- QA round 5 regressions -----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "echo '{}' > .cursor/hooks.json" + "\n" * 10000,
+    "echo .cursor/hooks.json" + "\n(" * 8000,
+    "x | " * 4000 + "python3 .cursor/hooks.json",
+])
+def test_qa5_bounded(cmd):
+    t = time.time()
+    d = _only(_shell(cmd))
+    assert time.time() - t < 0.5
+    if cmd.startswith("echo '{}'"):
+        assert d is not None
+
+
+@pytest.mark.parametrize("cmd", [
+    "sleep 1& touch .cursor/hooks.json",
+    "sleep 1& patch .cursor/hooks.json < evil.diff",
+    "make -j4& sponge .cursor/hooks.json < x",
+    "echo \"open('.cursor/hooks.json','w')\" | python3 -X utf8",
+    "echo \"open('.cursor/hooks.json','w')\" | python3 -W ignore",
+    "echo \"open('.cursor/hooks.json','w')\" | timeout 5 python3",
+    "echo \"open('.cursor/hooks.json','w')\" | nice python3",
+    "echo \"open('.cursor/hooks.json','w')\" | command python3",
+    "echo \"open('.cursor/hooks.json','w')\" | python3 /dev/stdin",
+    "echo \"require('fs').writeFileSync('.cursor/hooks.json','x')\" | node --input-type=module",
+    "python3 - <<'EOF2'\nopen('.cursor/hooks.json','w').write('x')\nEOF2",
+])
+def test_qa5_write_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "sleep 5 & echo hi > /tmp/x",
+    "npm start & sleep 2 && curl localhost",
+    "cat .cursor/hooks.json | python3 -m json.tool",
+    "python3 -m pytest -q 2>&1 | tail -5",
+    "node script.js .cursor/hooks.json",
+    "make -j4 2>&1 | tee build.log",
+])
+def test_qa5_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd
+
+
+def test_qa5_mixed_content_newline_runs_linear():
+    t = time.time()
+    _only(_edit("/r/.gemini/settings.json", old="\n" * 20000, new="\n" * 20000))
+    _only(_write("/r/.codex/config.toml", content="\n" * 20000 + "[mcp_servers.x]"))
+    assert time.time() - t < 0.5
+    assert _only(_write("/r/.codex/config.toml", content="\n" * 500 + "  [mcp_servers.x]")) is not None
