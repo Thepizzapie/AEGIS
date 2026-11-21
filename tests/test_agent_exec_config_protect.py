@@ -1132,3 +1132,38 @@ def test_qa15_multi_base_bounded(cmd):
     t = time.time()
     _only(_shell(cmd[:20000], cwd="/repo"))
     assert time.time() - t < 0.5
+
+
+# ---- QA round 16 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cd ~; cd x; cd y; cp -r /tmp/x/.codex .",
+    "cd ~ || exit; cd build 2>/dev/null; cd out 2>/dev/null; cp -r /tmp/x/.codex .",
+    "cd a; cd b; cd c; cd d; cd e; cp -r /tmp/x/.codex .",
+    "echo a;cp -r /tmp/x/.codex ~/",
+    "cd ~&&cp -r /tmp/x/.codex .",
+    "true|cp -r /tmp/x/.gemini ~/",
+    "true;mv /tmp/x/.codex ~/",
+    "echo hi\n" * 64 + "cp -r /tmp/x/.codex ~/",
+    "echo hi\n" * 200 + "cd ~ && cp -r /tmp/x/.codex .",
+    "cd -- && cp -r /tmp/.codex .",
+])
+def test_qa16_forms(cmd):
+    assert _only(_shell(cmd, cwd="/repo")) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    ("cd a; cp x y; " * 2000)[:20000],
+    "".join(f"cd d{i}; cp x{i} y{i}; " for i in range(1200))[:20000],
+])
+def test_qa16_bounded(cmd):
+    t = time.time()
+    _only(_shell(cmd, cwd="/repo"))
+    assert time.time() - t < 0.5
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd a; cd b; cd c; cd d; cd e; cp -r src dist",
+    "cd a; cd b; cd c; cd d; cd e; cp -r ~/.codex /tmp/bak",
+])
+def test_qa16_overflow_silent(cmd):
+    assert _only(_shell(cmd, cwd="/repo")) is None, cmd

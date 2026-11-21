@@ -12963,7 +12963,7 @@ _AXC_PLACE_RE = re.compile(
     r"|\bsvn\s+(?:co|checkout|export)\b|\b(?:wget|aria2c)\b|\bcurl\b[^|;&\n]{0,400}--output-dir\b",
     re.IGNORECASE)
 _AXC_COPY_CMD_RE = re.compile(
-    r"(?:^|[\s/\\!(`])(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|cpi|mi|scp|ditto)(?=\s|$)",
+    r"(?:^|[\s/\\!(`;&|])(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|cpi|mi|scp|ditto)(?=\s|$)",
     re.IGNORECASE)
 
 
@@ -13593,40 +13593,52 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     # must not depend on a config-dir NAME appearing in the command text)
     if _AXC_COPY_CMD_RE.search(noise) or re.search(r"\bclone\b", noise):
         seen, budget = set(), [3000]
-        for rendering in noise[:200_000].split("\n")[:64]:
+        # the same event with no cwd: a relative destination then counts as
+        # the project root -- used once the possible cd bases are too many to
+        # track (QA round 16)
+        ev_nocwd = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args=ev.args, cwd=None)
+        lines = noise[:200_000].split("\n")
+        for rendering in lines:
             # every `cd` base that MAY be in effect before each clause: a cd
             # replaces the bases only when chained with `&&` outside a
             # subshell; after `;`/`||`/`|`/`&`, or in `( )`, it may not have
             # happened, so the old bases stay too (QA round 14)
-            bases = [""]
-            pieces = _AXC_SEP_KEEP_RE.split(rendering)[:8192]
+            bases, overflow = [""], False
+            pieces = _AXC_SEP_KEEP_RE.split(rendering)
             for pi in range(0, len(pieces), 2):
                 clause = pieces[pi]
                 sep = pieces[pi + 1] if pi + 1 < len(pieces) else ""
-                cdm = re.match(r"^\s*([({]?)\s*(?:cd|pushd|chdir)(?:\s+(?:--\s+)?(\S{1,1024}))?\s*[)}]?\s*$",
-                               clause)
+                cdm = re.match(r"^\s*([({]?)\s*(?:builtin\s+|command\s+)?(?:cd|pushd|chdir)"
+                               r"(?:\s+-[LPe@]{1,3})*(?:\s+(\S{1,1024}))?\s*[)}]?\s*$", clause)
                 if cdm:
                     d = (cdm.group(2) or "").strip("'\"")
+                    if d in ("--", "~"):
+                        d = "~"
                     new = []
                     for b in bases:
-                        if d in ("", "-", "~") or d.startswith(("/", "~", "$")):
+                        if d in ("", "-") or d.startswith(("/", "~", "$")):
                             new.append("" if d in ("", "-") else d)
                         else:
                             root = b or str(ev.cwd or "")
                             new.append((root.rstrip("/") + "/" + d) if root else d)
-                    if sep == "&&" and not cdm.group(1):
-                        bases = list(dict.fromkeys(new))[:4]
-                    else:
-                        bases = list(dict.fromkeys(bases + new))[-4:]
+                    merged = list(dict.fromkeys(new if (sep == "&&" and not cdm.group(1)) else bases + new))
+                    if len(merged) > 4 or any(len(b) > 2048 for b in merged):
+                        overflow = True
+                        merged = merged[:2] + merged[-2:]
+                    bases = merged
                     continue
-                key = (clause.strip(), tuple(bases))
+                if not (_AXC_COPY_CMD_RE.search(clause) or "clone" in clause):
+                    continue
+                key = (clause.strip(), tuple(bases), overflow)
                 if key in seen:
                     continue
                 seen.add(key)
-                budget[0] -= len(bases)
+                budget[0] -= len(bases) + 1 + sum(len(b) for b in bases) // 256
                 if budget[0] < 0:
                     return kind or "dedicated"   # pathological: bounded work, the safe direction
                 if _agent_exec_copy_dir_into_place(ev, clause, bases):
+                    return kind or "dedicated"
+                if overflow and _agent_exec_copy_dir_into_place(ev_nocwd, clause, [""]):
                     return kind or "dedicated"
     if not kind and not inside and not patterns.AGENT_EXEC_PARENT_DIR_RE.search(noise):
         return ""
