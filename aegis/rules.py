@@ -12915,7 +12915,9 @@ _AXC_INPLACE_RE = re.compile(
     r"\bsed\b[^|;&\n]{0,300}?\s-[a-zA-Z]{0,8}i|\bsed\b[^|;&\n]{0,300}?\s--in-place\b"
     r"|\bperl\b[^|;&\n]{0,300}?\s-[a-zA-Z]{0,8}i"
     r"|\bawk\b[^|;&\n]{0,300}?-i\s*inplace\b|\b(?:vim?|nvim|ex)\b[^|;&\n]{0,300}?-c\s*['\"]?(?:wq!?|w\b|write)"
-    r"|^\s*ed\b", re.IGNORECASE)
+    r"|^\s*ed\b|\b(?:yq|dasel|sd)\b[^|;&\n]{0,300}?\s(?:-[a-zA-Z]{0,4}i\b|--in-place\b|-w\b|put\b)"
+    r"|\bjq\b[^|;&\n]{0,300}?\s--in-place\b|\bjaq\b[^|;&\n]{0,300}?\s-i\b",
+    re.IGNORECASE)
 # What makes an interpreter one-liner a WRITE (not `print(open(p).read())`).
 _AXC_INTERP_WRITE_RE = re.compile(
     r"open\s*\([^)]{0,300},\s*(?:mode\s*=\s*)?['\"][rbt+]*[wax]|\.write(?:_text|_bytes|lines)?\s*\("
@@ -12949,7 +12951,7 @@ _AXC_GLUED_OUT_RE = re.compile(r"(?-i:-[a-zA-Z]{0,8}[oOP])\S")
 # Commands whose -o/-d/-t/-P options are NOT output destinations
 _AXC_READONLY_WORDS = frozenset(("ls", "ll", "dir", "test", "[", "[[", "grep", "egrep", "fgrep", "rg",
                                  "ag", "find", "stat", "file", "du", "jq", "yq", "cat", "less", "head",
-                                 "tail", "diff", "wc", "sort", "uniq", "awk", "cut", "tr"))
+                                 "tail", "diff", "wc", "cut", "tr"))   # not sort/uniq/awk: they write (QA round 8)
 # Fetch / clone verbs that place files at a path operand (QA round 7)
 _AXC_PLACE_RE = re.compile(
     r"\bgit\b[^|;&\n]{0,200}\s(?:clone|submodule\s+add|worktree\s+add)\b|\bgh\s+repo\s+clone\b"
@@ -13081,7 +13083,7 @@ def _agent_exec_inside_dedicated(ev: Event, cmd: str) -> bool:
 
 # Any relative operand (not an option, absolute path, ~, variable or /dev/...)
 _AXC_REL_OPERAND_RE = re.compile(
-    r"(?:^|[\s'\"=<>])(?![-/~$\\])(?:\.{1,2}[/\\])?[\w@.][^\s'\"<>|;&]{0,1000}(?=[\s'\"<>|;&)]|$)")
+    r"(?:^|[\s'\"=<>])(?![-/~$\\])(?:\.{1,2}[/\\])?[\w@.][^\s'\"<>|;&=]{0,1000}(?=[\s'\"<>|;&)=]|$)")
 
 
 def _agent_exec_inside_parent(ev: Event, cmd: str) -> bool:
@@ -13189,7 +13191,7 @@ def _agent_exec_editor_cmd(clause: str) -> bool:
 # An interpreter's own inline-code argument (QA round 3: matching the whole
 # command asked on `grep 'spawn(' .opencode/plugin/x.ts && node --version`).
 _AXC_INTERP_CODE_RE = re.compile(
-    r"\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell|osascript)\b"
+    r"\b(?:python[0-9.]*|pypy[0-9.]*|node|nodejs|tsx|ts-node|deno|bun|ruby|perl|php|pwsh|powershell|osascript)\b"
     r"[^|;&\n]{0,200}?\s(?:-[a-zA-Z]{0,4}[ceErp]|--eval|--print|-Command|eval)(?=\s)",
     re.IGNORECASE)
 
@@ -13230,7 +13232,7 @@ _AXC_STAGE_SPLIT_RE = re.compile(r"(\|&|\|\|?|&&|(?<!>)&(?!>)|;|\n)")
 # node/ruby's -r are not inline code).
 _AXC_INLINE_FLAGS = (
     (re.compile(r"python[0-9.]*", re.I), re.compile(r"-[a-zA-Z]{0,6}c\S*")),
-    (re.compile(r"node|nodejs|deno|bun", re.I), re.compile(r"-[a-zA-Z]{0,6}[ep]\S*|--eval\S*|--print\S*")),
+    (re.compile(r"node|nodejs|deno|bun|tsx|ts-node", re.I), re.compile(r"-[a-zA-Z]{0,6}[ep]\S*|--eval\S*|--print\S*")),
     (re.compile(r"ruby", re.I), re.compile(r"-[a-zA-Z]{0,6}e\S*")),
     (re.compile(r"perl", re.I), re.compile(r"-[a-zA-Z]{0,6}[eE]\S*")),
     (re.compile(r"php", re.I), re.compile(r"-[a-zA-Z]{0,6}r\S*")),
@@ -13324,8 +13326,11 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
         # `> path`, `>>path`, `tee -a path`, `-o path`, `--output=path`, `of=path`
         lead = clause[:s]
         if _AXC_OUT_OP_RE.search(lead) or _AXC_GLUED_OUT_RE.match(clause, s):
-            if re.search(r">|\btee\b|\bof=", lead[-400:]) or \
-                    _agent_exec_command_word(clause)[0] not in _AXC_READONLY_WORDS:
+            # the read-only exemption covers short options only, and never a
+            # clause that runs another command (`find -exec curl -o ...`)
+            if (re.search(r">|\btee\b|\bof=|--[\w-]+=?\s*['\"]?$", lead[-400:])
+                    or re.search(r"\s-(?:exec|execdir|ok|okdir)\b", clause)
+                    or _agent_exec_command_word(clause)[0] not in _AXC_READONLY_WORDS):
                 return True
     if (_AXC_INPLACE_RE.search(clause)
             or patterns.FORCED_LINK_WRITE_RE.search(clause)
