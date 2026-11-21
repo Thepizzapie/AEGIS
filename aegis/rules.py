@@ -13770,7 +13770,22 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
     ``formatter`` or ``env`` setting elsewhere in the file does not make
     every later edit ask. Shell
     writes under ``.claude/``/``.vscode/``/``.mcp.json`` belong to other
-    guards and are not repeated here."""
+    guards and are not repeated here. ``~/.vscode/extensions`` (an editor,
+    not an agent) and ``xargs``-fed copy destinations are not covered.
+
+    QA history: seventeen independent adversarial review rounds (bypass
+    hunting, design / false-positive review, then verification of each
+    round's fixes). They found and closed, among others: JSON ``\\u`` / JSONC
+    comment / TOML quoted-key obfuscation of exec keys; a hidden-character
+    DENY from agent-rules-protect being downgraded to this ASK; several
+    quadratic or exponential regexes (wrapper skipping, interpreter windows,
+    newline runs, slash runs) -- each replaced by a linear token scan or a
+    bounded form; bundled download flags (``curl -fsSLo``); clone/download
+    into plugin directories; staged config directories copied or moved into
+    place (``cp -r /tmp/t/.codex ~/``, MCP ``move_file``), including after
+    ``cd`` chains that may or may not have run; and false positives on
+    ``git commit`` / ``grep`` / ``sort`` / backups. Round 17 passed with
+    nothing at medium severity or above."""
     if ev.event != HookEvent.PRE_TOOL_USE:
         return None
     cfg = getattr(policy, "agent_exec_config", None) or {}
