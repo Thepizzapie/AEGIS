@@ -12945,6 +12945,9 @@ _AXC_OUT_OP_RE = re.compile(
     # `wget -P`) -- QA round 7
     r"(?:>{1,2}\|?|\btee\b(?:\s+-[a-zA-Z-]+)*|(?:^|\s)(?-i:-[a-zA-Z]{0,8}[oOtdCP])"
     r"|--(?:output|target-directory|output-document|directory|output-dir|directory-prefix)=?"
+    # single-dash long output options (openssl -out, PowerShell -OutFile) and
+    # find's -fprint/-fprint0/-fprintf/-fls (QA round 9)
+    r"|(?:^|\s)-(?:out|outfile|OutFile|output|fprint0?|fprintf|fls)(?:\s+\S+)?"
     r"|\bof=)\s*['\"]?$", re.IGNORECASE)
 # A glued output option: `-o.cursor/hooks.json`, `-sLo.cursor/...`
 _AXC_GLUED_OUT_RE = re.compile(r"(?-i:-[a-zA-Z]{0,8}[oOP])\S")
@@ -13329,7 +13332,7 @@ def _agent_exec_clause_write(clause: str, names_re, parent_ok: bool) -> bool:
             # the read-only exemption covers short options only, and never a
             # clause that runs another command (`find -exec curl -o ...`)
             if (re.search(r">|\btee\b|\bof=|--[\w-]+=?\s*['\"]?$", lead[-400:])
-                    or re.search(r"\s-(?:exec|execdir|ok|okdir)\b", clause)
+                    or re.search(r"\s-(?:exec|execdir|ok|okdir|fprint0?|fprintf|fls|out|outfile)\b", clause)
                     or _agent_exec_command_word(clause)[0] not in _AXC_READONLY_WORDS):
                 return True
     if (_AXC_INPLACE_RE.search(clause)
@@ -13376,7 +13379,9 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
     shell command writes. ``cmd`` is the de-obfuscated scan surface."""
     # `-o.cursor/hooks.json` / `-sLo.x`: give a glued output operand the same
     # boundary a spaced one has (QA round 7)
-    cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}[oOP]))(?=[.~\w])", r"\1 ", cmd)
+    # -- only when the glued text is path-like, so `openssl ... -out PATH`
+    # stays one option (QA round 9)
+    cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}[oOP]))(?=[.~/\\]|[\w-]{0,200}[./\\])", r"\1 ", cmd)
     kind = patterns.agent_exec_path_hit(cmd)
     inside = _agent_exec_inside_parent(ev, cmd)
     noise = patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", cmd)
