@@ -12961,7 +12961,7 @@ _AXC_PLACE_RE = re.compile(
     r"|\bsvn\s+(?:co|checkout|export)\b|\b(?:wget|aria2c)\b|\bcurl\b[^|;&\n]{0,400}--output-dir\b",
     re.IGNORECASE)
 _AXC_COPY_CMD_RE = re.compile(
-    r"(?:^|[\s/\\!])(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|cpi|mi|scp|ditto)(?=\s|$)",
+    r"(?:^|[\s/\\!(`])(?:cp|mv|ln|install|rsync|copy|move|copy-item|move-item|cpi|mi|scp|ditto)(?=\s|$)",
     re.IGNORECASE)
 
 
@@ -13026,7 +13026,7 @@ def _agent_exec_target(ev: Event):
                     if form and patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(form):
                         return v, "dedicated", [form]
                     if form and _agent_exec_place_dest_ok(ev, form) and any(
-                            _agent_exec_effective_hit(form, src) for src in srcs[:16]):
+                            _agent_exec_effective_hit(form, src, str(ev.cwd or "")) for src in srcs[:16]):
                         return v, "dedicated", [form]
     return "", "", []
 
@@ -13393,12 +13393,17 @@ _AXC_HOME_DEST_RE = re.compile(
     r"^(?:\.|~|\$\{?HOME\}?|/root|/home/[^/\s]{1,64}|/Users/[^/\s]{1,64}|[A-Za-z]:\\Users\\[^\\\s]{1,64})[/\\]*$")
 
 
+_AXC_HOME_ROOT_RE = re.compile(
+    r"^(?:/home/_h|/root|/home/[^/\\\s]{1,64}|/Users/[^/\\\s]{1,64}|[A-Za-z]:\\Users\\[^\\\s]{1,64})$")
+
+
 def _agent_exec_place_dest_ok(ev: Event, dest: str) -> bool:
     """A copy destination that someone's agent will load from: the home dir,
     the cwd, a relative path, or an absolute path under the cwd -- not /tmp
     or a backup location elsewhere."""
     d = dest.rstrip("/\\") or "/"
-    if _AXC_HOME_DEST_RE.match(d) or re.match(r"^(?:~|\$\{?HOME\}?)[/\\]", d):
+    if _AXC_HOME_DEST_RE.match(d) or re.match(r"^(?:~|\$\{?HOME\}?)[/\\]", d) or \
+            re.match(r"^(?:/root|/home/[^/\s]{1,64}|/Users/[^/\s]{1,64})/", d):
         return True
     if not d.startswith(("/", "\\")) and not re.match(r"^[A-Za-z]:", d):
         return not d.startswith("..")
@@ -13406,28 +13411,46 @@ def _agent_exec_place_dest_ok(ev: Event, dest: str) -> bool:
     return bool(cwd and cwd not in ("/", "/tmp") and (d == cwd or d.startswith(cwd + "/")))
 
 
-def _agent_exec_effective_hit(dest: str, src: str) -> bool:
-    """`dest/basename(src)` (a copy INTO a directory), or dest itself, names an
-    agent config dir or a dedicated path."""
+def _agent_exec_effective_hit(dest: str, src: str, cwd: str = "") -> bool:
+    """`dest/basename(src)` (a copy INTO a directory), or dest itself, is a
+    dedicated path, or an agent config dir sitting where an agent loads it:
+    the home dir, the project root (cwd), or `~/.config` for the XDG ones --
+    not `~/backups/x/.codex` (QA round 12)."""
+    cwd = cwd.rstrip("/\\")
     for eff in (dest.rstrip("/\\") + "/" + re.split(r"[/\\]", src.rstrip("/\\"))[-1], dest):
         e = re.sub(r"^(?:~|\$\{?HOME\}?)(?=[/\\]|$)", "/home/_h", eff)
-        if patterns.AGENT_EXEC_PARENT_OPERAND_RE.match(e) or \
-                patterns.AGENT_EXEC_DEDICATED_RE.search(" " + e + " "):
+        e = re.sub(r"(?:^|(?<=[/\\]))\.(?:[/\\]+|$)", "", e) or "."
+        if patterns.AGENT_EXEC_DEDICATED_RE.search(" " + e + " "):
             return True
+        m = patterns.AGENT_EXEC_PARENT_SPLIT_RE.match(e)
+        if m:
+            pre = m.group(1).rstrip("/\\")
+            if pre in ("", ".") or (cwd and pre == cwd) or _AXC_HOME_ROOT_RE.match(pre):
+                return True
     return False
 
 
-def _agent_exec_copy_dir_into_place(ev: Event, clause: str) -> bool:
+def _agent_exec_copy_dir_into_place(ev: Event, clause: str, base: str = "") -> bool:
     """A copy/move/link whose effective destination -- ``dest/basename(src)``
     -- is an agent config dir or dedicated path, where dest is the home dir,
     the cwd or inside it: `cp -r .codex ~/`, `cp -r /tmp/t/.gemini/extensions
     ~/.gemini`, `cp /tmp/x/hooks.json .cursor/` (QA rounds 10-11)."""
-    if not _AXC_COPY_CMD_RE.search(clause):
+    clause = re.sub(r"\$\(|[()`]", " ", clause)       # `(cp ...)`, `$(cp ...)` (QA round 12)
+    clone = re.search(r"\bgit\b[^|;&\n]{0,200}\sclone\b", clause, re.IGNORECASE)
+    if not (_AXC_COPY_CMD_RE.search(clause) or clone):
         return False
     try:
         toks = shlex.split(clause, posix=True)
     except Exception:
         return False
+    if clone:
+        ops = [t for t in toks[toks.index("clone") + 1:] if not t.startswith("-")] if "clone" in toks else []
+        if not ops:
+            return False
+        dest = ops[1] if len(ops) > 1 else re.sub(r"\.git$", "", ops[0].rstrip("/").rsplit("/", 1)[-1])
+        if base and not dest.startswith(("/", "~", "$")):
+            dest = base.rstrip("/") + "/" + dest
+        return _agent_exec_place_dest_ok(ev, dest) and _agent_exec_effective_hit(dest, dest, str(ev.cwd or ""))
     idx = next((i for i, t in enumerate(toks)
                 if re.fullmatch(r"(?:.*[/\\])?(?:cp|mv|ln|install|rsync|copy|move|copy-item"
                                 r"|move-item|cpi|mi|scp|ditto)", t, re.IGNORECASE)), None)
@@ -13437,7 +13460,7 @@ def _agent_exec_copy_dir_into_place(ev: Event, clause: str) -> bool:
     target_dir, ops, k = None, [], 0
     while k < len(toks):
         t = toks[k]
-        if t in ("-t", "--target-directory") and k + 1 < len(toks):
+        if (t in ("-t", "--target-directory") or re.fullmatch(r"-[a-zA-Z]{1,8}t", t)) and k + 1 < len(toks):
             target_dir = toks[k + 1]
             k += 2
             continue
@@ -13452,9 +13475,11 @@ def _agent_exec_copy_dir_into_place(ev: Event, clause: str) -> bool:
         dest, srcs = ops[-1], ops[:-1]
     else:
         return False
+    if base and not dest.startswith(("/", "~", "$", "\\")) and not re.match(r"^[A-Za-z]:", dest):
+        dest = base.rstrip("/") + "/" + dest
     if not _agent_exec_place_dest_ok(ev, dest):
         return False
-    return any(_agent_exec_effective_hit(dest, src) for src in srcs[:64])
+    return any(_agent_exec_effective_hit(dest, src, str(ev.cwd or "")) for src in srcs[:64])
 
 
 def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
@@ -13476,6 +13501,14 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
             cmd = re.sub(r"((?:^|\s)(?-i:-[a-zA-Z]{0,8}?[oOP]))(?=[\w@][\w@.-]{0,200}\.\w{1,10}(?:\s|$))",
                          r"\1 ", cmd)
     noise = patterns.AGENT_RULES_FD_NOISE_RE.sub(" ", cmd)
+    # copy/move/clone into place, resolved by destination (QA round 12: this
+    # must not depend on a config-dir NAME appearing in the command text)
+    bases = [(m.group(1) or m.group(2) or m.group(3) or "") for m in _AXC_CHDIR_RE.finditer(cmd[:20000])]
+    base = bases[-1] if bases else ""
+    if _AXC_COPY_CMD_RE.search(noise) or re.search(r"\bclone\b", noise):
+        for clause in _AXC_CLAUSE_RE.split(noise[:200_000])[:4096]:
+            if _agent_exec_copy_dir_into_place(ev, clause, base):
+                return kind or "dedicated"
     if not kind and not inside and not patterns.AGENT_EXEC_PARENT_DIR_RE.search(noise):
         return ""
     names = [patterns.AGENT_EXEC_DEDICATED_RE, patterns.AGENT_EXEC_MIXED_RE]
@@ -13496,8 +13529,6 @@ def _agent_exec_shell_hit(ev: Event, cmd: str) -> str:
             return kind or "dedicated"
         for clause in _AXC_CLAUSE_RE.split(noise[:200_000])[:4096]:
             if _agent_exec_clause_write(clause, names_re, parent_ok=(names_re is names[0])):
-                return kind or "dedicated"
-            if names_re is names[0] and _agent_exec_copy_dir_into_place(ev, clause):
                 return kind or "dedicated"
     return ""
 

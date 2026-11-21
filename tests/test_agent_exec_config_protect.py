@@ -988,3 +988,38 @@ def test_qa11_shell_mcp_shapes():
     assert _only(_ev("mcp__x__run", args={"command": "echo x > .cursor/hooks.json"})) is not None
     assert _only(_ev("mcp__x__run", command="echo x > hooks.json",
                      working_directory="/repo/.cursor")) is not None
+
+
+# ---- QA round 12 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cp -r /tmp/d/opencode ~/.config/",
+    "mv /tmp/d/opencode ~/.config/",
+    "rsync -a /tmp/d/opencode ~/.config/",
+    "cp -rt ~/.config /tmp/d/opencode",
+    "cp -r /tmp/d/goose ~/.config/",
+    "cp -r /tmp/d/hooks .github/",
+    "cd ~/.config && git clone https://e/x opencode",
+    "(cp -r /tmp/d/evil ~/.gemini/extensions/)",
+    "$(cp -r /tmp/d/.codex ~)",
+    "(cp -r /tmp/d/.cursor .)",
+    "cp -r .codex ~/",
+    "cp -r /tmp/t/.gemini/extensions ~/.gemini",
+])
+def test_qa12_copy_into_place(cmd):
+    assert _only(_shell(cmd)) is not None, cmd
+
+
+def test_qa12_mcp_into_xdg():
+    ev = _ev("mcp__fs__move_file", source="/tmp/d/opencode", destination="/home/u/.config/")
+    assert _only(ev) is not None
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp -r ~/.codex ~/backups/codex-2026",
+    "cp -r ~/.gemini ~/old",
+    "cp -r ~/.gemini /tmp",
+    "cp -r /tmp/d/src ~/.config/",
+    "cd ~/src && git clone https://github.com/a/b",
+])
+def test_qa12_silent(cmd):
+    assert _only(_shell(cmd)) is None, cmd
