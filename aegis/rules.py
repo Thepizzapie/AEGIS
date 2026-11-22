@@ -13915,22 +13915,45 @@ _HTTP_RC_NON_CONTENT_KEYS = frozenset((
 ))
 
 
-# A read/search/info MCP call with an `encoding`/`mode`/`pattern` string must
-# not have those values parsed as rc directives (QA round 1).
-_HTTP_RC_MCP_WRITE_TOOL_RE = re.compile(
-    r"write|edit|create|put|save|append|update|patch|upload|move|copy|rename|replace|insert|set",
-    re.IGNORECASE)
+_HTTP_RC_WORD_SPLIT_RE = re.compile(r"[_\-.\s/]+|(?<=[a-z0-9])(?=[A-Z])")
+_HTTP_RC_READ_WORDS = frozenset((
+    "read", "get", "list", "search", "stat", "info", "view", "find", "head",
+    "tail", "cat", "tree", "exists", "exist", "describe", "watch", "ls",
+    "glob", "grep", "show", "open", "query", "lookup",
+))
+_HTTP_RC_WRITE_WORDS = frozenset((
+    "write", "edit", "create", "put", "save", "append", "update", "patch",
+    "upload", "move", "copy", "rename", "replace", "insert", "set",
+    "duplicate", "concatenate", "concat", "download", "mv", "cp", "store",
+    "add", "modify", "apply", "overwrite", "new", "make", "touch", "link",
+    "symlink", "restore", "import", "extract", "unzip", "untar", "sync",
+))
+# Argument keys that make even a read-shaped call put bytes somewhere.
+_HTTP_RC_OUTPUT_KEY_WORDS = frozenset((
+    "output", "out", "dest", "destination", "save", "target", "to", "outfile",
+))
 
 
-_HTTP_RC_MCP_READ_TOOL_RE = re.compile(
-    r"read|get|list|search|stat|info|view|find|head|tail|cat|tree|exist|describe|watch",
-    re.IGNORECASE)
+def _http_rc_words(name) -> set:
+    return {w.lower() for w in _HTTP_RC_WORD_SPLIT_RE.split(str(name or "")) if w}
 
 
 def _http_rc_mcp_read_only(ev: Event) -> bool:
-    tool = str(ev.tool or "")
-    return (ev.action == ActionClass.MCP and bool(_HTTP_RC_MCP_READ_TOOL_RE.search(tool))
-            and not _HTTP_RC_MCP_WRITE_TOOL_RE.search(tool))
+    """A read-shaped MCP call (a `read_file` with `encoding: utf-8` must not
+    have that value parsed as an rc directive -- QA round 1). Judged on the
+    TOOL's own name (after the last `__`, so a server called `cathead`
+    doesn't count), by whole word, with no write word and no output/
+    destination argument (QA round 3: `duplicate_file`, `concatenate_files`,
+    `http__get{save_to}`)."""
+    if ev.action != ActionClass.MCP:
+        return False
+    words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+    if not (words & _HTTP_RC_READ_WORDS) or (words & _HTTP_RC_WRITE_WORDS):
+        return False
+    for k in (ev.args or {}):
+        if _http_rc_words(k) & _HTTP_RC_OUTPUT_KEY_WORDS:
+            return False
+    return True
 
 
 def _http_rc_mcp_strings(ev: Event, a: dict) -> list:
@@ -13942,6 +13965,15 @@ def _http_rc_mcp_strings(ev: Event, a: dict) -> list:
     return _http_rc_written_strings(a)
 
 
+# Option keys a write tool never writes INTO the file (QA round 3:
+# `encoding_fallback_from: latin1` must not parse as a directive).
+_HTTP_RC_META_KEY_WORDS = frozenset((
+    "encoding", "charset", "mode", "format", "newline", "eol", "permissions",
+    "perm", "chmod", "owner", "mime", "mimetype", "language", "lang",
+    "dry", "dryrun", "run", "overwrite", "backup", "fallback", "from",
+))
+
+
 def _http_rc_written_strings(v, _depth: int = 0) -> list:
     if _depth > 12:
         return []
@@ -13949,6 +13981,9 @@ def _http_rc_written_strings(v, _depth: int = 0) -> list:
         out = []
         for k, x in v.items():
             if str(k) in _HTTP_RC_NON_CONTENT_KEYS:
+                continue
+            kw = _http_rc_words(k)
+            if kw and kw <= _HTTP_RC_META_KEY_WORDS:
                 continue
             out.extend(_http_rc_written_strings(x, _depth + 1))
         return out
@@ -13967,8 +14002,17 @@ _HTTP_RC_EDIT_PAIRS = (("old_string", "new_string"), ("oldText", "newText"),
                        ("old_str", "new_str"), ("old", "new"),
                        ("search", "replace"), ("find", "replace"),
                        ("pattern", "replacement"), ("from", "to"))
-_HTTP_RC_OLDISH_KEY_RE = re.compile(r"old|search|find|pattern|match|from|target_text|before",
-                                    re.IGNORECASE)
+# Key WORDS (split on `_`/`-`/camelCase) that name text being replaced or
+# its replacement; an unrecognized pair using any of them fails closed.
+_HTTP_RC_OLDISH_WORDS = frozenset((
+    "old", "search", "find", "pattern", "match", "before", "original",
+    "needle", "regex", "regexp", "existing", "query", "orig", "source", "src",
+    "replace", "replacement", "repl", "updated", "with",
+))
+# Pairs whose old side is a REGEX for some tools: replayed literally only
+# when the value has no regex metacharacter (QA round 3).
+_HTTP_RC_REGEXISH_OLD = frozenset(("search", "find", "pattern"))
+_HTTP_RC_REGEX_META_RE = re.compile(r"[.^$*+?()\[\]{}|\\]")
 
 
 def _http_rc_edit_list(a: dict) -> tuple:
@@ -14002,7 +14046,11 @@ def _http_rc_edit_list(a: dict) -> tuple:
         if depth > 6 or not isinstance(d, dict):
             return
         for k, v in d.items():
-            if k not in seen_keys and _HTTP_RC_OLDISH_KEY_RE.search(str(k)) and isinstance(v, str) and v:
+            if (k not in seen_keys and isinstance(v, str)
+                    and _http_rc_words(k) & _HTTP_RC_OLDISH_WORDS):
+                unreplayable = True
+            if (k in _HTTP_RC_REGEXISH_OLD and isinstance(v, str)
+                    and _HTTP_RC_REGEX_META_RE.search(v)):
                 unreplayable = True
             if isinstance(v, dict):
                 scan(v, depth + 1)
@@ -14034,7 +14082,7 @@ def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
         if ev.action == ActionClass.MCP:
             # Every non-path string, not just `content` (QA round 2: a
             # second `file_body` key rode along unjudged).
-            content = "\n".join(x for x in _http_rc_written_strings(a) if x != p)
+            return _http_rc_mcp_judge(_http_rc_written_strings(a), p, kind)
         return patterns.http_client_rc_unsafe_directives(content, kind)
     if edits:
         before = _npmrc_read(ev, p)
@@ -14042,11 +14090,20 @@ def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
         if after is not None:
             had = [ln for _, ln in patterns.http_client_rc_unsafe_entries(before, kind)]
             added = []
-            for name, ln in patterns.http_client_rc_unsafe_entries(after, kind):
+            after_unsafe = patterns.http_client_rc_unsafe_entries(after, kind)
+            for name, ln in after_unsafe:
                 if ln in had:
                     had.remove(ln)
                 else:
                     added.append(name)
+            if not added and after_unsafe and kind == "wget":
+                # Removing a safe OVERRIDE line (`use_proxy = off`) re-arms an
+                # unsafe line already in the file (QA round 3).
+                after_lines = [x.strip() for x in after.replace("\r", "\n").split("\n")]
+                for ln in before.replace("\r", "\n").split("\n"):
+                    if ln.strip() and ln.strip() not in after_lines and \
+                            patterns.http_client_rc_is_override_line(ln):
+                        added.append(ln.strip()[:40])
             return added
         found = patterns.http_client_rc_unsafe_directives(
             "\n".join(n for _, n, _ in edits), kind)
@@ -14055,10 +14112,46 @@ def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
         if any(o for o, _, _ in edits):
             return ["<edit not verifiable against the file on disk>"]
         return []
-    strings = (_http_rc_mcp_strings(ev, a) if ev.action == ActionClass.MCP
-               else _http_rc_written_strings(a))
+    if ev.action == ActionClass.MCP:
+        return _http_rc_mcp_judge(_http_rc_mcp_strings(ev, a), p, kind)
     return patterns.http_client_rc_unsafe_directives(
-        "\n".join(x for x in strings if x != p), kind)
+        "\n".join(x for x in _http_rc_written_strings(a) if x != p), kind)
+
+
+_HTTP_RC_PATHLIKE_RE = re.compile(
+    r"^(?:file://\S+|(?:~|\.{1,2})?[/\\][^\s=]*|[A-Za-z]:[/\\][^\s=]*)$")
+
+
+def _http_rc_mcp_judge(strings, p: str, kind: str) -> list:
+    """An MCP write's strings: the target path and its parent directories
+    are skipped; any OTHER path means content comes from another file
+    (copy/concatenate/duplicate) and is gated; the rest is rc text."""
+    body = []
+    pn = str(p).replace("\\", "/").rstrip("/")
+    for x in strings:
+        xs = x.strip()
+        if not xs or xs == p:
+            continue
+        if _HTTP_RC_PATHLIKE_RE.match(xs):
+            xn = xs.replace("\\", "/").rstrip("/")
+            if xn and (pn == xn or pn.startswith(xn + "/")):
+                continue
+            return [f"<content from another file: {xs[:60]}>"]
+        body.append(x)
+    return patterns.http_client_rc_unsafe_directives("\n".join(body), kind)
+
+
+def _http_rc_mcp_shell_command(ev: Event) -> Optional[str]:
+    a = ev.args or {}
+    if isinstance(a.get("args"), dict) and not any(k in a for k in ("command", "cmd", "script")):
+        a = a["args"]
+    for key in ("command", "cmd", "script", "shell_command", "commandLine", "command_line"):
+        v = a.get(key)
+        if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+            v = " ".join(list(v)[:256])
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
 
 
 def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -14155,8 +14248,19 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     non-path string is judged unless the tool is read-shaped;
     ``${XDG_CONFIG_HOME:-$HOME/.config}/curlrc`` spellings; leading-``*``
     globs; ``rg --pre``/``bat --pager``/``sort -o``; and false ASKs on
-    ``if``/``for`` loops, ``sort``/``cut``/``nl`` reads. All closed, with
-    regression tests."""
+    ``if``/``for`` loops, ``cut``/``nl`` reads. Round 3 found: the round-2
+    ``for`` no-op swallowed ``for x do cp ... ~/.curlrc`` (segments now
+    split on ``do``/``then``/``else``/``elif``); shell-type MCP tools
+    (``start_process``/``run_command``) were never judged as shell (now
+    re-evaluated as a Bash sub-event, as ``rule_agent_exec_config_protect``
+    does); unknown edit-key spellings (serena ``regex``/``repl``,
+    ``needle``, ``original``/``updated``) and regex-valued ``pattern``s
+    now fail closed; ``sort`` dropped (``--out=`` abbreviation,
+    ``--compress-program``); MCP read/write classification is now by
+    whole word on the tool's own name, with an output-argument override,
+    and a write that names a second file path (copy/concatenate) is
+    gated; removing a wget ``use_proxy = off`` override is gated; Windows
+    ``%XDG_CONFIG_HOME%``. All closed, with regression tests."""
     cfg = getattr(policy, "http_client_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14169,6 +14273,20 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
             _record_monitor(ev, would, "http-client-config-protect-monitor")
             return None
         return would
+
+    if ev.action == ActionClass.MCP:
+        # A shell-type MCP tool (`start_process`, `run_command`, ...): judge
+        # its command string as a shell command, as
+        # `rule_agent_exec_config_protect` does (QA round 3).
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                             args={"command": shell_cmd}, cwd=ev.cwd)
+            d = rule_http_client_config_protect(sub, policy)
+            if d is not None:
+                return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                "command that writes a curl/wget config file. " + d.message)
+            return None
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)

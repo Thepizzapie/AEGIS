@@ -7129,7 +7129,7 @@ HTTP_CLIENT_RC_PATH_RE = re.compile(
     _HTTP_RC_B + r"(?:"
     r"[._]curlrc"
     r"|\.config\}?" + _SEP + r"curlrc"
-    r"|\$\{?XDG_CONFIG_HOME(?::?[-=+?][^}\s]{0,200})?\}?" + _SEP + r"curlrc"
+    r"|(?:\$\{?|%|\$env:)XDG_CONFIG_HOME(?::?[-=+?][^}\s]{0,200})?[}%]?" + _SEP + r"curlrc"
     r"|[._]wgetrc"
     r"|etc" + _SEP + r"wget2?rc"
     r"|[._]wget2rc"
@@ -7324,6 +7324,16 @@ def http_client_rc_unsafe_entries(content, kind: str) -> list:
     return out
 
 
+def http_client_rc_is_override_line(line: str) -> bool:
+    """A wget line whose safety depends on its value (`use_proxy`,
+    `check_certificate`, `hsts`, `check_hostname`)."""
+    m = _HTTP_RC_LINE_RE.match(str(line or "").strip(" \t\ufeff\v\f"))
+    if not m:
+        return False
+    name = m.group("key").lower().replace("_", "").replace("-", "")
+    return name in _WGET_RC_SAFE_IF_ON or name in _WGET_RC_SAFE_IF_OFF
+
+
 def http_client_rc_kind(path) -> str:
     """'curl' / 'wget' / '' for an rc path -- decided by the matched rc name
     itself, not by `wget` appearing anywhere else in the path."""
@@ -7346,12 +7356,13 @@ HTTP_RC_SAFE_VERBS = frozenset((
     "echo", "printf", "true", "false", "cd", "pwd", "which", "type",
     "realpath", "readlink", "du", "bat", "get-content", "gc", "dir",
     "get-item", "test-path", "exit", "set", ":",
-    "cut", "tr", "nl", "column", "sort",
+    "cut", "tr", "nl", "column",
 ))
+# `sort` is deliberately absent: GNU getopt abbreviations (`--out=F`) write
+# and `--compress-program=sh` executes (QA round 3).
 # Safe verbs that become unsafe with a flag: `sort -o FILE` writes; `rg
 # --pre CMD` / `bat --pager CMD` run a program (QA round 2).
 _HTTP_RC_VERB_BAD_FLAGS = {
-    "sort": re.compile(r"(?:^|\s)(?:-[a-zA-Z]*o|--output)"),
     "rg": re.compile(r"--pre\b"),
     "bat": re.compile(r"--pager\b"),
 }
@@ -7361,7 +7372,11 @@ _HTTP_RC_NOOP_KEYWORDS = frozenset(("for", "case", "select", "fi", "done", "esac
 _HTTP_RC_PREFIX_WORDS = frozenset(("sudo", "command", "builtin", "nohup", "time",
                                    "env", "exec", "doas", "nice", "then", "do",
                                    "else", "if", "while", "until", "!", "{"))
-_HTTP_RC_SEG_SPLIT_RE = re.compile(r"&&|\|\||[;&|\n(){}`]|\$\(")
+# `do`/`then`/`else`/`elif` start a new simple command: `for x do cp ...`
+# (no `in`, no `;`) is valid bash, so a `for` segment must never swallow
+# the command after it (QA round 3 regression).
+_HTTP_RC_SEG_SPLIT_RE = re.compile(
+    r"&&|\|\||[;&|\n(){}`]|\$\(|(?<!\S)(?:do|then|else|elif)(?!\S)")
 _HTTP_RC_ASSIGN_RE = re.compile(r"^\w+=")
 _HTTP_RC_HARMLESS_REDIR_RE = re.compile(
     r"\d*>{1,2}\s*(?:/dev/null|&\d|&-)|&>\s*/dev/null|\d*<&?\d?")
