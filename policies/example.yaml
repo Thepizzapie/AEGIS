@@ -23,6 +23,18 @@
 #     require_pinned: false # deny unpinned specs (force exact == / a lockfile)
 #     allow: []            # regexes on the command that skip the gate
 
+# curl/wget config hijack (optional tuning). Built in and ON by default
+# (mode: ask): a write to ~/.curlrc / _curlrc / $XDG_CONFIG_HOME/curlrc /
+# ~/.wgetrc / /etc/wgetrc / wget2rc that adds anything beyond routine
+# transfer options (silent, fail, retries, timeouts, user-agent, redirects)
+# -- proxy, insecure, connect-to, trace, data=@file, url, engine, wget
+# https_proxy / check_certificate=off / post_file / use_askpass -- asks a
+# human first. A human pre-approves with AEGIS_ALLOW_HTTP_CLIENT_CONFIG=1
+# or a trailing '# aegis-allow' on a shell command; a spawned agent cannot.
+#   http_client_config:
+#     mode: ask            # deny | ask (default) | monitor | off
+#     allow: ['^/ci/\.curlrc$']   # regexes on the path/command that skip it
+
 default_action: allow
 on_error: allow
 
