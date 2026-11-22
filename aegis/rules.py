@@ -14169,6 +14169,25 @@ def _http_rc_mcp_judge(strings, p: str, kind: str) -> list:
     return patterns.http_client_rc_unsafe_directives("\n".join(body), kind)
 
 
+_HTTP_RC_PATH_SHAPE_RE = re.compile(
+    r"^(?:file://|[/\\~.]|[A-Za-z]:[/\\]|%\w+%|\$\{?\w+)[^\r\n]*$")
+
+
+def _http_rc_path_shaped(v) -> bool:
+    """A single-line string that starts like a path and whose rc-name match
+    runs to its end (spaces allowed: `C:\\Users\\John Smith\\_curlrc` --
+    QA round 5). Prose (`check your ~/.curlrc ...`) starts with a word."""
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or not _HTTP_RC_PATH_SHAPE_RE.match(t):
+        return False
+    m = None
+    for m in patterns.HTTP_CLIENT_RC_PATH_RE.finditer(t):
+        pass
+    return bool(m) and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?", t[m.end():]) is not None
+
+
 def _http_rc_mapping_keys(v, _depth: int = 0) -> list:
     out = []
     if _depth > 8:
@@ -14183,8 +14202,22 @@ def _http_rc_mapping_keys(v, _depth: int = 0) -> list:
     return out
 
 
+_HTTP_RC_SHELL_TOOL_WORDS = frozenset((
+    "exec", "execute", "run", "process", "terminal", "shell", "eval",
+    "interact", "repl", "spawn", "send", "command", "bash", "powershell",
+    "sh", "cmd", "tmux", "console",
+))
+
+
 def _http_rc_mcp_shell_command(ev: Event) -> Optional[str]:
     a = ev.args or {}
+    if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_SHELL_TOOL_WORDS:
+        # A shell/terminal/exec tool: every string it carries is shell
+        # input (`interact_with_process{input}`, `executable`+`args`,
+        # `arguments`/`argv`, tmux `keys`) -- QA round 5.
+        parts = [str(x) for x in _flatten_strings(a) if isinstance(x, (str, int, float))]
+        if parts:
+            return "\n".join(parts)[:200000]
     if isinstance(a.get("args"), dict) and not any(k in a for k in ("command", "cmd", "script")):
         a = a["args"]
     for key in ("command", "cmd", "script", "shell_command", "commandLine", "command_line"):
@@ -14196,6 +14229,8 @@ def _http_rc_mcp_shell_command(ev: Event) -> Optional[str]:
             extra = a.get("args") if a.get("args") is not a else None
             if isinstance(extra, (list, tuple)):
                 v += " " + " ".join(str(x) for x in list(extra)[:256])
+            elif isinstance(extra, str):
+                v += " " + extra
             for sk in ("stdin", "input", "script_body"):
                 if isinstance(a.get(sk), str) and a.get(sk):
                     v += "\n" + a[sk]
@@ -14319,7 +14354,17 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     path under a path key; ``stdin``/``args`` of shell tools; rc paths as
     mapping keys. False positives fixed: GitHub/Slack metadata args, prose
     mentioning ``~/.curlrc``, ``while read`` loops, case-only override
-    edits. Accepted: reordering two existing wget override lines."""
+    edits. Accepted: reordering two existing wget override lines. Round 5
+    found the round-4 whitespace-free path rule dropped spaced Windows
+    profile paths under nested/non-standard keys (now: any single-line,
+    path-shaped string whose rc-name match runs to its end); shell-like
+    MCP tools carrying input outside ``command`` (``interact_with_process``,
+    ``executable``+``args``, tmux ``keys``) -- a tool whose name is
+    shell/exec/run/terminal-shaped now has every string judged as shell;
+    indented patch headers. False positives fixed: editor verbs
+    (``view``/``create``) parsed as directives, diffs quoted inside an
+    ordinary MCP file write. Accepted: ``-w "\\n"`` now ASKs (write-out
+    is not allowlisted)."""
     cfg = getattr(policy, "http_client_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14347,7 +14392,12 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
                                 "command that writes a curl/wget config file. " + d.message)
             # No shell hit: fall through to the write check -- an editor
             # tool's `command: "create"` is not a shell (QA round 4
-            # regression).
+            # regression). A one-word editor verb is not file content
+            # either (QA round 5).
+            a0 = ev.args or {}
+            if isinstance(a0.get("command"), str) and re.fullmatch(r"\s*[A-Za-z_]{1,32}\s*", a0["command"]):
+                ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                                args={k: v for k, v in a0.items() if k != "command"})
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
@@ -14362,10 +14412,13 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
             # ~/.curlrc is prose, not a target).
             for s_ in _flatten_strings(a):
                 s_ = str(s_)
-                if s_ and not any(c.isspace() for c in s_.strip()) and patterns.http_client_rc_kind(s_):
+                if _http_rc_path_shaped(s_) and patterns.http_client_rc_kind(s_):
                     kind, p = patterns.http_client_rc_kind(s_), s_.strip()
                     break
-            if not kind:
+            if not kind and not (_path(ev) and "\n" not in _path(ev)):
+                # Patch bodies only when the call has no other, ordinary
+                # target (an MCP write of CHANGES.md quoting a diff is not
+                # a patch application -- QA round 5).
                 for s_ in _flatten_strings(a):
                     pk = patterns.http_client_rc_patch_kind(str(s_))
                     if pk:

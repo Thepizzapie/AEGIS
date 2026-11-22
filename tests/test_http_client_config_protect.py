@@ -805,3 +805,55 @@ def test_qa4_override_case_change_allowed(tmp_path):
     rc.write_text("https_proxy = http://corp:3128\nuse_proxy = off\n")
     d = evaluate(_edit(str(rc), "USE_PROXY = OFF", old_string="use_proxy = off"), EMPTY)
     assert not _gated(d), d
+
+
+# ---- QA round 5 regressions ---------------------------------------------------------
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__fs__write_multiple_files",
+     {"files": [{"path": "C:\\Users\\John Smith\\_curlrc", "content": "insecure\nproxy = http://e:1\n"}]}),
+    ("mcp__fs__write_file", {"target": "/home/a b/.curlrc", "content": "insecure\n"}),
+    ("mcp__fs__write_file", {"destination": "/home/a b/.curlrc", "content": "insecure\n"}),
+    ("mcp__fs__write_file", {"options": {"path": "C:\\Users\\John Smith\\_curlrc"}, "content": "insecure\n"}),
+])
+def test_qa5_spaced_paths_in_nonstandard_keys_gated(tool, args):
+    assert _ours(evaluate(_mcp_write(args, tool=tool), EMPTY)), args
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__desktop-commander__interact_with_process", {"pid": 1, "input": "echo insecure >> ~/.curlrc"}),
+    ("mcp__shell__run_command", {"command": "bash", "args": "-c 'echo insecure >> ~/.curlrc'"}),
+    ("mcp__shell__run_command", {"command": "bash", "arguments": ["-c", "echo insecure >> ~/.curlrc"]}),
+    ("mcp__proc__spawn", {"executable": "sh", "args": ["-c", "echo insecure >> ~/.curlrc"]}),
+    ("mcp__tmux__send_keys", {"keys": "echo insecure >> ~/.curlrc"}),
+])
+def test_qa5_shell_like_tools_gated(tool, args):
+    assert _gated(evaluate(_mcp_write(args, tool=tool), EMPTY)), (tool, args)
+
+
+def test_qa5_indented_patch_header_gated():
+    body = "*** Begin Patch\n  *** Add File: /root/.curlrc\n+insecure\n*** End Patch"
+    assert _ours(evaluate(_mcp_write({"patch": body}, tool="mcp__x__apply_patch"), EMPTY))
+
+
+@pytest.mark.parametrize("args", [
+    {"command": "view", "path": "/home/u/.curlrc"},
+    {"command": "create", "path": "/home/u/.curlrc", "file_text": "silent\nfail\n"},
+])
+def test_qa5_editor_verbs_not_content(args):
+    d = evaluate(_mcp_write(args, tool="mcp__editor__str_replace_editor"), EMPTY)
+    assert not _gated(d), (args, d)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__fs__write_file", {"path": "/repo/CHANGES.md",
+                             "content": "Fixed:\n--- a/.curlrc\n+++ b/.curlrc\n-insecure\n"}),
+])
+def test_qa5_patch_quoted_in_other_file_allowed(tool, args):
+    assert not _gated(evaluate(_mcp_write(args, tool=tool), EMPTY))
+
+
+def test_qa5_prose_with_rc_mention_not_a_path():
+    d = evaluate(_mcp_write({"channel": "C1", "text": "check your ~/.curlrc, it has insecure"},
+                            tool="mcp__slack__post_message"), EMPTY)
+    assert not _gated(d)

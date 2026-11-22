@@ -7335,7 +7335,7 @@ def http_client_rc_is_override_line(line: str) -> bool:
 
 
 _HTTP_RC_PATCH_HDR_RE = re.compile(
-    r"^(?:\*\*\*\s+(?:Add|Update|Delete|Move)\s+File:|\+\+\+\s|---\s|diff\s--git\s|\*\*\*\s+Move\s+to:)"
+    r"^[ \t]*(?:\*\*\*\s+(?:Add|Update|Delete|Move)\s+File:|\+\+\+\s|---\s|diff\s--git\s|\*\*\*\s+Move\s+to:)"
     r"[^\n]*$", re.MULTILINE)
 
 
