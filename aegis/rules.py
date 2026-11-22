@@ -11187,6 +11187,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.JVM_CONFIG_PATH_RE, "a Maven .mvn/jvm.config"),
     (patterns.WRAPPER_PROPS_PATH_RE, "a Gradle/Maven wrapper properties file"),
     (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
+    (patterns.HTTP_CLIENT_RC_PATH_RE, "a curl/wget config file (.curlrc/.wgetrc)"),
 )
 
 
@@ -13890,6 +13891,185 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+def _http_client_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+# Arg keys whose string values are the PRE-edit text (or the target path),
+# never content the call writes -- excluded from the flattened-content sweep.
+_HTTP_RC_NON_CONTENT_KEYS = frozenset((
+    "old_string", "oldText", "old_text", "oldString", "file_path", "path",
+    "notebook_path", "target_file", "targetFile", "filename", "file", "uri",
+    "filePath", "replace_all", "dryRun", "dry_run",
+))
+
+
+def _http_rc_written_strings(v, _depth: int = 0) -> list:
+    if _depth > 12:
+        return []
+    if isinstance(v, dict):
+        out = []
+        for k, x in v.items():
+            if str(k) in _HTTP_RC_NON_CONTENT_KEYS:
+                continue
+            out.extend(_http_rc_written_strings(x, _depth + 1))
+        return out
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            out.extend(_http_rc_written_strings(x, _depth + 1))
+        return out
+    if isinstance(v, str):
+        return [v]
+    return []
+
+
+def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate planting a directive in curl's/wget's per-user config
+    (``~/.curlrc``/``_curlrc``/``$XDG_CONFIG_HOME/curlrc``, ``~/.wgetrc``,
+    ``/etc/wgetrc``, wget2's ``wget2rc``) beyond routine transfer behaviour.
+
+    THREAT MODEL: coding agents run ``curl``/``wget`` constantly -- API
+    probes, ``curl -H "Authorization: Bearer $TOKEN" ...``, installer
+    downloads. Both tools silently apply every line of their rc file to
+    EVERY future invocation, by this agent, a teammate or CI, with nothing
+    in the visible command line to show it. A prompt-injected agent that
+    plants ``proxy = http://attacker:8080`` plus ``insecure`` (wget:
+    ``https_proxy`` + ``check_certificate = off``) gets a transparent TLS
+    MITM of every later request, tokens and all; ``connect-to``/
+    ``resolve``/``doh-url`` redirect a named host to another IP; ``trace``/
+    ``dump-header``/``cookie-jar`` (wget ``logfile``/``save_cookies``) log
+    every transfer's credentials to a file; ``url``/``data = @~/.ssh/
+    id_rsa``/``upload-file`` (wget ``post_file``/``body_file``) bolt an
+    exfiltration request onto every ordinary call; ``engine`` loads a
+    shared library and wget's ``use_askpass`` runs a program. It also
+    routes AROUND ``rule_network_egress``, which only ever sees the host
+    written in the command -- an allowlisted ``curl https://api.github.com``
+    still goes through the planted proxy. No existing guard covered these
+    files: the fetch-to-file backstop and containment only ever looked at
+    curl's/wget's command line, never the config both read implicitly.
+
+    Content check (``patterns.http_client_rc_unsafe_directives``) is an
+    ALLOWLIST: a file that only sets silent/fail/retry/timeout/user-agent/
+    redirect/progress-style options passes; any other directive -- including
+    an unknown alias, a short-option cluster with a non-benign letter, or a
+    wget ``check_certificate``/``hsts`` switched off -- is gated. curl's
+    250+ options, short aliases and three separator styles (and wget's
+    case/``_``/``-`` folding) make a denylist leak by alias.
+
+    Shell form: any write verb (redirect, ``tee``, ``cp``/``install``/
+    ``dd``, ``mv``, ``ln -sf``, ``sed -i``/``perl -pi``) on a command that
+    names one of these paths is gated without trying to reconstruct what
+    lands in the file -- writing an HTTP client's rc file from a shell is
+    rare, and a ``cp staged ~/.curlrc`` hides its content anyway. A bare
+    ``rm``/``del`` of the file is not gated (it removes a hijack). A
+    fetch-to-file write (``curl -o ~/.curlrc <url>``) is caught by
+    ``rule_fetch_to_file_protect``, which this guard's path regex is
+    registered with.
+
+    Config (``policy.http_client_config``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command). Escapable only by
+    a human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_HTTP_CLIENT_CONFIG=1`` set before launch; a spawned agent
+    can do neither.
+
+    Honest scope: ``CURL_HOME``/``XDG_CONFIG_HOME``/``WGETRC`` pointed at a
+    directory/file with none of these names, an explicit ``curl -K <file>``/
+    ``wget --config=<file>`` of a staged file, the ``HTTPS_PROXY``/
+    ``SSL_CERT_FILE`` environment variables (a shell-startup write is
+    ``rule_shell_persist_protect``'s), and a path assembled indirectly
+    (variable concatenation, ``cd ~ && cp x .curlrc`` without the name
+    literal) are not covered -- the same "computed indirectly" class every
+    sibling guard accepts. Other HTTP clients' configs (httpie, aria2,
+    ``.netrc`` writes, pip/npm proxy keys) are out of scope here.
+    A shell read that also writes elsewhere (``cp ~/.curlrc /tmp/bak``) is
+    an accepted false ASK."""
+    cfg = getattr(policy, "http_client_config", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "http-client-config-protect-monitor")
+            return None
+        return would
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        kind = patterns.http_client_rc_kind(p)
+        if not kind and ev.action == ActionClass.MCP:
+            # An MCP tool may name its path argument anything.
+            for s in _flatten_strings(a):
+                kind = patterns.http_client_rc_kind(str(s))
+                if kind:
+                    p = str(s)
+                    break
+        if not kind:
+            return None
+        literal = a.get("content")
+        if not isinstance(literal, str) or not literal:
+            literal = a.get("new_string")
+        if isinstance(literal, str) and literal:
+            content = literal
+        else:
+            content = "\n".join(s for s in _http_rc_written_strings(a) if s != p)
+        found = patterns.http_client_rc_unsafe_directives(content, kind)
+        if not found:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")
+                or _http_client_config_allowed_by_policy(cfg, p)):
+            return None
+        shown = ", ".join(found[:5]) + (", ..." if len(found) > 5 else "")
+        tool = "wget" if kind == "wget" else "curl"
+        return _finish(Decision(action, "http-client-config-protect",
+                         f"'{p}' is {tool}'s own config file, applied silently "
+                         f"to every future {tool} run (this agent, a teammate, "
+                         f"or CI), and this write sets: {shown}. Directives "
+                         "beyond routine transfer behaviour can reroute every "
+                         "request through a proxy (around Aegis's egress "
+                         "allowlist), disable TLS checks, log credentials to "
+                         "a file, or attach a local file to every request. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_HTTP_CLIENT_CONFIG=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        if not patterns.HTTP_CLIENT_RC_PATH_RE.search(cmd):
+            return None
+        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
+                           or patterns.HTTP_RC_MOVE_VERB_RE.search(cmd)
+                           or patterns.INPLACE_WRITE_RE.search(cmd)
+                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
+                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
+        if not write_verb:
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")
+                or _http_client_config_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "http-client-config-protect",
+                         "A curl/wget config file (.curlrc/.wgetrc) is being "
+                         "written from a shell -- every line in it applies "
+                         "silently to every future curl/wget run, and can "
+                         "reroute requests through a proxy (around Aegis's "
+                         "egress allowlist), disable TLS checks, log "
+                         "credentials, or attach a local file to every "
+                         "request. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_HTTP_CLIENT_CONFIG=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -13950,6 +14130,8 @@ _CORE_RULES = (
     # pre-empt `rm -rf ~` / `| sh` / force-push DENYs chained onto a plant.
     rule_repl_rc_exec_protect,
     rule_agent_exec_config_protect,
+    # Content-gated ASK; same tail-block reason as npmrc/repl_rc above.
+    rule_http_client_config_protect,
     rule_agent_rules_protect,
 )
 

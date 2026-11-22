@@ -7082,3 +7082,160 @@ def agent_exec_path_hit(text: str) -> str:
     if AGENT_EXEC_MIXED_RE.search(text):
         return "mixed"
     return ""
+
+
+# ---------------------------------------------------------------------------
+# HTTP-client config hijack (`rules.rule_http_client_config_protect`).
+#
+# curl reads `.curlrc` (`_curlrc` on Windows) from `$CURL_HOME`,
+# `$XDG_CONFIG_HOME` (also as `curlrc`) and `$HOME` on EVERY invocation not
+# started with `-q`/`--disable`; wget reads `/etc/wgetrc` then `~/.wgetrc`
+# (wget2: `~/.config/wget/wget2rc`, `~/.wget2rc`) on every run. Each line is
+# a command-line option applied to every future transfer, by this agent, a
+# teammate or CI, with nothing in the visible command line to show it:
+#   * `proxy`/`preproxy`/`socks5*`/`connect-to`/`resolve`/`doh-url`
+#     (wget: `http_proxy`/`https_proxy`/`use_proxy`) silently reroute every
+#     request -- `Authorization:` headers and tokens included -- through an
+#     attacker host, and route AROUND Aegis's own egress allowlist, which
+#     only sees the host written in the command;
+#   * `insecure`/`cacert`/`capath`/`proxy-insecure` (wget:
+#     `check_certificate = off`, `ca_certificate`) turn that reroute into a
+#     transparent TLS MITM;
+#   * `trace`/`trace-ascii`/`dump-header`/`cookie-jar`/`output`/`stderr`
+#     (wget: `logfile`, `save_cookies`, `output_document`) write every
+#     transfer -- credentials in it -- to a chosen file;
+#   * `url`/`data*`/`form`/`upload-file`/`variable` (wget: `post_file`,
+#     `body_file`) add an extra request, or attach a local file
+#     (`data = @~/.ssh/id_rsa`), to every transfer -- exfiltration on every
+#     ordinary `curl` the agent runs;
+#   * `engine` loads an OpenSSL engine shared library (code exec); wget's
+#     `use_askpass` runs a program; `config` includes another file.
+#
+# The content check is an ALLOWLIST, not a denylist: curl has 250+ options,
+# short aliases, `--`/`-`/bare spellings and `=`/`:`/space separators, and
+# wget folds case, `_` and `-` -- a denylist would leak by alias. A file
+# that only sets routine transfer behaviour (silent, fail, retries,
+# timeouts, user-agent, redirects, progress style) stays allowed; any other
+# directive is gated.
+_HTTP_RC_B = r"(?:^|[\s'\"/\\=:])"
+HTTP_CLIENT_RC_PATH_RE = re.compile(
+    _HTTP_RC_B + r"(?:"
+    r"[._]curlrc"
+    r"|\.config" + _SEP + r"curlrc"
+    r"|[._]wgetrc"
+    r"|etc" + _SEP + r"wgetrc"
+    r"|[._]wget2rc"
+    r"|wget" + _SEP + r"wget2?rc"
+    r")" + _CI_END,
+    re.IGNORECASE,
+)
+# Which grammar a path speaks.
+_HTTP_RC_WGET_RE = re.compile(r"wget2?rc", re.IGNORECASE)
+
+# curl long options (without dashes) that only shape ordinary transfer
+# behaviour. `no-<name>` of each is equally benign.
+_CURL_RC_SAFE_LONG = frozenset((
+    "silent", "show-error", "fail", "fail-with-body", "fail-early",
+    "location", "max-redirs", "retry", "retry-delay", "retry-max-time",
+    "retry-all-errors", "retry-connrefused", "connect-timeout", "max-time",
+    "user-agent", "compressed", "progress-bar", "progress-meter",
+    "verbose", "http1.0", "http1.1", "http2", "http3", "ipv4", "ipv6",
+    "keepalive", "keepalive-time", "buffer", "styled-output", "globoff",
+    "remote-time", "speed-limit", "speed-time", "limit-rate", "tcp-nodelay",
+    "tcp-fastopen", "parallel", "parallel-max", "parallel-immediate",
+    "tlsv1.2", "tlsv1.3", "ssl-reqd", "happy-eyeballs-timeout-ms",
+    "expect100-timeout", "disable", "include", "show-headers", "xattr",
+    "sessionid", "alpn", "npn", "clobber", "skip-existing",
+))
+# curl short options with the same property (case-sensitive: `-k` is
+# --insecure, `-K` is --config).
+_CURL_RC_SAFE_SHORT = frozenset("sSfLAmv#N4601gRiqY")
+
+# wget/wget2 rc commands, normalized the way wget itself reads them
+# (case-folded, `_` and `-` removed).
+_WGET_RC_SAFE = frozenset((
+    "tries", "timeout", "readtimeout", "connecttimeout", "dnstimeout",
+    "wait", "waitretry", "randomwait", "retryconnrefused", "retryonhosterror",
+    "retryonhttperror", "continue", "timestamping", "useragent", "quiet",
+    "verbose", "progress", "showprogress", "dotstyle", "dotbytes",
+    "dotsinline", "dotspacing", "robots", "noclobber", "serverresponse",
+    "inet4only", "inet6only", "preferfamily", "limitrate", "maxredirect",
+    "httpkeepalive", "cache", "compression", "iri", "localencoding",
+    "remoteencoding", "adjustextension", "httpsonly", "reclevel",
+    "noparent", "backups", "debug", "chunksize", "maxthreads",
+))
+# wget commands that are safe only when switched ON (`check_certificate =
+# off` is the TLS-MITM primitive; `hsts = off` drops HSTS upgrades).
+_WGET_RC_SAFE_IF_ON = frozenset(("checkcertificate", "hsts", "checkhostname"))
+_WGET_ON_VALUES = frozenset(("on", "1", "yes", "true"))
+
+_HTTP_RC_LINE_RE = re.compile(
+    r"^[ \t\ufeff]*(?P<dash>-{0,2})(?P<key>[^\s=:]+)(?:[ \t]*[=:][ \t]*|[ \t]+|$)(?P<val>.*)$")
+
+
+def _curl_rc_line_safe(dash: str, key: str) -> bool:
+    if dash == "-" and len(key) >= 1 and not key.startswith("-"):
+        # `-sS` style cluster: safe only if every letter is.
+        return all(c in _CURL_RC_SAFE_SHORT for c in key)
+    name = key.lower()
+    if name.startswith("no-"):
+        name = name[3:]
+    return name in _CURL_RC_SAFE_LONG
+
+
+def _wget_rc_line_safe(key: str, val: str) -> bool:
+    name = key.lower().replace("_", "").replace("-", "")
+    if name in _WGET_RC_SAFE:
+        return True
+    if name in _WGET_RC_SAFE_IF_ON:
+        v = val.strip().strip("'\"").strip().lower()
+        return v in _WGET_ON_VALUES
+    return False
+
+
+_HTTP_RC_MAX_LINES = 20000
+_CURL_RC_CRLF_ESC_RE = re.compile(r"\\[rn]")
+
+
+def http_client_rc_unsafe_directives(content: str, kind: str) -> list:
+    """Directive names in `content` (an rc-file body or fragment) that fall
+    outside the benign allowlist for `kind` ('curl' or 'wget'). Blank lines
+    and full-line `#` comments are inert in both grammars."""
+    out = []
+    if not content:
+        return out
+    text = content.replace("\r", "\n")
+    for i, line in enumerate(text.split("\n")):
+        if i >= _HTTP_RC_MAX_LINES:
+            out.append("<oversized>")
+            break
+        s = line.strip(" \t\ufeff\v\f")
+        if not s or s.startswith("#"):
+            continue
+        m = _HTTP_RC_LINE_RE.match(s)
+        if not m:
+            out.append(s[:40])
+            continue
+        dash, key, val = m.group("dash"), m.group("key"), m.group("val") or ""
+        if kind == "wget":
+            ok = not dash and _wget_rc_line_safe(key, val)
+        else:
+            # A `\r`/`\n` escape in a quoted curl value would smuggle an
+            # extra header line into an otherwise benign one (user-agent).
+            ok = _curl_rc_line_safe(dash, key) and not _CURL_RC_CRLF_ESC_RE.search(val)
+        if not ok:
+            out.append((dash + key)[:40])
+    return out
+
+
+def http_client_rc_kind(path: str) -> str:
+    """'curl' / 'wget' / '' for an rc path."""
+    if not path or not HTTP_CLIENT_RC_PATH_RE.search(path):
+        return ""
+    return "wget" if _HTTP_RC_WGET_RE.search(path) else "curl"
+
+
+# Shell verbs that put content at a path. A bare delete (`rm ~/.curlrc`)
+# removes the hijack rather than planting one, so it is not on this list.
+HTTP_RC_MOVE_VERB_RE = re.compile(
+    r"\b(?:mv|move-item|move|ren|rename-item)\b", re.IGNORECASE)
