@@ -875,3 +875,26 @@ def test_qa5_prose_with_rc_mention_not_a_path():
 ])
 def test_qa6_patch_tool_with_path_arg_gated(tool, args):
     assert _ours(evaluate(_mcp_write(args, tool=tool), EMPTY)), (tool, args)
+
+
+# ---- QA round 7 (non-blocking, closed) --------------------------------------------
+
+_D = "--- a/.curlrc\n+++ b/.curlrc\n@@ -0,0 +1 @@\n+insecure\n"
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__git__git_am", {"path": "/home/u", "mbox": "From x\n\n" + _D}),
+    ("mcp__x__edit", {"path": "/home/u", "udiff": _D}),
+    ("mcp__x__edit_files", {"path": "/home/u/repo", "diff_text": _D}),
+    ("mcp__x__merge", {"file": "/home/u", "hunks": _D}),
+    ("mcp__x__bulk", {"path": "/home/u", "patches": [_D]}),
+])
+def test_qa7_patch_under_any_noncontent_key_gated(tool, args):
+    assert _ours(evaluate(_mcp_write(args, tool=tool), EMPTY)), (tool, args)
+
+
+@pytest.mark.parametrize("key", ["content", "text", "body"])
+def test_qa7_quoted_diff_in_content_allowed(key):
+    d = evaluate(_mcp_write({"path": "/repo/NOTES.md", key: "Fixed:\n" + _D},
+                            tool="mcp__fs__write_file"), EMPTY)
+    assert not _gated(d)

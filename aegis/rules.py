@@ -14367,7 +14367,11 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     is not allowlisted). Round 6 found the round-5 quoted-diff skip also
     hid real patch tools whose ``path`` arg is a repo/workdir (``git_apply
     {path, patch}``); the skip now applies only to non-patch tools with the
-    diff under an ordinary content key."""
+    diff under an ordinary content key. Round 7 APPROVED; its one
+    non-blocking note (diffs under other keys -- ``mbox``/``udiff``/
+    ``hunks`` -- of a call with a directory ``path``) was closed by
+    inverting the skip: only ``content``/``text``/``body``-style keys of a
+    call with its own target are exempt from patch scanning."""
     cfg = getattr(policy, "http_client_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14418,20 +14422,23 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
                 if _http_rc_path_shaped(s_) and patterns.http_client_rc_kind(s_):
                     kind, p = patterns.http_client_rc_kind(s_), s_.strip()
                     break
-            patch_tool = bool(_http_rc_words(str(ev.tool or "").split("__")[-1])
-                              & {"patch", "diff", "apply"})
-            patch_key = any(isinstance(a.get(k_), str) and patterns.http_client_rc_patch_kind(a[k_])
-                            for k_ in ("patch", "diff", "changes", "input", "patches"))
-            # QA round 6: a patch tool's `path` is often its repo/workdir,
-            # so the skip applies only to non-patch tools carrying the diff
-            # under an ordinary content key.
-            if not kind and (patch_tool or patch_key
-                             or not (_path(ev) and "\n" not in _path(ev))):
-                # Patch bodies only when the call has no other, ordinary
-                # target (an MCP write of CHANGES.md quoting a diff is not
-                # a patch application -- QA round 5).
-                for s_ in _flatten_strings(a):
-                    pk = patterns.http_client_rc_patch_kind(str(s_))
+            # QA rounds 5-7: a diff QUOTED in an ordinary file write (CHANGES.md
+            # content) is not a patch application, so only strings under a
+            # plain content key of a call whose own target is set are exempt;
+            # every other string (patch/diff/mbox/udiff/hunks keys, list
+            # values, or a call with no target) is scanned for patch headers.
+            exempt = set()
+            if _path(ev) and "\n" not in _path(ev):
+                exempt = {"content", "contents", "text", "body", "file_content", "new_content"}
+            if not kind:
+                for k_, v_ in a.items():
+                    if str(k_) in exempt:
+                        continue
+                    pk = ""
+                    for s_ in _flatten_strings({k_: v_}):
+                        pk = patterns.http_client_rc_patch_kind(str(s_))
+                        if pk:
+                            break
                     if pk:
                         kind, p, found = pk, "<patch>", ["<patch touching a curl/wget config file>"]
                         break
