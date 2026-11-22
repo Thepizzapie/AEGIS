@@ -13892,7 +13892,12 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
 
 
 def _http_client_config_allowed_by_policy(cfg: dict, text: str) -> bool:
-    for pat in (cfg.get("allow") or []):
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):
+        allow = [allow]          # a bare string is one regex, not characters
+    elif not isinstance(allow, (list, tuple)):
+        return False
+    for pat in allow:
         try:
             if re.search(str(pat), text, re.IGNORECASE):
                 return True
@@ -13908,6 +13913,33 @@ _HTTP_RC_NON_CONTENT_KEYS = frozenset((
     "notebook_path", "target_file", "targetFile", "filename", "file", "uri",
     "filePath", "replace_all", "dryRun", "dry_run",
 ))
+
+
+# MCP arg keys that carry content being written. A read/search/info MCP call
+# with an `encoding`/`mode`/`pattern` string must not have those values
+# parsed as rc directives (QA round 1).
+_HTTP_RC_MCP_CONTENT_KEYS = frozenset((
+    "content", "contents", "text", "data", "body", "newText", "new_text",
+    "new_string", "newString", "new_source", "edits", "value", "source",
+    "file_text", "fileText", "payload", "lines", "patch", "diff",
+))
+_HTTP_RC_MCP_WRITE_TOOL_RE = re.compile(
+    r"write|edit|create|put|save|append|update|patch|upload|move|copy|rename|replace|insert|set",
+    re.IGNORECASE)
+
+
+def _http_rc_mcp_strings(ev: Event, a: dict) -> list:
+    keyed = []
+    for k, v in a.items():
+        if str(k) in _HTTP_RC_MCP_CONTENT_KEYS:
+            keyed.extend(_http_rc_written_strings(v))
+    if keyed:
+        return keyed
+    # No recognizable content key: a write-shaped tool still has every
+    # non-path string judged; a read-shaped one has nothing to judge.
+    if _HTTP_RC_MCP_WRITE_TOOL_RE.search(str(ev.tool or "")):
+        return _http_rc_written_strings(a)
+    return []
 
 
 def _http_rc_written_strings(v, _depth: int = 0) -> list:
@@ -13928,6 +13960,46 @@ def _http_rc_written_strings(v, _depth: int = 0) -> list:
     if isinstance(v, str):
         return [v]
     return []
+
+
+def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
+    """Unsafe directive names the call would leave in the file. A whole-file
+    Write is judged as written. An Edit/MultiEdit/MCP edit is replayed on the
+    on-disk file and the RESULT is diffed (by whole line) against the file
+    as it stands -- QA round 1: judging only `new_string` let a deletion
+    (`# insecure` -> `insecure`, `silent insecure` -> `insecure`) uncover a
+    directive planted earlier as inert text. An edit the hook cannot replay
+    (file unreadable, old text absent) that removes text is gated."""
+    a = ev.args or {}
+    edits = _npmrc_edit_list(a)
+    content = a.get("content")
+    if not isinstance(content, str):
+        content = a.get("contents") if isinstance(a.get("contents"), str) else None
+    if isinstance(content, str) and not edits:
+        return patterns.http_client_rc_unsafe_directives(content, kind)
+    if edits:
+        before = _npmrc_read(ev, p)
+        after = _npmrc_apply_edits(before, edits) if before is not None else None
+        if after is not None:
+            had = [ln for _, ln in patterns.http_client_rc_unsafe_entries(before, kind)]
+            added = []
+            for name, ln in patterns.http_client_rc_unsafe_entries(after, kind):
+                if ln in had:
+                    had.remove(ln)
+                else:
+                    added.append(name)
+            return added
+        found = patterns.http_client_rc_unsafe_directives(
+            "\n".join(n for _, n, _ in edits), kind)
+        if found:
+            return found
+        if any(o for o, _, _ in edits):
+            return ["<edit not verifiable against the file on disk>"]
+        return []
+    strings = (_http_rc_mcp_strings(ev, a) if ev.action == ActionClass.MCP
+               else _http_rc_written_strings(a))
+    return patterns.http_client_rc_unsafe_directives(
+        "\n".join(x for x in strings if x != p), kind)
 
 
 def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -13963,15 +14035,26 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     250+ options, short aliases and three separator styles (and wget's
     case/``_``/``-`` folding) make a denylist leak by alias.
 
-    Shell form: any write verb (redirect, ``tee``, ``cp``/``install``/
-    ``dd``, ``mv``, ``ln -sf``, ``sed -i``/``perl -pi``) on a command that
-    names one of these paths is gated without trying to reconstruct what
-    lands in the file -- writing an HTTP client's rc file from a shell is
-    rare, and a ``cp staged ~/.curlrc`` hides its content anyway. A bare
-    ``rm``/``del`` of the file is not gated (it removes a hijack). A
-    fetch-to-file write (``curl -o ~/.curlrc <url>``) is caught by
-    ``rule_fetch_to_file_protect``, which this guard's path regex is
-    registered with.
+    Edit/MultiEdit/MCP ``edit_file`` calls are REPLAYED against the file on
+    disk and the resulting file is diffed, by whole line, against the file
+    as it stands: a deletion that uncovers a directive planted earlier as
+    inert text (``# insecure`` -> ``insecure``) counts as adding it, while an
+    unrelated edit to a file that already carries a human-set ``proxy`` line
+    is not re-litigated. An edit the hook cannot replay (file unreadable,
+    old text absent) is judged on its new text, and gated if it removes
+    anything. For MCP calls only content-shaped keys are judged (a
+    ``read_file`` with ``encoding: utf-8`` is not a write).
+
+    Shell form is INVERTED: a command naming one of these paths -- literally,
+    through ``\\`` escapes, or through a glob/brace word bash would expand to
+    one (``~/.curl{rc,}``, ``~/.curlr?``) -- is gated unless every simple
+    command in it is a read-only/delete verb (``cat``/``grep``/``ls``/
+    ``stat``/``test``/``rm``...) and nothing is redirected into a file
+    (``2>/dev/null``/``2>&1`` noise excepted). A write-verb list always
+    misses one more tool (rsync, ``tar -x``, unzip, sponge, socat, ``sed
+    w``, ``vim -es``, patch, cpio). A fetch-to-file write (``curl -o
+    ~/.curlrc <url>``) is also caught by ``rule_fetch_to_file_protect``,
+    which this guard's path regex is registered with.
 
     Config (``policy.http_client_config``): ``mode`` (deny|ask|monitor|off,
     default ask), ``allow`` (regexes on the path/command). Escapable only by
@@ -13988,8 +14071,23 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     literal) are not covered -- the same "computed indirectly" class every
     sibling guard accepts. Other HTTP clients' configs (httpie, aria2,
     ``.netrc`` writes, pip/npm proxy keys) are out of scope here.
-    A shell read that also writes elsewhere (``cp ~/.curlrc /tmp/bak``) is
-    an accepted false ASK."""
+    Accepted false ASKs on the shell form: any non-read verb in a command
+    that merely mentions the path (``cp ~/.curlrc /tmp/bak``, ``git commit
+    -m "mention .curlrc"``, ``echo see ~/.curlrc >> NOTES.md``).
+
+    QA history (two independent reviews, bypass-hunting and design/false-
+    positive, run in parallel): round 1 found the path regex's shared end
+    anchor rejected a glued ``>``/``<`` (``cat >~/.curlrc<<EOF``,
+    ``tee ~/.curlrc>/dev/null``) and its start anchor a glued redirect
+    (``>.curlrc``); a two-step uncomment-by-Edit plant; escape/brace/glob
+    spellings; ten write tools outside the verb list; NTFS ``::$DATA``;
+    ``/etc/wget2rc`` and literal ``$XDG_CONFIG_HOME/curlrc``. On the
+    false-positive side: fd-noise redirects, read-only MCP calls with an
+    ``encoding``/``pattern`` arg, common options (``write-out`` sans
+    ``%output{}``, ``create-dirs``, ``proto``, wget ``use_proxy = off``),
+    a bare-string ``allow``. Credential-printing ``verbose``/``include``
+    (wget ``debug``/``server_response``) were moved OUT of the allowlist.
+    All closed, with regression tests."""
     cfg = getattr(policy, "http_client_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14016,14 +14114,7 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
                     break
         if not kind:
             return None
-        literal = a.get("content")
-        if not isinstance(literal, str) or not literal:
-            literal = a.get("new_string")
-        if isinstance(literal, str) and literal:
-            content = literal
-        else:
-            content = "\n".join(s for s in _http_rc_written_strings(a) if s != p)
-        found = patterns.http_client_rc_unsafe_directives(content, kind)
+        found = _http_rc_new_unsafe(ev, p, kind)
         if not found:
             return None
         if (os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")
@@ -14045,14 +14136,12 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        if not patterns.HTTP_CLIENT_RC_PATH_RE.search(cmd):
+        if not patterns.http_client_rc_shell_path_hit(cmd):
             return None
-        write_verb = bool(patterns.WRITE_REDIRECT_RE.search(cmd)
-                           or patterns.HTTP_RC_MOVE_VERB_RE.search(cmd)
-                           or patterns.INPLACE_WRITE_RE.search(cmd)
-                           or patterns.FORCED_LINK_WRITE_RE.search(cmd)
-                           or patterns.COPY_WRITE_VERB_RE.search(cmd))
-        if not write_verb:
+        # Inverted check (QA round 1): any command naming the path is gated
+        # unless it only reads or deletes -- a write-verb list always misses
+        # one more tool (rsync, tar -x, unzip, sponge, socat, vim -es, patch).
+        if patterns.http_client_rc_shell_only_reads(cmd):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")
                 or _http_client_config_allowed_by_policy(cfg, _cmd(ev))):

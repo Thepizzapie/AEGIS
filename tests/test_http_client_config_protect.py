@@ -212,8 +212,10 @@ def test_edit_new_string_gated():
     assert _ours(d)
 
 
-def test_edit_benign_new_string_allowed():
-    d = evaluate(_edit("/home/u/.curlrc", "silent\n", old_string="proxy = http://e:1\n"), EMPTY)
+def test_edit_benign_new_string_allowed(tmp_path):
+    rc = tmp_path / ".curlrc"
+    rc.write_text("proxy = http://e:1\n")
+    d = evaluate(_edit(str(rc), "silent\n", old_string="proxy = http://e:1\n"), EMPTY)
     assert not _gated(d)
 
 
@@ -222,10 +224,14 @@ def test_multiedit_gated():
     assert _ours(d)
 
 
-def test_multiedit_benign_allowed():
+def test_multiedit_benign_allowed(tmp_path):
     """The file path and old_string values must not be parsed as directives."""
-    d = evaluate(_multiedit("/home/u/.curlrc", ["silent\n", "fail\n"]), EMPTY)
-    assert not _gated(d)
+    rc = tmp_path / ".curlrc"
+    rc.write_text("x\n")
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+                    args={"file_path": str(rc),
+                          "edits": [{"old_string": "x", "new_string": "silent\nfail"}]})
+    assert not _gated(evaluate(ev, EMPTY))
 
 
 def test_mcp_write_gated():
@@ -241,8 +247,10 @@ def test_mcp_edit_file_newtext_gated():
     assert _ours(d)
 
 
-def test_mcp_edit_file_benign_allowed():
-    d = evaluate(_mcp_write({"path": "/home/u/.wgetrc",
+def test_mcp_edit_file_benign_allowed(tmp_path):
+    rc = tmp_path / ".wgetrc"
+    rc.write_text("https_proxy=http://e:1\n")
+    d = evaluate(_mcp_write({"path": str(rc),
                              "edits": [{"oldText": "https_proxy=http://e:1", "newText": "tries=3"}]},
                             tool="mcp__filesystem__edit_file"), EMPTY)
     assert not _gated(d)
@@ -359,3 +367,213 @@ def test_large_benign_file_fast():
     t = time.time()
     evaluate(_write("/home/u/.curlrc", body), EMPTY)
     assert time.time() - t < 2.0
+
+
+# ---- QA round 1 regressions ---------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    # path glued to `<`/`>` (heredoc / redirect)
+    "cat >~/.curlrc<<EOF\ninsecure\nEOF",
+    "cat >~/.wgetrc<<'EOF'\nhttps_proxy=http://e\ncheck_certificate=off\nEOF",
+    "tee ~/.curlrc</tmp/evil",
+    "tee ~/.curlrc>/dev/null <<< insecure",
+    "printf 'proxy=x' | tee -a ~/.curlrc>/dev/null",
+    # bare relative redirect target
+    "cd ~ && echo insecure >.curlrc",
+    "cd ~ && echo insecure >>.curlrc",
+    # escapes / braces / globs
+    "printf 'insecure\\n' > ~/.curl\\rc",
+    "echo insecure | tee ~/.{curl,wget}rc",
+    "echo insecure | tee ~/.curl{rc,}",
+    "echo insecure >> ~/.curlr?",
+    "echo insecure >> ~/.curlr[c]",
+    "echo insecure >> ~/.wget*",
+    # write tools outside any verb list
+    "rsync /tmp/evil ~/.curlrc",
+    "tar -xf /tmp/x.tar -C ~ .curlrc",
+    "unzip -o /tmp/x.zip .curlrc -d ~",
+    "echo insecure | sponge ~/.curlrc",
+    "socat -u FILE:/tmp/e CREATE:$HOME/.curlrc",
+    "sed -n 'w /home/u/.curlrc' /tmp/evil",
+    "vim -es -c 'normal iinsecure' -c 'x' ~/.curlrc",
+    "ex -s ~/.curlrc <<< $'a\\ninsecure\\n.\\nx'",
+    "patch ~/.curlrc < /tmp/p.diff",
+    "cpio -i < x.cpio .curlrc",
+    "echo 'use_askpass=/tmp/x' > /etc/wget2rc",
+])
+def test_qa1_shell_bypasses_gated(cmd):
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _gated(d), (cmd, d)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat ~/.curlrc 2>/dev/null",
+    "ls -la ~/.curlrc ~/.wgetrc",
+    "test -f ~/.curlrc && cat ~/.curlrc | grep -v proxy",
+    "rm -f ~/.curlrc",
+    "head -n 5 ~/.wgetrc; wc -l ~/.wgetrc",
+])
+def test_qa1_shell_reads_still_allowed(cmd):
+    d = evaluate(_shell(cmd), EMPTY)
+    assert d.rule != RULE, (cmd, d)
+
+
+def test_qa1_ntfs_stream_path_gated():
+    d = evaluate(_write("C:\\Users\\u\\.curlrc::$DATA", "insecure\n"), EMPTY)
+    assert _ours(d)
+    d = evaluate(_write("C:\\Users\\u\\.curlrc:x", "insecure\n"), EMPTY)
+    assert _ours(d)
+
+
+@pytest.mark.parametrize("before,old,new", [
+    ("# insecure\n", "# ", ""),
+    ("silent insecure\n", "silent ", "\n"),
+    ("#insecure\n", "#", "  "),
+    ("# proxy = http://e:1\nsilent\n", "# proxy", "proxy"),
+])
+def test_qa1_deletion_edit_uncovering_directive_gated(tmp_path, before, old, new):
+    rc = tmp_path / ".curlrc"
+    rc.write_text(before)
+    d = evaluate(_edit(str(rc), new, old_string=old), EMPTY)
+    assert _ours(d), d
+    d = evaluate(_multiedit(str(rc), []), EMPTY)   # sanity: empty edit list
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit",
+                    args={"file_path": str(rc),
+                          "edits": [{"old_string": old, "new_string": new}]})
+    assert _ours(evaluate(ev, EMPTY))
+
+
+def test_qa1_mcp_deletion_edit_gated(tmp_path):
+    rc = tmp_path / ".wgetrc"
+    rc.write_text("# https_proxy = http://e\n")
+    d = evaluate(_mcp_write({"path": str(rc),
+                             "edits": [{"oldText": "# ", "newText": ""}]},
+                            tool="mcp__filesystem__edit_file"), EMPTY)
+    assert _ours(d)
+
+
+def test_qa1_edit_of_unrelated_line_keeps_existing_directive_allowed(tmp_path):
+    """A pre-existing proxy line the human set is not re-litigated by an
+    unrelated benign edit."""
+    rc = tmp_path / ".curlrc"
+    rc.write_text("proxy = http://corp:3128\nretry 2\n")
+    d = evaluate(_edit(str(rc), "retry 5", old_string="retry 2"), EMPTY)
+    assert not _gated(d), d
+
+
+def test_qa1_edit_changing_proxy_value_gated(tmp_path):
+    rc = tmp_path / ".curlrc"
+    rc.write_text("proxy = http://corp:3128\n")
+    d = evaluate(_edit(str(rc), "http://evil:3128", old_string="http://corp:3128"), EMPTY)
+    assert _ours(d)
+
+
+def test_qa1_unverifiable_deleting_edit_gated(tmp_path):
+    d = evaluate(_edit(str(tmp_path / "missing" / ".curlrc"), "", old_string="# "), EMPTY)
+    assert _ours(d)
+
+
+# ---- QA round 1 (design review) --------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'proxy=x'|tee ~/.curlrc>/dev/null",
+    "cp /tmp/x ~/.curlrc>/dev/null",
+    "ln -sf /tmp/x ~/.curlrc>/dev/null",
+    "tee ~/.wgetrc</tmp/payload",
+    "echo proxy=x > \"$XDG_CONFIG_HOME/curlrc\"",
+    "echo proxy=x > ${XDG_CONFIG_HOME}/curlrc",
+])
+def test_design_qa1_shell_gated(cmd):
+    assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls -la ~/.curlrc 2>/dev/null",
+    "cat ~/.wgetrc 2>/dev/null || true",
+    "stat ~/.curlrc >/dev/null 2>&1",
+    "test -f ~/.curlrc && echo yes 2>&1",
+])
+def test_design_qa1_fd_noise_reads_allowed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__fs__read_file", {"path": "~/.curlrc", "encoding": "utf-8"}),
+    ("mcp__fs__read_text_file", {"path": "~/.curlrc", "mode": "text"}),
+    ("mcp__fs__get_file_info", {"path": "~/.curlrc", "format": "json"}),
+    ("mcp__fs__search_files", {"path": "~/.wgetrc", "pattern": "proxy"}),
+])
+def test_design_qa1_mcp_reads_allowed(tool, args):
+    assert not _gated(evaluate(_mcp_write(args, tool=tool), EMPTY))
+
+
+@pytest.mark.parametrize("body", [
+    'write-out = "\\n"\n', '-w "\\n%{http_code}\\n"\n', "create-dirs\n",
+    "netrc-optional\n", "proto = =https\n", "proto-default https\n",
+    "max-filesize 10M\n", "noproxy = localhost\n", "ca-native\n",
+])
+def test_design_qa1_curl_common_options_allowed(body):
+    assert not _gated(evaluate(_write("/home/u/.curlrc", body), EMPTY)), body
+
+
+@pytest.mark.parametrize("body", [
+    'write-out = "%output{>>/home/u/.bashrc}x"\n', "verbose\n", "-v\n",
+    "include\n", "-i\n",
+])
+def test_design_qa1_curl_logging_options_gated(body):
+    assert _ours(evaluate(_write("/home/u/.curlrc", body), EMPTY)), body
+
+
+@pytest.mark.parametrize("body,gated", [
+    ("use_proxy = off\n", False), ("use_proxy = on\n", True),
+    ("no_proxy = localhost\n", False), ("passive_ftp = on\n", False),
+    ("secure_protocol = TLSv1_2\n", False), ("secure_protocol = SSLv3\n", True),
+    ("debug = on\n", True), ("server_response = on\n", True),
+])
+def test_design_qa1_wget_options(body, gated):
+    d = evaluate(_write("/home/u/.wgetrc", body), EMPTY)
+    assert _gated(d) == gated, body
+
+
+def test_design_qa1_kind_from_matched_name_only():
+    assert patterns.http_client_rc_kind("/home/u/wgetrc-dir/.curlrc") == "curl"
+
+
+@pytest.mark.parametrize("bad", [None, 5, [], {}, b"proxy=x"])
+def test_design_qa1_helpers_accept_odd_input(bad):
+    assert patterns.http_client_rc_kind(bad) == ""
+    assert patterns.http_client_rc_unsafe_directives(bad, "curl") == []
+    assert patterns.http_client_rc_shell_path_hit(bad) is False
+
+
+def test_design_qa1_allow_string_is_one_regex():
+    pol = Policy(http_client_config={"allow": "corp/\\.curlrc$"})
+    assert _ours(evaluate(_write("/home/u/.curlrc", "insecure\n"), pol))
+    assert not _gated(evaluate(_write("/corp/.curlrc", "insecure\n"), pol))
+    pol = Policy(http_client_config={"allow": 5})
+    assert _ours(evaluate(_write("/home/u/.curlrc", "insecure\n"), pol))
+
+
+def test_registered_in_core_rules_tail_and_fetch_backstop():
+    from aegis import rules
+    core = list(rules._CORE_RULES)
+    i = core.index(rules.rule_http_client_config_protect)
+    assert i > core.index(rules.rule_destructive_delete)
+    assert i > core.index(rules.rule_remote_exec)
+    assert any(rx is patterns.HTTP_CLIENT_RC_PATH_RE for rx, _ in rules._FETCH_HUMAN_ESCAPABLE)
+
+
+def test_monitor_mode_records(monkeypatch):
+    from aegis import rules
+    seen = []
+    monkeypatch.setattr(rules, "_record_monitor", lambda ev, d, note="": seen.append((d.rule, note)))
+    pol = Policy(http_client_config={"mode": "monitor"})
+    assert not _gated(evaluate(_write("/home/u/.curlrc", "insecure\n"), pol))
+    assert seen and seen[0][0] == RULE
+
+
+def test_yaml_allow_loads(tmp_path):
+    from aegis.loader import load_policy
+    (tmp_path / "p.yaml").write_text("http_client_config:\n  allow: ['/ci/\\.curlrc$']\n")
+    pol = load_policy(str(tmp_path))
+    assert not _gated(evaluate(_write("/ci/.curlrc", "proxy=http://c:1\n"), pol))
