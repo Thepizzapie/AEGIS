@@ -13971,6 +13971,9 @@ _HTTP_RC_META_KEY_WORDS = frozenset((
     "encoding", "charset", "mode", "format", "newline", "eol", "permissions",
     "perm", "chmod", "owner", "mime", "mimetype", "language", "lang",
     "dry", "dryrun", "run", "overwrite", "backup", "fallback", "from",
+    "owner", "repo", "repository", "message", "branch", "sha", "commit",
+    "author", "committer", "email", "title", "base", "head", "ref",
+    "description", "labels", "label", "channel", "thread", "ts",
 ))
 
 
@@ -14072,6 +14075,22 @@ def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
     a = ev.args or {}
     if _http_rc_mcp_read_only(ev):
         return []
+    if ev.action == ActionClass.MCP:
+        # Copy/move/rename/download INTO an rc path: the content comes from
+        # elsewhere and can't be judged here (QA round 4: `move_file{path,
+        # destination}`, `rename_file{new_name: .curlrc}`).
+        if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
+            return ["<copied/moved from another file>"]
+        # A second path under a PATH key (skipped from content) still means
+        # another file is involved.
+        for k in _HTTP_RC_NON_CONTENT_KEYS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != p \
+                    and _HTTP_RC_PATHLIKE_RE.match(v.strip()):
+                pn = str(p).replace("\\", "/").rstrip("/")
+                vn = v.strip().replace("\\", "/").rstrip("/")
+                if not (pn == vn or pn.startswith(vn + "/")):
+                    return [f"<content from another file: {v.strip()[:60]}>"]
     edits, unreplayable = _http_rc_edit_list(a)
     if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
         return ["<edit shape not replayable against the file on disk>"]
@@ -14099,9 +14118,11 @@ def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
             if not added and after_unsafe and kind == "wget":
                 # Removing a safe OVERRIDE line (`use_proxy = off`) re-arms an
                 # unsafe line already in the file (QA round 3).
-                after_lines = [x.strip() for x in after.replace("\r", "\n").split("\n")]
+                def _norm(x):
+                    return re.sub(r"[\s_\-]", "", x).lower()
+                after_lines = [_norm(x) for x in after.replace("\r", "\n").split("\n")]
                 for ln in before.replace("\r", "\n").split("\n"):
-                    if ln.strip() and ln.strip() not in after_lines and \
+                    if ln.strip() and _norm(ln) not in after_lines and \
                             patterns.http_client_rc_is_override_line(ln):
                         added.append(ln.strip()[:40])
             return added
@@ -14120,6 +14141,13 @@ def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
 
 _HTTP_RC_PATHLIKE_RE = re.compile(
     r"^(?:file://\S+|(?:~|\.{1,2})?[/\\][^\s=]*|[A-Za-z]:[/\\][^\s=]*)$")
+
+
+_HTTP_RC_COPY_WORDS = frozenset((
+    "copy", "move", "rename", "duplicate", "concatenate", "concat", "mv", "cp",
+    "link", "symlink", "restore", "import", "extract", "unzip", "untar",
+    "sync", "download", "clone",
+))
 
 
 def _http_rc_mcp_judge(strings, p: str, kind: str) -> list:
@@ -14141,6 +14169,20 @@ def _http_rc_mcp_judge(strings, p: str, kind: str) -> list:
     return patterns.http_client_rc_unsafe_directives("\n".join(body), kind)
 
 
+def _http_rc_mapping_keys(v, _depth: int = 0) -> list:
+    out = []
+    if _depth > 8:
+        return out
+    if isinstance(v, dict):
+        for k, x in list(v.items())[:2000]:
+            out.append(str(k))
+            out.extend(_http_rc_mapping_keys(x, _depth + 1))
+    elif isinstance(v, (list, tuple)):
+        for x in list(v)[:2000]:
+            out.extend(_http_rc_mapping_keys(x, _depth + 1))
+    return out
+
+
 def _http_rc_mcp_shell_command(ev: Event) -> Optional[str]:
     a = ev.args or {}
     if isinstance(a.get("args"), dict) and not any(k in a for k in ("command", "cmd", "script")):
@@ -14150,6 +14192,13 @@ def _http_rc_mcp_shell_command(ev: Event) -> Optional[str]:
         if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
             v = " ".join(list(v)[:256])
         if isinstance(v, str) and v.strip():
+            # `{command: "bash", args: ["-c", ...], stdin: "..."}` (QA round 4)
+            extra = a.get("args") if a.get("args") is not a else None
+            if isinstance(extra, (list, tuple)):
+                v += " " + " ".join(str(x) for x in list(extra)[:256])
+            for sk in ("stdin", "input", "script_body"):
+                if isinstance(a.get(sk), str) and a.get(sk):
+                    v += "\n" + a[sk]
             return v
     return None
 
@@ -14260,7 +14309,17 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     whole word on the tool's own name, with an output-argument override,
     and a write that names a second file path (copy/concatenate) is
     gated; removing a wget ``use_proxy = off`` override is gated; Windows
-    ``%XDG_CONFIG_HOME%``. All closed, with regression tests."""
+    ``%XDG_CONFIG_HOME%``. Round 4 found: the round-3 shell-tool hand-off
+    returned early for editor tools whose ``command`` is ``create``/
+    ``insert`` (now falls through); ``write-out`` could append to any file
+    via ``%\\output{}`` unescaping or ``@fmtfile`` (removed from the
+    allowlist, as was ``remote-name-all``); a Codex ``apply_patch`` body was
+    taken as the path (only a whitespace-free string is a path now; a
+    patch naming an rc file is gated); copy/move/rename tools and a second
+    path under a path key; ``stdin``/``args`` of shell tools; rc paths as
+    mapping keys. False positives fixed: GitHub/Slack metadata args, prose
+    mentioning ``~/.curlrc``, ``while read`` loops, case-only override
+    edits. Accepted: reordering two existing wget override lines."""
     cfg = getattr(policy, "http_client_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14286,22 +14345,42 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
             if d is not None:
                 return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
                                 "command that writes a curl/wget config file. " + d.message)
-            return None
+            # No shell hit: fall through to the write check -- an editor
+            # tool's `command: "create"` is not a shell (QA round 4
+            # regression).
 
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
         kind = patterns.http_client_rc_kind(p)
+        found = None
         if not kind and ev.action == ActionClass.MCP:
-            # An MCP tool may name its path argument anything.
-            for s in _flatten_strings(a):
-                kind = patterns.http_client_rc_kind(str(s))
-                if kind:
-                    p = str(s)
+            # An MCP tool may name its path argument anything -- but only a
+            # single, whitespace-free, path-shaped string counts as the path
+            # (QA round 4: a whole `apply_patch` body was taken as `p` and
+            # then skipped as "the path"; a chat message mentioning
+            # ~/.curlrc is prose, not a target).
+            for s_ in _flatten_strings(a):
+                s_ = str(s_)
+                if s_ and not any(c.isspace() for c in s_.strip()) and patterns.http_client_rc_kind(s_):
+                    kind, p = patterns.http_client_rc_kind(s_), s_.strip()
                     break
+            if not kind:
+                for s_ in _flatten_strings(a):
+                    pk = patterns.http_client_rc_patch_kind(str(s_))
+                    if pk:
+                        kind, p, found = pk, "<patch>", ["<patch touching a curl/wget config file>"]
+                        break
+            if not kind:
+                for k_ in _http_rc_mapping_keys(a):
+                    if patterns.http_client_rc_kind(k_):
+                        kind, p, found = (patterns.http_client_rc_kind(k_), k_,
+                                          ["<content keyed by a curl/wget config path>"])
+                        break
         if not kind:
             return None
-        found = _http_rc_new_unsafe(ev, p, kind)
+        if found is None:
+            found = _http_rc_new_unsafe(ev, p, kind)
         if not found:
             return None
         if (os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")

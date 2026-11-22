@@ -508,7 +508,7 @@ def test_design_qa1_mcp_reads_allowed(tool, args):
 
 
 @pytest.mark.parametrize("body", [
-    'write-out = "\\n"\n', '-w "\\n%{http_code}\\n"\n', "create-dirs\n",
+    "create-dirs\n",
     "netrc-optional\n", "proto = =https\n", "proto-default https\n",
     "max-filesize 10M\n", "noproxy = localhost\n", "ca-native\n",
 ])
@@ -517,7 +517,9 @@ def test_design_qa1_curl_common_options_allowed(body):
 
 
 @pytest.mark.parametrize("body", [
-    'write-out = "%output{>>/home/u/.bashrc}x"\n', "verbose\n", "-v\n",
+    'write-out = "%output{>>/home/u/.bashrc}x"\n', 'write-out = "\\n"\n',
+    '-w "\\n%{http_code}\\n"\n', 'write-out = "%\\output{>>/home/u/.bashrc}x"\n',
+    "write-out = @/tmp/fmt\n", "-sw @/tmp/f\n", "remote-name-all\n", "verbose\n", "-v\n",
     "include\n", "-i\n",
 ])
 def test_design_qa1_curl_logging_options_gated(body):
@@ -637,8 +639,6 @@ def test_qa2_shell_reads_allowed(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
 
 
-def test_qa2_remote_name_all_allowed():
-    assert not _gated(evaluate(_write("/home/u/.curlrc", "remote-name-all\n"), EMPTY))
 
 
 @pytest.mark.parametrize("cmd", [
@@ -732,3 +732,76 @@ def test_qa3_meta_key_skip_needs_all_words_meta():
     d = evaluate(_mcp_write({"path": "/home/u/.curlrc", "create_content": "insecure"},
                             tool="mcp__fs__write_file"), EMPTY)
     assert _ours(d)
+
+
+# ---- QA round 4 regressions ---------------------------------------------------------
+
+@pytest.mark.parametrize("args", [
+    {"command": "create", "path": "/home/u/.curlrc", "file_text": "proxy = http://evil:8080\ninsecure\n"},
+    {"command": "insert", "path": "/home/u/.curlrc", "insert_line": 1, "new_str": "insecure"},
+    {"command": "create", "path": "/home/u/.wgetrc", "file_text": "check_certificate = off\n"},
+])
+def test_qa4_editor_command_tools_judged(args):
+    d = evaluate(_mcp_write(args, tool="mcp__editor__str_replace_editor"), EMPTY)
+    assert _ours(d), (args, d)
+
+
+@pytest.mark.parametrize("body", [
+    "*** Begin Patch\n*** Add File: /home/u/.curlrc\n+insecure\n*** End Patch",
+    "*** Begin Patch\n*** Update File: /home/u/.curlrc\n@@\n-# insecure\n+insecure\n*** End Patch",
+    "--- a/.curlrc\n+++ b/.curlrc\n@@ -1 +1 @@\n-# insecure\n+insecure",
+])
+def test_qa4_patch_bodies_gated(body):
+    d = evaluate(_mcp_write({"input": body}, tool="mcp__codex__apply_patch"), EMPTY)
+    assert _ours(d), d
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__fs__move_file", {"path": "/tmp/evil", "destination": "/home/u/.curlrc"}),
+    ("mcp__fs__copy_file", {"file_path": "/tmp/evil", "new_path": "/home/u/.curlrc"}),
+    ("mcp__fs__rename_file", {"path": "/home/u/evil.txt", "new_name": ".curlrc"}),
+    ("mcp__fs__copy", {"uri": "file:///tmp/evil", "target_uri": "file:///home/u/.curlrc"}),
+    ("mcp__fs__copy_file", {"input": "silent", "output": "/home/u/.curlrc"}),
+])
+def test_qa4_copy_move_into_rc_gated(tool, args):
+    assert _ours(evaluate(_mcp_write(args, tool=tool), EMPTY)), (tool, args)
+
+
+@pytest.mark.parametrize("args", [
+    {"command": "bash", "stdin": "echo insecure > ~/.curlrc"},
+    {"command": "bash", "args": ["-c", "printf 'insecure\\n' > ~/.curlrc"]},
+])
+def test_qa4_shell_tool_stdin_args_gated(args):
+    assert _gated(evaluate(_mcp_write(args, tool="mcp__commands__run_command"), EMPTY)), args
+
+
+def test_qa4_dict_key_path_gated():
+    d = evaluate(_mcp_write({"files": {"/home/u/.curlrc": "insecure"}},
+                            tool="mcp__fs__write_files"), EMPTY)
+    assert _ours(d)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__github__create_or_update_file",
+     {"owner": "me", "repo": "dotfiles", "path": "dotfiles/.curlrc", "content": "silent\n",
+      "message": "add curlrc", "branch": "main"}),
+    ("mcp__slack__post_message", {"channel": "C1", "text": "check your ~/.curlrc for a proxy line"}),
+    ("mcp__github__add_issue_comment", {"owner": "me", "repo": "r", "issue_number": 1,
+                                        "body": "Remove `proxy=` from ~/.curlrc please"}),
+])
+def test_qa4_false_positives_allowed(tool, args):
+    assert not _gated(evaluate(_mcp_write(args, tool=tool), EMPTY)), (tool, args)
+
+
+@pytest.mark.parametrize("cmd", [
+    "while read l; do echo \"$l\"; done < ~/.curlrc",
+])
+def test_qa4_shell_read_loop_allowed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE
+
+
+def test_qa4_override_case_change_allowed(tmp_path):
+    rc = tmp_path / ".wgetrc"
+    rc.write_text("https_proxy = http://corp:3128\nuse_proxy = off\n")
+    d = evaluate(_edit(str(rc), "USE_PROXY = OFF", old_string="use_proxy = off"), EMPTY)
+    assert not _gated(d), d

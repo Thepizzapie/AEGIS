@@ -7213,14 +7213,18 @@ _CURL_RC_SAFE_LONG = frozenset((
     # QA round 1 (design review): common, harmless or hardening options.
     "create-dirs", "netrc-optional", "proto", "proto-default", "proto-redir",
     "http2-prior-knowledge", "cert-status", "ca-native", "max-filesize",
-    "referer", "noproxy", "write-out", "remote-name-all",
+    "referer", "noproxy",
 ))
 # Deliberately NOT allowed: `verbose`/`-v`, `include`/`-i`, `show-headers`
 # print every later request's `Authorization:`/cookie headers into agent
 # transcripts and CI logs (QA round 1).
 # curl short options with the same property (case-sensitive: `-k` is
 # --insecure, `-K` is --config).
-_CURL_RC_SAFE_SHORT = frozenset("sSfLAm#N4601gRqYyew")
+# `write-out`/`-w` and `remote-name-all` are NOT here: write-out's
+# `%output{>>FILE}` (also via `%\\output` unescaping or `@fmtfile`) appends
+# to any file on every run, and remote-name-all makes every later curl
+# save to disk (QA round 4).
+_CURL_RC_SAFE_SHORT = frozenset("sSfLAm#N4601gRqYye")
 
 # wget/wget2 rc commands, normalized the way wget itself reads them
 # (case-folded, `_` and `-` removed).
@@ -7313,11 +7317,7 @@ def http_client_rc_unsafe_entries(content, kind: str) -> list:
             # A `\r`/`\n` escape in a quoted curl value would smuggle an
             # extra header line into an otherwise benign one (user-agent).
             ok = _curl_rc_line_safe(dash, key)
-            lk = key.lower()
-            if ok and (lk == "write-out" or (dash == "-" and "w" in key)):
-                # curl 8.3+ `%output{>>file}` makes write-out write files.
-                ok = "%output" not in val.lower()
-            elif ok and _CURL_RC_CRLF_ESC_RE.search(val):
+            if ok and _CURL_RC_CRLF_ESC_RE.search(val):
                 ok = False
         if not ok:
             out.append(((dash + key)[:40], s))
@@ -7332,6 +7332,23 @@ def http_client_rc_is_override_line(line: str) -> bool:
         return False
     name = m.group("key").lower().replace("_", "").replace("-", "")
     return name in _WGET_RC_SAFE_IF_ON or name in _WGET_RC_SAFE_IF_OFF
+
+
+_HTTP_RC_PATCH_HDR_RE = re.compile(
+    r"^(?:\*\*\*\s+(?:Add|Update|Delete|Move)\s+File:|\+\+\+\s|---\s|diff\s--git\s|\*\*\*\s+Move\s+to:)"
+    r"[^\n]*$", re.MULTILINE)
+
+
+def http_client_rc_patch_kind(text) -> str:
+    """'curl'/'wget' if `text` is a patch (Codex `*** Add/Update File:` or
+    unified diff) whose header line names a curl/wget rc file."""
+    if not isinstance(text, str) or "\n" not in text:
+        return ""
+    for m in _HTTP_RC_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        k = http_client_rc_kind(m.group(0))
+        if k:
+            return k
+    return ""
 
 
 def http_client_rc_kind(path) -> str:
@@ -7355,7 +7372,7 @@ HTTP_RC_SAFE_VERBS = frozenset((
     "sha1sum", "sha256sum", "rm", "unlink", "del", "erase", "remove-item",
     "echo", "printf", "true", "false", "cd", "pwd", "which", "type",
     "realpath", "readlink", "du", "bat", "get-content", "gc", "dir",
-    "get-item", "test-path", "exit", "set", ":",
+    "get-item", "test-path", "exit", "set", ":", "read",
     "cut", "tr", "nl", "column",
 ))
 # `sort` is deliberately absent: GNU getopt abbreviations (`--out=F`) write
