@@ -14364,7 +14364,10 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     indented patch headers. False positives fixed: editor verbs
     (``view``/``create``) parsed as directives, diffs quoted inside an
     ordinary MCP file write. Accepted: ``-w "\\n"`` now ASKs (write-out
-    is not allowlisted)."""
+    is not allowlisted). Round 6 found the round-5 quoted-diff skip also
+    hid real patch tools whose ``path`` arg is a repo/workdir (``git_apply
+    {path, patch}``); the skip now applies only to non-patch tools with the
+    diff under an ordinary content key."""
     cfg = getattr(policy, "http_client_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14415,7 +14418,15 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
                 if _http_rc_path_shaped(s_) and patterns.http_client_rc_kind(s_):
                     kind, p = patterns.http_client_rc_kind(s_), s_.strip()
                     break
-            if not kind and not (_path(ev) and "\n" not in _path(ev)):
+            patch_tool = bool(_http_rc_words(str(ev.tool or "").split("__")[-1])
+                              & {"patch", "diff", "apply"})
+            patch_key = any(isinstance(a.get(k_), str) and patterns.http_client_rc_patch_kind(a[k_])
+                            for k_ in ("patch", "diff", "changes", "input", "patches"))
+            # QA round 6: a patch tool's `path` is often its repo/workdir,
+            # so the skip applies only to non-patch tools carrying the diff
+            # under an ordinary content key.
+            if not kind and (patch_tool or patch_key
+                             or not (_path(ev) and "\n" not in _path(ev))):
                 # Patch bodies only when the call has no other, ordinary
                 # target (an MCP write of CHANGES.md quoting a diff is not
                 # a patch application -- QA round 5).

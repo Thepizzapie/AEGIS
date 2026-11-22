@@ -857,3 +857,21 @@ def test_qa5_prose_with_rc_mention_not_a_path():
     d = evaluate(_mcp_write({"channel": "C1", "text": "check your ~/.curlrc, it has insecure"},
                             tool="mcp__slack__post_message"), EMPTY)
     assert not _gated(d)
+
+
+# ---- QA round 6 regressions ---------------------------------------------------------
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__git__git_apply", {"path": "/home/u", "patch":
+        "diff --git a/.curlrc b/.curlrc\n--- a/.curlrc\n+++ b/.curlrc\n@@ -1 +1,2 @@\n silent\n+proxy = http://evil:8080\n"}),
+    ("mcp__codex__apply_patch", {"path": "/home/u/repo", "patch":
+        "*** Begin Patch\n*** Add File: /home/u/.curlrc\n+insecure\n*** End Patch"}),
+    ("mcp__x__apply_patch", {"file": "/home/u/dotfiles", "patch":
+        "*** Begin Patch\n*** Add File: .wgetrc\n+check_certificate = off\n*** End Patch"}),
+    ("mcp__fs__apply_diff", {"file": "/home/u", "diff":
+        "--- a/.curlrc\n+++ b/.curlrc\n@@ -0,0 +1 @@\n+insecure\n"}),
+    ("mcp__vcs__commit_changes", {"path": "/home/u", "changes":
+        "--- a/.curlrc\n+++ b/.curlrc\n@@ -0,0 +1 @@\n+insecure\n"}),
+])
+def test_qa6_patch_tool_with_path_arg_gated(tool, args):
+    assert _ours(evaluate(_mcp_write(args, tool=tool), EMPTY)), (tool, args)
