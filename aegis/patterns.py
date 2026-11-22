@@ -7128,8 +7128,8 @@ _HTTP_RC_END = _WIN_TRIM + r"(?=[/\\;&|)<>`}:,]|\s|['\"]|$)"
 HTTP_CLIENT_RC_PATH_RE = re.compile(
     _HTTP_RC_B + r"(?:"
     r"[._]curlrc"
-    r"|\.config" + _SEP + r"curlrc"
-    r"|\$\{?XDG_CONFIG_HOME\}?" + _SEP + r"curlrc"
+    r"|\.config\}?" + _SEP + r"curlrc"
+    r"|\$\{?XDG_CONFIG_HOME(?::?[-=+?][^}\s]{0,200})?\}?" + _SEP + r"curlrc"
     r"|[._]wgetrc"
     r"|etc" + _SEP + r"wget2?rc"
     r"|[._]wget2rc"
@@ -7181,7 +7181,12 @@ def http_client_rc_shell_path_hit(cmd) -> bool:
         for cand in _brace_expand(base):
             if HTTP_CLIENT_RC_PATH_RE.search("/" + cand):
                 return True
-            if any(c in cand for c in "*?[") and cand[:1] in "._cw[?":
+            if any(c in cand for c in "*?[") and (
+                    cand[:1] in "._cw[?"
+                    # a leading `*` must still carry a literal `rc`
+                    # (`*lrc`, `*getrc`), or `echo '* text=auto' >>
+                    # .gitattributes` would match (QA round 2 regression).
+                    or (cand[:1] == "*" and "rc" in cand.lower())):
                 for name in _HTTP_RC_NAMES:
                     if fnmatch.fnmatchcase(name, cand.lower()):
                         return True
@@ -7208,7 +7213,7 @@ _CURL_RC_SAFE_LONG = frozenset((
     # QA round 1 (design review): common, harmless or hardening options.
     "create-dirs", "netrc-optional", "proto", "proto-default", "proto-redir",
     "http2-prior-knowledge", "cert-status", "ca-native", "max-filesize",
-    "referer", "noproxy", "write-out",
+    "referer", "noproxy", "write-out", "remote-name-all",
 ))
 # Deliberately NOT allowed: `verbose`/`-v`, `include`/`-i`, `show-headers`
 # print every later request's `Authorization:`/cookie headers into agent
@@ -7339,8 +7344,20 @@ HTTP_RC_SAFE_VERBS = frozenset((
     "ls", "stat", "test", "[", "[[", "file", "wc", "diff", "cmp", "md5sum",
     "sha1sum", "sha256sum", "rm", "unlink", "del", "erase", "remove-item",
     "echo", "printf", "true", "false", "cd", "pwd", "which", "type",
-    "realpath", "readlink", "du", "bat", "get-content", "gc", "dir", "get-item", "test-path", "exit", "set", ":",
+    "realpath", "readlink", "du", "bat", "get-content", "gc", "dir",
+    "get-item", "test-path", "exit", "set", ":",
+    "cut", "tr", "nl", "column", "sort",
 ))
+# Safe verbs that become unsafe with a flag: `sort -o FILE` writes; `rg
+# --pre CMD` / `bat --pager CMD` run a program (QA round 2).
+_HTTP_RC_VERB_BAD_FLAGS = {
+    "sort": re.compile(r"(?:^|\s)(?:-[a-zA-Z]*o|--output)"),
+    "rg": re.compile(r"--pre\b"),
+    "bat": re.compile(r"--pager\b"),
+}
+# Shell keywords whose segment runs nothing by itself (`for f in a b`,
+# `case x in`, `fi`, `done`).
+_HTTP_RC_NOOP_KEYWORDS = frozenset(("for", "case", "select", "fi", "done", "esac", "in"))
 _HTTP_RC_PREFIX_WORDS = frozenset(("sudo", "command", "builtin", "nohup", "time",
                                    "env", "exec", "doas", "nice", "then", "do",
                                    "else", "if", "while", "until", "!", "{"))
@@ -7366,6 +7383,11 @@ def http_client_rc_shell_only_reads(cmd: str) -> bool:
         verb = words[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
         if verb.endswith(".exe"):
             verb = verb[:-4]
+        if verb in _HTTP_RC_NOOP_KEYWORDS:
+            continue
         if verb not in HTTP_RC_SAFE_VERBS:
+            return False
+        bad = _HTTP_RC_VERB_BAD_FLAGS.get(verb)
+        if bad and bad.search(" ".join(words[1:])):
             return False
     return True

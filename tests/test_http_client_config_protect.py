@@ -577,3 +577,74 @@ def test_yaml_allow_loads(tmp_path):
     (tmp_path / "p.yaml").write_text("http_client_config:\n  allow: ['/ci/\\.curlrc$']\n")
     pol = load_policy(str(tmp_path))
     assert not _gated(evaluate(_write("/ci/.curlrc", "proxy=http://c:1\n"), pol))
+
+
+# ---- QA round 2 regressions ---------------------------------------------------------
+
+def test_qa2_long_command_padding_still_gated():
+    d = evaluate(_shell("echo " + "a" * 30000 + "; cp x ~/.curlrc"), EMPTY)
+    assert _gated(d)
+
+
+@pytest.mark.parametrize("args,tool", [
+    ({"edits": [{"search": "# ", "replace": ""}]}, "mcp__fs__edit_file"),
+    ({"old_text": "# ", "new_text": ""}, "mcp__fs__edit_file"),
+    ({"oldText": "# ", "newText": ""}, "mcp__fs__replace_text"),
+    ({"old_str": "# ", "new_str": ""}, "mcp__fs__str_replace"),
+    ({"edits": {"oldText": "# ", "newText": ""}}, "mcp__fs__edit_file"),
+    ({"edits": [{"before_text": "# ", "after_text": ""}]}, "mcp__fs__edit_file"),
+])
+def test_qa2_mcp_edit_shapes_replayed_or_gated(tmp_path, args, tool):
+    rc = tmp_path / ".curlrc"
+    rc.write_text("# proxy = http://p.invalid\n")
+    d = evaluate(_mcp_write(dict(args, path=str(rc)), tool=tool), EMPTY)
+    assert _ours(d), (args, d)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__fs__add_file", {"path": "/home/u/.curlrc", "file_content": "proxy = http://p.invalid"}),
+    ("mcp__fs__store", {"target": "/home/u/.curlrc", "input": "proxy = http://p.invalid"}),
+    ("mcp__fs__write_file", {"path": "/home/u/.curlrc", "content": "silent",
+                             "file_body": "proxy = http://p.invalid"}),
+])
+def test_qa2_mcp_unlisted_content_keys_gated(tool, args):
+    assert _ours(evaluate(_mcp_write(args, tool=tool), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp /tmp/x ${XDG_CONFIG_HOME:-$HOME/.config}/curlrc",
+    "cp /tmp/x ${XDG_CONFIG_HOME-~/.config}/curlrc",
+    "cp /tmp/x ${XDG_CONFIG_HOME:=~/.config}/curlrc",
+    "cp x ~/.config/*lrc",
+    "cp x /etc/*getrc",
+    "rg --pre /tmp/helper.sh . ~/.curlrc",
+    "bat --paging=always --pager=/tmp/helper.sh ~/.curlrc",
+    "cat ~/.curlrc | sort -o ~/.curlrc",
+    "for f in ~/.curlrc; do cp /tmp/x $f; done",
+])
+def test_qa2_shell_gated(cmd):
+    assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "if [ -f ~/.wgetrc ]; then cat ~/.wgetrc; fi",
+    "for f in ~/.curlrc ~/.wgetrc; do cat $f; done",
+    "cat ~/.curlrc | sort",
+    "cat -A ~/.curlrc | cut -c1-80",
+    "nl ~/.curlrc",
+])
+def test_qa2_shell_reads_allowed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+def test_qa2_remote_name_all_allowed():
+    assert not _gated(evaluate(_write("/home/u/.curlrc", "remote-name-all\n"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo '* text=auto' >> .gitattributes",
+    "cp *.txt /tmp/out/",
+    "echo 'see ~/.curlrc docs' | grep curl",
+])
+def test_qa2_bare_glob_not_an_rc_path(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

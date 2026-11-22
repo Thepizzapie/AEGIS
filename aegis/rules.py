@@ -13915,31 +13915,31 @@ _HTTP_RC_NON_CONTENT_KEYS = frozenset((
 ))
 
 
-# MCP arg keys that carry content being written. A read/search/info MCP call
-# with an `encoding`/`mode`/`pattern` string must not have those values
-# parsed as rc directives (QA round 1).
-_HTTP_RC_MCP_CONTENT_KEYS = frozenset((
-    "content", "contents", "text", "data", "body", "newText", "new_text",
-    "new_string", "newString", "new_source", "edits", "value", "source",
-    "file_text", "fileText", "payload", "lines", "patch", "diff",
-))
+# A read/search/info MCP call with an `encoding`/`mode`/`pattern` string must
+# not have those values parsed as rc directives (QA round 1).
 _HTTP_RC_MCP_WRITE_TOOL_RE = re.compile(
     r"write|edit|create|put|save|append|update|patch|upload|move|copy|rename|replace|insert|set",
     re.IGNORECASE)
 
 
+_HTTP_RC_MCP_READ_TOOL_RE = re.compile(
+    r"read|get|list|search|stat|info|view|find|head|tail|cat|tree|exist|describe|watch",
+    re.IGNORECASE)
+
+
+def _http_rc_mcp_read_only(ev: Event) -> bool:
+    tool = str(ev.tool or "")
+    return (ev.action == ActionClass.MCP and bool(_HTTP_RC_MCP_READ_TOOL_RE.search(tool))
+            and not _HTTP_RC_MCP_WRITE_TOOL_RE.search(tool))
+
+
 def _http_rc_mcp_strings(ev: Event, a: dict) -> list:
-    keyed = []
-    for k, v in a.items():
-        if str(k) in _HTTP_RC_MCP_CONTENT_KEYS:
-            keyed.extend(_http_rc_written_strings(v))
-    if keyed:
-        return keyed
-    # No recognizable content key: a write-shaped tool still has every
-    # non-path string judged; a read-shaped one has nothing to judge.
-    if _HTTP_RC_MCP_WRITE_TOOL_RE.search(str(ev.tool or "")):
-        return _http_rc_written_strings(a)
-    return []
+    """Strings an MCP call writes. Every non-path string is judged unless
+    the tool is read-shaped (and not also write-shaped) -- QA round 2: a
+    content-key allowlist missed `file_content`/`input`/a second content key."""
+    if _http_rc_mcp_read_only(ev):
+        return []
+    return _http_rc_written_strings(a)
 
 
 def _http_rc_written_strings(v, _depth: int = 0) -> list:
@@ -13962,6 +13962,57 @@ def _http_rc_written_strings(v, _depth: int = 0) -> list:
     return []
 
 
+_HTTP_RC_EDIT_PAIRS = (("old_string", "new_string"), ("oldText", "newText"),
+                       ("old_text", "new_text"), ("oldString", "newString"),
+                       ("old_str", "new_str"), ("old", "new"),
+                       ("search", "replace"), ("find", "replace"),
+                       ("pattern", "replacement"), ("from", "to"))
+_HTTP_RC_OLDISH_KEY_RE = re.compile(r"old|search|find|pattern|match|from|target_text|before",
+                                    re.IGNORECASE)
+
+
+def _http_rc_edit_list(a: dict) -> tuple:
+    """(edits, unreplayable): every old->new pair in the call, at top level
+    or inside an `edits`/`changes`/`replacements` list or dict, in any of the
+    common key spellings (QA round 2); `unreplayable` is True when an
+    old/search-shaped key is present that no known pair accounts for."""
+    edits, seen_keys = [], set()
+
+    def take(d):
+        for ok, nk in _HTTP_RC_EDIT_PAIRS:
+            if ok in d or nk in d:
+                edits.append((_npmrc_str(d.get(ok)), _npmrc_str(d.get(nk)),
+                              bool(d.get("replace_all") or d.get("replaceAll")
+                                   or d.get("all"))))
+                seen_keys.update((ok, nk))
+                return True
+        return False
+
+    take(a)
+    for lk in ("edits", "changes", "replacements", "edit", "operations"):
+        v = a.get(lk)
+        items = v if isinstance(v, list) else ([v] if isinstance(v, dict) else [])
+        for e in items:
+            if isinstance(e, dict):
+                take(e)
+    unreplayable = False
+
+    def scan(d, depth=0):
+        nonlocal unreplayable
+        if depth > 6 or not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            if k not in seen_keys and _HTTP_RC_OLDISH_KEY_RE.search(str(k)) and isinstance(v, str) and v:
+                unreplayable = True
+            if isinstance(v, dict):
+                scan(v, depth + 1)
+            elif isinstance(v, list):
+                for x in v:
+                    scan(x, depth + 1)
+    scan(a)
+    return edits, unreplayable
+
+
 def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
     """Unsafe directive names the call would leave in the file. A whole-file
     Write is judged as written. An Edit/MultiEdit/MCP edit is replayed on the
@@ -13971,11 +14022,19 @@ def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
     directive planted earlier as inert text. An edit the hook cannot replay
     (file unreadable, old text absent) that removes text is gated."""
     a = ev.args or {}
-    edits = _npmrc_edit_list(a)
+    if _http_rc_mcp_read_only(ev):
+        return []
+    edits, unreplayable = _http_rc_edit_list(a)
+    if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
+        return ["<edit shape not replayable against the file on disk>"]
     content = a.get("content")
     if not isinstance(content, str):
         content = a.get("contents") if isinstance(a.get("contents"), str) else None
     if isinstance(content, str) and not edits:
+        if ev.action == ActionClass.MCP:
+            # Every non-path string, not just `content` (QA round 2: a
+            # second `file_body` key rode along unjudged).
+            content = "\n".join(x for x in _http_rc_written_strings(a) if x != p)
         return patterns.http_client_rc_unsafe_directives(content, kind)
     if edits:
         before = _npmrc_read(ev, p)
@@ -14087,7 +14146,17 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     ``%output{}``, ``create-dirs``, ``proto``, wget ``use_proxy = off``),
     a bare-string ``allow``. Credential-printing ``verbose``/``include``
     (wget ``debug``/``server_response``) were moved OUT of the allowlist.
-    All closed, with regression tests."""
+    Round 2 found: commands over 20000 chars skip the truncated scan
+    surface (an ENGINE-WIDE gap in ``normalize.scan_surface``, reported
+    separately; this guard now also checks the raw command); MCP edit shapes
+    the replay didn't know (``search``/``replace``, top-level ``old_text``,
+    dict ``edits``) -- now replayed, and an unknown old/search-shaped key
+    fails closed; MCP write content under an unlisted key -- now every
+    non-path string is judged unless the tool is read-shaped;
+    ``${XDG_CONFIG_HOME:-$HOME/.config}/curlrc`` spellings; leading-``*``
+    globs; ``rg --pre``/``bat --pager``/``sort -o``; and false ASKs on
+    ``if``/``for`` loops, ``sort``/``cut``/``nl`` reads. All closed, with
+    regression tests."""
     cfg = getattr(policy, "http_client_config", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14136,12 +14205,18 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
 
     if _is_shell(ev):
         cmd = _shell_scan(ev)
-        if not patterns.http_client_rc_shell_path_hit(cmd):
+        raw = _cmd(ev)
+        # Also the RAW command: `normalize.scan_surface` truncates at 20000
+        # chars, so `echo <30k pad>; cp x ~/.curlrc` would otherwise never be
+        # seen (QA round 2; an engine-wide gap reported separately).
+        if not (patterns.http_client_rc_shell_path_hit(cmd)
+                or patterns.http_client_rc_shell_path_hit(raw)):
             return None
         # Inverted check (QA round 1): any command naming the path is gated
         # unless it only reads or deletes -- a write-verb list always misses
         # one more tool (rsync, tar -x, unzip, sponge, socat, vim -es, patch).
-        if patterns.http_client_rc_shell_only_reads(cmd):
+        if (patterns.http_client_rc_shell_only_reads(cmd)
+                and patterns.http_client_rc_shell_only_reads(raw)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")
                 or _http_client_config_allowed_by_policy(cfg, _cmd(ev))):
