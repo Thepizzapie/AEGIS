@@ -440,6 +440,13 @@ class Policy:
     # scope, handing it a live registry credential every time. See
     # rules.rule_docker_cred_helper_protect.
     docker_cred_helper: dict = field(default_factory=dict)
+    # HTTP-client config hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask). Covers
+    # curl's `.curlrc`/`_curlrc` and wget's `.wgetrc`/`wget2rc`, whose every
+    # line applies silently to every future curl/wget run (proxy reroute,
+    # TLS-off, credential logging, file-attaching exfil). See
+    # rules.rule_http_client_config_protect.
+    http_client_config: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/

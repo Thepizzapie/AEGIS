@@ -3,6 +3,7 @@
 Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
+import fnmatch
 import re
 import unicodedata
 
@@ -7082,3 +7083,343 @@ def agent_exec_path_hit(text: str) -> str:
     if AGENT_EXEC_MIXED_RE.search(text):
         return "mixed"
     return ""
+
+
+# ---------------------------------------------------------------------------
+# HTTP-client config hijack (`rules.rule_http_client_config_protect`).
+#
+# curl reads `.curlrc` (`_curlrc` on Windows) from `$CURL_HOME`,
+# `$XDG_CONFIG_HOME` (also as `curlrc`) and `$HOME` on EVERY invocation not
+# started with `-q`/`--disable`; wget reads `/etc/wgetrc` then `~/.wgetrc`
+# (wget2: `~/.config/wget/wget2rc`, `~/.wget2rc`) on every run. Each line is
+# a command-line option applied to every future transfer, by this agent, a
+# teammate or CI, with nothing in the visible command line to show it:
+#   * `proxy`/`preproxy`/`socks5*`/`connect-to`/`resolve`/`doh-url`
+#     (wget: `http_proxy`/`https_proxy`/`use_proxy`) silently reroute every
+#     request -- `Authorization:` headers and tokens included -- through an
+#     attacker host, and route AROUND Aegis's own egress allowlist, which
+#     only sees the host written in the command;
+#   * `insecure`/`cacert`/`capath`/`proxy-insecure` (wget:
+#     `check_certificate = off`, `ca_certificate`) turn that reroute into a
+#     transparent TLS MITM;
+#   * `trace`/`trace-ascii`/`dump-header`/`cookie-jar`/`output`/`stderr`
+#     (wget: `logfile`, `save_cookies`, `output_document`) write every
+#     transfer -- credentials in it -- to a chosen file;
+#   * `url`/`data*`/`form`/`upload-file`/`variable` (wget: `post_file`,
+#     `body_file`) add an extra request, or attach a local file
+#     (`data = @~/.ssh/id_rsa`), to every transfer -- exfiltration on every
+#     ordinary `curl` the agent runs;
+#   * `engine` loads an OpenSSL engine shared library (code exec); wget's
+#     `use_askpass` runs a program; `config` includes another file.
+#
+# The content check is an ALLOWLIST, not a denylist: curl has 250+ options,
+# short aliases, `--`/`-`/bare spellings and `=`/`:`/space separators, and
+# wget folds case, `_` and `-` -- a denylist would leak by alias. A file
+# that only sets routine transfer behaviour (silent, fail, retries,
+# timeouts, user-agent, redirects, progress style) stays allowed; any other
+# directive is gated.
+# Left boundary: also a redirect/pipe/subshell/brace/backtick character, so
+# `echo x >.curlrc` and `(cd ~;tee .curlrc)` match (QA round 1).
+_HTTP_RC_B = r"(?:^|[\s'\"/\\=:<>|&;(`{,])"
+# Right boundary: `_CI_END` plus `<`/`>` (heredoc/redirect glued to the path:
+# `cat >~/.curlrc<<EOF`), backtick, `}` and `:` (an NTFS stream suffix,
+# `.curlrc::$DATA` -- QA round 1).
+_HTTP_RC_END = _WIN_TRIM + r"(?=[/\\;&|)<>`}:,]|\s|['\"]|$)"
+HTTP_CLIENT_RC_PATH_RE = re.compile(
+    _HTTP_RC_B + r"(?:"
+    r"[._]curlrc"
+    r"|\.config\}?" + _SEP + r"curlrc"
+    r"|(?:\$\{?|%|\$env:)XDG_CONFIG_HOME(?::?[-=+?][^}\s]{0,200})?[}%]?" + _SEP + r"curlrc"
+    r"|[._]wgetrc"
+    r"|etc" + _SEP + r"wget2?rc"
+    r"|[._]wget2rc"
+    r"|wget" + _SEP + r"wget2?rc"
+    r")" + _HTTP_RC_END,
+    re.IGNORECASE,
+)
+# Basenames curl/wget read, for matching a shell glob/brace word against
+# (`~/.curl{rc,}`, `~/.{curl,wget}rc`, `~/.curlr?`, `~/.curlr[c]`).
+_HTTP_RC_NAMES = (".curlrc", "_curlrc", "curlrc", ".wgetrc", "_wgetrc",
+                  "wgetrc", ".wget2rc", "_wget2rc", "wget2rc")
+_HTTP_RC_WORD_RE = re.compile(r"[^\s'\"<>|&;()`=]+")
+_HTTP_RC_BRACE_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def _brace_expand(word: str, budget: int = 64) -> list:
+    out, todo = [], [word]
+    while todo and len(out) + len(todo) <= budget:
+        w = todo.pop()
+        m = _HTTP_RC_BRACE_RE.search(w)
+        if not m or "," not in m.group(1):
+            out.append(w)
+            continue
+        for alt in m.group(1).split(","):
+            todo.append(w[:m.start()] + alt + w[m.end():])
+    return out + todo
+
+
+def http_client_rc_shell_path_hit(cmd) -> bool:
+    """True if a shell command names a curl/wget rc file -- literally, through
+    backslash escapes (`.curl\\rc`), or through a glob/brace word that bash
+    would expand to one of those names."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    if HTTP_CLIENT_RC_PATH_RE.search(cmd):
+        return True
+    unesc = cmd.replace("\\", "")
+    if unesc != cmd and HTTP_CLIENT_RC_PATH_RE.search(unesc):
+        return True
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc)):
+        if i > 4000:
+            return True                       # fail closed on absurd input
+        w = m.group(0)
+        if not any(c in w for c in "*?[{"):
+            continue
+        base = w.replace("\\", "/").rsplit("/", 1)[-1]
+        if not base or len(base) > 200:
+            continue
+        for cand in _brace_expand(base):
+            if HTTP_CLIENT_RC_PATH_RE.search("/" + cand):
+                return True
+            if any(c in cand for c in "*?[") and (
+                    cand[:1] in "._cw[?"
+                    # a leading `*` must still carry a literal `rc`
+                    # (`*lrc`, `*getrc`), or `echo '* text=auto' >>
+                    # .gitattributes` would match (QA round 2 regression).
+                    or (cand[:1] == "*" and "rc" in cand.lower())):
+                for name in _HTTP_RC_NAMES:
+                    if fnmatch.fnmatchcase(name, cand.lower()):
+                        return True
+    return False
+
+
+# Which grammar a path speaks.
+_HTTP_RC_WGET_RE = re.compile(r"wget2?rc", re.IGNORECASE)
+
+# curl long options (without dashes) that only shape ordinary transfer
+# behaviour. `no-<name>` of each is equally benign.
+_CURL_RC_SAFE_LONG = frozenset((
+    "silent", "show-error", "fail", "fail-with-body", "fail-early",
+    "location", "max-redirs", "retry", "retry-delay", "retry-max-time",
+    "retry-all-errors", "retry-connrefused", "connect-timeout", "max-time",
+    "user-agent", "compressed", "progress-bar", "progress-meter",
+    "http1.0", "http1.1", "http2", "http3", "ipv4", "ipv6",
+    "keepalive", "keepalive-time", "buffer", "styled-output", "globoff",
+    "remote-time", "speed-limit", "speed-time", "limit-rate", "tcp-nodelay",
+    "tcp-fastopen", "parallel", "parallel-max", "parallel-immediate",
+    "tlsv1.2", "tlsv1.3", "ssl-reqd", "happy-eyeballs-timeout-ms",
+    "expect100-timeout", "disable", "xattr",
+    "sessionid", "alpn", "npn", "clobber", "skip-existing",
+    # QA round 1 (design review): common, harmless or hardening options.
+    "create-dirs", "netrc-optional", "proto", "proto-default", "proto-redir",
+    "http2-prior-knowledge", "cert-status", "ca-native", "max-filesize",
+    "referer", "noproxy",
+))
+# Deliberately NOT allowed: `verbose`/`-v`, `include`/`-i`, `show-headers`
+# print every later request's `Authorization:`/cookie headers into agent
+# transcripts and CI logs (QA round 1).
+# curl short options with the same property (case-sensitive: `-k` is
+# --insecure, `-K` is --config).
+# `write-out`/`-w` and `remote-name-all` are NOT here: write-out's
+# `%output{>>FILE}` (also via `%\\output` unescaping or `@fmtfile`) appends
+# to any file on every run, and remote-name-all makes every later curl
+# save to disk (QA round 4).
+_CURL_RC_SAFE_SHORT = frozenset("sSfLAm#N4601gRqYye")
+
+# wget/wget2 rc commands, normalized the way wget itself reads them
+# (case-folded, `_` and `-` removed).
+_WGET_RC_SAFE = frozenset((
+    "tries", "timeout", "readtimeout", "connecttimeout", "dnstimeout",
+    "wait", "waitretry", "randomwait", "retryconnrefused", "retryonhosterror",
+    "retryonhttperror", "continue", "timestamping", "useragent", "quiet",
+    "verbose", "progress", "showprogress", "dotstyle", "dotbytes",
+    "dotsinline", "dotspacing", "robots", "noclobber",
+    "inet4only", "inet6only", "preferfamily", "limitrate", "maxredirect",
+    "httpkeepalive", "cache", "compression", "iri", "localencoding",
+    "remoteencoding", "adjustextension", "httpsonly", "reclevel",
+    "noparent", "backups", "chunksize", "maxthreads",
+    "noproxy", "passiveftp", "restrictfilenames", "convertlinks",
+    "pagerequisites", "ignorecase",
+))
+# `debug`/`server_response` are left out: they print headers (cookies,
+# auth) of every later transfer to the log (QA round 1).
+# wget commands that are safe only when switched ON (`check_certificate =
+# off` is the TLS-MITM primitive; `hsts = off` drops HSTS upgrades).
+_WGET_RC_SAFE_IF_ON = frozenset(("checkcertificate", "hsts", "checkhostname"))
+_WGET_ON_VALUES = frozenset(("on", "1", "yes", "true"))
+# ...and the reverse: turning the proxy OFF is harmless.
+_WGET_RC_SAFE_IF_OFF = frozenset(("useproxy",))
+_WGET_OFF_VALUES = frozenset(("off", "0", "no", "false"))
+_WGET_SECURE_PROTOCOLS = frozenset(("auto", "tlsv1_2", "tlsv1_3", "pfs"))
+
+_HTTP_RC_LINE_RE = re.compile(
+    r"^[ \t\ufeff]*(?P<dash>-{0,2})(?P<key>[^\s=:]+)(?:[ \t]*[=:][ \t]*|[ \t]+|$)(?P<val>.*)$")
+
+
+def _curl_rc_line_safe(dash: str, key: str) -> bool:
+    if dash == "-" and len(key) >= 1 and not key.startswith("-"):
+        # `-sS` style cluster: safe only if every letter is.
+        return all(c in _CURL_RC_SAFE_SHORT for c in key)
+    name = key.lower()
+    if name.startswith("no-"):
+        name = name[3:]
+    return name in _CURL_RC_SAFE_LONG
+
+
+def _wget_rc_line_safe(key: str, val: str) -> bool:
+    name = key.lower().replace("_", "").replace("-", "")
+    if name in _WGET_RC_SAFE:
+        return True
+    v = val.strip().strip("'\"").strip().lower()
+    if name in _WGET_RC_SAFE_IF_ON:
+        return v in _WGET_ON_VALUES
+    if name in _WGET_RC_SAFE_IF_OFF:
+        return v in _WGET_OFF_VALUES
+    if name == "secureprotocol":
+        return v in _WGET_SECURE_PROTOCOLS
+    return False
+
+
+_HTTP_RC_MAX_LINES = 20000
+_CURL_RC_CRLF_ESC_RE = re.compile(r"\\[rn]")
+
+
+def http_client_rc_unsafe_directives(content, kind: str) -> list:
+    """Directive names in `content` (an rc-file body or fragment) that fall
+    outside the benign allowlist for `kind` ('curl' or 'wget'). Blank lines
+    and full-line `#` comments are inert in both grammars."""
+    return [n for n, _ in http_client_rc_unsafe_entries(content, kind)]
+
+
+def http_client_rc_unsafe_entries(content, kind: str) -> list:
+    """(directive name, whole stripped line) for every unsafe line."""
+    out = []
+    if not isinstance(content, str):
+        return out
+    if not content:
+        return out
+    text = content.replace("\r", "\n")
+    for i, line in enumerate(text.split("\n")):
+        if i >= _HTTP_RC_MAX_LINES:
+            out.append(("<oversized>", "<oversized>"))
+            break
+        s = line.strip(" \t\ufeff\v\f")
+        if not s or s.startswith("#"):
+            continue
+        m = _HTTP_RC_LINE_RE.match(s)
+        if not m:
+            out.append((s[:40], s))
+            continue
+        dash, key, val = m.group("dash"), m.group("key"), m.group("val") or ""
+        if kind == "wget":
+            ok = not dash and _wget_rc_line_safe(key, val)
+        else:
+            # A `\r`/`\n` escape in a quoted curl value would smuggle an
+            # extra header line into an otherwise benign one (user-agent).
+            ok = _curl_rc_line_safe(dash, key)
+            if ok and _CURL_RC_CRLF_ESC_RE.search(val):
+                ok = False
+        if not ok:
+            out.append(((dash + key)[:40], s))
+    return out
+
+
+def http_client_rc_is_override_line(line: str) -> bool:
+    """A wget line whose safety depends on its value (`use_proxy`,
+    `check_certificate`, `hsts`, `check_hostname`)."""
+    m = _HTTP_RC_LINE_RE.match(str(line or "").strip(" \t\ufeff\v\f"))
+    if not m:
+        return False
+    name = m.group("key").lower().replace("_", "").replace("-", "")
+    return name in _WGET_RC_SAFE_IF_ON or name in _WGET_RC_SAFE_IF_OFF
+
+
+_HTTP_RC_PATCH_HDR_RE = re.compile(
+    r"^[ \t]*(?:\*\*\*\s+(?:Add|Update|Delete|Move)\s+File:|\+\+\+\s|---\s|diff\s--git\s|\*\*\*\s+Move\s+to:)"
+    r"[^\n]*$", re.MULTILINE)
+
+
+def http_client_rc_patch_kind(text) -> str:
+    """'curl'/'wget' if `text` is a patch (Codex `*** Add/Update File:` or
+    unified diff) whose header line names a curl/wget rc file."""
+    if not isinstance(text, str) or "\n" not in text:
+        return ""
+    for m in _HTTP_RC_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        k = http_client_rc_kind(m.group(0))
+        if k:
+            return k
+    return ""
+
+
+def http_client_rc_kind(path) -> str:
+    """'curl' / 'wget' / '' for an rc path -- decided by the matched rc name
+    itself, not by `wget` appearing anywhere else in the path."""
+    if not isinstance(path, str) or not path:
+        return ""
+    m = HTTP_CLIENT_RC_PATH_RE.search(path)
+    if not m:
+        return ""
+    return "wget" if _HTTP_RC_WGET_RE.search(m.group(0)) else "curl"
+
+
+# Shell commands that only read or delete. A command naming an rc path is
+# gated unless EVERY simple command in it is one of these and nothing is
+# redirected to a file (QA round 1: a write-verb list missed rsync, tar,
+# unzip, sponge, socat, sed `w`, vim/ex, patch, cpio...).
+HTTP_RC_SAFE_VERBS = frozenset((
+    "cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg",
+    "ls", "stat", "test", "[", "[[", "file", "wc", "diff", "cmp", "md5sum",
+    "sha1sum", "sha256sum", "rm", "unlink", "del", "erase", "remove-item",
+    "echo", "printf", "true", "false", "cd", "pwd", "which", "type",
+    "realpath", "readlink", "du", "bat", "get-content", "gc", "dir",
+    "get-item", "test-path", "exit", "set", ":", "read",
+    "cut", "tr", "nl", "column",
+))
+# `sort` is deliberately absent: GNU getopt abbreviations (`--out=F`) write
+# and `--compress-program=sh` executes (QA round 3).
+# Safe verbs that become unsafe with a flag: `sort -o FILE` writes; `rg
+# --pre CMD` / `bat --pager CMD` run a program (QA round 2).
+_HTTP_RC_VERB_BAD_FLAGS = {
+    "rg": re.compile(r"--pre\b"),
+    "bat": re.compile(r"--pager\b"),
+}
+# Shell keywords whose segment runs nothing by itself (`for f in a b`,
+# `case x in`, `fi`, `done`).
+_HTTP_RC_NOOP_KEYWORDS = frozenset(("for", "case", "select", "fi", "done", "esac", "in"))
+_HTTP_RC_PREFIX_WORDS = frozenset(("sudo", "command", "builtin", "nohup", "time",
+                                   "env", "exec", "doas", "nice", "then", "do",
+                                   "else", "if", "while", "until", "!", "{"))
+# `do`/`then`/`else`/`elif` start a new simple command: `for x do cp ...`
+# (no `in`, no `;`) is valid bash, so a `for` segment must never swallow
+# the command after it (QA round 3 regression).
+_HTTP_RC_SEG_SPLIT_RE = re.compile(
+    r"&&|\|\||[;&|\n(){}`]|\$\(|(?<!\S)(?:do|then|else|elif)(?!\S)")
+_HTTP_RC_ASSIGN_RE = re.compile(r"^\w+=")
+_HTTP_RC_HARMLESS_REDIR_RE = re.compile(
+    r"\d*>{1,2}\s*(?:/dev/null|&\d|&-)|&>\s*/dev/null|\d*<&?\d?")
+
+
+def http_client_rc_shell_only_reads(cmd: str) -> bool:
+    """True if every simple command in `cmd` is a read-only/delete verb and
+    nothing is redirected into a file."""
+    stripped = _HTTP_RC_HARMLESS_REDIR_RE.sub(" ", cmd)
+    if ">" in stripped:
+        return False
+    for seg in _HTTP_RC_SEG_SPLIT_RE.split(stripped):
+        words = seg.split()
+        while words and (words[0].lower() in _HTTP_RC_PREFIX_WORDS
+                         or _HTTP_RC_ASSIGN_RE.match(words[0])):
+            words.pop(0)
+        if not words:
+            continue
+        verb = words[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if verb.endswith(".exe"):
+            verb = verb[:-4]
+        if verb in _HTTP_RC_NOOP_KEYWORDS:
+            continue
+        if verb not in HTTP_RC_SAFE_VERBS:
+            return False
+        bad = _HTTP_RC_VERB_BAD_FLAGS.get(verb)
+        if bad and bad.search(" ".join(words[1:])):
+            return False
+    return True

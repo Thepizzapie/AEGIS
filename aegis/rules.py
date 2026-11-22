@@ -11187,6 +11187,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.JVM_CONFIG_PATH_RE, "a Maven .mvn/jvm.config"),
     (patterns.WRAPPER_PROPS_PATH_RE, "a Gradle/Maven wrapper properties file"),
     (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
+    (patterns.HTTP_CLIENT_RC_PATH_RE, "a curl/wget config file (.curlrc/.wgetrc)"),
 )
 
 
@@ -13890,6 +13891,617 @@ def rule_agent_exec_config_protect(ev: Event, policy=None) -> Optional[Decision]
     return None
 
 
+def _http_client_config_allowed_by_policy(cfg: dict, text: str) -> bool:
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):
+        allow = [allow]          # a bare string is one regex, not characters
+    elif not isinstance(allow, (list, tuple)):
+        return False
+    for pat in allow:
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+# Arg keys whose string values are the PRE-edit text (or the target path),
+# never content the call writes -- excluded from the flattened-content sweep.
+_HTTP_RC_NON_CONTENT_KEYS = frozenset((
+    "old_string", "oldText", "old_text", "oldString", "file_path", "path",
+    "notebook_path", "target_file", "targetFile", "filename", "file", "uri",
+    "filePath", "replace_all", "dryRun", "dry_run",
+))
+
+
+_HTTP_RC_WORD_SPLIT_RE = re.compile(r"[_\-.\s/]+|(?<=[a-z0-9])(?=[A-Z])")
+_HTTP_RC_READ_WORDS = frozenset((
+    "read", "get", "list", "search", "stat", "info", "view", "find", "head",
+    "tail", "cat", "tree", "exists", "exist", "describe", "watch", "ls",
+    "glob", "grep", "show", "open", "query", "lookup",
+))
+_HTTP_RC_WRITE_WORDS = frozenset((
+    "write", "edit", "create", "put", "save", "append", "update", "patch",
+    "upload", "move", "copy", "rename", "replace", "insert", "set",
+    "duplicate", "concatenate", "concat", "download", "mv", "cp", "store",
+    "add", "modify", "apply", "overwrite", "new", "make", "touch", "link",
+    "symlink", "restore", "import", "extract", "unzip", "untar", "sync",
+))
+# Argument keys that make even a read-shaped call put bytes somewhere.
+_HTTP_RC_OUTPUT_KEY_WORDS = frozenset((
+    "output", "out", "dest", "destination", "save", "target", "to", "outfile",
+))
+
+
+def _http_rc_words(name) -> set:
+    return {w.lower() for w in _HTTP_RC_WORD_SPLIT_RE.split(str(name or "")) if w}
+
+
+def _http_rc_mcp_read_only(ev: Event) -> bool:
+    """A read-shaped MCP call (a `read_file` with `encoding: utf-8` must not
+    have that value parsed as an rc directive -- QA round 1). Judged on the
+    TOOL's own name (after the last `__`, so a server called `cathead`
+    doesn't count), by whole word, with no write word and no output/
+    destination argument (QA round 3: `duplicate_file`, `concatenate_files`,
+    `http__get{save_to}`)."""
+    if ev.action != ActionClass.MCP:
+        return False
+    words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+    if not (words & _HTTP_RC_READ_WORDS) or (words & _HTTP_RC_WRITE_WORDS):
+        return False
+    for k in (ev.args or {}):
+        if _http_rc_words(k) & _HTTP_RC_OUTPUT_KEY_WORDS:
+            return False
+    return True
+
+
+def _http_rc_mcp_strings(ev: Event, a: dict) -> list:
+    """Strings an MCP call writes. Every non-path string is judged unless
+    the tool is read-shaped (and not also write-shaped) -- QA round 2: a
+    content-key allowlist missed `file_content`/`input`/a second content key."""
+    if _http_rc_mcp_read_only(ev):
+        return []
+    return _http_rc_written_strings(a)
+
+
+# Option keys a write tool never writes INTO the file (QA round 3:
+# `encoding_fallback_from: latin1` must not parse as a directive).
+_HTTP_RC_META_KEY_WORDS = frozenset((
+    "encoding", "charset", "mode", "format", "newline", "eol", "permissions",
+    "perm", "chmod", "owner", "mime", "mimetype", "language", "lang",
+    "dry", "dryrun", "run", "overwrite", "backup", "fallback", "from",
+    "owner", "repo", "repository", "message", "branch", "sha", "commit",
+    "author", "committer", "email", "title", "base", "head", "ref",
+    "description", "labels", "label", "channel", "thread", "ts",
+))
+
+
+def _http_rc_written_strings(v, _depth: int = 0) -> list:
+    if _depth > 12:
+        return []
+    if isinstance(v, dict):
+        out = []
+        for k, x in v.items():
+            if str(k) in _HTTP_RC_NON_CONTENT_KEYS:
+                continue
+            kw = _http_rc_words(k)
+            if kw and kw <= _HTTP_RC_META_KEY_WORDS:
+                continue
+            out.extend(_http_rc_written_strings(x, _depth + 1))
+        return out
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            out.extend(_http_rc_written_strings(x, _depth + 1))
+        return out
+    if isinstance(v, str):
+        return [v]
+    return []
+
+
+_HTTP_RC_EDIT_PAIRS = (("old_string", "new_string"), ("oldText", "newText"),
+                       ("old_text", "new_text"), ("oldString", "newString"),
+                       ("old_str", "new_str"), ("old", "new"),
+                       ("search", "replace"), ("find", "replace"),
+                       ("pattern", "replacement"), ("from", "to"))
+# Key WORDS (split on `_`/`-`/camelCase) that name text being replaced or
+# its replacement; an unrecognized pair using any of them fails closed.
+_HTTP_RC_OLDISH_WORDS = frozenset((
+    "old", "search", "find", "pattern", "match", "before", "original",
+    "needle", "regex", "regexp", "existing", "query", "orig", "source", "src",
+    "replace", "replacement", "repl", "updated", "with",
+))
+# Pairs whose old side is a REGEX for some tools: replayed literally only
+# when the value has no regex metacharacter (QA round 3).
+_HTTP_RC_REGEXISH_OLD = frozenset(("search", "find", "pattern"))
+_HTTP_RC_REGEX_META_RE = re.compile(r"[.^$*+?()\[\]{}|\\]")
+
+
+def _http_rc_edit_list(a: dict) -> tuple:
+    """(edits, unreplayable): every old->new pair in the call, at top level
+    or inside an `edits`/`changes`/`replacements` list or dict, in any of the
+    common key spellings (QA round 2); `unreplayable` is True when an
+    old/search-shaped key is present that no known pair accounts for."""
+    edits, seen_keys = [], set()
+
+    def take(d):
+        for ok, nk in _HTTP_RC_EDIT_PAIRS:
+            if ok in d or nk in d:
+                edits.append((_npmrc_str(d.get(ok)), _npmrc_str(d.get(nk)),
+                              bool(d.get("replace_all") or d.get("replaceAll")
+                                   or d.get("all"))))
+                seen_keys.update((ok, nk))
+                return True
+        return False
+
+    take(a)
+    for lk in ("edits", "changes", "replacements", "edit", "operations"):
+        v = a.get(lk)
+        items = v if isinstance(v, list) else ([v] if isinstance(v, dict) else [])
+        for e in items:
+            if isinstance(e, dict):
+                take(e)
+    unreplayable = False
+
+    def scan(d, depth=0):
+        nonlocal unreplayable
+        if depth > 6 or not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            if (k not in seen_keys and isinstance(v, str)
+                    and _http_rc_words(k) & _HTTP_RC_OLDISH_WORDS):
+                unreplayable = True
+            if (k in _HTTP_RC_REGEXISH_OLD and isinstance(v, str)
+                    and _HTTP_RC_REGEX_META_RE.search(v)):
+                unreplayable = True
+            if isinstance(v, dict):
+                scan(v, depth + 1)
+            elif isinstance(v, list):
+                for x in v:
+                    scan(x, depth + 1)
+    scan(a)
+    return edits, unreplayable
+
+
+def _http_rc_new_unsafe(ev: Event, p: str, kind: str) -> list:
+    """Unsafe directive names the call would leave in the file. A whole-file
+    Write is judged as written. An Edit/MultiEdit/MCP edit is replayed on the
+    on-disk file and the RESULT is diffed (by whole line) against the file
+    as it stands -- QA round 1: judging only `new_string` let a deletion
+    (`# insecure` -> `insecure`, `silent insecure` -> `insecure`) uncover a
+    directive planted earlier as inert text. An edit the hook cannot replay
+    (file unreadable, old text absent) that removes text is gated."""
+    a = ev.args or {}
+    if _http_rc_mcp_read_only(ev):
+        return []
+    if ev.action == ActionClass.MCP:
+        # Copy/move/rename/download INTO an rc path: the content comes from
+        # elsewhere and can't be judged here (QA round 4: `move_file{path,
+        # destination}`, `rename_file{new_name: .curlrc}`).
+        if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
+            return ["<copied/moved from another file>"]
+        # A second path under a PATH key (skipped from content) still means
+        # another file is involved.
+        for k in _HTTP_RC_NON_CONTENT_KEYS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != p \
+                    and _HTTP_RC_PATHLIKE_RE.match(v.strip()):
+                pn = str(p).replace("\\", "/").rstrip("/")
+                vn = v.strip().replace("\\", "/").rstrip("/")
+                if not (pn == vn or pn.startswith(vn + "/")):
+                    return [f"<content from another file: {v.strip()[:60]}>"]
+    edits, unreplayable = _http_rc_edit_list(a)
+    if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
+        return ["<edit shape not replayable against the file on disk>"]
+    content = a.get("content")
+    if not isinstance(content, str):
+        content = a.get("contents") if isinstance(a.get("contents"), str) else None
+    if isinstance(content, str) and not edits:
+        if ev.action == ActionClass.MCP:
+            # Every non-path string, not just `content` (QA round 2: a
+            # second `file_body` key rode along unjudged).
+            return _http_rc_mcp_judge(_http_rc_written_strings(a), p, kind)
+        return patterns.http_client_rc_unsafe_directives(content, kind)
+    if edits:
+        before = _npmrc_read(ev, p)
+        after = _npmrc_apply_edits(before, edits) if before is not None else None
+        if after is not None:
+            had = [ln for _, ln in patterns.http_client_rc_unsafe_entries(before, kind)]
+            added = []
+            after_unsafe = patterns.http_client_rc_unsafe_entries(after, kind)
+            for name, ln in after_unsafe:
+                if ln in had:
+                    had.remove(ln)
+                else:
+                    added.append(name)
+            if not added and after_unsafe and kind == "wget":
+                # Removing a safe OVERRIDE line (`use_proxy = off`) re-arms an
+                # unsafe line already in the file (QA round 3).
+                def _norm(x):
+                    return re.sub(r"[\s_\-]", "", x).lower()
+                after_lines = [_norm(x) for x in after.replace("\r", "\n").split("\n")]
+                for ln in before.replace("\r", "\n").split("\n"):
+                    if ln.strip() and _norm(ln) not in after_lines and \
+                            patterns.http_client_rc_is_override_line(ln):
+                        added.append(ln.strip()[:40])
+            return added
+        found = patterns.http_client_rc_unsafe_directives(
+            "\n".join(n for _, n, _ in edits), kind)
+        if found:
+            return found
+        if any(o for o, _, _ in edits):
+            return ["<edit not verifiable against the file on disk>"]
+        return []
+    if ev.action == ActionClass.MCP:
+        return _http_rc_mcp_judge(_http_rc_mcp_strings(ev, a), p, kind)
+    return patterns.http_client_rc_unsafe_directives(
+        "\n".join(x for x in _http_rc_written_strings(a) if x != p), kind)
+
+
+_HTTP_RC_PATHLIKE_RE = re.compile(
+    r"^(?:file://\S+|(?:~|\.{1,2})?[/\\][^\s=]*|[A-Za-z]:[/\\][^\s=]*)$")
+
+
+_HTTP_RC_COPY_WORDS = frozenset((
+    "copy", "move", "rename", "duplicate", "concatenate", "concat", "mv", "cp",
+    "link", "symlink", "restore", "import", "extract", "unzip", "untar",
+    "sync", "download", "clone",
+))
+
+
+def _http_rc_mcp_judge(strings, p: str, kind: str) -> list:
+    """An MCP write's strings: the target path and its parent directories
+    are skipped; any OTHER path means content comes from another file
+    (copy/concatenate/duplicate) and is gated; the rest is rc text."""
+    body = []
+    pn = str(p).replace("\\", "/").rstrip("/")
+    for x in strings:
+        xs = x.strip()
+        if not xs or xs == p:
+            continue
+        if _HTTP_RC_PATHLIKE_RE.match(xs):
+            xn = xs.replace("\\", "/").rstrip("/")
+            if xn and (pn == xn or pn.startswith(xn + "/")):
+                continue
+            return [f"<content from another file: {xs[:60]}>"]
+        body.append(x)
+    return patterns.http_client_rc_unsafe_directives("\n".join(body), kind)
+
+
+_HTTP_RC_PATH_SHAPE_RE = re.compile(
+    r"^(?:file://|[/\\~.]|[A-Za-z]:[/\\]|%\w+%|\$\{?\w+)[^\r\n]*$")
+
+
+def _http_rc_path_shaped(v) -> bool:
+    """A single-line string that starts like a path and whose rc-name match
+    runs to its end (spaces allowed: `C:\\Users\\John Smith\\_curlrc` --
+    QA round 5). Prose (`check your ~/.curlrc ...`) starts with a word."""
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or not _HTTP_RC_PATH_SHAPE_RE.match(t):
+        return False
+    m = None
+    for m in patterns.HTTP_CLIENT_RC_PATH_RE.finditer(t):
+        pass
+    return bool(m) and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?", t[m.end():]) is not None
+
+
+def _http_rc_mapping_keys(v, _depth: int = 0) -> list:
+    out = []
+    if _depth > 8:
+        return out
+    if isinstance(v, dict):
+        for k, x in list(v.items())[:2000]:
+            out.append(str(k))
+            out.extend(_http_rc_mapping_keys(x, _depth + 1))
+    elif isinstance(v, (list, tuple)):
+        for x in list(v)[:2000]:
+            out.extend(_http_rc_mapping_keys(x, _depth + 1))
+    return out
+
+
+_HTTP_RC_SHELL_TOOL_WORDS = frozenset((
+    "exec", "execute", "run", "process", "terminal", "shell", "eval",
+    "interact", "repl", "spawn", "send", "command", "bash", "powershell",
+    "sh", "cmd", "tmux", "console",
+))
+
+
+def _http_rc_mcp_shell_command(ev: Event) -> Optional[str]:
+    a = ev.args or {}
+    if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_SHELL_TOOL_WORDS:
+        # A shell/terminal/exec tool: every string it carries is shell
+        # input (`interact_with_process{input}`, `executable`+`args`,
+        # `arguments`/`argv`, tmux `keys`) -- QA round 5.
+        parts = [str(x) for x in _flatten_strings(a) if isinstance(x, (str, int, float))]
+        if parts:
+            return "\n".join(parts)[:200000]
+    if isinstance(a.get("args"), dict) and not any(k in a for k in ("command", "cmd", "script")):
+        a = a["args"]
+    for key in ("command", "cmd", "script", "shell_command", "commandLine", "command_line"):
+        v = a.get(key)
+        if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+            v = " ".join(list(v)[:256])
+        if isinstance(v, str) and v.strip():
+            # `{command: "bash", args: ["-c", ...], stdin: "..."}` (QA round 4)
+            extra = a.get("args") if a.get("args") is not a else None
+            if isinstance(extra, (list, tuple)):
+                v += " " + " ".join(str(x) for x in list(extra)[:256])
+            elif isinstance(extra, str):
+                v += " " + extra
+            for sk in ("stdin", "input", "script_body"):
+                if isinstance(a.get(sk), str) and a.get(sk):
+                    v += "\n" + a[sk]
+            return v
+    return None
+
+
+def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate planting a directive in curl's/wget's per-user config
+    (``~/.curlrc``/``_curlrc``/``$XDG_CONFIG_HOME/curlrc``, ``~/.wgetrc``,
+    ``/etc/wgetrc``, wget2's ``wget2rc``) beyond routine transfer behaviour.
+
+    THREAT MODEL: coding agents run ``curl``/``wget`` constantly -- API
+    probes, ``curl -H "Authorization: Bearer $TOKEN" ...``, installer
+    downloads. Both tools silently apply every line of their rc file to
+    EVERY future invocation, by this agent, a teammate or CI, with nothing
+    in the visible command line to show it. A prompt-injected agent that
+    plants ``proxy = http://attacker:8080`` plus ``insecure`` (wget:
+    ``https_proxy`` + ``check_certificate = off``) gets a transparent TLS
+    MITM of every later request, tokens and all; ``connect-to``/
+    ``resolve``/``doh-url`` redirect a named host to another IP; ``trace``/
+    ``dump-header``/``cookie-jar`` (wget ``logfile``/``save_cookies``) log
+    every transfer's credentials to a file; ``url``/``data = @~/.ssh/
+    id_rsa``/``upload-file`` (wget ``post_file``/``body_file``) bolt an
+    exfiltration request onto every ordinary call; ``engine`` loads a
+    shared library and wget's ``use_askpass`` runs a program. It also
+    routes AROUND ``rule_network_egress``, which only ever sees the host
+    written in the command -- an allowlisted ``curl https://api.github.com``
+    still goes through the planted proxy. No existing guard covered these
+    files: the fetch-to-file backstop and containment only ever looked at
+    curl's/wget's command line, never the config both read implicitly.
+
+    Content check (``patterns.http_client_rc_unsafe_directives``) is an
+    ALLOWLIST: a file that only sets silent/fail/retry/timeout/user-agent/
+    redirect/progress-style options passes; any other directive -- including
+    an unknown alias, a short-option cluster with a non-benign letter, or a
+    wget ``check_certificate``/``hsts`` switched off -- is gated. curl's
+    250+ options, short aliases and three separator styles (and wget's
+    case/``_``/``-`` folding) make a denylist leak by alias.
+
+    Edit/MultiEdit/MCP ``edit_file`` calls are REPLAYED against the file on
+    disk and the resulting file is diffed, by whole line, against the file
+    as it stands: a deletion that uncovers a directive planted earlier as
+    inert text (``# insecure`` -> ``insecure``) counts as adding it, while an
+    unrelated edit to a file that already carries a human-set ``proxy`` line
+    is not re-litigated. An edit the hook cannot replay (file unreadable,
+    old text absent) is judged on its new text, and gated if it removes
+    anything. For MCP calls only content-shaped keys are judged (a
+    ``read_file`` with ``encoding: utf-8`` is not a write).
+
+    Shell form is INVERTED: a command naming one of these paths -- literally,
+    through ``\\`` escapes, or through a glob/brace word bash would expand to
+    one (``~/.curl{rc,}``, ``~/.curlr?``) -- is gated unless every simple
+    command in it is a read-only/delete verb (``cat``/``grep``/``ls``/
+    ``stat``/``test``/``rm``...) and nothing is redirected into a file
+    (``2>/dev/null``/``2>&1`` noise excepted). A write-verb list always
+    misses one more tool (rsync, ``tar -x``, unzip, sponge, socat, ``sed
+    w``, ``vim -es``, patch, cpio). A fetch-to-file write (``curl -o
+    ~/.curlrc <url>``) is also caught by ``rule_fetch_to_file_protect``,
+    which this guard's path regex is registered with.
+
+    Config (``policy.http_client_config``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command). Escapable only by
+    a human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_HTTP_CLIENT_CONFIG=1`` set before launch; a spawned agent
+    can do neither.
+
+    Honest scope: ``CURL_HOME``/``XDG_CONFIG_HOME``/``WGETRC`` pointed at a
+    directory/file with none of these names, an explicit ``curl -K <file>``/
+    ``wget --config=<file>`` of a staged file, the ``HTTPS_PROXY``/
+    ``SSL_CERT_FILE`` environment variables (a shell-startup write is
+    ``rule_shell_persist_protect``'s), and a path assembled indirectly
+    (variable concatenation, ``cd ~ && cp x .curlrc`` without the name
+    literal) are not covered -- the same "computed indirectly" class every
+    sibling guard accepts. Other HTTP clients' configs (httpie, aria2,
+    ``.netrc`` writes, pip/npm proxy keys) are out of scope here.
+    Accepted false ASKs on the shell form: any non-read verb in a command
+    that merely mentions the path (``cp ~/.curlrc /tmp/bak``, ``git commit
+    -m "mention .curlrc"``, ``echo see ~/.curlrc >> NOTES.md``).
+
+    QA history (two independent reviews, bypass-hunting and design/false-
+    positive, run in parallel): round 1 found the path regex's shared end
+    anchor rejected a glued ``>``/``<`` (``cat >~/.curlrc<<EOF``,
+    ``tee ~/.curlrc>/dev/null``) and its start anchor a glued redirect
+    (``>.curlrc``); a two-step uncomment-by-Edit plant; escape/brace/glob
+    spellings; ten write tools outside the verb list; NTFS ``::$DATA``;
+    ``/etc/wget2rc`` and literal ``$XDG_CONFIG_HOME/curlrc``. On the
+    false-positive side: fd-noise redirects, read-only MCP calls with an
+    ``encoding``/``pattern`` arg, common options (``write-out`` sans
+    ``%output{}``, ``create-dirs``, ``proto``, wget ``use_proxy = off``),
+    a bare-string ``allow``. Credential-printing ``verbose``/``include``
+    (wget ``debug``/``server_response``) were moved OUT of the allowlist.
+    Round 2 found: commands over 20000 chars skip the truncated scan
+    surface (an ENGINE-WIDE gap in ``normalize.scan_surface``, reported
+    separately; this guard now also checks the raw command); MCP edit shapes
+    the replay didn't know (``search``/``replace``, top-level ``old_text``,
+    dict ``edits``) -- now replayed, and an unknown old/search-shaped key
+    fails closed; MCP write content under an unlisted key -- now every
+    non-path string is judged unless the tool is read-shaped;
+    ``${XDG_CONFIG_HOME:-$HOME/.config}/curlrc`` spellings; leading-``*``
+    globs; ``rg --pre``/``bat --pager``/``sort -o``; and false ASKs on
+    ``if``/``for`` loops, ``cut``/``nl`` reads. Round 3 found: the round-2
+    ``for`` no-op swallowed ``for x do cp ... ~/.curlrc`` (segments now
+    split on ``do``/``then``/``else``/``elif``); shell-type MCP tools
+    (``start_process``/``run_command``) were never judged as shell (now
+    re-evaluated as a Bash sub-event, as ``rule_agent_exec_config_protect``
+    does); unknown edit-key spellings (serena ``regex``/``repl``,
+    ``needle``, ``original``/``updated``) and regex-valued ``pattern``s
+    now fail closed; ``sort`` dropped (``--out=`` abbreviation,
+    ``--compress-program``); MCP read/write classification is now by
+    whole word on the tool's own name, with an output-argument override,
+    and a write that names a second file path (copy/concatenate) is
+    gated; removing a wget ``use_proxy = off`` override is gated; Windows
+    ``%XDG_CONFIG_HOME%``. Round 4 found: the round-3 shell-tool hand-off
+    returned early for editor tools whose ``command`` is ``create``/
+    ``insert`` (now falls through); ``write-out`` could append to any file
+    via ``%\\output{}`` unescaping or ``@fmtfile`` (removed from the
+    allowlist, as was ``remote-name-all``); a Codex ``apply_patch`` body was
+    taken as the path (only a whitespace-free string is a path now; a
+    patch naming an rc file is gated); copy/move/rename tools and a second
+    path under a path key; ``stdin``/``args`` of shell tools; rc paths as
+    mapping keys. False positives fixed: GitHub/Slack metadata args, prose
+    mentioning ``~/.curlrc``, ``while read`` loops, case-only override
+    edits. Accepted: reordering two existing wget override lines. Round 5
+    found the round-4 whitespace-free path rule dropped spaced Windows
+    profile paths under nested/non-standard keys (now: any single-line,
+    path-shaped string whose rc-name match runs to its end); shell-like
+    MCP tools carrying input outside ``command`` (``interact_with_process``,
+    ``executable``+``args``, tmux ``keys``) -- a tool whose name is
+    shell/exec/run/terminal-shaped now has every string judged as shell;
+    indented patch headers. False positives fixed: editor verbs
+    (``view``/``create``) parsed as directives, diffs quoted inside an
+    ordinary MCP file write. Accepted: ``-w "\\n"`` now ASKs (write-out
+    is not allowlisted). Round 6 found the round-5 quoted-diff skip also
+    hid real patch tools whose ``path`` arg is a repo/workdir (``git_apply
+    {path, patch}``); the skip now applies only to non-patch tools with the
+    diff under an ordinary content key. Round 7 APPROVED; its one
+    non-blocking note (diffs under other keys -- ``mbox``/``udiff``/
+    ``hunks`` -- of a call with a directory ``path``) was closed by
+    inverting the skip: only ``content``/``text``/``body``-style keys of a
+    call with its own target are exempt from patch scanning."""
+    cfg = getattr(policy, "http_client_config", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "http-client-config-protect-monitor")
+            return None
+        return would
+
+    if ev.action == ActionClass.MCP:
+        # A shell-type MCP tool (`start_process`, `run_command`, ...): judge
+        # its command string as a shell command, as
+        # `rule_agent_exec_config_protect` does (QA round 3).
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                             args={"command": shell_cmd}, cwd=ev.cwd)
+            d = rule_http_client_config_protect(sub, policy)
+            if d is not None:
+                return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                "command that writes a curl/wget config file. " + d.message)
+            # No shell hit: fall through to the write check -- an editor
+            # tool's `command: "create"` is not a shell (QA round 4
+            # regression). A one-word editor verb is not file content
+            # either (QA round 5).
+            a0 = ev.args or {}
+            if isinstance(a0.get("command"), str) and re.fullmatch(r"\s*[A-Za-z_]{1,32}\s*", a0["command"]):
+                ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                                args={k: v for k, v in a0.items() if k != "command"})
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        kind = patterns.http_client_rc_kind(p)
+        found = None
+        if not kind and ev.action == ActionClass.MCP:
+            # An MCP tool may name its path argument anything -- but only a
+            # single, whitespace-free, path-shaped string counts as the path
+            # (QA round 4: a whole `apply_patch` body was taken as `p` and
+            # then skipped as "the path"; a chat message mentioning
+            # ~/.curlrc is prose, not a target).
+            for s_ in _flatten_strings(a):
+                s_ = str(s_)
+                if _http_rc_path_shaped(s_) and patterns.http_client_rc_kind(s_):
+                    kind, p = patterns.http_client_rc_kind(s_), s_.strip()
+                    break
+            # QA rounds 5-7: a diff QUOTED in an ordinary file write (CHANGES.md
+            # content) is not a patch application, so only strings under a
+            # plain content key of a call whose own target is set are exempt;
+            # every other string (patch/diff/mbox/udiff/hunks keys, list
+            # values, or a call with no target) is scanned for patch headers.
+            exempt = set()
+            if _path(ev) and "\n" not in _path(ev):
+                exempt = {"content", "contents", "text", "body", "file_content", "new_content"}
+            if not kind:
+                for k_, v_ in a.items():
+                    if str(k_) in exempt:
+                        continue
+                    pk = ""
+                    for s_ in _flatten_strings({k_: v_}):
+                        pk = patterns.http_client_rc_patch_kind(str(s_))
+                        if pk:
+                            break
+                    if pk:
+                        kind, p, found = pk, "<patch>", ["<patch touching a curl/wget config file>"]
+                        break
+            if not kind:
+                for k_ in _http_rc_mapping_keys(a):
+                    if patterns.http_client_rc_kind(k_):
+                        kind, p, found = (patterns.http_client_rc_kind(k_), k_,
+                                          ["<content keyed by a curl/wget config path>"])
+                        break
+        if not kind:
+            return None
+        if found is None:
+            found = _http_rc_new_unsafe(ev, p, kind)
+        if not found:
+            return None
+        if (os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")
+                or _http_client_config_allowed_by_policy(cfg, p)):
+            return None
+        shown = ", ".join(found[:5]) + (", ..." if len(found) > 5 else "")
+        tool = "wget" if kind == "wget" else "curl"
+        return _finish(Decision(action, "http-client-config-protect",
+                         f"'{p}' is {tool}'s own config file, applied silently "
+                         f"to every future {tool} run (this agent, a teammate, "
+                         f"or CI), and this write sets: {shown}. Directives "
+                         "beyond routine transfer behaviour can reroute every "
+                         "request through a proxy (around Aegis's egress "
+                         "allowlist), disable TLS checks, log credentials to "
+                         "a file, or attach a local file to every request. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_HTTP_CLIENT_CONFIG=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        raw = _cmd(ev)
+        # Also the RAW command: `normalize.scan_surface` truncates at 20000
+        # chars, so `echo <30k pad>; cp x ~/.curlrc` would otherwise never be
+        # seen (QA round 2; an engine-wide gap reported separately).
+        if not (patterns.http_client_rc_shell_path_hit(cmd)
+                or patterns.http_client_rc_shell_path_hit(raw)):
+            return None
+        # Inverted check (QA round 1): any command naming the path is gated
+        # unless it only reads or deletes -- a write-verb list always misses
+        # one more tool (rsync, tar -x, unzip, sponge, socat, vim -es, patch).
+        if (patterns.http_client_rc_shell_only_reads(cmd)
+                and patterns.http_client_rc_shell_only_reads(raw)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_HTTP_CLIENT_CONFIG")
+                or _http_client_config_allowed_by_policy(cfg, _cmd(ev))):
+            return None
+        return _finish(Decision(action, "http-client-config-protect",
+                         "A curl/wget config file (.curlrc/.wgetrc) is being "
+                         "written from a shell -- every line in it applies "
+                         "silently to every future curl/wget run, and can "
+                         "reroute requests through a proxy (around Aegis's "
+                         "egress allowlist), disable TLS checks, log "
+                         "credentials, or attach a local file to every "
+                         "request. A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_HTTP_CLIENT_CONFIG=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -13950,6 +14562,8 @@ _CORE_RULES = (
     # pre-empt `rm -rf ~` / `| sh` / force-push DENYs chained onto a plant.
     rule_repl_rc_exec_protect,
     rule_agent_exec_config_protect,
+    # Content-gated ASK; same tail-block reason as npmrc/repl_rc above.
+    rule_http_client_config_protect,
     rule_agent_rules_protect,
 )
 
