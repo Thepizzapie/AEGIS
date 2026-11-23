@@ -14967,7 +14967,14 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     ~/.config``) -- ``mv``/``rm``/``trash`` sources earlier in the command
     are now tracked as removed; and the quote-stripped scan rendering
     changing what ``bash -c 'cd /tmp && git pull'`` runs (skipped: the
-    tokenizer handles quotes itself)."""
+    tokenizer handles quotes itself). Round 13 found ``eval 'cd ~ && tar
+    xf x'`` regressed (only the first segment of an ``eval`` body was
+    analyzed; now all, inline, with the cwd state); removed-path tracking
+    missed relative sources under an absolute target and ``mv
+    ~/.config{,.bak}``/glob sources (sources are now resolved against every
+    cwd, words are brace-expanded in bash order, globs expanded); heredoc
+    bodies fed to a shell (``bash <<'EOF'``, ``cat <<EOF | sh``) are now
+    analyzed as commands; ``$"..."`` locale quoting (and ``$""``)."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

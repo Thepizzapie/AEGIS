@@ -7925,7 +7925,7 @@ _ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl", "yadm"))
 _ED_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "busybox-sh",
                         "su", "script", "runuser"))
 _ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS | _ED_SHELLS
-                      | frozenset(("rm", "rmdir", "unlink", "trash", "trash-put", "gio",
+                      | frozenset(("eval", "rm", "rmdir", "unlink", "trash", "trash-put", "gio",
                                    "remove-item", "del",
                                    "giget", "copier", "cookiecutter", "export", "rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
                                    "podman", "kubectl", "oc", "degit", "tiged", "wget",
@@ -8156,7 +8156,7 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
             end_seg()
             i += 1
             while heredocs:
-                delim, strip_tabs, quoted = heredocs.pop(0)
+                delim, strip_tabs, quoted, fed = heredocs.pop(0)
                 body = []
                 closed = False
                 while i < n:
@@ -8167,7 +8167,11 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
                         closed = True
                         break
                     body.append(line)
-                if not quoted:
+                if fed:
+                    # `bash <<'EOF' ... EOF`, `cat <<EOF | sh`: the body IS
+                    # the script (QA round 13).
+                    nested.append("\n".join(body))
+                elif not quoted:
                     nested.extend(_ed_subst_bodies("\n".join(body)))
                 if not closed:
                     # An unterminated heredoc: judge its body as commands
@@ -8206,6 +8210,9 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
         if c == "(" and not have and cmd.startswith("((", i):
             i = _ed_match_close(cmd, i, "((", "))")
             end_seg(); continue
+        if c == "$" and i + 1 < n and cmd[i + 1] == '"':
+            i += 1                               # `$"..."` == `"..."` (QA round 13)
+            continue
         if c == '"':
             j = i + 1
             buf = []
@@ -8283,7 +8290,11 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
                 word = cmd[i:j]
                 quoted = any(q in word for q in "'\"\\")
                 delim = re.sub(r"['\"\\]", "", word)
-                heredocs.append((delim, "-" in op, quoted))
+                line_end = cmd.find("\n", j)
+                rest_line = cmd[j:] if line_end < 0 else cmd[j:line_end]
+                fed = bool(words and _ed_verb(words[0]) in _ED_SHELLS) or bool(
+                    re.search(r"\|\s*(?:sudo\s+|env\s+)?(?:\S*/)?(?:ba|z|da|k|mk)?sh\b", rest_line))
+                heredocs.append((delim, "-" in op, quoted, fed))
                 i = j
                 continue
             if op.endswith("&") or op in (">&", "<&"):
@@ -8365,9 +8376,10 @@ def _ed_strip_prefix(words: list, state: dict) -> list:
             for _ in range(npos):
                 if words:
                     words.pop(0)
-            if prefix == "eval" and len(words) == 1:
-                t = _ed_tokenize(words[0])
-                words = t[0] if t else []
+            if prefix == "eval":
+                # Handled by the caller (all segments inline) -- keep a marker.
+                words = ["eval"] + words
+                break
         elif lw in ("pnpm", "yarn", "bun") and len(words) > 1 and words[1] in ("dlx", "x", "exec"):
             words = words[2:]                    # `pnpm dlx degit` (QA round 8)
         elif lw in ("uv", "poetry", "pipenv", "hatch", "pdm", "rye", "pixi") and len(words) > 1 \
@@ -8382,6 +8394,20 @@ def _ed_strip_prefix(words: list, state: dict) -> list:
         else:
             break
     return words
+
+
+def _ed_brace_ordered(word: str, budget: int = 64) -> list:
+    """bash brace expansion of one word, left-to-right order preserved."""
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", word)
+    if not m:
+        return [word]
+    out = []
+    for alt in m.group(1).split(","):
+        for x in _ed_brace_ordered(word[:m.start()] + alt + word[m.end():], budget):
+            out.append(x)
+            if len(out) >= budget:
+                return out
+    return out
 
 
 def _ed_verb(w: str) -> str:
@@ -8479,9 +8505,23 @@ def _ed_placement(cmd, cwd, hits, depth):
             return hits, True
         if len(words) > 4000:
             return hits, True                    # fail closed (QA round 11)
+        if any("{" in w and "," in w for w in words):
+            # bash brace expansion, in order (`mv ~/.config{,.bak}` -- QA r13)
+            ex = []
+            for w in words:
+                ex.extend(_ed_brace_ordered(w) if ("{" in w and "," in w) else [w])
+                if len(ex) > 4000:
+                    return hits, True
+            words = ex
         words = _ed_strip_prefix(words, state)
         verb = _ed_verb(words[0])
         args = words[1:]
+        if verb == "eval":
+            # `eval 'cd ~ && tar xf x'`: every segment of the body, inline,
+            # with the current cwd state (QA round 13 regression).
+            if args:
+                queue[0:0] = _ed_tokenize(" ".join(args), False, depth + 1)
+            continue
         if verb in _ED_SHELLS:
             # `bash -c 'cp -r x .'` runs in THIS cwd: analyze inline so the
             # surrounding `cd` state applies (QA round 10).
@@ -8550,10 +8590,7 @@ def _ed_placement(cmd, cwd, hits, depth):
                 return hits, True
             continue
         if verb in ("rm", "rmdir", "unlink", "trash", "trash-put", "gio", "remove-item", "del"):
-            for a in args:
-                if not a.startswith("-"):
-                    for d in cur_dirs():
-                        state.setdefault("removed", set()).add(_ed_canon(_ed_join(d, a)))
+            _ed_record_removed(state, [a for a in args if not a.startswith("-")], cur_dirs())
             continue
         if verb in _ED_PLACE_VERBS:
             if _ed_place(verb, args, state, cur_dirs(), hits):
@@ -8873,8 +8910,7 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
             # (fresh container/CI home): the source BECOMES it (QA round 11).
             return True
         if verb in ("mv", "move", "move-item", "mi", "gmv"):
-            for src in srcs:
-                state.setdefault("removed", set()).add(_ed_canon(_ed_join(d, src)))
+            _ed_record_removed(state, srcs, dirs)    # relative to EVERY cwd (QA r13)
         unknown_checked = False
         for src in srcs[:4000]:
             if verb in ("ln", "gln"):
@@ -8911,6 +8947,18 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
                 # round 11 false positives).
                 return True
     return False
+
+
+def _ed_record_removed(state, paths, dirs) -> None:
+    rem = state.setdefault("removed", set())
+    for src in paths[:256]:
+        src = _ed_home_norm(src)
+        cands = _ed_glob_candidates(src)[:64] if any(c in src for c in "*?[{") else [src]
+        for c in cands:
+            for d in (dirs or [None]):
+                rem.add(_ed_canon(_ed_join(d, c) if not c.startswith(("/", "~")) else c))
+        if len(rem) > 4096:
+            raise _EdTooBig()
 
 
 def _ed_canon(p) -> str:

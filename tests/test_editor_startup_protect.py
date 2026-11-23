@@ -1223,3 +1223,45 @@ def test_r12_move_aside_swap_gated(cmd, cwd):
 @pytest.mark.parametrize("cwd", [None, "/home/u/proj", "/home/u"])
 def test_r12_false_positives(cmd, cwd):
     assert evaluate(_sh_cwd(cmd, cwd), EMPTY).rule != RULE, (cmd, cwd)
+
+
+# ---- QA round 13 regressions --------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "eval 'cd ~ && tar xf /tmp/x.tgz'", "eval \"cd ~/.config && unzip -o /tmp/n.zip\"",
+    "eval 'cd ~/.config && cp -r /tmp/nvim .'", "eval 'cd ~/.config; git clone https://x/nvim'",
+    "eval 'cd ~ && git pull https://x/dots main'", "builtin eval 'cd ~ && tar xf /tmp/x.tgz'",
+    "command eval 'cd ~ && tar xf /tmp/x.tgz'", "eval cd ~ '&&' tar xf /tmp/x.tgz",
+    "cd ~ && mv .config /tmp/o && mv /tmp/p ~/.config",
+    "mv ~/.config{,.bak} && mv /tmp/p ~/.config",
+    "mv ~/.config{,.old} && cp -r /tmp/p ~/.config",
+    "mv ~/.conf* /tmp/o && mv /tmp/p ~/.config", "mv ~/.conf?g /tmp/o && mv /tmp/p ~/.config",
+    "bash <<'EOF'\ncp -r /tmp/nvim ~/.config/\nEOF",
+    "bash <<'EOF'\ncd ~\ntar xf /tmp/x.tgz\nEOF",
+    "sh <<EOF\nrsync -a /tmp/p/ ~/\nEOF", "bash -s <<'EOF'\ncp -r /tmp/p/. ~\nEOF",
+    "cat <<'EOF' | bash\ncp -r /tmp/p/. ~\nEOF",
+    "bash <<'EOF'\nmv ~/.config /tmp/o && mv /tmp/p ~/.config\nEOF",
+    "tar xf /tmp/x.tgz -C $\"$HOME\"", "cd ~/$\".config\" && tar xf /tmp/x.tgz",
+    "unzip -o /tmp/x.zip -d $\"$HOME\"", "rsync -a /tmp/p/ $\"$HOME/\"",
+    "cp -r /tmp/p/. $\"$HOME\"", "cp -r /tmp/nvim ~/.config$\"\"/",
+    "cp -r /tmp/nvim ~/.config/$\"\"", "mv /tmp/nvim ~/.config/$\"\"",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj", "/home/u"])
+def test_r13_gated(cmd, cwd):
+    assert _ours(rules.rule_editor_startup_protect(_sh_cwd(cmd, cwd), EMPTY)), (cmd, cwd)
+    assert evaluate(_sh_cwd(cmd, cwd), EMPTY).action != Action.ALLOW, (cmd, cwd)
+
+
+def test_r13_relative_mv_aside_with_home_cwd():
+    cmd = "mv .config /tmp/o && mv /tmp/p .config"
+    assert _ours(evaluate(_sh_cwd(cmd, "/home/u"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "eval \"$(ssh-agent -s)\"", "eval \"$(direnv hook bash)\"", "eval $(minikube docker-env)",
+    "bash <<'EOF'\necho hello\nnpm test\nEOF", "cat <<'EOF' > notes.md\ncp -r a ~/.config\nEOF",
+    "mv ~/.config/foo.toml{,.bak}", "python - <<'EOF'\nprint(1)\nEOF",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj"])
+def test_r13_false_positives(cmd, cwd):
+    assert evaluate(_sh_cwd(cmd, cwd), EMPTY).rule != RULE, (cmd, cwd)
