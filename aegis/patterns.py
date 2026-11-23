@@ -7423,3 +7423,171 @@ def http_client_rc_shell_only_reads(cmd: str) -> bool:
         if bad and bad.search(" ".join(words[1:])):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Editor startup/init hijack (`rules.rule_editor_startup_protect`).
+#
+# Terminal editors execute their user init files and runtime directories as
+# CODE on every launch, with the human's full privileges and no prompt:
+#   * Vim: `~/.vimrc`/`_vimrc`/`.gvimrc`, `~/.vim/**` (plugin/, ftplugin/,
+#     after/, autoload/, pack/*/start/ -- all sourced automatically),
+#     `~/vimfiles/**` (Windows), `~/.config/vim/**` (Vim 9.1 XDG),
+#     `/etc/vim/**`, `/etc/vimrc`, `.../share/vim/**`, `.exrc`;
+#   * Neovim: `~/.config/nvim/**` (init.lua/init.vim, lua/, plugin/),
+#     `~/.local/share/nvim/**` (site/pack, plugin-manager checkouts),
+#     `%LOCALAPPDATA%\nvim[-data]`, `/etc/xdg/nvim/**`, project `.nvim.lua`/
+#     `.nvimrc` (exrc);
+#   * Emacs: `~/.emacs[.el|.elc]`, `~/.emacs.d/**`, `~/.config/emacs/**`,
+#     Doom/Spacemacs config, `site-start.el`/`site-start.d`, site-lisp
+#     `default.el`, `/etc/emacs/**`, `.dir-locals.el` (`eval:` locals);
+#   * Kakoune `~/.config/kak/**` (`%sh{}`), micro `~/.config/micro/**`
+#     (init.lua / Lua plugins), Helix `~/.config/helix/**` and workspace
+#     `.helix/**` (`languages.toml` names the language-server COMMAND run on
+#     opening a file), IdeaVim `.ideavimrc`.
+# The trigger is not only the human opening their editor: `git commit`
+# without `-m`, `git rebase -i`, `crontab -e`, `visudo`, `sudoedit` and
+# `less`'s `v` all launch `$EDITOR` -- the agent's own next `git commit`
+# can fire the plant. Every one of these files is Turing-complete
+# (Vimscript `system()`/`:!`, Lua `os.execute`/`vim.fn.jobstart`, Elisp
+# `shell-command`/`call-process`), so there is no benign subset to
+# allowlist: ANY write is gated (ask by default), as `SHELL_RC_PATH_RE`'s
+# guard does for `.bashrc`.
+_ED_B = _HTTP_RC_B
+_ED_END = _HTTP_RC_END
+_ED_XDG = (r"(?:\$\{?|%|\$env:)XDG_(?:CONFIG|DATA)_HOME(?::?[-=+?][^}\s]{0,200})?[}%]?"
+           + _SEP)
+_ED_APPDATA = (r"(?:(?:\$\{?|%|\$env:)(?:LOCALAPPDATA|APPDATA)[}%]?|AppData" + _SEP
+               + r"(?:Local|Roaming))" + _SEP)
+EDITOR_STARTUP_PATH_RE = re.compile(
+    _ED_B + r"(?:"
+    # --- Vim ---
+    r"[._]g?vimrc"
+    r"|[._]exrc"
+    r"|[._]ideavimrc"
+    r"|\.vim"
+    r"|vimfiles"
+    r"|\.config\}?" + _SEP + r"vim"
+    r"|" + _ED_XDG + r"vim"
+    r"|etc" + _SEP + r"g?vimrc"
+    r"|etc" + _SEP + r"vim"
+    r"|share" + _SEP + r"vim"
+    # --- Neovim ---
+    r"|\.config\}?" + _SEP + r"nvim"
+    r"|\.local" + _SEP + r"share" + _SEP + r"nvim"
+    r"|share" + _SEP + r"nvim"
+    r"|" + _ED_XDG + r"nvim"
+    r"|" + _ED_APPDATA + r"nvim(?:-data)?"
+    r"|etc" + _SEP + r"xdg" + _SEP + r"nvim"
+    r"|\.nvim\.lua"
+    r"|\.nvimrc"
+    # --- Emacs ---
+    r"|\.emacs(?:\.elc?|\.d)?"
+    r"|\.config\}?" + _SEP + r"(?:emacs|doom)"
+    r"|" + _ED_XDG + r"(?:emacs|doom)"
+    r"|\.doom\.d"
+    r"|\.spacemacs(?:\.d)?"
+    r"|site-start\.(?:elc?|d)"
+    r"|site-lisp" + _SEP + r"default\.elc?"
+    r"|etc" + _SEP + r"emacs"
+    r"|\.dir-locals(?:-2)?\.el"
+    # --- Kakoune / micro / Helix ---
+    r"|\.config\}?" + _SEP + r"(?:kak|micro|helix)"
+    r"|" + _ED_XDG + r"(?:kak|micro|helix)"
+    r"|" + _ED_APPDATA + r"helix"
+    r"|\.helix"
+    r")" + _ED_END,
+    re.IGNORECASE,
+)
+
+# Path components that, alone or under their parent, name a gated file or
+# tree -- for matching a shell glob/brace component against
+# (`~/.vim{rc,}`, `~/.config/nv*/init.lua`, `~/.e?acs.d/init.el`).
+_ED_COMPONENT_NAMES = (
+    ".vimrc", "_vimrc", ".gvimrc", "_gvimrc", ".exrc", "_exrc", ".ideavimrc",
+    "_ideavimrc", ".vim", "vimfiles", "vim", "nvim", "nvim-data", ".nvim.lua",
+    ".nvimrc", ".emacs", ".emacs.el", ".emacs.elc", ".emacs.d", "emacs",
+    "doom", ".doom.d", ".spacemacs", ".spacemacs.d", "site-start.el",
+    "site-start.elc", "site-start.d", "default.el", "default.elc",
+    ".dir-locals.el", ".dir-locals-2.el", "kak", "micro", "helix", ".helix",
+    "vimrc", "gvimrc", ".config", "config", "share", ".local", "etc", "xdg",
+    "site-lisp", "local", "roaming", "appdata",
+)
+_ED_GLOB_CHARS = "*?["
+
+
+_ED_PARENT_NAMES = frozenset((".config", "config", "share", "etc", "xdg",
+                               "local", "roaming", "appdata", "site-lisp"))
+_ED_PURE_WILD_RE = re.compile(r"[*?]+")
+
+
+def _ed_glob_candidates(word: str, budget: int = 256) -> list:
+    """Every path a glob/brace word could expand to, with each globbed
+    component replaced by every gated component name it matches. A pattern
+    not starting with `.` never matches a dot-name (bash's default, no
+    `dotglob`), and a bare `*`/`?` component is expanded only under a known
+    parent (`~/.config/*/init.lua`), so `cp src/*/* out/` is not a hit."""
+    out = []
+    for cand in _brace_expand(word):
+        parts = cand.replace("\\", "/").split("/")
+        paths = [[]]
+        for comp in parts:
+            nxt = []
+            for p_ in paths:
+                if any(c in comp for c in _ED_GLOB_CHARS):
+                    lc = comp.lower()
+                    if _ED_PURE_WILD_RE.fullmatch(comp) and not (
+                            p_ and p_[-1].lower() in _ED_PARENT_NAMES):
+                        subs = [comp]
+                    else:
+                        subs = [n for n in _ED_COMPONENT_NAMES
+                                if (lc.startswith(".") or not n.startswith("."))
+                                and fnmatch.fnmatchcase(n, lc)] or [comp]
+                else:
+                    subs = [comp]
+                for s_ in subs:
+                    nxt.append(p_ + [s_])
+                if len(nxt) >= budget:
+                    break
+            paths = nxt[:budget]
+        out.extend("/".join(x) for x in paths)
+        if len(out) >= budget:
+            break
+    return out[:budget]
+
+
+def editor_startup_shell_path_hit(cmd) -> bool:
+    """True if a shell command names an editor init file/tree -- literally,
+    through backslash escapes (`.vim\\rc`), or through a glob/brace word
+    bash would expand to one."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    if EDITOR_STARTUP_PATH_RE.search(cmd):
+        return True
+    unesc = cmd.replace("\\", "")
+    if unesc != cmd and EDITOR_STARTUP_PATH_RE.search(unesc):
+        return True
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc)):
+        if i > 4000:
+            return True                       # fail closed on absurd input
+        w = m.group(0)
+        if not any(c in w for c in "*?[{"):
+            continue
+        if len(w) > 400:
+            return True
+        for cand in _ed_glob_candidates(w):
+            if EDITOR_STARTUP_PATH_RE.search("/" + cand.lstrip("/")) or \
+                    EDITOR_STARTUP_PATH_RE.search(cand):
+                return True
+    return False
+
+
+def editor_startup_patch_hit(text) -> bool:
+    """True if `text` is a patch (Codex `*** Add/Update File:` or unified
+    diff) whose header names an editor init file/tree."""
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    for m in _HTTP_RC_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        if EDITOR_STARTUP_PATH_RE.search(m.group(0)):
+            return True
+    return False

