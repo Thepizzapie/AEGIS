@@ -1325,3 +1325,31 @@ def test_r15_stacked_heredoc_pipes_fast(cmd):
 def test_r15_pipe_into_wrapped_shell_still_gated():
     cmd = "cat <<'EOF' | tee /tmp/log | sudo -E bash\ncp -r /tmp/p/. ~\nEOF"
     assert _ours(evaluate(_shell(cmd), EMPTY))
+
+
+# ---- QA round 16 regressions --------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cd ~ && tar xf /tmp/dots.tgz\n" + "sudo " * 1700 + "<<''" * 22306 + "|sudo" * 255,
+    "sudo " * 2000 + "<<''" * 22250,
+    "cat" + " <<E" * 12500 + ("|" + " sudo" * 38) * 255,
+    "sudo " * 2000 + "<<<''" * 17800,
+])
+def test_r16_heredoc_operator_flood_fast(cmd):
+    import time
+    t = time.time()
+    rules.rule_editor_startup_protect(_shell(cmd), EMPTY)
+    assert time.time() - t < 1.0
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<EOF | bash>/dev/null\ncd ~/.config && tar xf /tmp/n.tgz\nEOF",
+    "cat <<EOF | (bash)\ncd ~/.config && tar xf /tmp/n.tgz\nEOF",
+    "cat <<EOF|(sudo -E bash)\ncd /etc && tar xf /tmp/v.tgz\nEOF",
+    "cat <<EOF | sudo -u \"my user\" bash\ncd ~ && tar xf /tmp/d.tgz\nEOF",
+    "cat <<EOF | 2>/dev/null bash\ncp -r /tmp/p/. ~\nEOF",
+    "cat <<EOF | b'a'sh\ncp -r /tmp/p/. ~\nEOF", "cat <<EOF | $'bash'\ncp -r /tmp/p/. ~\nEOF",
+    "cat <<EOF | ( sudo bash )\ncp -r /tmp/p/. ~\nEOF",
+])
+def test_r16_wrapped_pipe_shells_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd

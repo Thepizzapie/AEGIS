@@ -8049,7 +8049,7 @@ def _ed_is_shell_words(words) -> bool:
     if not words:
         return False
     try:
-        w = _ed_strip_prefix(list(words), {})
+        w = _ed_strip_prefix(list(words[:64]), {})
     except Exception:
         return True
     if not w:
@@ -8070,8 +8070,13 @@ def _ed_pipe_into_shell(rest_line: str) -> bool:
         if k >= 256:
             return True
         nxt = re.split(r"[|;&\n]", rest_line[m.end():m.end() + 2000], maxsplit=1)[0]
-        words = [w.strip("'\"") for w in nxt.split()[:32]]
-        if words and _ed_is_shell_words(words):
+        try:
+            # The real tokenizer on the bounded slice (QA round 16: a plain
+            # split lost `| (bash)`, `| bash>/dev/null`, `sudo -u "a b" bash`).
+            segs = _ed_tokenize(nxt, False, 3)
+        except Exception:
+            return True
+        if any(_ed_is_shell_words(sg) for sg in segs[:4]):
             return True
     return False
 
@@ -8167,6 +8172,7 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
     drop_next = False
     heredocs = []
     nested = []
+    n_here = 0
     i, n = 0, len(cmd)
 
     def end_word():
@@ -8296,6 +8302,10 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
             i += 1
             while i < n and cmd[i] in "<>&|-" and len(op) < 3:
                 op += cmd[i]; i += 1
+            if op.startswith("<<"):
+                n_here += 1
+                if n_here > 64:
+                    raise _EdTooBig()            # QA round 16: bounded work, fail closed
             if op.startswith("<<<") and _ed_is_shell_words(words):
                 # `sh -s <<< 'cmd'`: the here-string is the script (QA r11)
                 while i < n and cmd[i] in " \t":

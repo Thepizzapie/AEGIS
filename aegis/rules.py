@@ -14983,7 +14983,13 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     its budget now fails closed. Round 15 found the round-14 pipe check
     re-tokenizing the whole line tail per ``|`` (82 s on 3.5 KB of stacked
     heredocs + pipes -- a fail-open timeout); it now inspects only the
-    command right after each pipe, with a pipe budget and a cache."""
+    command right after each pipe, with a pipe budget and a cache. Round 16
+    found the per-heredoc-operator cost still super-linear (30 s on 99 KB
+    of ``<<''`` operators) -- more than 64 heredoc/here-string operators in
+    one command now fails closed -- and the round-15 plain split losing
+    ``| (bash)``, ``| bash>/dev/null`` and quoted wrappers (the tokenizer
+    now runs on the bounded slice). Disclosed: like every ``_flatten_strings``
+    based check, MCP args nested more than 12 levels deep are not walked."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
