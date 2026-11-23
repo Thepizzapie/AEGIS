@@ -14580,7 +14580,8 @@ _ED_MESSAGING_WORDS = frozenset((
     "notify", "sms", "dm", "slack", "discord", "teams", "invite", "review",
     # QA round 4: database / payment / browser-script tools are not shells.
     "query", "sql", "database", "db", "payment", "payments", "invoice",
-    "issues", "sentry", "search", "commit", "log", "logs", "events", "traces",
+    "issues", "sentry", "commit", "events", "traces", "fetch", "think", "thinking",
+    "sequential", "thought",
     "evaluate", "javascript", "js", "browser", "playwright", "puppeteer",
 ))
 _ED_PROSE_KEY_WORDS = frozenset((
@@ -14594,7 +14595,8 @@ _ED_STRONG_SHELL_WORDS = frozenset((
 ))
 _ED_FILE_TOOL_WORDS = frozenset(("file", "files", "fs", "filesystem", "write",
                                  "save", "path", "dir", "directory", "folder",
-                                 "upload", "download", "copy", "move"))
+                                 "upload", "download", "copy", "move", "replace",
+                                 "edit", "patch", "insert", "editor", "text"))
 # Remote-repository servers: a `path` there names a file in a hosted repo,
 # not on this machine (QA round 4).
 _ED_REMOTE_SERVERS = frozenset((
@@ -14896,7 +14898,20 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     xzfC``; ``coproc``, ``jar``/``ar`` extraction; more MCP runner cwd
     keys; a shell runner on a server named like a remote one. False
     positives fixed: ``git -C DIR log``, Sentry/issue search, a commit
-    message mentioning ``~/.vimrc``."""
+    message mentioning ``~/.vimrc``. Round 7 found git work-tree updates
+    (``cd ~ && git pull``, bare-repo dotfiles ``git --work-tree=$HOME
+    checkout``, ``git apply``/``am``/``stash pop``) were ungated -- they now
+    count as unknown-name placement into the work tree, as do chezmoi/yadm/
+    vcsh (which the placement prefilter had silently skipped); the round-6
+    ``search``/``log`` messaging words excluded real search-replace editors
+    and ``run_*_log`` runners (removed); ``cd`` into a glob (``cd
+    ~/.conf*``); ``cp -T``/``ditto``/``xcopy`` contents copies; ``wget
+    -r``, remote ``scp``/``rsync`` sources, ``svn export``, ``degit``,
+    ``rclone``/``aws s3``/``docker cp``/``kubectl cp``, ``unsquashfs``/
+    ``cabextract``/``lha``, ``python -m zipfile|tarfile -e``; ``$(..)``
+    inside ``${..}``/``$((..))``; exact MCP cwd keys before ``*dir``;
+    ``relative_path``; ``~/.vimrc.local``. False positives fixed: fetch and
+    thinking tools."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14950,11 +14965,17 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         for _v in a0.values():
             if isinstance(_v, dict):
                 _cands.extend(_v.items())          # `{options: {cwd}}` (QA round 6)
-        for _k, _v in _cands:
-            kn = re.sub(r"[_\-\s]", "", str(_k).lower())
-            if (kn in ("cwd", "cd", "pwd") or kn.endswith("dir") or kn.endswith("directory")
-                    or kn in ("workingfolder", "folder")) and isinstance(_v, str) and _v:
-                mcp_cwd = _v               # the runner's own cwd (QA rounds 5-6)
+        _exact = ("cwd", "cd", "pwd", "workdir", "workingdir", "workingdirectory",
+                  "currentdir", "currentdirectory", "workingfolder")
+        for _pass in (0, 1):               # exact names first (QA round 7: `logdir`)
+            for _k, _v in _cands:
+                kn = re.sub(r"[_\-\s]", "", str(_k).lower())
+                ok = kn in _exact if _pass == 0 else (kn.endswith("dir") or kn.endswith("directory")
+                                                      or kn == "folder")
+                if ok and isinstance(_v, str) and _v:
+                    mcp_cwd = _v           # the runner's own cwd (QA rounds 5-7)
+                    break
+            if mcp_cwd is not ev.cwd:
                 break
         if shell_cmd is not None:
             sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
@@ -14997,7 +15018,8 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         p = _editor_startup_mcp_target(ev)
         if not p:
-            _p0 = _path(ev)
+            _p0 = _path(ev) or str((ev.args or {}).get("relative_path")
+                                    or (ev.args or {}).get("relativePath") or "")
             if (_p0 and ev.cwd and "\n" not in _p0
                     and not re.match(r"^(?:[/\\~]|[A-Za-z]:|file:)", _p0)
                     and patterns.editor_startup_path_hit(str(ev.cwd).rstrip("/\\") + "/" + _p0)):

