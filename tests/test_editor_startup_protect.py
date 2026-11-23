@@ -772,7 +772,7 @@ def test_r4_prefixed_placement_gated(cmd):
     "sudo -T 5 cp -r /tmp/nvim /etc/xdg/", "env -C /home/u/.config cp -r /tmp/nvim .",
     "env -S 'cp -r /tmp/nvim /home/u/.config/'", "FOO=\"a b\" cp -r /tmp/nvim ~/.config/",
     "eval 'cp -r /tmp/nvim ~/.config/'", "eval cp -r /tmp/nvim ~/.config/",
-    "find /tmp -name nvim -exec cp -r {} ~/.config \;",
+    "find /tmp -name nvim -exec cp -r {} ~/.config \\;",
     # cwd tracking
     "cd ~; cd /nonexistent 2>/dev/null; tar xf /tmp/d.tgz",
     "cd ~ && cd /tmp | cat; tar xf /tmp/d.tgz",
@@ -842,3 +842,61 @@ def test_r5_perf_bounded(cmd):
     t = time.time()
     rules.rule_editor_startup_protect(ev, EMPTY)
     assert time.time() - t < 2.0
+
+
+# ---- QA round 6 regressions ---------------------------------------------------
+
+PL = "cd ~/.config; cp -r /tmp/x/nvim ."
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo $((1<<2))\n" + PL, "((x<<=1))\n" + PL, "echo ${x#<<}\n" + PL,
+    "echo $((1<<2))\ntar xzf /tmp/x.tgz -C ~", "echo $((1<<2))\nrsync -a /tmp/d/ ~/",
+    "cat <<E\"O\"F\nEOF\n" + PL, "cat <<E'O'F\nEOF\n" + PL, "cat <<\"EOF\"x\nEOFx\n" + PL,
+    "echo \"`cd ~/.config && cp -r /tmp/x/nvim .`\"", "echo \"`tar xzf /tmp/x.tgz -C ~`\"",
+    "cat <<EOF\n$(cd ~/.config; cp -r /tmp/x/nvim .)\nEOF",
+    "cat <<EOF\n`tar xzf /tmp/x.tgz -C ~`\nEOF",
+    "cat <<EOF\nnever closed\n" + PL,
+    "echo it\\'s mi; " + PL, "echo C:\\\\x; echo it\\'s; " + PL,
+    "cp /tmp/x ~/.$'\\u76'imrc", "cp /tmp/x ~/.$'\\x{76}'imrc",
+    "cp -r /tmp/x ~/.config/n$'\\u76'im",
+    "tar -xzC ~ -f /tmp/n.tgz", "tar -xzvC ~/.config -f x", "bsdtar -xC ~ -f x",
+    "tar xzfC /tmp/n.tgz ~", "unzip -od ~ x.zip", "unzip -qod ~ x.zip",
+    "coproc cp -r /tmp/nvim ~/.config", "jar xf x.jar && cd ~ && jar xf /tmp/x.jar",
+    "cd ~ && ar x /tmp/x.a",
+])
+def test_r6_shell_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("args", [
+    {"command": "mv /tmp/nvim .", "workingDir": "~/.config"},
+    {"command": "mv /tmp/nvim .", "working_dir": "~/.config"},
+    {"command": "mv /tmp/nvim .", "current_dir": "~/.config"},
+    {"command": "mv /tmp/nvim .", "options": {"cwd": "~/.config"}},
+])
+def test_r6_mcp_cwd_keys(args):
+    assert _ours(evaluate(_mcp(args, tool="mcp__shell__run_command"), EMPTY)), args
+
+
+def test_r6_remote_server_name_collision_still_judged():
+    assert _ours(evaluate(_mcp({"command": "cp /tmp/x ~/.vimrc"},
+                               tool="mcp__memory__run_command"), EMPTY))
+
+
+@pytest.mark.parametrize("ev", [
+    _shell("git -C ~/.config/nvim log"),
+    _mcp({"query": "crash in ~/.config/nvim/init.lua"}, tool="mcp__sentry__search_issues"),
+    _mcp({"repo_path": "/repo", "message": "update ~/.vimrc docs"}, tool="mcp__git__git_commit"),
+])
+def test_r6_false_positives_fixed(ev):
+    assert evaluate(ev, EMPTY).rule != RULE
+
+
+def test_r6_cd_star_blowup_bounded():
+    import time
+    cmd = "; ".join(f"cd d{i}" for i in range(100)) + "; cp " + " ".join(["*"] * 200) \
+        + " out; cp /tmp/x ~/.vimrc"
+    t = time.time()
+    d = rules.rule_editor_startup_protect(_shell(cmd), EMPTY)
+    assert time.time() - t < 2.0 and _ours(d)

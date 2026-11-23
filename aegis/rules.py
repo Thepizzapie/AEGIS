@@ -14580,7 +14580,13 @@ _ED_MESSAGING_WORDS = frozenset((
     "notify", "sms", "dm", "slack", "discord", "teams", "invite", "review",
     # QA round 4: database / payment / browser-script tools are not shells.
     "query", "sql", "database", "db", "payment", "payments", "invoice",
+    "issues", "sentry", "search", "commit", "log", "logs", "events", "traces",
     "evaluate", "javascript", "js", "browser", "playwright", "puppeteer",
+))
+_ED_PROSE_KEY_WORDS = frozenset((
+    "message", "msg", "title", "description", "query", "q", "search", "prompt",
+    "question", "topic", "summary", "comment", "note", "notes", "subject", "body",
+    "reason", "label", "name",
 ))
 _ED_STRONG_SHELL_WORDS = frozenset((
     "shell", "bash", "sh", "zsh", "pwsh", "powershell", "terminal", "exec",
@@ -14877,7 +14883,20 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     a 5-7 s path blow-up (directory length capped, failing closed). False
     positives fixed: commands with 400+ lines (only relevant segments
     count), ``cd ~ && mv *.log logs/``, ``pkgroot/etc``, knowledge/remote
-    MCP servers (memory, Notion, Drive, context7, Linear, ...)."""
+    MCP servers (memory, Notion, Drive, context7, Linear, ...). Round 6
+    found a 146 s blow-up from ``cd`` x ``*``-source fan-out (gated-parent
+    checks are now cached, once per destination, with bounded directory
+    sets failing closed); heredoc false starts (``$((1<<2))``, ``((x<<=1))``,
+    ``${x#<<}``) and partially-quoted delimiters (``E"O"F``) swallowing the
+    commands after them; ``$(..)``/backticks inside double quotes and
+    unquoted heredoc bodies; an unterminated heredoc; the Windows-hint
+    backslash rewrite breaking ``\\'`` (both readings are now analyzed);
+    bash-exact ``$'..'`` decoding (``\\u76``, ``\\x{76}``, ``\\cv``);
+    clustered ``tar -xzC DIR``/``unzip -qod DIR`` and old-style ``tar
+    xzfC``; ``coproc``, ``jar``/``ar`` extraction; more MCP runner cwd
+    keys; a shell runner on a server named like a remote one. False
+    positives fixed: ``git -C DIR log``, Sentry/issue search, a commit
+    message mentioning ``~/.vimrc``."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14900,7 +14919,11 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action == ActionClass.MCP:
         a0 = ev.args or {}
         _srv = str(ev.tool or "").split("__")
-        if len(_srv) >= 3 and _srv[1].lower() in _ED_REMOTE_SERVERS:
+        _tw0 = _http_rc_words(_srv[-1])
+        if len(_srv) >= 3 and _srv[1].lower() in _ED_REMOTE_SERVERS and not (
+                _tw0 & (_ED_STRONG_SHELL_WORDS | {"run", "command", "commands"})):
+            # A remote/knowledge server -- unless the tool is plainly a shell
+            # runner, whatever the server is called (QA round 6).
             return None
         tool_words = _http_rc_words(str(ev.tool or "").replace("__", "_"))
         lkeys = {str(k).lower() for k in a0}
@@ -14923,10 +14946,15 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         else:
             shell_cmd = None
         mcp_cwd = ev.cwd
-        for _k, _v in a0.items():
-            if str(_k).lower() in ("cwd", "workdir", "working_directory", "workingdirectory",
-                                   "directory", "dir", "cd") and isinstance(_v, str) and _v:
-                mcp_cwd = _v               # the runner's own cwd (QA round 5)
+        _cands = list(a0.items())
+        for _v in a0.values():
+            if isinstance(_v, dict):
+                _cands.extend(_v.items())          # `{options: {cwd}}` (QA round 6)
+        for _k, _v in _cands:
+            kn = re.sub(r"[_\-\s]", "", str(_k).lower())
+            if (kn in ("cwd", "cd", "pwd") or kn.endswith("dir") or kn.endswith("directory")
+                    or kn in ("workingfolder", "folder")) and isinstance(_v, str) and _v:
+                mcp_cwd = _v               # the runner's own cwd (QA rounds 5-6)
                 break
         if shell_cmd is not None:
             sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
@@ -14943,6 +14971,9 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             _p0 = _path(ev)
             if _p0 and "\n" not in _p0:
                 skip = _ED_PLAIN_CONTENT_KEYS
+            # Prose-shaped keys (a commit message, a search query) are not
+            # commands (QA round 6 false positives).
+            skip = set(skip) | {k for k in a0 if _http_rc_words(k) & _ED_PROSE_KEY_WORDS}
             for leaf in _flatten_strings({k: v for k, v in a0.items() if str(k) not in skip}):
                 leaf = str(leaf)
                 if not re.search(r"\S\s+\S", leaf) or len(leaf) > 200000:

@@ -4,6 +4,7 @@ Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
 import fnmatch
+import functools
 import re
 import unicodedata
 
@@ -7771,11 +7772,9 @@ _ED_ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.){0,4000})'")
 
 
 def _ed_ansi_c_decode(m) -> str:
-    try:
-        import codecs
-        return codecs.decode(m.group(1), "unicode_escape")
-    except Exception:
-        return m.group(1)
+    return _ed_ansi_c(m.group(1))
+
+
 _ED_QUOTED_RE = re.compile(r"'[^']{0,100000}'|\"[^\"]{0,100000}\"")
 
 
@@ -7856,7 +7855,7 @@ _ED_EXEC_ENV_RE = re.compile(
 # allowed for THIS guard only (QA round 1 false positives).
 _ED_SEG_TAIL = r"[^;&|\n<>`$()]*"
 _ED_GIT_READ_RE = re.compile(
-    r"(?<![\w./-])git(?:\s+--no-pager)?\s+(?:log|show|status|diff|blame|ls-files)\b"
+    r"(?<![\w./-])git(?:\s+--no-pager|\s+-C\s+[^\s;&|<>`$()]+)*\s+(?:log|show|status|diff|blame|ls-files)\b"
     r"(?![^;&|\n]*--(?:output|ext-diff|textconv|exec))(?![^;&|\n]*\s-c\b)" + _ED_SEG_TAIL)
 _ED_SORT_READ_RE = re.compile(
     r"(?<![\w./-])sort\b(?![^;&|\n]*(?:\s-[A-Za-z]*o|--o|--c|--f))" + _ED_SEG_TAIL)
@@ -7887,7 +7886,7 @@ _ED_PREFIX_CMDS = frozenset(("sudo", "doas", "env", "command", "builtin", "nohup
                              "ionice", "stdbuf", "busybox", "chronic", "unbuffer",
                              "caffeinate", "flock", "setsid", "chroot", "nsenter",
                              "elif", "eval", "run0", "pkexec", "proot", "fakeroot",
-                             "systemd-run", "watch", "strace", "ltrace"))
+                             "systemd-run", "watch", "strace", "ltrace", "coproc"))
 # Prefix options that take a value (`sudo -u root`, `nice -n 10`,
 # `timeout -s KILL 5`, `xargs -n1 -I{}`); a short cluster whose LAST letter
 # is one of these consumes the next word (`sudo -nu root` -- QA round 5).
@@ -7907,7 +7906,7 @@ _ED_PLACE_VERBS = frozenset(("cp", "mv", "ln", "install", "rsync", "ditto", "cop
                              "gmv", "gln", "scp", "xcopy", "robocopy", "cpio-p"))
 _ED_EXTRACT_VERBS = frozenset(("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "7zz",
                                "unrar", "cpio", "expand-archive", "stow", "xstow",
-                               "chezmoi", "yadm", "unar", "pax", "patch"))
+                               "chezmoi", "yadm", "unar", "pax", "patch", "jar", "ar"))
 _ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl"))
 _ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS
                       | frozenset(("cd", "pushd", "popd", "set-location", "chdir", "find",
@@ -7962,6 +7961,11 @@ def _ed_is_gated_parent(d: str) -> bool:
         return False
     if len(d) > _ED_DIR_MAX:
         raise _EdTooBig()
+    return _ed_is_gated_parent_cached(d)
+
+
+@functools.lru_cache(maxsize=4096)
+def _ed_is_gated_parent_cached(d: str) -> bool:
     d = _ed_dotdot_normalize(d.rstrip("/\\") or "/")
     if _ED_HOME_DIR_RE.match(d):
         return True
@@ -7980,7 +7984,7 @@ def _ed_unknown_name(src: str) -> bool:
 
 _ED_WIN_HINT_RE = re.compile(
     r"[A-Za-z]:\\|%\w+%\\|\$env:\w+\\|\b(?:copy-item|move-item|expand-archive|xcopy|robocopy"
-    r"|new-item|cpi|mi)\b", re.IGNORECASE)
+    r"|new-item)\b", re.IGNORECASE)
 _ED_TOK_MAX = 400_000
 _ED_PLACE_PREFILTER_RE = re.compile(
     r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
@@ -8001,22 +8005,97 @@ def _ed_place_maybe(text: str) -> bool:
 _ED_PLAIN_RUN_RE = re.compile(r"[^\s\\'\"$#;|()`&<>]+")
 
 
-def _ed_tokenize(cmd: str) -> list:
+def _ed_ansi_c(raw: str) -> str:
+    r"""Decode a bash `$'...'` body exactly as bash does (QA round 6: Python's
+    `unicode_escape` rejects `\u76`, `\x{76}`, `\cv`)."""
+    out = []
+    i, n = 0, len(raw)
+    simple = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
+              "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+    while i < n:
+        c = raw[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c); i += 1; continue
+        d = raw[i + 1]
+        if d in simple:
+            out.append(simple[d]); i += 2; continue
+        if d in "01234567":
+            m = re.match(r"[0-7]{1,3}", raw[i + 1:])
+            out.append(chr(int(m.group(0), 8) & 0xFF)); i += 1 + len(m.group(0)); continue
+        if d == "x":
+            m = re.match(r"\{([0-9A-Fa-f]{1,8})\}|([0-9A-Fa-f]{1,2})", raw[i + 2:])
+            if m:
+                out.append(chr(min(int(m.group(1) or m.group(2), 16), 0x10FFFF)))
+                i += 2 + len(m.group(0)); continue
+        if d in "uU":
+            m = re.match(r"[0-9A-Fa-f]{1,%d}" % (4 if d == "u" else 8), raw[i + 2:])
+            if m:
+                out.append(chr(min(int(m.group(0), 16), 0x10FFFF)))
+                i += 2 + len(m.group(0)); continue
+        if d == "c" and i + 2 < n:
+            out.append(chr(ord(raw[i + 2]) & 0x1F)); i += 3; continue
+        out.append("\\" + d); i += 2
+    return "".join(out)
+
+
+def _ed_match_close(cmd: str, i: int, opener: str, closer: str) -> int:
+    """Index just past the `closer` matching an `opener` at i (nesting)."""
+    depth, j, n = 0, i, len(cmd)
+    while j < n:
+        if cmd.startswith(opener, j):
+            depth += 1; j += len(opener); continue
+        if cmd.startswith(closer, j):
+            depth -= 1; j += len(closer)
+            if depth == 0:
+                return j
+            continue
+        if cmd[j] == "\\":
+            j += 2; continue
+        j += 1
+    return n
+
+
+def _ed_subst_bodies(text: str) -> list:
+    """`$(...)` and backtick bodies inside text (a double-quoted string or
+    an unquoted heredoc body) -- bash runs them (QA round 6)."""
+    out = []
+    i, n = 0, len(text)
+    while i < n and len(out) < 256:
+        if text.startswith("$((", i):
+            i = _ed_match_close(text, i, "((", "))"); continue
+        if text.startswith("$(", i):
+            j = _ed_match_close(text, i + 1, "(", ")")
+            out.append(text[i + 2:j - 1]); i = j; continue
+        if text[i] == "`":
+            j = text.find("`", i + 1)
+            j = n if j < 0 else j
+            out.append(text[i + 1:j]); i = j + 1; continue
+        if text[i] == "\\":
+            i += 2; continue
+        i += 1
+    return out
+
+
+def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
     """Split a shell command into simple commands (lists of words), the way
     bash would: quotes, backslash escapes, ANSI-C `$'..'`, `#` comments,
     `;`/`&`/`|`/`&&`/`||`/newline/`(`/`)`/`$(`/backticks, redirections (the
-    operator and its target are dropped, an fd number before it too) and
-    heredoc bodies (skipped). QA round 5: shlex kept `2>/dev/null` and
-    `# comment` as operands, and `scan_surface`'s space-joined renderings
-    merged commands."""
+    operator and its target are dropped, an fd number before it too),
+    heredoc bodies (skipped, but `$(..)`/backticks inside an unquoted one
+    are analyzed), `$((..))`/`((..))`/`${..}` (never a heredoc), and
+    `$(..)`/backticks inside double quotes. QA rounds 5-6. `win` rewrites
+    `\` to `/` first (PowerShell/cmd paths); callers union both forms."""
     if len(cmd) > _ED_TOK_MAX:
         raise _EdTooBig()
-    if _ED_WIN_HINT_RE.search(cmd):
+    if _depth > 4:
+        raise _EdTooBig()
+    if win:
         cmd = cmd.replace("\\", "/")
     segs, words = [], []
     cur, have = [], False
     drop_next = False
     heredocs = []
+    nested = []
     i, n = 0, len(cmd)
 
     def end_word():
@@ -8042,13 +8121,23 @@ def _ed_tokenize(cmd: str) -> list:
             end_seg()
             i += 1
             while heredocs:
-                delim, strip_tabs = heredocs.pop(0)
+                delim, strip_tabs, quoted = heredocs.pop(0)
+                body = []
+                closed = False
                 while i < n:
                     j = cmd.find("\n", i)
                     line = cmd[i:] if j < 0 else cmd[i:j]
                     i = n if j < 0 else j + 1
-                    if (line.lstrip("\t") if strip_tabs else line) == delim:
+                    if (line.lstrip("\t") if strip_tabs else line).rstrip("\r") == delim:
+                        closed = True
                         break
+                    body.append(line)
+                if not quoted:
+                    nested.extend(_ed_subst_bodies("\n".join(body)))
+                if not closed:
+                    # An unterminated heredoc: judge its body as commands
+                    # too rather than let it hide anything (QA round 6).
+                    nested.append("\n".join(body))
             continue
         if c in " \t\r":
             end_word(); i += 1; continue
@@ -8065,29 +8154,35 @@ def _ed_tokenize(cmd: str) -> list:
             i = j + 1; continue
         if c == "$" and i + 1 < n and cmd[i + 1] == "'":
             j = i + 2
-            buf = []
             while j < n and cmd[j] != "'":
-                if cmd[j] == "\\" and j + 1 < n:
-                    buf.append(cmd[j:j + 2]); j += 2
-                else:
-                    buf.append(cmd[j]); j += 1
-            raw = "".join(buf)
-            try:
-                import codecs
-                raw = codecs.decode(raw, "unicode_escape")
-            except Exception:
-                pass
-            cur.append(raw); have = True
+                j += 2 if cmd[j] == "\\" else 1
+            cur.append(_ed_ansi_c(cmd[i + 2:min(j, n)])); have = True
             i = j + 1; continue
+        if c == "$" and cmd.startswith("$((", i):
+            j = _ed_match_close(cmd, i + 1, "((", "))")
+            cur.append(cmd[i:j]); have = True
+            i = j; continue
+        if c == "$" and i + 1 < n and cmd[i + 1] == "{":
+            j = _ed_match_close(cmd, i + 1, "{", "}")
+            cur.append(cmd[i:j]); have = True
+            i = j; continue
+        if c == "(" and not have and cmd.startswith("((", i):
+            i = _ed_match_close(cmd, i, "((", "))")
+            end_seg(); continue
         if c == '"':
             j = i + 1
             buf = []
             while j < n and cmd[j] != '"':
                 if cmd[j] == "\\" and j + 1 < n and cmd[j + 1] in '"\\$`\n':
-                    buf.append(cmd[j + 1]); j += 2
+                    buf.append(cmd[j:j + 2] if cmd[j + 1] in "$`" else cmd[j + 1]); j += 2
+                elif cmd.startswith("$(", j) and not cmd.startswith("$((", j):
+                    k = _ed_match_close(cmd, j + 1, "(", ")")
+                    buf.append(cmd[j:k]); j = k
                 else:
                     buf.append(cmd[j]); j += 1
-            cur.append("".join(buf)); have = True
+            text = "".join(buf)
+            nested.extend(_ed_subst_bodies(text))
+            cur.append(text); have = True
             i = j + 1; continue
         if c == "#" and not have:
             j = cmd.find("\n", i)
@@ -8118,18 +8213,24 @@ def _ed_tokenize(cmd: str) -> list:
             while i < n and cmd[i] in "<>&|-" and len(op) < 3:
                 op += cmd[i]; i += 1
             if op.startswith("<<") and not op.startswith("<<<"):
-                # heredoc: the next word is the delimiter
+                # heredoc: the next word is the delimiter; bash removes
+                # quotes from the WHOLE word (`E"O"F` -> EOF -- QA round 6)
                 while i < n and cmd[i] in " \t":
                     i += 1
                 j = i
                 while j < n and cmd[j] not in " \t\n;&|<>()":
-                    j += 1
-                delim = cmd[i:j].strip("'\"").replace("\\", "")
-                heredocs.append((delim, "-" in op))
+                    if cmd[j] in "'\"":
+                        k = cmd.find(cmd[j], j + 1)
+                        j = n if k < 0 else k + 1
+                    else:
+                        j += 1
+                word = cmd[i:j]
+                quoted = any(q in word for q in "'\"\\")
+                delim = re.sub(r"['\"\\]", "", word)
+                heredocs.append((delim, "-" in op, quoted))
                 i = j
                 continue
             if op.endswith("&") or op in (">&", "<&"):
-                # `>&2`, `2>&1`, `>&-`: consume the fd word
                 while i < n and cmd[i] in " \t":
                     i += 1
                 j = i
@@ -8148,6 +8249,11 @@ def _ed_tokenize(cmd: str) -> list:
             cur.append(c); have = True
             i += 1
     end_seg()
+    if heredocs:
+        pass                                   # heredoc never started a body
+    for body in nested[:64]:
+        if body.strip():
+            segs.extend(_ed_tokenize(body, win, _depth + 1))
     return segs
 
 
@@ -8250,6 +8356,10 @@ def _ed_placement(cmd, cwd, hits, depth):
     if depth > 4:
         return hits, True
     segs = _ed_tokenize(cmd)
+    if _ED_WIN_HINT_RE.search(cmd):
+        # Both readings: `\` as an escape AND as a Windows separator (QA
+        # round 6: a global rewrite turned `it\'s` into an opening quote).
+        segs = segs + _ed_tokenize(cmd, win=True)
     state = {"cwd": cwd or None}
     stack = []
     # Every working directory the command could be in: a failed `cd`, a `cd`
@@ -8260,7 +8370,7 @@ def _ed_placement(cmd, cwd, hits, depth):
     relevant = 0
 
     def cur_dirs():
-        return list(dict.fromkeys(seen + [state["cwd"]]))
+        return list(dict.fromkeys(seen + [state["cwd"]]))[:65]
 
     queue = list(segs)
     while queue:
@@ -8283,7 +8393,10 @@ def _ed_placement(cmd, cwd, hits, depth):
             if verb == "pushd":
                 stack.append(state["cwd"])
             state["cwd"] = _ed_dotdot_normalize(_ed_join(state["cwd"], ops[0])) if ops else "~"
-            seen.append(state["cwd"])
+            if state["cwd"] not in seen:
+                seen.append(state["cwd"])
+            if len(seen) > 64:
+                raise _EdTooBig()                # QA round 6: bounded work
             continue
         if verb == "popd":
             state["cwd"] = stack.pop() if stack else state["cwd"]
@@ -8446,11 +8559,14 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
             hits.append(dest)
         if no_target_dir:
             continue
-        for src in srcs:
+        unknown_checked = False
+        for src in srcs[:4000]:
             if _ed_unknown_name(src) or (verb in ("rsync", "xcopy", "robocopy")
                                          and src.endswith(("/", "\\"))) or src == "./":
-                if _ed_is_gated_parent(dest or "."):
-                    return True
+                if not unknown_checked:
+                    unknown_checked = True        # once per dest (QA round 6)
+                    if _ed_is_gated_parent(dest or "."):
+                        return True
                 continue
             if parents:
                 base = src.lstrip("/").replace("\\", "/")
@@ -8471,6 +8587,8 @@ def _ed_extract(verb, args, state, dirs, hits) -> bool:
             return False
     if verb in ("7z", "7za", "7zz") and not (args and args[0] in ("x", "e")):
         return False
+    if verb in ("jar", "ar") and not (args and "x" in args[0].lstrip("-")):
+        return False
     if verb == "chezmoi" and not (args and args[0] in ("apply", "init", "update")):
         return False
     if verb == "cpio" and not any(re.fullmatch(r"-[A-Za-z]*[ip][A-Za-z]*|--extract|--pass-through", a)
@@ -8490,6 +8608,29 @@ def _ed_extract(verb, args, state, dirs, hits) -> bool:
             explicit = a[2:]
         elif verb in ("7z", "7za", "7zz") and a.startswith("-o") and len(a) > 2:
             explicit = a[2:]
+        elif re.fullmatch(r"-[A-Za-z]{2,}", a) and verb in ("tar", "bsdtar", "gtar", "unzip"):
+            # A cluster holding the directory option (`-xzC ~`, `-qod ~`).
+            letter = "d" if verb == "unzip" else "C"
+            if letter in a[1:]:
+                rest = a[a.index(letter, 1) + 1:]
+                if rest and verb == "unzip":
+                    explicit = rest
+                elif i + 1 < len(args) and not rest:
+                    explicit = args[i + 1]
+                elif rest:
+                    # tar `-xzCDIR`? only if the rest isn't more option letters
+                    if i + 1 < len(args):
+                        explicit = args[i + 1]
+    if verb in ("tar", "bsdtar", "gtar") and args and not args[0].startswith("-") \
+            and re.fullmatch(r"[A-Za-z]+", args[0]) and "C" in args[0]:
+        # Old-style `tar xzfC ARCHIVE DIR`: values follow in letter order.
+        vals = [x for x in args[1:]]
+        k = 0
+        for letter in args[0]:
+            if letter in "fCbTXKNgVL":
+                if letter == "C" and k < len(vals):
+                    explicit = vals[k]
+                k += 1
     if verb == "expand-archive" and explicit is None:
         pos = [a for a in args if not a.startswith("-")]
         if len(pos) >= 2:
