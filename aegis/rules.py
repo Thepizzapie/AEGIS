@@ -14989,7 +14989,14 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     one command now fails closed -- and the round-15 plain split losing
     ``| (bash)``, ``| bash>/dev/null`` and quoted wrappers (the tokenizer
     now runs on the bounded slice). Disclosed: like every ``_flatten_strings``
-    based check, MCP args nested more than 12 levels deep are not walked."""
+    based check, MCP args nested more than 12 levels deep are not walked.
+    Round 17 PASSED (no HIGH; no regression, no fail-open slow path, no
+    realistic false positive). Its pre-existing MEDIUM notes are accepted
+    residuals for a future round: a stdin shell introduced by a LEADING
+    redirect (``<<EOF bash``, ``<<<'..' bash``), a trailing ``|`` continued
+    onto the next line before the shell, and ``| exec -a x bash`` / ``| if
+    ..; then bash; fi`` wrappers -- each needs deliberate reordering; the
+    natural forms are gated."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
