@@ -35,6 +35,18 @@
 #     mode: ask            # deny | ask (default) | monitor | off
 #     allow: ['^/ci/\.curlrc$']   # regexes on the path/command that skip it
 
+# Editor startup/init hijack (optional tuning). Built in and ON by default
+# (mode: ask): ANY write to a Vim/Neovim/Emacs/Kakoune/micro/Helix init
+# file or runtime directory (~/.vimrc, ~/.vim/**, ~/.config/nvim/**,
+# ~/.local/share/nvim/**, ~/.emacs.d/**, .dir-locals.el, .nvim.lua, ...)
+# asks a human first -- the editor runs it as code on its next launch,
+# including the one `git commit` starts. A human pre-approves with
+# AEGIS_ALLOW_EDITOR_STARTUP=1 or a trailing '# aegis-allow' on a shell
+# command; a spawned agent cannot.
+#   editor_startup:
+#     mode: ask            # deny | ask (default) | monitor | off
+#     allow: ['^/home/[^/]+/dotfiles/']   # regexes on the (normalized) path
+
 default_action: allow
 on_error: allow
 

@@ -447,6 +447,13 @@ class Policy:
     # TLS-off, credential logging, file-attaching exfil). See
     # rules.rule_http_client_config_protect.
     http_client_config: dict = field(default_factory=dict)
+    # Editor startup/init hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path/command]}. Empty -> defaults (mode=ask). Covers
+    # Vim/Neovim/Emacs/Kakoune/micro/Helix init files and runtime dirs
+    # (~/.vimrc, ~/.vim/, ~/.config/nvim/, ~/.emacs.d/, ...), executed as
+    # code on the editor's next launch -- including the one `git commit`
+    # starts. See rules.rule_editor_startup_protect.
+    editor_startup: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/

