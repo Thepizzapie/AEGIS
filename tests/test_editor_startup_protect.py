@@ -513,3 +513,124 @@ def test_r2_glob_bomb_bounded():
     t = time.time()
     d = evaluate(_shell(cmd), EMPTY)
     assert time.time() - t < 10.0 and d.action != Action.ALLOW
+
+
+# ---- QA round 3 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "/home/u/.config/git/./../nvim/init.lua",
+    "/home/u/.local/share/x/./../nvim/site/plugin/x.lua",
+    "/usr/share/x/./../vim/vimrc", "/etc/x/./../vim/vimrc.local",
+    "/home/u/.config/x/.//../nvim/init.lua",
+    "/./etc/vim/vimrc.local", "/../etc/vimrc",
+    "/proc/self/root/etc/vimrc", "C:/msys64/etc/vimrc", "/c/msys64/etc/vimrc",
+    "/opt/homebrew/opt/neovim/share/nvim/runtime/plugin/x.lua",
+    "/usr/local/Cellar/neovim/0.10/share/nvim/runtime/plugin/a.lua",
+    "/opt/homebrew/Cellar/emacs-plus@29/29.1/share/emacs/site-lisp/default.el",
+    "/usr/local/opt/vim/share/vim/vim91/plugin/x.vim",
+    "/home/u/.local/share/bob/v0.10.0/share/nvim/runtime/plugin/x.lua",
+    "/home/u/.asdf/installs/neovim/0.10.0/share/nvim/runtime/plugin/x.lua",
+    "/home/u/nvim-linux-x86_64/share/nvim/runtime/plugin/x.lua",
+    "/opt/nvim-linux64/share/nvim/runtime/lua/vim/_init.lua",
+    "/Applications/Emacs.app/Contents/Resources/site-lisp/default.el",
+    "/Applications/Emacs.app/Contents/Resources/lisp/subdirs.el",
+    "C:\\PROGRA~1\\Vim\\vim91\\plugin\\x.vim",
+    "C:\\Users\\u\\AppData\\Roaming\\EMACS~1.D\\init.el",
+])
+def test_r3_paths_gated(path):
+    assert _ours(evaluate(_write(path), EMPTY)), path
+    assert _ours(evaluate(_shell(f"echo x > '{path}'"), EMPTY)), path
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo x > ~/../../etc/vim/vimrc.local", "echo x > $HOME/../../etc/vimrc",
+    "echo x > /proc/1/root/etc/vim/vimrc.local",
+    "mv nvim ~/.config/", "mkdir -p /tmp/p/nvim && mv /tmp/p/nvim ~/.config",
+    "ln -s $PWD/nvim ~/.config/", "ln -sfn /tmp/evil ~/.config/",
+    "cp -t ~/.config -r nvim", "mv /tmp/p/* ~/.config/",
+    "git -C ~/.config clone https://x/nvim",
+])
+def test_r3_shell_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+C3 = "echo 'au VimEnter * !id' >> ~/.vimrc"
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__tmux__send_keys", {"paneId": "%1", "keys": C3}),
+    ("mcp__tmux__send_keys", {"paneId": "%1", "text": C3}),
+    ("mcp__x__run_command", {"commandline": C3}),
+    ("mcp__x__run_command", {"cmdline": C3}),
+    ("mcp__x__run_command", {"line": C3}),
+    ("mcp__x__RunCommand", {"CommandLine": C3}),
+    ("mcp__x__run", {"argv": ["bash", "-c", C3]}),
+    ("mcp__x__run_program", {"program": "bash", "arguments": ["-c", C3]}),
+    ("mcp__x__launch", {"executable": "bash", "args": ["-c", C3]}),
+    ("mcp__ssh__ssh_run", {"line": C3}),
+    ("mcp__remote__run_remote", {"input": C3}),
+])
+def test_r3_mcp_shell_runners_gated(tool, args):
+    assert _ours(evaluate(_mcp(args, tool=tool), EMPTY)), tool
+
+
+def test_r3_mcp_messaging_still_not_shell():
+    for tool, args in [("mcp__gmail__send_email", {"body": "I updated ~/.vimrc"}),
+                       ("mcp__slack__send_message", {"text": "see .emacs.d/init.el"}),
+                       ("mcp__github__actions_run_trigger", {"inputs": {"n": ".helix ok"}})]:
+        assert evaluate(_mcp(args, tool=tool), EMPTY).rule != RULE, tool
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp x ~/dotfiles/.vimrc; cp x ~/.vi?rc",
+    "cp x ~/dotfiles/.vimrc; cp x ~/.vi\"m\"rc",
+    "cp x ~/dotfiles/.vimrc; cp x ~/.vi''mrc",
+    "cp x ~/dotfiles/.vimrc; cp x ~/.vi{m,}rc",
+    "cp x ~/dotfiles/.vimrc; cp x ~/.config/(nvim)/init.lua",
+    "cp x ~/dotfiles/.vimrc; cd ~/.config && cp x nvim/init.lua",
+])
+def test_r3_shell_allow_not_bypassable(cmd):
+    pol = Policy(editor_startup={"allow": ["/dotfiles/"]})
+    assert _ours(evaluate(_shell(cmd), pol)), cmd
+
+
+def test_r3_allow_dot_and_urlencoded_bypass():
+    pol = Policy(editor_startup={"allow": ["/dotfiles/"]})
+    assert _ours(evaluate(_write("/home/u/dotfiles/./../.vimrc"), pol))
+    assert _ours(evaluate(_write("file:///home/u/dotfiles/%2e%2e/.vimrc"), pol))
+
+
+def test_r3_allow_bad_type_no_crash():
+    pol = Policy(editor_startup={"allow": 5})
+    assert _ours(rules.rule_editor_startup_protect(_write("~/.vimrc"), pol))
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp apps/*/config/default.json dist/", "cat packages/*/data/*.json > merged.json",
+    "tar czf out.tgz services/*/config", "jq . src/*/app/manifest.json > out.json",
+    "cp -r modules/*/local/x dist/", "cp ~/work/*/config/app.yml /tmp/",
+    "echo x > debian/tmp/usr/share/vim/addons/x.vim", "touch ./usr/share/vim/x",
+    "cd ~ && mv a b", "mv a.txt b.txt", "ln -s ../lib/x.py x.py",
+])
+def test_r3_false_positives_fixed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+def test_r3_cwd_relative_writes_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Write", cwd="/home/u/.config/nvim",
+                    args={"file_path": "init.lua", "content": "x"})
+    assert _ours(evaluate(ev, EMPTY))
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", cwd="/home/u/.vim",
+                    args={"command": "echo x > plugin/x.vim"})
+    assert _ours(evaluate(ev, EMPTY))
+
+
+@pytest.mark.parametrize("ev", [
+    _shell("%2E" * 126000), _write("%2E" * 126000), _shell("echo " + "." * 20000),
+    _write("/tmp/" + "a" * 20000 + ".."), _mcp({"path": "a" * 20000 + ".."}),
+])
+def test_r3_perf_bounded(ev):
+    import time
+    t = time.time()
+    evaluate(ev, EMPTY)
+    assert time.time() - t < 5.0

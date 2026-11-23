@@ -14512,8 +14512,15 @@ def _editor_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
     allow = cfg.get("allow") or []
     if isinstance(allow, str):
         allow = [allow]
+    elif not isinstance(allow, (list, tuple)):
+        return False                       # QA round 3: bad config, no crash
     if not isinstance(text, str) or not text:
         return False
+    try:
+        import urllib.parse as _up
+        text = _up.unquote(text)           # QA round 3: `%2e%2e`
+    except Exception:
+        pass
     norm = patterns._ed_dotdot_normalize(text.replace("\\", "/"))
     if ".." in norm.replace("\\", "/").split("/"):
         return False
@@ -14530,13 +14537,19 @@ def _editor_startup_shell_allowed(cfg: dict, cmd: str) -> bool:
     """Shell form: every word that names a gated path must itself satisfy
     `allow` -- an agent appending `# /dotfiles/` to the command, or
     mentioning an allowed path elsewhere in it, does not (QA round 2)."""
-    if not cfg.get("allow"):
+    if not cfg.get("allow") or not isinstance(cmd, str):
         return False
-    words = [w for w in re.findall(r"[^\s'\"<>|&;()`]+", cmd or "")
+    words = [w for w in re.findall(r"[^\s'\"<>|&;()`]+", cmd)
              if patterns.editor_startup_path_hit(w)]
-    if not words:
+    if not words or not all(_editor_startup_allowed_by_policy(cfg, w) for w in words):
         return False
-    return all(_editor_startup_allowed_by_policy(cfg, w) for w in words)
+    # QA round 3: with the allowed words blanked out, the full detector
+    # (globs, quotes, zsh groups, `cd` joins) must find nothing else.
+    rest = cmd
+    for w in sorted(set(words), key=len, reverse=True):
+        rest = rest.replace(w, " ")
+    return not (patterns.editor_startup_shell_path_hit(rest)
+                or patterns.editor_startup_shell_path_hit(normalize.scan_surface(rest)))
 
 
 # Tool-name words that make an MCP tool a shell/process runner. Narrower
@@ -14546,10 +14559,21 @@ def _editor_startup_shell_allowed(cfg: dict, cmd: str) -> bool:
 _ED_SHELL_TOOL_WORDS = frozenset((
     "exec", "execute", "process", "terminal", "shell", "eval", "interact",
     "repl", "spawn", "bash", "powershell", "sh", "cmd", "tmux", "console",
-    "zsh", "pwsh",
+    "zsh", "pwsh", "command", "run", "send", "ssh", "remote", "launch",
+    "program", "keys", "commandline", "cmdline",
 ))
-_ED_COMMAND_KEYS = ("command", "cmd", "script", "shell_command", "commandLine",
-                    "command_line")
+# ...unless the tool is plainly messaging/CI (QA round 2: `send_email`,
+# `send_message`, `actions_run_trigger`). Judged on the WHOLE tool name,
+# server segment included (QA round 3: `mcp__tmux__send_keys`).
+_ED_MESSAGING_WORDS = frozenset((
+    "email", "mail", "gmail", "message", "messages", "msg", "chat", "post",
+    "comment", "reply", "issue", "trigger", "workflow", "notification",
+    "notify", "sms", "dm", "slack", "discord", "teams", "invite", "review",
+))
+_ED_COMMAND_KEYS = frozenset((
+    "command", "cmd", "script", "shell_command", "commandline", "command_line",
+    "cmdline", "argv", "keys",
+))
 # Plain content keys of a write whose OWN target is set: a quoted path or
 # diff inside an ordinary file's body is not a write to that path (QA
 # round 2; the curl/wget sibling's round 5-7 rule).
@@ -14585,7 +14609,21 @@ def _editor_startup_path_shaped(v) -> bool:
         return False
     if not (_ED_PATH_SHAPE_RE.match(t) or _ED_REL_PATH_RE.match(t)):
         return False
-    return patterns.editor_startup_path_hit(t)
+    if not patterns.editor_startup_path_hit(t):
+        return False
+    if not re.search(r"\s", t):
+        return True
+    # Spaces are allowed only INSIDE the path: after the last gated name the
+    # tail must continue the path (`/plugin/a b.lua`), not be prose
+    # (`.helix ok`, `~/.vimrc is broken` -- QA round 3).
+    m = None
+    for m in patterns.EDITOR_STARTUP_PATH_RE.finditer(t):
+        pass
+    if m is None:
+        return False
+    tail = t[m.end():]
+    return (not tail or tail[0] in "/\\"
+            or re.fullmatch(r"[ .]*(?::[^\s/\\]*)?", tail) is not None)
 
 
 def _editor_startup_mcp_target(ev: Event) -> str:
@@ -14737,7 +14775,27 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     the normalized path, and on every gated path word of a shell
     command); a crash (fail-open) on non-dict MCP args; a ~80 s glob bomb
     (now a per-command budget, ~2 s, failing closed); and docstring
-    overstatements (sudoedit, prompted exrc/dir-locals)."""
+    overstatements (sudoedit, prompted exrc/dir-locals). Round 3 found:
+    the ``..`` normalizer mishandled ``.`` segments (``x/./../nvim``) and
+    was quadratic (116 s on 380 KB) -- replaced by a linear per-token
+    resolver that clamps ``/..`` at the root, with a size cap failing
+    closed; the round-2 ``/etc`` anchor missed ``/./etc``, ``../etc``,
+    ``/proc/<pid>/root/etc`` and MSYS2/Cygwin roots; the round-2 MCP
+    shell-tool narrowing dropped tmux ``send_keys``, ``run_command
+    {commandline}``, ``argv``/``program+arguments``/``executable+args``
+    and ``ssh``/``remote`` runners (now judged on the whole tool name,
+    server included, case-insensitive keys, with a messaging/CI word
+    exclusion); user-writable runtimes under Homebrew Cellar/opt, bob/mise/
+    asdf, portable tarballs and ``Emacs.app`` (distinctive runtime subpaths
+    are now gated under any prefix); the shell ``allow`` check could be
+    satisfied by one allowed word while a glob/quote/``cd``-join plant rode
+    along (now the remainder must be clean), ``%2e%2e`` in ``allow``; ``mv``/
+    ``ln``/``cp -t``/``git -C <root> clone`` of a gated-named dir into the
+    config root; the session ``cwd`` for relative paths; a non-list
+    ``allow`` crashing the rule; 8.3 short names. False positives fixed:
+    ``apps/*/config/x`` (a bare ``*`` now expands only to real parents of
+    the next name), root-anchored ``usr`` (package staging trees), prose
+    after a path (``.helix ok``)."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14759,13 +14817,18 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if ev.action == ActionClass.MCP:
         a0 = ev.args or {}
-        tool_words = _http_rc_words(str(ev.tool or "").split("__")[-1])
-        shell_cmd = None
-        if tool_words & _ED_SHELL_TOOL_WORDS or any(
-                isinstance(a0.get(k), (str, list, tuple)) for k in _ED_COMMAND_KEYS) or (
-                isinstance(a0.get("args"), dict)
-                and any(k in a0["args"] for k in _ED_COMMAND_KEYS)):
-            shell_cmd = _http_rc_mcp_shell_command(ev)
+        tool_words = _http_rc_words(str(ev.tool or "").replace("__", "_"))
+        lkeys = {str(k).lower() for k in a0}
+        if isinstance(a0.get("args"), dict):
+            lkeys |= {str(k).lower() for k in a0["args"]}
+        shellish = bool(tool_words & _ED_SHELL_TOOL_WORDS) and not (
+            tool_words & _ED_MESSAGING_WORDS)
+        if (shellish or lkeys & _ED_COMMAND_KEYS
+                or {"program", "arguments"} <= lkeys or {"executable", "args"} <= lkeys):
+            parts = [str(x) for x in _flatten_strings(a0)]
+            shell_cmd = "\n".join(parts)[:200000] if parts else None
+        else:
+            shell_cmd = None
         if shell_cmd is not None:
             sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
                              args={"command": shell_cmd}, cwd=ev.cwd)
@@ -14785,13 +14848,17 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
     elif ev.action in (ActionClass.EDIT, ActionClass.WRITE):
         p = _path(ev)
-        if not (p and patterns.editor_startup_path_hit(p)):
+        hit = bool(p and patterns.editor_startup_path_hit(p))
+        if not hit and p and ev.cwd and not re.match(r"^(?:[/\\~]|[A-Za-z]:)", p):
+            # QA round 3: a relative path inside a gated cwd.
+            hit = patterns.editor_startup_path_hit(str(ev.cwd).rstrip("/\\") + "/" + p)
+        if not hit:
             return None
     elif _is_shell(ev):
         cmd = _shell_scan(ev)
         raw = _cmd(ev)
-        named = (patterns.editor_startup_shell_path_hit(cmd)
-                 or patterns.editor_startup_shell_path_hit(raw))
+        named = (patterns.editor_startup_shell_path_hit(cmd, ev.cwd)
+                 or patterns.editor_startup_shell_path_hit(raw, ev.cwd))
         bulk = (patterns.editor_startup_home_bulk_hit(cmd)
                 or patterns.editor_startup_home_bulk_hit(raw))
         if not (named or bulk):

@@ -7463,13 +7463,32 @@ _ED_APPDATA = (r"(?:(?:\$\{?|%|\$env:)(?:LOCALAPPDATA|APPDATA)[}%]?|AppData" + _
 _ED_TOOLS = r"(?:n?vim|emacs|doom|kak|micro|helix)"
 # `etc` only as the filesystem root's (`/etc`, `/private/etc`, Git for
 # Windows' `Git/etc`), never a repo's `docs/etc/` -- QA round 2.
-_ED_ETC = (r"(?:(?<=^/)|(?<=^\\)|(?<=[\s'\"=:<>|&;(`{,][/\\])|(?<=private[/\\])"
-           r"|(?<=Git[/\\])|(?<=[/\\][/\\]))etc")
+# QA round 3: also after `..` (`~/../../etc`, a leading `/..` clamps to
+# `/`), `/proc/<pid>/root/` and MSYS2/Cygwin roots (`C:/msys64/etc`).
+_ED_ROOTED = (r"(?:(?<=^/)|(?<=^\\)|(?<=[\s'\"=:<>|&;(`{,][/\\])|(?<=private[/\\])"
+              r"|(?<=Git[/\\])|(?<=[/\\][/\\])|(?<=\.\.[/\\])|(?<=root[/\\])"
+              r"|(?<=msys64[/\\])|(?<=msys32[/\\])|(?<=msys2[/\\])|(?<=cygwin64[/\\])"
+              r"|(?<=cygwin[/\\]))")
+_ED_ETC = _ED_ROOTED + r"etc"
 # `share`/`lib` only under a real install prefix (`/usr`, `/usr/local`,
 # `~/.local`, Homebrew, a Nix store path, an Emacs install dir), never a
 # repo's `build/share/` -- QA round 2.
-_ED_PREFIX = (r"(?:usr|\.?local|homebrew|\.linuxbrew|[0-9a-z]{32}-[^\s'\"/\\]{1,200}"
+# `usr` root-anchored like `etc` (QA round 3: `debian/tmp/usr/share/vim`
+# staging); bare `local` only as `/usr/local`.
+_ED_PREFIX = (r"(?:" + _ED_ROOTED + r"usr|\.local|(?<=usr[/\\])local|homebrew|\.linuxbrew"
+              r"|[0-9a-z]{32}-[^\s'\"/\\]{1,200}"
               r"|[^\s'\"/\\]{0,100}emacs[^\s'\"/\\]{0,100})" + _SEP)
+# Runtime subpaths distinctive enough to gate under ANY prefix -- Homebrew
+# Cellar/opt, version managers (bob/mise/asdf), portable tarballs, which
+# are user-writable (QA round 3).
+_ED_ANY_PREFIX_RUNTIME = (
+    r"share" + _SEP + r"nvim" + _SEP + r"(?:runtime|site)"
+    r"|share" + _SEP + r"vim" + _SEP + r"(?:vim\d{2,3}|vimfiles|vimrc|gvimrc)"
+    r"|share" + _SEP + r"emacs" + _SEP + r"(?:site-lisp|\d+(?:\.\d+)*)"
+    r"|Emacs\.app" + _SEP + r"Contents" + _SEP + r"Resources" + _SEP + r"(?:site-)?lisp"
+    r"|share" + _SEP + r"kak" + _SEP + r"(?:kakrc|autoload|rc)"
+    r"|(?:share|lib)" + _SEP + r"helix" + _SEP + r"runtime"
+)
 EDITOR_STARTUP_PATH_RE = re.compile(
     _ED_B + r"(?:"
     # --- Vim ---
@@ -7485,8 +7504,9 @@ EDITOR_STARTUP_PATH_RE = re.compile(
     r"|" + _ED_PREFIX + r"share" + _SEP + r"vim"
     # `$VIM\vimrc` (`C:\Program Files\Vim\vimrc`), MacVim's bundled
     # `Resources/vim/vimrc`, and `$VIMRUNTIME` (`vim91/`) -- QA round 1.
-    r"|Files(?: \(x86\))?" + _SEP + r"Vim"
-    r"|MacVim\.app"
+    r"|(?:Files(?: \(x86\))?|PROGRA~\d)" + _SEP + r"Vim"
+    r"|" + _ED_ANY_PREFIX_RUNTIME
+    + r"|MacVim\.app"
     # --- Neovim ---
     r"|\.config\}?" + _SEP + r"nvim"
     r"|\.local" + _SEP + r"share" + _SEP + r"nvim"
@@ -7503,6 +7523,8 @@ EDITOR_STARTUP_PATH_RE = re.compile(
     + r"(?:config|data)" + _SEP + _ED_TOOLS
     # --- Emacs ---
     + r"|\.emacs(?:\.elc?|\.d)?"
+    # Windows 8.3 short names (QA round 3).
+    r"|\.?EMACS~\d(?:\.D)?|_?VIMRC~\d|\.?VIMFIL~\d"
     r"|\.config\}?" + _SEP + r"(?:emacs|doom)"
     r"|" + _ED_XDG + r"(?:emacs|doom)"
     r"|\.doom\.d"
@@ -7555,6 +7577,12 @@ _ED_CHILDREN = {
     "~": ("vimfiles", "appdata"), "$home": ("vimfiles", "appdata"),
     "${home}": ("vimfiles", "appdata"), "%userprofile%": ("vimfiles", "appdata"),
 }
+# Reverse map: parents of a gated child (`*/vim` -> etc/share/.config...).
+_ED_PARENTS_OF: dict = {}
+for _par, _kids in _ED_CHILDREN.items():
+    for _k in _kids:
+        if _par:
+            _ED_PARENTS_OF.setdefault(_k, []).append(_par)
 # A pure `.*`/`.?*` component expands to dot-names only under a home dir.
 _ED_HOMEISH_RE = re.compile(r"^(?:~[^/]*|\$home|\$\{home\}|%userprofile%|\$env:userprofile)$")
 _ED_DOT_WILD_RE = re.compile(r"\.[*?]+")
@@ -7608,8 +7636,11 @@ def _ed_glob_candidates(word: str, budget: int = 256) -> list:
                         pool = _ED_CHILDREN.get(prev, ()) if prev is not None else ()
                         if homeish:
                             pool = pool + ("vimfiles", "appdata")
-                        if nxt_lit in _ED_NEXT_GATED and prev is not None:
-                            pool = pool + tuple(n for n in _ED_COMPONENT_NAMES
+                        if prev is not None and nxt_lit in _ED_PARENTS_OF:
+                            # Only real parents of the next name (QA round 3:
+                            # `apps/*/config/x.json` must not become
+                            # `apps/_vimrc/config`).
+                            pool = pool + tuple(n for n in _ED_PARENTS_OF[nxt_lit]
                                                 if not n.startswith("."))
                     elif _ED_DOT_WILD_RE.fullmatch(comp) and not homeish:
                         pool = ()
@@ -7635,6 +7666,9 @@ def _ed_glob_candidates(word: str, budget: int = 256) -> list:
 
 
 _ED_URL_ESC_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_ED_PREFILTER_RE = re.compile(
+    r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}",
+    re.IGNORECASE)
 
 
 def editor_startup_path_hit(text) -> bool:
@@ -7643,6 +7677,12 @@ def editor_startup_path_hit(text) -> bool:
     QA round 1), `%XX` URL-decoding (`file:///home/u/%2Evimrc`) and with
     zsh `(...)` grouping removed (`~/.config/(nvim)/init.lua`)."""
     if not isinstance(text, str) or not text:
+        return False
+    if len(text) > _ED_NORM_MAX:
+        return True                           # fail closed (QA round 3 perf)
+    # Cheap prefilter: every alternative of the path regex contains one of
+    # these literals (or is reached only through `%XX` decoding).
+    if not _ED_PREFILTER_RE.search(text):
         return False
     if EDITOR_STARTUP_PATH_RE.search(text):
         return True
@@ -7655,28 +7695,48 @@ def editor_startup_path_hit(text) -> bool:
             pass
     if "(" in text or ")" in text:
         variants.append(re.sub(r"[()]", "", text))
-    if ".." in text:
+    if "/." in text or "\\." in text:
         variants.append(_ed_dotdot_normalize(text))
+    for v in list(variants):
+        if "/." in v or "\\." in v:
+            variants.append(_ed_dotdot_normalize(v))
     for v in variants:
-        if v != text and (EDITOR_STARTUP_PATH_RE.search(v)
-                          or (".." in v and EDITOR_STARTUP_PATH_RE.search(_ed_dotdot_normalize(v)))):
+        if v != text and EDITOR_STARTUP_PATH_RE.search(v):
             return True
     return False
 
 
-_ED_DOTDOT_RE = re.compile(r"[^\s'\"/\\=:<>|&;(`{,]+[/\\]+\.\.(?=[/\\]|$|[\s'\"])")
+_ED_PATH_TOKEN_RE = re.compile(r"[^\s'\"=:<>|&;(`{,]+")
+_ED_NORM_MAX = 400_000
+
+
+def _ed_norm_token(tok: str) -> str:
+    if ".." not in tok and "/./" not in tok and "\\.\\" not in tok \
+            and not tok.endswith(("/.", "\\.")):
+        return tok
+    absolute = tok[:1] in "/\\"
+    out = []
+    for seg in re.split(r"[/\\]+", tok):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if out and out[-1] != "..":
+                out.pop()
+            elif not absolute:
+                out.append("..")          # stays relative (`../etc`)
+            continue                       # `/..` clamps to `/`
+        out.append(seg)
+    return ("/" if absolute else "") + "/".join(out)
 
 
 def _ed_dotdot_normalize(text: str) -> str:
-    """Lexically collapse every `seg/..` pair, in place, anywhere in text."""
-    prev = None
-    n = 0
-    while prev != text and n < 64:
-        prev = text
-        text = _ED_DOTDOT_RE.sub("", text, count=1)
-        text = re.sub(r"[/\\]{2,}", "/", text) if text != prev else text
-        n += 1
-    return text
+    """Lexically resolve `.`/`..` segments in every path-like token of text
+    (`x/./../nvim`, `/./etc`, `/../etc`; QA round 3). Linear time; past
+    `_ED_NORM_MAX` the input is truncated (callers fail closed on size)."""
+    if not isinstance(text, str):
+        return ""
+    text = text[:_ED_NORM_MAX]
+    return _ED_PATH_TOKEN_RE.sub(lambda m: _ed_norm_token(m.group(0)), text)
 
 
 # A `cd DIR` whose later relative words are joined onto DIR
@@ -7686,7 +7746,7 @@ _ED_CMD_BUDGET = 4000
 _ED_QUOTED_RE = re.compile(r"'[^']{0,100000}'|\"[^\"]{0,100000}\"")
 
 
-def editor_startup_shell_path_hit(cmd) -> bool:
+def editor_startup_shell_path_hit(cmd, cwd=None) -> bool:
     """True if a shell command names an editor init file/tree -- literally,
     through backslash escapes (`.vim\\rc`), `..` segments, zsh grouping,
     a glob/brace word bash would expand to one, or a relative word after a
@@ -7700,6 +7760,10 @@ def editor_startup_shell_path_hit(cmd) -> bool:
         return True
     budget = _ED_CMD_BUDGET
     cds = [m.group(2) for m in _ED_CD_RE.finditer(unesc)][:16]
+    if isinstance(cwd, str) and cwd:
+        cds.insert(0, cwd)                     # QA round 3: session cwd
+    if not cds and not any(c in unesc for c in "*?[{"):
+        return False
     # bash never glob-expands quoted text (`sed 's/.*/X/'`): neutralize glob
     # characters inside quotes before the glob pass (QA round 2). The
     # de-obfuscated scan surface already unwraps `bash -c '...'`.
@@ -7774,14 +7838,18 @@ _ED_HOME_DEST_RE = re.compile(
     r"[/\\]*['\"]?(?=\s|$|[;&|)])",
     re.IGNORECASE)
 _ED_BULK_VERB_RE = re.compile(
-    r"\bcp\s+(?:-[A-Za-z]*[rRa][A-Za-z]*|--recursive|--archive)\b|\bstow\b|\bditto\b"
-    r"|\bbsdtar\b|\bxstow\b|\bchezmoi\s+apply\b|\byadm\b",
+    r"\bcp\s+(?:-[A-Za-z]*[rRat][A-Za-z]*|--recursive|--archive|--target-directory)\b"
+    r"|\bstow\b|\bditto\b"
+    r"|\bbsdtar\b|\bxstow\b|\bchezmoi\s+apply\b|\byadm\b"
+    # QA round 3: moving/linking a gated-named dir into the config root.
+    r"|(?<![\w-])(?:mv|ln|move|Move-Item|New-Item)\b|\bgit\s+-C\s+\S+\s+clone\b",
     re.IGNORECASE)
+_ED_CD_WORD_RE = re.compile(r"(?:^|[\s;&|(])(?:cd|pushd|Set-Location|sl)\s+\S+")
 
 
 def editor_startup_home_bulk_hit(cmd) -> bool:
     if not isinstance(cmd, str) or not cmd:
         return False
-    if not _ED_HOME_DEST_RE.search(cmd):
+    if not _ED_HOME_DEST_RE.search(_ED_CD_WORD_RE.sub(" ", cmd)):
         return False
     return bool(ARCHIVE_SYNC_VERB_RE.search(cmd) or _ED_BULK_VERB_RE.search(cmd))
