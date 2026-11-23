@@ -14520,41 +14520,65 @@ def _editor_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
 
 _ED_PATH_SHAPE_RE = re.compile(
     r"^(?:file://|[/\\~.]|[A-Za-z]:[/\\]|%\w+%|\$\{?\w+)[^\r\n]*$")
+# A relative path (`home/u/.vimrc`, `Documents/../.vimrc`): no whitespace,
+# at least one separator (QA round 1).
+_ED_REL_PATH_RE = re.compile(r"^[^\s]*[/\\][^\s]*$")
 _ED_DELETE_WORDS = frozenset(("delete", "remove", "rm", "unlink", "trash"))
+# An arg key carrying bytes to write: a read/delete-shaped tool name never
+# exempts a call that has one (`open_file{path, content}`,
+# `delete_then_recreate{content}` -- QA round 1).
+_ED_CONTENT_KEY_WORDS = frozenset((
+    "content", "contents", "data", "text", "body", "source", "src", "input",
+    "payload", "new", "replacement", "patch", "diff", "edits", "edit",
+    "append", "insert", "value", "lines", "code", "script", "bytes", "blob",
+))
 
 
 def _editor_startup_path_shaped(v) -> bool:
-    """A single-line string that starts like a path, names an editor init
-    file/tree, and has no whitespace after the last such name (a spaced
-    Windows profile dir before it is fine; prose after it is not)."""
+    """A single-line string that starts like a path (or is a whitespace-
+    free relative path) and names an editor init file/tree. Text after the
+    match may contain spaces (`plugin/a b.lua`, QA round 1); prose does not
+    start like a path."""
     if not isinstance(v, str):
         return False
     t = v.strip()
-    if not t or not _ED_PATH_SHAPE_RE.match(t):
+    if not t or "\n" in t or "\r" in t or len(t) > 4096:
         return False
-    m = None
-    for m in patterns.EDITOR_STARTUP_PATH_RE.finditer(t):
-        pass
-    return bool(m) and not re.search(r"\s", t[m.end():])
+    if not (_ED_PATH_SHAPE_RE.match(t) or _ED_REL_PATH_RE.match(t)):
+        return False
+    return patterns.editor_startup_path_hit(t)
 
 
 def _editor_startup_mcp_target(ev: Event) -> str:
     """The editor init path a (non-read-only) MCP call touches, or ''."""
     a = ev.args or {}
     p = _path(ev)
-    if p and patterns.EDITOR_STARTUP_PATH_RE.search(p) and "\n" not in p:
+    if p and "\n" not in p and patterns.editor_startup_path_hit(p):
         return p
-    for s_ in _flatten_strings(a):
-        if _editor_startup_path_shaped(str(s_)):
-            return str(s_).strip()
-    for s_ in _flatten_strings(a):
-        if patterns.editor_startup_patch_hit(str(s_)):
+    flat = [str(x) for x in _flatten_strings(a)]
+    for s_ in flat:
+        if _editor_startup_path_shaped(s_):
+            return s_.strip()
+    for s_ in flat:
+        if patterns.editor_startup_patch_hit(s_):
             return "<patch touching an editor init file>"
     for k_ in _http_rc_mapping_keys(a):
-        if _editor_startup_path_shaped(k_) or (
-                patterns.EDITOR_STARTUP_PATH_RE.search(k_) and not re.search(r"\s", k_.strip())):
+        if "\n" not in k_ and patterns.editor_startup_path_hit(k_.strip()) and (
+                _editor_startup_path_shaped(k_) or not re.search(r"\s", k_.strip())
+                or _ED_PATH_SHAPE_RE.match(k_.strip())):
             return k_
     return ""
+
+
+def _editor_startup_has_content_key(a, _depth: int = 0) -> bool:
+    if _depth > 6 or not isinstance(a, dict):
+        return False
+    for k, v in a.items():
+        if _http_rc_words(k) & _ED_CONTENT_KEY_WORDS and v not in (None, "", [], {}):
+            return True
+        if isinstance(v, dict) and _editor_startup_has_content_key(v, _depth + 1):
+            return True
+    return False
 
 
 def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -14620,13 +14644,41 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     (``nvim --headless +Lazy\\ sync``) after a benign-looking spec change
     made elsewhere, nano's ``nanorc`` ``formatter``/``linter`` (runs only on
     a keypress), modelines in ordinary files, and paths assembled indirectly
-    (variable concatenation, ``cd ~/.config && cp x nvim/init.lua`` --
-    the ``nvim`` component without its parent) are not covered -- the same
+    (variable concatenation, a ``cd`` computed from a variable) are not
+    covered -- the same
     "computed indirectly" class every sibling guard discloses. A project
     file under a directory literally called ``.vim``/``.helix`` is gated
     too. Accepted false ASKs on the shell form: any non-read verb in a
     command that merely mentions a path (``git add .vimrc`` in a dotfiles
-    repo, ``find ~/.config/nvim -name '*.lua'``)."""
+    repo, ``find ~/.config/nvim -name '*.lua'``), and a bulk extract/
+    recursive copy/sync whose destination is the home or config root
+    (``tar xf x.tgz -C ~``, ``rsync -a d/ ~/``, ``stow -t ~ pkg``) -- it
+    can plant ``.vimrc`` without naming it, so it is gated too.
+
+    Engine-wide note (not specific to this guard): ``engine._run`` returns
+    the FIRST non-ALLOW decision, so under ``mode: deny`` an earlier
+    sibling's ASK on the same command (install-review, fetch-to-file,
+    shell-persist) is what the human sees. Making a later DENY win changes
+    28 existing sibling-guard expectations and is left as a separate,
+    engine-level change.
+
+    QA history (two independent reviews, bypass-hunting and design/false-
+    positive, in parallel). Round 1 found: ``..`` segments
+    (``~/.config/x/../nvim/init.lua``) defeated every parent-anchored
+    alternative -- paths are now also matched after lexical normalization,
+    URL-decoding (``file:///home/u/%2Evimrc``) and zsh ``(...)`` removal;
+    spaced file names and relative paths under unlisted MCP keys; bash
+    ``[^x]``, ``[[:lower:]]`` and ``{a..b}`` globs ``fnmatch`` doesn't
+    speak; bare ``*`` under ``.local``, the root or ``~``; missing startup
+    locations (``$VIM\\vimrc``, ``vim91/`` runtime, MacVim, Emacs
+    ``subdirs.el``/site-lisp/native-lisp, system Kakoune/Helix runtime,
+    Flatpak ``~/.var/app``, Neovim's ``luac`` cache); ``LESSOPEN=... less``
+    turning a "read" into a write (exec-bearing env prefixes now void the
+    read-only exemption); zsh glob qualifiers (``~/.vimrc(N)``); read- or
+    delete-shaped MCP tool names carrying content (``open_file{content}``,
+    ``delete_then_recreate``); a per-command glob-candidate budget (fails
+    closed); ``cd DIR && cp x nvim/init.lua``; bulk extraction into ``~``.
+    False positives fixed: ``| sort``, ``git log/diff/status/show``."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14649,26 +14701,31 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             if d is not None:
                 return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
                                 "command that writes an editor init file. " + d.message)
-        if _http_rc_mcp_read_only(ev):
+        has_content = _editor_startup_has_content_key(ev.args or {})
+        if _http_rc_mcp_read_only(ev) and not has_content:
             return None
         words = _http_rc_words(str(ev.tool or "").split("__")[-1])
-        if words & _ED_DELETE_WORDS and not (words & (_HTTP_RC_WRITE_WORDS - {"set"})):
+        if (words & _ED_DELETE_WORDS and not (words & (_HTTP_RC_WRITE_WORDS - {"set"}))
+                and not has_content and len(words - _ED_DELETE_WORDS - {"file", "files", "dir", "directory", "path", "item", "items"}) == 0):
             return None
         p = _editor_startup_mcp_target(ev)
         if not p:
             return None
     elif ev.action in (ActionClass.EDIT, ActionClass.WRITE):
         p = _path(ev)
-        if not (p and patterns.EDITOR_STARTUP_PATH_RE.search(p)):
+        if not (p and patterns.editor_startup_path_hit(p)):
             return None
     elif _is_shell(ev):
         cmd = _shell_scan(ev)
         raw = _cmd(ev)
-        if not (patterns.editor_startup_shell_path_hit(cmd)
-                or patterns.editor_startup_shell_path_hit(raw)):
+        named = (patterns.editor_startup_shell_path_hit(cmd)
+                 or patterns.editor_startup_shell_path_hit(raw))
+        bulk = (patterns.editor_startup_home_bulk_hit(cmd)
+                or patterns.editor_startup_home_bulk_hit(raw))
+        if not (named or bulk):
             return None
-        if (patterns.http_client_rc_shell_only_reads(cmd)
-                and patterns.http_client_rc_shell_only_reads(raw)):
+        if not bulk and (patterns.editor_startup_shell_only_reads(cmd)
+                         and patterns.editor_startup_shell_only_reads(raw)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP")
                 or _editor_startup_allowed_by_policy(cfg, raw)):

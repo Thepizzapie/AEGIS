@@ -306,3 +306,118 @@ def test_loader_reads_policy_key(tmp_path):
     f = tmp_path / "p.yaml"
     f.write_text("editor_startup:\n  mode: deny\n")
     assert load_policy(str(f)).editor_startup == {"mode": "deny"}
+
+
+# ---- QA round 1 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "/home/u/.config/x/../nvim/init.lua",
+    "/home/u/.local/share/x/../nvim/site/plugin/a.lua",
+    "C:\\Users\\u\\AppData\\Local\\x\\..\\nvim\\init.lua",
+    "C:\\Program Files\\Vim\\vimrc", "C:\\Program Files\\Vim\\vim91\\plugin\\x.vim",
+    "/Applications/MacVim.app/Contents/Resources/vim/vimrc",
+    "/usr/share/emacs/site-lisp/subdirs.el", "/usr/local/share/emacs/30.1/site-lisp/x.el",
+    "/usr/share/emacs/30.1/lisp/subdirs.el", "/usr/lib/emacs/30.1/native-lisp/x/y.eln",
+    "/usr/share/kak/kakrc", "/usr/local/share/kak/autoload/x.kak",
+    "/usr/lib/helix/runtime/grammars/python.so",
+    "~/.var/app/io.neovim.nvim/config/nvim/init.lua",
+    "~/.var/app/io.neovim.nvim/data/nvim/site/plugin/a.lua",
+    "~/.cache/nvim/luac/%init.luac",
+    "file:///home/u/%2Evimrc",
+])
+def test_r1_paths_gated(path):
+    assert _ours(evaluate(_write(path), EMPTY)), path
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp /tmp/e ~/.config/foo/../nvim/init.lua",
+    "echo x >> ~/.config/x/../nvim/init.lua",
+    "cp /tmp/e ~/.vim[^x]c",
+    "cp /tmp/e ~/.vim[[:lower:]]c",
+    "cp /tmp/e ~/.config/nvi[[:alpha:]]/init.lua",
+    "cp /tmp/e ~/.vi{l..m}rc",
+    "cp /tmp/e ~/.config/{m..n}vim/init.lua",
+    "cp /tmp/e ~/.local/*/nvim/site/plugin/x.lua",
+    "cp /tmp/e /*/vim/vimrc.local",
+    "cp /tmp/e /*/xdg/nvim/sysinit.vim",
+    "cp /tmp/e ~/*/*/nvim/init.lua",
+    "LESSOPEN=$'cp\\x20/tmp/e\\x20%s' less ~/.vimrc",
+    "RIPGREP_CONFIG_PATH=/tmp/rgc rg . ~/.vimrc",
+    "cp /tmp/e ~/.vimrc(N)",
+    "cp /tmp/e ~/.vimr(c)",
+    "cp /tmp/e ~/.config/(nvim)/init.lua",
+    "tar xzf e.tgz -C ~",
+    "unzip e.zip -d ~",
+    "cp -r /tmp/dotfiles/. ~/",
+    "rsync -a d/ ~/",
+    "stow -t ~ evil",
+    "tar xf e.tgz -C $HOME/.config",
+    "cd ~/.config && cp x nvim/init.lua",
+    "cd ~ && echo x >> .vimrc",
+])
+def test_r1_shell_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("args,tool", [
+    ({"source": "/tmp/e", "destination": "/home/u/.config/nvim/plugin/a b.lua"},
+     "mcp__fs__move_file"),
+    ({"source": "/tmp/e", "destination": "~/.vim/plugin/x y.vim"}, "mcp__fs__copy_file"),
+    ({"files": {"/home/u/.config/nvim/a b.lua": "x"}}, "mcp__fs__write_many"),
+    ({"destination": "home/u/.vimrc"}, "mcp__fs__move_file"),
+    ({"destination": "Documents/../.vimrc"}, "mcp__fs__move_file"),
+    ({"dest": "/home/u/.config/x/../nvim/init.lua"}, "mcp__fs__move_file"),
+    ({"input": "*** Begin Patch\n*** Add File: /home/u/.config/x/../nvim/init.lua\n+x\n*** End Patch\n"},
+     "mcp__codex__apply_patch"),
+    ({"command": ["cp", "/tmp/e", "/home/u/.config/x/../nvim/init.lua"]},
+     "mcp__desktop__start_process"),
+    ({"file_path": "~/.vimrc", "contents": "x"}, "mcp__fs__open"),
+    ({"path": "~/.vimrc", "content": "x"}, "mcp__fs__open_file"),
+    ({"path": "~/.vimrc", "data": "x"}, "mcp__ide__open_in_editor"),
+    ({"path": "~/.vimrc", "content": "x"}, "mcp__fs__unlink_dump"),
+    ({"path": "~/.vimrc", "content": "x"}, "mcp__fs__remove_emit"),
+    ({"path": "~/.vimrc", "content": "x"}, "mcp__fs__delete_then_recreate"),
+    ({"uri": "file:///home/u/%2Evimrc", "text": "x"}, "mcp__fs__write"),
+])
+def test_r1_mcp_gated(args, tool):
+    assert _ours(evaluate(_mcp(args, tool=tool), EMPTY)), (tool, args)
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls ~/.vim | sort",
+    "wc -l ~/.vimrc | sort -n",
+    "git log -- .vimrc",
+    "git diff ~/.config/nvim/init.lua",
+    "cd ~/.config/nvim && git status",
+    "cd ~ && tar czf /tmp/backup.tgz proj",
+    "ls ~",
+])
+def test_r1_false_positives_fixed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls ~/.vim | sort -o ~/.vimrc",
+    "git diff --output=~/.vimrc",
+    "git -c core.pager=x log -- .vimrc > ~/.vimrc",
+    "sort --compress-program=sh ~/.vimrc",
+])
+def test_r1_read_verb_abuse_still_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r1_glob_perf_bounded():
+    import time
+    cmd = "cp x " + " ".join(["q/[a-d]*/[a-d]*/[a-d]*/[a-d]*/q"] * 600)
+    t = time.time()
+    evaluate(_shell(cmd), EMPTY)
+    assert time.time() - t < 3.0
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo '* text=auto' >> .gitattributes",
+    "echo '*.log' >> .gitignore",
+    "cp * /tmp/out/",
+])
+def test_r1_bare_star_not_a_hit(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
