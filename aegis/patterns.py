@@ -7461,6 +7461,15 @@ _ED_XDG = (r"(?:\$\{?|%|\$env:)XDG_(?:CONFIG|DATA|CACHE)_HOME(?::?[-=+?][^}\s]{0
 _ED_APPDATA = (r"(?:(?:\$\{?|%|\$env:)(?:LOCALAPPDATA|APPDATA)[}%]?|AppData" + _SEP
                + r"(?:Local|Roaming))" + _SEP)
 _ED_TOOLS = r"(?:n?vim|emacs|doom|kak|micro|helix)"
+# `etc` only as the filesystem root's (`/etc`, `/private/etc`, Git for
+# Windows' `Git/etc`), never a repo's `docs/etc/` -- QA round 2.
+_ED_ETC = (r"(?:(?<=^/)|(?<=^\\)|(?<=[\s'\"=:<>|&;(`{,][/\\])|(?<=private[/\\])"
+           r"|(?<=Git[/\\])|(?<=[/\\][/\\]))etc")
+# `share`/`lib` only under a real install prefix (`/usr`, `/usr/local`,
+# `~/.local`, Homebrew, a Nix store path, an Emacs install dir), never a
+# repo's `build/share/` -- QA round 2.
+_ED_PREFIX = (r"(?:usr|\.?local|homebrew|\.linuxbrew|[0-9a-z]{32}-[^\s'\"/\\]{1,200}"
+              r"|[^\s'\"/\\]{0,100}emacs[^\s'\"/\\]{0,100})" + _SEP)
 EDITOR_STARTUP_PATH_RE = re.compile(
     _ED_B + r"(?:"
     # --- Vim ---
@@ -7471,21 +7480,20 @@ EDITOR_STARTUP_PATH_RE = re.compile(
     r"|vimfiles"
     r"|\.config\}?" + _SEP + r"vim"
     r"|" + _ED_XDG + r"vim"
-    r"|etc" + _SEP + r"g?vimrc"
-    r"|etc" + _SEP + r"vim"
-    r"|share" + _SEP + r"vim"
+    r"|" + _ED_ETC + _SEP + r"g?vimrc"
+    r"|" + _ED_ETC + _SEP + r"vim"
+    r"|" + _ED_PREFIX + r"share" + _SEP + r"vim"
     # `$VIM\vimrc` (`C:\Program Files\Vim\vimrc`), MacVim's bundled
     # `Resources/vim/vimrc`, and `$VIMRUNTIME` (`vim91/`) -- QA round 1.
-    r"|vim" + _SEP + r"g?vimrc"
-    r"|vim\d{2,3}"
+    r"|Files(?: \(x86\))?" + _SEP + r"Vim"
     r"|MacVim\.app"
     # --- Neovim ---
     r"|\.config\}?" + _SEP + r"nvim"
     r"|\.local" + _SEP + r"share" + _SEP + r"nvim"
-    r"|share" + _SEP + r"nvim"
+    r"|" + _ED_PREFIX + r"share" + _SEP + r"nvim"
     r"|" + _ED_XDG + r"nvim"
     r"|" + _ED_APPDATA + r"nvim(?:-data)?"
-    r"|etc" + _SEP + r"xdg" + _SEP + r"nvim"
+    r"|" + _ED_ETC + _SEP + r"xdg" + _SEP + r"nvim"
     # `vim.loader` byte-code cache, loaded at startup (QA round 1).
     r"|\.cache" + _SEP + r"nvim" + _SEP + r"luac"
     r"|\.nvim\.lua"
@@ -7499,20 +7507,17 @@ EDITOR_STARTUP_PATH_RE = re.compile(
     r"|" + _ED_XDG + r"(?:emacs|doom)"
     r"|\.doom\.d"
     r"|\.spacemacs(?:\.d)?"
-    r"|site-start\.(?:elc?|d)"
     # Every `load-path` dir's `subdirs.el`/`leim-list.el`/`*-autoloads.el`
     # and native-comp `.eln` files load at startup (QA round 1).
-    r"|site-lisp"
-    r"|share" + _SEP + r"emacs"
-    r"|lib" + _SEP + r"emacs"
-    r"|etc" + _SEP + r"emacs"
+    r"|" + _ED_PREFIX + r"(?:share|lib)" + _SEP + r"emacs"
+    r"|" + _ED_ETC + _SEP + r"emacs"
     r"|\.dir-locals(?:-2)?\.el"
     # --- Kakoune / micro / Helix ---
     r"|\.config\}?" + _SEP + r"(?:kak|micro|helix)"
     r"|" + _ED_XDG + r"(?:kak|micro|helix)"
     r"|" + _ED_APPDATA + r"helix"
-    r"|share" + _SEP + r"kak"
-    r"|(?:share|lib)" + _SEP + r"helix"
+    r"|" + _ED_PREFIX + r"share" + _SEP + r"kak"
+    r"|" + _ED_PREFIX + r"(?:share|lib)" + _SEP + r"helix"
     r"|\.helix"
     r")" + _ED_END,
     re.IGNORECASE,
@@ -7525,13 +7530,34 @@ _ED_COMPONENT_NAMES = (
     ".vimrc", "_vimrc", ".gvimrc", "_gvimrc", ".exrc", "_exrc", ".ideavimrc",
     "_ideavimrc", ".vim", "vimfiles", "vim", "nvim", "nvim-data", ".nvim.lua",
     ".nvimrc", ".emacs", ".emacs.el", ".emacs.elc", ".emacs.d", "emacs",
-    "doom", ".doom.d", ".spacemacs", ".spacemacs.d", "site-start.el",
-    "site-start.elc", "site-start.d", "site-lisp",
+    "doom", ".doom.d", ".spacemacs", ".spacemacs.d",
     ".dir-locals.el", ".dir-locals-2.el", "kak", "micro", "helix", ".helix",
     "vimrc", "gvimrc", ".config", "config", "share", ".local", "etc", "xdg",
     "local", "roaming", "appdata", "lib", ".cache", "luac", ".var", "app",
-    "data", "vim91", "vim90", "macvim.app",
+    "data", "macvim.app", "usr", "homebrew", "files", "private", "git",
 )
+# For a bare `*`/`?` component: the gated children of each parent, so
+# `cp -r config/* build/` or `zip -r x etc/*` don't expand to every name
+# (QA round 2). Root/home expand to their own gated children.
+_ED_CHILDREN = {
+    ".config": ("vim", "nvim", "emacs", "doom", "kak", "micro", "helix"),
+    "config": ("vim", "nvim", "emacs", "doom", "kak", "micro", "helix"),
+    "data": ("vim", "nvim", "emacs", "kak", "helix"),
+    "share": ("vim", "nvim", "emacs", "kak", "helix"),
+    "lib": ("emacs", "helix"),
+    "etc": ("vim", "vimrc", "gvimrc", "emacs", "xdg"),
+    "xdg": ("nvim",),
+    ".local": ("share",), "local": ("share", "nvim", "nvim-data", "helix", "lib"),
+    "usr": ("share", "lib", "local"), "homebrew": ("share", "lib"),
+    "appdata": ("local", "roaming"), "roaming": ("helix",),
+    ".cache": ("nvim",), "nvim": ("luac",), ".var": ("app",),
+    "": ("etc", "usr", "private", "opt"), "private": ("etc",),
+    "~": ("vimfiles", "appdata"), "$home": ("vimfiles", "appdata"),
+    "${home}": ("vimfiles", "appdata"), "%userprofile%": ("vimfiles", "appdata"),
+}
+# A pure `.*`/`.?*` component expands to dot-names only under a home dir.
+_ED_HOMEISH_RE = re.compile(r"^(?:~[^/]*|\$home|\$\{home\}|%userprofile%|\$env:userprofile)$")
+_ED_DOT_WILD_RE = re.compile(r"\.[*?]+")
 _ED_GLOB_CHARS = "*?["
 # Parents under which a bare `*`/`?` component is expanded; a bare `*` is
 # also expanded right after the root/home, or before a gated name
@@ -7574,19 +7600,27 @@ def _ed_glob_candidates(word: str, budget: int = 256) -> list:
             for p_ in paths:
                 if any(c in comp for c in _ED_GLOB_CHARS):
                     lc = _ed_glob_normalize(comp.lower())
-                    if _ED_PURE_WILD_RE.fullmatch(comp) and not (
-                            # idx 0 has no parent at all (`echo '*' >> f` is
-                            # not a hit); `[""]` is the filesystem root.
-                            (bool(p_) and p_[-1].lower() in _ED_PARENT_NAMES)
-                            or nxt_lit in _ED_NEXT_GATED):
-                        subs = [comp]
+                    prev = p_[-1].lower() if p_ else None
+                    homeish = prev is not None and (
+                        bool(_ED_HOMEISH_RE.match(prev))
+                        or (len(p_) >= 2 and p_[-2].lower() in ("home", "users")))
+                    if _ED_PURE_WILD_RE.fullmatch(comp):
+                        pool = _ED_CHILDREN.get(prev, ()) if prev is not None else ()
+                        if homeish:
+                            pool = pool + ("vimfiles", "appdata")
+                        if nxt_lit in _ED_NEXT_GATED and prev is not None:
+                            pool = pool + tuple(n for n in _ED_COMPONENT_NAMES
+                                                if not n.startswith("."))
+                    elif _ED_DOT_WILD_RE.fullmatch(comp) and not homeish:
+                        pool = ()
                     else:
-                        try:
-                            subs = [n for n in _ED_COMPONENT_NAMES
-                                    if (lc.startswith(".") or not n.startswith("."))
-                                    and fnmatch.fnmatchcase(n, lc)] or [comp]
-                        except re.error:
-                            subs = list(_ED_COMPONENT_NAMES)
+                        pool = _ED_COMPONENT_NAMES
+                    try:
+                        subs = [n for n in pool
+                                if (lc.startswith(".") or not n.startswith("."))
+                                and fnmatch.fnmatchcase(n, lc)] or [comp]
+                    except re.error:
+                        subs = list(pool) or [comp]
                 else:
                     subs = [comp]
                 for s_ in subs:
@@ -7649,6 +7683,7 @@ def _ed_dotdot_normalize(text: str) -> str:
 # (`cd ~/.config && cp x nvim/init.lua`) -- QA round 1.
 _ED_CD_RE = re.compile(r"(?:^|[\s;&|(])(?:cd|pushd|Set-Location|sl)\s+(['\"]?)([^\s'\";&|()]+)\1")
 _ED_CMD_BUDGET = 4000
+_ED_QUOTED_RE = re.compile(r"'[^']{0,100000}'|\"[^\"]{0,100000}\"")
 
 
 def editor_startup_shell_path_hit(cmd) -> bool:
@@ -7665,7 +7700,11 @@ def editor_startup_shell_path_hit(cmd) -> bool:
         return True
     budget = _ED_CMD_BUDGET
     cds = [m.group(2) for m in _ED_CD_RE.finditer(unesc)][:16]
-    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc)):
+    # bash never glob-expands quoted text (`sed 's/.*/X/'`): neutralize glob
+    # characters inside quotes before the glob pass (QA round 2). The
+    # de-obfuscated scan surface already unwraps `bash -c '...'`.
+    globbable = _ED_QUOTED_RE.sub(lambda q: re.sub(r"[*?\[{]", "_", q.group(0)), unesc)
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(globbable)):
         if i > 4000:
             return True                       # fail closed on absurd input
         w = m.group(0)
@@ -7682,8 +7721,7 @@ def editor_startup_shell_path_hit(cmd) -> bool:
         if budget < 0:
             return True                       # fail closed (QA round 1 perf)
         for cand in cands:
-            if EDITOR_STARTUP_PATH_RE.search("/" + cand.lstrip("/")) or \
-                    EDITOR_STARTUP_PATH_RE.search(cand):
+            if EDITOR_STARTUP_PATH_RE.search(cand):
                 return True
     return False
 

@@ -211,8 +211,8 @@ def test_shell_deny_mode():
 
 
 def test_shell_policy_allow():
-    pol = Policy(editor_startup={"allow": [r"stow "]})
-    assert evaluate(_shell("stow -t ~ vim # links ~/.vimrc"), pol).rule != RULE
+    pol = Policy(editor_startup={"allow": [r"^/home/[^/]+/dotfiles/"]})
+    assert evaluate(_shell("cp x /home/u/dotfiles/.vimrc"), pol).rule != RULE
 
 
 # ---- MCP ------------------------------------------------------------------
@@ -421,3 +421,95 @@ def test_r1_glob_perf_bounded():
 ])
 def test_r1_bare_star_not_a_hit(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 2 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cp *.el dist/", "git add lisp/*.el", "emacs --batch -f batch-byte-compile *.el",
+    "cp *.d out/", "cp -r config/* build/", "cp local/* x/", "rsync -a share/* /out/",
+    "zip -r out.zip etc/*", "sed -i 's/.*/X/' f.txt", "perl -pi -e 's/.*//' a.txt",
+    "sed -i 's|/.*/|/|' f", "mkdir -p build/share/vim",
+    "prettier --write 'src/**/*.ts'", "eslint 'src/**/*.{js,ts}'",
+    "cp src/.* /tmp/out/",
+])
+def test_r2_shell_false_positives_fixed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("path", [
+    "/repo/app/vim/vimrc", "docs/etc/vim/notes.md", "/repo/src/share/nvim/x.ts",
+    "/repo/etc/emacs/x", "/repo/lisp/site-start.el", "/repo/site-lisp/x.el",
+    "/repo/vim91/x",
+])
+def test_r2_write_false_positives_fixed(path):
+    assert evaluate(_write(path), EMPTY).rule != RULE, path
+
+
+@pytest.mark.parametrize("path", [
+    "/etc/vim/vimrc", "/private/etc/vimrc", "C:/Program Files/Git/etc/vimrc",
+    "/usr/share/vim/vimfiles/plugin/a.vim", "/usr/local/share/nvim/site/plugin/a.lua",
+    "/opt/homebrew/share/vim/vimrc", "/nix/store/" + "a" * 32 + "-vim-9.1/share/vim/vimrc",
+    "C:\\Program Files\\Emacs\\emacs-29.1\\share\\emacs\\site-lisp\\site-start.el",
+    "C:\\Program Files (x86)\\Vim\\vim91\\defaults.vim",
+    "//etc/vim/vimrc", "/usr/share/emacs/site-lisp/default.el",
+])
+def test_r2_anchored_system_paths_still_gated(path):
+    assert _ours(evaluate(_write(path), EMPTY)), path
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp x /*/vim/vimrc.local", "cp x ~/.config/*/init.lua", "cp x /home/u/.vi?rc",
+    "cp x ~/.?im/plugin/a.vim", "cp x \"$HOME\"/.vim{rc,}",
+])
+def test_r2_real_globs_still_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("args,tool", [
+    ({"path": "/repo/x.txt", "content": "a\n+++ b/.vimrc\n"}, "mcp__fs__write_file"),
+    ({"path": "/repo/notes.md", "content": "~/.vimrc"}, "mcp__fs__write_file"),
+    ({"to": "a@b", "body": "I updated my ~/.vimrc today"}, "mcp__gmail__send_email"),
+    ({"text": "see .emacs.d/init.el for config"}, "mcp__slack__send_message"),
+    ({"inputs": {"note": "helix/.helix ok"}}, "mcp__github__actions_run_trigger"),
+])
+def test_r2_mcp_false_positives_fixed(args, tool):
+    assert evaluate(_mcp(args, tool=tool), EMPTY).rule != RULE, tool
+
+
+@pytest.mark.parametrize("args,tool", [
+    ({"path": "~/.vimrc", "content": "x"}, "mcp__fs__delete_and_set"),
+    ({"path": "~/.vimrc", "content": "x"}, "mcp__fs__remove_and_rewrite"),
+    ({"path": "~/.config/nvim/init.lua", "data": "x"}, "mcp__fs__rm_dump"),
+    ({"path": "~/.vimrc", "text": "\" "}, "mcp__fs__delete_text"),
+    ({"path": "~/.vimrc", "start": 1, "end": 3}, "mcp__fs__delete_lines"),
+    ({"path": "~/.vimrc"}, "mcp__fs__remove_comment"),
+    ({"path": "~/.vimrc", "content": "x"}, "mcp__fs__open_file"),
+    ({"command": "echo x >> ~/.vimrc"}, "mcp__ci__run"),
+    ({"input": "echo x >> ~/.vimrc"}, "mcp__term__interact_with_process"),
+])
+def test_r2_mcp_still_gated(args, tool):
+    assert _ours(evaluate(_mcp(args, tool=tool), EMPTY)), tool
+
+
+def test_r2_allow_regex_normalized():
+    pol = Policy(editor_startup={"allow": ["/dotfiles/"]})
+    assert _ours(evaluate(_write("/home/u/dotfiles/../.vimrc"), pol))
+    assert _ours(evaluate(_shell("echo 'source /tmp/p.vim' >> ~/.vimrc # /dotfiles/"), pol))
+    assert _ours(evaluate(_shell("cp /home/u/dotfiles/x ~/.vimrc"), pol))
+    assert evaluate(_shell("cp x /home/u/dotfiles/.vimrc"), pol).rule != RULE
+
+
+def test_r2_non_dict_args_do_not_crash():
+    ev = _mcp({"path": "x"}, tool="mcp__fs__write")
+    ev.args = "~/.vimrc"
+    assert _ours(rules.rule_editor_startup_protect(ev, EMPTY))
+
+
+def test_r2_glob_bomb_bounded():
+    import time
+    word = "{a,b,c,d,e,f}{a,b,c,d,e,f}{a,b}/" + "/".join(["x*"] * 20)
+    cmd = "true " + " ".join([word] * 3900) + "; cp /tmp/p ~/.v?mrc"
+    t = time.time()
+    d = evaluate(_shell(cmd), EMPTY)
+    assert time.time() - t < 10.0 and d.action != Action.ALLOW

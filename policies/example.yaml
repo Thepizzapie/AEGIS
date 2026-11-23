@@ -45,7 +45,7 @@
 # command; a spawned agent cannot.
 #   editor_startup:
 #     mode: ask            # deny | ask (default) | monitor | off
-#     allow: ['/dotfiles/']   # regexes on the path/command that skip it
+#     allow: ['^/home/[^/]+/dotfiles/']   # regexes on the (normalized) path
 
 default_action: allow
 on_error: allow
