@@ -7925,7 +7925,9 @@ _ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl", "yadm"))
 _ED_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "busybox-sh",
                         "su", "script", "runuser"))
 _ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS | _ED_SHELLS
-                      | frozenset(("giget", "copier", "cookiecutter", "export", "rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
+                      | frozenset(("rm", "rmdir", "unlink", "trash", "trash-put", "gio",
+                                   "remove-item", "del",
+                                   "giget", "copier", "cookiecutter", "export", "rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
                                    "podman", "kubectl", "oc", "degit", "tiged", "wget",
                                    "wget2", "unsquashfs", "cabextract", "lha", "python",
                                    "python3", "vcsh"))
@@ -8547,6 +8549,12 @@ def _ed_placement(cmd, cwd, hits, depth):
             if _ed_remote_copy(verb, args, state, cur_dirs(), hits):
                 return hits, True
             continue
+        if verb in ("rm", "rmdir", "unlink", "trash", "trash-put", "gio", "remove-item", "del"):
+            for a in args:
+                if not a.startswith("-"):
+                    for d in cur_dirs():
+                        state.setdefault("removed", set()).add(_ed_canon(_ed_join(d, a)))
+            continue
         if verb in _ED_PLACE_VERBS:
             if _ed_place(verb, args, state, cur_dirs(), hits):
                 return hits, True
@@ -8857,10 +8865,16 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
                 return True
             continue
         if recursive and len(srcs) == 1 and target and _ed_is_gated_parent(dest) \
-                and not _ed_is_real_dir(dest):
+                and (not _ed_is_real_dir(dest)
+                     or _ed_canon(dest) in state.get("removed", ())):
+            # ...including one this same command moved/removed first
+            # (`mv ~/.config /tmp/o && mv /tmp/p ~/.config` -- QA round 12).
             # Copy/move/link ONTO a gated parent that does not exist yet
             # (fresh container/CI home): the source BECOMES it (QA round 11).
             return True
+        if verb in ("mv", "move", "move-item", "mi", "gmv"):
+            for src in srcs:
+                state.setdefault("removed", set()).add(_ed_canon(_ed_join(d, src)))
         unknown_checked = False
         for src in srcs[:4000]:
             if verb in ("ln", "gln"):
@@ -8897,6 +8911,14 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
                 # round 11 false positives).
                 return True
     return False
+
+
+def _ed_canon(p) -> str:
+    try:
+        q = _ed_dotdot_normalize(_ed_home_norm(str(p or "")).replace("\\", "/"))
+        return os.path.expanduser(q).rstrip("/") or "/"
+    except Exception:
+        return str(p)
 
 
 def _ed_home_norm(x: str) -> str:

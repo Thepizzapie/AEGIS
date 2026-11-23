@@ -14961,7 +14961,13 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     narrowing (only a pipe touching the ``cd`` stage does); extracted
     ``bash -c`` bodies are no longer re-judged without their ``cd``; the
     gated-parent-source rule is limited to home and ``/etc`` targets
-    (``cp -r build/share /usr/local/`` passes)."""
+    (``cp -r build/share /usr/local/`` passes). Round 12 found the live-
+    filesystem "does not exist yet" check defeated by moving the gated
+    parent aside in the same command (``mv ~/.config /tmp/o && mv /tmp/p
+    ~/.config``) -- ``mv``/``rm``/``trash`` sources earlier in the command
+    are now tracked as removed; and the quote-stripped scan rendering
+    changing what ``bash -c 'cd /tmp && git pull'`` runs (skipped: the
+    tokenizer handles quotes itself)."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -15144,6 +15150,11 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         _pc, _uc = [], False
         _cd_dirs = [m.group(2) for m in patterns._ED_CD_RE.finditer(raw)][:8]
         for _r in dict.fromkeys(normalize.scan_surface(raw, sep="\x1e").split("\x1e")):
+            if _r != raw and re.sub(r"[\s'\"$]", "", _r) == re.sub(r"[\s'\"$]", "", raw):
+                # The quote-stripped copy: the tokenizer already handles
+                # quotes (`c''p`), and stripping them changes what `bash -c
+                # 'cd /tmp && git pull'` runs (QA round 12 false positive).
+                continue
             if _r != raw and _r.strip() and _r.strip() in raw:
                 # An extracted body (`bash -c 'git pull'`): the inline analysis
                 # of the raw command already judged it WITH its `cd` state

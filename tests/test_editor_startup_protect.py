@@ -1196,3 +1196,30 @@ def test_r11_home_cwd_false_positives_fixed(cmd):
 ])
 def test_r11_prefix_install_false_positives_fixed(cmd):
     assert evaluate(_sh_cwd(cmd, "/home/u/proj"), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 12 regressions --------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "mv ~/.config /tmp/o && mv /tmp/payload ~/.config",
+    "mv ~/.config /tmp/o && cp -r /tmp/payload ~/.config",
+    "mv ~/.config /tmp/o; mv /tmp/payload ~/.config",
+    "mv $HOME/.config /tmp/o && ln -s /tmp/payload $HOME/.config",
+    "mv ~ /tmp/oldhome && mv /tmp/newhome ~",
+    "trash-put ~/.config && cp -r /tmp/payload ~/.config",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj", "/home/u"])
+def test_r12_move_aside_swap_gated(cmd, cwd):
+    d = evaluate(_sh_cwd(cmd, cwd), EMPTY)
+    assert d.action != Action.ALLOW, (cmd, cwd)
+    assert _ours(rules.rule_editor_startup_protect(_sh_cwd(cmd, cwd), EMPTY)), (cmd, cwd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "bash -c 'cd /tmp && git pull'", "bash -c 'cd /home/u/proj && git pull'",
+    "mv ~/.config/foo.bak ~/.config/foo", "mv build/out ~/newdir",
+    "mv old.txt new.txt && mv dir1 ~/Documents/",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj", "/home/u"])
+def test_r12_false_positives(cmd, cwd):
+    assert evaluate(_sh_cwd(cmd, cwd), EMPTY).rule != RULE, (cmd, cwd)
