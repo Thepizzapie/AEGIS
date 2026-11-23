@@ -1043,3 +1043,47 @@ def test_r8_mcp_git_checkout_in_home_gated():
 ])
 def test_r8_mcp_false_positives_fixed(ev):
     assert evaluate(ev, EMPTY).rule != RULE
+
+
+# ---- QA round 9 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cd ~/.config && cd /tmp && cd - && cp -r /tmp/p/. .",
+    "cd ~/.config && cd /tmp && cd - >/dev/null && cp -r /tmp/p/. .",
+    "cd ~/.config && cd /tmp && builtin cd - && cp -r /tmp/p/. .",
+    "cd ~/.config && cd /tmp && cd \"$OLDPWD\" && cp -r /tmp/p/. .",
+    "cd ~/.config && cd \"$(mktemp -d)\" && cd - && rsync -a /tmp/p/ .",
+    "cd ~/.config && (cd /tmp) && cp -r /tmp/p/. .",
+    "cd ~/.config && x=$(cd /tmp) && cp -r /tmp/p/. .",
+    "cd ~/.config && cd /nonexistent && : || cp -r /tmp/p/. .",
+    "cd ~/.config && cd /nope && echo hi || rsync -a /tmp/p/ .",
+    "cd ~/.config && cd /nope && : || unzip -o /tmp/x.zip",
+    "cd ~ && cd /nope && : || git pull",
+    "cd ~/.config && ! cd /nope && cp -r /tmp/p/. .",
+    "cd ~/.config && { cd /nope && :; } ; cp -r /tmp/p/. .",
+    "cd ~/.config && npx degit evil/cfg", "cd ~/.config && degit x/y --force",
+    "cd ~ && npx tiged x/y", "cd ~/.config && npx giget gh:x/nvim",
+    "cookiecutter gh:x/y --output-dir=$HOME/.config", "cd ~/.config && cookiecutter gh:x/y",
+    "python3 -Im zipfile -e x.zip ~/",
+])
+def test_r9_shell_gated(cmd):
+    assert _ours(evaluate(_sh_cwd(cmd, "/home/user/proj"), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__term__write_input", {"uri": "term://1", "input": "cd ~/.config && cp -r /tmp/p/. .\n"}),
+    ("mcp__term__write_input", {"file": "/dev/pts/1", "input": "cd ~/.config && cp -r /tmp/p/. .\n"}),
+    ("mcp__git__git_pull", {"repo": "~"}), ("mcp__git__git_pull", {"working_dir": "~"}),
+    ("mcp__x__run_command", {"command": "tar xf x.tgz", "cwd_path": "~"}),
+    ("mcp__x__run_command", {"command": "tar xf x.tgz", "location": "~"}),
+])
+def test_r9_mcp_gated(tool, args):
+    assert _ours(evaluate(_mcp(args, tool=tool), EMPTY)), (tool, args)
+
+
+@pytest.mark.parametrize("cmd", [
+    "npx degit sveltejs/template web", "pushd src && make && popd",
+    "cd ~/.config/nvim && git status", "cd .. && ls", "cd build && cmake .. && make",
+])
+def test_r9_false_positives(cmd):
+    assert evaluate(_sh_cwd(cmd, "/home/user/proj"), EMPTY).rule != RULE, cmd

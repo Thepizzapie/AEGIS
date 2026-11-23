@@ -14923,7 +14923,19 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     after ``;`` the earlier ones are kept, so ``cd /nonexistent; tar xf``
     is still judged in ``~``; ``cd /x && true; tar xf`` is an accepted
     residual), ``log_dir`` taken as a runner cwd, file writes whose content
-    quotes an editor command."""
+    quotes an editor command. Round 9 found the round-8 ``cd X &&`` narrowing
+    unsound under ``cd -``/``$OLDPWD``, subshell or ``$(..)`` ``cd``s, a
+    later ``||``, ``! cd`` and brace groups -- narrowing now applies only
+    to a flat ``&&`` chain with none of those constructs, and ``cd -``
+    resolves to the previous cwd; ``degit``/``tiged``/``giget``/
+    ``cookiecutter`` default to the cwd (and ``--output-dir=``); terminal
+    ``write_input`` tools with a ``uri``/``file`` address are no longer
+    treated as file writes; more MCP git/runner cwd keys; ``python -Im``.
+    Accepted residual (design decision): unknown-name extraction or bulk
+    copy into ``~/.local`` itself (not ``~/.local/share``) is not gated --
+    tool-install tarballs routinely target it, so gating it would ASK on
+    every ``tar xf node.tgz -C ~/.local``; an archive whose own tree holds
+    ``share/nvim/...`` can therefore land there unasked."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14978,7 +14990,8 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             if isinstance(_v, dict):
                 _cands.extend(_v.items())          # `{options: {cwd}}` (QA round 6)
         _exact = ("cwd", "cd", "pwd", "workdir", "workingdir", "workingdirectory",
-                  "currentdir", "currentdirectory", "workingfolder")
+                  "currentdir", "currentdirectory", "workingfolder", "cwdpath", "location",
+                  "workingpath")
         for _pass in (0, 1):               # exact names first (QA round 7: `logdir`)
             for _k, _v in _cands:
                 kn = re.sub(r"[_\-\s]", "", str(_k).lower())
@@ -15008,7 +15021,8 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         if tool_words & {"checkout", "pull", "merge", "reset", "restore", "switch", "apply",
                          "stash", "rebase", "clone"} and "git" in tool_words:
             for _k in ("repo_path", "repoPath", "repository", "path", "cwd", "directory",
-                       "target_path", "local_path"):
+                       "target_path", "local_path", "repo", "working_dir", "workdir",
+                       "workingDir", "dir", "repository_path", "worktree"):
                 _v = a0.get(_k)
                 if isinstance(_v, str) and _v and (
                         patterns._ed_is_gated_parent(_v) or patterns.editor_startup_path_hit(_v)):
@@ -15024,7 +15038,9 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
                                      "spawned agent cannot."))
         # An ordinary file write to a non-gated target: its content is data,
         # not a command (QA round 8: a README quoting `echo .. >> ~/.vimrc`).
-        if not (tool_words & _ED_MESSAGING_WORDS) and not _own_ungated_target:
+        _file_writer = bool(tool_words & _ED_FILE_TOOL_WORDS) and not (
+            tool_words & (_ED_STRONG_SHELL_WORDS | {"term", "input", "keys", "type"}))
+        if not (tool_words & _ED_MESSAGING_WORDS) and not (_own_ungated_target and _file_writer):
             skip = set()
             # Prose-shaped keys (a commit message, a search query) are not
             # commands (QA round 6 false positives).

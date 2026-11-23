@@ -7998,6 +7998,7 @@ _ED_WIN_HINT_RE = re.compile(
     r"|new-item)\b", re.IGNORECASE)
 _ED_TOK_MAX = 400_000
 _ED_AND_MARK = "\x00&&"
+_ED_NO_NARROW_RE = re.compile(r"\|\||(?:^|[\s;&|(])!\s|[(){}`]|\bcd\s+(?:--\s+)?-(?:\s|$)|OLDPWD|~-|\bpopd\b")
 _ED_PLACE_PREFILTER_RE = re.compile(
     r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
     r"|~|\$\{?HOME|\$env:|%\w+%|/home/|/Users/|/root|/var/home|\betc\b|\bshare\b|\blib\b"
@@ -8399,10 +8400,16 @@ def _ed_placement(cmd, cwd, hits, depth):
 
     queue = list(segs)
     last_cd_alts = None
+    # Narrowing the candidate cwds after `cd X &&` is only sound for a flat
+    # `&&` chain: `||`, `!`, subshells, `$(..)`, brace groups, `cd -` /
+    # `$OLDPWD` / `~-` and `popd` can all leave bash somewhere else (QA
+    # round 9 regression).
+    can_narrow = not _ED_NO_NARROW_RE.search(cmd)
+    prev_cwd = [state["cwd"]]
     while queue:
         words = queue.pop(0)
         if words == [_ED_AND_MARK]:
-            if last_cd_alts:
+            if last_cd_alts and can_narrow:
                 # `cd /x && ...`: what follows runs only if the cd succeeded,
                 # so the earlier cwds no longer apply (QA round 8: session cwd
                 # `$HOME` + `cd proj && git pull` false-ASKed).
@@ -8432,7 +8439,12 @@ def _ed_placement(cmd, cwd, hits, depth):
             ops = [a for a in args if not re.fullmatch(r"-[LPe@]+|--", a)]
             if verb == "pushd":
                 stack.append(state["cwd"])
-            state["cwd"] = _ed_dotdot_normalize(_ed_join(state["cwd"], ops[0])) if ops else "~"
+            before = state["cwd"]
+            if ops and (ops[0] in ("-", "~-") or "OLDPWD" in ops[0]):
+                state["cwd"] = prev_cwd[-1]          # `cd -` (QA round 9)
+            else:
+                state["cwd"] = _ed_dotdot_normalize(_ed_join(state["cwd"], ops[0])) if ops else "~"
+            prev_cwd.append(before)
             alts = [state["cwd"]]
             if ops and any(c in ops[0] for c in "*?[{"):
                 # `cd ~/.conf*` -- every expansion is a possible cwd (QA r7).
@@ -8507,11 +8519,15 @@ _ED_REMOTE_COPY = {
 
 def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
     if verb == "cookiecutter":
+        t = None
         for i, a in enumerate(args):
             if a in ("-o", "--output-dir") and i + 1 < len(args):
-                t = _ed_dotdot_normalize(_ed_join((dirs or [None])[0], args[i + 1]))
-                return _ed_is_gated_parent(t) or editor_startup_path_hit(t)
-        return False
+                t = args[i + 1]
+            elif a.startswith("--output-dir="):
+                t = a.split("=", 1)[1]
+        targets = [_ed_join(d, t) for d in dirs] if t else [d for d in dirs if d]
+        return any(_ed_is_gated_parent(_ed_dotdot_normalize(x))
+                   or editor_startup_path_hit(x) for x in targets if x)
     if verb in ("wget", "wget2"):
         if not any(re.fullmatch(r"-[A-Za-z]*[rm][A-Za-z]*|--recursive|--mirror", a) for a in args):
             return False
@@ -8541,6 +8557,9 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
         return bool(args and "x" in args[0]) and any(_ed_is_gated_parent(x) for x in targets if x)
     if verb in ("python", "python3"):
         while args and args[0].startswith("-") and args[0] != "-m":
+            if re.fullmatch(r"-[A-Za-z]*m", args[0]):
+                args = ["-m"] + args[1:]          # `-Im zipfile` (QA round 9)
+                break
             args = args[1:]                       # `python3 -I -m ...` (QA round 8)
         if len(args) >= 4 and args[0] == "-m" and args[1] in ("zipfile", "tarfile") \
                 and args[2] in ("-e", "--extract"):
@@ -8567,6 +8586,9 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
         if verb in ("aws", "gcloud") and rest and rest[0] in ("cp", "sync", "mv", "rsync"):
             rest = rest[1:]
     ops = [a for a in rest if not a.startswith("-")]
+    if len(ops) == 1 and verb in ("degit", "tiged", "giget"):
+        # No destination: extracts into the cwd (QA round 9).
+        return any(d and (_ed_is_gated_parent(d) or editor_startup_path_hit(d)) for d in dirs)
     if len(ops) < 2:
         return False
     target = ops[-1]
