@@ -1265,3 +1265,43 @@ def test_r13_relative_mv_aside_with_home_cwd():
 @pytest.mark.parametrize("cwd", [None, "/home/u/proj"])
 def test_r13_false_positives(cmd, cwd):
     assert evaluate(_sh_cwd(cmd, cwd), EMPTY).rule != RULE, (cmd, cwd)
+
+
+# ---- QA round 14 regressions --------------------------------------------------
+
+_B14 = "\ncd ~/.config && git clone https://x/nvim\nEOF"
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo bash <<'EOF'" + _B14, "env bash <<'EOF'" + _B14, "env -i bash <<'EOF'" + _B14,
+    "FOO=1 bash <<'EOF'" + _B14, "time bash <<'EOF'" + _B14, "command bash <<'EOF'" + _B14,
+    "nice -n 5 sh <<'EOF'" + _B14, "cat <<'EOF' | sudo -u me bash" + _B14,
+    "sudo bash <<'EOF'\ncd ~\ntar xf /tmp/x.tgz\nEOF",
+    "timeout 60 bash <<'EOF'\ntar xf /tmp/x.tgz -C ~\nEOF",
+    "/usr/bin/env bash <<'EOF'\nrsync -a /tmp/p/ ~/\nEOF",
+    "sudo -u root bash -s <<'EOF'\ncp -r /tmp/p/. ~\nEOF",
+    "nohup bash <<'EOF'\ncp -r /tmp/p/. ~\nEOF", "exec bash <<'EOF'\ncp -r /tmp/p/. ~\nEOF",
+    "sudo bash <<'EOF'\ncp -r /tmp/p/. /etc/\nEOF",
+    "cat <<'EOF' | sudo -E bash\ntar xf /tmp/x.tgz -C /\nEOF",
+    "sudo bash <<<'cd; tar xf /tmp/x.tgz'",
+    "bash -c \"$(cat <<'EOF'\ncp -r /tmp/p/. ~\nEOF\n)\"",
+    "sudo bash -c \"$(cat <<'EOF'\ncp -r /tmp/p/. ~\nEOF\n)\"",
+    "printf '%s\\n' 'cp -r /tmp/p/. ~' | sh",
+    "cat <<'EOF' |& bash\ncp -r /tmp/p/. ~\nEOF", "cat <<'EOF' | sudo -i\ncp -r /tmp/p/. ~\nEOF",
+    "cat <<'EOF' | fish\ncp -r /tmp/p/. ~\nEOF",
+    "mv {" + ",".join(f"a{i}" for i in range(65)) + ",~/.config} /tmp/o && mv /tmp/p ~/.config",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj"])
+def test_r14_gated(cmd, cwd):
+    assert evaluate(_sh_cwd(cmd, cwd), EMPTY).action != Action.ALLOW, (cmd[:60], cwd)
+    assert _ours(rules.rule_editor_startup_protect(_sh_cwd(cmd, cwd), EMPTY)), (cmd[:60], cwd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo bash <<'EOF'\napt-get update\nmkdir -p ~/.config/myapp\nEOF",
+    "cat <<'EOF' | sudo tee /etc/apt/sources.list.d/x.list\ndeb http://x stable main\nEOF",
+    "printf '%s\\n' a b c | sort", "sudo -u postgres psql <<'EOF'\nselect 1;\nEOF",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj"])
+def test_r14_false_positives(cmd, cwd):
+    assert evaluate(_sh_cwd(cmd, cwd), EMPTY).rule != RULE, (cmd[:60], cwd)

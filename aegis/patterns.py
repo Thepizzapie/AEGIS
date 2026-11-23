@@ -8040,6 +8040,38 @@ def _ed_place_maybe(text: str) -> bool:
 _ED_PLAIN_RUN_RE = re.compile(r"[^\s\\'\"$#;|()`&<>]+")
 
 
+_ED_CAT_HEREDOC_RE = re.compile(
+    r"\$\(\s*cat\s+<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n[ \t]*\1[ \t]*\n?\s*\)", re.DOTALL)
+
+
+def _ed_is_shell_words(words) -> bool:
+    """Whether a (partial) simple command, wrappers stripped, is a shell."""
+    if not words:
+        return False
+    try:
+        w = _ed_strip_prefix(list(words), {})
+    except Exception:
+        return True
+    if not w:
+        # `sudo -i` / `sudo -s` alone read commands from stdin
+        return any(x in ("-i", "-s", "--login", "--shell") for x in words[:6]) and \
+            _ed_verb(words[0]) in ("sudo", "doas", "su")
+    return _ed_verb(w[0]) in _ED_SHELLS
+
+
+def _ed_pipe_into_shell(rest_line: str) -> bool:
+    """`| [wrappers] sh` (also `|&`) somewhere after a heredoc operator."""
+    for m in re.finditer(r"\|&?(?!\|)", rest_line):
+        tail = rest_line[m.end():]
+        try:
+            segs = _ed_tokenize(tail, False, 3)
+        except Exception:
+            return True
+        if segs and _ed_is_shell_words(segs[0]):
+            return True
+    return False
+
+
 def _ed_ansi_c(raw: str) -> str:
     r"""Decode a bash `$'...'` body exactly as bash does (QA round 6: Python's
     `unicode_escape` rejects `\u76`, `\x{76}`, `\cv`)."""
@@ -8260,7 +8292,7 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
             i += 1
             while i < n and cmd[i] in "<>&|-" and len(op) < 3:
                 op += cmd[i]; i += 1
-            if op.startswith("<<<") and words and _ed_verb(words[0]) in _ED_SHELLS:
+            if op.startswith("<<<") and _ed_is_shell_words(words):
                 # `sh -s <<< 'cmd'`: the here-string is the script (QA r11)
                 while i < n and cmd[i] in " \t":
                     i += 1
@@ -8292,8 +8324,9 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
                 delim = re.sub(r"['\"\\]", "", word)
                 line_end = cmd.find("\n", j)
                 rest_line = cmd[j:] if line_end < 0 else cmd[j:line_end]
-                fed = bool(words and _ed_verb(words[0]) in _ED_SHELLS) or bool(
-                    re.search(r"\|\s*(?:sudo\s+|env\s+)?(?:\S*/)?(?:ba|z|da|k|mk)?sh\b", rest_line))
+                # Wrappers stripped first (`sudo bash <<EOF`, `env -i sh`,
+                # `cat <<EOF | sudo -u x bash` -- QA round 14).
+                fed = _ed_is_shell_words(words) or _ed_pipe_into_shell(rest_line)
                 heredocs.append((delim, "-" in op, quoted, fed))
                 i = j
                 continue
@@ -8509,7 +8542,10 @@ def _ed_placement(cmd, cwd, hits, depth):
             # bash brace expansion, in order (`mv ~/.config{,.bak}` -- QA r13)
             ex = []
             for w in words:
-                ex.extend(_ed_brace_ordered(w) if ("{" in w and "," in w) else [w])
+                bx = _ed_brace_ordered(w) if ("{" in w and "," in w) else [w]
+                if len(bx) >= 64:
+                    return hits, True              # truncated expansion: fail closed (QA r14)
+                ex.extend(bx)
                 if len(ex) > 4000:
                     return hits, True
             words = ex
@@ -8532,13 +8568,21 @@ def _ed_placement(cmd, cwd, hits, depth):
                     while m < len(args) - 1 and re.fullmatch(r"--?|[-+][A-Za-z]+|[-+]o", args[m]):
                         m += 2 if args[m] in ("-o", "+o") else 1
                     if m < len(args):
-                        queue[0:0] = _ed_tokenize(args[m], False, depth + 1)
+                        body = args[m]
+                        hm = _ED_CAT_HEREDOC_RE.search(body)
+                        if hm:
+                            # `bash -c "$(cat <<'EOF' ... EOF)"` (QA round 14)
+                            body = hm.group(2)
+                        queue[0:0] = _ed_tokenize(body, False, depth + 1)
                     break
             else:
                 # `echo 'cmd' | sh`, `sh -s <<< 'cmd'`: the piped/here-string
                 # body (QA round 11).
                 if _pw and _ed_verb(_pw[0]) in ("echo", "printf") and len(_pw) > 1:
-                    queue[0:0] = _ed_tokenize(" ".join(_pw[1:]), False, depth + 1)
+                    body_args = _pw[1:]
+                    if _ed_verb(_pw[0]) == "printf" and "%" in body_args[0] and len(body_args) > 1:
+                        body_args = body_args[1:]     # `printf '%s\n' 'cmd' | sh` (QA r14)
+                    queue[0:0] = _ed_tokenize("\n".join(body_args), False, depth + 1)
             continue
         if verb in ("cd", "pushd", "set-location", "chdir"):
             ops = [a for a in args if not re.fullmatch(r"-[LPe@]+|--", a)]

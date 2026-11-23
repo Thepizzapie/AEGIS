@@ -14974,7 +14974,13 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     ~/.config{,.bak}``/glob sources (sources are now resolved against every
     cwd, words are brace-expanded in bash order, globs expanded); heredoc
     bodies fed to a shell (``bash <<'EOF'``, ``cat <<EOF | sh``) are now
-    analyzed as commands; ``$"..."`` locale quoting (and ``$""``)."""
+    analyzed as commands; ``$"..."`` locale quoting (and ``$""``). Round 14
+    found a wrapper before the heredoc-fed shell (``sudo bash <<EOF``,
+    ``env -i sh``, ``cat <<EOF | sudo -u x bash``, ``|&``, ``sudo -i``)
+    skipped the round-13 body analysis -- wrappers are now stripped before
+    the shell test, for here-strings too; ``bash -c "$(cat <<'EOF' ...
+    EOF)"``; ``printf '%s\\n' 'cmd' | sh``; a brace expansion truncated at
+    its budget now fails closed."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
