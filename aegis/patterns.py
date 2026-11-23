@@ -7466,7 +7466,7 @@ _ED_TOOLS = r"(?:n?vim|emacs|doom|kak|micro|helix)"
 # QA round 3: also after `..` (`~/../../etc`, a leading `/..` clamps to
 # `/`), `/proc/<pid>/root/` and MSYS2/Cygwin roots (`C:/msys64/etc`).
 _ED_ROOTED = (r"(?:(?<=^/)|(?<=^\\)|(?<=[\s'\"=:<>|&;(`{,][/\\])|(?<=private[/\\])"
-              r"|(?<=Git[/\\])|(?<=[/\\][/\\])|(?<=\.\.[/\\])|(?<=root[/\\])"
+              r"|(?<=Git[/\\])|(?<=[/\\][/\\])|(?<=\.\.[/\\])|(?<=[/\\]root[/\\])"
               r"|(?<=msys64[/\\])|(?<=msys32[/\\])|(?<=msys2[/\\])|(?<=cygwin64[/\\])"
               r"|(?<=cygwin[/\\]))")
 _ED_ETC = _ED_ROOTED + r"etc"
@@ -7671,6 +7671,17 @@ def _ed_glob_candidates(word: str, budget: int = 256) -> list:
 
 _ED_URL_ESC_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 _ED_GLUED_OPT_RE = re.compile(r"((?:^|[\s'\"])-[A-Za-z]{1,6})(?=[/\\~$])")
+_ED_KEYWORDS = ("vim", "emacs", "exrc", "doom", "dir-locals", "kak", "micro", "helix")
+
+
+def _ed_has_keyword(text: str) -> bool:
+    """Substring prefilter (a regex alternation was ~30 ms per 200 KB).
+    Every alternative of the path regex contains one of these, or is
+    reached only through `%XX` decoding."""
+    low = text.lower()
+    return "%" in low or any(k in low for k in _ED_KEYWORDS)
+
+
 _ED_PREFILTER_RE = re.compile(
     r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
     r"|vim_runtime",
@@ -7688,9 +7699,9 @@ def editor_startup_path_hit(text) -> bool:
         return True                           # fail closed (QA round 3 perf)
     # Cheap prefilter: every alternative of the path regex contains one of
     # these literals (or is reached only through `%XX` decoding).
-    if not _ED_PREFILTER_RE.search(text) and not (
+    if not _ed_has_keyword(text) and not (
             ("(" in text or ")" in text)
-            and _ED_PREFILTER_RE.search(re.sub(r"[()]", "", text))):
+            and _ed_has_keyword(re.sub(r"[()]", "", text))):
         return False                          # (zsh `~/.(e)macs` -- QA round 4)
     if EDITOR_STARTUP_PATH_RE.search(text):
         return True
@@ -7870,18 +7881,37 @@ def editor_startup_shell_only_reads(cmd: str) -> bool:
 # each source basename, and matched; an unknown-name source (glob, `$var`,
 # `d/.`, `d/`, an archive) is gated when its destination is itself a
 # parent of a gated name (`~`, `~/.config`, `/etc`, `/usr/share`, ...).
-_ED_SEG_RE = re.compile(r"&&|\|\||[;&|\n]")
 _ED_PREFIX_CMDS = frozenset(("sudo", "doas", "env", "command", "builtin", "nohup",
                              "time", "nice", "exec", "then", "do", "else", "if",
-                             "while", "until", "!", "{", "(", "xargs"))
+                             "while", "until", "!", "{", "}", "xargs", "timeout",
+                             "ionice", "stdbuf", "busybox", "chronic", "unbuffer",
+                             "caffeinate", "flock", "setsid", "chroot", "nsenter",
+                             "elif", "eval", "run0", "pkexec", "proot", "fakeroot",
+                             "systemd-run", "watch", "strace", "ltrace"))
+# Prefix options that take a value (`sudo -u root`, `nice -n 10`,
+# `timeout -s KILL 5`, `xargs -n1 -I{}`); a short cluster whose LAST letter
+# is one of these consumes the next word (`sudo -nu root` -- QA round 5).
+_ED_PREFIX_OPT_ARG = {
+    "sudo": "ugChprtUDRT", "doas": "uC", "nice": "n", "ionice": "cnp",
+    "timeout": "sk", "xargs": "IiLlnPsEdaJ", "flock": "wEn", "chroot": "",
+    "env": "uCS", "stdbuf": "ioe", "time": "fo", "watch": "nd",
+    "systemd-run": "upM", "nsenter": "tSG", "strace": "oepsSu", "ltrace": "oepsSu",
+}
+_ED_PREFIX_LONG_ARG = frozenset(("--user", "--group", "--chdir", "--host", "--prompt",
+                                 "--signal", "--kill-after", "--adjustment", "--unset",
+                                 "--split-string", "--output", "--interval"))
+# A prefix's own positional argument before the real verb.
+_ED_PREFIX_POSITIONAL = {"timeout": 1, "flock": 1, "chroot": 1, "watch": 0}
 _ED_PLACE_VERBS = frozenset(("cp", "mv", "ln", "install", "rsync", "ditto", "copy",
                              "move", "copy-item", "move-item", "cpi", "mi", "gcp",
-                             "gmv", "gln", "scp"))
+                             "gmv", "gln", "scp", "xcopy", "robocopy", "cpio-p"))
 _ED_EXTRACT_VERBS = frozenset(("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "7zz",
                                "unrar", "cpio", "expand-archive", "stow", "xstow",
-                               "chezmoi", "yadm", "unar", "pax"))
-_ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS
-                      | frozenset(("cd", "pushd", "set-location", "sl", "chdir", "git")))
+                               "chezmoi", "yadm", "unar", "pax", "patch"))
+_ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl"))
+_ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS
+                      | frozenset(("cd", "pushd", "popd", "set-location", "chdir", "find",
+                                   "fd")))
 _ED_OPT_WITH_ARG = {
     "install": frozenset(("-m", "-o", "-g", "-S", "--mode", "--owner", "--group",
                           "--suffix", "-Z")),
@@ -7889,7 +7919,17 @@ _ED_OPT_WITH_ARG = {
                         "--exclude", "--include", "--chmod", "-T", "--temp-dir")),
     "cp": frozenset(("-S", "--suffix")), "mv": frozenset(("-S", "--suffix")),
     "ln": frozenset(("-S", "--suffix")),
+    "copy-item": frozenset(("-path", "-literalpath", "-filter", "-include", "-exclude",
+                            "-credential")),
+    "move-item": frozenset(("-path", "-literalpath", "-filter", "-include", "-exclude",
+                            "-credential")),
 }
+_ED_GIT_CLONE_ARG = frozenset(("--depth", "-b", "--branch", "-o", "--origin", "-c",
+                               "--config", "--template", "--reference", "--reference-if-able",
+                               "--separate-git-dir", "-j", "--jobs", "--filter", "-u",
+                               "--upload-pack", "--shallow-since", "--shallow-exclude",
+                               "--server-option", "--bundle-uri", "-r", "--rev",
+                               "--revision", "-U", "--updaterev"))
 # Parent-dependent probe names only: `.vimrc` matches under ANY dir, so a
 # home directory is recognized by `_ED_HOME_DIR_RE` instead.
 _ED_PROBE_NAMES = ("nvim", "vim", "emacs", "vimrc", "xdg/nvim", "helix", "kak", "micro")
@@ -7898,19 +7938,30 @@ _ED_HOME_DIR_RE = re.compile(
     r"|/root|/home/[^/\\]+|/Users/[^/\\]+|/var/home/[^/\\]+|[A-Za-z]:[/\\]+Users[/\\]+[^/\\]+"
     r"|(?:~|\$HOME|/home/[^/\\]+|/Users/[^/\\]+)[/\\]+(?:vimfiles|AppData(?:[/\\]+(?:Local|Roaming))?))"
     r"[/\\]*$", re.IGNORECASE)
+_ED_DIR_MAX = 4096
+
+
+class _EdTooBig(Exception):
+    pass
 
 
 def _ed_join(base, rel: str) -> str:
     if not rel:
         return base or ""
     if rel.startswith(("/", "~", "$", "%")) or re.match(r"^[A-Za-z]:[/\\]", rel) or not base:
-        return rel
-    return base.rstrip("/\\") + "/" + rel
+        out = rel
+    else:
+        out = base.rstrip("/\\") + "/" + rel
+    if len(out) > _ED_DIR_MAX:
+        raise _EdTooBig()                     # QA round 5 perf: fail closed
+    return out
 
 
 def _ed_is_gated_parent(d: str) -> bool:
     if not d:
         return False
+    if len(d) > _ED_DIR_MAX:
+        raise _EdTooBig()
     d = _ed_dotdot_normalize(d.rstrip("/\\") or "/")
     if _ED_HOME_DIR_RE.match(d):
         return True
@@ -7923,40 +7974,248 @@ def _ed_is_gated_parent(d: str) -> bool:
 def _ed_unknown_name(src: str) -> bool:
     # `src/` (trailing slash) copies/moves the dir ITSELF for cp/mv/ln; only
     # rsync treats it as "contents" (handled by the caller).
-    return (any(c in src for c in "*?[{$`") or src in (".", "./")
+    return (any(c in src for c in "*?[{$`") or src in (".", "./", "{}")
             or src.endswith(("/.", "\\.")))
 
 
-_ED_SUDO_OPT_ARG = frozenset(("-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D",
-                              "--user", "--group", "--chdir", "--host", "--prompt"))
+_ED_WIN_HINT_RE = re.compile(
+    r"[A-Za-z]:\\|%\w+%\\|\$env:\w+\\|\b(?:copy-item|move-item|expand-archive|xcopy|robocopy"
+    r"|new-item|cpi|mi)\b", re.IGNORECASE)
+_ED_TOK_MAX = 400_000
+_ED_PLACE_PREFILTER_RE = re.compile(
+    r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
+    r"|~|\$\{?HOME|\$env:|%\w+%|/home/|/Users/|/root|/var/home|\betc\b|\bshare\b|\blib\b"
+    r"|\.config|appdata|users[/\\]|\bxdg\b|\.\.|\\|\$'|\bcd\b|pushd|chdir|--chdir|-C\b"
+    r"|\benv\b|\beval\b|\$\w|`|\$\(",
+    re.IGNORECASE)
+_ED_PLACE_SUBSTRINGS = _ED_KEYWORDS + (
+    "%", "~", "$", "`", "\\", "..", "/home/", "/users/", "/root", "etc", "share", "lib",
+    ".config", "appdata", "users/", "xdg", "cd", "pushd", "chdir", "-c", "env", "eval")
 
 
-def _ed_strip_prefix(words: list) -> list:
-    """Drop `sudo -u root`, `env A=1`, `nohup`, ... before the real verb."""
+def _ed_place_maybe(text: str) -> bool:
+    low = text.lower()
+    return any(k in low for k in _ED_PLACE_SUBSTRINGS)
+
+
+_ED_PLAIN_RUN_RE = re.compile(r"[^\s\\'\"$#;|()`&<>]+")
+
+
+def _ed_tokenize(cmd: str) -> list:
+    """Split a shell command into simple commands (lists of words), the way
+    bash would: quotes, backslash escapes, ANSI-C `$'..'`, `#` comments,
+    `;`/`&`/`|`/`&&`/`||`/newline/`(`/`)`/`$(`/backticks, redirections (the
+    operator and its target are dropped, an fd number before it too) and
+    heredoc bodies (skipped). QA round 5: shlex kept `2>/dev/null` and
+    `# comment` as operands, and `scan_surface`'s space-joined renderings
+    merged commands."""
+    if len(cmd) > _ED_TOK_MAX:
+        raise _EdTooBig()
+    if _ED_WIN_HINT_RE.search(cmd):
+        cmd = cmd.replace("\\", "/")
+    segs, words = [], []
+    cur, have = [], False
+    drop_next = False
+    heredocs = []
+    i, n = 0, len(cmd)
+
+    def end_word():
+        nonlocal cur, have, drop_next
+        if have:
+            w = "".join(cur)
+            if drop_next:
+                drop_next = False
+            else:
+                words.append(w)
+        cur, have = [], False
+
+    def end_seg():
+        nonlocal words
+        end_word()
+        if words:
+            segs.append(words)
+        words = []
+
+    while i < n:
+        c = cmd[i]
+        if c == "\n":
+            end_seg()
+            i += 1
+            while heredocs:
+                delim, strip_tabs = heredocs.pop(0)
+                while i < n:
+                    j = cmd.find("\n", i)
+                    line = cmd[i:] if j < 0 else cmd[i:j]
+                    i = n if j < 0 else j + 1
+                    if (line.lstrip("\t") if strip_tabs else line) == delim:
+                        break
+            continue
+        if c in " \t\r":
+            end_word(); i += 1; continue
+        if c == "\\":
+            if i + 1 < n and cmd[i + 1] == "\n":
+                i += 2; continue
+            if i + 1 < n:
+                cur.append(cmd[i + 1]); have = True
+            i += 2; continue
+        if c == "'":
+            j = cmd.find("'", i + 1)
+            j = n if j < 0 else j
+            cur.append(cmd[i + 1:j]); have = True
+            i = j + 1; continue
+        if c == "$" and i + 1 < n and cmd[i + 1] == "'":
+            j = i + 2
+            buf = []
+            while j < n and cmd[j] != "'":
+                if cmd[j] == "\\" and j + 1 < n:
+                    buf.append(cmd[j:j + 2]); j += 2
+                else:
+                    buf.append(cmd[j]); j += 1
+            raw = "".join(buf)
+            try:
+                import codecs
+                raw = codecs.decode(raw, "unicode_escape")
+            except Exception:
+                pass
+            cur.append(raw); have = True
+            i = j + 1; continue
+        if c == '"':
+            j = i + 1
+            buf = []
+            while j < n and cmd[j] != '"':
+                if cmd[j] == "\\" and j + 1 < n and cmd[j + 1] in '"\\$`\n':
+                    buf.append(cmd[j + 1]); j += 2
+                else:
+                    buf.append(cmd[j]); j += 1
+            cur.append("".join(buf)); have = True
+            i = j + 1; continue
+        if c == "#" and not have:
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "$" and i + 1 < n and cmd[i + 1] == "(":
+            end_seg(); i += 2; continue
+        if c in ";|()`":
+            end_seg(); i += 1; continue
+        if c == "&":
+            if i + 1 < n and cmd[i + 1] == ">":
+                end_word(); i += 2
+                if i < n and cmd[i] == ">":
+                    i += 1
+                drop_next = True
+                continue
+            end_seg(); i += 1; continue
+        if c in "<>":
+            if i + 1 < n and cmd[i + 1] == "(":
+                end_seg(); i += 2; continue           # process substitution
+            fd_only = have and "".join(cur).isdigit()
+            if fd_only:
+                cur, have = [], False
+            else:
+                end_word()
+            op = c
+            i += 1
+            while i < n and cmd[i] in "<>&|-" and len(op) < 3:
+                op += cmd[i]; i += 1
+            if op.startswith("<<") and not op.startswith("<<<"):
+                # heredoc: the next word is the delimiter
+                while i < n and cmd[i] in " \t":
+                    i += 1
+                j = i
+                while j < n and cmd[j] not in " \t\n;&|<>()":
+                    j += 1
+                delim = cmd[i:j].strip("'\"").replace("\\", "")
+                heredocs.append((delim, "-" in op))
+                i = j
+                continue
+            if op.endswith("&") or op in (">&", "<&"):
+                # `>&2`, `2>&1`, `>&-`: consume the fd word
+                while i < n and cmd[i] in " \t":
+                    i += 1
+                j = i
+                while j < n and (cmd[j].isdigit() or cmd[j] == "-"):
+                    j += 1
+                if j > i:
+                    i = j
+                    continue
+            drop_next = True
+            continue
+        m = _ED_PLAIN_RUN_RE.match(cmd, i)
+        if m:
+            cur.append(m.group(0)); have = True
+            i = m.end()
+        else:
+            cur.append(c); have = True
+            i += 1
+    end_seg()
+    return segs
+
+
+def _ed_strip_prefix(words: list, state: dict) -> list:
+    """Drop `sudo -nu root`, `env -C DIR A=1`, `timeout 5`, `nice -n 10`,
+    `xargs -n1`, `eval`, ... before the real verb. `env -C`/`--chdir`
+    updates the working directory in `state`."""
     words = list(words)
-    after_prefix = False
+    prefix = None
     while words:
         w0 = words[0]
-        if w0.lower() in _ED_PREFIX_CMDS:
-            after_prefix = True
+        lw = w0.lower().replace("\\", "/").rsplit("/", 1)[-1]
+        if lw in _ED_PREFIX_CMDS:
+            prefix = lw
             words.pop(0)
+            npos = _ED_PREFIX_POSITIONAL.get(lw, 0)
+            # options of this prefix
+            while words and words[0].startswith("-") and words[0] != "-":
+                o = words.pop(0)
+                if o == "--":
+                    break
+                if o.startswith("--"):
+                    if "=" in o:
+                        k, v = o.split("=", 1)
+                        if prefix == "env" and k == "--chdir":
+                            state["cwd"] = _ed_join(state.get("cwd"), v)
+                        if prefix == "env" and k == "--split-string":
+                            words = _ed_tokenize(v)[0] + words if _ed_tokenize(v) else words
+                    elif o in _ED_PREFIX_LONG_ARG and words:
+                        v = words.pop(0)
+                        if prefix == "env" and o == "--chdir":
+                            state["cwd"] = _ed_join(state.get("cwd"), v)
+                        if prefix == "env" and o == "--split-string":
+                            t = _ed_tokenize(v)
+                            words = (t[0] if t else []) + words
+                    continue
+                letters = _ED_PREFIX_OPT_ARG.get(prefix, "")
+                last = o[-1]
+                if len(o) == 2 and last in letters and words:
+                    v = words.pop(0)
+                elif len(o) > 2 and o[1] in letters:
+                    v = o[2:]             # glued value (`-n10`, `-o0`)
+                    last = o[1]
+                elif last in letters and words:
+                    v = words.pop(0)
+                else:
+                    continue
+                if prefix == "env" and last == "C":
+                    state["cwd"] = _ed_join(state.get("cwd"), v)
+                if prefix == "env" and last == "S":
+                    t = _ed_tokenize(v)
+                    words = (t[0] if t else []) + words
+            for _ in range(npos):
+                if words:
+                    words.pop(0)
+            if prefix == "eval" and len(words) == 1:
+                t = _ed_tokenize(words[0])
+                words = t[0] if t else []
         elif re.match(r"^\w+=", w0):
             words.pop(0)
-        elif w0.startswith("-") and len(words) > 1 and after_prefix:
-            words.pop(0)
-            if w0 in _ED_SUDO_OPT_ARG and words:
-                words.pop(0)
         else:
             break
     return words
 
 
-def _ed_split_words(seg: str) -> list:
-    try:
-        import shlex
-        return shlex.split(seg, posix=True)
-    except Exception:
-        return seg.split()
+def _ed_verb(w: str) -> str:
+    v = w.strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return v[:-4] if v.endswith(".exe") else v
 
 
 def editor_startup_placement_hit(cmd, cwd=None) -> bool:
@@ -7966,130 +8225,295 @@ def editor_startup_placement_hit(cmd, cwd=None) -> bool:
 
 def editor_startup_placement_targets(cmd, cwd=None):
     """(gated paths this command places a file at, whether it places
-    unknown names into a gated parent dir)."""
+    unknown names into a gated parent dir). Fails closed (unknown=True) on
+    oversized input."""
     hits = []
-    if not isinstance(cmd, str) or not cmd or len(cmd) > _ED_NORM_MAX:
-        return hits, isinstance(cmd, str) and len(cmd) > _ED_NORM_MAX
-    cur = cwd if isinstance(cwd, str) and cwd else None
-    for n_seg, seg in enumerate(_ED_SEG_RE.split(cmd)):
-        if n_seg > 400:
+    if not isinstance(cmd, str) or not cmd:
+        return hits, False
+    if not isinstance(cwd, str):
+        cwd = str(cwd) if cwd is not None else None
+    # Cheap skip: a placement can only land somewhere gated if the command
+    # names an editor keyword, a home/system/config root, `..`, or runs
+    # from a cwd that is itself gated or a gated parent.
+    if not _ed_place_maybe(cmd) and not (
+            cwd and (_ed_place_maybe(cwd) or editor_startup_path_hit(cwd))):
+        return hits, False
+    try:
+        return _ed_placement(cmd, cwd, hits, 0)
+    except _EdTooBig:
+        return hits, True
+    except RecursionError:
+        return hits, True
+
+
+def _ed_placement(cmd, cwd, hits, depth):
+    if depth > 4:
+        return hits, True
+    segs = _ed_tokenize(cmd)
+    state = {"cwd": cwd or None}
+    stack = []
+    # Every working directory the command could be in: a failed `cd`, a `cd`
+    # in a pipeline/subshell, or `if false; then cd ...` leaves bash where it
+    # was, so unknown-name placements are judged against all of them (QA
+    # round 5).
+    seen = [state["cwd"]]
+    relevant = 0
+
+    def cur_dirs():
+        return list(dict.fromkeys(seen + [state["cwd"]]))
+
+    queue = list(segs)
+    while queue:
+        words = queue.pop(0)
+        head = words[:64]
+        stripped = _ed_strip_prefix(head, state)
+        if not stripped:
+            continue
+        verb = _ed_verb(stripped[0])
+        if verb not in _ED_RELEVANT_VERBS:
+            continue
+        relevant += 1
+        if relevant > 400:
             return hits, True
-        # Cheap verb check before tokenizing (shlex is slow on huge args).
-        head = _ed_strip_prefix(seg[:400].split())
-        hv = head[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower() if head else ""
-        if hv.endswith(".exe"):
-            hv = hv[:-4]
-        if hv not in _ED_RELEVANT_VERBS and not (head and len(head) < 2 and len(seg) > 400):
-            continue
-        words = (_ed_split_words(seg) if len(seg) <= 50000 else seg.split())[:4000]
-        words = _ed_strip_prefix(words)
-        if not words:
-            continue
-        verb = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-        if verb.endswith(".exe"):
-            verb = verb[:-4]
+        words = _ed_strip_prefix(words[:4000], state)
+        verb = _ed_verb(words[0])
         args = words[1:]
-        if verb in ("cd", "pushd", "set-location", "sl", "chdir"):
+        if verb in ("cd", "pushd", "set-location", "chdir"):
             ops = [a for a in args if not re.fullmatch(r"-[LPe@]+|--", a)]
-            cur = _ed_dotdot_normalize(_ed_join(cur, ops[0])) if ops else "~"
+            if verb == "pushd":
+                stack.append(state["cwd"])
+            state["cwd"] = _ed_dotdot_normalize(_ed_join(state["cwd"], ops[0])) if ops else "~"
+            seen.append(state["cwd"])
             continue
-        if verb == "git":
-            # `git [-C DIR] clone URL [DIR]`
-            gdir = cur
-            i = 0
-            while i < len(args) and args[i].startswith("-"):
-                if args[i] == "-C" and i + 1 < len(args):
-                    gdir = _ed_join(gdir, args[i + 1]); i += 2; continue
-                if args[i] == "-c":
-                    i += 2; continue
-                i += 1
-            if i < len(args) and args[i] == "clone":
-                ops = [a for a in args[i + 1:] if not a.startswith("-")]
-                if ops:
-                    name = ops[1] if len(ops) > 1 else re.sub(
-                        r"\.git$", "", ops[0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
-                    j = _ed_dotdot_normalize(_ed_join(gdir or "", name))
-                    if editor_startup_path_hit(j):
-                        hits.append(j)
+        if verb == "popd":
+            state["cwd"] = stack.pop() if stack else state["cwd"]
+            seen.append(state["cwd"])
+            continue
+        if verb in ("find", "fd"):
+            # `find ... -exec cp -r {} ~/.config/ \;` -> a new command.
+            for k, a in enumerate(args):
+                if a in ("-exec", "-execdir", "-ok", "-okdir", "-x", "--exec", "-X",
+                         "--exec-batch"):
+                    rest = []
+                    for b in args[k + 1:]:
+                        if b in (";", "+", "\;"):
+                            break
+                        rest.append(b)
+                    if rest:
+                        queue.insert(0, rest)
+                    break
+            continue
+        if verb in _ED_CLONE_VERBS:
+            _ed_clone(verb, args, state, cur_dirs(), hits)
             continue
         if verb in _ED_PLACE_VERBS:
-            target, no_target_dir, ops = None, False, []
-            with_arg = _ED_OPT_WITH_ARG.get(verb, frozenset())
-            i = 0
-            end_opts = False
-            while i < len(args):
-                a = args[i]
-                if not end_opts and a == "--":
-                    end_opts = True
-                elif not end_opts and a.startswith("--target-directory="):
-                    target = a.split("=", 1)[1]
-                elif not end_opts and a in ("-t", "--target-directory", "-Destination",
-                                            "-destination") and i + 1 < len(args):
-                    target = args[i + 1]; i += 1
-                elif not end_opts and re.match(r"^-[A-Za-z]*t.", a) and not a.startswith("--") \
-                        and verb in ("cp", "mv", "ln", "install", "gcp", "gmv", "gln"):
-                    target = a[a.index("t") + 1:]
-                elif not end_opts and (a in ("-T", "--no-target-directory")):
-                    no_target_dir = True
-                elif not end_opts and a in with_arg and i + 1 < len(args):
-                    i += 1
-                elif not end_opts and a.startswith("-") and a != "-":
-                    pass
-                else:
-                    ops.append(a)
-                i += 1
-            if verb == "scp":
-                ops = [o for o in ops if ":" not in o or re.match(r"^[A-Za-z]:[/\\]", o)]
-            if target is None:
-                if verb in ("ln", "gln") and len(ops) == 1:
-                    target, srcs = cur or "", ops
-                elif len(ops) >= 2:
-                    target, srcs = ops[-1], ops[:-1]
-                else:
-                    continue
-            else:
-                srcs = ops
-            dest = _ed_dotdot_normalize(_ed_join(cur, target))
-            if editor_startup_path_hit(dest):
-                hits.append(dest)
-            if no_target_dir:
-                continue
-            for src in srcs:
-                if _ed_unknown_name(src) or (verb == "rsync" and src.endswith("/")):
-                    if _ed_is_gated_parent(dest):
-                        return hits, True
-                    continue
-                base = src.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
-                j = _ed_dotdot_normalize(dest.rstrip("/\\") + "/" + base)
-                if editor_startup_path_hit(j):
-                    hits.append(j)
+            if _ed_place(verb, args, state, cur_dirs(), hits):
+                return hits, True
             continue
         if verb in _ED_EXTRACT_VERBS:
-            if verb == "tar" or verb in ("bsdtar", "gtar", "pax"):
-                joined = " ".join(args)
-                if not re.search(r"(?:^|\s)(?:-{0,1}[A-Za-z]*x[A-Za-z]*|--extract|--get)(?:\s|$)", joined) \
-                        and not (args and re.fullmatch(r"[A-Za-z]*x[A-Za-z]*", args[0])):
-                    continue
-            if verb in ("7z", "7za", "7zz") and not (args and args[0] in ("x", "e")):
-                continue
-            if verb == "chezmoi" and not (args and args[0] in ("apply", "init", "update")):
-                continue
-            dest = cur
-            for i, a in enumerate(args):
-                if a in ("-C", "--directory", "-d", "-t", "--target", "-DestinationPath",
-                         "-o") and i + 1 < len(args):
-                    dest = _ed_join(cur, args[i + 1])
-                elif a.startswith(("--directory=", "--target=")):
-                    dest = _ed_join(cur, a.split("=", 1)[1])
-                elif re.match(r"^-[Cd].", a) and verb in ("tar", "unzip", "bsdtar", "gtar"):
-                    dest = _ed_join(cur, a[2:])
-                elif verb in ("7z", "7za", "7zz") and a.startswith("-o") and len(a) > 2:
-                    dest = _ed_join(cur, a[2:])
-            if verb in ("chezmoi", "yadm"):
-                dest = "~"
-            elif verb in ("stow", "xstow") and dest is cur:
-                # stow's default target is the PARENT of the stow dir.
-                dest = (_ed_dotdot_normalize(cur.rstrip("/\\") + "/..") if cur else "~")
-            if dest and (_ed_is_gated_parent(dest) or editor_startup_path_hit(dest)):
+            if _ed_extract(verb, args, state, cur_dirs(), hits):
                 return hits, True
     return hits, False
+
+
+def _ed_clone(verb, args, state, dirs, hits):
+    """`git [-C DIR] clone [opts] URL [DIR]`, `gh repo clone R [DIR]`,
+    `hg clone`, `svn checkout|co`, `jj git clone`."""
+    gdirs = list(dirs)
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-C" and i + 1 < len(args):
+            gdirs = [_ed_join(d, args[i + 1]) for d in gdirs]; i += 2; continue
+        if args[i] in ("-c", "--git-dir", "--work-tree", "-R", "--repository", "--cwd") \
+                and i + 1 < len(args):
+            if args[i] in ("-R", "--cwd", "--repository") and verb in ("hg", "jj", "sl"):
+                gdirs = [_ed_join(d, args[i + 1]) for d in gdirs]
+            i += 2; continue
+        i += 1
+    rest = args[i:]
+    if verb == "gh" and rest[:2] == ["repo", "clone"]:
+        rest = rest[2:]
+    elif verb == "jj" and rest[:2] == ["git", "clone"]:
+        rest = rest[2:]
+    elif rest and rest[0] in ("clone", "checkout", "co"):
+        if verb == "svn" and rest[0] == "clone":
+            return
+        rest = rest[1:]
+    else:
+        return
+    ops = []
+    k = 0
+    while k < len(rest):
+        a = rest[k]
+        if a == "--":
+            ops.extend(rest[k + 1:]); break
+        if a.startswith("--") and "=" in a:
+            k += 1; continue
+        if a in _ED_GIT_CLONE_ARG:
+            k += 2; continue
+        if a.startswith("-") and a != "-":
+            k += 1; continue
+        ops.append(a)
+        k += 1
+    if not ops:
+        return
+    name = ops[1] if len(ops) > 1 else re.sub(
+        r"\.git$", "", ops[0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+    for d in gdirs:
+        j = _ed_dotdot_normalize(_ed_join(d or "", name))
+        if editor_startup_path_hit(j):
+            hits.append(j)
+            return
+
+
+def _ed_place(verb, args, state, dirs, hits) -> bool:
+    """True if unknown names land in a gated parent; appends named hits."""
+    target, no_target_dir, parents, ops = None, False, False, []
+    with_arg = _ED_OPT_WITH_ARG.get(verb, frozenset())
+    win = verb in ("xcopy", "robocopy", "copy-item", "move-item", "cpi", "mi", "copy", "move")
+    i = 0
+    end_opts = False
+    while i < len(args):
+        a = args[i]
+        la = a.lower()
+        if not end_opts and a == "--":
+            end_opts = True
+        elif not end_opts and win and la in ("-destination", "-dest", "-target"):
+            if i + 1 < len(args):
+                target = args[i + 1]; i += 1
+        elif not end_opts and win and verb in ("xcopy", "robocopy") \
+                and re.fullmatch(r"/[A-Za-z]{1,8}(?::\S*)?[+-]?", a):
+            pass
+        elif not end_opts and win and la in ("-path", "-literalpath") and i + 1 < len(args):
+            ops.insert(0, args[i + 1]); i += 1       # PowerShell source (QA round 5)
+        elif not end_opts and la in with_arg and i + 1 < len(args):
+            i += 1
+        elif not end_opts and a.startswith("--"):
+            k = a.split("=", 1)[0]
+            # GNU long-option abbreviations (`--targ=`, `--t`) -- QA round 5.
+            if len(k) >= 3 and "--target-directory".startswith(k):
+                if "=" in a:
+                    target = a.split("=", 1)[1]
+                elif i + 1 < len(args):
+                    target = args[i + 1]; i += 1
+            elif len(k) >= 4 and "--no-target-directory".startswith(k):
+                no_target_dir = True
+            elif len(k) >= 4 and "--parents".startswith(k):
+                parents = True
+        elif not end_opts and a.startswith("-") and a != "-" and not win:
+            letters = a[1:]
+            if "t" in letters and verb in ("cp", "mv", "ln", "install", "gcp", "gmv", "gln"):
+                rest = letters[letters.index("t") + 1:]
+                if rest:
+                    target = rest
+                elif i + 1 < len(args):
+                    target = args[i + 1]; i += 1     # `-rt DIR` (QA round 5)
+            elif "T" in letters and verb in ("cp", "mv", "ln", "install", "gcp", "gmv", "gln"):
+                no_target_dir = True
+                rest = letters[letters.index("T") + 1:]
+                if rest:
+                    ops.append(rest)
+            if verb == "install" and "D" in letters:
+                pass
+        elif not end_opts and win and a.startswith("-"):
+            pass
+        else:
+            ops.append(a)
+        i += 1
+    if verb == "scp":
+        ops = [o for o in ops if ":" not in o or re.match(r"^[A-Za-z]:[/\\]", o)] or ops[-1:]
+    if verb == "robocopy":
+        if len(ops) < 2:
+            return False
+        target, srcs = ops[1], ["./"]
+    elif target is None:
+        if verb in ("ln", "gln") and len(ops) == 1:
+            target, srcs = "", ops
+        elif len(ops) >= 2:
+            target, srcs = ops[-1], ops[:-1]
+        elif verb in ("xcopy",) and len(ops) == 1:
+            target, srcs = "", ["./"]
+        else:
+            return False
+    else:
+        # `xargs cp -t DIR` / `find | cpio`: sources arrive on stdin.
+        srcs = ops or ["{}"]
+    rel = not target or not target.startswith(("/", "~", "$", "%")) and \
+        not re.match(r"^[A-Za-z]:[/\\]", target)
+    for d in (dirs if rel else [None]):
+        dest = _ed_dotdot_normalize(_ed_join(d, target)) if target else (d or "")
+        if dest and editor_startup_path_hit(dest):
+            hits.append(dest)
+        if no_target_dir:
+            continue
+        for src in srcs:
+            if _ed_unknown_name(src) or (verb in ("rsync", "xcopy", "robocopy")
+                                         and src.endswith(("/", "\\"))) or src == "./":
+                if _ed_is_gated_parent(dest or "."):
+                    return True
+                continue
+            if parents:
+                base = src.lstrip("/").replace("\\", "/")
+            else:
+                base = src.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+            j = _ed_dotdot_normalize((dest.rstrip("/\\") + "/" if dest else "") + base)
+            if editor_startup_path_hit(j):
+                hits.append(j)
+    return False
+
+
+def _ed_extract(verb, args, state, dirs, hits) -> bool:
+    if verb in ("tar", "bsdtar", "gtar", "pax"):
+        joined = " ".join(args)
+        if not re.search(r"(?:^|\s)(?:-{0,1}[A-Za-z]*x[A-Za-z]*|--extract|--get)(?:\s|$)", joined) \
+                and not (args and re.fullmatch(r"[A-Za-z]*x[A-Za-z]*", args[0])) \
+                and not (verb == "pax" and "-r" in args):
+            return False
+    if verb in ("7z", "7za", "7zz") and not (args and args[0] in ("x", "e")):
+        return False
+    if verb == "chezmoi" and not (args and args[0] in ("apply", "init", "update")):
+        return False
+    if verb == "cpio" and not any(re.fullmatch(r"-[A-Za-z]*[ip][A-Za-z]*|--extract|--pass-through", a)
+                                  for a in args):
+        return False
+    explicit = None
+    for i, a in enumerate(args):
+        la = a.lower()
+        if la in ("-c", "--directory", "-d", "-t", "--target", "-destinationpath", "-o",
+                  "--dir", "-dir") and i + 1 < len(args) and not (verb == "patch" and la == "-o"):
+            if verb == "patch" and la != "-d" and la != "--directory":
+                continue
+            explicit = args[i + 1]
+        elif a.startswith(("--directory=", "--target=", "--dir=")):
+            explicit = a.split("=", 1)[1]
+        elif re.match(r"^-[Cd].", a) and verb in ("tar", "unzip", "bsdtar", "gtar", "patch"):
+            explicit = a[2:]
+        elif verb in ("7z", "7za", "7zz") and a.startswith("-o") and len(a) > 2:
+            explicit = a[2:]
+    if verb == "expand-archive" and explicit is None:
+        pos = [a for a in args if not a.startswith("-")]
+        if len(pos) >= 2:
+            explicit = pos[1]
+    if verb == "cpio" and explicit is None:
+        pos = [a for a in args if not a.startswith("-")]
+        if pos and any("p" in a for a in args if a.startswith("-") and not a.startswith("--")):
+            explicit = pos[-1]
+    if verb in ("chezmoi", "yadm"):
+        targets = ["~"]
+    elif explicit is not None:
+        targets = [_ed_join(d, explicit) for d in dirs] if not explicit.startswith(
+            ("/", "~", "$", "%")) else [explicit]
+    elif verb in ("stow", "xstow"):
+        # stow's default target is the PARENT of the stow dir.
+        targets = [(_ed_dotdot_normalize(d.rstrip("/\\") + "/..") if d else "~") for d in dirs]
+    else:
+        targets = [d for d in dirs if d]
+    for t in targets:
+        t = _ed_dotdot_normalize(t)
+        if verb == "patch":
+            if editor_startup_path_hit(t.rstrip("/") + "/") or _ed_is_gated_parent(t):
+                return True
+            continue
+        if _ed_is_gated_parent(t) or editor_startup_path_hit(t):
+            return True
+    return False

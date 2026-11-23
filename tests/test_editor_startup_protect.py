@@ -736,3 +736,109 @@ def test_r4_allow_respects_cwd_and_zsh_groups():
 ])
 def test_r4_prefixed_placement_gated(cmd):
     assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+# ---- QA round 5 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    # redirections / comments taken as destination
+    "cp -r /tmp/nvim ~/.config 2>/dev/null", "cp -r /tmp/nvim ~/.config >/dev/null 2>&1",
+    "cp -r /tmp/nvim ~/.config </dev/null", "cp -r /tmp/nvim ~/.config>/dev/null",
+    "cp -r /tmp/nvim ~/.config # copy", "cp -a /tmp/dot/. ~ #",
+    # inner shells / quote splits
+    "bash -c 'cp -r /tmp/nvim ~/.config/'", "sh -c 'cp -r /tmp/nvim ~/.config/'",
+    "c''p -r /tmp/nvim ~/.config/", "cd ~/.config && bash -c 'cp -r /tmp/nvim .'",
+    # clustered -t
+    "cp -rt ~/.config /tmp/nvim", "mv -ft ~/.config /tmp/nvim", "cp -rvt ~/.config /tmp/nvim",
+    "ln -sfnt ~/.config ~/dot/nvim", "cp -rt ~ /tmp/dot/.",
+    "echo /tmp/nvim | xargs -n1 cp -rt ~/.config",
+    # git clone value options
+    "cd ~/.config && git clone --depth 1 https://e/x/nvim",
+    "cd ~/.config && git clone -b main https://e/x/nvim",
+    "cd ~/.config && git clone -c k=v https://e/x/nvim",
+    "cd ~/.config && git clone https://e/x/nvim --depth 1",
+    "git -C ~/.config clone --depth 1 https://e/x/nvim",
+    "gh repo clone x/nvim ~/.config/nvim", "hg clone https://e/x ~/.config/nvim",
+    "svn checkout https://e/x ~/.config/nvim",
+    # substitutions / subshells
+    "x=$(cp -r /tmp/nvim ~/.config/)", "echo `cp -r /tmp/nvim ~/.config/`",
+    "(cp -r /tmp/nvim ~/.config/)", "(tar xf /tmp/d.tgz -C ~)",
+    "(cd ~ && tar xf /tmp/d.tgz)", "cd ~ && (tar xf /tmp/d.tgz)",
+    # wrappers
+    "timeout 5 cp -r /tmp/nvim ~/.config/", "nice -n 10 cp -r /tmp/nvim ~/.config/",
+    "stdbuf -o0 cp -r /tmp/nvim ~/.config/", "time -p cp -r /tmp/nvim ~/.config/",
+    "busybox cp -r /tmp/nvim ~/.config/", "command -p cp -r /tmp/nvim ~/.config/",
+    "sudo -nu root cp -r /tmp/nvim /etc/xdg/", "sudo -R /x cp -r /tmp/nvim /etc/xdg/",
+    "sudo -T 5 cp -r /tmp/nvim /etc/xdg/", "env -C /home/u/.config cp -r /tmp/nvim .",
+    "env -S 'cp -r /tmp/nvim /home/u/.config/'", "FOO=\"a b\" cp -r /tmp/nvim ~/.config/",
+    "eval 'cp -r /tmp/nvim ~/.config/'", "eval cp -r /tmp/nvim ~/.config/",
+    "find /tmp -name nvim -exec cp -r {} ~/.config \;",
+    # cwd tracking
+    "cd ~; cd /nonexistent 2>/dev/null; tar xf /tmp/d.tgz",
+    "cd ~ && cd /tmp | cat; tar xf /tmp/d.tgz",
+    "cd ~ && pushd /tmp && popd && tar xf /tmp/d.tgz",
+    "cd ~ && if false; then cd /tmp; fi; tar xf /tmp/d.tgz",
+    # PowerShell / cmd
+    "Copy-Item -Path C:\\t\\nvim -Destination $env:LOCALAPPDATA -Recurse",
+    "Copy-Item -Path C:\\t\\nvim -Destination \"$env:LOCALAPPDATA\" -Recurse",
+    "Expand-Archive x.zip $env:LOCALAPPDATA",
+    "xcopy /E /I C:\\t\\nvim %LOCALAPPDATA%\\nvim\\",
+    "robocopy C:\\t\\nvim %LOCALAPPDATA%\\nvim /E",
+    # misc low
+    "cp --parents nvim/init.lua ~/.config", "cp -r --targ=$HOME/.config /tmp/nvim",
+    "mv --t ~/.config /tmp/nvim", "cd ~/.config && patch -p0 < x.diff",
+])
+def test_r5_shell_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd ~ && mv *.log logs/", "cd ~ && cp *.pdf Documents/", "cd ~ && cp proj/* /tmp/",
+    "cd ~ && rsync -a proj/ /tmp/proj/", "cd ~ && cp -r . /tmp/home-bk",
+    "cat > gen.py <<'EOF'\n" + "print(1)\n" * 450 + "EOF\n",
+    "\n".join(["echo hi"] * 401),
+    "git commit -m '" + "line\n" * 420 + "'",
+    "cd pkgroot && cp -r etc/* /tmp/stage/etc/",
+    "make install PREFIX=/usr/local", "sudo install -m755 bin/app /usr/local/bin/",
+    "sudo tar -C /usr/local -xzf go1.22.linux-amd64.tar.gz",
+    "git clone https://github.com/x/nvim ~/code/nvim", "cp -r src/ build/",
+    "mv report.pdf ~", "cp config.yaml ~/.config/myapp/",
+    "cd /repo && git apply fix.diff", "cd /repo && patch -p1 < fix.diff",
+])
+def test_r5_false_positives_fixed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd[:80]
+
+
+@pytest.mark.parametrize("args", [
+    {"command": ["cp", "-r", "/tmp/nvim", "/home/u/.config/"]},
+    {"command": "cp", "args": ["-r", "/tmp/nvim", "/home/u/.config/"]},
+    {"program": "cp", "arguments": ["-r", "/tmp/nvim", "/home/u/.config/"]},
+    {"executable": "tar", "args": ["xf", "/tmp/d.tgz", "-C", "/home/u"]},
+    {"command": "cp -r /tmp/nvim .", "cwd": "/home/u/.config"},
+    {"command": "cp -r /tmp/nvim .", "workdir": "/home/u/.config"},
+])
+def test_r5_mcp_runner_argv_and_cwd(args):
+    assert _ours(evaluate(_mcp(args, tool="mcp__shell__run_command"), EMPTY)), args
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__memory__create_entities", {"entities": [{"obs": "cp -r ~/dot/nvim ~/.config/"}]}),
+    ("mcp__notion__notion-create-pages", {"content": "cp -r ~/dot/nvim ~/.config/"}),
+    ("mcp__google-drive__create_file", {"content": "cp -r ~/dot/nvim ~/.config/"}),
+    ("mcp__context7__get-library-docs", {"topic": "init.lua in ~/.config/nvim"}),
+])
+def test_r5_mcp_remote_false_positives_fixed(tool, args):
+    assert evaluate(_mcp(args, tool=tool), EMPTY).rule != RULE, tool
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp -a /tmp/d/. " + "x/" * 190000,
+    ("cd " + "x/" * 450 + ";") * 399 + "cp -a /tmp/d/. .",
+    "cp -a /tmp/d/. " + "share/" * 60000,
+])
+def test_r5_perf_bounded(cmd):
+    import time
+    ev = _shell(cmd)
+    t = time.time()
+    rules.rule_editor_startup_protect(ev, EMPTY)
+    assert time.time() - t < 2.0

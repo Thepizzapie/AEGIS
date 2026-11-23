@@ -14553,7 +14553,7 @@ def _editor_startup_shell_allowed(cfg: dict, cmd: str, cwd=None) -> bool:
         return False
     # Resolved placements (`cp nvim ~/.config` -> `~/.config/nvim`) must each
     # be allowed too, and an unknown-name placement never is.
-    for c in (cmd, normalize.scan_surface(cmd)):
+    for c in (cmd, normalize.scan_surface(cmd, sep="\n")):
         paths, unknown = patterns.editor_startup_placement_targets(c, cwd)
         if unknown or not all(_editor_startup_allowed_by_policy(cfg, x) for x in paths):
             return False
@@ -14591,7 +14591,13 @@ _ED_FILE_TOOL_WORDS = frozenset(("file", "files", "fs", "filesystem", "write",
                                  "upload", "download", "copy", "move"))
 # Remote-repository servers: a `path` there names a file in a hosted repo,
 # not on this machine (QA round 4).
-_ED_REMOTE_SERVERS = frozenset(("github", "gitlab", "bitbucket", "gitea", "azure_devops"))
+_ED_REMOTE_SERVERS = frozenset((
+    "github", "gitlab", "bitbucket", "gitea", "azure_devops",
+    # QA round 5: knowledge/doc/remote-storage servers.
+    "notion", "memory", "google-drive", "google_drive", "gdrive", "drive",
+    "context7", "linear", "confluence", "jira", "atlassian", "asana", "slack",
+    "gmail", "supabase", "hubspot", "intercom", "figma", "canva",
+))
 _ED_COMMAND_KEYS = frozenset((
     "command", "cmd", "script", "shell_command", "commandline", "command_line",
     "cmdline", "argv", "keys", "chars", "exec", "entrypoint", "binary",
@@ -14670,6 +14676,28 @@ def _editor_startup_mcp_target(ev: Event) -> str:
                 or _ED_PATH_SHAPE_RE.match(k_.strip())):
             return k_
     return ""
+
+
+def _editor_startup_mcp_argv(a: dict) -> Optional[str]:
+    """A shell-runner's argv, re-joined as ONE command line (QA round 5:
+    flattened with newlines, `["cp","-r",src,dst]` became four commands)."""
+    import shlex as _sh
+
+    def _j(v):
+        if isinstance(v, (list, tuple)) and all(isinstance(x, (str, int, float)) for x in v):
+            return _sh.join(str(x) for x in list(v)[:4000])
+        return v if isinstance(v, str) else None
+
+    lower = {str(k).lower(): v for k, v in a.items()}
+    for ck, ak in (("command", "args"), ("cmd", "args"), ("program", "arguments"),
+                   ("executable", "args"), ("binary", "parameters"),
+                   ("entrypoint", "argv_list"), ("command", "arguments"), ("argv", None)):
+        c = _j(lower.get(ck))
+        if c is None:
+            continue
+        extra = _j(lower.get(ak)) if ak else None
+        return (c + " " + extra) if extra else c
+    return None
 
 
 def _editor_startup_has_content_key(a, _depth: int = 0) -> bool:
@@ -14832,7 +14860,24 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     escapes; ``GIT_EXTERNAL_DIFF``/``GIT_CONFIG_*`` voiding the git read
     exemption; SpaceVim, ``.vim_runtime``, chemacs ``.emacs-profiles.el``;
     MCP cwd-relative paths; ``allow`` remainder ignoring cwd. False positives
-    fixed: DB/payment/browser-script/remote-repo MCP tools."""
+    fixed: DB/payment/browser-script/remote-repo MCP tools. Round 5 found
+    the placement analyzer's shlex parsing took ``2>/dev/null`` and ``#
+    comment`` as the destination, and ``scan_surface``'s space-joined
+    renderings merged commands -- replaced by a bash-faithful tokenizer
+    (quotes, ANSI-C, comments, ``$(``/backticks/subshells, redirections and
+    heredoc bodies dropped) fed newline-separated renderings; clustered
+    ``-rt DIR``, GNU ``--targ=`` abbreviations, ``--parents``; ``git
+    clone`` value options, ``gh repo clone``/``hg clone``/``svn
+    checkout``; wrappers (``timeout``/``nice``/``stdbuf``/``busybox``/
+    ``eval``/``env -C``/``env -S``/``sudo -nu``) and ``find -exec``;
+    ``cd`` evasion via failed/subshell/``popd`` ``cd``s (every directory
+    the command could be in is now considered); PowerShell ``-Path``/
+    ``-Destination``, ``Expand-Archive``, ``xcopy``/``robocopy``; MCP
+    runner argv lists and their own ``cwd``; ``patch`` into a gated dir;
+    a 5-7 s path blow-up (directory length capped, failing closed). False
+    positives fixed: commands with 400+ lines (only relevant segments
+    count), ``cd ~ && mv *.log logs/``, ``pkgroot/etc``, knowledge/remote
+    MCP servers (memory, Notion, Drive, context7, Linear, ...)."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14871,13 +14916,21 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             tool_words & _ED_MESSAGING_WORDS)
         if (shellish or lkeys & _ED_COMMAND_KEYS
                 or {"program", "arguments"} <= lkeys or {"executable", "args"} <= lkeys):
+            shell_cmd = _editor_startup_mcp_argv(a0)
             parts = [str(x) for x in _flatten_strings(a0)]
-            shell_cmd = "\n".join(parts)[:200000] if parts else None
+            flat = "\n".join(parts)[:200000] if parts else None
+            shell_cmd = (shell_cmd + "\n" + flat) if shell_cmd and flat else (shell_cmd or flat)
         else:
             shell_cmd = None
+        mcp_cwd = ev.cwd
+        for _k, _v in a0.items():
+            if str(_k).lower() in ("cwd", "workdir", "working_directory", "workingdirectory",
+                                   "directory", "dir", "cd") and isinstance(_v, str) and _v:
+                mcp_cwd = _v               # the runner's own cwd (QA round 5)
+                break
         if shell_cmd is not None:
             sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
-                             args={"command": shell_cmd}, cwd=ev.cwd)
+                             args={"command": shell_cmd}, cwd=mcp_cwd)
             d = rule_editor_startup_protect(sub, policy)
             if d is not None:
                 return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
@@ -14933,7 +14986,11 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = _cmd(ev)
         named = (patterns.editor_startup_shell_path_hit(cmd, ev.cwd)
                  or patterns.editor_startup_shell_path_hit(raw, ev.cwd))
-        _pc, _uc = patterns.editor_startup_placement_targets(cmd, ev.cwd)
+        # The placement analyzer tokenizes itself; give it renderings kept
+        # APART by newlines -- `scan_surface`'s space-joined form merged one
+        # command's tail into the next (QA round 5).
+        _pc, _uc = patterns.editor_startup_placement_targets(
+            normalize.scan_surface(raw, sep="\n"), ev.cwd)
         _pr, _ur = patterns.editor_startup_placement_targets(raw, ev.cwd)
         bulk = _uc or _ur
         named = named or bool(_pc or _pr)
