@@ -7916,7 +7916,7 @@ _ED_EXTRACT_VERBS = frozenset(("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "7
                                "chezmoi", "yadm", "unar", "pax", "patch", "jar", "ar"))
 _ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl", "yadm"))
 _ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS
-                      | frozenset(("rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
+                      | frozenset(("giget", "copier", "cookiecutter", "export", "rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
                                    "podman", "kubectl", "oc", "degit", "tiged", "wget",
                                    "wget2", "unsquashfs", "cabextract", "lha", "python",
                                    "python3", "vcsh"))
@@ -7997,6 +7997,7 @@ _ED_WIN_HINT_RE = re.compile(
     r"[A-Za-z]:\\|%\w+%\\|\$env:\w+\\|\b(?:copy-item|move-item|expand-archive|xcopy|robocopy"
     r"|new-item)\b", re.IGNORECASE)
 _ED_TOK_MAX = 400_000
+_ED_AND_MARK = "\x00&&"
 _ED_PLACE_PREFILTER_RE = re.compile(
     r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
     r"|~|\$\{?HOME|\$env:|%\w+%|/home/|/Users/|/root|/var/home|\betc\b|\bshare\b|\blib\b"
@@ -8213,6 +8214,10 @@ def _ed_tokenize(cmd: str, win: bool = False, _depth: int = 0) -> list:
                     i += 1
                 drop_next = True
                 continue
+            if i + 1 < n and cmd[i + 1] == "&":
+                end_seg()
+                segs.append([_ED_AND_MARK])           # `&&`: the next runs only on success
+                i += 2; continue
             end_seg(); i += 1; continue
         if c in "<>":
             if i + 1 < n and cmd[i + 1] == "(":
@@ -8326,6 +8331,8 @@ def _ed_strip_prefix(words: list, state: dict) -> list:
             if prefix == "eval" and len(words) == 1:
                 t = _ed_tokenize(words[0])
                 words = t[0] if t else []
+        elif lw in ("pnpm", "yarn", "bun") and len(words) > 1 and words[1] in ("dlx", "x", "exec"):
+            words = words[2:]                    # `pnpm dlx degit` (QA round 8)
         elif re.match(r"^\w+=", w0):
             if w0.startswith("GIT_WORK_TREE="):
                 state["git_work_tree"] = w0.split("=", 1)[1]
@@ -8337,6 +8344,8 @@ def _ed_strip_prefix(words: list, state: dict) -> list:
 
 def _ed_verb(w: str) -> str:
     v = w.strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if "@" in v[1:]:
+        v = v[0] + v[1:].split("@", 1)[0]        # `giget@latest` (npx package spec)
     return v[:-4] if v.endswith(".exe") else v
 
 
@@ -8389,8 +8398,23 @@ def _ed_placement(cmd, cwd, hits, depth):
         return list(dict.fromkeys(seen + [state["cwd"]]))[:65]
 
     queue = list(segs)
+    last_cd_alts = None
     while queue:
         words = queue.pop(0)
+        if words == [_ED_AND_MARK]:
+            if last_cd_alts:
+                # `cd /x && ...`: what follows runs only if the cd succeeded,
+                # so the earlier cwds no longer apply (QA round 8: session cwd
+                # `$HOME` + `cd proj && git pull` false-ASKed).
+                seen[:] = list(last_cd_alts)
+            last_cd_alts = None
+            continue
+        last_cd_alts = None
+        if words and words[0] == "export":
+            for w in words[1:]:
+                if w.startswith("GIT_WORK_TREE="):
+                    state["git_work_tree"] = w.split("=", 1)[1]
+            continue
         head = words[:64]
         stripped = _ed_strip_prefix(head, state)
         if not stripped:
@@ -8418,6 +8442,7 @@ def _ed_placement(cmd, cwd, hits, depth):
             for x in alts:
                 if x not in seen:
                     seen.append(x)
+            last_cd_alts = alts
             if len(seen) > 64:
                 raise _EdTooBig()                # QA round 6: bounded work
             continue
@@ -8460,6 +8485,12 @@ def _ed_placement(cmd, cwd, hits, depth):
 # git subcommands that write the WORK TREE with names chosen by the repo
 # (QA round 7: `cd ~ && git pull`, bare-repo dotfiles `git --work-tree=$HOME
 # checkout`, `git apply`).
+_ED_EXTRACT_DIR_OPTS = {
+    "tar": ("-C", "--directory"), "gtar": ("-C", "--directory"), "bsdtar": ("-C", "--directory"),
+    "unzip": ("-d",), "patch": ("-d", "--directory"), "stow": ("-t", "--target"),
+    "xstow": ("-t", "--target"), "expand-archive": ("-destinationpath",),
+    "unar": ("-o", "-output-directory"),
+}
 _ED_GIT_TREE_WRITERS = frozenset(("pull", "checkout", "merge", "reset", "restore", "switch",
                                   "stash", "apply", "am", "cherry-pick", "rebase", "revert",
                                   "read-tree", "checkout-index", "worktree", "sparse-checkout"))
@@ -8470,10 +8501,17 @@ _ED_REMOTE_COPY = {
     "azcopy": ("copy", "sync"), "docker": ("cp",), "podman": ("cp",), "kubectl": ("cp",),
     "oc": ("cp",), "degit": (), "tiged": (), "wget": (), "wget2": (), "unsquashfs": (),
     "cabextract": (), "lha": (), "python": ("-m",), "python3": ("-m",), "vcsh": (),
+    "giget": (), "copier": ("copy", "recopy"), "cookiecutter": (),
 }
 
 
 def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
+    if verb == "cookiecutter":
+        for i, a in enumerate(args):
+            if a in ("-o", "--output-dir") and i + 1 < len(args):
+                t = _ed_dotdot_normalize(_ed_join((dirs or [None])[0], args[i + 1]))
+                return _ed_is_gated_parent(t) or editor_startup_path_hit(t)
+        return False
     if verb in ("wget", "wget2"):
         if not any(re.fullmatch(r"-[A-Za-z]*[rm][A-Za-z]*|--recursive|--mirror", a) for a in args):
             return False
@@ -8483,8 +8521,10 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
                 dest = args[i + 1]
             elif a.startswith("--directory-prefix="):
                 dest = a.split("=", 1)[1]
-            elif a.startswith("-P") and len(a) > 2:
-                dest = a[2:]
+            elif re.fullmatch(r"-[A-Za-z]*P", a) and i + 1 < len(args):
+                dest = args[i + 1]                # `-rP DIR` (QA round 8)
+            elif re.match(r"^-[A-Za-z]*P.", a):
+                dest = a[a.index("P") + 1:]
         targets = [_ed_join(d, dest) for d in dirs] if dest else [d for d in dirs if d]
         return any(_ed_is_gated_parent(_ed_dotdot_normalize(t)) or editor_startup_path_hit(t)
                    for t in targets if t)
@@ -8500,6 +8540,8 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
         targets = [_ed_join(d, t) for d in dirs] if t else [d for d in dirs if d]
         return bool(args and "x" in args[0]) and any(_ed_is_gated_parent(x) for x in targets if x)
     if verb in ("python", "python3"):
+        while args and args[0].startswith("-") and args[0] != "-m":
+            args = args[1:]                       # `python3 -I -m ...` (QA round 8)
         if len(args) >= 4 and args[0] == "-m" and args[1] in ("zipfile", "tarfile") \
                 and args[2] in ("-e", "--extract"):
             t = args[4] if len(args) > 4 else "."
@@ -8511,9 +8553,17 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
     subs = _ED_REMOTE_COPY.get(verb, ())
     rest = list(args)
     if subs:
-        if not rest or rest[0] not in subs:
+        # Global options may precede the subcommand (`aws --region x s3`,
+        # `kubectl -n ns cp`, `docker container cp` -- QA round 8).
+        k = next((i for i, a in enumerate(rest[:12]) if a in subs
+                  or (verb in ("docker", "podman") and a == "container")), None)
+        if k is None:
             return False
-        rest = rest[1:]
+        rest = rest[k + 1:]
+        if verb in ("docker", "podman") and args[k] == "container":
+            if not rest or rest[0] != "cp":
+                return False
+            rest = rest[1:]
         if verb in ("aws", "gcloud") and rest and rest[0] in ("cp", "sync", "mv", "rsync"):
             rest = rest[1:]
     ops = [a for a in rest if not a.startswith("-")]
@@ -8529,8 +8579,9 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
             hits.append(dest)
         for src in ops[:-1]:
             base = re.sub(r"^[^/\\]*:(?![/\\])", "", src).rstrip("/\\").rsplit("/", 1)[-1]
-            if verb in ("degit", "tiged") or _ed_unknown_name(src) or src.endswith("/") \
-                    or verb in ("rclone", "aws", "gsutil", "gcloud", "azcopy"):
+            if verb in ("degit", "tiged", "giget", "copier", "cookiecutter") \
+                    or _ed_unknown_name(src) or src.endswith("/") \
+                    or verb in ("rclone", "aws", "gsutil", "gcloud", "azcopy", "kubectl", "oc"):
                 if _ed_is_gated_parent(dest):
                     return True
                 continue
@@ -8551,6 +8602,8 @@ def _ed_clone(verb, args, state, dirs, hits):
             gdirs = [_ed_join(d, args[i + 1]) for d in gdirs]; i += 2; continue
         if args[i].startswith("--work-tree="):
             work_tree = args[i].split("=", 1)[1]; i += 1; continue
+        if args[i] == "-c" and i + 1 < len(args) and args[i + 1].lower().startswith("core.worktree="):
+            work_tree = args[i + 1].split("=", 1)[1]; i += 2; continue
         if args[i] == "--work-tree" and i + 1 < len(args):
             work_tree = args[i + 1]; i += 2; continue
         if args[i] in ("-c", "--git-dir", "--work-tree", "-R", "--repository", "--cwd") \
@@ -8744,14 +8797,15 @@ def _ed_extract(verb, args, state, dirs, hits) -> bool:
                                   for a in args):
         return False
     explicit = None
+    # Per-verb directory options, case-sensitive (QA round 8: `unzip -o` is
+    # OVERWRITE, tar `-o` is no-same-owner, cpio `-d` is make-dirs).
+    dir_opts = _ED_EXTRACT_DIR_OPTS.get(verb, ())
     for i, a in enumerate(args):
-        la = a.lower()
-        if la in ("-c", "--directory", "-d", "-t", "--target", "-destinationpath", "-o",
-                  "--dir", "-dir") and i + 1 < len(args) and not (verb == "patch" and la == "-o"):
-            if verb == "patch" and la != "-d" and la != "--directory":
-                continue
+        la = a.lower() if verb == "expand-archive" else a
+        if la in dir_opts and i + 1 < len(args):
             explicit = args[i + 1]
-        elif a.startswith(("--directory=", "--target=", "--dir=")):
+        elif a.startswith(("--directory=", "--target=", "--dir=")) and \
+                a.split("=", 1)[0] in dir_opts:
             explicit = a.split("=", 1)[1]
         elif re.match(r"^-[Cd].", a) and verb in ("tar", "unzip", "bsdtar", "gtar", "patch"):
             explicit = a[2:]

@@ -14911,7 +14911,19 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``cabextract``/``lha``, ``python -m zipfile|tarfile -e``; ``$(..)``
     inside ``${..}``/``$((..))``; exact MCP cwd keys before ``*dir``;
     ``relative_path``; ``~/.vimrc.local``. False positives fixed: fetch and
-    thinking tools."""
+    thinking tools. Round 8 found ``unzip -o`` (overwrite) read as an output
+    dir, hiding extraction into the cwd -- directory options are now per
+    verb and case-sensitive; global options before ``aws``/``rclone``/
+    ``kubectl``/``docker`` subcommands; ``kubectl cp`` contents semantics;
+    ``pnpm dlx``/``yarn dlx``/``bun x``/``npx pkg@ver``; ``wget -rP``;
+    ``python -I -m zipfile``; ``export GIT_WORK_TREE``/``-c core.worktree``;
+    copier/cookiecutter/giget; MCP git work-tree tools on a home repo.
+    False positives fixed: with session cwd ``$HOME``, ``cd proj && git
+    pull`` (a ``cd`` followed by ``&&`` now replaces the candidate cwds --
+    after ``;`` the earlier ones are kept, so ``cd /nonexistent; tar xf``
+    is still judged in ``~``; ``cd /x && true; tar xf`` is an accepted
+    residual), ``log_dir`` taken as a runner cwd, file writes whose content
+    quotes an editor command."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14970,8 +14982,9 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         for _pass in (0, 1):               # exact names first (QA round 7: `logdir`)
             for _k, _v in _cands:
                 kn = re.sub(r"[_\-\s]", "", str(_k).lower())
-                ok = kn in _exact if _pass == 0 else (kn.endswith("dir") or kn.endswith("directory")
-                                                      or kn == "folder")
+                ok = kn in _exact if _pass == 0 else (
+                    (kn.endswith("dir") or kn.endswith("directory") or kn == "folder")
+                    and not re.search(r"log|tmp|temp|cache|out|output|dest|target|backup", kn))
                 if ok and isinstance(_v, str) and _v:
                     mcp_cwd = _v           # the runner's own cwd (QA rounds 5-7)
                     break
@@ -14987,11 +15000,32 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         # QA round 4: any other command-shaped string leaf of a non-messaging
         # call (`write_stdin{chars}`, `pty__write{data}`, computer-use
         # `type{text}`) is judged as a shell command too.
-        if not (tool_words & _ED_MESSAGING_WORDS):
+        _p0 = _path(ev)
+        _own_ungated_target = bool(_p0 and "\n" not in _p0
+                                   and not patterns.editor_startup_path_hit(_p0))
+        # MCP git servers: a work-tree-writing tool on a repo rooted at a
+        # gated parent (`git_checkout{repo_path: ~}` -- QA round 8).
+        if tool_words & {"checkout", "pull", "merge", "reset", "restore", "switch", "apply",
+                         "stash", "rebase", "clone"} and "git" in tool_words:
+            for _k in ("repo_path", "repoPath", "repository", "path", "cwd", "directory",
+                       "target_path", "local_path"):
+                _v = a0.get(_k)
+                if isinstance(_v, str) and _v and (
+                        patterns._ed_is_gated_parent(_v) or patterns.editor_startup_path_hit(_v)):
+                    p = _v
+                    if os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP") or \
+                            _editor_startup_allowed_by_policy(cfg, p):
+                        return None
+                    return _finish(Decision(action, "editor-startup-protect",
+                                     f"MCP git tool '{ev.tool}' updates a work tree at '{_v}' "
+                                     "-- files it checks out land in editor startup/init "
+                                     "locations, which the editor runs as code on its next "
+                                     "launch. Confirm with AEGIS_ALLOW_EDITOR_STARTUP=1; a "
+                                     "spawned agent cannot."))
+        # An ordinary file write to a non-gated target: its content is data,
+        # not a command (QA round 8: a README quoting `echo .. >> ~/.vimrc`).
+        if not (tool_words & _ED_MESSAGING_WORDS) and not _own_ungated_target:
             skip = set()
-            _p0 = _path(ev)
-            if _p0 and "\n" not in _p0:
-                skip = _ED_PLAIN_CONTENT_KEYS
             # Prose-shaped keys (a commit message, a search query) are not
             # commands (QA round 6 false positives).
             skip = set(skip) | {k for k in a0 if _http_rc_words(k) & _ED_PROSE_KEY_WORDS}

