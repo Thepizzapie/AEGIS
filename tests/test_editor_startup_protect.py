@@ -1305,3 +1305,23 @@ def test_r14_gated(cmd, cwd):
 @pytest.mark.parametrize("cwd", [None, "/home/u/proj"])
 def test_r14_false_positives(cmd, cwd):
     assert evaluate(_sh_cwd(cmd, cwd), EMPTY).rule != RULE, (cmd[:60], cwd)
+
+
+# ---- QA round 15 regressions --------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cat" + " <<EOF" * 4 + "|true" * 1000 + "\nx\nEOF\n" * 4,
+    "cat" + " <<EOF" * 6 + "|true" * 1200 + "\nx\nEOF\n" * 6,
+    "cat" + " <<EOF" * 5 + "|x" * 1200 + "\nhi\n" + "EOF\n" * 5,
+    "cat" + " <<EOF" * 40 + "|x" * 1500 + "\n" + "hi\nEOF\n" * 40,
+])
+def test_r15_stacked_heredoc_pipes_fast(cmd):
+    import time
+    t = time.time()
+    rules.rule_editor_startup_protect(_shell(cmd), EMPTY)
+    assert time.time() - t < 1.0
+
+
+def test_r15_pipe_into_wrapped_shell_still_gated():
+    cmd = "cat <<'EOF' | tee /tmp/log | sudo -E bash\ncp -r /tmp/p/. ~\nEOF"
+    assert _ours(evaluate(_shell(cmd), EMPTY))

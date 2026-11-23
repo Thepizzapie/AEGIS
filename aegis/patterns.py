@@ -8059,15 +8059,19 @@ def _ed_is_shell_words(words) -> bool:
     return _ed_verb(w[0]) in _ED_SHELLS
 
 
+@functools.lru_cache(maxsize=256)
 def _ed_pipe_into_shell(rest_line: str) -> bool:
-    """`| [wrappers] sh` (also `|&`) somewhere after a heredoc operator."""
-    for m in re.finditer(r"\|&?(?!\|)", rest_line):
-        tail = rest_line[m.end():]
-        try:
-            segs = _ed_tokenize(tail, False, 3)
-        except Exception:
+    """`| [wrappers] sh` (also `|&`) after a heredoc operator. Only the
+    simple command right after each pipe is examined, cheaply, with a pipe
+    budget that fails closed (QA round 15: re-tokenizing the whole tail per
+    pipe was quadratic -- 82 s on 3.5 KB, a fail-open timeout); cached so
+    stacked heredocs on one line share the work."""
+    for k, m in enumerate(re.finditer(r"\|&?(?!\|)", rest_line)):
+        if k >= 256:
             return True
-        if segs and _ed_is_shell_words(segs[0]):
+        nxt = re.split(r"[|;&\n]", rest_line[m.end():m.end() + 2000], maxsplit=1)[0]
+        words = [w.strip("'\"") for w in nxt.split()[:32]]
+        if words and _ed_is_shell_words(words):
             return True
     return False
 

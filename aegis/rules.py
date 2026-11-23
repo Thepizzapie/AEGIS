@@ -14980,7 +14980,10 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     skipped the round-13 body analysis -- wrappers are now stripped before
     the shell test, for here-strings too; ``bash -c "$(cat <<'EOF' ...
     EOF)"``; ``printf '%s\\n' 'cmd' | sh``; a brace expansion truncated at
-    its budget now fails closed."""
+    its budget now fails closed. Round 15 found the round-14 pipe check
+    re-tokenizing the whole line tail per ``|`` (82 s on 3.5 KB of stacked
+    heredocs + pipes -- a fail-open timeout); it now inspects only the
+    command right after each pipe, with a pipe budget and a cache."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
