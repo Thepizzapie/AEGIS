@@ -546,7 +546,7 @@ def test_r3_paths_gated(path):
     "echo x > ~/../../etc/vim/vimrc.local", "echo x > $HOME/../../etc/vimrc",
     "echo x > /proc/1/root/etc/vim/vimrc.local",
     "mv nvim ~/.config/", "mkdir -p /tmp/p/nvim && mv /tmp/p/nvim ~/.config",
-    "ln -s $PWD/nvim ~/.config/", "ln -sfn /tmp/evil ~/.config/",
+    "ln -s $PWD/nvim ~/.config/", "ln -sfn /tmp/evil ~/.config/nvim",
     "cp -t ~/.config -r nvim", "mv /tmp/p/* ~/.config/",
     "git -C ~/.config clone https://x/nvim",
 ])
@@ -634,3 +634,105 @@ def test_r3_perf_bounded(ev):
     t = time.time()
     evaluate(ev, EMPTY)
     assert time.time() - t < 5.0
+
+
+# ---- QA round 4 regressions ---------------------------------------------------
+
+def _sh_cwd(cmd, cwd):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", cwd=cwd, args={"command": cmd})
+
+
+@pytest.mark.parametrize("cmd", [
+    # placement into system dirs
+    "sudo cp /tmp/vimrc /etc/", "sudo cp -t /etc /tmp/vimrc", "sudo mv /tmp/vimrc /etc/",
+    "sudo ln -s /tmp/vim /etc/", "sudo cp -r /tmp/nvim /etc/xdg/",
+    "sudo cp -r /tmp/vim /usr/share/", "sudo cp -r /tmp/emacs /etc/",
+    "rsync /tmp/vimrc /etc/", "sudo install -m644 vimrc /etc/",
+    # glued short options
+    "sort -o/etc/vimrc x", "curl -sSo/etc/vimrc https://x/y", "wget -qO/etc/vimrc https://x/y",
+    "cp -t/etc/vim x", "cp x -T/etc/vimrc", "patch -o/etc/vimrc a b",
+    "sort -o/etc/xdg/nvim/sysinit.vim x", "tar -C/etc -xf v.tar",
+    # cd + glob / cd options
+    "cd ~/.config && cp x n?im/init.lua", "cd ~/.config; cp x */init.lua",
+    "cd ~/.config && cp x {nvim,y}/init.lua", "cd ~/.config/x && echo x > ../n?im/init.lua",
+    "cd -- ~/.config && cp x nvim/init.lua", "cd -P ~/.config && cp x nvim/init.lua",
+    # zsh groups past the prefilter
+    "echo x >> ~/.(e)macs", "echo x >> ~/.(e)macs.d/init.el", "echo x >> ~/.(v)(i)(m)rc",
+    "echo x >> ~/.config/n(v)im/init.lua",
+    # bulk via cd / . / trailing options
+    "cd ~/.config && mv /tmp/nvim .", "cd ~/.config && cp -r /tmp/nvim .",
+    "cd ~/.config && ln -s ~/dotfiles/nvim", "cd ~/.config && git clone https://x/nvim",
+    "cd ~ && cp -r /tmp/dots/. .", "cd ~; tar xf /tmp/d.tgz",
+    "mv /tmp/nvim ~/.config/.", "mv /tmp/nvim ~/./.config", "mv /tmp/nvim ~/.config/x/..",
+    "cp /tmp/nvim -r ~/.config", "cp /tmp/dots/. -a ~",
+    # ANSI-C unicode escapes, git exec env
+    "echo x > ~/.$'\\U00000076'imrc", "echo x > ~/.$'\\u0076'imrc",
+    "GIT_EXTERNAL_DIFF=/tmp/x.sh git diff ~/.vimrc",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.external GIT_CONFIG_VALUE_0=/tmp/e git diff ~/.vimrc",
+    # new locations
+    "echo x > ~/.SpaceVim.d/init.toml", "echo x > ~/.vim_runtime/vimrcs/basic.vim",
+    "echo x > ~/.emacs-profiles.el",
+])
+def test_r4_shell_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r4_cwd_glob_gated():
+    assert _ours(evaluate(_sh_cwd("cp x n?im/init.lua", "/home/u/.config"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "mv report.pdf ~", "mv ~/Downloads/x.tar.gz ~/", "mv node_modules ~/",
+    "ln -s ~/code/proj ~", "ln -s ~/dotfiles/zshrc ~/", "mv ./a.txt ~/.config/",
+    "mv ~/foo ~/.local/share/", "cp build/* dist/", "mv a b", "cp -r src dist",
+    "tar xf a.tgz -C /tmp/out", "git clone https://github.com/x/y",
+    "cd /tmp && tar xf a.tgz", "sudo cp app.conf /etc/nginx/",
+])
+def test_r4_false_positives_fixed(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__codex__write_stdin", {"session_id": 3, "chars": "echo x >> ~/.vimrc\n"}),
+    ("mcp__pty__write", {"data": "echo x >> ~/.vimrc\n"}),
+    ("mcp__x__stdin_write", {"content": "cp x ~/.vimrc"}),
+    ("mcp__x__task_create", {"exec": "echo x >> ~/.vimrc"}),
+    ("mcp__x__start", {"entrypoint": "sh", "argv_list": ["-c", "echo x >> ~/.vimrc"]}),
+    ("mcp__x__invoke", {"binary": "sh", "parameters": ["-c", "cp x ~/.vimrc"]}),
+    ("mcp__computer__type", {"text": "echo x >> ~/.vimrc\n"}),
+    ("mcp__x__invoke", {"binary": "cp", "parameters": ["x", "~/.(e)macs"]}),
+])
+def test_r4_mcp_gated(tool, args):
+    assert _ours(evaluate(_mcp(args, tool=tool), EMPTY)), tool
+
+
+def test_r4_mcp_cwd_relative_gated():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__write_file", action=ActionClass.MCP,
+                    cwd="/home/u/.config/nvim", args={"path": "plugin/x.lua", "content": "x"})
+    assert _ours(evaluate(ev, EMPTY))
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__db__run_query", {"query": "insert into notes values ('~/.vimrc')"}),
+    ("mcp__supabase__execute_sql", {"query": "insert into t values ('cp x ~/.vimrc')"}),
+    ("mcp__x__process_payment", {"note": "~/.vimrc"}),
+    ("mcp__puppeteer__evaluate", {"script": "document.querySelector('.vim')"}),
+    ("mcp__github__create_or_update_file", {"path": ".vimrc", "content": "x"}),
+])
+def test_r4_mcp_false_positives_fixed(tool, args):
+    assert evaluate(_mcp(args, tool=tool), EMPTY).rule != RULE, tool
+
+
+def test_r4_allow_respects_cwd_and_zsh_groups():
+    pol = Policy(editor_startup={"allow": ["/dotfiles/"]})
+    ev = _sh_cwd("cp x ~/dotfiles/.vimrc && cp x init.lua", "/home/u/.config/nvim")
+    assert _ours(evaluate(ev, pol))
+    assert _ours(evaluate(_shell("cp x ~/dotfiles/.vimrc && cp x ~/.(e)macs"), pol))
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo -u root cp /tmp/vimrc /etc/", "sudo -E -u root mv /tmp/nvim /etc/xdg/",
+    "env FOO=1 cp -r /tmp/nvim ~/.config/", "nohup cp -r /tmp/emacs /etc/ &",
+])
+def test_r4_prefixed_placement_gated(cmd):
+    assert _ours(evaluate(_shell(cmd), EMPTY)), cmd

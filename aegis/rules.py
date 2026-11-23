@@ -14533,7 +14533,7 @@ def _editor_startup_allowed_by_policy(cfg: dict, text: str) -> bool:
     return False
 
 
-def _editor_startup_shell_allowed(cfg: dict, cmd: str) -> bool:
+def _editor_startup_shell_allowed(cfg: dict, cmd: str, cwd=None) -> bool:
     """Shell form: every word that names a gated path must itself satisfy
     `allow` -- an agent appending `# /dotfiles/` to the command, or
     mentioning an allowed path elsewhere in it, does not (QA round 2)."""
@@ -14548,8 +14548,16 @@ def _editor_startup_shell_allowed(cfg: dict, cmd: str) -> bool:
     rest = cmd
     for w in sorted(set(words), key=len, reverse=True):
         rest = rest.replace(w, " ")
-    return not (patterns.editor_startup_shell_path_hit(rest)
-                or patterns.editor_startup_shell_path_hit(normalize.scan_surface(rest)))
+    if (patterns.editor_startup_shell_path_hit(rest, cwd)
+            or patterns.editor_startup_shell_path_hit(normalize.scan_surface(rest), cwd)):
+        return False
+    # Resolved placements (`cp nvim ~/.config` -> `~/.config/nvim`) must each
+    # be allowed too, and an unknown-name placement never is.
+    for c in (cmd, normalize.scan_surface(cmd)):
+        paths, unknown = patterns.editor_startup_placement_targets(c, cwd)
+        if unknown or not all(_editor_startup_allowed_by_policy(cfg, x) for x in paths):
+            return False
+    return True
 
 
 # Tool-name words that make an MCP tool a shell/process runner. Narrower
@@ -14560,7 +14568,8 @@ _ED_SHELL_TOOL_WORDS = frozenset((
     "exec", "execute", "process", "terminal", "shell", "eval", "interact",
     "repl", "spawn", "bash", "powershell", "sh", "cmd", "tmux", "console",
     "zsh", "pwsh", "command", "run", "send", "ssh", "remote", "launch",
-    "program", "keys", "commandline", "cmdline",
+    "program", "keys", "commandline", "cmdline", "stdin", "pty", "tty",
+    "keystrokes", "xdotool",
 ))
 # ...unless the tool is plainly messaging/CI (QA round 2: `send_email`,
 # `send_message`, `actions_run_trigger`). Judged on the WHOLE tool name,
@@ -14569,10 +14578,24 @@ _ED_MESSAGING_WORDS = frozenset((
     "email", "mail", "gmail", "message", "messages", "msg", "chat", "post",
     "comment", "reply", "issue", "trigger", "workflow", "notification",
     "notify", "sms", "dm", "slack", "discord", "teams", "invite", "review",
+    # QA round 4: database / payment / browser-script tools are not shells.
+    "query", "sql", "database", "db", "payment", "payments", "invoice",
+    "evaluate", "javascript", "js", "browser", "playwright", "puppeteer",
 ))
+_ED_STRONG_SHELL_WORDS = frozenset((
+    "shell", "bash", "sh", "zsh", "pwsh", "powershell", "terminal", "exec",
+    "execute", "pty", "tty", "stdin", "tmux", "ssh", "console", "cmd", "spawn",
+))
+_ED_FILE_TOOL_WORDS = frozenset(("file", "files", "fs", "filesystem", "write",
+                                 "save", "path", "dir", "directory", "folder",
+                                 "upload", "download", "copy", "move"))
+# Remote-repository servers: a `path` there names a file in a hosted repo,
+# not on this machine (QA round 4).
+_ED_REMOTE_SERVERS = frozenset(("github", "gitlab", "bitbucket", "gitea", "azure_devops"))
 _ED_COMMAND_KEYS = frozenset((
     "command", "cmd", "script", "shell_command", "commandline", "command_line",
-    "cmdline", "argv", "keys",
+    "cmdline", "argv", "keys", "chars", "exec", "entrypoint", "binary",
+    "argv_list",
 ))
 # Plain content keys of a write whose OWN target is set: a quoted path or
 # diff inside an ordinary file's body is not a write to that path (QA
@@ -14795,7 +14818,21 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``allow`` crashing the rule; 8.3 short names. False positives fixed:
     ``apps/*/config/x`` (a bare ``*`` now expands only to real parents of
     the next name), root-anchored ``usr`` (package staging trees), prose
-    after a path (``.helix ok``)."""
+    after a path (``.helix ok``). Round 4 found: placement into SYSTEM dirs
+    (``sudo cp /tmp/vimrc /etc/``) and the round-3 "verb + home dest"
+    heuristic both false-ASKing (``mv report.pdf ~``) and missing ``cd
+    ~/.config && mv /tmp/nvim .`` -- replaced by a placement analyzer that
+    resolves each ``cp``/``mv``/``ln``/``install``/``rsync``/archive/``git
+    clone``/``stow`` destination against ``cd``s and the cwd, joins source
+    basenames, and gates unknown names (globs, ``$var``, ``d/.``, archives)
+    only into a gated parent dir; glued short options (``sort
+    -o/etc/vimrc``); ``cd`` + glob and ``cd -P``/``--``; the round-3
+    prefilter hiding zsh ``~/.(e)macs``; stdin/pty/computer-use ``type``
+    MCP runners and any command-shaped string leaf; ``$'\\u0076'``
+    escapes; ``GIT_EXTERNAL_DIFF``/``GIT_CONFIG_*`` voiding the git read
+    exemption; SpaceVim, ``.vim_runtime``, chemacs ``.emacs-profiles.el``;
+    MCP cwd-relative paths; ``allow`` remainder ignoring cwd. False positives
+    fixed: DB/payment/browser-script/remote-repo MCP tools."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14817,10 +14854,19 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if ev.action == ActionClass.MCP:
         a0 = ev.args or {}
+        _srv = str(ev.tool or "").split("__")
+        if len(_srv) >= 3 and _srv[1].lower() in _ED_REMOTE_SERVERS:
+            return None
         tool_words = _http_rc_words(str(ev.tool or "").replace("__", "_"))
         lkeys = {str(k).lower() for k in a0}
         if isinstance(a0.get("args"), dict):
             lkeys |= {str(k).lower() for k in a0["args"]}
+        if (tool_words & _ED_MESSAGING_WORDS and not (tool_words & _ED_FILE_TOOL_WORDS)
+                and not (tool_words & _ED_STRONG_SHELL_WORDS)):
+            # Messaging / DB / payment / browser-script tools neither run a
+            # local shell nor write local files; an editor path in their
+            # text is prose or data (QA round 4).
+            return None
         shellish = bool(tool_words & _ED_SHELL_TOOL_WORDS) and not (
             tool_words & _ED_MESSAGING_WORDS)
         if (shellish or lkeys & _ED_COMMAND_KEYS
@@ -14836,6 +14882,28 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             if d is not None:
                 return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
                                 "command that writes an editor init file. " + d.message)
+        # QA round 4: any other command-shaped string leaf of a non-messaging
+        # call (`write_stdin{chars}`, `pty__write{data}`, computer-use
+        # `type{text}`) is judged as a shell command too.
+        if not (tool_words & _ED_MESSAGING_WORDS):
+            skip = set()
+            _p0 = _path(ev)
+            if _p0 and "\n" not in _p0:
+                skip = _ED_PLAIN_CONTENT_KEYS
+            for leaf in _flatten_strings({k: v for k, v in a0.items() if str(k) not in skip}):
+                leaf = str(leaf)
+                if not re.search(r"\S\s+\S", leaf) or len(leaf) > 200000:
+                    continue
+                if (patterns.editor_startup_shell_path_hit(leaf)
+                        or patterns.editor_startup_placement_hit(leaf)) and \
+                        not patterns.editor_startup_shell_only_reads(leaf):
+                    sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                     args={"command": leaf}, cwd=ev.cwd)
+                    d = rule_editor_startup_protect(sub, policy)
+                    if d is not None:
+                        return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' "
+                                        "carries a command that writes an editor "
+                                        "init file. " + d.message)
         has_content = _editor_startup_has_content_key(ev.args or {})
         if _http_rc_mcp_read_only(ev) and not has_content:
             return None
@@ -14845,7 +14913,13 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         p = _editor_startup_mcp_target(ev)
         if not p:
-            return None
+            _p0 = _path(ev)
+            if (_p0 and ev.cwd and "\n" not in _p0
+                    and not re.match(r"^(?:[/\\~]|[A-Za-z]:|file:)", _p0)
+                    and patterns.editor_startup_path_hit(str(ev.cwd).rstrip("/\\") + "/" + _p0)):
+                p = _p0                    # QA round 4: cwd-relative MCP path
+            else:
+                return None
     elif ev.action in (ActionClass.EDIT, ActionClass.WRITE):
         p = _path(ev)
         hit = bool(p and patterns.editor_startup_path_hit(p))
@@ -14859,15 +14933,17 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = _cmd(ev)
         named = (patterns.editor_startup_shell_path_hit(cmd, ev.cwd)
                  or patterns.editor_startup_shell_path_hit(raw, ev.cwd))
-        bulk = (patterns.editor_startup_home_bulk_hit(cmd)
-                or patterns.editor_startup_home_bulk_hit(raw))
+        _pc, _uc = patterns.editor_startup_placement_targets(cmd, ev.cwd)
+        _pr, _ur = patterns.editor_startup_placement_targets(raw, ev.cwd)
+        bulk = _uc or _ur
+        named = named or bool(_pc or _pr)
         if not (named or bulk):
             return None
         if not bulk and (patterns.editor_startup_shell_only_reads(cmd)
                          and patterns.editor_startup_shell_only_reads(raw)):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP")
-                or (not bulk and _editor_startup_shell_allowed(cfg, raw))):
+                or (not bulk and _editor_startup_shell_allowed(cfg, raw, ev.cwd))):
             return None
         return _finish(Decision(action, "editor-startup-protect",
                          "An editor startup/init file or runtime directory "

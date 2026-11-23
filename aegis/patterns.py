@@ -7516,6 +7516,8 @@ EDITOR_STARTUP_PATH_RE = re.compile(
     r"|" + _ED_ETC + _SEP + r"xdg" + _SEP + r"nvim"
     # `vim.loader` byte-code cache, loaded at startup (QA round 1).
     r"|\.cache" + _SEP + r"nvim" + _SEP + r"luac"
+    r"|\.SpaceVim(?:\.d)?"
+    r"|\.vim_runtime"
     r"|\.nvim\.lua"
     r"|\.nvimrc"
     # Flatpak: XDG dirs under `~/.var/app/<id>/{config,data}` (QA round 1).
@@ -7529,6 +7531,7 @@ EDITOR_STARTUP_PATH_RE = re.compile(
     r"|" + _ED_XDG + r"(?:emacs|doom)"
     r"|\.doom\.d"
     r"|\.spacemacs(?:\.d)?"
+    r"|\.emacs-profiles?\.el"
     # Every `load-path` dir's `subdirs.el`/`leim-list.el`/`*-autoloads.el`
     # and native-comp `.eln` files load at startup (QA round 1).
     r"|" + _ED_PREFIX + r"(?:share|lib)" + _SEP + r"emacs"
@@ -7552,7 +7555,8 @@ _ED_COMPONENT_NAMES = (
     ".vimrc", "_vimrc", ".gvimrc", "_gvimrc", ".exrc", "_exrc", ".ideavimrc",
     "_ideavimrc", ".vim", "vimfiles", "vim", "nvim", "nvim-data", ".nvim.lua",
     ".nvimrc", ".emacs", ".emacs.el", ".emacs.elc", ".emacs.d", "emacs",
-    "doom", ".doom.d", ".spacemacs", ".spacemacs.d",
+    "doom", ".doom.d", ".spacemacs", ".spacemacs.d", ".spacevim", ".spacevim.d",
+    ".vim_runtime", ".emacs-profiles.el",
     ".dir-locals.el", ".dir-locals-2.el", "kak", "micro", "helix", ".helix",
     "vimrc", "gvimrc", ".config", "config", "share", ".local", "etc", "xdg",
     "local", "roaming", "appdata", "lib", ".cache", "luac", ".var", "app",
@@ -7666,8 +7670,10 @@ def _ed_glob_candidates(word: str, budget: int = 256) -> list:
 
 
 _ED_URL_ESC_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_ED_GLUED_OPT_RE = re.compile(r"((?:^|[\s'\"])-[A-Za-z]{1,6})(?=[/\\~$])")
 _ED_PREFILTER_RE = re.compile(
-    r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}",
+    r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
+    r"|vim_runtime",
     re.IGNORECASE)
 
 
@@ -7682,11 +7688,17 @@ def editor_startup_path_hit(text) -> bool:
         return True                           # fail closed (QA round 3 perf)
     # Cheap prefilter: every alternative of the path regex contains one of
     # these literals (or is reached only through `%XX` decoding).
-    if not _ED_PREFILTER_RE.search(text):
-        return False
+    if not _ED_PREFILTER_RE.search(text) and not (
+            ("(" in text or ")" in text)
+            and _ED_PREFILTER_RE.search(re.sub(r"[()]", "", text))):
+        return False                          # (zsh `~/.(e)macs` -- QA round 4)
     if EDITOR_STARTUP_PATH_RE.search(text):
         return True
     variants = []
+    # A short option glued to its path (`sort -o/etc/vimrc`, `-t/etc/vim`)
+    # hides the root anchor's separator (QA round 4).
+    if _ED_GLUED_OPT_RE.search(text):
+        variants.append(_ED_GLUED_OPT_RE.sub(r"\1 ", text))
     if _ED_URL_ESC_RE.search(text):
         try:
             import urllib.parse as _up
@@ -7741,8 +7753,18 @@ def _ed_dotdot_normalize(text: str) -> str:
 
 # A `cd DIR` whose later relative words are joined onto DIR
 # (`cd ~/.config && cp x nvim/init.lua`) -- QA round 1.
-_ED_CD_RE = re.compile(r"(?:^|[\s;&|(])(?:cd|pushd|Set-Location|sl)\s+(['\"]?)([^\s'\";&|()]+)\1")
+_ED_CD_RE = re.compile(r"(?:^|[\s;&|(])(?:cd|pushd|Set-Location|sl)\s+(?:(?:-[LPe@]+|--)\s+)*"
+                       r"(['\"]?)([^\s'\";&|()]+)\1")
 _ED_CMD_BUDGET = 4000
+_ED_ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.){0,4000})'")
+
+
+def _ed_ansi_c_decode(m) -> str:
+    try:
+        import codecs
+        return codecs.decode(m.group(1), "unicode_escape")
+    except Exception:
+        return m.group(1)
 _ED_QUOTED_RE = re.compile(r"'[^']{0,100000}'|\"[^\"]{0,100000}\"")
 
 
@@ -7755,6 +7777,10 @@ def editor_startup_shell_path_hit(cmd, cwd=None) -> bool:
         return False
     if editor_startup_path_hit(cmd):
         return True
+    if "$'" in cmd:
+        dec = _ED_ANSI_C_RE.sub(_ed_ansi_c_decode, cmd)
+        if dec != cmd and editor_startup_path_hit(dec):
+            return True                       # `$'\u0076'` (QA round 4)
     unesc = cmd.replace("\\", "")
     if unesc != cmd and editor_startup_path_hit(unesc):
         return True
@@ -7781,6 +7807,11 @@ def editor_startup_shell_path_hit(cmd, cwd=None) -> bool:
         if len(w) > 400:
             return True
         cands = _ed_glob_candidates(w)
+        if not w.startswith(("/", "~", "$")):
+            # `cd ~/.config && cp x n?im/init.lua` (QA round 4).
+            for d in cds:
+                cands = cands + [_ed_dotdot_normalize(c) for c in
+                                 _ed_glob_candidates(d.rstrip("/") + "/" + w)]
         budget -= len(cands)
         if budget < 0:
             return True                       # fail closed (QA round 1 perf)
@@ -7806,7 +7837,9 @@ def editor_startup_patch_hit(text) -> bool:
 _ED_EXEC_ENV_RE = re.compile(
     r"(?:^|[\s;&|(`])(?:export\s+|set\s+)?(?:LESSOPEN|LESSCLOSE|LESS|LESSKEY\w*|LESSEDIT"
     r"|PAGER|MANPAGER|BAT_\w+|RIPGREP_CONFIG_PATH|GREP_OPTIONS|EDITOR|VISUAL"
-    r"|BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_\w+|PATH|IFS)=",
+    r"|BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|DYLD_\w+|PATH|IFS"
+    r"|GIT_EXTERNAL_DIFF|GIT_CONFIG_\w+|GIT_PAGER|GIT_\w*_COMMAND|GIT_SSH\w*|GIT_EDITOR"
+    r"|GIT_ASKPASS|GIT_EXEC_PATH|GIT_DIR|GIT_WORK_TREE)=",
     re.IGNORECASE)
 # Read-only `git` subcommands and `sort` without an output/exec option,
 # allowed for THIS guard only (QA round 1 false positives).
@@ -7828,28 +7861,235 @@ def editor_startup_shell_only_reads(cmd: str) -> bool:
     return http_client_rc_shell_only_reads(c)
 
 
-# Bulk placement into the home/config root without naming the file:
-# `tar xf e.tgz -C ~`, `unzip e.zip -d ~`, `cp -r d/. ~/`, `rsync -a d/ ~/`,
-# `stow -t ~ pkg` (QA round 1 scope note).
-_ED_HOME_DEST_RE = re.compile(
-    r"(?:^|[\s'\"=])(?:~|\$HOME|\$\{HOME\}|%USERPROFILE%|\$env:USERPROFILE|/root"
-    r"|/home/[^\s'\"/\\]+|/Users/[^\s'\"/\\]+)"
-    r"(?:[/\\]+(?:\.config|\.local(?:[/\\]+share)?|AppData(?:[/\\]+(?:Local|Roaming))?))?"
-    r"[/\\]*['\"]?(?=\s|$|[;&|)])",
-    re.IGNORECASE)
-_ED_BULK_VERB_RE = re.compile(
-    r"\bcp\s+(?:-[A-Za-z]*[rRat][A-Za-z]*|--recursive|--archive|--target-directory)\b"
-    r"|\bstow\b|\bditto\b"
-    r"|\bbsdtar\b|\bxstow\b|\bchezmoi\s+apply\b|\byadm\b"
-    # QA round 3: moving/linking a gated-named dir into the config root.
-    r"|(?<![\w-])(?:mv|ln|move|Move-Item|New-Item)\b|\bgit\s+-C\s+\S+\s+clone\b",
-    re.IGNORECASE)
-_ED_CD_WORD_RE = re.compile(r"(?:^|[\s;&|(])(?:cd|pushd|Set-Location|sl)\s+\S+")
+# ---- placement analysis (QA round 4) -----------------------------------------
+# `cp`/`mv`/`ln`/`install`/`rsync`/`ditto` place `DEST/basename(SRC)`;
+# archive tools, `git clone` and `stow` place unknown names into a
+# directory. Rather than "verb + home destination" (which ASKed on `mv
+# report.pdf ~` and missed `sudo cp /tmp/vimrc /etc/`), each segment's
+# destination is resolved (against `cd`s and the session cwd), joined with
+# each source basename, and matched; an unknown-name source (glob, `$var`,
+# `d/.`, `d/`, an archive) is gated when its destination is itself a
+# parent of a gated name (`~`, `~/.config`, `/etc`, `/usr/share`, ...).
+_ED_SEG_RE = re.compile(r"&&|\|\||[;&|\n]")
+_ED_PREFIX_CMDS = frozenset(("sudo", "doas", "env", "command", "builtin", "nohup",
+                             "time", "nice", "exec", "then", "do", "else", "if",
+                             "while", "until", "!", "{", "(", "xargs"))
+_ED_PLACE_VERBS = frozenset(("cp", "mv", "ln", "install", "rsync", "ditto", "copy",
+                             "move", "copy-item", "move-item", "cpi", "mi", "gcp",
+                             "gmv", "gln", "scp"))
+_ED_EXTRACT_VERBS = frozenset(("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "7zz",
+                               "unrar", "cpio", "expand-archive", "stow", "xstow",
+                               "chezmoi", "yadm", "unar", "pax"))
+_ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS
+                      | frozenset(("cd", "pushd", "set-location", "sl", "chdir", "git")))
+_ED_OPT_WITH_ARG = {
+    "install": frozenset(("-m", "-o", "-g", "-S", "--mode", "--owner", "--group",
+                          "--suffix", "-Z")),
+    "rsync": frozenset(("-e", "--rsh", "--rsync-path", "-f", "--filter",
+                        "--exclude", "--include", "--chmod", "-T", "--temp-dir")),
+    "cp": frozenset(("-S", "--suffix")), "mv": frozenset(("-S", "--suffix")),
+    "ln": frozenset(("-S", "--suffix")),
+}
+# Parent-dependent probe names only: `.vimrc` matches under ANY dir, so a
+# home directory is recognized by `_ED_HOME_DIR_RE` instead.
+_ED_PROBE_NAMES = ("nvim", "vim", "emacs", "vimrc", "xdg/nvim", "helix", "kak", "micro")
+_ED_HOME_DIR_RE = re.compile(
+    r"^(?:~[^/\\]*|\$HOME|\$\{HOME\}|%USERPROFILE%|%HOMEPATH%|\$env:USERPROFILE|\$env:HOME"
+    r"|/root|/home/[^/\\]+|/Users/[^/\\]+|/var/home/[^/\\]+|[A-Za-z]:[/\\]+Users[/\\]+[^/\\]+"
+    r"|(?:~|\$HOME|/home/[^/\\]+|/Users/[^/\\]+)[/\\]+(?:vimfiles|AppData(?:[/\\]+(?:Local|Roaming))?))"
+    r"[/\\]*$", re.IGNORECASE)
 
 
-def editor_startup_home_bulk_hit(cmd) -> bool:
-    if not isinstance(cmd, str) or not cmd:
+def _ed_join(base, rel: str) -> str:
+    if not rel:
+        return base or ""
+    if rel.startswith(("/", "~", "$", "%")) or re.match(r"^[A-Za-z]:[/\\]", rel) or not base:
+        return rel
+    return base.rstrip("/\\") + "/" + rel
+
+
+def _ed_is_gated_parent(d: str) -> bool:
+    if not d:
         return False
-    if not _ED_HOME_DEST_RE.search(_ED_CD_WORD_RE.sub(" ", cmd)):
-        return False
-    return bool(ARCHIVE_SYNC_VERB_RE.search(cmd) or _ED_BULK_VERB_RE.search(cmd))
+    d = _ed_dotdot_normalize(d.rstrip("/\\") or "/")
+    if _ED_HOME_DIR_RE.match(d):
+        return True
+    for n in _ED_PROBE_NAMES:
+        if editor_startup_path_hit(d.rstrip("/\\") + "/" + n):
+            return True
+    return False
+
+
+def _ed_unknown_name(src: str) -> bool:
+    # `src/` (trailing slash) copies/moves the dir ITSELF for cp/mv/ln; only
+    # rsync treats it as "contents" (handled by the caller).
+    return (any(c in src for c in "*?[{$`") or src in (".", "./")
+            or src.endswith(("/.", "\\.")))
+
+
+_ED_SUDO_OPT_ARG = frozenset(("-u", "-g", "-C", "-h", "-p", "-r", "-t", "-U", "-D",
+                              "--user", "--group", "--chdir", "--host", "--prompt"))
+
+
+def _ed_strip_prefix(words: list) -> list:
+    """Drop `sudo -u root`, `env A=1`, `nohup`, ... before the real verb."""
+    words = list(words)
+    after_prefix = False
+    while words:
+        w0 = words[0]
+        if w0.lower() in _ED_PREFIX_CMDS:
+            after_prefix = True
+            words.pop(0)
+        elif re.match(r"^\w+=", w0):
+            words.pop(0)
+        elif w0.startswith("-") and len(words) > 1 and after_prefix:
+            words.pop(0)
+            if w0 in _ED_SUDO_OPT_ARG and words:
+                words.pop(0)
+        else:
+            break
+    return words
+
+
+def _ed_split_words(seg: str) -> list:
+    try:
+        import shlex
+        return shlex.split(seg, posix=True)
+    except Exception:
+        return seg.split()
+
+
+def editor_startup_placement_hit(cmd, cwd=None) -> bool:
+    paths, unknown = editor_startup_placement_targets(cmd, cwd)
+    return bool(paths) or unknown
+
+
+def editor_startup_placement_targets(cmd, cwd=None):
+    """(gated paths this command places a file at, whether it places
+    unknown names into a gated parent dir)."""
+    hits = []
+    if not isinstance(cmd, str) or not cmd or len(cmd) > _ED_NORM_MAX:
+        return hits, isinstance(cmd, str) and len(cmd) > _ED_NORM_MAX
+    cur = cwd if isinstance(cwd, str) and cwd else None
+    for n_seg, seg in enumerate(_ED_SEG_RE.split(cmd)):
+        if n_seg > 400:
+            return hits, True
+        # Cheap verb check before tokenizing (shlex is slow on huge args).
+        head = _ed_strip_prefix(seg[:400].split())
+        hv = head[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower() if head else ""
+        if hv.endswith(".exe"):
+            hv = hv[:-4]
+        if hv not in _ED_RELEVANT_VERBS and not (head and len(head) < 2 and len(seg) > 400):
+            continue
+        words = (_ed_split_words(seg) if len(seg) <= 50000 else seg.split())[:4000]
+        words = _ed_strip_prefix(words)
+        if not words:
+            continue
+        verb = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if verb.endswith(".exe"):
+            verb = verb[:-4]
+        args = words[1:]
+        if verb in ("cd", "pushd", "set-location", "sl", "chdir"):
+            ops = [a for a in args if not re.fullmatch(r"-[LPe@]+|--", a)]
+            cur = _ed_dotdot_normalize(_ed_join(cur, ops[0])) if ops else "~"
+            continue
+        if verb == "git":
+            # `git [-C DIR] clone URL [DIR]`
+            gdir = cur
+            i = 0
+            while i < len(args) and args[i].startswith("-"):
+                if args[i] == "-C" and i + 1 < len(args):
+                    gdir = _ed_join(gdir, args[i + 1]); i += 2; continue
+                if args[i] == "-c":
+                    i += 2; continue
+                i += 1
+            if i < len(args) and args[i] == "clone":
+                ops = [a for a in args[i + 1:] if not a.startswith("-")]
+                if ops:
+                    name = ops[1] if len(ops) > 1 else re.sub(
+                        r"\.git$", "", ops[0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+                    j = _ed_dotdot_normalize(_ed_join(gdir or "", name))
+                    if editor_startup_path_hit(j):
+                        hits.append(j)
+            continue
+        if verb in _ED_PLACE_VERBS:
+            target, no_target_dir, ops = None, False, []
+            with_arg = _ED_OPT_WITH_ARG.get(verb, frozenset())
+            i = 0
+            end_opts = False
+            while i < len(args):
+                a = args[i]
+                if not end_opts and a == "--":
+                    end_opts = True
+                elif not end_opts and a.startswith("--target-directory="):
+                    target = a.split("=", 1)[1]
+                elif not end_opts and a in ("-t", "--target-directory", "-Destination",
+                                            "-destination") and i + 1 < len(args):
+                    target = args[i + 1]; i += 1
+                elif not end_opts and re.match(r"^-[A-Za-z]*t.", a) and not a.startswith("--") \
+                        and verb in ("cp", "mv", "ln", "install", "gcp", "gmv", "gln"):
+                    target = a[a.index("t") + 1:]
+                elif not end_opts and (a in ("-T", "--no-target-directory")):
+                    no_target_dir = True
+                elif not end_opts and a in with_arg and i + 1 < len(args):
+                    i += 1
+                elif not end_opts and a.startswith("-") and a != "-":
+                    pass
+                else:
+                    ops.append(a)
+                i += 1
+            if verb == "scp":
+                ops = [o for o in ops if ":" not in o or re.match(r"^[A-Za-z]:[/\\]", o)]
+            if target is None:
+                if verb in ("ln", "gln") and len(ops) == 1:
+                    target, srcs = cur or "", ops
+                elif len(ops) >= 2:
+                    target, srcs = ops[-1], ops[:-1]
+                else:
+                    continue
+            else:
+                srcs = ops
+            dest = _ed_dotdot_normalize(_ed_join(cur, target))
+            if editor_startup_path_hit(dest):
+                hits.append(dest)
+            if no_target_dir:
+                continue
+            for src in srcs:
+                if _ed_unknown_name(src) or (verb == "rsync" and src.endswith("/")):
+                    if _ed_is_gated_parent(dest):
+                        return hits, True
+                    continue
+                base = src.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+                j = _ed_dotdot_normalize(dest.rstrip("/\\") + "/" + base)
+                if editor_startup_path_hit(j):
+                    hits.append(j)
+            continue
+        if verb in _ED_EXTRACT_VERBS:
+            if verb == "tar" or verb in ("bsdtar", "gtar", "pax"):
+                joined = " ".join(args)
+                if not re.search(r"(?:^|\s)(?:-{0,1}[A-Za-z]*x[A-Za-z]*|--extract|--get)(?:\s|$)", joined) \
+                        and not (args and re.fullmatch(r"[A-Za-z]*x[A-Za-z]*", args[0])):
+                    continue
+            if verb in ("7z", "7za", "7zz") and not (args and args[0] in ("x", "e")):
+                continue
+            if verb == "chezmoi" and not (args and args[0] in ("apply", "init", "update")):
+                continue
+            dest = cur
+            for i, a in enumerate(args):
+                if a in ("-C", "--directory", "-d", "-t", "--target", "-DestinationPath",
+                         "-o") and i + 1 < len(args):
+                    dest = _ed_join(cur, args[i + 1])
+                elif a.startswith(("--directory=", "--target=")):
+                    dest = _ed_join(cur, a.split("=", 1)[1])
+                elif re.match(r"^-[Cd].", a) and verb in ("tar", "unzip", "bsdtar", "gtar"):
+                    dest = _ed_join(cur, a[2:])
+                elif verb in ("7z", "7za", "7zz") and a.startswith("-o") and len(a) > 2:
+                    dest = _ed_join(cur, a[2:])
+            if verb in ("chezmoi", "yadm"):
+                dest = "~"
+            elif verb in ("stow", "xstow") and dest is cur:
+                # stow's default target is the PARENT of the stow dir.
+                dest = (_ed_dotdot_normalize(cur.rstrip("/\\") + "/..") if cur else "~")
+            if dest and (_ed_is_gated_parent(dest) or editor_startup_path_hit(dest)):
+                return hits, True
+    return hits, False
