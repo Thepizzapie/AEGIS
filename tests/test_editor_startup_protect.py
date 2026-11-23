@@ -75,7 +75,7 @@ GATED_PATHS = [
 
 UNGATED_PATHS = [
     "src/syntax/foo.vim", "dotfiles/vimrc", "~/.vimrc.bak", "~/.viminfo2",
-    "~/.config/nvim-old/init.lua", "README.md", "my.emacs.d/x", "docs/vim.md",
+    "README.md", "my.emacs.d/x", "docs/vim.md",
     "~/.helixrc", "app/emacs_mode.py", "~/.config/nvimx/init.lua",
     "src/default.el", "~/.config/vimx",
 ]
@@ -1087,3 +1087,54 @@ def test_r9_mcp_gated(tool, args):
 ])
 def test_r9_false_positives(cmd):
     assert evaluate(_sh_cwd(cmd, "/home/user/proj"), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 10 regressions --------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cp -r .config ~/", "cp -r .config/ ~/", "rsync -av .config ~/",
+    "cp -r dotfiles/.config ~/", "cp -a /tmp/d/.config /home/u/",
+    "git clone https://github.com/x/dots /tmp/d && cp -r /tmp/d/.config ~/",
+    "sudo cp -r /tmp/d/etc /", "cp -r /tmp/d/AppData ~", "docker cp c1:/root/.config ~/",
+    "mv ~/.config ~/.config.bak && ln -s ~/proj/.config ~/.config",
+    "ln -s ~/.config c && echo x > c/nvim/plugin/x.lua",
+    "ln -s /home/u/.local/share s && cp -r p s/nvim/site/",
+    "python3.12 -m zipfile -e a.zip ~", "uv run python -m zipfile -e a.zip ~",
+    "python3 -X utf8 -m zipfile -e a.zip ~", "python3 -W ignore -m tarfile -e a.tgz ~",
+    "dpkg -x evil.deb ~", "dpkg-deb -x evil.deb ~",
+    "echo x > ~/.config/lvim/config.lua", "echo x > ~/.config/nvim-kickstart/init.lua",
+    "echo x > ~/.config/astronvim/init.lua",
+])
+@pytest.mark.parametrize("cwd", [None, "/home/u/proj", "/home/u"])
+def test_r10_shell_gated(cmd, cwd):
+    assert _ours(evaluate(_sh_cwd(cmd, cwd), EMPTY)), (cmd, cwd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "true | cd /tmp && tar xf /tmp/evil.tgz", "cd /tmp && true & tar xf /tmp/evil.tgz",
+    "cd /tmp && sleep 0 & git pull", "CDPATH=/home cd u && tar xf /tmp/x.tgz",
+    "pushd /tmp && pushd +1 && tar xf /tmp/x.tgz", "cd \"$PWD\" && tar xf /tmp/x.tgz",
+    "cmake -E tar xf x.tgz",
+])
+def test_r10_home_cwd_narrowing_gaps_gated(cmd):
+    assert _ours(evaluate(_sh_cwd(cmd, "/home/u"), EMPTY)), cmd
+
+
+def test_r10_mcp_move_into_gated_parent():
+    assert _ours(evaluate(_mcp({"source": "/tmp/d/.config", "destination": "/home/u/.config"},
+                               tool="mcp__filesystem__move_file"), EMPTY))
+
+
+@pytest.mark.parametrize("ev", [
+    _sh_cwd("cd .. && git checkout main", "/home/u/proj/web"),
+    _sh_cwd("cd ..; git stash pop", "/home/u/proj/web"),
+    _mcp({"command": "cd .. && git pull", "cwd": "/home/u/proj/web"},
+         tool="mcp__x__execute_command"),
+    _mcp({"relative_path": "src/a.py", "regex": "x", "repl": "cp a ~/.vimrc"},
+         tool="mcp__serena__replace_regex"),
+    _sh_cwd("cp -r src ~/backup/", "/home/u/proj"),
+    _sh_cwd("ln -s ~/dotfiles/starship.toml ~/.config/starship.toml", "/home/u"),
+    _sh_cwd("cp -r build/dist ~/", "/home/u/proj"),
+])
+def test_r10_false_positives_fixed(ev):
+    assert evaluate(ev, EMPTY).rule != RULE

@@ -14553,7 +14553,7 @@ def _editor_startup_shell_allowed(cfg: dict, cmd: str, cwd=None) -> bool:
         return False
     # Resolved placements (`cp nvim ~/.config` -> `~/.config/nvim`) must each
     # be allowed too, and an unknown-name placement never is.
-    for c in (cmd, normalize.scan_surface(cmd, sep="\n")):
+    for c in [cmd] + list(dict.fromkeys(normalize.scan_surface(cmd, sep="\x1e").split("\x1e"))):
         paths, unknown = patterns.editor_startup_placement_targets(c, cwd)
         if unknown or not all(_editor_startup_allowed_by_policy(cfg, x) for x in paths):
             return False
@@ -14935,7 +14935,19 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
     copy into ``~/.local`` itself (not ``~/.local/share``) is not gated --
     tool-install tarballs routinely target it, so gating it would ASK on
     every ``tar xf node.tgz -C ~/.local``; an archive whose own tree holds
-    ``share/nvim/...`` can therefore land there unasked."""
+    ``share/nvim/...`` can therefore land there unasked. Round 10 found a
+    copied/linked directory that is itself a gated PARENT (``cp -r .config
+    ~/``, ``sudo cp -r d/etc /``, ``docker cp c:/root/.config ~/``, MCP
+    ``move_file`` onto ``~/.config``) and symlink aliases of one (``ln -s
+    ~/.config c``) ungated -- now gated as unknown-name placement; a single
+    ``|``/background ``&``, ``CDPATH``, ``cd $VAR``/``pushd +N`` still let
+    the cwd narrowing drop the session cwd (now disable it); ``bash -c``
+    bodies are analyzed inline with the surrounding ``cd`` state;
+    ``python3.12``, ``uv run``/``poetry run``, ``-X``/``-W``; ``cmake -E
+    tar``, ``dpkg -x``; NVIM_APPNAME-style ``~/.config/nvim-*`` and the
+    LunarVim/AstroNvim/NvChad/LazyVim dirs. False positives fixed: ``cd ..``
+    applied twice across scan renderings (each rendering is now analyzed
+    with fresh state), Serena ``replace_regex`` content."""
     cfg = getattr(policy, "editor_startup", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -14981,7 +14993,8 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
             shell_cmd = _editor_startup_mcp_argv(a0)
             parts = [str(x) for x in _flatten_strings(a0)]
             flat = "\n".join(parts)[:200000] if parts else None
-            shell_cmd = (shell_cmd + "\n" + flat) if shell_cmd and flat else (shell_cmd or flat)
+            # Judged separately (QA round 10: concatenated, `cd ..` ran twice).
+            shell_cmd = [c for c in dict.fromkeys((shell_cmd, flat)) if c]
         else:
             shell_cmd = None
         mcp_cwd = ev.cwd
@@ -15003,9 +15016,9 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
                     break
             if mcp_cwd is not ev.cwd:
                 break
-        if shell_cmd is not None:
+        for _sc in (shell_cmd or []):
             sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
-                             args={"command": shell_cmd}, cwd=mcp_cwd)
+                             args={"command": _sc}, cwd=mcp_cwd)
             d = rule_editor_startup_protect(sub, policy)
             if d is not None:
                 return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
@@ -15013,7 +15026,7 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         # QA round 4: any other command-shaped string leaf of a non-messaging
         # call (`write_stdin{chars}`, `pty__write{data}`, computer-use
         # `type{text}`) is judged as a shell command too.
-        _p0 = _path(ev)
+        _p0 = _path(ev) or str(a0.get("relative_path") or a0.get("relativePath") or "")
         _own_ungated_target = bool(_p0 and "\n" not in _p0
                                    and not patterns.editor_startup_path_hit(_p0))
         # MCP git servers: a work-tree-writing tool on a repo rooted at a
@@ -15036,6 +15049,26 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
                                      "locations, which the editor runs as code on its next "
                                      "launch. Confirm with AEGIS_ALLOW_EDITOR_STARTUP=1; a "
                                      "spawned agent cannot."))
+        # MCP move/copy/link whose destination IS a gated parent
+        # (`move_file{source: d/.config, destination: ~/.config}` -- QA r10).
+        if tool_words & {"move", "copy", "rename", "symlink", "link", "mv", "cp", "duplicate"}:
+            for _k, _v in a0.items():
+                if isinstance(_v, str) and _v and _http_rc_words(_k) & {
+                        "destination", "dest", "target", "to", "new", "dst", "link"}:
+                    try:
+                        _gp = patterns._ed_is_gated_parent(_v.strip())
+                    except Exception:
+                        _gp = True
+                    if _gp:
+                        if os.environ.get("AEGIS_ALLOW_EDITOR_STARTUP") or \
+                                _editor_startup_allowed_by_policy(cfg, _v):
+                            return None
+                        return _finish(Decision(action, "editor-startup-protect",
+                                         f"MCP tool '{ev.tool}' moves/copies/links a "
+                                         f"directory onto '{_v}', a parent of editor "
+                                         "startup/init locations the editor runs as code. "
+                                         "Confirm with AEGIS_ALLOW_EDITOR_STARTUP=1; a "
+                                         "spawned agent cannot."))
         # An ordinary file write to a non-gated target: its content is data,
         # not a command (QA round 8: a README quoting `echo .. >> ~/.vimrc`).
         _file_writer = bool(tool_words & _ED_FILE_TOOL_WORDS) and not (
@@ -15092,8 +15125,13 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
         # The placement analyzer tokenizes itself; give it renderings kept
         # APART by newlines -- `scan_surface`'s space-joined form merged one
         # command's tail into the next (QA round 5).
-        _pc, _uc = patterns.editor_startup_placement_targets(
-            normalize.scan_surface(raw, sep="\n"), ev.cwd)
+        # Each rendering analyzed with FRESH cwd state: run back to back, a
+        # relative `cd ..` would apply twice (QA round 10).
+        _pc, _uc = [], False
+        for _r in dict.fromkeys(normalize.scan_surface(raw, sep="\x1e").split("\x1e")):
+            _p1, _u1 = patterns.editor_startup_placement_targets(_r, ev.cwd)
+            _pc += _p1
+            _uc = _uc or _u1
         _pr, _ur = patterns.editor_startup_placement_targets(raw, ev.cwd)
         bulk = _uc or _ur
         named = named or bool(_pc or _pr)

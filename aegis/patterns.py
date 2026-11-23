@@ -7510,6 +7510,10 @@ EDITOR_STARTUP_PATH_RE = re.compile(
     + r"|MacVim\.app"
     # --- Neovim ---
     r"|\.config\}?" + _SEP + r"nvim"
+    # NVIM_APPNAME configs and distributions (`~/.config/nvim-kickstart`,
+    # LunarVim, AstroNvim, NvChad, LazyVim) -- QA round 10.
+    r"|\.config\}?" + _SEP + r"(?:nvim-[^\s'\"/\\]{1,64}|lvim|astronvim|nvchad|lazyvim)"
+    r"|\.local" + _SEP + r"share" + _SEP + r"(?:lunarvim|lvim)"
     r"|\.local" + _SEP + r"share" + _SEP + r"nvim"
     r"|" + _ED_PREFIX + r"share" + _SEP + r"nvim"
     r"|" + _ED_XDG + r"nvim"
@@ -7913,9 +7917,11 @@ _ED_PLACE_VERBS = frozenset(("cp", "mv", "ln", "install", "rsync", "ditto", "cop
                              "gmv", "gln", "scp", "xcopy", "robocopy", "cpio-p"))
 _ED_EXTRACT_VERBS = frozenset(("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "7zz",
                                "unrar", "cpio", "expand-archive", "stow", "xstow",
-                               "chezmoi", "yadm", "unar", "pax", "patch", "jar", "ar"))
+                               "chezmoi", "yadm", "unar", "pax", "patch", "jar", "ar",
+                               "dpkg", "dpkg-deb", "rpm2cpio"))
 _ED_CLONE_VERBS = frozenset(("git", "gh", "hg", "svn", "jj", "sl", "yadm"))
-_ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS
+_ED_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "busybox-sh"))
+_ED_RELEVANT_VERBS = (_ED_PLACE_VERBS | _ED_EXTRACT_VERBS | _ED_CLONE_VERBS | _ED_SHELLS
                       | frozenset(("giget", "copier", "cookiecutter", "export", "rclone", "aws", "gsutil", "gcloud", "azcopy", "docker",
                                    "podman", "kubectl", "oc", "degit", "tiged", "wget",
                                    "wget2", "unsquashfs", "cabextract", "lha", "python",
@@ -7998,7 +8004,11 @@ _ED_WIN_HINT_RE = re.compile(
     r"|new-item)\b", re.IGNORECASE)
 _ED_TOK_MAX = 400_000
 _ED_AND_MARK = "\x00&&"
-_ED_NO_NARROW_RE = re.compile(r"\|\||(?:^|[\s;&|(])!\s|[(){}`]|\bcd\s+(?:--\s+)?-(?:\s|$)|OLDPWD|~-|\bpopd\b")
+_ED_NO_NARROW_RE = re.compile(
+    r"\|\||(?:^|[\s;&|(])!\s|[(){}`]|\bcd\s+(?:--\s+)?-(?:\s|$)|OLDPWD|~-|\bpopd\b"
+    # a single `|` (pipeline subshell) or background `&` (QA round 10), a
+    # variable/`+N` cd target, CDPATH
+    r"|(?<![|&>])[|&](?![|&>])|CDPATH|\b(?:cd|pushd)\s+(?:--\s+)?[\"']?(?:\$|[+-]\d)")
 _ED_PLACE_PREFILTER_RE = re.compile(
     r"vim|emacs|exrc|nvim|doom|spacemacs|dir-locals|kak|micro|helix|vimfil|%[0-9a-f]{2}"
     r"|~|\$\{?HOME|\$env:|%\w+%|/home/|/Users/|/root|/var/home|\betc\b|\bshare\b|\blib\b"
@@ -8334,6 +8344,11 @@ def _ed_strip_prefix(words: list, state: dict) -> list:
                 words = t[0] if t else []
         elif lw in ("pnpm", "yarn", "bun") and len(words) > 1 and words[1] in ("dlx", "x", "exec"):
             words = words[2:]                    # `pnpm dlx degit` (QA round 8)
+        elif lw in ("uv", "poetry", "pipenv", "hatch", "pdm", "rye", "pixi") and len(words) > 1 \
+                and words[1] == "run":
+            words = words[2:]                    # `uv run python ...` (QA round 10)
+        elif lw == "cmake" and len(words) > 1 and words[1] == "-E":
+            words = words[2:]                    # `cmake -E tar xf`
         elif re.match(r"^\w+=", w0):
             if w0.startswith("GIT_WORK_TREE="):
                 state["git_work_tree"] = w0.split("=", 1)[1]
@@ -8345,6 +8360,8 @@ def _ed_strip_prefix(words: list, state: dict) -> list:
 
 def _ed_verb(w: str) -> str:
     v = w.strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if re.fullmatch(r"python3(?:\.\d+)?|python\d?(?:\.\d+)?|pypy3?", v):
+        v = "python3"                            # `python3.12` (QA round 10)
     if "@" in v[1:]:
         v = v[0] + v[1:].split("@", 1)[0]        # `giget@latest` (npx package spec)
     return v[:-4] if v.endswith(".exe") else v
@@ -8435,6 +8452,14 @@ def _ed_placement(cmd, cwd, hits, depth):
         words = _ed_strip_prefix(words[:4000], state)
         verb = _ed_verb(words[0])
         args = words[1:]
+        if verb in _ED_SHELLS:
+            # `bash -c 'cp -r x .'` runs in THIS cwd: analyze inline so the
+            # surrounding `cd` state applies (QA round 10).
+            for k, a in enumerate(args):
+                if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a) and k + 1 < len(args):
+                    queue[0:0] = _ed_tokenize(args[k + 1], False, depth + 1)
+                    break
+            continue
         if verb in ("cd", "pushd", "set-location", "chdir"):
             ops = [a for a in args if not re.fullmatch(r"-[LPe@]+|--", a)]
             if verb == "pushd":
@@ -8557,6 +8582,9 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
         return bool(args and "x" in args[0]) and any(_ed_is_gated_parent(x) for x in targets if x)
     if verb in ("python", "python3"):
         while args and args[0].startswith("-") and args[0] != "-m":
+            if args[0] in ("-X", "-W", "-c") and len(args) > 1:
+                args = args[2:] if args[0] != "-c" else []
+                continue
             if re.fullmatch(r"-[A-Za-z]*m", args[0]):
                 args = ["-m"] + args[1:]          # `-Im zipfile` (QA round 9)
                 break
@@ -8610,6 +8638,8 @@ def _ed_remote_copy(verb, args, state, dirs, hits) -> bool:
             j = _ed_dotdot_normalize(dest.rstrip("/") + "/" + base)
             if editor_startup_path_hit(j):
                 hits.append(j)
+            elif _ed_is_gated_parent(j):
+                return True                       # `docker cp c:/root/.config ~/`
     return False
 
 
@@ -8799,6 +8829,17 @@ def _ed_place(verb, args, state, dirs, hits) -> bool:
             j = _ed_dotdot_normalize((dest.rstrip("/\\") + "/" if dest else "") + base)
             if editor_startup_path_hit(j):
                 hits.append(j)
+            elif _ed_is_gated_parent(j):
+                # The source is itself a gated PARENT (`cp -r .config ~/`,
+                # `sudo cp -r d/etc /`): it merges unknown names into it
+                # (QA round 10).
+                return True
+            if verb in ("ln", "gln"):
+                # A link whose TARGET is a gated parent/tree aliases it
+                # (`ln -s ~/.config c && echo .. > c/nvim/..` -- QA round 10).
+                tgt = _ed_dotdot_normalize(_ed_join(d, src))
+                if _ed_is_gated_parent(tgt) or editor_startup_path_hit(tgt):
+                    return True
     return False
 
 
@@ -8812,6 +8853,14 @@ def _ed_extract(verb, args, state, dirs, hits) -> bool:
     if verb in ("7z", "7za", "7zz") and not (args and args[0] in ("x", "e")):
         return False
     if verb in ("jar", "ar") and not (args and "x" in args[0].lstrip("-")):
+        return False
+    if verb in ("dpkg", "dpkg-deb"):
+        # `dpkg -x PKG DIR` / `dpkg-deb -x|-X|-R PKG DIR` (QA round 10)
+        for i, a in enumerate(args):
+            if a in ("-x", "-X", "--extract", "--vextract", "-R", "--raw-extract") \
+                    and i + 2 < len(args):
+                t = _ed_dotdot_normalize(_ed_join((dirs or [None])[0], args[i + 2]))
+                return _ed_is_gated_parent(t) or editor_startup_path_hit(t)
         return False
     if verb == "chezmoi" and not (args and args[0] in ("apply", "init", "update")):
         return False
