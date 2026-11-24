@@ -902,3 +902,38 @@ def test_qa9_long_token_fast():
 @pytest.mark.parametrize("cmd", ["ls *", "echo *", "cp * dist/", "rm -f *.pyc", "ls ?", "cat [ab]*"])
 def test_qa9_glob_binary_no_fp(cmd):
     assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 10 regressions -------------------------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ('cd ~/.local/share && cp -r evil mi""se/plugins/x', None),
+    ('cd ~/.config && cp -r evil mi""se', None), ('cd ~/.config && cp -r evil m"is"e', None),
+    ("cd ~/.config && cp -r evil 'mi'se", None), ("cd ~/.config && cp -r evil mi\\se", None),
+    ("cd ~/.config && cd 'm'ise && cp x config.toml", None),
+    ("cd ~/.config && cd mi?e && cp x config.toml", None),
+    ("cd mi?e && cp x config.toml", "/home/u/.config"),
+    ("cd ~/.config/mi\\se && cp x config.toml", None),
+    ("cd ~/.config && cp --target-directory=mise x", None),
+    ("cd ~/.config && cp -r evil mise{,}", None), ("xargs m?se trust", None),
+])
+def test_qa10_shell(cmd, cwd):
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd=cwd)
+    d = rule_mise_exec_protect(ev, EMPTY)
+    assert d is not None and d.rule == RULE, (cmd, cwd)
+
+
+def test_qa10_cwd_join_bounded():
+    import time
+    long = "/" + "/".join(f"d{i}" for i in range(280))
+    cmd = "".join(f"cd {long}/x{n} && " for n in range(29))
+    cmd += "cp " + " ".join(f"f{i}" for i in range(3900)) + " out && cd /home/u/proj && echo hi >> notes"
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd="/home/u/proj")
+    t = time.time()
+    rule_mise_exec_protect(ev, EMPTY)
+    assert time.time() - t < 2
+    cmd2 = "".join(f"cd {long[:300]}{n} && " for n in range(12)) + "cp " + " ".join(
+        f"mise{i}.toml" for i in range(1000))
+    t = time.time()
+    rule_mise_exec_protect(Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                      args={"command": cmd2}, cwd="/p"), EMPTY)
+    assert time.time() - t < 2

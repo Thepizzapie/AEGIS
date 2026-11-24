@@ -9254,39 +9254,85 @@ def _mise_join(base: str, w: str) -> str:
     return base.rstrip("/") + "/" + w
 
 
+_MISE_CWD_VOCAB = ("mise", "rtx", "asdf", "conf.d", ".toml", "tool-versions", "plugins",
+                   "shims", "installs", "trusted", "ignored", "default-", ".lock",
+                   "*", "?", "[", "{")
+_MISE_CWD_MAX_DIR = 1024
+_MISE_CWD_MAX_JOINS = 3000
+
+
+def _mise_dir_or_path_hit(p: str) -> bool:
+    j = _ed_dotdot_normalize(p).rstrip("/")
+    m = MISE_CONFIG_DIR_RE.search(j)
+    if (m and m.end() >= len(j) - 1) or MISE_PATH_RE.search(j):
+        return True
+    if any(c in j for c in "*?["):
+        for v in _mise_glob_variants(j):
+            v = v.rstrip("/")
+            m = MISE_CONFIG_DIR_RE.search(v)
+            if (m and m.end() >= len(v) - 1) or MISE_PATH_RE.search(v):
+                return True
+    return False
+
+
 def mise_cwd_hit(cmd: str, cwd) -> bool:
     """True if some path word of the command, resolved against the event
     cwd and every directory a `cd`/`pushd` (chained: `cd ~/.config && cd
     mise`) may have left it in, is a mise config/runtime dir or file -- a
     bare `config.toml`, or `cp -r evil mise` from `~/.config` (QA rounds
-    8-9)."""
+    8-9). Words are dequoted/unescaped by the shell tokenizer, `--opt=VAL`
+    values and brace/glob forms are expanded (QA round 10), only words
+    carrying mise vocabulary are joined, and total work is capped, failing
+    closed (QA round 10: a 125 KB cd/word cross product took 65 s)."""
     if not isinstance(cmd, str) or not cmd:
         return False
+    segs = _mise_cli_segments(cmd)
     dirs = [str(cwd)] if cwd else []
     cur = str(cwd) if cwd else ""
-    for m in _MISE_CD_RE.finditer(cmd):
-        t = m.group(1).strip("'\"")
-        cur = _mise_join(cur, t) if t not in ("-",) else cur
-        dirs.append(cur)
-    dirs = [d for d in dirs if d]
+    words = []
+    for seg in segs:
+        k = 0
+        while k < len(seg):
+            w = seg[k]
+            if w in ("cd", "pushd") and k + 1 < len(seg):
+                q = k + 1
+                while q < len(seg) and seg[q].startswith("-") and seg[q] != "-":
+                    q += 1
+                if q < len(seg):
+                    t = seg[q]
+                    if t != "-":
+                        for tt in _brace_expand(t, 8):
+                            cur = _mise_join(cur, tt) if cur or tt.startswith(("/", "~", "$")) else tt
+                            dirs.append(cur)
+                    k = q + 1
+                    continue
+            words.append(w)
+            k += 1
+    dirs = [d for d in dict.fromkeys(dirs) if d]
     if not dirs:
         return False
-    if len(dirs) > 32:
+    if len(dirs) > 32 or any(len(d) > _MISE_CWD_MAX_DIR for d in dirs):
         return True                    # fail closed on absurd input
-    words = _MISE_WORD_RE.findall(cmd)
-    if len(words) > 4000:
-        return True
-    for d in dirs:
-        dn = _ed_dotdot_normalize(d.replace("\\", "/")).rstrip("/")
-        m = MISE_CONFIG_DIR_RE.search(dn)
-        if m and m.end() >= len(dn) - 1:
-            return True
-        for w in words:
-            if w.startswith("-") or "=" in w or len(w) > 1024:
+    cand = []
+    for w in dict.fromkeys(words):
+        if w.startswith("-"):
+            if "=" not in w:
                 continue
-            j = _ed_dotdot_normalize(_mise_join(dn, w))
-            m = MISE_CONFIG_DIR_RE.search(j)
-            if (m and m.end() >= len(j.rstrip("/")) - 1) or MISE_PATH_RE.search(j):
+            w = w.split("=", 1)[1]
+        if not w or len(w) > 1024:
+            continue
+        lw = w.lower()
+        if not any(v in lw for v in _MISE_CWD_VOCAB):
+            continue
+        cand.extend(_brace_expand(w, 8))
+    if len(cand) * len(dirs) > _MISE_CWD_MAX_JOINS:
+        return True                    # fail closed (bounded work)
+    for d in dirs:
+        dn = d.replace("\\", "/")
+        if _mise_dir_or_path_hit(dn):
+            return True
+        for w in cand:
+            if _mise_dir_or_path_hit(_mise_join(dn, w)):
                 return True
     return False
 
@@ -9912,6 +9958,14 @@ def _mise_glob_binary(cmd: str) -> bool:
         if any(c in base for c in "*?[") and re.search(r"[a-z]", base) and len(base) <= 40 \
                 and any(fnmatch.fnmatchcase(b, base) for b in _MISE_CLI_BINS):
             return True
+        # ... or the command a runner executes (`xargs m?se trust`).
+        for r_, w_ in enumerate(words[:-1]):
+            if w_.rsplit("/", 1)[-1].lower() in ("xargs", "parallel", "-exec", "-execdir"):
+                for nxt in words[r_ + 1:r_ + 6]:
+                    b2 = nxt.strip("'\"").rsplit("/", 1)[-1].lower()
+                    if any(c in b2 for c in "*?[") and re.search(r"[a-z]", b2) and len(b2) <= 40 \
+                            and any(fnmatch.fnmatchcase(b, b2) for b in _MISE_CLI_BINS):
+                        return True
     return False
 # `mise`/`rtx`/`asdf` as a word, not inside `promise`/`premises` (QA round 2).
 _MISE_BIN_WORD_RE = re.compile(r"(?<![\w.\-])(?:mise|rtx|asdf)(?:\.exe)?(?![\w\-])",

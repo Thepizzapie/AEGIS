@@ -15644,6 +15644,14 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     runtime/trust-store/default-package paths (component-wise vocabulary
     match) and a glob-named binary (``~/.local/bin/m*e trust``); more MCP
     ``{path|location, name|file}`` shapes; shlex skipped above 50 KB.
+    Round 10 found the round-9 cwd-join a fail-open DoS (65 s on a 125 KB
+    cd x word cross product) and blind to obfuscated relative names
+    (``mi""se``, ``mi\\se``, ``mi?e``, ``--target-directory=mise``,
+    ``mise{,}``) -- words are now shell-dequoted, ``--opt=`` values and
+    brace/glob forms expanded, only mise-vocabulary words joined, and the
+    total work capped (failing closed); ``xargs m?se trust``. Accepted:
+    any non-read command run with the session cwd INSIDE a mise config
+    dir (``make`` in ``~/.config/mise``) asks.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
