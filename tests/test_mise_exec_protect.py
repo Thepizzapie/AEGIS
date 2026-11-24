@@ -697,3 +697,31 @@ def test_qa4_default_packages(p):
 
 def test_qa4_tool_versions_ref(tmp_path):
     assert _ours(evaluate(_write(str(tmp_path / ".tool-versions"), "node ref:https://x\n"), EMPTY))
+
+
+# ---- QA round 5 regressions --------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "mise exec node@22 -y -- node -v", "mise exec node@22 --yes -- node -v",
+    "mise x python@3 --yes -- python -c 1", "mise exec -E dev -y -- node",
+    "mise exec -C /tmp -y -- node", "mise run -E dev --yes test",
+    "mise run --jobs 4 -y test", "mise run --cd /tmp -y test", "mise tasks run -y test",
+    "mise exec -c 'node -v' -y", "find . -exec mise trust {} \\;",
+    "echo x | xargs -n1 mise trust", "xargs -a f mise",
+])
+def test_qa5_shell_gated(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "find . -name '*.py' -exec grep -l mise {} \\;", "find . -exec grep -l asdf {} +",
+    "xargs -a list.txt grep mise", "mise run build --yes",
+    "mise exec -- yarn -y", "find . -name '*.toml' | xargs grep node",
+])
+def test_qa5_shell_allowed(cmd):
+    assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+def test_qa5_tool_versions_template_in_comment(tmp_path):
+    c = 'node 22 # {{exec(command="id")}}\n'
+    assert _ours(evaluate(_write(str(tmp_path / ".tool-versions"), c), EMPTY))

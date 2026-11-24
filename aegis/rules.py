@@ -15567,7 +15567,14 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     run under xargs/parallel now asks), ``-y`` after ``run``/``exec``
     (``mise run -y test`` -- options up to the first positional now count),
     globs as the subcommand (``mise tr?st``), ``~/.default-npm-packages``
-    and siblings (now gated paths), ``.tool-versions`` ``ref:http``.
+    and siblings (now gated paths), ``.tool-versions`` ``ref:http``. Round
+    5 found ``-y`` still hidden behind an option value or tool spec (``mise
+    exec node@22 -y --``, ``mise run -E dev --yes test``, ``mise tasks run
+    -y``) -- every pre-``--`` word of ``exec`` and every option (with its
+    value) before a ``run`` task name now counts; false ASKs on ``find
+    -exec grep mise {}``/``xargs grep mise`` (a mise word under xargs/find
+    is the binary only in command position); a quoted ``"{mise,x}"`` still
+    asks (the quote-stripped scan rendering expands it) -- accepted nit.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

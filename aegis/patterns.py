@@ -9673,7 +9673,7 @@ def mise_tool_versions_unsafe_entries(content) -> list:
         bad = bool(backend and backend not in _MISE_SAFE_BACKENDS)
         bad = bad or any(w.lower().startswith(("path:", "prefix:/", "ref:http", "ref:git"))
                          for w in words[1:])
-        bad = bad or bool(_MISE_TEMPLATE_EXEC_RE.search(s))
+        bad = bad or bool(_MISE_TEMPLATE_EXEC_RE.search(line))
         if bad:
             out.append((s[:60], _mise_fp("tv", " ".join(words))))
     return out
@@ -9775,6 +9775,11 @@ _MISE_WHICH_RE = re.compile(
     r"([\w./\-]*(?:mise|rtx|asdf)(?:\.exe)?)\s*`", re.IGNORECASE)
 
 
+def _mise_unquoted(cmd: str) -> str:
+    """`cmd` with quoted spans removed (a quoted brace is not expanded)."""
+    return re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", " ", cmd)
+
+
 def _mise_cli_segments(cmd: str) -> list:
     """Simple commands of `cmd` as word lists: quote-aware (a quoted
     `{{exec(...)}}` stays one word), split at `;`/`&`/`|`/`(`/`)`/backtick/
@@ -9822,8 +9827,9 @@ def mise_cli_hit(cmd) -> str:
     # `mise$x trust`, `mise$(true) trust`, `` mise`true` trust ``,
     # `{mise,trust}`: an expansion glued to the binary word (QA round 4).
     if re.search(r"(?<![\w.\-])(?:mise|rtx|asdf)(?:\.exe)?[$`]", cmd, re.IGNORECASE) or \
-            re.search(r"\{[^{}\s]*,[^{}\s]*\}", cmd) and re.search(
-                r"\{[^{}\s]*(?<![\w.\-])(?:mise|rtx|asdf)(?![\w\-])[^{}\s]*\}", cmd, re.IGNORECASE):
+            re.search(r"\{[^{}\s]*,[^{}\s]*\}", _mise_unquoted(cmd)) and re.search(
+                r"\{[^{}\s]*(?<![\w.\-])(?:mise|rtx|asdf)(?![\w\-])[^{}\s]*\}",
+                _mise_unquoted(cmd), re.IGNORECASE):
         return "computed mise invocation"
     bad = _mise_env_assignment_hit(cmd)
     if bad:
@@ -9863,6 +9869,8 @@ def _mise_cli_hit(cmd: str, depth: int) -> str:
                 base = base[:-4]
             if base not in _MISE_CLI_BINS:
                 continue
+            if not _mise_is_command_word(words, i):
+                continue
             if any(x.replace("\\", "/").rsplit("/", 1)[-1].lower() in ("xargs", "parallel")
                    for x in words[:i]):
                 # stdin supplies (or substitutes into) the arguments (QA round 4).
@@ -9873,6 +9881,37 @@ def _mise_cli_hit(cmd: str, depth: int) -> str:
             if r:
                 return r
     return ""
+
+
+_MISE_XARGS_VALUE_OPTS = frozenset(("-a", "-I", "-n", "-L", "-P", "-d", "-E", "-s",
+                                    "-j", "--arg-file", "--delimiter", "--max-args",
+                                    "--max-procs", "--replace", "--eof", "--jobs"))
+_MISE_RUNNER_WORDS = frozenset(("xargs", "parallel"))
+_MISE_FIND_EXEC = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+
+
+def _mise_is_command_word(words: list, i: int) -> bool:
+    """Under xargs/parallel/`find -exec`, a mise word is the BINARY only if
+    it is the first non-option word of the command they run -- `find ...
+    -exec grep -l mise {} \\;` and `xargs grep mise` only mention it (QA
+    round 5 false positive)."""
+    m, kind = -1, ""
+    for k in range(i):
+        b = words[k].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if b in _MISE_RUNNER_WORDS:
+            m, kind = k, "xargs"
+        elif words[k] in _MISE_FIND_EXEC:
+            m, kind = k, "find"
+        elif words[k] in (";", "\\;", "+") and kind == "find":
+            m, kind = -1, ""
+    if m < 0:
+        return True
+    if kind == "find":
+        return i == m + 1
+    q = m + 1
+    while q < len(words) and words[q].startswith("-") and q < i:
+        q += 1 if ("=" in words[q] or words[q] not in _MISE_XARGS_VALUE_OPTS) else 2
+    return q == i
 
 
 def _mise_judge_invocation(words: list, i: int) -> str:
@@ -9898,16 +9937,28 @@ def _mise_judge_invocation(words: list, i: int) -> str:
     # `--yes`/`-y` auto-answers mise's "config is not trusted. Trust
     # it?" prompt -- the same trust bypass as `mise trust` (QA round 1).
     opts = rest[:rest.index("--")] if "--" in rest else rest
-    if args and args[0].lower() in ("run", "r", "exec", "x", "watch", "w", "tasks", "t"):
-        # `mise run test -y`: a `-y` after the task name belongs to the task,
-        # but `mise run -y test` / `mise exec --yes --` is mise's own global
-        # flag (QA round 4): options up to the first positional or `--`.
+    a0 = args[0].lower() if args else ""
+    if a0 in ("exec", "x"):
+        # Everything before `--` is mise's own (tool specs, -E/-C values,
+        # `-c CMD`) -- a `-y` anywhere there is the global flag (QA round 5).
+        pass
+    elif a0 in ("run", "r", "watch", "w", "tasks", "task", "t"):
+        # `mise run test -y`: a `-y` after the task name belongs to the
+        # task, but `mise run -y test` / `mise run -E dev --yes test` /
+        # `mise tasks run -y test` is mise's own global flag (QA rounds
+        # 4-5): options (with their values) up to the first task name.
         k = rest.index(args[0])
         opts = rest[:k]
-        for o in rest[k + 1:]:
+        tail_ = rest[k + 1:]
+        if a0 in ("tasks", "task", "t") and tail_[:1] and tail_[0].lower() in ("run", "r"):
+            tail_ = tail_[1:]
+        q = 0
+        while q < len(tail_):
+            o = tail_[q]
             if o == "--" or not o.startswith("-"):
                 break
             opts.append(o)
+            q += 2 if o in _MISE_VALUE_OPTS or o in ("-t", "--tool", "-o") else 1
     if any(o == "--yes" or o.startswith("--yes=")
            or re.fullmatch(r"-[A-Za-z]*y[A-Za-z]*", o) for o in opts):
         return "mise --yes/-y (auto-accepts mise's untrusted-config prompt)"
