@@ -15582,6 +15582,13 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     runner's command is a known read-only tool (``grep``/``cat``/``ls``...),
     and any quoted command naming mise under a runner asks; ``-y`` hidden
     by an option value spelled like the subcommand (``mise -E run run -y``).
+    Round 7 found the read-only-tool list itself abusable: ``xargs echo
+    mise trust | sh`` (echo/printf removed), runner options that consume the
+    next word (``xargs --process-slot-var grep mise trust``, ``--arg``
+    abbreviations -- any option not known flag/value now keeps mise a call),
+    a path-qualified tool (``xargs ./echo``) or ``PATH=`` prefix, ``rg
+    --pre mise``/``--pager`` (now gated anywhere), and ``-y`` behind ``mise
+    run -s bash``/``--timeout 5s``.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

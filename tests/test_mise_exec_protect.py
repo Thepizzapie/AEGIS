@@ -753,3 +753,33 @@ def test_qa6_shell_gated(cmd):
 ])
 def test_qa6_shell_allowed(cmd):
     assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 7 regressions --------------------------------------------------
+BS = "\\"
+QA7_GATED = [
+    "xargs echo mise trust | sh", "xargs printf 'mise trust" + BS + "n' | bash",
+    "find . -maxdepth 0 -exec echo mise trust " + BS + "; | sh",
+    "seq 1 1 | xargs printf 'asdf plugin add x %s" + BS + "n' | sh",
+    "xargs --process-slot-var grep mise trust", "xargs --arg grep mise trust",
+    "parallel --tmpdir grep ::: 'mise trust'", "parallel -S grep mise trust ::: a",
+    "xargs ./echo mise trust", "find . -maxdepth 0 -exec ./grep mise trust " + BS + ";",
+    "PATH=.:$PATH xargs grep mise trust", "touch trust && rg --pre mise x trust",
+    "rg --pre=mise x trust", "find . -name trust -exec rg --pre mise x {} " + BS + ";",
+    "mise run -s bash -y test", "mise run --shell bash -y test", "mise run --timeout 5s -y test",
+]
+
+
+@pytest.mark.parametrize("cmd", QA7_GATED)
+def test_qa7_shell_gated(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "find . -exec grep -l mise {} " + BS + ";", "xargs grep asdf", "xargs -0 -r grep mise",
+    "find . -name '*.toml' | xargs grep -l 'mise trust'", "xargs -n1 grep mise",
+    "rg mise docs/", "mise run -s bash test -y",
+])
+def test_qa7_shell_allowed(cmd):
+    assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd

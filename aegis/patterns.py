@@ -9750,6 +9750,10 @@ def _mise_env_assignment_hit(cmd: str) -> str:
     return ""
 
 
+# `mise run`/`watch` options taking a separate value (QA round 7).
+_MISE_RUN_VALUE_OPTS = frozenset(("-t", "--tool", "-o", "-s", "--shell", "--timeout",
+                                  "-c", "--continue-on-error-max", "--output",
+                                  "-j", "--jobs", "-w", "--watch", "-g", "--glob"))
 _MISE_SETTINGS_KV_RE = re.compile(r"^([A-Za-z_][\w.\-]*)=(.*)$")
 
 
@@ -9831,6 +9835,9 @@ def mise_cli_hit(cmd) -> str:
                 r"\{[^{}\s]*(?<![\w.\-])(?:mise|rtx|asdf)(?![\w\-])[^{}\s]*\}",
                 _mise_unquoted(cmd), re.IGNORECASE):
         return "computed mise invocation"
+    if re.search(r"--(?:pre|pager|search-zip-cmd)(?:=|\s+)\S*(?<![\w.\-])(?:mise|rtx|asdf)(?![\w\-])",
+                 cmd, re.IGNORECASE):
+        return "mise run as another tool's preprocessor/pager (--pre/--pager)"
     bad = _mise_env_assignment_hit(cmd)
     if bad:
         return f"mise setting {bad} overridden through the environment"
@@ -9893,13 +9900,17 @@ _MISE_XARGS_VALUE_OPTS = frozenset(("-a", "-I", "-n", "-L", "-P", "-d", "-E", "-
                                     "-j", "--arg-file", "--delimiter", "--max-args",
                                     "--max-procs", "--replace", "--eof", "--jobs"))
 _MISE_RUNNER_WORDS = frozenset(("xargs", "parallel"))
+_MISE_XARGS_FLAG_OPTS = frozenset(("-0", "-r", "-t", "-x", "-p", "--null", "--verbose",
+                                   "--no-run-if-empty", "--interactive", "--exit",
+                                   "--open-tty", "-o", "--"))
 _MISE_FIND_EXEC = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
 
 
 # Commands that only read/print their arguments: under xargs/parallel/
 # `find -exec` a mise word after one of these is a mention, not a call.
 _MISE_MENTION_TOOLS = frozenset((
-    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "ls", "echo", "printf",
+    # No echo/printf: `xargs echo mise trust | sh` (QA round 7).
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "ls",
     "wc", "head", "tail", "file", "stat", "basename", "dirname", "realpath",
     "readlink", "diff", "cmp", "md5sum", "sha256sum", "sha1sum", "du", "test",
 ))
@@ -9930,13 +9941,32 @@ def _mise_is_command_word(words: list, i: int) -> bool:
     kind, m = _mise_runner_ctx(words, i)
     if m < 0:
         return True
+    if any(w.startswith("PATH=") for w in words[:m + 1]):
+        return True
     q = m + 1
     while q < i and words[q].startswith("-"):
-        q += 1 if ("=" in words[q] or words[q] not in _MISE_XARGS_VALUE_OPTS) else 2
+        o = words[q]
+        if o in _MISE_XARGS_VALUE_OPTS:
+            q += 2
+        elif o in _MISE_XARGS_FLAG_OPTS or (kind == "xargs" and "=" in o
+                                             and o.split("=", 1)[0] in _MISE_XARGS_VALUE_OPTS) \
+                or (kind == "xargs" and len(o) > 2 and not o.startswith("--")
+                    and o[:2] in _MISE_XARGS_VALUE_OPTS):     # glued `-n1`, `-I%`
+            q += 1
+        else:
+            # Unknown option (or a GNU long-option abbreviation, `--arg`):
+            # it may consume the next word -- keep mise a call (QA round 7).
+            return True
     if q >= i:
         return True
-    cmdw = words[q].replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return cmdw not in _MISE_MENTION_TOOLS
+    cmdw = words[q]
+    if "/" in cmdw or "\\" in cmdw:
+        return True             # `./grep` may be anything (QA round 7)
+    cmdw = cmdw.lower()
+    if cmdw not in _MISE_MENTION_TOOLS:
+        return True
+    # `rg --pre mise`, `ag/ack --pager mise` run their option value.
+    return any(re.match(r"--(?:pre|pager|search-zip-cmd)\b", w) for w in words[q + 1:i + 1])
 
 
 def _mise_judge_invocation(words: list, i: int) -> str:
@@ -9993,7 +10023,7 @@ def _mise_judge_invocation(words: list, i: int) -> str:
             if o == "--" or not o.startswith("-"):
                 break
             opts.append(o)
-            q += 2 if o in _MISE_VALUE_OPTS or o in ("-t", "--tool", "-o") else 1
+            q += 2 if o in _MISE_VALUE_OPTS or o in _MISE_RUN_VALUE_OPTS else 1
     if any(o == "--yes" or o.startswith("--yes=")
            or re.fullmatch(r"-[A-Za-z]*y[A-Za-z]*", o) for o in opts):
         return "mise --yes/-y (auto-accepts mise's untrusted-config prompt)"
