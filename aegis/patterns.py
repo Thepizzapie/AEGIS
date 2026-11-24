@@ -9232,6 +9232,7 @@ MISE_PATH_RE = re.compile(
 MISE_CONFIG_DIR_RE = re.compile(
     r"(?:^|(?<=[\s'\"=:<>|&;(`{,/\\]))(?:"
     r"\.config[/\\]+(?:mise|rtx)(?:[/\\]+conf\.d)?"
+    r"|(?:\$\{?|%|\$env:)XDG_CONFIG_HOME(?::?[-=+?][^}\s]{0,200})?[}%]?[/\\]+(?:mise|rtx)(?:[/\\]+conf\.d)?"
     r"|\.(?:mise|rtx)(?:[/\\]+conf\.d)?"
     r"|(?<![\w.])mise[/\\]+conf\.d"
     r"|etc[/\\]+(?:mise|rtx)"
@@ -9243,20 +9244,50 @@ MISE_CONFIG_DIR_RE = re.compile(
 _MISE_CD_RE = re.compile(r"(?:^|[\s;&|(`])(?:cd|pushd)\s+(?:-[LPe@]+\s+|--\s+)*([^\s;&|)`]+)")
 
 
+_MISE_WORD_RE = re.compile(r"[^\s;&|()<>`]+")
+
+
+def _mise_join(base: str, w: str) -> str:
+    w = w.strip("'\"")
+    if not base or w.startswith(("/", "~", "$")) or re.match(r"^[A-Za-z]:", w):
+        return w
+    return base.rstrip("/") + "/" + w
+
+
 def mise_cwd_hit(cmd: str, cwd) -> bool:
-    """True if the command runs in (or `cd`s into) a mise config/runtime
-    directory, where a bare `config.toml`/`x.toml` IS a mise config (QA
-    round 8: `cd ~/.config/mise && cp /tmp/c config.toml`)."""
+    """True if some path word of the command, resolved against the event
+    cwd and every directory a `cd`/`pushd` (chained: `cd ~/.config && cd
+    mise`) may have left it in, is a mise config/runtime dir or file -- a
+    bare `config.toml`, or `cp -r evil mise` from `~/.config` (QA rounds
+    8-9)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
     dirs = [str(cwd)] if cwd else []
-    for m in _MISE_CD_RE.finditer(cmd or ""):
+    cur = str(cwd) if cwd else ""
+    for m in _MISE_CD_RE.finditer(cmd):
         t = m.group(1).strip("'\"")
-        if cwd and not t.startswith(("/", "~", "$")):
-            t = str(cwd).rstrip("/") + "/" + t
-        dirs.append(t)
-    for d in dirs[:200]:
-        d = _ed_dotdot_normalize(d.replace("\\", "/")).rstrip("/")
-        if MISE_CONFIG_DIR_RE.search(d) and MISE_CONFIG_DIR_RE.search(d).end() >= len(d) - 1:
+        cur = _mise_join(cur, t) if t not in ("-",) else cur
+        dirs.append(cur)
+    dirs = [d for d in dirs if d]
+    if not dirs:
+        return False
+    if len(dirs) > 32:
+        return True                    # fail closed on absurd input
+    words = _MISE_WORD_RE.findall(cmd)
+    if len(words) > 4000:
+        return True
+    for d in dirs:
+        dn = _ed_dotdot_normalize(d.replace("\\", "/")).rstrip("/")
+        m = MISE_CONFIG_DIR_RE.search(dn)
+        if m and m.end() >= len(dn) - 1:
             return True
+        for w in words:
+            if w.startswith("-") or "=" in w or len(w) > 1024:
+                continue
+            j = _ed_dotdot_normalize(_mise_join(dn, w))
+            m = MISE_CONFIG_DIR_RE.search(j)
+            if (m and m.end() >= len(j.rstrip("/")) - 1) or MISE_PATH_RE.search(j):
+                return True
     return False
 
 
@@ -9285,6 +9316,36 @@ def mise_kind(path) -> str:
             return "pkgs"
         return "dir"
     return ""
+
+
+_MISE_GLOB_VOCAB = (
+    "mise", "rtx", ".mise", ".rtx", ".asdf", "plugins", "shims", "installs",
+    "trusted-configs", "ignored-configs", ".config", "conf.d", ".local", "share",
+    "state", "etc", "mise.toml", ".mise.toml", "mise.local.toml", ".mise.local.toml",
+    ".tool-versions", "config.toml", "settings.toml", "mise.lock", ".miserc.toml",
+    ".default-npm-packages", ".default-python-packages", ".default-gems",
+    ".default-cargo-crates", ".default-go-packages",
+)
+
+
+def _mise_glob_variants(word: str, budget: int = 64) -> list:
+    out = [""]
+    comps = word.replace("\\", "/").split("/")
+    for ci, comp in enumerate(comps):
+        opts = [comp]
+        if ci == len(comps) - 1 and re.fullmatch(r"[*?.]*(?:toml|lock)?", comp.lower()):
+            pass        # a final `*`/`*.toml` is too generic (`cp *.toml dist/`)
+        elif any(c in comp for c in "*?["):
+            hits = [v for v in _MISE_GLOB_VOCAB if fnmatch.fnmatchcase(v, comp.lower())]
+            opts = hits or [comp]
+        nxt = []
+        for o in out:
+            for c in opts:
+                nxt.append(o + "/" + c if o else c)
+                if len(nxt) >= budget:
+                    break
+        out = nxt[:budget]
+    return [("/" + v) for v in out]
 
 
 def mise_shell_path_hit(cmd) -> bool:
@@ -9318,6 +9379,12 @@ def mise_shell_path_hit(cmd) -> bool:
             continue
         if len(w) > 400:
             return True
+        # Component-wise: substitute each glob component by any mise
+        # vocabulary name it matches (`~/.local/share/mi?e/plugins/x`,
+        # `~/.a?df/plugins`, `trusted-c*` -- QA round 9).
+        for v in _mise_glob_variants(w):
+            if MISE_PATH_RE.search(v) or MISE_CONFIG_DIR_RE.search(v):
+                return True
         parts = w.replace("\\", "/").split("/")
         for n in (1, 2, 3):
             if len(parts) < n:
@@ -9822,6 +9889,30 @@ def _mise_spec_unsafe(spec: str) -> bool:
 
 
 _MISE_PUNCT = "();<>|&`\n"
+_MISE_WRAPPERS = frozenset(("sudo", "env", "command", "exec", "nohup", "time", "nice",
+                            "doas", "builtin", "then", "do", "else", "!", "{"))
+
+
+def _mise_glob_binary(cmd: str) -> bool:
+    """A simple command whose COMMAND word is a glob matching mise/rtx/asdf
+    (`~/.local/bin/m*e trust`, `/usr/bin/mi?e trust` -- QA round 9). Only
+    the command position, and the glob needs a literal letter (`ls *` is
+    not one)."""
+    if not any(c in cmd for c in "*?["):
+        return False
+    for n, seg in enumerate(re.split(r"&&|\|\||[;&|\n(){}`]", cmd)):
+        if n > 4000:
+            return True
+        words = seg.split()
+        while words and (words[0].lower() in _MISE_WRAPPERS or _HTTP_RC_ASSIGN_RE.match(words[0])):
+            words.pop(0)
+        if not words:
+            continue
+        base = words[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if any(c in base for c in "*?[") and re.search(r"[a-z]", base) and len(base) <= 40 \
+                and any(fnmatch.fnmatchcase(b, base) for b in _MISE_CLI_BINS):
+            return True
+    return False
 # `mise`/`rtx`/`asdf` as a word, not inside `promise`/`premises` (QA round 2).
 _MISE_BIN_WORD_RE = re.compile(r"(?<![\w.\-])(?:mise|rtx|asdf)(?:\.exe)?(?![\w\-])",
                                re.IGNORECASE)
@@ -9842,6 +9933,9 @@ def _mise_cli_segments(cmd: str) -> list:
     `{{exec(...)}}` stays one word), split at `;`/`&`/`|`/`(`/`)`/backtick/
     newline. Unbalanced quoting falls back to a plain regex split."""
     import shlex as _sh
+    if len(cmd) > 50_000:
+        # shlex is quadratic on one long token (QA round 9): quote-unaware split.
+        return [seg.split() for seg in _MISE_CLI_SEG_RE.split(cmd)]
     try:
         lx = _sh.shlex(cmd, posix=True, punctuation_chars=_MISE_PUNCT)
         lx.whitespace = " \t\r"        # `\n` separates commands (QA round 1)
@@ -9875,6 +9969,8 @@ def mise_cli_hit(cmd) -> str:
         return ""
     cmd = cmd.replace("\\", "") if "\\" in cmd else cmd   # `mi\se` is `mise`
     low = cmd.lower()
+    if _mise_glob_binary(cmd):
+        return "mise binary named by a glob"       # `~/.local/bin/m*e trust` (QA round 9)
     if "mise" not in low and "rtx" not in low and "asdf" not in low:
         return ""               # every gated CLI form names one (perf)
     # `mise$IFS trust` / `mise${IFS}trust` (QA round 2; as rule_direnv_protect).
@@ -9937,7 +10033,10 @@ def _mise_cli_hit(cmd: str, depth: int) -> str:
             if base.endswith(".exe"):
                 base = base[:-4]
             if base not in _MISE_CLI_BINS:
-                continue
+                if not (any(c in base for c in "*?[") and any(
+                        fnmatch.fnmatchcase(b, base) for b in _MISE_CLI_BINS)):
+                    continue
+                return "mise binary named by a glob"     # `~/.local/bin/m*e trust` (QA round 9)
             if not _mise_is_command_word(words, i):
                 continue
             if any(x.replace("\\", "/").rsplit("/", 1)[-1].lower() in ("xargs", "parallel")

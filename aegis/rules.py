@@ -15321,8 +15321,9 @@ def _mise_target_kind(ev: Event, p: str) -> tuple:
     return "", p
 
 
-_MISE_DIR_KEY_WORDS = frozenset(("dir", "directory", "folder", "parent", "cwd", "root", "base"))
-_MISE_NAME_KEY_WORDS = frozenset(("name", "filename", "basename"))
+_MISE_DIR_KEY_WORDS = frozenset(("dir", "directory", "folder", "parent", "cwd", "root", "base",
+                                 "path", "location", "target", "dest", "destination"))
+_MISE_NAME_KEY_WORDS = frozenset(("name", "filename", "basename", "file"))
 
 
 def _mise_mcp_item_content(a, p: str):
@@ -15634,7 +15635,15 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``ref:`` versions; whole-directory placement onto ``~/.config/mise``/
     ``.mise``/the asdf and mise runtime dirs (shell and MCP move/copy).
     Writing through a symlinked alias of a mise dir is not resolved -- the
-    engine-wide symlink gap sibling guards share.
+    engine-wide symlink gap sibling guards share. Round 9 found chained
+    ``cd``s (``cd ~/.config && cd mise && ...``) and bare relative
+    directory names (``cd ~/.config && cp -r evil mise``, cwd ``~/.config``)
+    -- every path word is now resolved against the event cwd and each
+    sequentially-tracked ``cd`` target; MCP directory placement now
+    normalizes/decodes/cwd-joins; ``$XDG_CONFIG_HOME/mise``; globs inside
+    runtime/trust-store/default-package paths (component-wise vocabulary
+    match) and a glob-named binary (``~/.local/bin/m*e trust``); more MCP
+    ``{path|location, name|file}`` shapes; shlex skipped above 50 KB.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -15707,6 +15716,7 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                 names = [v for k, v in a.items() if isinstance(v, str)
                          and (_http_rc_words(k) & _MISE_NAME_KEY_WORDS
                               or str(k).lower() in ("file_name", "filename", "name"))]
+                names = [n for n in names if "/" not in n and "\\" not in n]
                 for d_ in dirs[:8]:
                     for n_ in names[:8]:
                         k_, _ = _mise_target_kind(ev, d_.rstrip("/\\") + "/" + n_)
@@ -15720,7 +15730,17 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                 # Moving/copying/linking a whole directory onto a mise
                 # config dir (QA round 8).
                 for s_ in _flatten_strings(a):
-                    if patterns.MISE_CONFIG_DIR_RE.search(str(s_)):
+                    t_ = str(s_).strip()
+                    if not t_ or "\n" in t_ or len(t_) > 4096:
+                        continue
+                    if t_.lower().startswith("file://"):
+                        t_ = t_[7:]
+                    t_ = urllib.parse.unquote(t_)
+                    if ev.cwd:
+                        t_ = patterns._mise_join(str(ev.cwd), t_)
+                    t_ = patterns._ed_dotdot_normalize(t_.replace("\\", "/")).rstrip("/")
+                    m_ = patterns.MISE_CONFIG_DIR_RE.search(t_)
+                    if m_ and m_.end() >= len(t_) - 1:
                         kind, p, found = "dir", str(s_), ["<directory placed onto a mise config/runtime dir>"]
                         break
             if not kind and not _http_rc_mcp_read_only(ev):

@@ -845,3 +845,60 @@ def test_qa8_routine_still_allowed(tmp_path):
     for cmd in ("cd ~/project && cp a b", "ls ~/.config/mise", "cat ~/.config/mise/config.toml",
                 "git add mise.toml"):
         assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 9 regressions --------------------------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cd ~/.config && cd mise && cp /tmp/c config.toml", None),
+    ("cd ~/.config && mkdir -p mise && cd mise && printf x > config.toml", None),
+    ("cd ~/.config\ncd mise\ncp /tmp/c config.toml", None),
+    ("cd ~/.config && pushd mise && cp /tmp/c config.toml", None),
+    ("cd ~ && cd .config && cd mise && cp c config.toml", None),
+    ("cd ~/.config && cp -r /tmp/evil mise", None), ("cd ~/.config && mv /tmp/evil ./mise", None),
+    ("cd ~/.config && rsync -a /tmp/e/ mise/", None),
+    ("cp -r /tmp/evil mise", "/home/u/.config"), ("ln -sfn /tmp/evil mise", "/home/u/.config"),
+    ("cp -r /tmp/p mise/plugins/node", "/home/u/.local/share"),
+    ("cp -r /tmp/evil $XDG_CONFIG_HOME/mise", None),
+    ("cp -r /tmp/evil ${XDG_CONFIG_HOME:-~/.config}/mise", None),
+    ("cp x ~/.local/share/mi?e/plugins/foo", None), ("cp x ~/.asdf/sh?ms/node", None),
+    ("cp x ~/.a?df/plugins/x/bin/exec-env", None), ("cp x ~/.local/state/mise/trusted-c*/abc", None),
+    ("cp x ~/.default-npm-packag?s", None), ("~/.local/bin/m*e trust", None),
+    ("/usr/bin/mi?e trust", None),
+])
+def test_qa9_shell(cmd, cwd):
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd=cwd)
+    d = rule_mise_exec_protect(ev, EMPTY)
+    assert d is not None and d.rule == RULE, (cmd, cwd)
+
+
+def test_qa9_mcp():
+    for args, cwd, tool in (
+            ({"source": "/tmp/evil", "destination": "/home/u/.config/x/../mise"}, None, "mcp__fs__move_file"),
+            ({"source": "/tmp/evil", "destination": "mise"}, "/home/u/.config", "mcp__fs__move_file"),
+            ({"path": "/x/.mise", "name": "config.toml", "content": HOOK}, None, "mcp__fs__write_file"),
+            ({"location": "/x/.mise", "file": "config.toml", "content": HOOK}, None, "mcp__fs__write_file")):
+        ev = Event.make(HookEvent.PRE_TOOL_USE, tool=tool, action=ActionClass.MCP, args=args, cwd=cwd)
+        d = rule_mise_exec_protect(ev, EMPTY)
+        assert d is not None and d.rule == RULE, args
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cd ~/.config && ls", None), ("cd src && cp a b", "/home/u/proj"),
+    ("cp -r build dist", "/home/u/.config/myapp"), ("git clone x", "/home/u/.config"),
+    ("cd ~/proj && cp -r tmpl mise-docs", None), ("cp *.md docs/", None),
+])
+def test_qa9_allowed(cmd, cwd):
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd=cwd)
+    assert rule_mise_exec_protect(ev, EMPTY) is None, (cmd, cwd)
+
+
+def test_qa9_long_token_fast():
+    import time
+    t = time.time()
+    rule_mise_exec_protect(_shell("cp x " + "mise/" * 79000), EMPTY)
+    assert time.time() - t < 3
+
+
+@pytest.mark.parametrize("cmd", ["ls *", "echo *", "cp * dist/", "rm -f *.pyc", "ls ?", "cat [ab]*"])
+def test_qa9_glob_binary_no_fp(cmd):
+    assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
