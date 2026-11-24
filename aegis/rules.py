@@ -15688,7 +15688,11 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     now keeps the literal prefix and covers the last 12 glob components of
     the whole word; and wrapper forms hiding placement (``sudo -iu u``,
     ``stdbuf -o 0``, ``taskset -c 0``, ``time -o f``, ``exec -a x``, ``sh -c
-    BODY`` / ``bash -lc``, ``jj --no-pager git clone``).
+    BODY`` / ``bash -lc``, ``jj --no-pager git clone``). Round 15 found
+    ``.miserc.toml`` judged with the mise.toml schema, so its top-level
+    ``override_config_filenames`` (load a config under an unguarded name)
+    and ``ignored_config_paths`` (drop the global config) passed -- it now
+    has its own allowlist (only ``env`` with plain names).
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

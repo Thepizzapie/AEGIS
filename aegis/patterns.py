@@ -9493,8 +9493,12 @@ def mise_kind(path) -> str:
     if not isinstance(path, str) or not path:
         return ""
     for m in MISE_CONFIG_PATH_RE.finditer(path):
-        return "tool-versions" if m.group(0).lower().rstrip(" .").endswith(
-            ".tool-versions") else "toml"
+        g = m.group(0).lower().rstrip(" .")
+        if g.endswith(".tool-versions"):
+            return "tool-versions"
+        if re.search(r"(?:^|[/\\\s'\"=:<>|&;(`{,])\.?miserc(?:\.[\w-]+)*\.toml$", g):
+            return "miserc"
+        return "toml"
     m = MISE_RUNTIME_DIR_RE.search(path)
     if m:
         t = m.group(0).lower()
@@ -10011,9 +10015,43 @@ def mise_tool_versions_unsafe_entries(content) -> list:
     return out
 
 
+_MISE_RC_ENV_NAME_RE = re.compile(r"^[\w.\-]{1,64}$")
+
+
+def mise_miserc_unsafe_entries(content) -> list:
+    """`.miserc.toml` is read as TOP-LEVEL early settings (mise
+    `src/config/miserc.rs`): `override_config_filenames`/
+    `override_tool_versions_filenames` make mise load configs under names
+    no guard knows, `ignored_config_paths` drops the human's global config
+    (and its `paranoid = true`), `ceiling_paths`/`env_conf_d`/`env_sets`
+    reshape which files load (QA round 15). Allowlist: only `env` (plain
+    environment names, selecting the already-gated `mise.<env>.toml`)."""
+    out = []
+    if not isinstance(content, str) or not content.strip():
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+    if _mise_toml is None:
+        return [("<no TOML parser available>", _mise_fp("noparser", content))]
+    try:
+        doc = _mise_toml.loads(content.lstrip("\ufeff"))
+    except Exception:
+        return [("<unparseable TOML>", "<unparseable>")]
+    for k, v in doc.items():
+        if k == "env":
+            vals = v if isinstance(v, list) else [v]
+            if all(isinstance(x, str) and _MISE_RC_ENV_NAME_RE.match(x) for x in vals):
+                continue
+        out.append((f"miserc {k}"[:60], _mise_fp("miserc", k, v)))
+    _mise_templates(doc, [], out)
+    return out
+
+
 def mise_unsafe_entries(content, kind: str) -> list:
     if kind == "tool-versions":
         return mise_tool_versions_unsafe_entries(content)
+    if kind == "miserc":
+        return mise_miserc_unsafe_entries(content)
     return mise_toml_unsafe_entries(content)
 
 

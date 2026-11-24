@@ -1101,3 +1101,27 @@ def test_qa14_gated(cmd):
 ])
 def test_qa14_allowed(cmd):
     assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 15 regressions -------------------------------------------------
+@pytest.mark.parametrize("content", [
+    'override_config_filenames = ["build.toml"]\n',
+    'override_tool_versions_filenames = ["x"]\n',
+    'ignored_config_paths = ["/root/.config/mise/config.toml"]\n',
+    'ceiling_paths = ["/"]\n', 'env_conf_d = "x"\n', 'env_sets = {a = ["b"]}\n',
+    'env = ["../x"]\n', 'bad = = toml',
+])
+def test_qa15_miserc_gated(content, tmp_path):
+    d = evaluate(_write(str(tmp_path / ".miserc.toml"), content), EMPTY)
+    assert _ours(d), content
+
+
+@pytest.mark.parametrize("content", ['env = ["dev"]\n', 'env = "ci"\n', ''])
+def test_qa15_miserc_allowed(content, tmp_path):
+    assert _allowed(evaluate(_write(str(tmp_path / ".miserc.toml"), content), EMPTY))
+
+
+def test_qa15_miserc_kind():
+    assert patterns.mise_kind("/r/.miserc.toml") == "miserc"
+    assert patterns.mise_kind("/r/miserc.local.toml") == "miserc"
+    assert patterns.mise_kind("/r/mise.toml") == "toml"
