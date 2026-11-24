@@ -15295,6 +15295,32 @@ def _mise_mcp_delete_only(ev: Event) -> bool:
     return not _editor_startup_has_content_key(ev.args or {})
 
 
+def _mise_mcp_item_content(a, p: str, _depth: int = 0):
+    """Content of the one list item `{path: p, content: ...}`, if exactly
+    one item names `p` and every mise-path item is that one; else None."""
+    if _depth > 6:
+        return None
+    if isinstance(a, dict):
+        for v in a.values():
+            r = _mise_mcp_item_content(v, p, _depth + 1)
+            if r is not None:
+                return r
+        return None
+    if not isinstance(a, list):
+        return None
+    hits = []
+    for it in a:
+        if not isinstance(it, dict):
+            continue
+        ip = str(it.get("path") or it.get("file_path") or it.get("filename") or "")
+        if patterns.mise_kind(ip):
+            hits.append((ip, it))
+    if len(hits) != 1 or hits[0][0].strip() != p:
+        return None
+    c = hits[0][1].get("content", hits[0][1].get("contents"))
+    return c if isinstance(c, str) else None
+
+
 def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
     """Labels of exec-bearing constructs the call would ADD to the file.
     Write/Edit/MultiEdit/MCP edits are applied to the on-disk file and the
@@ -15307,6 +15333,10 @@ def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
         return []
     if kind == "dir":
         return ["<write into a mise/asdf plugin, shim or install directory>"]
+    if kind == "lock":
+        return ["<write to the mise lockfile (pins every tool's download URL/checksum)>"]
+    if kind == "trust":
+        return ["<write to mise's trust store (a file here IS `mise trust`)>"]
     if ev.action == ActionClass.MCP:
         if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
             return ["<copied/moved from another file>"]
@@ -15335,6 +15365,10 @@ def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
             return ["<edit not verifiable against the file on disk>"]
     elif isinstance(content, str):
         after = content
+    elif ev.action == ActionClass.MCP and _mise_mcp_item_content(a, p) is not None:
+        # A multi-file push (`files: [{path, content}, ...]`): judge the
+        # mise item's own content, not every file's joined (QA round 2).
+        after = _mise_mcp_item_content(a, p)
     elif ev.action == ActionClass.MCP:
         body = [x for x in _http_rc_mcp_strings(ev, a) if x.strip() and x.strip() != p]
         after = "\n".join(body)
@@ -15347,6 +15381,12 @@ def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
             had.remove(fp)
         else:
             added.append(label)
+    if kind == "toml" and before:
+        # Removing a human-set `paranoid`/`gpg_verify = true` (QA round 2).
+        sw_before = patterns.mise_toml_safety_switches(before) or set()
+        sw_after = patterns.mise_toml_safety_switches(after)
+        if sw_after is not None:
+            added.extend(f"removes settings.{k} = true" for k in sorted(sw_before - sw_after))
     return added
 
 
@@ -15443,7 +15483,12 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``pipx:``/``cargo:``) on first add; ``[env]`` names that are often
     routine but can carry exec (``JAVA_HOME``/``GOPATH``/``*_HOME``,
     ``*PATH``, ``RUSTFLAGS``/``*FLAGS``, any ``NODE_OPTIONS``) and
-    ``_.path``/``_.file`` directives, on first add only; unparseable TOML.
+    ``_.path``/``_.file`` directives, on first add only; unparseable TOML;
+    ``-y``/``--yes`` on any mise command (before a ``run``/``exec`` task
+    name) and ``CI=`` on a mise command or ``export CI=`` beside one;
+    quoted text, commit messages and heredoc bodies that merely mention a
+    gated form (``git commit -m 'run mise trust'``) -- as
+    ``rule_direnv_protect`` does for ``direnv allow``.
 
     QA history (two independent reviews, bypass-hunting and design/false-
     positive, in parallel). Round 1 found: a newline between commands
@@ -15470,6 +15515,22 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     fingerprints truncated at 4000 chars (now a full sha256); also added
     ``[shell_alias]``, ``[prepare]``, ``vars._``, ``mise tool-alias set``,
     ``BASH_FUNC_*``, ``LUA_INIT``, ``PHPRC``, ``CONFIG_SITE``, ``RSYNC_RSH``.
+    Round 2 (bypass) found: argv-shaped MCP exec tools newline-joined into
+    separate commands (the argv is now also judged space-joined); ``+=``,
+    ``\\``-escaped, ``export --`` and brace-word ``MISE_*`` assignments --
+    every assigned ``MISE_*``/``RTX_*`` name is now judged against the
+    settings allowlist (closing ``MISE_NODE_MIRROR_URL=`` too); ``$IFS``
+    splitting; ``mise link``/``sync``, ``mise local/global`` and ``asdf
+    set/local/global`` with ``path:``/``ref:`` versions; removing a human-set
+    ``paranoid``/``gpg_verify = true`` by Edit; zsh ``PROMPT``/``RPROMPT``;
+    ``.miserc.toml``, ``conf.d/.toml``, longer env-name chains. Round 2
+    (design) PASSED with should-fixes, closed: ``CI=`` and the prefilter now
+    need ``mise``/``rtx``/``asdf`` as a whole word (``promise``); template
+    test requires ``exec(``; CLI judging bounded (at most 64 mise words per
+    simple command, failing closed); a multi-file MCP push judges the mise
+    item's own content; distinct lockfile/trust-store labels; list-valued
+    ``command``; version-only aliases, frontend ``VITE_``/``NEXT_PUBLIC_``
+    constants and ``*_compile`` settings allowed.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -15484,6 +15545,9 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         return would
 
+    if isinstance(ev.args, dict) and isinstance(ev.args.get("command"), (list, tuple)):
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={**ev.args, "command": " ".join(str(x) for x in ev.args["command"])})
     if not isinstance(ev.args, dict):
         # A non-dict payload would make the shared helpers raise, which the
         # engine treats as allow (QA round 1) -- judge it as text instead.
@@ -15498,6 +15562,13 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
                              args={"command": shell_cmd}, cwd=ev.cwd)
             d = rule_mise_exec_protect(sub, policy)
+            if d is None and "\n" in shell_cmd:
+                # argv-shaped tools (`{command: mise, args: [trust]}`) come
+                # back newline-joined; judge the space-joined argv too (QA
+                # round 2).
+                sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                 args={"command": shell_cmd.replace("\n", " ")}, cwd=ev.cwd)
+                d = rule_mise_exec_protect(sub, policy)
             if d is not None:
                 return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
                                 "command that touches mise/asdf config. " + d.message)
@@ -15553,13 +15624,13 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "AEGIS_ALLOW_MISE_EXEC=1; a spawned agent cannot."))
 
     if _is_shell(ev):
-        raw = _cmd(ev)
+        raw = re.sub(r"\$\{?IFS\}?", " ", _cmd(ev))
         cmd = normalize.scan_surface(raw, sep="\n")
         writes = False
         if (patterns.mise_shell_path_hit(cmd) or patterns.mise_shell_path_hit(raw)):
             writes = not (patterns.mise_shell_only_reads(cmd)
                           and patterns.mise_shell_only_reads(raw))
-        cli = patterns.mise_cli_hit(cmd) or patterns.mise_cli_hit(raw)
+        cli = "" if writes else (patterns.mise_cli_hit(cmd) or patterns.mise_cli_hit(raw))
         if not (writes or cli):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MISE_EXEC")

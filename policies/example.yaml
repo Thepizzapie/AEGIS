@@ -55,7 +55,8 @@
 # or a trust-removing setting asks a human first; routine edits
 # (node = "22") pass. `mise trust`, `mise settings set
 # trusted_config_paths ...`, `mise plugins install` and writes into the
-# mise/asdf plugin/shim dirs ask too. A human pre-approves with
+# mise/asdf plugin/shim dirs, mise's trust store, mise.lock, `mise -y`,
+# `CI=` on a mise command and assigned MISE_* settings ask too. A human pre-approves with
 # AEGIS_ALLOW_MISE_EXEC=1 or a trailing '# aegis-allow'; a spawned agent
 # cannot. Shell `allow` regexes must match the WHOLE command.
 #   mise_exec:
