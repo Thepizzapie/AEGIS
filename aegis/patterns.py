@@ -9256,7 +9256,7 @@ def _mise_join(base: str, w: str) -> str:
 
 _MISE_CWD_VOCAB = ("mise", "rtx", "asdf", "conf.d", ".toml", "tool-versions", "plugins",
                    "shims", "installs", "trusted", "ignored", "default-", ".lock",
-                   "*", "?", "[", "{")
+                   "*", "?", "[")
 _MISE_CWD_MAX_DIR = 1024
 _MISE_CWD_MAX_JOINS = 3000
 
@@ -9275,64 +9275,96 @@ def _mise_dir_or_path_hit(p: str) -> bool:
     return False
 
 
-def mise_cwd_hit(cmd: str, cwd) -> bool:
-    """True if some path word of the command, resolved against the event
-    cwd and every directory a `cd`/`pushd` (chained: `cd ~/.config && cd
-    mise`) may have left it in, is a mise config/runtime dir or file -- a
-    bare `config.toml`, or `cp -r evil mise` from `~/.config` (QA rounds
-    8-9). Words are dequoted/unescaped by the shell tokenizer, `--opt=VAL`
-    values and brace/glob forms are expanded (QA round 10), only words
-    carrying mise vocabulary are joined, and total work is capped, failing
-    closed (QA round 10: a 125 KB cd/word cross product took 65 s)."""
-    if not isinstance(cmd, str) or not cmd:
-        return False
-    segs = _mise_cli_segments(cmd)
-    dirs = [str(cwd)] if cwd else []
-    cur = str(cwd) if cwd else ""
-    words = []
-    for seg in segs:
-        k = 0
-        while k < len(seg):
-            w = seg[k]
-            if w in ("cd", "pushd") and k + 1 < len(seg):
-                q = k + 1
-                while q < len(seg) and seg[q].startswith("-") and seg[q] != "-":
-                    q += 1
-                if q < len(seg):
-                    t = seg[q]
-                    if t != "-":
-                        for tt in _brace_expand(t, 8):
-                            cur = _mise_join(cur, tt) if cur or tt.startswith(("/", "~", "$")) else tt
-                            dirs.append(cur)
-                    k = q + 1
-                    continue
-            words.append(w)
-            k += 1
-    dirs = [d for d in dict.fromkeys(dirs) if d]
-    if not dirs:
-        return False
-    if len(dirs) > 32 or any(len(d) > _MISE_CWD_MAX_DIR for d in dirs):
-        return True                    # fail closed on absurd input
-    cand = []
-    for w in dict.fromkeys(words):
+_MISE_PLACE_VERBS = frozenset(("cp", "mv", "ln", "rsync", "install", "ditto", "scp"))
+
+
+def _mise_cand_words(ws) -> list:
+    out = []
+    for w in ws:
         if w.startswith("-"):
             if "=" not in w:
                 continue
             w = w.split("=", 1)[1]
         if not w or len(w) > 1024:
             continue
-        lw = w.lower()
-        if not any(v in lw for v in _MISE_CWD_VOCAB):
+        for e in (_brace_expand(w, 8) if "{" in w else [w]):
+            if any(v in e.lower() for v in _MISE_CWD_VOCAB):
+                out.append(e)
+    return out
+
+
+def mise_cwd_hit(cmd: str, cwd) -> bool:
+    """True if some path word of the command, resolved against the event
+    cwd and every directory a `cd`/`pushd` (chained: `cd ~/.config && cd
+    mise`) may have left it in, is a mise config/runtime dir or file -- a
+    bare `config.toml`, or `cp -r evil mise` from `~/.config` (QA rounds
+    8-9); or if a cp/mv/ln/rsync/`git clone` places a source whose BASENAME
+    is a mise dir into a mise parent (`cp -r /tmp/mise ~/.config/`, `cd
+    ~/.config && git clone https://x/mise` -- QA round 11). Words are
+    shell-dequoted, `--opt=VAL` values and brace/glob forms expanded, only
+    mise-vocabulary words joined, and work is capped (QA rounds 10-11)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    segs = _mise_cli_segments(cmd)
+    if len(segs) > 4000:
+        return True
+    cur = str(cwd) if cwd else ""
+    dirs = {}
+    if cur:
+        dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+    words = []
+    joins = 0
+    for seg in segs:
+        while seg and (seg[0].lower() in _MISE_WRAPPERS or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+            seg = seg[1:]
+        if not seg:
             continue
-        cand.extend(_brace_expand(w, 8))
+        v0 = seg[0].rsplit("/", 1)[-1].lower()
+        if v0 in ("cd", "pushd") and len(seg) > 1:
+            q = 1
+            while q < len(seg) and seg[q].startswith("-") and seg[q] != "-":
+                q += 1
+            if q < len(seg) and seg[q] != "-":
+                for tt in _brace_expand(seg[q], 8):
+                    nxt = _mise_join(cur, tt) if cur or tt.startswith(("/", "~", "$")) else tt
+                    nn = _ed_dotdot_normalize(nxt.replace("\\", "/")).rstrip("/") or "/"
+                    if len(nn) > _MISE_CWD_MAX_DIR:
+                        return True
+                    dirs[nn] = None
+                    cur = nn
+            continue
+        # Known-name placement into a parent (QA round 11).
+        pos = [w for w in seg[1:] if not w.startswith("-")]
+        if v0 in _MISE_PLACE_VERBS and len(pos) >= 2:
+            dest, srcs = pos[-1], pos[:-1]
+            dbase = _mise_join(cur, dest) if cur else dest
+            for sw in srcs[:200]:
+                b = sw.rstrip("/").replace("\\", "/").rsplit("/", 1)[-1]
+                if b and _mise_dir_or_path_hit(dbase.rstrip("/") + "/" + b):
+                    return True
+        if v0 == "git" and "clone" in seg:
+            k = seg.index("clone")
+            cp_ = [w for w in seg[k + 1:] if not w.startswith("-")]
+            if cp_:
+                tgt = cp_[1] if len(cp_) > 1 else cp_[0].rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+                if _mise_dir_or_path_hit(_mise_join(cur, tgt) if cur else tgt):
+                    return True
+        words.extend(seg)
+    if not dirs:
+        return False
+    if len(dirs) > 512:
+        return True
+    for d in dirs:
+        if _mise_dir_or_path_hit(d):
+            return True
+    cand = list(dict.fromkeys(_mise_cand_words(dict.fromkeys(words))))
+    if not cand:
+        return False
     if len(cand) * len(dirs) > _MISE_CWD_MAX_JOINS:
         return True                    # fail closed (bounded work)
     for d in dirs:
-        dn = d.replace("\\", "/")
-        if _mise_dir_or_path_hit(dn):
-            return True
         for w in cand:
-            if _mise_dir_or_path_hit(_mise_join(dn, w)):
+            if _mise_dir_or_path_hit(_mise_join(d, w)):
                 return True
     return False
 
@@ -9375,8 +9407,12 @@ _MISE_GLOB_VOCAB = (
 
 
 def _mise_glob_variants(word: str, budget: int = 64) -> list:
+    """Vocabulary substitutions of a glob word's LAST six components only
+    (every mise path regex spans fewer), so the work per word is bounded
+    regardless of its length (QA round 11: a 395-char `sh*/sh*/...` word
+    made 64 full-length variants)."""
     out = [""]
-    comps = word.replace("\\", "/").split("/")
+    comps = word.replace("\\", "/").split("/")[-6:]
     for ci, comp in enumerate(comps):
         opts = [comp]
         if ci == len(comps) - 1 and re.fullmatch(r"[*?.]*(?:toml|lock)?", comp.lower()):
@@ -9414,6 +9450,7 @@ def mise_shell_path_hit(cmd) -> bool:
         norm = _ed_dotdot_normalize(cmd)
         if norm != cmd and (MISE_PATH_RE.search(norm) or MISE_CONFIG_DIR_RE.search(norm)):
             return True
+    seen_glob = set()
     unesc = cmd.replace("\\", "")
     if unesc != cmd and any(k in low for k in _MISE_LITERAL_KEYS) and MISE_PATH_RE.search(unesc):
         return True
@@ -9428,6 +9465,10 @@ def mise_shell_path_hit(cmd) -> bool:
         # Component-wise: substitute each glob component by any mise
         # vocabulary name it matches (`~/.local/share/mi?e/plugins/x`,
         # `~/.a?df/plugins`, `trusted-c*` -- QA round 9).
+        tail6 = "/".join(w.replace("\\", "/").split("/")[-6:])
+        if tail6 in seen_glob:
+            continue
+        seen_glob.add(tail6)
         for v in _mise_glob_variants(w):
             if MISE_PATH_RE.search(v) or MISE_CONFIG_DIR_RE.search(v):
                 return True

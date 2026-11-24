@@ -937,3 +937,39 @@ def test_qa10_cwd_join_bounded():
     rule_mise_exec_protect(Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
                                       args={"command": cmd2}, cwd="/p"), EMPTY)
     assert time.time() - t < 2
+
+
+# ---- QA round 11 regressions -------------------------------------------------
+def test_qa11_glob_padding_bounded():
+    import time
+    w = ("sh*/" * 100)[:390]
+    pad = " ".join(f"{w}x{i}" for i in range(150))
+    t = time.time()
+    d = rule_mise_exec_protect(_shell(f"ls {pad} >/dev/null; cd ~/.config && cp -r /tmp/evil mise"), EMPTY)
+    assert d is not None
+    assert time.time() - t < 1.5
+    t = time.time()
+    rule_mise_exec_protect(_shell(f"ls {pad} >/dev/null; true"), EMPTY)
+    assert time.time() - t < 1.5
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd /repo && " + " && ".join(f"cd svc{i} && make && cd .." for i in range(40)),
+    " && ".join(f"cd packages/p{i} && npm run build && cd ../.." for i in range(33)),
+    " && ".join(f"cd d{i} && cp x.{{json,yaml}} out/ && cd .." for i in range(16))
+    + " && " + " ".join(f"cp a{i}.{{json,yaml}} out/" for i in range(200)),
+])
+def test_qa11_ci_scripts_allowed(cmd):
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd="/repo")
+    assert rule_mise_exec_protect(ev, EMPTY) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp -r /tmp/mise ~/.config/", "mv /tmp/evil/mise ~/.config/",
+    "cd ~/.config && cp -r /tmp/mise .", "cd ~/.config && git clone https://x/mise",
+    "cd ~/.config && git clone https://x/mise.git", "cd ~/.config && cp -r /tmp/evil mi$'s'e",
+    "builtin cd ~/.config && cp -r evil mise",
+])
+def test_qa11_placement(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd

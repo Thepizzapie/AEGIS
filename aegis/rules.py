@@ -15651,7 +15651,16 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     brace/glob forms expanded, only mise-vocabulary words joined, and the
     total work capped (failing closed); ``xargs m?se trust``. Accepted:
     any non-read command run with the session cwd INSIDE a mise config
-    dir (``make`` in ``~/.config/mise``) asks.
+    dir (``make`` in ``~/.config/mise``) asks. Round 11 found glob-variant
+    expansion over long multi-component words a fail-open DoS (now only the
+    last six components are substituted, cached per word); the caps failing
+    closed on routine CI scripts with many ``cd``s (dirs now normalized and
+    deduplicated, the join cap applies only when mise-vocabulary words
+    exist, plain brace words no longer count); known-name placement into a
+    parent (``cp -r /tmp/mise ~/.config/``, ``cd ~/.config && git clone
+    https://x/mise``) -- source basenames are now joined onto the
+    destination; ``mi$'s'e``; an MCP vocabulary prefilter bounding large
+    multi-item calls.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -15710,7 +15719,11 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                     kind, p = patterns.mise_kind(s_.strip()), s_.strip()
                     break
                 t_ = s_.strip()
-                if t_ and "\n" not in t_ and " " not in t_ and len(t_) < 4096 and (
+                lt_ = t_.lower()
+                if t_ and "\n" not in t_ and " " not in t_ and len(t_) < 4096 and any(
+                        k in lt_ for k in ("mise", "rtx", "asdf", "tool-versions", "default-",
+                                           ".toml", ".lock", "%", "config", "..", "plugins",
+                                           "shims", "installs", "trusted")) and (
                         "/" in t_ or "\\" in t_ or t_.lower().endswith((".toml", ".lock"))
                         or t_ == ".tool-versions"):
                     k_, _ = _mise_target_kind(ev, t_)
@@ -15791,7 +15804,9 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         cmd = normalize.scan_surface(raw, sep="\n")
         writes = False
         if (patterns.mise_shell_path_hit(cmd) or patterns.mise_shell_path_hit(raw)
-                or patterns.mise_cwd_hit(raw, ev.cwd)):
+                or patterns.mise_cwd_hit(raw, ev.cwd)
+                # The scan rendering decodes `$'..'` (QA round 11: `mi$'s'e`).
+                or ("$'" in raw and patterns.mise_cwd_hit(cmd, ev.cwd))):
             writes = not (patterns.mise_shell_only_reads(cmd)
                           and patterns.mise_shell_only_reads(raw))
         cli = "" if writes else (patterns.mise_cli_hit(cmd) or patterns.mise_cli_hit(raw))
