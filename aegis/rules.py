@@ -15573,8 +15573,15 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     -y``) -- every pre-``--`` word of ``exec`` and every option (with its
     value) before a ``run`` task name now counts; false ASKs on ``find
     -exec grep mise {}``/``xargs grep mise`` (a mise word under xargs/find
-    is the binary only in command position); a quoted ``"{mise,x}"`` still
+    is a mention only under a read-only tool); a quoted ``"{mise,x}"`` still
     asks (the quote-stripped scan rendering expands it) -- accepted nit.
+    Round 6 found the round-5 "first word after the runner" narrowing hid
+    wrapped calls (``xargs env mise trust``, ``find -exec sudo mise trust``,
+    ``parallel -S host mise``) and quoted ``xargs -I% sh -c 'mise %'`` -- the
+    logic is inverted: a mise word under a runner is a mention only when the
+    runner's command is a known read-only tool (``grep``/``cat``/``ls``...),
+    and any quoted command naming mise under a runner asks; ``-y`` hidden
+    by an option value spelled like the subcommand (``mise -E run run -y``).
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

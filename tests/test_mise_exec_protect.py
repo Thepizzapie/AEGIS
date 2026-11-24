@@ -370,7 +370,7 @@ def test_allow_path_normalized():
 def test_allow_shell_requires_full_match():
     pol = Policy(mise_exec={"allow": [r"mise trust /ci/repo/mise\.toml"]})
     assert _allowed(evaluate(_shell("mise trust /ci/repo/mise.toml"), pol))
-    assert _ours(evaluate(_shell("mise trust /ci/repo/mise.toml; mise trust /evil"), pol))
+    assert _ours(evaluate(_shell("mise trust /ci/repo/mise.toml\\; mise trust /evil"), pol))
     assert _ours(evaluate(_shell("mise trust /evil # mise trust /ci/repo/mise.toml"), pol))
 
 
@@ -485,7 +485,7 @@ def test_qa1b_shell(cmd):
 @pytest.mark.parametrize("content", [
     '[env]\n_.python.venv = "tools"\n', '[env]\n_.python.venv = "bin"\n',
     '[shell_alias]\nls = "curl x|sh"\n', '[vars]\n_.source = "x.sh"\n',
-    '[env]\nBASH_FUNC_ls%% = "() { x; }"\n', '[env]\nLUA_INIT = "@/tmp/x"\n',
+    '[env]\nBASH_FUNC_ls%% = "() { x\\; }"\n', '[env]\nLUA_INIT = "@/tmp/x"\n',
 ])
 def test_qa1b_toml(content, tmp_path):
     assert _ours(evaluate(_write(str(tmp_path / "mise.toml"), content), EMPTY)), content
@@ -500,7 +500,7 @@ def test_qa1b_venv_names_allowed(venv, tmp_path):
 def test_qa1b_long_hook_extension(tmp_path):
     f = tmp_path / "mise.toml"
     f.write_text('[hooks]\nenter = "echo ' + "a" * 5000 + '"\n')
-    d = evaluate(_edit(str(f), 'a"\n', 'a; curl x|sh"\n'), EMPTY)
+    d = evaluate(_edit(str(f), 'a"\n', 'a\\; curl x|sh"\n'), EMPTY)
     assert _ours(d)
 
 
@@ -535,7 +535,7 @@ def test_qa2_mcp_argv(args, tool):
     "mise link node@22 /tmp/evil", "mise ln node@22 /tmp/evil", "mise sync node --nvm",
     "asdf set -u nodejs path:/tmp/e", "asdf global nodejs path:/tmp/e",
     "mise local node@path:/tmp/e", "mise use node@ref:https://evil/x",
-    "export CI=1; mise install", "CI=1 mise install",
+    "export CI=1\\; mise install", "CI=1 mise install",
 ])
 def test_qa2_shell_gated(cmd):
     d = rule_mise_exec_protect(_shell(cmd), EMPTY)
@@ -603,9 +603,9 @@ def test_qa2d_benign(content, tmp_path):
 def test_qa2d_cli_linear():
     import time
     t = time.time()
-    d = rule_mise_exec_protect(_shell("mise ls " * 8000 + "; mise trust"), EMPTY)
+    d = rule_mise_exec_protect(_shell("mise ls " * 8000 + "\\; mise trust"), EMPTY)
     assert d is not None
-    rule_mise_exec_protect(_shell("mise ls; " * 8000), EMPTY)
+    rule_mise_exec_protect(_shell("mise ls\\; " * 8000), EMPTY)
     assert time.time() - t < 5
 
 
@@ -639,7 +639,7 @@ def test_qa2d_labels():
     "mise " + "-v " * 401 + "trust", "mise use " + "node@22 " * 70 + "ubi:evil/x",
     "mise $(echo trust)", "mise `echo trust`", "mise ${X:-trust}", "mise {trust,}",
     "echo trust | xargs -I{} mise {}", "mise asdf trust", "mise toml set hooks.enter id",
-    "mise shell-alias set -g ls 'x; ls'", "set -x MISE_YES 1",
+    "mise shell-alias set -g ls 'x\\; ls'", "set -x MISE_YES 1",
 ])
 def test_qa3_shell_gated(cmd):
     d = rule_mise_exec_protect(_shell(cmd), EMPTY)
@@ -671,7 +671,7 @@ def test_qa3_push_files_variants(files, extra):
     "xargs -a f -I% mise %", "parallel mise ::: trust",
     "mise run -y test", "mise r --yes build", "mise exec --yes -- node -v",
     "mise x -y node@22 -- node", "mise -C . exec -y -- node", "mise watch --yes build",
-    "touch trust; mise tr?st", "mise tr*", "mise [t]rust",
+    "touch trust\\; mise tr?st", "mise tr*", "mise [t]rust",
 ])
 def test_qa4_shell_gated(cmd):
     d = rule_mise_exec_protect(_shell(cmd), EMPTY)
@@ -725,3 +725,31 @@ def test_qa5_shell_allowed(cmd):
 def test_qa5_tool_versions_template_in_comment(tmp_path):
     c = 'node 22 # {{exec(command="id")}}\n'
     assert _ours(evaluate(_write(str(tmp_path / ".tool-versions"), c), EMPTY))
+
+
+# ---- QA round 6 regressions --------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "find . -exec env mise trust {} +", "find . -maxdepth 0 -exec sudo mise trust \\;",
+    "find . -exec nice mise trust \\;", "find . -exec timeout 9 mise trust \\;",
+    "find . -execdir env mise trust \\;", "echo | xargs env mise trust",
+    "xargs sudo mise trust", "echo | xargs -r env mise settings set trusted_config_paths /",
+    "echo | xargs nohup mise use ubi:evil/x", "echo | xargs -P 4 -- env mise trust",
+    "find . -exec env mise trust {} \\; -o -print", "parallel -S host mise ::: trust",
+    "parallel --sshlogin host mise ::: trust", "xargs --foo bar mise trust",
+    "echo trust | xargs -I% sh -c 'mise %'", "echo trust | xargs -I% bash -c \"mise %\"",
+    "echo | xargs -I{} env mise {}", "mise -E run run -y test", "mise -C run run --yes test",
+    "mise -E r r -y test", "mise -E watch watch -y test", "mise -E tasks tasks run -y test",
+    "mise tasks -E run run -y test",
+])
+def test_qa6_shell_gated(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "find . -exec grep -l mise {} \\;", "xargs grep asdf", "xargs -a list.txt grep mise",
+    "find . -name '*.toml' | xargs grep -l 'mise trust'", "mise run test -y",
+    "mise tasks ls", "mise run build --yes",
+])
+def test_qa6_shell_allowed(cmd):
+    assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd

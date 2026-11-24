@@ -9852,8 +9852,14 @@ def _mise_cli_hit(cmd: str, depth: int) -> str:
     for words in _mise_cli_segments(cmd):
         # A quoted multi-word argument may itself be a command
         # (`mise exec -c "mise trust"`, `sudo sh -c "mise trust"`).
-        for w in words:
+        for wi, w in enumerate(words):
             if (" " in w or "\n" in w) and _MISE_BIN_WORD_RE.search(w):
+                if _mise_runner_ctx(words, wi)[1] >= 0:
+                    if not _mise_is_command_word(words, wi):
+                        continue        # an argument of `xargs grep ...`
+                    # `xargs -I% sh -c 'mise %'`: the runner substitutes into
+                    # the quoted command (QA round 6).
+                    return "mise inside a command run by xargs/parallel/find -exec"
                 r = _mise_cli_hit(w, depth + 1)
                 if r:
                     return r
@@ -9890,11 +9896,18 @@ _MISE_RUNNER_WORDS = frozenset(("xargs", "parallel"))
 _MISE_FIND_EXEC = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
 
 
-def _mise_is_command_word(words: list, i: int) -> bool:
-    """Under xargs/parallel/`find -exec`, a mise word is the BINARY only if
-    it is the first non-option word of the command they run -- `find ...
-    -exec grep -l mise {} \\;` and `xargs grep mise` only mention it (QA
-    round 5 false positive)."""
+# Commands that only read/print their arguments: under xargs/parallel/
+# `find -exec` a mise word after one of these is a mention, not a call.
+_MISE_MENTION_TOOLS = frozenset((
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "ls", "echo", "printf",
+    "wc", "head", "tail", "file", "stat", "basename", "dirname", "realpath",
+    "readlink", "diff", "cmp", "md5sum", "sha256sum", "sha1sum", "du", "test",
+))
+
+
+def _mise_runner_ctx(words: list, i: int):
+    """(kind, index) of the xargs/parallel/`find -exec` runner whose command
+    contains words[i], or ("", -1)."""
     m, kind = -1, ""
     for k in range(i):
         b = words[k].replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -9904,14 +9917,26 @@ def _mise_is_command_word(words: list, i: int) -> bool:
             m, kind = k, "find"
         elif words[k] in (";", "\\;", "+") and kind == "find":
             m, kind = -1, ""
+    return kind, m
+
+
+def _mise_is_command_word(words: list, i: int) -> bool:
+    """Under xargs/parallel/`find -exec`, a mise word is only a MENTION when
+    the command they run is a known read-only tool (`find ... -exec grep -l
+    mise {} \\;`, `xargs grep mise` -- QA round 5 false positive). Anything
+    else -- a wrapper (`env`/`sudo`/`nice`), an unknown runner option whose
+    value might be the command -- keeps it a call (QA round 6: the round-5
+    "first word only" rule hid `xargs env mise trust`)."""
+    kind, m = _mise_runner_ctx(words, i)
     if m < 0:
         return True
-    if kind == "find":
-        return i == m + 1
     q = m + 1
-    while q < len(words) and words[q].startswith("-") and q < i:
+    while q < i and words[q].startswith("-"):
         q += 1 if ("=" in words[q] or words[q] not in _MISE_XARGS_VALUE_OPTS) else 2
-    return q == i
+    if q >= i:
+        return True
+    cmdw = words[q].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return cmdw not in _MISE_MENTION_TOOLS
 
 
 def _mise_judge_invocation(words: list, i: int) -> str:
@@ -9921,6 +9946,7 @@ def _mise_judge_invocation(words: list, i: int) -> str:
     if len(words) - (i + 1) > 400:
         return "mise invocation too long to judge"     # fails closed (QA round 3)
     args = []
+    sub_pos = -1
     j = 0
     while j < len(rest):
         w = rest[j]
@@ -9930,6 +9956,8 @@ def _mise_judge_invocation(words: list, i: int) -> str:
         if not args and w.startswith("-"):
             j += 1
             continue
+        if not args:
+            sub_pos = j
         args.append(w)
         j += 1
         if len(args) >= 64:
@@ -9947,11 +9975,18 @@ def _mise_judge_invocation(words: list, i: int) -> str:
         # task, but `mise run -y test` / `mise run -E dev --yes test` /
         # `mise tasks run -y test` is mise's own global flag (QA rounds
         # 4-5): options (with their values) up to the first task name.
-        k = rest.index(args[0])
+        k = sub_pos                 # real position, not `.index()` (QA round 6)
         opts = rest[:k]
         tail_ = rest[k + 1:]
-        if a0 in ("tasks", "task", "t") and tail_[:1] and tail_[0].lower() in ("run", "r"):
-            tail_ = tail_[1:]
+        if a0 in ("tasks", "task", "t"):
+            q0 = 0
+            while q0 < len(tail_) and tail_[q0].startswith("-"):
+                opts.append(tail_[q0])
+                q0 += 2 if tail_[q0] in _MISE_VALUE_OPTS else 1
+            if q0 < len(tail_) and tail_[q0].lower() in ("run", "r"):
+                tail_ = tail_[q0 + 1:]
+            else:
+                tail_ = []
         q = 0
         while q < len(tail_):
             o = tail_[q]
