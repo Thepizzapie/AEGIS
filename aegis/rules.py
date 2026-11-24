@@ -15295,6 +15295,36 @@ def _mise_mcp_delete_only(ev: Event) -> bool:
     return not _editor_startup_has_content_key(ev.args or {})
 
 
+def _mise_target_kind(ev: Event, p: str) -> tuple:
+    """(kind, path) for a write target, matched on the raw path, its
+    URL-decoded form, its lexically normalized form, and joined onto the
+    event cwd when relative (QA round 8: `conf.d/../config.toml`, a bare
+    `config.toml` with cwd `~/.config/mise`, `file:///x/mise%2Etoml`)."""
+    if not isinstance(p, str) or not p or "\n" in p or len(p) > 4096:
+        return "", p
+    cands = [p]
+    q = p
+    if q.lower().startswith("file://"):
+        q = urllib.parse.unquote(q[7:])
+        cands.append(q)
+    elif "%" in q:
+        cands.append(urllib.parse.unquote(q))
+    for c in list(cands):
+        c2 = c.replace("\\", "/")
+        cands.append(posixpath.normpath(c2))
+        if ev.cwd and not c2.startswith(("/", "~", "$")) and not re.match(r"^[A-Za-z]:", c2):
+            cands.append(posixpath.normpath(posixpath.join(str(ev.cwd).replace("\\", "/"), c2)))
+    for c in cands:
+        k = patterns.mise_kind(c)
+        if k:
+            return k, p
+    return "", p
+
+
+_MISE_DIR_KEY_WORDS = frozenset(("dir", "directory", "folder", "parent", "cwd", "root", "base"))
+_MISE_NAME_KEY_WORDS = frozenset(("name", "filename", "basename"))
+
+
 def _mise_mcp_item_content(a, p: str):
     """Content of the one list item that names `p`, for a multi-file push
     (`files: [{path, content}, ...]`) -- only when `p` is the ONLY
@@ -15387,7 +15417,11 @@ def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
     had = [fp for _, fp in patterns.mise_unsafe_entries(before or "", kind)]
     added = []
     for label, fp in patterns.mise_unsafe_entries(after, kind):
-        if fp in had:
+        if fp in ("<unparseable>", "<oversized>"):
+            # Never cancelled against the old file: an already-broken file
+            # must not make every later broken write pass (QA round 8).
+            added.append(label)
+        elif fp in had:
             had.remove(fp)
         else:
             added.append(label)
@@ -15588,7 +15622,19 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     abbreviations -- any option not known flag/value now keeps mise a call),
     a path-qualified tool (``xargs ./echo``) or ``PATH=`` prefix, ``rg
     --pre mise``/``--pager`` (now gated anywhere), and ``-y`` behind ``mise
-    run -s bash``/``--timeout 5s``.
+    run -s bash``/``--timeout 5s``. Round 8 (file-write half) found ``..``
+    paths (``~/.config/mise/conf.d/../config.toml``) and relative targets
+    inside a mise config dir (``config.toml`` with cwd ``~/.config/mise``,
+    ``cd ~/.config/mise && cp c config.toml``, MCP ``{dir, file_name}``) --
+    targets are now also matched normalized, URL-decoded and cwd-joined, and
+    a shell command run in / ``cd``-ing into a mise config dir is judged as
+    naming it; an already-unparseable file cancelling a later unparseable
+    write in the diff (sentinels now always count); git ``rename to``/
+    ``copy to`` patch headers; ``%2E``-encoded URIs; dict-form ``prefix:``/
+    ``ref:`` versions; whole-directory placement onto ``~/.config/mise``/
+    ``.mise``/the asdf and mise runtime dirs (shell and MCP move/copy).
+    Writing through a symlinked alias of a mise dir is not resolved -- the
+    engine-wide symlink gap sibling guards share.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -15638,7 +15684,7 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
         p = _path(ev)
         a = ev.args or {}
-        kind = patterns.mise_kind(p) if "\n" not in p else ""
+        kind, p = _mise_target_kind(ev, p)
         found = None
         if not kind and ev.action == ActionClass.MCP:
             for s_ in _flatten_strings(a):
@@ -15646,6 +15692,37 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                 if _mise_path_shaped(s_):
                     kind, p = patterns.mise_kind(s_.strip()), s_.strip()
                     break
+                t_ = s_.strip()
+                if t_ and "\n" not in t_ and " " not in t_ and len(t_) < 4096 and (
+                        "/" in t_ or "\\" in t_ or t_.lower().endswith((".toml", ".lock"))
+                        or t_ == ".tool-versions"):
+                    k_, _ = _mise_target_kind(ev, t_)
+                    if k_:
+                        kind, p = k_, t_
+                        break
+            if not kind:
+                # `{dir: /x/.mise, file_name: config.toml}` (QA round 8).
+                dirs = [v for k, v in a.items() if isinstance(v, str)
+                        and _http_rc_words(k) & _MISE_DIR_KEY_WORDS]
+                names = [v for k, v in a.items() if isinstance(v, str)
+                         and (_http_rc_words(k) & _MISE_NAME_KEY_WORDS
+                              or str(k).lower() in ("file_name", "filename", "name"))]
+                for d_ in dirs[:8]:
+                    for n_ in names[:8]:
+                        k_, _ = _mise_target_kind(ev, d_.rstrip("/\\") + "/" + n_)
+                        if k_:
+                            kind, p = k_, d_.rstrip("/\\") + "/" + n_
+                            break
+                    if kind:
+                        break
+            if not kind and (_http_rc_words(str(ev.tool or "").split("__")[-1])
+                             & _HTTP_RC_COPY_WORDS):
+                # Moving/copying/linking a whole directory onto a mise
+                # config dir (QA round 8).
+                for s_ in _flatten_strings(a):
+                    if patterns.MISE_CONFIG_DIR_RE.search(str(s_)):
+                        kind, p, found = "dir", str(s_), ["<directory placed onto a mise config/runtime dir>"]
+                        break
             if not kind and not _http_rc_mcp_read_only(ev):
                 exempt = set()
                 if _path(ev) and "\n" not in _path(ev):
@@ -15685,7 +15762,8 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = re.sub(r"\$\{?IFS\}?", " ", _cmd(ev))
         cmd = normalize.scan_surface(raw, sep="\n")
         writes = False
-        if (patterns.mise_shell_path_hit(cmd) or patterns.mise_shell_path_hit(raw)):
+        if (patterns.mise_shell_path_hit(cmd) or patterns.mise_shell_path_hit(raw)
+                or patterns.mise_cwd_hit(raw, ev.cwd)):
             writes = not (patterns.mise_shell_only_reads(cmd)
                           and patterns.mise_shell_only_reads(raw))
         cli = "" if writes else (patterns.mise_cli_hit(cmd) or patterns.mise_cli_hit(raw))

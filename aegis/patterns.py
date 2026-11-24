@@ -9226,6 +9226,41 @@ MISE_PATH_RE = re.compile(
     "(?:" + MISE_CONFIG_PATH_RE.pattern + ")|(?:" + MISE_RUNTIME_DIR_RE.pattern + ")",
     re.IGNORECASE,
 )
+# A mise config/runtime DIRECTORY itself (placing a whole directory under
+# this name plants every file in it -- QA round 8: `cp -r /tmp/evil
+# ~/.config/mise`, `ln -sfn /tmp/evil .mise`).
+MISE_CONFIG_DIR_RE = re.compile(
+    r"(?:^|(?<=[\s'\"=:<>|&;(`{,/\\]))(?:"
+    r"\.config[/\\]+(?:mise|rtx)(?:[/\\]+conf\.d)?"
+    r"|\.(?:mise|rtx)(?:[/\\]+conf\.d)?"
+    r"|(?<![\w.])mise[/\\]+conf\.d"
+    r"|etc[/\\]+(?:mise|rtx)"
+    r"|\.local[/\\]+(?:share|state)[/\\]+(?:mise|rtx)(?:[/\\]+(?:plugins|shims|installs|trusted-configs))?"
+    r"|\.asdf(?:[/\\]+(?:plugins|shims|installs))?"
+    r")[/\\]?(?=[\s'\";&|)<>`]|$)",
+    re.IGNORECASE,
+)
+_MISE_CD_RE = re.compile(r"(?:^|[\s;&|(`])(?:cd|pushd)\s+(?:-[LPe@]+\s+|--\s+)*([^\s;&|)`]+)")
+
+
+def mise_cwd_hit(cmd: str, cwd) -> bool:
+    """True if the command runs in (or `cd`s into) a mise config/runtime
+    directory, where a bare `config.toml`/`x.toml` IS a mise config (QA
+    round 8: `cd ~/.config/mise && cp /tmp/c config.toml`)."""
+    dirs = [str(cwd)] if cwd else []
+    for m in _MISE_CD_RE.finditer(cmd or ""):
+        t = m.group(1).strip("'\"")
+        if cwd and not t.startswith(("/", "~", "$")):
+            t = str(cwd).rstrip("/") + "/" + t
+        dirs.append(t)
+    for d in dirs[:200]:
+        d = _ed_dotdot_normalize(d.replace("\\", "/")).rstrip("/")
+        if MISE_CONFIG_DIR_RE.search(d) and MISE_CONFIG_DIR_RE.search(d).end() >= len(d) - 1:
+            return True
+    return False
+
+
+_MISE_LITERAL_KEYS = ("mise", "rtx", "asdf", "tool-versions", "default-")
 _MISE_NAMES = ("mise.toml", ".mise.toml", "mise.local.toml", ".mise.local.toml",
                ".tool-versions", "rtx.toml", ".rtx.toml")
 _MISE_TAILS = ("mise/config.toml", ".mise/config.toml", "mise/settings.toml",
@@ -9259,10 +9294,21 @@ def mise_shell_path_hit(cmd) -> bool:
     `~/.config/mi*/config.toml`)."""
     if not isinstance(cmd, str) or not cmd:
         return False
-    if MISE_PATH_RE.search(cmd):
+    low = cmd.lower()
+    if "\\" in low:
+        low = low.replace("\\", "")
+    # Every literal path form needs one of these substrings; skip the
+    # regex scans otherwise (perf: the shared hook budget).
+    if any(k in low for k in _MISE_LITERAL_KEYS) and (
+            MISE_PATH_RE.search(cmd) or MISE_CONFIG_DIR_RE.search(cmd)):
         return True
+    # `~/.config/mise/conf.d/../config.toml` (QA round 8).
+    if "." in cmd and len(cmd) < 400_000 and any(k in low for k in _MISE_LITERAL_KEYS):
+        norm = _ed_dotdot_normalize(cmd)
+        if norm != cmd and (MISE_PATH_RE.search(norm) or MISE_CONFIG_DIR_RE.search(norm)):
+            return True
     unesc = cmd.replace("\\", "")
-    if unesc != cmd and MISE_PATH_RE.search(unesc):
+    if unesc != cmd and any(k in low for k in _MISE_LITERAL_KEYS) and MISE_PATH_RE.search(unesc):
         return True
     for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc)):
         if i > 4000:
@@ -9561,7 +9607,8 @@ def _mise_tool_entries(tools, out):
             elif isinstance(s, dict):
                 extra = sorted(str(x) for x in s if str(x) not in _MISE_TOOL_SAFE_OPTS)
                 ver = s.get("version")
-                if extra or (isinstance(ver, str) and ver.strip().lower().startswith("path:")):
+                if extra or (isinstance(ver, str) and ver.strip().lower().startswith(
+                        ("path:", "prefix:/", "ref:http", "ref:git"))):
                     out.append((f"tool {n} options {','.join(extra)[:30]}"[:60],
                                 _mise_fp("tool", n, s)))
             elif s is not None and not isinstance(s, (int, float)):
@@ -9685,11 +9732,17 @@ def mise_unsafe_entries(content, kind: str) -> list:
     return mise_toml_unsafe_entries(content)
 
 
+_MISE_PATCH_HDR_RE = re.compile(
+    r"^[ \t]*(?:\*\*\*\s+(?:Add|Update|Delete|Move)\s+File:|\+\+\+\s|---\s|diff\s--git\s"
+    r"|\*\*\*\s+Move\s+to:|(?:rename|copy)\s+(?:from|to)\s)[^\n]*$", re.MULTILINE)
+
+
 def mise_patch_hit(text) -> bool:
-    """True if `text` is a patch whose header line names a mise path."""
+    """True if `text` is a patch whose header line (incl. git `rename to`/
+    `copy to` -- QA round 8) names a mise path."""
     if not isinstance(text, str) or "\n" not in text:
         return False
-    for m in _HTTP_RC_PATCH_HDR_RE.finditer(text[:2_000_000]):
+    for m in _MISE_PATCH_HDR_RE.finditer(text[:2_000_000]):
         if MISE_PATH_RE.search(m.group(0)):
             return True
     return False
@@ -9821,6 +9874,9 @@ def mise_cli_hit(cmd) -> str:
             return "oversized command naming mise"
         return ""
     cmd = cmd.replace("\\", "") if "\\" in cmd else cmd   # `mi\se` is `mise`
+    low = cmd.lower()
+    if "mise" not in low and "rtx" not in low and "asdf" not in low:
+        return ""               # every gated CLI form names one (perf)
     # `mise$IFS trust` / `mise${IFS}trust` (QA round 2; as rule_direnv_protect).
     cmd = re.sub(r"\$\{?IFS\}?", " ", cmd)
     # `` mise `echo trust` `` / `mise $(...)`: the tokenizer splits at the
