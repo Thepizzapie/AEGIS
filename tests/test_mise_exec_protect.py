@@ -394,3 +394,58 @@ def test_oversized_and_deep_inputs_fast(tmp_path):
     evaluate(_shell("echo " + "a{b,c}*" * 3000 + " > x"), EMPTY)
     evaluate(_shell("mise " + "-v " * 20000 + "trust"), EMPTY)
     assert time.time() - t < 10
+
+
+# ---- QA round 1 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "mise ls\nmise trust", "mise doctor\r\nmise settings set trusted_config_paths /",
+    "mise ls\n\nmise use ubi:evil/x", "mise x -- mise trust",
+    "mise exec node@22 -- mise trust", "mise run -- mise trust",
+    "mise exec -- asdf plugin add x https://e", "mise exec -c 'mise trust'",
+    "mi\\se trust", "m\\ise trust", "mise settings unset paranoid",
+    "mise settings rm trusted_config_paths", "export MISE_YES=1",
+    "MISE_DATA_DIR=/tmp/x mise install",
+])
+def test_qa1_gated(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "mise settings", "mise settings\necho x", "printenv MISE_DATA_DIR",
+    "env | grep MISE_CONFIG_DIR", "grep -r 'MISE_YES' docs/",
+    "echo \"MISE_DATA_DIR is $MISE_DATA_DIR\"", "unset MISE_YES",
+    "mise settings set python.uv_venv_auto true", "mise settings unset jobs",
+])
+def test_qa1_allowed(cmd):
+    assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("content", [
+    '[tools]\nrust = { version = "1.80", profile = "minimal", components = "rustfmt,clippy" }\n',
+    '[tools]\npython = { version = "3.12", virtualenv = ".venv" }\n',
+    '[settings.python]\nuv_venv_auto = true\n',
+])
+def test_qa1_benign_toml(content, tmp_path):
+    assert _allowed(evaluate(_write(str(tmp_path / "mise.toml"), content), EMPTY))
+
+
+def test_qa1_nested_settings_still_gated(tmp_path):
+    assert _ours(evaluate(_write(str(tmp_path / "mise.toml"),
+                                 '[settings.node]\nmirror_url = "https://evil"\n'), EMPTY))
+
+
+def test_qa1_non_dict_args_fail_closed():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": "x"})
+    ev.args = "mise trust"
+    d = rule_mise_exec_protect(ev, EMPTY)
+    assert d is not None and d.rule == RULE
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__x__write_file",
+                    action=ActionClass.MCP, args={})
+    ev.args = ["/p/mise.toml", "[hooks]\nenter='x'"]
+    rule_mise_exec_protect(ev, EMPTY)       # must not raise
+
+
+def test_qa1_non_string_content_gated(tmp_path):
+    d = evaluate(_mcp({"path": str(tmp_path / "mise.toml"), "content": {"hooks": {"enter": "x"}}}), EMPTY)
+    assert _ours(d)

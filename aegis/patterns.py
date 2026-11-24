@@ -9405,12 +9405,20 @@ _MISE_SETTINGS_SAFE = frozenset((
     "exec_auto_install", "task_auto_install", "status", "activate_aggressive",
     "trace", "env",
 ))
+# Nested `[settings.<tool>]` keys with no exec/fetch effect (QA round 1).
+_MISE_SETTINGS_SAFE_NESTED = frozenset((
+    "python.uv_venv_auto", "python.venv_auto_create", "python.venv_stdlib",
+    "python.compile", "node.corepack", "status.missing_tools",
+    "status.show_env", "status.show_tools",
+))
 # Safety switches: fine when ON, gated when turned off.
 _MISE_SETTINGS_SAFE_IF_TRUE = frozenset(("paranoid", "gpg_verify"))
 # Tool backends that fetch only from mise's own curated sources.
 _MISE_SAFE_BACKENDS = frozenset(("core", "aqua"))
 # Tool option keys with no exec/fetch effect.
-_MISE_TOOL_SAFE_OPTS = frozenset(("version", "os", "platforms", "depends"))
+_MISE_TOOL_SAFE_OPTS = frozenset(("version", "os", "platforms", "depends",
+                                  "profile", "components", "targets",
+                                  "virtualenv"))
 _MISE_TEMPLATE_EXEC_RE = re.compile(r"\{[{%][\s\S]*?\bexec\b", re.IGNORECASE)
 _MISE_VENV_PATH_RE = re.compile(r"^(?!/)(?![A-Za-z]:)(?!~)[\w.\-/]{1,200}$")
 _MISE_MAX_TEXT = 2_000_000
@@ -9516,6 +9524,11 @@ def _mise_settings_entries(st, out, prefix=""):
             continue
         if not prefix and ks in _MISE_SETTINGS_SAFE_IF_TRUE and v is True:
             continue
+        if not prefix and isinstance(v, dict) and ks not in _MISE_SETTINGS_SAFE:
+            for sk, sv in v.items():
+                if f"{ks}.{sk}".lower() not in _MISE_SETTINGS_SAFE_NESTED:
+                    out.append((f"settings.{ks}.{sk}"[:60], _mise_fp("settings", ks, sk, sv)))
+            continue
         out.append((f"settings.{full}"[:60], _mise_fp("settings", full, v)))
 
 
@@ -9600,12 +9613,15 @@ _MISE_CLI_BINS = frozenset(("mise", "rtx", "asdf"))
 _MISE_VALUE_OPTS = frozenset(("-C", "--cd", "-E", "--env", "-j", "--jobs",
                               "--log-level", "--output"))
 _MISE_CLI_SEG_RE = re.compile(r"&&|\|\||[;&|\n(){}`]|\$\(")
+# Only an ASSIGNMENT (`NAME=`, `export NAME[=]`, `setenv NAME`) -- a mere
+# mention (`printenv MISE_DATA_DIR`, `grep MISE_YES docs/`) is not an
+# override (QA round 1).
 _MISE_TRUST_ENV_RE = re.compile(
-    r"(?:^|[\s;&|(`'\"])(?:export\s+|declare\s+-x\s+|setenv\s+)?"
+    r"(?:^|[\s;&|(`'\"])(?:(?:export|declare\s+-x|typeset\s+-x|setenv|set\s+-gx)\s+(?=\w+(?:\s*=|\s|$))|(?=\w+=))"
     r"(?:MISE|RTX)_(?:TRUSTED_CONFIG_PATHS|PARANOID|YES|URL_REPLACEMENTS"
     r"|UNIX_DEFAULT_\w*SHELL\w*|GLOBAL_CONFIG_FILE|SYSTEM_CONFIG_FILE|CONFIG_DIR"
     r"|DATA_DIR|SHIMS_DIR|OVERRIDE_CONFIG_FILENAMES|OVERRIDE_TOOL_VERSIONS_FILENAMES)"
-    r"(?:\s*=|\s|$)", re.IGNORECASE)
+    r"(?:=|\s|$)", re.IGNORECASE)
 _MISE_SETTINGS_KV_RE = re.compile(r"^([A-Za-z_][\w.\-]*)=(.*)$")
 
 
@@ -9630,6 +9646,7 @@ def _mise_cli_segments(cmd: str) -> list:
     import shlex as _sh
     try:
         lx = _sh.shlex(cmd, posix=True, punctuation_chars=_MISE_PUNCT)
+        lx.whitespace = " \t\r"        # `\n` separates commands (QA round 1)
         lx.whitespace_split = True
         lx.commenters = "#"
         toks = list(lx)
@@ -9658,29 +9675,47 @@ def mise_cli_hit(cmd) -> str:
         return "oversized command naming mise"
     if _MISE_TRUST_ENV_RE.search(cmd):
         return "mise trust/safety setting overridden through the environment"
-    if not re.search(r"(?:mise|rtx|asdf)", cmd, re.IGNORECASE):
+    if not re.search(r"(?:mise|rtx|asdf)", cmd.replace("\\", ""), re.IGNORECASE):
         return ""
+    return _mise_cli_hit(cmd, 0)
+
+
+def _mise_cli_hit(cmd: str, depth: int) -> str:
+    if depth > 4:
+        return "deeply nested mise invocation"
     for words in _mise_cli_segments(cmd):
-        # Skip wrapper prefixes and assignments.
-        i = 0
-        while i < len(words):
-            w = words[i]
+        # A quoted multi-word argument may itself be a command
+        # (`mise exec -c "mise trust"`, `sudo sh -c "mise trust"`).
+        for w in words:
+            if (" " in w or "\n" in w) and re.search(r"(?:mise|rtx|asdf)", w, re.IGNORECASE):
+                r = _mise_cli_hit(w, depth + 1)
+                if r:
+                    return r
+        # EVERY mise/rtx/asdf word starts a candidate invocation, so a
+        # nested `mise x -- mise trust` / `mise run -- asdf plugin add` /
+        # wrapper prefix is judged too (QA round 1).
+        for i, w in enumerate(words):
             base = w.replace("\\", "/").rsplit("/", 1)[-1].lower()
             if base.endswith(".exe"):
                 base = base[:-4]
-            if base in _MISE_CLI_BINS:
-                break
-            i += 1
-        if i >= len(words):
-            continue
-            # (no mise word in this segment)
+            if base not in _MISE_CLI_BINS:
+                continue
+            r = _mise_judge_invocation(words, i)
+            if r:
+                return r
+    return ""
+
+
+def _mise_judge_invocation(words: list, i: int) -> str:
+    """Judge the mise/rtx/asdf invocation starting at `words[i]`."""
+    if True:
         binname = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
         rest = words[i + 1:]
         args = []
         j = 0
         while j < len(rest):
             w = rest[j]
-            if w in _MISE_VALUE_OPTS:
+            if not args and w in _MISE_VALUE_OPTS:
                 j += 2
                 continue
             if not args and w.startswith("-"):
@@ -9689,7 +9724,7 @@ def mise_cli_hit(cmd) -> str:
             args.append(w)
             j += 1
         if not args:
-            continue
+            return ""
         sub = args[0].lower()
         tail = args[1:]
         tl = [t.lower() for t in tail]
@@ -9697,33 +9732,41 @@ def mise_cli_hit(cmd) -> str:
             if sub in ("plugin-add", "plugin-update") or (
                     sub == "plugin" and tl[:1] and tl[0] in ("add", "update")):
                 return "asdf plugin install/update (runs the plugin's scripts on every shim call)"
-            continue
+            return ""
         if sub == "trust":
             flags = {t for t in tl if t.startswith("-")}
             if flags & {"--untrust", "--show", "--ignore"}:
-                continue
+                return ""
             return "mise trust (silences mise's own untrusted-config check)"
         if sub in ("settings", "setting"):
             if not tl:
-                continue
+                return ""
             op = tl[0]
-            if op in ("ls", "list", "get", "unset", "rm"):
-                continue
+            if op in ("ls", "list", "get"):
+                return ""
+            if op in ("unset", "rm"):
+                # Removing a human-set safety switch (`paranoid`) weakens
+                # mise as much as setting it false (QA round 1).
+                if all(k.lower() in _MISE_SETTINGS_SAFE
+                       or k.lower() in _MISE_SETTINGS_SAFE_NESTED
+                       for k in tail[1:] if not k.startswith("-")):
+                    return ""
+                return f"mise settings {op} (removes a setting)"
             kv = tail[1:] if op in ("set", "add") else tail
             key = ""
             if kv:
                 m = _MISE_SETTINGS_KV_RE.match(kv[0])
                 key = (m.group(1) if m else kv[0]).lower()
                 val = (m.group(2) if m else (kv[1] if len(kv) > 1 else "")).lower()
-                if key in _MISE_SETTINGS_SAFE:
-                    continue
+                if key in _MISE_SETTINGS_SAFE or key in _MISE_SETTINGS_SAFE_NESTED:
+                    return ""
                 if key in _MISE_SETTINGS_SAFE_IF_TRUE and val in ("true", "1", "yes"):
-                    continue
+                    return ""
             return f"mise settings change ({key or op})"
         if sub in ("config", "cfg"):
             if tl[:1] and tl[0] in ("set",):
                 return "mise config set (rewrites a mise.toml key)"
-            continue
+            return ""
         if sub == "set":
             for t in tail:
                 if t.startswith("-"):
@@ -9732,19 +9775,19 @@ def mise_cli_hit(cmd) -> str:
                 if eq and (mise_env_name_dangerous(name)
                            or _MISE_TEMPLATE_EXEC_RE.search(val)):
                     return f"mise set {name} (exported into every later shell/command)"
-            continue
+            return ""
         if sub in ("use", "u"):
             if any(_mise_spec_unsafe(t) for t in tail):
                 return "mise use of a code-fetching backend / path: version (persisted to mise.toml)"
-            continue
+            return ""
         if sub in ("plugins", "plugin", "p"):
             if tl[:1] and tl[0] in ("install", "i", "add", "a", "link", "ln",
                                     "update", "up", "upgrade"):
                 return "mise plugin install/link (runs the plugin's scripts)"
-            continue
+            return ""
         if sub in ("generate", "gen", "g"):
             if tl[:1] and tl[0] in ("git-pre-commit", "pre-commit") and (
                     {"--write", "-w"} & set(tl)):
                 return "mise generate git-pre-commit --write (plants a git hook)"
-            continue
+            return ""
     return ""

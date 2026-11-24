@@ -15322,9 +15322,11 @@ def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
     if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
         return ["<edit shape not replayable against the file on disk>"]
     before = _npmrc_read(ev, p)
-    content = a.get("content")
-    if not isinstance(content, str):
-        content = a.get("contents") if isinstance(a.get("contents"), str) else None
+    content = a.get("content", a.get("contents"))
+    if content is not None and not isinstance(content, str):
+        # Non-string content (a JSON object an MCP server serializes): judged
+        # as its JSON text, which is not TOML and so fails closed.
+        content = json.dumps(content, default=str)
     if edits:
         if before is None:
             return ["<edit not verifiable against the file on disk>"]
@@ -15433,9 +15435,29 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``[env]`` variable outside the denylist that some program treats as
     exec-bearing; and paths assembled indirectly -- the same "computed
     indirectly" class every sibling guard discloses. Accepted false ASKs:
-    any shell write that names a mise path (``echo 'node 22' >>
-    .tool-versions``), common but code-fetching tool backends (``npm:``/
-    ``pipx:``/``cargo:``) on first add, unparseable TOML.
+    any shell command naming a mise path that is not a pure read/delete
+    verb or a non-writing ``git`` subcommand -- including reads by other
+    tools (``cp mise.toml /tmp``, ``tar czf x mise.toml``, ``find . -name
+    mise.toml``, ``taplo fmt``) and writes (``echo 'node 22' >>
+    .tool-versions``); common but code-fetching tool backends (``npm:``/
+    ``pipx:``/``cargo:``) on first add; ``[env]`` names that are often
+    routine but can carry exec (``JAVA_HOME``/``GOPATH``/``*_HOME``,
+    ``*PATH``, ``RUSTFLAGS``/``*FLAGS``, any ``NODE_OPTIONS``) and
+    ``_.path``/``_.file`` directives, on first add only; unparseable TOML.
+
+    QA history (two independent reviews, bypass-hunting and design/false-
+    positive, in parallel). Round 1 found: a newline between commands
+    (``mise ls\nmise trust``) merged them in the CLI tokenizer (shlex treats
+    ``\n`` as whitespace even when listed as punctuation) -- now a separator;
+    nested invocations (``mise x -- mise trust``, ``mise run -- asdf plugin
+    add``, ``mise exec -c "mise trust"``) -- every mise word in a command,
+    and every quoted multi-word argument, is now judged; ``mi\\se trust``
+    escaped the prefilter; ``mise settings unset paranoid``; non-dict args
+    failing open via a helper exception. False positives fixed: tool
+    options ``profile``/``components``/``targets``/``virtualenv``, nested
+    ``[settings.python] uv_venv_auto``-style keys, a bare ``mise
+    settings`` listing, and ``MISE_*`` names merely mentioned
+    (``printenv MISE_DATA_DIR``) -- only assignments/exports now count.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -15449,6 +15471,14 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             _record_monitor(ev, would, "mise-exec-protect-monitor")
             return None
         return would
+
+    if not isinstance(ev.args, dict):
+        # A non-dict payload would make the shared helpers raise, which the
+        # engine treats as allow (QA round 1) -- judge it as text instead.
+        raw_args = ev.args
+        txt = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)[:400000]
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"command": txt} if _is_shell(ev) else {"input": txt})
 
     if ev.action == ActionClass.MCP:
         shell_cmd = _http_rc_mcp_shell_command(ev)
