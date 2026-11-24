@@ -15343,6 +15343,8 @@ def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
         return ["<write into a mise/asdf plugin, shim or install directory>"]
     if kind == "lock":
         return ["<write to the mise lockfile (pins every tool's download URL/checksum)>"]
+    if kind == "pkgs":
+        return ["<write to a mise default-packages list (installed after every new tool version)>"]
     if kind == "trust":
         return ["<write to mise's trust store (a file here IS `mise trust`)>"]
     if ev.action == ActionClass.MCP:
@@ -15505,7 +15507,7 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     a mise invocation longer than 400 words or 64 positional arguments
     (fails closed);
     ``-y``/``--yes`` on any mise command (before a ``run``/``exec`` task
-    name) and ``CI=`` on a mise command or ``export CI=`` beside one;
+    name; after it, it is the task's own argument) and ``CI=`` on a mise command or ``export CI=`` beside one;
     quoted text, commit messages and heredoc bodies that merely mention a
     gated form (``git commit -m 'run mise trust'``) -- as
     ``rule_direnv_protect`` does for ``direnv allow``.
@@ -15559,7 +15561,13 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     fish ``set -x MISE_YES``; the multi-file MCP item logic now applies only
     when the mise path is the call's only one and its item has one content
     key. The implicit-trust behaviour of current mise (above) was surfaced
-    here and is disclosed rather than gated.
+    here and is disclosed rather than gated. Round 4 found: an expansion
+    glued to the binary word (``mise$x trust``, ``mise$(true) trust``,
+    ``{mise,trust}``), ``xargs -I%``/``--replace``/``parallel`` (any mise
+    run under xargs/parallel now asks), ``-y`` after ``run``/``exec``
+    (``mise run -y test`` -- options up to the first positional now count),
+    globs as the subcommand (``mise tr?st``), ``~/.default-npm-packages``
+    and siblings (now gated paths), ``.tool-versions`` ``ref:http``.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

@@ -660,3 +660,40 @@ def test_qa3_push_files_variants(files, extra):
     d = evaluate(_mcp({"owner": "o", "repo": "r", "files": files, **extra},
                       tool="mcp__github__push_files"), EMPTY)
     assert _ours(d)
+
+
+# ---- QA round 4 regressions --------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "mise$x trust", "mise${x} trust", "mise$(true) trust", "mise`true` trust",
+    "{mise,trust}", "mise$(true) settings set paranoid false",
+    "echo trust | xargs -I% mise %", "echo trust | xargs -I @ mise @",
+    "echo trust | xargs -IX mise X", "echo trust | xargs --replace=T mise T",
+    "xargs -a f -I% mise %", "parallel mise ::: trust",
+    "mise run -y test", "mise r --yes build", "mise exec --yes -- node -v",
+    "mise x -y node@22 -- node", "mise -C . exec -y -- node", "mise watch --yes build",
+    "touch trust; mise tr?st", "mise tr*", "mise [t]rust",
+])
+def test_qa4_shell_gated(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "mise run build -- --yes", "mise run test -y", "mise x -- npx -y cowsay",
+    'eval "$(mise activate bash)"', "cd $(mise where node)", "node $(mise which node)",
+    "python -c 'print(1)' " + "." * 500_000,
+])
+def test_qa4_shell_allowed(cmd):
+    assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd[:60]
+
+
+@pytest.mark.parametrize("p", ["/h/.default-npm-packages", "/h/.default-python-packages",
+                               "/h/.default-gems", "/h/.default-cargo-crates",
+                               "/h/.default-go-packages"])
+def test_qa4_default_packages(p):
+    d = rule_mise_exec_protect(_write(p, "evil-pkg\n"), EMPTY)
+    assert d is not None and "default-packages" in d.message
+
+
+def test_qa4_tool_versions_ref(tmp_path):
+    assert _ours(evaluate(_write(str(tmp_path / ".tool-versions"), "node ref:https://x\n"), EMPTY))

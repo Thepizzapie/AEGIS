@@ -9215,6 +9215,9 @@ MISE_RUNTIME_DIR_RE = re.compile(
     r"|(?:\$\{?|%|\$env:)(?:MISE|RTX)_STATE_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?"
     r"|(?:\$\{?|%|\$env:)XDG_STATE_HOME[}%]?" + _SEP + r"(?:mise|rtx)"
     r")" + _SEP + r"(?:trusted|ignored)-configs" + _MISE_END
+    # Default-package lists mise's core plugins install after EVERY new
+    # tool install (npm postinstall / gem / pip build code) -- QA round 4.
+    + r"|" + _MISE_B + r"\.default-(?:npm-packages|python-packages|gems|cargo-crates|go-packages)" + _MISE_END
     # The lockfile pins download URLs/checksums for every tool.
     + r"|" + _MISE_B + r"\.?(?:mise|rtx)(?:\.[\w-]{1,40}){0,6}\.lock" + _MISE_END,
     re.IGNORECASE,
@@ -9243,6 +9246,8 @@ def mise_kind(path) -> str:
             return "lock"
         if "-configs" in t:
             return "trust"
+        if ".default-" in t:
+            return "pkgs"
         return "dir"
     return ""
 
@@ -9666,7 +9671,8 @@ def mise_tool_versions_unsafe_entries(content) -> list:
         tool = words[0]
         backend = tool.split(":", 1)[0].lower() if ":" in tool else ""
         bad = bool(backend and backend not in _MISE_SAFE_BACKENDS)
-        bad = bad or any(w.lower().startswith(("path:", "prefix:/")) for w in words[1:])
+        bad = bad or any(w.lower().startswith(("path:", "prefix:/", "ref:http", "ref:git"))
+                         for w in words[1:])
         bad = bad or bool(_MISE_TEMPLATE_EXEC_RE.search(s))
         if bad:
             out.append((s[:60], _mise_fp("tv", " ".join(words))))
@@ -9802,7 +9808,9 @@ def mise_cli_hit(cmd) -> str:
     if not isinstance(cmd, str) or not cmd:
         return ""
     if len(cmd) > 400_000:
-        return "oversized command naming mise"
+        if _MISE_BIN_WORD_RE.search(cmd.replace("\\", "")):
+            return "oversized command naming mise"
+        return ""
     cmd = cmd.replace("\\", "") if "\\" in cmd else cmd   # `mi\se` is `mise`
     # `mise$IFS trust` / `mise${IFS}trust` (QA round 2; as rule_direnv_protect).
     cmd = re.sub(r"\$\{?IFS\}?", " ", cmd)
@@ -9811,6 +9819,12 @@ def mise_cli_hit(cmd) -> str:
     if re.search(_MISE_BIN_WORD_RE.pattern + r"(?:\s+-[^\s`$]*)*\s+(?:`|\$\(|<\()", cmd,
                  re.IGNORECASE):
         return "mise with a computed subcommand"
+    # `mise$x trust`, `mise$(true) trust`, `` mise`true` trust ``,
+    # `{mise,trust}`: an expansion glued to the binary word (QA round 4).
+    if re.search(r"(?<![\w.\-])(?:mise|rtx|asdf)(?:\.exe)?[$`]", cmd, re.IGNORECASE) or \
+            re.search(r"\{[^{}\s]*,[^{}\s]*\}", cmd) and re.search(
+                r"\{[^{}\s]*(?<![\w.\-])(?:mise|rtx|asdf)(?![\w\-])[^{}\s]*\}", cmd, re.IGNORECASE):
+        return "computed mise invocation"
     bad = _mise_env_assignment_hit(cmd)
     if bad:
         return f"mise setting {bad} overridden through the environment"
@@ -9849,6 +9863,10 @@ def _mise_cli_hit(cmd: str, depth: int) -> str:
                 base = base[:-4]
             if base not in _MISE_CLI_BINS:
                 continue
+            if any(x.replace("\\", "/").rsplit("/", 1)[-1].lower() in ("xargs", "parallel")
+                   for x in words[:i]):
+                # stdin supplies (or substitutes into) the arguments (QA round 4).
+                return "mise run with arguments from stdin (xargs/parallel)"
             if any(re.match(r"CI\+?=", x) for x in words[:i]):
                 return "CI= on a mise command (mise auto-trusts configs under CI)"
             r = _mise_judge_invocation(words, i)
@@ -9881,8 +9899,15 @@ def _mise_judge_invocation(words: list, i: int) -> str:
     # it?" prompt -- the same trust bypass as `mise trust` (QA round 1).
     opts = rest[:rest.index("--")] if "--" in rest else rest
     if args and args[0].lower() in ("run", "r", "exec", "x", "watch", "w", "tasks", "t"):
-        # `mise run test -y`: a `-y` after the task belongs to the task.
-        opts = rest[:rest.index(args[0])]
+        # `mise run test -y`: a `-y` after the task name belongs to the task,
+        # but `mise run -y test` / `mise exec --yes --` is mise's own global
+        # flag (QA round 4): options up to the first positional or `--`.
+        k = rest.index(args[0])
+        opts = rest[:k]
+        for o in rest[k + 1:]:
+            if o == "--" or not o.startswith("-"):
+                break
+            opts.append(o)
     if any(o == "--yes" or o.startswith("--yes=")
            or re.fullmatch(r"-[A-Za-z]*y[A-Za-z]*", o) for o in opts):
         return "mise --yes/-y (auto-accepts mise's untrusted-config prompt)"
@@ -9895,7 +9920,7 @@ def _mise_judge_invocation(words: list, i: int) -> str:
     tail = args[1:]
     # A computed subcommand (`mise $(echo trust)`, `mise ${X:-trust}`,
     # `mise {trust,}`, `xargs -I{} mise {}`) is unknown -- ask (QA round 3).
-    if any(c in sub for c in "$`") or sub == "{}" or ("{" in sub and "," in sub):
+    if any(c in sub for c in "$`*?[") or sub == "{}" or ("{" in sub and "," in sub):
         return "mise with a computed subcommand"
     if binname in ("mise", "rtx") and sub == "asdf":
         # `mise asdf <args>` forwards to the mise CLI (QA round 3).
