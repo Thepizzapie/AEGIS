@@ -47,6 +47,22 @@
 #     mode: ask            # deny | ask (default) | monitor | off
 #     allow: ['^/home/[^/]+/dotfiles/']   # regexes on the (normalized) path
 
+# mise / asdf config exec hijack (optional tuning). Built in and ON by
+# default (mode: ask): a write to mise.toml/.mise.toml/~/.config/mise/
+# config.toml/.tool-versions that ADDS a hook, env._.source/_.path,
+# an exec-bearing env var (LD_PRELOAD, NODE_OPTIONS, *_PROXY, ...), a
+# template exec(), a plugin, a code-fetching tool backend (ubi:/npm:/...)
+# or a trust-removing setting asks a human first; routine edits
+# (node = "22") pass. `mise trust`, `mise settings set
+# trusted_config_paths ...`, `mise plugins install` and writes into the
+# mise/asdf plugin/shim dirs, mise's trust store, mise.lock, `mise -y`,
+# `CI=` on a mise command and assigned MISE_* settings ask too. A human pre-approves with
+# AEGIS_ALLOW_MISE_EXEC=1 or a trailing '# aegis-allow'; a spawned agent
+# cannot. Shell `allow` regexes must match the WHOLE command.
+#   mise_exec:
+#     mode: ask            # deny | ask (default) | monitor | off
+#     allow: ['^/ci/repo/mise\.toml$', 'mise trust /ci/repo']
+
 default_action: allow
 on_error: allow
 

