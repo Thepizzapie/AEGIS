@@ -9321,6 +9321,9 @@ def mise_cwd_hit(cmd: str, cwd) -> bool:
     joins = 0
     for seg in segs:
         while seg and (seg[0].lower() in _MISE_WRAPPERS or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+            if seg[0].lower() not in ("env",) and seg[0].lower() in _MISE_WRAPPERS:
+                seg = _mise_strip_wrapper(seg)
+                continue
             if seg[0].lower() == "env":
                 # `env -C DIR cmd` / `--chdir=DIR` (QA round 12).
                 seg = seg[1:]
@@ -9354,7 +9357,26 @@ def mise_cwd_hit(cmd: str, cwd) -> bool:
                     dirs[nn] = None
                     cur = nn
             continue
-        if v0 == "env" or (v0 == "git" and "-C" in seg[:3]):
+        if v0 == "git":
+            # Walk git's global options to the subcommand, applying every
+            # `-C DIR`/`-CDIR` (QA round 13: `git -c x=y -C ~/.config clone`).
+            k = 1
+            while k < len(seg) and seg[k].startswith("-"):
+                o = seg[k]
+                if o == "-C" and k + 1 < len(seg):
+                    v = seg[k + 1]
+                    k += 2
+                elif o.startswith("-C") and len(o) > 2:
+                    v = o[2:]
+                    k += 1
+                else:
+                    k += 2 if o in ("-c", "--git-dir", "--work-tree", "--namespace",
+                                    "--config-env", "--exec-path") else 1
+                    continue
+                cur = _mise_join(cur, v) if cur or v.startswith(("/", "~", "$")) else v
+                dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+            seg = [seg[0]] + seg[k:]
+        if v0 == "env":
             # `env -C DIR cmd`, `git -C DIR clone ...` (QA round 12).
             if "-C" in seg:
                 k = seg.index("-C")
@@ -9404,6 +9426,8 @@ def mise_cwd_hit(cmd: str, cwd) -> bool:
             clone_at = 2
         elif v0 in ("hg", "svn", "jj") and len(seg) > 1 and seg[1] in ("clone", "co", "checkout", "export"):
             clone_at = 1
+        elif v0 == "jj" and seg[1:3] == ["git", "clone"]:
+            clone_at = 2
         if clone_at >= 0:
             cp_, k = [], clone_at + 1
             while k < len(seg):
@@ -9486,7 +9510,8 @@ def _mise_glob_variants(word: str, budget: int = 64) -> list:
         opts = [comp]
         if ci == len(comps) - 1 and re.fullmatch(r"[*?.]*(?:toml|lock)?", comp.lower()):
             pass        # a final `*`/`*.toml` is too generic (`cp *.toml dist/`)
-        elif any(c in comp for c in "*?["):
+        elif any(c in comp for c in "*?[") and len(
+                re.sub(r"[*?]|\[[^\]]*\]", "", comp)) <= 30 and len(comp) <= 200:
             hits = [v for v in _MISE_GLOB_VOCAB if fnmatch.fnmatchcase(v, comp.lower())]
             opts = hits or [comp]
         nxt = []
@@ -9520,6 +9545,7 @@ def mise_shell_path_hit(cmd) -> bool:
         if norm != cmd and (MISE_PATH_RE.search(norm) or MISE_CONFIG_DIR_RE.search(norm)):
             return True
     seen_glob = set()
+    budget = [0]
     unesc = cmd.replace("\\", "")
     if unesc != cmd and any(k in low for k in _MISE_LITERAL_KEYS) and MISE_PATH_RE.search(unesc):
         return True
@@ -9544,7 +9570,9 @@ def mise_shell_path_hit(cmd) -> bool:
             if MISE_PATH_RE.search(v) or MISE_CONFIG_DIR_RE.search(v):
                 return True
         parts = w.replace("\\", "/").split("/")
-        for n in (1, 2, 3):
+        # A component whose LITERAL characters outnumber the longest mise
+        # name can never match one; skip the fnmatch work (QA round 13).
+        for n in (1, 2, 3) if len(re.sub(r"[*?]|\[[^\]]*\]|[{},]", "", "/".join(parts[-3:]))) <= 80 else ():
             if len(parts) < n:
                 break
             tail = "/".join(parts[-n:])
@@ -9556,6 +9584,9 @@ def mise_shell_path_hit(cmd) -> bool:
                 if not any(c in cand for c in "*?["):
                     continue
                 low = cand.lower()
+                budget[0] += 1
+                if budget[0] > 4000:
+                    return True               # command-wide glob budget, fails closed
                 if n == 1 and re.fullmatch(r"[*?.]*(?:toml)?", low):
                     continue                  # `*.toml` alone: too generic
                 for name in (_MISE_NAMES if n == 1 else _MISE_TAILS):
@@ -10048,7 +10079,37 @@ def _mise_spec_unsafe(spec: str) -> bool:
 
 _MISE_PUNCT = "();<>|&`\n"
 _MISE_WRAPPERS = frozenset(("sudo", "env", "command", "exec", "nohup", "time", "nice",
-                            "doas", "builtin", "then", "do", "else", "!", "{"))
+                            "doas", "builtin", "then", "do", "else", "!", "{",
+                            "timeout", "stdbuf", "busybox", "ionice", "chrt", "setsid",
+                            "taskset", "unbuffer", "caffeinate", "flock"))
+# Wrapper options that take a separate value (QA round 13: `sudo -u u cp`).
+_MISE_WRAPPER_VALUE_OPTS = {
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "--user",
+             "--group", "--host", "--prompt", "--chdir"},
+    "doas": {"-u", "-C"},
+    "nice": {"-n", "--adjustment"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
+    "chrt": {"-p"}, "taskset": {"-c", "-p"}, "flock": {"-w", "-E", "--timeout"},
+}
+# Wrappers whose first positional is an argument, not the command.
+_MISE_WRAPPER_POSITIONAL = {"timeout": 1, "chrt": 1, "taskset": 1, "flock": 1}
+
+
+def _mise_strip_wrapper(seg: list) -> list:
+    """Drop ONE leading wrapper word with its options/values (and, for
+    `timeout 5`/`chrt 10`/`taskset 0x1`/`flock FILE`, its positional)."""
+    w = seg[0].lower()
+    vals = _MISE_WRAPPER_VALUE_OPTS.get(w, set())
+    k = 1
+    while k < len(seg) and seg[k].startswith("-") and seg[k] != "-":
+        if seg[k] == "--":
+            k += 1
+            break
+        k += 2 if seg[k] in vals else 1
+    k += _MISE_WRAPPER_POSITIONAL.get(w, 0)
+    return seg[k:] if w not in ("then", "do", "else", "!", "{", "builtin", "command",
+                                "exec", "time", "busybox") else seg[1:]
 
 
 def _mise_glob_binary(cmd: str) -> bool:
@@ -10114,6 +10175,13 @@ def _mise_cli_segments(cmd: str) -> list:
     skip_target = False
     for t in toks:
         if t and all(c in _MISE_PUNCT for c in t):
+            # `;>`, `&&>`, `|>`: a separator glued to a redirect (QA round 13).
+            sm = re.match(r"(?:;|&&|\|\||\|(?!&)|\(|\)|\n|`|&(?![>&]))+", t)
+            if sm and sm.end() < len(t) and ("<" in t[sm.end():] or ">" in t[sm.end():]):
+                if cur:
+                    out.append(cur)
+                cur = []
+                t = t[sm.end():]
             if ("<" in t or ">" in t) and not t.startswith(("<(", ">(")):
                 # A redirect is part of the SAME simple command: drop its fd
                 # number and its target word (QA round 12: `cp -r /tmp/mise

@@ -1031,3 +1031,41 @@ def test_qa12_perf_bounds(tmp_path):
     d = rule_mise_exec_protect(ev, EMPTY)
     assert d is not None                      # fails closed
     assert time.time() - t < 3
+
+
+# ---- QA round 13 regressions -------------------------------------------------
+def test_qa13_quoted_glob_perf():
+    import time
+    w = "'src/{q,w}{e,r}{t,y}{u,i}{o,p}{z,x}" + "*Q" * 150 + "/a/b{N}'"
+    cmd = "printf %s " + " ".join(w.replace("{N}", str(i)) for i in range(256)) + " ; mise trust"
+    t = time.time()
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None
+    assert time.time() - t < 2
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("sudo -u u cp -r /tmp/mise ~/.config/", None), ("sudo -E cp -r /tmp/mise ~/.config/", None),
+    ("nice -n 5 cp -r /tmp/mise ~/.config/", None), ("timeout 5 cp -r /tmp/mise ~/.config/", None),
+    ("stdbuf -o0 cp -r /tmp/mise ~/.config/", None), ("busybox cp -r /tmp/mise ~/.config/", None),
+    ("timeout 60 git clone https://x/mise", "/home/u/.config"),
+    ("cd ~/.config && sudo -E cp -r /tmp/mise .", None),
+    ("echo a;>/dev/null cp -r /tmp/mise ~/.config/", None),
+    ("echo a&&>/dev/null cp -r /tmp/mise ~/.config/", None),
+    ("cd ~/.config;>/dev/null git clone https://x/mise", None),
+    ("git -c x=y -C ~/.config clone https://x/mise", None),
+    ("git -C ~ -C .config clone https://x/mise", None), ("git -C~/.config clone https://x/mise", None),
+    ("jj git clone https://x/mise", "/home/u/.config"),
+])
+def test_qa13_placement(cmd, cwd):
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd=cwd)
+    d = rule_mise_exec_protect(ev, EMPTY)
+    assert d is not None and d.rule == RULE, (cmd, cwd)
+
+
+def test_qa13_big_mcp_push_allowed():
+    files = [{"path": f"src/m{i}.py", "content": f"# config {i}\nx = '%d' % 1\nimport os\n"}
+             for i in range(800)]
+    d = rule_mise_exec_protect(_mcp({"owner": "o", "repo": "r", "files": files},
+                                    tool="mcp__github__push_files"), EMPTY)
+    assert d is None

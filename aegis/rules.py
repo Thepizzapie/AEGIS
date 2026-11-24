@@ -15675,6 +15675,15 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     the session cwd is a mise runtime dir; and three fail-open costs, now
     bounded and failing closed: MCP discovery (500 candidate strings), glob
     words (256 distinct), Edit replay (500 edits or 50 M edit-bytes).
+    Round 13 found long quoted glob words still costing ~230 ms each in
+    ``fnmatch`` (59 s total, at the hook timeout) -- components whose literal
+    characters exceed any mise name's length are now skipped and a
+    command-wide 4000-candidate budget fails closed; wrapper options hiding
+    a placement (``sudo -u u cp``, ``nice -n 5``, ``timeout 5``, ``stdbuf
+    -o0``, ``busybox``); a separator glued to a redirect (``a;>/dev/null cp
+    ...``); ``git -c x=y -C DIR``/``-CDIR``/repeated ``-C``; ``jj git
+    clone``; multi-line MCP content strings no longer count toward the MCP
+    budget.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -15735,8 +15744,8 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             for s_ in _flatten_strings(a):
                 s_ = str(s_)
                 ls_ = s_[:4096].lower()
-                if not in_mise_dir and not any(k in ls_ for k in _MISE_MCP_KEYS):
-                    continue
+                if not in_mise_dir and ("\n" in s_ or not any(k in ls_ for k in _MISE_MCP_KEYS)):
+                    continue        # a multi-line string is content, never a path (QA round 13)
                 examined += 1
                 if examined > 500:
                     # Bounded work, failing closed (QA round 12).
