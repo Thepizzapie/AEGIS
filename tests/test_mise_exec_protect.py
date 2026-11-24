@@ -631,3 +631,32 @@ def test_qa2d_labels():
     assert "lockfile" in d.message
     d = rule_mise_exec_protect(_write("/h/.local/state/mise/trusted-configs/x", ""), EMPTY)
     assert "trust store" in d.message
+
+
+# ---- QA round 3 regressions --------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "mise " + "-E dev " * 201 + "trust", "mise " + "--env=dev " * 401 + "trust",
+    "mise " + "-v " * 401 + "trust", "mise use " + "node@22 " * 70 + "ubi:evil/x",
+    "mise $(echo trust)", "mise `echo trust`", "mise ${X:-trust}", "mise {trust,}",
+    "echo trust | xargs -I{} mise {}", "mise asdf trust", "mise toml set hooks.enter id",
+    "mise shell-alias set -g ls 'x; ls'", "set -x MISE_YES 1",
+])
+def test_qa3_shell_gated(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("files,extra", [
+    ([{"path": "mise.toml", "content": "OK"}, {"name": "mise.local.toml", "content": "HOOK"}], {}),
+    ([{"path": "mise.toml", "content": "OK"}, {"file": "mise.local.toml", "content": "HOOK"}], {}),
+    ([{"path": "mise.toml", "content": "OK"}], {"more": [{"path": "mise.local.toml", "content": "HOOK"}]}),
+    ([{"path": "mise.toml", "content": "OK", "contents": "HOOK"}], {}),
+])
+def test_qa3_push_files_variants(files, extra):
+    ok, hook = '[tools]\nnode = "22"\n', '[hooks]\nenter = "x"\n'
+    files = [{k: (ok if v == "OK" else hook if v == "HOOK" else v) for k, v in f.items()} for f in files]
+    extra = {k: [{kk: (hook if vv == "HOOK" else vv) for kk, vv in i.items()} for i in v]
+             for k, v in extra.items()}
+    d = evaluate(_mcp({"owner": "o", "repo": "r", "files": files, **extra},
+                      tool="mcp__github__push_files"), EMPTY)
+    assert _ours(d)

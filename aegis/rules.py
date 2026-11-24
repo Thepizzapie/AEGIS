@@ -15295,30 +15295,38 @@ def _mise_mcp_delete_only(ev: Event) -> bool:
     return not _editor_startup_has_content_key(ev.args or {})
 
 
-def _mise_mcp_item_content(a, p: str, _depth: int = 0):
-    """Content of the one list item `{path: p, content: ...}`, if exactly
-    one item names `p` and every mise-path item is that one; else None."""
-    if _depth > 6:
+def _mise_mcp_item_content(a, p: str):
+    """Content of the one list item that names `p`, for a multi-file push
+    (`files: [{path, content}, ...]`) -- only when `p` is the ONLY
+    mise-path-shaped string anywhere in the call and that item carries
+    exactly one content key; otherwise None (judge everything joined).
+    QA round 3: items keyed `name`/`file`, a second list, or an item with
+    both `content` and `contents` rode along unjudged."""
+    if sum(1 for x in _flatten_strings(a) if _mise_path_shaped(str(x))) != 1:
         return None
-    if isinstance(a, dict):
-        for v in a.values():
-            r = _mise_mcp_item_content(v, p, _depth + 1)
-            if r is not None:
-                return r
+    found = []
+
+    def walk(v, depth=0):
+        if depth > 8:
+            return
+        if isinstance(v, dict):
+            if any(isinstance(x, str) and x.strip() == p for x in v.values()):
+                found.append(v)
+            for x in v.values():
+                walk(x, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, depth + 1)
+    walk(a)
+    if len(found) != 1 or found[0] is a:
         return None
-    if not isinstance(a, list):
+    item = found[0]
+    ckeys = [k for k in item if _http_rc_words(k) & _ED_CONTENT_KEY_WORDS]
+    if len(ckeys) != 1 or not isinstance(item[ckeys[0]], str):
         return None
-    hits = []
-    for it in a:
-        if not isinstance(it, dict):
-            continue
-        ip = str(it.get("path") or it.get("file_path") or it.get("filename") or "")
-        if patterns.mise_kind(ip):
-            hits.append((ip, it))
-    if len(hits) != 1 or hits[0][0].strip() != p:
+    if any(isinstance(v, (dict, list)) for v in item.values()):
         return None
-    c = hits[0][1].get("content", hits[0][1].get("contents"))
-    return c if isinstance(c, str) else None
+    return item[ckeys[0]]
 
 
 def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
@@ -15461,7 +15469,17 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``AEGIS_ALLOW_MISE_EXEC=1`` set before launch; a spawned agent can do
     neither.
 
-    Honest scope: ``MISE_CONFIG_DIR``/``MISE_GLOBAL_CONFIG_FILE``/
+    Honest scope -- the largest gap first: mise releases from 2026-08
+    (upstream #12107) IMPLICITLY trust the active project config for
+    ``mise exec``/``install``/``run``/``watch``/bare ``mise <task>`` (outside
+    ``paranoid`` mode), so a config DELIVERED rather than written by the
+    agent -- ``git clone``/``pull``/``apply``/``am``/``stash pop``, ``patch``,
+    an archive extract -- runs its hooks/``_.source``/template exec() on the
+    next ``mise install`` with no trust prompt and no tool call this guard
+    can judge. Gating every ``mise install``/``mise run`` would ask on the
+    most routine mise commands there are, so it is not done here; set
+    ``paranoid = true`` in the global config (a removal of which this guard
+    gates) to restore mise's own prompt. Also not covered: ``MISE_CONFIG_DIR``/``MISE_GLOBAL_CONFIG_FILE``/
     ``MISE_DATA_DIR``/``ASDF_DATA_DIR`` relocations set OUTSIDE this
     command (setting them inline is gated), task files (``[tasks]``,
     ``.mise-tasks/``, ``mise-tasks/``, ``task_config.includes``) -- they run
@@ -15484,6 +15502,8 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     routine but can carry exec (``JAVA_HOME``/``GOPATH``/``*_HOME``,
     ``*PATH``, ``RUSTFLAGS``/``*FLAGS``, any ``NODE_OPTIONS``) and
     ``_.path``/``_.file`` directives, on first add only; unparseable TOML;
+    a mise invocation longer than 400 words or 64 positional arguments
+    (fails closed);
     ``-y``/``--yes`` on any mise command (before a ``run``/``exec`` task
     name) and ``CI=`` on a mise command or ``export CI=`` beside one;
     quoted text, commit messages and heredoc bodies that merely mention a
@@ -15530,7 +15550,16 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     simple command, failing closed); a multi-file MCP push judges the mise
     item's own content; distinct lockfile/trust-store labels; list-valued
     ``command``; version-only aliases, frontend ``VITE_``/``NEXT_PUBLIC_``
-    constants and ``*_compile`` settings allowed.
+    constants and ``*_compile`` settings allowed. Round 3 found: padding
+    (``-E dev`` x200, 70 tool specs) pushed the real subcommand/spec past
+    the word bounds, which then judged the truncated rest -- truncation
+    now fails closed; computed subcommands (``mise $(echo trust)``,
+    ``${X:-trust}``, ``{trust,}``, ``xargs -I{} mise {}``) now ask; ``mise
+    asdf <args>`` forwarding, ``mise toml set``, ``mise shell-alias set``,
+    fish ``set -x MISE_YES``; the multi-file MCP item logic now applies only
+    when the mise path is the call's only one and its item has one content
+    key. The implicit-trust behaviour of current mise (above) was surfaced
+    here and is disclosed rather than gated.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

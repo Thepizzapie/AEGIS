@@ -9710,7 +9710,7 @@ _MISE_TRUST_ENV_RE = re.compile(
 # settings set` (QA round 2: `MISE_YES+=1`, `MISE_NODE_MIRROR_URL=`).
 _MISE_ENV_NAME_RE = re.compile(r"(?<![\w$])((?:MISE|RTX)_\w+)", re.IGNORECASE)
 _MISE_EXPORT_BEFORE_RE = re.compile(
-    r"(?:export|declare|typeset|setenv|set\s+-gx|readonly|local)(?:\s+-{1,2}\w*)*\s+(?:\S+\s+)*$",
+    r"(?:export|declare|typeset|setenv|set\s+-[gU]?x|set\s+-gx|readonly|local)(?:\s+-{1,2}\w*)*\s+(?:\S+\s+)*$",
     re.IGNORECASE)
 _MISE_ENV_OK_SUFFIX = frozenset(("env", "profile", "log_file", "log_level",
                                  "quiet", "verbose", "jobs", "experimental",
@@ -9806,6 +9806,11 @@ def mise_cli_hit(cmd) -> str:
     cmd = cmd.replace("\\", "") if "\\" in cmd else cmd   # `mi\se` is `mise`
     # `mise$IFS trust` / `mise${IFS}trust` (QA round 2; as rule_direnv_protect).
     cmd = re.sub(r"\$\{?IFS\}?", " ", cmd)
+    # `` mise `echo trust` `` / `mise $(...)`: the tokenizer splits at the
+    # substitution, so catch it here (QA round 3).
+    if re.search(_MISE_BIN_WORD_RE.pattern + r"(?:\s+-[^\s`$]*)*\s+(?:`|\$\(|<\()", cmd,
+                 re.IGNORECASE):
+        return "mise with a computed subcommand"
     bad = _mise_env_assignment_hit(cmd)
     if bad:
         return f"mise setting {bad} overridden through the environment"
@@ -9856,6 +9861,8 @@ def _mise_judge_invocation(words: list, i: int) -> str:
     """Judge the mise/rtx/asdf invocation starting at `words[i]`."""
     binname = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
     rest = words[i + 1:i + 1 + 400]        # bounded: linear overall (QA round 2)
+    if len(words) - (i + 1) > 400:
+        return "mise invocation too long to judge"     # fails closed (QA round 3)
     args = []
     j = 0
     while j < len(rest):
@@ -9869,7 +9876,7 @@ def _mise_judge_invocation(words: list, i: int) -> str:
         args.append(w)
         j += 1
         if len(args) >= 64:
-            break
+            return "mise invocation too long to judge"  # fails closed (QA round 3)
     # `--yes`/`-y` auto-answers mise's "config is not trusted. Trust
     # it?" prompt -- the same trust bypass as `mise trust` (QA round 1).
     opts = rest[:rest.index("--")] if "--" in rest else rest
@@ -9886,6 +9893,13 @@ def _mise_judge_invocation(words: list, i: int) -> str:
         return ""
     sub = args[0].lower()
     tail = args[1:]
+    # A computed subcommand (`mise $(echo trust)`, `mise ${X:-trust}`,
+    # `mise {trust,}`, `xargs -I{} mise {}`) is unknown -- ask (QA round 3).
+    if any(c in sub for c in "$`") or sub == "{}" or ("{" in sub and "," in sub):
+        return "mise with a computed subcommand"
+    if binname in ("mise", "rtx") and sub == "asdf":
+        # `mise asdf <args>` forwards to the mise CLI (QA round 3).
+        return _mise_judge_invocation([binname] + tail, 0)
     tl = [t.lower() for t in tail]
     if binname == "asdf":
         if sub in ("set", "local", "global", "shell") and any(
@@ -9925,7 +9939,11 @@ def _mise_judge_invocation(words: list, i: int) -> str:
             if key in _MISE_SETTINGS_SAFE_IF_TRUE and val in ("true", "1", "yes"):
                 return ""
         return f"mise settings change ({key or op})"
-    if sub in ("config", "cfg"):
+    if sub in ("shell-alias", "shell_alias"):
+        if tl[:1] and tl[0] in ("set", "add"):
+            return "mise shell-alias set (defines a shell alias run on activation)"
+        return ""
+    if sub in ("config", "cfg", "toml"):
         if tl[:1] and tl[0] in ("set",):
             return "mise config set (rewrites a mise.toml key)"
         return ""
