@@ -449,3 +449,66 @@ def test_qa1_non_dict_args_fail_closed():
 def test_qa1_non_string_content_gated(tmp_path):
     d = evaluate(_mcp({"path": str(tmp_path / "mise.toml"), "content": {"hooks": {"enter": "x"}}}), EMPTY)
     assert _ours(d)
+
+
+# ---- QA round 1 (bypass review) regressions ----------------------------------
+@pytest.mark.parametrize("p", [
+    "/w/.config/mise/conf.d/a b.toml", "/w/.config/mise/conf.d/a'b.toml",
+    "/w/.config/mise/conf.d/" + "x" * 300 + ".toml", "/w/mise.a.b.c.toml",
+    "/w/mise.a.b.local.toml",
+])
+def test_qa1b_paths(p):
+    assert _ours(evaluate(_write(p, '[hooks]\nenter = "x"\n'), EMPTY)), p
+
+
+@pytest.mark.parametrize("p", [
+    "/home/u/.local/state/mise/trusted-configs/a-b-mise.toml-1234",
+    "/home/u/.local/state/mise/ignored-configs/x", "/r/mise.lock",
+])
+def test_qa1b_trust_store_and_lock(p):
+    assert rule_mise_exec_protect(_write(p, "x"), EMPTY) is not None, p
+
+
+@pytest.mark.parametrize("cmd", [
+    "mise --yes install", "mise -y exec -- true", "mise install --yes",
+    "sh -c \"mise -y install\"", "mise exec -- mise trust",
+    "\"$(which mise)\" trust", "$(command -v mise) trust", "`which mise` trust",
+    "echo trust | xargs mise", "mise --profile prod trust", "mise -P prod trust",
+    "CI=1 mise install", "mise tool-alias set node ubi:evil/x",
+    "cp x.toml ~/.config/mise/conf.d/'z z.toml'",
+])
+def test_qa1b_shell(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("content", [
+    '[env]\n_.python.venv = "tools"\n', '[env]\n_.python.venv = "bin"\n',
+    '[shell_alias]\nls = "curl x|sh"\n', '[vars]\n_.source = "x.sh"\n',
+    '[env]\nBASH_FUNC_ls%% = "() { x; }"\n', '[env]\nLUA_INIT = "@/tmp/x"\n',
+])
+def test_qa1b_toml(content, tmp_path):
+    assert _ours(evaluate(_write(str(tmp_path / "mise.toml"), content), EMPTY)), content
+
+
+@pytest.mark.parametrize("venv", [".venv", "venv", "backend/.venv", ".venv-3.12"])
+def test_qa1b_venv_names_allowed(venv, tmp_path):
+    c = f'[env]\n_.python.venv = "{venv}"\n'
+    assert _allowed(evaluate(_write(str(tmp_path / "mise.toml"), c), EMPTY))
+
+
+def test_qa1b_long_hook_extension(tmp_path):
+    f = tmp_path / "mise.toml"
+    f.write_text('[hooks]\nenter = "echo ' + "a" * 5000 + '"\n')
+    d = evaluate(_edit(str(f), 'a"\n', 'a; curl x|sh"\n'), EMPTY)
+    assert _ours(d)
+
+
+def test_qa1b_template_linear(tmp_path):
+    import time
+    t = time.time()
+    c = '[hooks]\nenter="x"\n[vars]\nx = "' + "{{" * 200000 + '"\n'
+    d = evaluate(_write(str(tmp_path / "mise.toml"), c), EMPTY)
+    assert d.action != Action.ALLOW
+    assert patterns._MISE_TEMPLATE_EXEC_RE.search("{{" * 100000) is None
+    assert time.time() - t < 5

@@ -9189,9 +9189,9 @@ def _ed_extract(verb, args, state, dirs, hits) -> bool:
 
 _MISE_B = _HTTP_RC_B
 _MISE_END = _WIN_TRIM + r"(?=[/\;&|)(<>`}:,]|\s|['\"]|$)"
-_MISE_BASE = r"(?:\.?(?:mise|rtx)(?:\.[\w-]{1,40}){0,2}\.toml)"
+_MISE_BASE = r"(?:\.?(?:mise|rtx)(?:\.[\w-]{1,40}){0,6}\.toml)"
 _MISE_DIR_FILE = (r"(?:\.?(?:mise|rtx)" + _SEP + r"(?:conf\.d" + _SEP
-                  + r"[^/\\\s'\"<>|&;]{1,200}\.toml|config(?:\.[\w-]{1,40}){0,2}\.toml"
+                  + r"[^/\\\n]{1,1024}?\.toml|config(?:\.[\w-]{1,40}){0,6}\.toml"
                   + r"|settings\.toml))")
 MISE_CONFIG_PATH_RE = re.compile(
     _MISE_B + r"(?:" + _MISE_BASE + r"|" + _MISE_DIR_FILE
@@ -9207,7 +9207,16 @@ MISE_RUNTIME_DIR_RE = re.compile(
     r"|\.asdf"
     r"|(?:(?:\$\{?|%|\$env:)LOCALAPPDATA[}%]?|AppData" + _SEP + r"Local)" + _SEP + r"mise"
     r"|(?:\$\{?|%|\$env:)(?:MISE|RTX|ASDF)_DATA_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?"
-    r")" + _SEP + r"(?:plugins|shims|installs)" + _MISE_END,
+    r")" + _SEP + r"(?:plugins|shims|installs)" + _MISE_END
+    # mise's trust store: in non-paranoid mode `is_trusted()` only checks
+    # that a (deterministically named) file exists here -- writing one IS
+    # `mise trust` (QA round 1).
+    + r"|" + _MISE_B + r"(?:\.local" + _SEP + r"state" + _SEP + r"(?:mise|rtx)"
+    r"|(?:\$\{?|%|\$env:)(?:MISE|RTX)_STATE_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?"
+    r"|(?:\$\{?|%|\$env:)XDG_STATE_HOME[}%]?" + _SEP + r"(?:mise|rtx)"
+    r")" + _SEP + r"(?:trusted|ignored)-configs" + _MISE_END
+    # The lockfile pins download URLs/checksums for every tool.
+    + r"|" + _MISE_B + r"\.?(?:mise|rtx)(?:\.[\w-]{1,40}){0,6}\.lock" + _MISE_END,
     re.IGNORECASE,
 )
 MISE_PATH_RE = re.compile(
@@ -9350,6 +9359,7 @@ _MISE_ENV_EXACT = frozenset((
     "CURL_CA_BUNDLE", "HOSTALIASES", "RES_OPTIONS", "LOCALDOMAIN",
     "VIMINIT", "EXINIT", "MYVIMRC", "NVIM_APPNAME", "GOTOOLCHAIN",
     "TMPDIR", "MAKEFLAGS", "MFLAGS", "SUDO_ASKPASS", "BUN_INSTALL",
+    "LUA_INIT", "PHPRC", "PHP_INI_SCAN_DIR", "CONFIG_SITE", "RSYNC_RSH", "CI",
 ))
 _MISE_ENV_PREFIX = (
     "LD_", "DYLD_", "MISE_", "RTX_", "ASDF_", "AEGIS_", "CLAUDE_", "ANTHROPIC_",
@@ -9360,6 +9370,7 @@ _MISE_ENV_PREFIX = (
     "GONOPROXY", "GOINSECURE", "GOSUMDB", "GOPRIVATE", "GOENV", "GOFLAGS",
     "COMPOSER_", "MAVEN_", "GRADLE_", "SBT_", "DENO_", "BUN_", "HTTP",
     "ALL_PROXY", "FTP_PROXY", "NO_PROXY", "TF_CLI_", "AWS_ENDPOINT",
+    "BASH_FUNC_", "LUA_INIT",
 )
 _MISE_ENV_SUFFIX = ("_PROXY", "PATH", "_HOME", "_OPTIONS", "_OPTS", "FLAGS",
                     "_COMMAND", "_CMD", "EDITOR", "PAGER", "ASKPASS", "WRAPPER",
@@ -9419,17 +9430,44 @@ _MISE_SAFE_BACKENDS = frozenset(("core", "aqua"))
 _MISE_TOOL_SAFE_OPTS = frozenset(("version", "os", "platforms", "depends",
                                   "profile", "components", "targets",
                                   "virtualenv"))
-_MISE_TEMPLATE_EXEC_RE = re.compile(r"\{[{%][\s\S]*?\bexec\b", re.IGNORECASE)
-_MISE_VENV_PATH_RE = re.compile(r"^(?!/)(?![A-Za-z]:)(?!~)[\w.\-/]{1,200}$")
+_MISE_EXEC_WORD_RE = re.compile(r"\bexec\b", re.IGNORECASE)
+_MISE_TPL_OPEN_RE = re.compile(r"\{[{%]")
+
+
+class _MiseTemplateExec:
+    """Linear `{{`/`{%` ... `exec` test (QA round 1: the lazy-regex form was
+    quadratic -- 35 s on 80 KB of `{{` -- and a hook timeout fails open)."""
+
+    @staticmethod
+    def search(s):
+        if not isinstance(s, str):
+            return None
+        m = _MISE_TPL_OPEN_RE.search(s)
+        if not m:
+            return None
+        return _MISE_EXEC_WORD_RE.search(s, m.end())
+
+
+_MISE_TEMPLATE_EXEC_RE = _MiseTemplateExec()
+# Relative, no `..`, and the last component must be venv-named: mise
+# prepends `<venv>/bin` to PATH, so `_.python.venv = "tools"` is `_.path`
+# binary shadowing in disguise (QA round 1).
+_MISE_VENV_PATH_RE = re.compile(
+    r"^(?!/)(?![A-Za-z]:)(?!~)(?:[\w.\-]{1,100}/){0,4}\.?(?:venv|virtualenv)[\w.\-]{0,40}/?$",
+    re.IGNORECASE)
 _MISE_MAX_TEXT = 2_000_000
 
 
 def _mise_fp(*parts) -> str:
+    """Canonical fingerprint: a hash of the FULL value (QA round 1: a
+    4000-char truncation let a long human-set hook be extended unseen)."""
+    import hashlib as _hl
     import json as _json
     try:
-        return _json.dumps(parts, sort_keys=True, default=str)[:4000]
+        txt = _json.dumps(parts, sort_keys=True, default=str)
     except Exception:
-        return repr(parts)[:4000]
+        txt = repr(parts)
+    return _hl.sha256(txt.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _mise_templates(v, path, out, depth=0):
@@ -9548,7 +9586,7 @@ def mise_toml_unsafe_entries(content) -> list:
     except Exception:
         return [("<unparseable TOML>", "<unparseable>")]
     for key in ("hooks", "watch_files", "plugins", "tool_alias", "alias",
-                "env_file", "env_path", "dotenv"):
+                "env_file", "env_path", "dotenv", "shell_alias", "prepare"):
         v = doc.get(key)
         if v in (None, {}, []):
             continue
@@ -9561,6 +9599,9 @@ def mise_toml_unsafe_entries(content) -> list:
         else:
             out.append((key, _mise_fp(key, v)))
     _mise_env_entries(doc.get("env"), out)
+    vars_ = doc.get("vars")
+    if isinstance(vars_, dict) and vars_.get("_") not in (None, {}, []):
+        out.append(("vars._ directive", _mise_fp("vars", "_", vars_.get("_"))))
     _mise_tool_entries(doc.get("tools"), out)
     _mise_settings_entries(doc.get("settings"), out)
     # Per-environment profile tables can carry their own env/tools.
@@ -9611,7 +9652,7 @@ def mise_patch_hit(text) -> bool:
 _MISE_CLI_BINS = frozenset(("mise", "rtx", "asdf"))
 # Global options that take a separate value (`mise -C dir trust`).
 _MISE_VALUE_OPTS = frozenset(("-C", "--cd", "-E", "--env", "-j", "--jobs",
-                              "--log-level", "--output"))
+                              "--log-level", "--output", "--profile", "-P"))
 _MISE_CLI_SEG_RE = re.compile(r"&&|\|\||[;&|\n(){}`]|\$\(")
 # Only an ASSIGNMENT (`NAME=`, `export NAME[=]`, `setenv NAME`) -- a mere
 # mention (`printenv MISE_DATA_DIR`, `grep MISE_YES docs/`) is not an
@@ -9637,6 +9678,11 @@ def _mise_spec_unsafe(spec: str) -> bool:
 
 
 _MISE_PUNCT = "();<>|&`\n"
+_MISE_WHICH_RE = re.compile(
+    r"\$\(\s*(?:which|command\s+-[vV]|type\s+-[pP]|whence\s+-p|where)\s+"
+    r"([\w./\-]*(?:mise|rtx|asdf)(?:\.exe)?)\s*\)"
+    r"|`\s*(?:which|command\s+-[vV]|type\s+-[pP]|whence\s+-p|where)\s+"
+    r"([\w./\-]*(?:mise|rtx|asdf)(?:\.exe)?)\s*`", re.IGNORECASE)
 
 
 def _mise_cli_segments(cmd: str) -> list:
@@ -9675,8 +9721,14 @@ def mise_cli_hit(cmd) -> str:
         return "oversized command naming mise"
     if _MISE_TRUST_ENV_RE.search(cmd):
         return "mise trust/safety setting overridden through the environment"
-    if not re.search(r"(?:mise|rtx|asdf)", cmd.replace("\\", ""), re.IGNORECASE):
+    cmd = cmd.replace("\\", "") if "\\" in cmd else cmd   # `mi\se` is `mise`
+    if not re.search(r"(?:mise|rtx|asdf)", cmd, re.IGNORECASE):
         return ""
+    # mise treats CI environments as trusting every config.
+    if re.search(r"(?:^|[\s;&|(`'\"])(?:export\s+)?CI=", cmd):
+        return "CI= set alongside mise (mise auto-trusts configs under CI)"
+    # `"$(which mise)" trust`, `` `command -v mise` trust `` (QA round 1).
+    cmd = _MISE_WHICH_RE.sub(lambda m: m.group(1) or m.group(2), cmd)
     return _mise_cli_hit(cmd, 0)
 
 
@@ -9723,7 +9775,16 @@ def _mise_judge_invocation(words: list, i: int) -> str:
                 continue
             args.append(w)
             j += 1
+        # `--yes`/`-y` auto-answers mise's "config is not trusted. Trust
+        # it?" prompt -- the same trust bypass as `mise trust` (QA round 1).
+        opts = rest[:rest.index("--")] if "--" in rest else rest
+        if any(o == "--yes" or o.startswith("--yes=")
+               or re.fullmatch(r"-[A-Za-z]*y[A-Za-z]*", o) for o in opts):
+            return "mise --yes/-y (auto-accepts mise's untrusted-config prompt)"
         if not args:
+            if binname in ("mise", "rtx") and any(
+                    w.rsplit("/", 1)[-1].lower() in ("xargs", "parallel") for w in words[:i]):
+                return "mise run with arguments from stdin (xargs)"
             return ""
         sub = args[0].lower()
         tail = args[1:]
@@ -9784,6 +9845,10 @@ def _mise_judge_invocation(words: list, i: int) -> str:
             if tl[:1] and tl[0] in ("install", "i", "add", "a", "link", "ln",
                                     "update", "up", "upgrade"):
                 return "mise plugin install/link (runs the plugin's scripts)"
+            return ""
+        if sub in ("tool-alias", "alias", "a"):
+            if tl[:1] and tl[0] in ("set", "add", "create"):
+                return "mise tool-alias set (remaps a tool name to another backend)"
             return ""
         if sub in ("generate", "gen", "g"):
             if tl[:1] and tl[0] in ("git-pre-commit", "pre-commit") and (

@@ -15458,6 +15458,18 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``[settings.python] uv_venv_auto``-style keys, a bare ``mise
     settings`` listing, and ``MISE_*`` names merely mentioned
     (``printenv MISE_DATA_DIR``) -- only assignments/exports now count.
+    The parallel bypass review found: ``conf.d`` names with spaces/quotes/
+    200+ chars and env names with 3+ dot segments escaped the path regex;
+    ``--yes``/``-y`` on any mise command auto-accepts the untrusted-config
+    prompt (now gated like ``mise trust``), as does ``CI=`` next to mise;
+    ``"$(which mise)" trust``, ``xargs mise``, ``--profile``/``-P``; the
+    trust store (``~/.local/state/mise/trusted-configs/``, whose file
+    existence IS trust) and ``mise.lock`` are now gated paths;
+    ``_.python.venv = "tools"`` shadowed PATH (the last component must now
+    be venv-named); the template test was quadratic (now linear) and
+    fingerprints truncated at 4000 chars (now a full sha256); also added
+    ``[shell_alias]``, ``[prepare]``, ``vars._``, ``mise tool-alias set``,
+    ``BASH_FUNC_*``, ``LUA_INIT``, ``PHPRC``, ``CONFIG_SITE``, ``RSYNC_RSH``.
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
