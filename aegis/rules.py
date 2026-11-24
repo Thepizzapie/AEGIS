@@ -15692,7 +15692,9 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``.miserc.toml`` judged with the mise.toml schema, so its top-level
     ``override_config_filenames`` (load a config under an unguarded name)
     and ``ignored_config_paths`` (drop the global config) passed -- it now
-    has its own allowlist (only ``env`` with plain names).
+    has its own allowlist (only ``env`` with plain names). Round 16
+    PASSED with no blocking findings (miserc locations, Edit/MCP replay,
+    related ``MISE_*`` env/settings forms and performance verified).
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
