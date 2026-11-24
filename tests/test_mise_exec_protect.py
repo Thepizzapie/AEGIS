@@ -1069,3 +1069,35 @@ def test_qa13_big_mcp_push_allowed():
     d = rule_mise_exec_protect(_mcp({"owner": "o", "repo": "r", "files": files},
                                     tool="mcp__github__push_files"), EMPTY)
     assert d is None
+
+
+# ---- QA round 14 regressions -------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cp evil ~/.local/share/mise/inst*/node/22/bin/node",
+    "cp evil ~/.local/share/mise/i?stalls/python/3.12/bin/python3",
+    "cp evil ~/.local/share/mise/insta??s/node/22/bin/node",
+    "cp evil ~/.local/share/mi?e/installs/node/22/bin/node",
+    "cp evil ~/.local/sh*/mise/installs/node/22/bin/node",
+    "cp evil ~/.local/share/mise/plug*/x/bin/install", "cp evil ~/.local/share/mise/p*s/x/bin/install",
+    "tee ~/.local/share/mise/inst*/node/22/bin/node",
+    "echo x > ~/.local/share/mise/inst*/node/22/bin/node",
+    "sudo -iu u cp -r /tmp/mise ~/.config/", "sudo -Eu u cp -r /tmp/mise ~/.config/",
+    "stdbuf -o 0 cp -r /tmp/mise ~/.config/", "stdbuf -o L -e 0 cp -r /tmp/mise ~/.config/",
+    "taskset -c 0 cp -r /tmp/mise ~/.config/", "env -u X cp -r /tmp/mise ~/.config/",
+    "time -p cp -r /tmp/mise ~/.config/", "command -p cp -r /tmp/mise ~/.config/",
+    "exec -a x cp -r /tmp/mise ~/.config/", "sh -c 'cp -r /tmp/mise ~/.config/'",
+    "bash -lc 'cd ~/.config && cp -r /tmp/mise .'",
+    "cd ~/.config && jj --no-pager git clone https://x/mise",
+])
+def test_qa14_gated(cmd):
+    d = rule_mise_exec_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo -u postgres psql", "timeout 30 npm test", "taskset -c 0 ./bench",
+    "git -C ~/.config clone dotfiles", "mkdir -p ~/.config/{nvim,kitty}", "cp *.toml dist/",
+    "bash -lc 'npm test'", "cp -r ~/.config/nvim /tmp/bak/",
+])
+def test_qa14_allowed(cmd):
+    assert rule_mise_exec_protect(_shell(cmd), EMPTY) is None, cmd

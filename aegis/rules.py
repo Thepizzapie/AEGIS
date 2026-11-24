@@ -15683,7 +15683,12 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     -o0``, ``busybox``); a separator glued to a redirect (``a;>/dev/null cp
     ...``); ``git -c x=y -C DIR``/``-CDIR``/repeated ``-C``; ``jj git
     clone``; multi-line MCP content strings no longer count toward the MCP
-    budget.
+    budget. Round 14 found globs deep in an install path (``~/.local/share/
+    mise/inst*/node/22/bin/node``) missed since round 9 -- glob substitution
+    now keeps the literal prefix and covers the last 12 glob components of
+    the whole word; and wrapper forms hiding placement (``sudo -iu u``,
+    ``stdbuf -o 0``, ``taskset -c 0``, ``time -o f``, ``exec -a x``, ``sh -c
+    BODY`` / ``bash -lc``, ``jj --no-pager git clone``).
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
