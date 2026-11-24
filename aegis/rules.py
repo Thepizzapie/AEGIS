@@ -15321,6 +15321,8 @@ def _mise_target_kind(ev: Event, p: str) -> tuple:
     return "", p
 
 
+_MISE_MCP_KEYS = ("mise", "rtx", "asdf", "tool-versions", "default-", ".toml", ".lock",
+                  "%", "config", "..", "plugins", "shims", "installs", "trusted")
 _MISE_DIR_KEY_WORDS = frozenset(("dir", "directory", "folder", "parent", "cwd", "root", "base",
                                  "path", "location", "target", "dest", "destination"))
 _MISE_NAME_KEY_WORDS = frozenset(("name", "filename", "basename", "file"))
@@ -15393,6 +15395,9 @@ def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
     if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
         return ["<edit shape not replayable against the file on disk>"]
     before = _npmrc_read(ev, p)
+    if len(edits) > 500 or len(edits) * len(before or "") > 50_000_000:
+        # Replay cost is edits x file size; fail closed (QA round 12).
+        return ["<too many edits to replay>"]
     content = a.get("content", a.get("contents"))
     if content is not None and not isinstance(content, str):
         # Non-string content (a JSON object an MCP server serializes): judged
@@ -15660,7 +15665,16 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     parent (``cp -r /tmp/mise ~/.config/``, ``cd ~/.config && git clone
     https://x/mise``) -- source basenames are now joined onto the
     destination; ``mi$'s'e``; an MCP vocabulary prefilter bounding large
-    multi-item calls.
+    multi-item calls. Round 12 found the placement check fooled by a
+    trailing redirect (``cp -r /tmp/mise ~/.config/ 2>/dev/null`` -- the
+    tokenizer now keeps redirects inside their command and drops their fd
+    and target), ``git clone --depth 1 .../mise`` / ``git -C ~/.config
+    clone`` / ``env -C`` (valued clone options skipped; ``gh repo clone``,
+    ``git submodule add``, ``hg``/``svn`` checkouts added), ``cp -t DIR``/
+    ``--target-directory``; the MCP prefilter dropping relative targets when
+    the session cwd is a mise runtime dir; and three fail-open costs, now
+    bounded and failing closed: MCP discovery (500 candidate strings), glob
+    words (256 distinct), Edit replay (500 edits or 50 M edit-bytes).
     """
     cfg = getattr(policy, "mise_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -15713,17 +15727,27 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         kind, p = _mise_target_kind(ev, p)
         found = None
         if not kind and ev.action == ActionClass.MCP:
+            # The session cwd is itself a mise dir: any relative string may
+            # be a target (QA round 12).
+            in_mise_dir = bool(ev.cwd) and bool(_mise_target_kind(ev, "./x")[0]
+                                                or patterns.MISE_CONFIG_DIR_RE.search(str(ev.cwd)))
+            examined = 0
             for s_ in _flatten_strings(a):
                 s_ = str(s_)
+                ls_ = s_[:4096].lower()
+                if not in_mise_dir and not any(k in ls_ for k in _MISE_MCP_KEYS):
+                    continue
+                examined += 1
+                if examined > 500:
+                    # Bounded work, failing closed (QA round 12).
+                    kind, p, found = "toml", "<many path-like strings>", [
+                        "<MCP call too large to judge for mise paths>"]
+                    break
                 if _mise_path_shaped(s_):
                     kind, p = patterns.mise_kind(s_.strip()), s_.strip()
                     break
                 t_ = s_.strip()
-                lt_ = t_.lower()
-                if t_ and "\n" not in t_ and " " not in t_ and len(t_) < 4096 and any(
-                        k in lt_ for k in ("mise", "rtx", "asdf", "tool-versions", "default-",
-                                           ".toml", ".lock", "%", "config", "..", "plugins",
-                                           "shims", "installs", "trusted")) and (
+                if t_ and "\n" not in t_ and " " not in t_ and len(t_) < 4096 and (
                         "/" in t_ or "\\" in t_ or t_.lower().endswith((".toml", ".lock"))
                         or t_ == ".tool-versions"):
                     k_, _ = _mise_target_kind(ev, t_)

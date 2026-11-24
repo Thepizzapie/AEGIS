@@ -973,3 +973,61 @@ def test_qa11_ci_scripts_allowed(cmd):
 def test_qa11_placement(cmd):
     d = rule_mise_exec_protect(_shell(cmd), EMPTY)
     assert d is not None and d.rule == RULE, cmd
+
+
+# ---- QA round 12 regressions -------------------------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cp -r /tmp/mise ~/.config/ 2>/dev/null", "/home/u/proj"),
+    ("cp -r /tmp/mise ~/.config/ 2>&1", None),
+    ("git clone --depth 1 https://github.com/x/mise", "/home/u/.config"),
+    ("cd ~/.config && git clone --depth 1 https://github.com/x/mise", None),
+    ("cd ~/.config && git clone -q --branch main https://x/mise", None),
+    ("git clone -o o https://x/mise", "/home/u/.config"),
+    ("git -C ~/.config clone https://x/mise", None),
+    ("cp -r -t ~/.config /tmp/mise", None), ("cp -rt ~/.config /tmp/mise", None),
+    ("cp -r --target-directory ~/.config /tmp/mise", None),
+    ("cp -r /tmp/mise --target-directory=$HOME/.config", None),
+    ("mv -t ~/.config /tmp/mise", None), ("cd ~/.config && gh repo clone evil/mise", None),
+    ("env -C ~/.config cp -r /tmp/mise .", None),
+])
+def test_qa12_placement(cmd, cwd):
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd=cwd)
+    d = rule_mise_exec_protect(ev, EMPTY)
+    assert d is not None and d.rule == RULE, (cmd, cwd)
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("rsync -avt src/ dest/", "/home/u/proj"), ("cd ~/.config && git clone https://x/mise-action", None),
+    ("git clone --depth 1 https://github.com/x/repo", "/home/u/.config"),
+    ("cp config.toml dist/ 2>/dev/null", "/home/u/proj"),
+])
+def test_qa12_allowed(cmd, cwd):
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd=cwd)
+    assert rule_mise_exec_protect(ev, EMPTY) is None, (cmd, cwd)
+
+
+def test_qa12_mcp_cwd_in_runtime_dir():
+    for key in ("destination", "target", "dest"):
+        ev = Event.make(HookEvent.PRE_TOOL_USE, tool="mcp__fs__write_file", action=ActionClass.MCP,
+                        args={key: "bin/node", "content": "x"},
+                        cwd="/home/u/.local/share/mise/installs/node/22")
+        assert rule_mise_exec_protect(ev, EMPTY) is not None, key
+
+
+def test_qa12_perf_bounds(tmp_path):
+    import time
+    t = time.time()
+    ev = _mcp({"items": ["plugins/" + "a/" * 300 + str(i) for i in range(3000)]}, tool="mcp__x__write_notes")
+    rule_mise_exec_protect(ev, EMPTY)
+    ev = _mcp({"items": ["b/" * 2000 + str(i) for i in range(5000)]}, tool="mcp__x__write_notes")
+    rule_mise_exec_protect(ev, EMPTY)
+    rule_mise_exec_protect(_shell("cat " + " ".join(f"s*/s*/s*/s*/s*/{'a' * 100}{i}" for i in range(1000))
+                                  + " > out"), EMPTY)
+    f = tmp_path / "mise.toml"
+    f.write_text("[tasks]\n" + "".join(f't{i}.run = "echo {i}"\n' for i in range(20000)))
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="MultiEdit", args={
+        "file_path": str(f), "edits": [{"old_string": f"echo {i}\"", "new_string": f"echo {i}!\""}
+                                       for i in range(20000)]})
+    d = rule_mise_exec_protect(ev, EMPTY)
+    assert d is not None                      # fails closed
+    assert time.time() - t < 3

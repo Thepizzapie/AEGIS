@@ -9276,6 +9276,11 @@ def _mise_dir_or_path_hit(p: str) -> bool:
 
 
 _MISE_PLACE_VERBS = frozenset(("cp", "mv", "ln", "rsync", "install", "ditto", "scp"))
+_MISE_CLONE_VALUE_OPTS = frozenset((
+    "--depth", "-b", "--branch", "-o", "--origin", "--reference", "--reference-if-able",
+    "-c", "--config", "--template", "--separate-git-dir", "-u", "--upload-pack",
+    "--filter", "--shallow-since", "--shallow-exclude", "-j", "--jobs", "--bundle-uri",
+    "--server-option", "--name", "-r", "--rev", "-u", "--updaterev"))
 
 
 def _mise_cand_words(ws) -> list:
@@ -9316,6 +9321,22 @@ def mise_cwd_hit(cmd: str, cwd) -> bool:
     joins = 0
     for seg in segs:
         while seg and (seg[0].lower() in _MISE_WRAPPERS or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+            if seg[0].lower() == "env":
+                # `env -C DIR cmd` / `--chdir=DIR` (QA round 12).
+                seg = seg[1:]
+                while seg and (seg[0].startswith("-") or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+                    o = seg[0]
+                    if o in ("-C", "--chdir") and len(seg) > 1:
+                        cur = _mise_join(cur, seg[1]) if cur or seg[1].startswith(("/", "~", "$")) else seg[1]
+                        dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+                        seg = seg[2:]
+                        continue
+                    if o.startswith("--chdir="):
+                        v = o.split("=", 1)[1]
+                        cur = _mise_join(cur, v) if cur or v.startswith(("/", "~", "$")) else v
+                        dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+                    seg = seg[1:]
+                continue
             seg = seg[1:]
         if not seg:
             continue
@@ -9333,18 +9354,66 @@ def mise_cwd_hit(cmd: str, cwd) -> bool:
                     dirs[nn] = None
                     cur = nn
             continue
-        # Known-name placement into a parent (QA round 11).
-        pos = [w for w in seg[1:] if not w.startswith("-")]
-        if v0 in _MISE_PLACE_VERBS and len(pos) >= 2:
-            dest, srcs = pos[-1], pos[:-1]
+        if v0 == "env" or (v0 == "git" and "-C" in seg[:3]):
+            # `env -C DIR cmd`, `git -C DIR clone ...` (QA round 12).
+            if "-C" in seg:
+                k = seg.index("-C")
+                if k + 1 < len(seg):
+                    cur = _mise_join(cur, seg[k + 1]) if cur or seg[k + 1].startswith(("/", "~", "$")) else seg[k + 1]
+                    dirs[_ed_dotdot_normalize(cur.replace("\\", "/")).rstrip("/") or "/"] = None
+                    seg = seg[:k] + seg[k + 2:]
+            if v0 == "env":
+                seg = seg[1:]
+                while seg and (seg[0].startswith("-") or _HTTP_RC_ASSIGN_RE.match(seg[0])):
+                    seg = seg[1:]
+                if not seg:
+                    continue
+                v0 = seg[0].rsplit("/", 1)[-1].lower()
+        # Known-name placement into a parent (QA rounds 11-12).
+        tdir = None
+        pos = []
+        k = 1
+        while k < len(seg):
+            w = seg[k]
+            if w in ("-t", "--target-directory") and k + 1 < len(seg) and v0 != "rsync":
+                tdir = seg[k + 1]
+                k += 2
+                continue
+            if w.startswith("--target-directory="):
+                tdir = w.split("=", 1)[1]
+            elif re.fullmatch(r"-[A-Za-z]*t", w) and k + 1 < len(seg) and v0 in ("cp", "mv", "ln", "install"):
+                tdir = seg[k + 1]
+                k += 2
+                continue
+            elif not w.startswith("-"):
+                pos.append(w)
+            k += 1
+        if v0 in _MISE_PLACE_VERBS and (len(pos) >= 2 or (tdir and pos)):
+            dest, srcs = (tdir, pos) if tdir else (pos[-1], pos[:-1])
             dbase = _mise_join(cur, dest) if cur else dest
             for sw in srcs[:200]:
                 b = sw.rstrip("/").replace("\\", "/").rsplit("/", 1)[-1]
                 if b and _mise_dir_or_path_hit(dbase.rstrip("/") + "/" + b):
                     return True
+        clone_at = -1
         if v0 == "git" and "clone" in seg:
-            k = seg.index("clone")
-            cp_ = [w for w in seg[k + 1:] if not w.startswith("-")]
+            clone_at = seg.index("clone")
+        elif v0 == "git" and "submodule" in seg and "add" in seg:
+            clone_at = seg.index("add")
+        elif v0 == "gh" and seg[1:3] == ["repo", "clone"]:
+            clone_at = 2
+        elif v0 in ("hg", "svn", "jj") and len(seg) > 1 and seg[1] in ("clone", "co", "checkout", "export"):
+            clone_at = 1
+        if clone_at >= 0:
+            cp_, k = [], clone_at + 1
+            while k < len(seg):
+                w = seg[k]
+                if w in _MISE_CLONE_VALUE_OPTS:
+                    k += 2
+                    continue
+                if not w.startswith("-"):
+                    cp_.append(w)
+                k += 1
             if cp_:
                 tgt = cp_[1] if len(cp_) > 1 else cp_[0].rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
                 if _mise_dir_or_path_hit(_mise_join(cur, tgt) if cur else tgt):
@@ -9469,6 +9538,8 @@ def mise_shell_path_hit(cmd) -> bool:
         if tail6 in seen_glob:
             continue
         seen_glob.add(tail6)
+        if len(seen_glob) > 256:
+            return True             # bounded total glob work, fails closed (QA round 12)
         for v in _mise_glob_variants(w):
             if MISE_PATH_RE.search(v) or MISE_CONFIG_DIR_RE.search(v):
                 return True
@@ -10040,11 +10111,24 @@ def _mise_cli_segments(cmd: str) -> list:
     except ValueError:
         return [seg.split() for seg in _MISE_CLI_SEG_RE.split(cmd)]
     out, cur = [], []
+    skip_target = False
     for t in toks:
         if t and all(c in _MISE_PUNCT for c in t):
+            if ("<" in t or ">" in t) and not t.startswith(("<(", ">(")):
+                # A redirect is part of the SAME simple command: drop its fd
+                # number and its target word (QA round 12: `cp -r /tmp/mise
+                # ~/.config/ 2>/dev/null` took `2` as the destination).
+                if cur and cur[-1].isdigit():
+                    cur.pop()
+                skip_target = True
+                continue
             if cur:
                 out.append(cur)
             cur = []
+            skip_target = False
+            continue
+        if skip_target:
+            skip_target = False
             continue
         cur.append(t[2:] if t.startswith("$(") else t)
     if cur:
