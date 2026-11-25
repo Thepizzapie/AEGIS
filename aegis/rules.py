@@ -16056,6 +16056,10 @@ def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     only for ``bun`` itself with every earlier word a flag or one of bun's
     consuming subcommands (``test``/``install``/``add``/``build``...), never
     for ``bunx``/``bun x``/``bun run s``/``bun f.js``, which forward it.
+    Round 4 PASSED with no blocking findings (every consuming subcommand,
+    ``--filter``/``--workspaces``/``--cwd=`` forms verified as config reads
+    in real Bun). Accepted false ASK: a positional before ``-c`` (``bun test
+    pattern -c bunfig.toml``, ``bun --cwd /r test -c ...``).
     """
     cfg = getattr(policy, "bunfig_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
