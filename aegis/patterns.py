@@ -10704,6 +10704,40 @@ def bunfig_shell_path_hit(cmd) -> bool:
     return False
 
 
+# A `bun`/`bunx` invocation only READS bunfig (`bun test -c ./bunfig.toml`,
+# `cat bunfig.toml && bun test` -- QA round 1). Not when it evaluates code
+# (`-e`/`-p`/`--eval`/`--print`), redirects, or carries a substitution.
+_BUNFIG_SEG_SPLIT_RE = re.compile(r"(&&|\|\||[;&|\n])")
+_BUNFIG_BUN_EVAL_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*[ep][A-Za-z]*|--eval|--print)(?:[=\s]|$)")
+_BUNFIG_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=\S*$")
+
+
+def bunfig_neutralize_bun_runs(cmd: str) -> str:
+    """`cmd` with every plain `bun`/`bunx` simple command replaced by
+    `true`, so a bunfig path named only as its `--config` value, or a read
+    chained with `&& bun test`, is judged as the read it is."""
+    if not isinstance(cmd, str) or len(cmd) > 200_000:
+        return cmd
+    parts = _BUNFIG_SEG_SPLIT_RE.split(cmd)
+    out = []
+    for seg in parts:
+        if _BUNFIG_SEG_SPLIT_RE.fullmatch(seg or "x"):
+            out.append(seg)
+            continue
+        words = seg.split()
+        i = 0
+        while i < len(words) and _BUNFIG_ASSIGN_RE.match(words[i]):
+            i += 1
+        verb = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower() if i < len(words) else ""
+        if (verb in ("bun", "bunx", "bun.exe", "bunx.exe")
+                and not any(c in seg for c in "<>`$'\"\\(){}*?[")
+                and not _BUNFIG_BUN_EVAL_RE.search(" ".join(words[1:]))):
+            out.append(" true ")
+        else:
+            out.append(seg)
+    return "".join(out)
+
+
 def bunfig_patch_hit(text) -> bool:
     """True if `text` is a patch whose header line names a bunfig file."""
     if not isinstance(text, str) or "\n" not in text:
@@ -10714,14 +10748,15 @@ def bunfig_patch_hit(text) -> bool:
     return False
 
 
-_BUNFIG_TOP_SAFE = frozenset(("jsx", "jsxFactory", "jsxFragment", "smol",
+_BUNFIG_TOP_SAFE = frozenset(("jsx", "smol",
                               "logLevel", "telemetry", "hot", "watch"))
 _BUNFIG_TEST_SAFE = frozenset((
     "root", "smol", "coverage", "coverageThreshold", "coverageSkipTestFiles",
     "coverageReporter", "coverageDir", "coveragePathIgnorePatterns",
     "coverageIgnoreSourcemaps", "randomize", "seed", "rerunEach", "retry",
     "concurrentTestGlob", "onlyFailures", "pathIgnorePatterns", "timeout",
-    "bail", "reporter", "updateSnapshots", "todo", "only",
+    "bail", "reporter", "updateSnapshots", "todo", "only", "concurrent",
+    "maxConcurrency",
 ))
 _BUNFIG_INSTALL_SAFE = frozenset((
     "optional", "dev", "peer", "production", "exact", "saveTextLockfile",
@@ -10743,11 +10778,18 @@ def _bunfig_scalar(v) -> bool:
 
 def _bunfig_define_safe(v) -> bool:
     """A `define` value is a JS expression substituted into every source
-    file; only a JSON literal or a dotted identifier is a constant."""
+    file; only a JSON literal, a single-quoted string or `undefined` is a
+    constant."""
     if not isinstance(v, str):
         return False
     s = v.strip()
-    if _BUNFIG_IDENT_RE.fullmatch(s):
+    # A bare identifier is NOT a constant: `"JSON.parse" = "eval"` turns every
+    # JSON.parse(x) into eval(x) (QA round 1 bypass review). Only `undefined`.
+    if s == "undefined":
+        return True
+    # Bun also accepts single-quoted strings (its own docs' example,
+    # `"process.env.bagel" = "'lox'"`) and `undefined` (QA round 1).
+    if re.fullmatch(r"'[^'\\\n]*'", s):
         return True
     import json as _json
     try:
@@ -10759,10 +10801,18 @@ def _bunfig_define_safe(v) -> bool:
 
 def _bunfig_registry_safe(v) -> bool:
     if isinstance(v, dict):
-        if set(v) - {"url"}:
-            return False          # token/username/password: a real, named registry
+        # Credentials for the OFFICIAL registry (private npm orgs) only ever
+        # go to npmjs (QA round 1); any other key is unknown -> gated.
+        if set(v) - {"url", "token", "username", "password"}:
+            return False
         v = v.get("url")
     return isinstance(v, str) and v.strip() in _BUNFIG_OFFICIAL_REGISTRIES
+
+
+def _bunfig_scopes_label(v) -> str:
+    if isinstance(v, dict) and all(_bunfig_registry_safe(x) for x in v.values()):
+        return ""
+    return " (per-scope package source)"
 
 
 def bunfig_unsafe_entries(content) -> list:
@@ -10801,6 +10851,11 @@ def bunfig_unsafe_entries(content) -> list:
                 add(k, k, v)
         elif k == "preload":
             add("preload (runs before every `bun run`)", k, v)
+        elif k in ("jsxFactory", "jsxFragment"):
+            # A dotted name (`h`, `React.createElement`); an expression would
+            # be substituted into every JSX file (QA round 1).
+            if not (isinstance(v, str) and _BUNFIG_IDENT_RE.fullmatch(v.strip())):
+                add(f"{k} (not a plain name)", k, v)
         elif k == "env":
             if not isinstance(v, bool):
                 add("env", k, v)
@@ -10841,14 +10896,14 @@ def bunfig_unsafe_entries(content) -> list:
                 return "" if isinstance(x, dict) and set(x) <= {"save", "print"} else " (unknown)"
             table("install", v, _BUNFIG_INSTALL_SAFE, {
                 "registry": lambda x: "" if _bunfig_registry_safe(x) else " (package source)",
-                "scopes": lambda x: " (per-scope package source)",
+                "scopes": _bunfig_scopes_label,
                 "ca": lambda x: " (trusted TLS root)",
                 "cafile": lambda x: " (trusted TLS root)",
                 "globalDir": lambda x: " (global package dir)",
                 "globalBinDir": lambda x: " (global bin dir on PATH)",
                 "security": lambda x: " (install-time scanner package, runs code)",
                 "auto": lambda x: "" if x in ("auto", "fallback", "disable", False) else " (auto-install)",
-                "ignoreScripts": lambda x: "" if x is True else " (lifecycle scripts)",
+                "ignoreScripts": lambda x: "" if isinstance(x, bool) else " (lifecycle scripts)",
                 "cache": _cache,
                 "lockfile": _lock,
             })

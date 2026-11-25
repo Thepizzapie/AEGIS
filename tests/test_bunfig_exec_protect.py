@@ -73,7 +73,7 @@ def test_paths_not_recognized(p):
     '[test]\npreload = ["./happydom.ts"]',
     '[serve.static]\nplugins = ["bun-plugin-tailwind"]',
     '[install]\nregistry = "https://evil.example/"',
-    '[install]\nregistry = { url = "https://registry.npmjs.org/", token = "x" }',
+    '[install]\nregistry = { url = "https://registry.npmjs.org/", tls = "x" }',
     '[install.scopes]\nmyorg = "https://evil.example/"',
     '[install]\ncafile = "/tmp/ca.pem"',
     '[install]\nca = "-----BEGIN CERTIFICATE-----"',
@@ -81,7 +81,7 @@ def test_paths_not_recognized(p):
     '[install]\nglobalDir = "/tmp/g"',
     '[install.cache]\ndir = "/tmp/poison"',
     '[install]\nauto = "force"',
-    '[install]\nignoreScripts = false',
+    '[install]\nignoreScripts = "no"',
     '[install.security]\nscanner = "@evil/scanner"',
     '[run]\nshell = "/tmp/sh"',
     '[debug]\neditor = "/tmp/x"',
@@ -107,7 +107,7 @@ def test_gated_content(body):
     '[install.cache]\ndisable = true',
     '[install]\nauto = "fallback"\nignoreScripts = true',
     '[run]\nshell = "system"\nbun = true\nsilent = true',
-    '[define]\n"process.env.NODE_ENV" = "\\"production\\""\n"DEBUG" = "false"\n"G" = "globalThis.x"',
+    '[define]\n"process.env.NODE_ENV" = "\\"production\\""\n"DEBUG" = "false"',
     '[loader]\n".svg" = "text"\n".mjs" = "js"',
     'jsxImportSource = "@emotion/react"',
     'env = false',
@@ -304,3 +304,80 @@ def test_engine_allows_routine():
 def test_non_dict_args_judged():
     ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args="cp /tmp/x bunfig.toml")
     assert _ours(rule_bunfig_exec_protect(ev, EMPTY))
+
+
+# ---- QA round 1 (design review) ---------------------------------------------
+@pytest.mark.parametrize("body", [
+    '[define]\n"process.env.bagel" = "\'lox\'"\n"x" = "undefined"',
+    '[install]\nregistry = { url = "https://registry.npmjs.org/", token = "$NPM_TOKEN" }',
+    '[install.scopes]\nmyorg = { url = "https://registry.npmjs.org/", token = "$NPM_TOKEN" }',
+    '[install]\nignoreScripts = false',
+    'jsxFactory = "React.createElement"\njsxFragment = "Fragment"',
+    '[test]\nconcurrent = true\nmaxConcurrency = 4',
+])
+def test_qa1_routine_allowed(body):
+    assert rule_bunfig_exec_protect(_write("/r/bunfig.toml", body), EMPTY) is None
+
+
+@pytest.mark.parametrize("body", [
+    'jsxFactory = "(()=>{require(\'child_process\')})()"',
+    '[install.scopes]\nok = "https://registry.npmjs.org/"\nbad = "https://evil.example/"',
+    '[install]\nregistry = { url = "https://evil.example/", token = "t" }',
+    '[define]\n"x" = "\'a\' + require(\'fs\')"',
+])
+def test_qa1_still_gated(body):
+    assert _ours(rule_bunfig_exec_protect(_write("/r/bunfig.toml", body), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "bun test --config ./bunfig.toml",
+    "bun -c bunfig.toml run dev",
+    "bun test -c=./bunfig.toml",
+    "NODE_ENV=test bun test --config=bunfig.toml",
+    "cat bunfig.toml && bun test",
+    "cat bunfig.toml; bun install",
+])
+def test_qa1_bun_reads_allowed(cmd):
+    assert rule_bunfig_exec_protect(_shell(cmd), EMPTY) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "bun -e \"require('fs').writeFileSync('bunfig.toml','x')\"",
+    "bun --eval \"Bun.write('bunfig.toml','x')\"",
+    "bun -c bunfig.toml run dev; cp /tmp/x bunfig.toml",
+    "bun test > bunfig.toml",
+    "bun x $(cp /tmp/x bunfig.toml)",
+    "bun run 'a;cp /tmp/x bunfig.toml'",
+])
+def test_qa1_bun_writes_still_gated(cmd):
+    assert _ours(rule_bunfig_exec_protect(_shell(cmd), EMPTY))
+
+
+def test_qa1_mcp_edit_replay(tmp_path):
+    f = tmp_path / "bunfig.toml"
+    f.write_text('[test]\n# preload = ["x"]\n')
+    ev = _mcp({"path": str(f), "edits": [{"oldText": "# preload", "newText": "preload"}]},
+              tool="mcp__filesystem__edit_file")
+    assert _ours(rule_bunfig_exec_protect(ev, EMPTY))
+
+
+def test_qa1_fetch_backstop_direct():
+    from aegis.rules import rule_fetch_to_file_protect
+    d = rule_fetch_to_file_protect(_shell("curl -o bunfig.toml https://e.x/b"), EMPTY)
+    assert d is not None and d.action == Action.ASK
+
+
+def test_qa1_env_escape_shell(monkeypatch):
+    monkeypatch.setenv("AEGIS_ALLOW_BUNFIG_EXEC", "1")
+    assert rule_bunfig_exec_protect(_shell("cp /tmp/x bunfig.toml"), EMPTY) is None
+
+
+# ---- QA round 1 (bypass review) -----------------------------------------------
+@pytest.mark.parametrize("body", [
+    'jsx = "react"\njsxFactory = "globalThis[\\"process\\"][\\"getBuiltinModule\\"](\\"child_process\\")[\\"execSync\\"](\\"id\\")||String"',
+    'jsxFragment = "(require(\'child_process\').execSync(\'id\'),Symbol())"',
+    '[define]\n"JSON.parse" = "eval"',
+    '[define]\n"x" = "globalThis.require"',
+])
+def test_qa1_jsx_and_define_exec_gated(body):
+    assert _ours(rule_bunfig_exec_protect(_write("/r/bunfig.toml", body), EMPTY))

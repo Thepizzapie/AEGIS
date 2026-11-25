@@ -16091,7 +16091,12 @@ def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = _cmd(ev)
         if not (patterns.bunfig_shell_path_hit(cmd) or patterns.bunfig_shell_path_hit(raw)):
             return None
-        if patterns.mise_shell_only_reads(cmd) and patterns.mise_shell_only_reads(raw):
+        # Plain `bun`/`bunx` runs only read bunfig (QA round 1).
+        ncmd = patterns.bunfig_neutralize_bun_runs(cmd)
+        nraw = patterns.bunfig_neutralize_bun_runs(raw)
+        if not (patterns.bunfig_shell_path_hit(ncmd) or patterns.bunfig_shell_path_hit(nraw)):
+            return None
+        if patterns.mise_shell_only_reads(ncmd) and patterns.mise_shell_only_reads(nraw):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_BUNFIG_EXEC")
                 or _mise_allowed_cmd(cfg, raw)):
