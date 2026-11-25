@@ -381,3 +381,41 @@ def test_qa1_env_escape_shell(monkeypatch):
 ])
 def test_qa1_jsx_and_define_exec_gated(body):
     assert _ours(rule_bunfig_exec_protect(_write("/r/bunfig.toml", body), EMPTY))
+
+
+# ---- QA round 2 ----------------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "bun build e.js --outfile bunfig.toml",
+    "bun build e.js -o bunfig.toml",
+    "bun build i.js --outdir . --loader .txt:file --asset-naming bunfig.toml",
+    "bun x cp evil bunfig.toml",
+    "bunx cp evil bunfig.toml",
+    "bun pm pack --destination bunfig.toml",
+    "bun init -y bunfig.toml",
+    "bun run gen bunfig.toml",
+    "bun ./write.js ~/.bunfig.toml",
+    "bun build x.ts --compile --outfile ~/.bunfig.toml",
+    "cat bunfig.toml && bun build e.js --outfile bunfig.toml",
+    "bun test -c bunfig.toml && bun x cp evil bunfig.toml",
+    "bun build e.js -c bunfig.toml --outfile bunfig.toml",
+])
+def test_qa2_bun_writers_gated(cmd):
+    assert _ours(rule_bunfig_exec_protect(_shell(cmd), EMPTY))
+
+
+@pytest.mark.parametrize("body", [
+    '[test.reporter]\njunit = "/home/u/.bashrc"',
+    '[test.reporter]\njunit = "../../.git/hooks/pre-commit"',
+    '[test.reporter]\njunit = "~/.profile"',
+    '[test]\ncoverageDir = "/etc/x"',
+])
+def test_qa2_output_paths_outside_gated(body):
+    assert _ours(rule_bunfig_exec_protect(_write("/r/bunfig.toml", body), EMPTY))
+
+
+@pytest.mark.parametrize("body", [
+    '[test.reporter]\njunit = "reports/junit.xml"',
+    '[test]\ncoverageDir = "coverage"',
+])
+def test_qa2_output_paths_local_allowed(body):
+    assert rule_bunfig_exec_protect(_write("/r/bunfig.toml", body), EMPTY) is None

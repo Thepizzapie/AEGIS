@@ -16027,7 +16027,30 @@ def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     paths assembled indirectly. Accepted false ASKs: a shell command naming
     a bunfig path with any non-read verb (``cp bunfig.toml /tmp``), the
     first add of a non-official registry / ``ca`` (corporate mirrors are
-    legitimate but need a human look), an unknown/new bunfig key.
+    legitimate but need a human look), an unknown/new bunfig key, a
+    ``[test.reporter] junit``/``coverageDir`` outside the project.
+
+    Plain ``bun``/``bunx`` runs are judged as reads of bunfig (``bun test -c
+    ./bunfig.toml``, ``cat bunfig.toml && bun test``) only when the bunfig
+    path is named solely as the ``-c``/``--config`` value and the segment
+    has no eval flag, redirect, substitution, quote or glob; any other
+    mention (``bun build x --outfile bunfig.toml``, ``bun x cp e
+    bunfig.toml``, ``bun pm pack --destination``) keeps the ASK.
+
+    QA history (independent bypass and design reviews). Round 1, bypass:
+    ``jsxFactory``/``jsxFragment`` are spliced verbatim into every JSX call
+    (RCE confirmed in real Bun) -- now dotted names only; ``define``
+    identifier remaps (``"JSON.parse" = "eval"``) -- only JSON literals,
+    single-quoted strings and ``undefined`` now pass. Round 1, design
+    (PASS with should-fixes): Bun's documented ``'lox'`` define form,
+    ``bun -c``/``&& bun test`` reads, official-registry credentials,
+    ``ignoreScripts = false``, ``[test] concurrent``/``maxConcurrency``.
+    Round 2: the round-1 bun-run exemption erased the whole segment, so
+    ``bun build --outfile bunfig.toml``/``bun x cp``/``bun pm pack
+    --destination`` wrote a working preload unseen (confirmed) -- only the
+    ``--config`` value is exempt now; ``[test.reporter] junit`` (and
+    ``coverageDir``) outside the project was an arbitrary-file-write
+    primitive on every ``bun test`` -- now gated.
     """
     cfg = getattr(policy, "bunfig_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -16092,7 +16115,8 @@ def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
         if not (patterns.bunfig_shell_path_hit(cmd) or patterns.bunfig_shell_path_hit(raw)):
             return None
         # Plain `bun`/`bunx` runs only read bunfig (QA round 1).
-        ncmd = patterns.bunfig_neutralize_bun_runs(cmd)
+        # Renderings joined by a newline so each stays its own simple command.
+        ncmd = patterns.bunfig_neutralize_bun_runs(normalize.scan_surface(raw, sep="\n"))
         nraw = patterns.bunfig_neutralize_bun_runs(raw)
         if not (patterns.bunfig_shell_path_hit(ncmd) or patterns.bunfig_shell_path_hit(nraw)):
             return None

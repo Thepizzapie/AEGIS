@@ -10732,7 +10732,26 @@ def bunfig_neutralize_bun_runs(cmd: str) -> str:
         if (verb in ("bun", "bunx", "bun.exe", "bunx.exe")
                 and not any(c in seg for c in "<>`$'\"\\(){}*?[")
                 and not _BUNFIG_BUN_EVAL_RE.search(" ".join(words[1:]))):
-            out.append(" true ")
+            # Drop ONLY the `-c/--config <path>` value; if a bunfig path is
+            # still named anywhere else in the segment (`bun build x
+            # --outfile bunfig.toml`, `bun x cp evil bunfig.toml`, `bun pm
+            # pack --destination ...`), bun may be WRITING it -- keep the
+            # segment as is (QA round 2).
+            rest, j = [], i + 1
+            while j < len(words):
+                w = words[j]
+                if w in ("-c", "--config") and j + 1 < len(words):
+                    j += 2
+                    continue
+                if w.startswith(("-c=", "--config=")):
+                    j += 1
+                    continue
+                rest.append(w)
+                j += 1
+            if bunfig_shell_path_hit(" ".join(rest)):
+                out.append(seg)
+            else:
+                out.append(" true ")
         else:
             out.append(seg)
     return "".join(out)
@@ -10815,6 +10834,19 @@ def _bunfig_scopes_label(v) -> str:
     return " (per-scope package source)"
 
 
+def _bunfig_local_out(v) -> bool:
+    """An output path `bun test` writes on every run (junit report,
+    coverage dir): fine inside the project, gated when absolute, home-,
+    variable- or `..`-relative -- an arbitrary-file-write primitive
+    otherwise (QA round 2)."""
+    if not isinstance(v, str) or not v.strip() or "\n" in v:
+        return False
+    t = v.strip().replace("\\", "/")
+    if t.startswith(("/", "~", "$", "%")) or re.match(r"^[A-Za-z]:", t):
+        return False
+    return ".." not in t.split("/")
+
+
 def bunfig_unsafe_entries(content) -> list:
     """(label, fingerprint) for every gated entry in a bunfig.toml body."""
     out = []
@@ -10882,9 +10914,12 @@ def bunfig_unsafe_entries(content) -> list:
             table("console", v, frozenset(("depth",)), {})
         elif k == "test":
             def _rep(x):
-                return "" if isinstance(x, dict) and set(x) <= {"dots", "junit"} else " (unknown reporter)"
-            table("test", v, _BUNFIG_TEST_SAFE - {"reporter"},
-                  {"preload": lambda x: " (runs before every `bun test`)", "reporter": _rep})
+                if not (isinstance(x, dict) and set(x) <= {"dots", "junit"}):
+                    return " (unknown reporter)"
+                return "" if "junit" not in x or _bunfig_local_out(x["junit"]) else " (report written outside the project)"
+            table("test", v, _BUNFIG_TEST_SAFE - {"reporter", "coverageDir"},
+                  {"preload": lambda x: " (runs before every `bun test`)", "reporter": _rep,
+                   "coverageDir": lambda x: "" if _bunfig_local_out(x) else " (written outside the project)"})
         elif k == "install":
             def _cache(x):
                 if not isinstance(x, dict):
