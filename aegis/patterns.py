@@ -10602,3 +10602,373 @@ def _mise_judge_invocation(words: list, i: int) -> str:
             return "mise generate git-pre-commit --write (plants a git hook)"
         return ""
     return ""
+
+
+# ---- Bun bunfig.toml exec/registry hijack (`rules.rule_bunfig_exec_protect`) --
+# Bun reads `bunfig.toml` from the working directory and `.bunfig.toml` from
+# `$HOME` / `$XDG_CONFIG_HOME` on EVERY `bun run`/`bun test`/`bun install`/
+# `bun <file>`/`bunx`, with no trust prompt. Several keys make that read run
+# code or change where code comes from:
+#   * top-level `preload` -- modules executed before EVERY `bun run`/`bun x.ts`;
+#   * `[test] preload` -- executed before every `bun test`;
+#   * `[serve.static] plugins` -- bundler plugins loaded by `bun serve`/HTML
+#     imports (code, in-process);
+#   * `[install] registry`/`scopes`/`ca`/`cafile` -- where every later
+#     `bun install`/`bun add`/`bunx` fetches packages from, and which TLS
+#     roots it trusts (a supply-chain swap, the `.npmrc` threat for Bun);
+#   * `[install.security] scanner` -- a package Bun loads and runs on every
+#     install; `[install] globalBinDir`/`globalDir`/`[install.cache] dir` --
+#     where global binaries / cached tarballs live (PATH and cache poisoning);
+#     `[install] auto = "force"` -- auto-installs any imported package;
+#   * `[run] shell` other than `system`/`bun`, `[debug] editor` (run by
+#     `Bun.openInEditor`), `define` values that are not constants, `loader`
+#     entries that make a data extension executable, a path-like
+#     `jsxImportSource`.
+# The content check is an ALLOWLIST per table (unknown keys are gated), the
+# TOML is parsed, and the before/after set of gated entries is diffed by
+# canonical fingerprint (`_mise_fp`), so routine edits (`[test] coverage =
+# true`, `[install] exact = true`) and edits beside a human-set `preload`
+# stay allowed.
+_BUNFIG_END = _WIN_TRIM + r"(?=[/\;&|)(<>`}:,]|\s|['\"]|$)"
+BUNFIG_PATH_RE = re.compile(_HTTP_RC_B + r"\.?bunfig\.toml" + _BUNFIG_END, re.IGNORECASE)
+_BUNFIG_NAMES = ("bunfig.toml", ".bunfig.toml")
+
+
+def bunfig_kind(path) -> str:
+    """'toml' if `path` (raw, URL-decoded or `..`-normalized) ends in a
+    bunfig name (NTFS ` .`/`::$DATA` trims tolerated), else ''."""
+    if not isinstance(path, str) or not path or "\n" in path or len(path) > 4096:
+        return ""
+    cands = [path]
+    try:
+        import urllib.parse as _up
+        if "%" in path or path.lower().startswith("file://"):
+            u = _up.unquote(path[7:] if path.lower().startswith("file://") else path)
+            cands.append(u)
+    except Exception:
+        pass
+    for c in list(cands):
+        cands.append(_ed_dotdot_normalize(c.replace("\\", "/")))
+    for c in cands:
+        m = None
+        for m in BUNFIG_PATH_RE.finditer(c):
+            pass
+        if m and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?[/\\]?", c[m.end():]):
+            return "toml"
+    return ""
+
+
+def bunfig_shell_path_hit(cmd) -> bool:
+    """True if a shell command names a bunfig file -- literally, through
+    backslash escapes or `..` segments, or through a glob/brace word bash
+    would expand to one (`bunfig.tom?`, `bun{fig,x}.toml`, `.bunf*`)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    low = cmd.lower()
+    if "bun" in low and BUNFIG_PATH_RE.search(cmd):
+        return True
+    unesc = cmd.replace("\\", "")
+    if unesc != cmd and BUNFIG_PATH_RE.search(unesc):
+        return True
+    for q in ("'", '"'):
+        if q in unesc and BUNFIG_PATH_RE.search(unesc.replace(q, "")):
+            return True        # `bun'fig'.toml`, `"bunfig".toml`
+    budget = 0
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc.replace("'", "").replace('"', ""))):
+        if i > 8000:
+            return True                       # fail closed on absurd input
+        w = m.group(0)
+        if not any(c in w for c in "*?[{"):
+            continue
+        base = w.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if not base:
+            continue
+        if len(base) > 200:
+            return True
+        for cand in _brace_expand(base):
+            budget += 1
+            if budget > 4000:
+                return True
+            if BUNFIG_PATH_RE.search("/" + cand):
+                return True
+            lc = cand.lower()
+            if not any(c in lc for c in "*?["):
+                continue
+            if re.fullmatch(r"[*?.]*(?:toml)?", lc):
+                continue                      # `*.toml` alone: too generic
+            if re.fullmatch(r"[*?.]*(?:t[*?o]?m?l?)?", lc.replace("[", "").replace("]", "")):
+                continue
+            for name in _BUNFIG_NAMES:
+                if fnmatch.fnmatchcase(name, lc):
+                    return True
+    return False
+
+
+# A `bun`/`bunx` invocation only READS bunfig (`bun test -c ./bunfig.toml`,
+# `cat bunfig.toml && bun test` -- QA round 1). Not when it evaluates code
+# (`-e`/`-p`/`--eval`/`--print`), redirects, or carries a substitution.
+_BUNFIG_SEG_SPLIT_RE = re.compile(r"(&&|\|\||[;&|\n])")
+_BUNFIG_BUN_EVAL_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*[ep][A-Za-z]*|--eval|--print)(?:[=\s]|$)")
+_BUNFIG_BUN_OWN_SUBS = frozenset(("test", "install", "i", "ci", "add", "a", "remove",
+                                  "rm", "update", "outdated", "build", "audit"))
+_BUNFIG_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=\S*$")
+
+
+def bunfig_neutralize_bun_runs(cmd: str) -> str:
+    """`cmd` with every plain `bun`/`bunx` simple command replaced by
+    `true`, so a bunfig path named only as its `--config` value, or a read
+    chained with `&& bun test`, is judged as the read it is."""
+    if not isinstance(cmd, str) or len(cmd) > 200_000:
+        return cmd
+    parts = _BUNFIG_SEG_SPLIT_RE.split(cmd)
+    out = []
+    for seg in parts:
+        if _BUNFIG_SEG_SPLIT_RE.fullmatch(seg or "x"):
+            out.append(seg)
+            continue
+        words = seg.split()
+        i = 0
+        while i < len(words) and _BUNFIG_ASSIGN_RE.match(words[i]):
+            i += 1
+        verb = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower() if i < len(words) else ""
+        if (verb in ("bun", "bunx", "bun.exe", "bunx.exe")
+                and not any(c in seg for c in "<>`$'\"\\(){}*?[")
+                and not _BUNFIG_BUN_EVAL_RE.search(" ".join(words[1:]))):
+            # Drop ONLY the `-c/--config <path>` value; if a bunfig path is
+            # still named anywhere else in the segment (`bun build x
+            # --outfile bunfig.toml`, `bun x cp evil bunfig.toml`, `bun pm
+            # pack --destination ...`), bun may be WRITING it -- keep the
+            # segment as is (QA round 2).
+            # And only where BUN consumes it: `bun` (not `bunx`/`bun x`,
+            # which forward every later arg to a child tool -- QA round 3:
+            # `bun x install src -c bunfig.toml` copies onto bunfig), with
+            # every word before it a flag or one of bun's own consuming
+            # subcommands (`bun run s -c f` / `bun f.js -c f` forward too).
+            rest, j = [], i + 1
+            own = verb in ("bun", "bun.exe")
+            while j < len(words):
+                w = words[j]
+                is_c = w in ("-c", "--config") or w.startswith(("-c=", "--config="))
+                if is_c and own:
+                    if w in ("-c", "--config"):
+                        if j + 1 < len(words):
+                            j += 2
+                            continue
+                    else:
+                        j += 1
+                        continue
+                if not w.startswith("-") and w.lower() not in _BUNFIG_BUN_OWN_SUBS:
+                    own = False
+                rest.append(w)
+                j += 1
+            if bunfig_shell_path_hit(" ".join(rest)):
+                out.append(seg)
+            else:
+                out.append(" true ")
+        else:
+            out.append(seg)
+    return "".join(out)
+
+
+def bunfig_patch_hit(text) -> bool:
+    """True if `text` is a patch whose header line names a bunfig file."""
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    for m in _MISE_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        if BUNFIG_PATH_RE.search(m.group(0)):
+            return True
+    return False
+
+
+_BUNFIG_TOP_SAFE = frozenset(("jsx", "smol",
+                              "logLevel", "telemetry", "hot", "watch"))
+_BUNFIG_TEST_SAFE = frozenset((
+    "root", "smol", "coverage", "coverageThreshold", "coverageSkipTestFiles",
+    "coverageReporter", "coverageDir", "coveragePathIgnorePatterns",
+    "coverageIgnoreSourcemaps", "randomize", "seed", "rerunEach", "retry",
+    "concurrentTestGlob", "onlyFailures", "pathIgnorePatterns", "timeout",
+    "bail", "reporter", "updateSnapshots", "todo", "only", "concurrent",
+    "maxConcurrency",
+))
+_BUNFIG_INSTALL_SAFE = frozenset((
+    "optional", "dev", "peer", "production", "exact", "saveTextLockfile",
+    "frozenLockfile", "dryRun", "linker", "minimumReleaseAge",
+    "minimumReleaseAgeExcludes", "concurrentScripts", "networkConcurrency",
+    "linkWorkspacePackages", "hoistPattern", "publicHoistPattern",
+))
+_BUNFIG_OFFICIAL_REGISTRIES = ("https://registry.npmjs.org", "https://registry.npmjs.org/")
+_BUNFIG_CODE_LOADERS = frozenset(("js", "jsx", "ts", "tsx", "napi", "wasm", "html", "sh"))
+_BUNFIG_JS_EXTS = frozenset((".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"))
+_BUNFIG_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
+_BUNFIG_PKG_RE = re.compile(r"(?:@[a-z0-9][\w.\-~]*/)?[a-z0-9][\w.\-~]*(?:/[\w.\-~]+)*")
+
+
+def _bunfig_scalar(v) -> bool:
+    return isinstance(v, (str, int, float, bool)) or (
+        isinstance(v, list) and all(isinstance(x, (str, int, float, bool)) for x in v))
+
+
+def _bunfig_define_safe(v) -> bool:
+    """A `define` value is a JS expression substituted into every source
+    file; only a JSON literal, a single-quoted string or `undefined` is a
+    constant."""
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    # A bare identifier is NOT a constant: `"JSON.parse" = "eval"` turns every
+    # JSON.parse(x) into eval(x) (QA round 1 bypass review). Only `undefined`.
+    if s == "undefined":
+        return True
+    # Bun also accepts single-quoted strings (its own docs' example,
+    # `"process.env.bagel" = "'lox'"`) and `undefined` (QA round 1).
+    if re.fullmatch(r"'[^'\\\n]*'", s):
+        return True
+    import json as _json
+    try:
+        x = _json.loads(s)
+    except Exception:
+        return False
+    return isinstance(x, (str, int, float, bool)) or x is None
+
+
+def _bunfig_registry_safe(v) -> bool:
+    if isinstance(v, dict):
+        # Credentials for the OFFICIAL registry (private npm orgs) only ever
+        # go to npmjs (QA round 1); any other key is unknown -> gated.
+        if set(v) - {"url", "token", "username", "password"}:
+            return False
+        v = v.get("url")
+    return isinstance(v, str) and v.strip() in _BUNFIG_OFFICIAL_REGISTRIES
+
+
+def _bunfig_scopes_label(v) -> str:
+    if isinstance(v, dict) and all(_bunfig_registry_safe(x) for x in v.values()):
+        return ""
+    return " (per-scope package source)"
+
+
+def _bunfig_local_out(v) -> bool:
+    """An output path `bun test` writes on every run (junit report,
+    coverage dir): fine inside the project, gated when absolute, home-,
+    variable- or `..`-relative -- an arbitrary-file-write primitive
+    otherwise (QA round 2)."""
+    if not isinstance(v, str) or not v.strip() or "\n" in v:
+        return False
+    t = v.strip().replace("\\", "/")
+    if t.startswith(("/", "~", "$", "%")) or re.match(r"^[A-Za-z]:", t):
+        return False
+    return ".." not in t.split("/")
+
+
+def bunfig_unsafe_entries(content) -> list:
+    """(label, fingerprint) for every gated entry in a bunfig.toml body."""
+    out = []
+    if not isinstance(content, str) or not content.strip():
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+    if _mise_toml is None:
+        return [("<no TOML parser available>", _mise_fp("noparser", content))]
+    try:
+        doc = _mise_toml.loads(content.lstrip("﻿"))
+    except Exception:
+        return [("<unparseable TOML>", "<unparseable>")]
+
+    def add(label, *parts):
+        out.append((label[:80], _mise_fp("bunfig", *parts)))
+
+    def table(name, v, safe, special):
+        if not isinstance(v, dict):
+            add(f"{name} (not a table)", name, v)
+            return
+        for k, x in v.items():
+            fn = special.get(k)
+            if fn is not None:
+                lab = fn(x)
+                if lab:
+                    add(f"{name}.{k}{lab}", name, k, x)
+            elif k not in safe:
+                add(f"{name}.{k}", name, k, x)
+
+    for k, v in doc.items():
+        if k in _BUNFIG_TOP_SAFE:
+            if not _bunfig_scalar(v):
+                add(k, k, v)
+        elif k == "preload":
+            add("preload (runs before every `bun run`)", k, v)
+        elif k in ("jsxFactory", "jsxFragment"):
+            # A dotted name (`h`, `React.createElement`); an expression would
+            # be substituted into every JSX file (QA round 1).
+            if not (isinstance(v, str) and _BUNFIG_IDENT_RE.fullmatch(v.strip())):
+                add(f"{k} (not a plain name)", k, v)
+        elif k == "env":
+            if not isinstance(v, bool):
+                add("env", k, v)
+        elif k == "jsxImportSource":
+            if not (isinstance(v, str) and _BUNFIG_PKG_RE.fullmatch(v.strip())):
+                add("jsxImportSource (path-like)", k, v)
+        elif k == "define":
+            if not isinstance(v, dict):
+                add("define", k, v)
+            else:
+                for dk, dv in v.items():
+                    if not _bunfig_define_safe(dv):
+                        add(f"define.{dk} (non-constant expression)", k, dk, dv)
+        elif k == "loader":
+            if not isinstance(v, dict):
+                add("loader", k, v)
+            else:
+                for ext, ld in v.items():
+                    if not isinstance(ld, str) or (
+                            ld.strip().lower() in _BUNFIG_CODE_LOADERS
+                            and str(ext).strip().lower() not in _BUNFIG_JS_EXTS):
+                        add(f"loader.{ext} = {ld!s:.20} (executes data files)", k, ext, ld)
+        elif k == "console":
+            table("console", v, frozenset(("depth",)), {})
+        elif k == "test":
+            def _rep(x):
+                if not (isinstance(x, dict) and set(x) <= {"dots", "junit"}):
+                    return " (unknown reporter)"
+                return "" if "junit" not in x or _bunfig_local_out(x["junit"]) else " (report written outside the project)"
+            table("test", v, _BUNFIG_TEST_SAFE - {"reporter", "coverageDir"},
+                  {"preload": lambda x: " (runs before every `bun test`)", "reporter": _rep,
+                   "coverageDir": lambda x: "" if _bunfig_local_out(x) else " (written outside the project)"})
+        elif k == "install":
+            def _cache(x):
+                if not isinstance(x, dict):
+                    return "" if isinstance(x, bool) else " (cache location)"
+                bad = set(x) - {"disable", "disableManifest"}
+                return f" ({', '.join(sorted(bad))[:40]})" if bad else ""
+
+            def _lock(x):
+                return "" if isinstance(x, dict) and set(x) <= {"save", "print"} else " (unknown)"
+            table("install", v, _BUNFIG_INSTALL_SAFE, {
+                "registry": lambda x: "" if _bunfig_registry_safe(x) else " (package source)",
+                "scopes": _bunfig_scopes_label,
+                "ca": lambda x: " (trusted TLS root)",
+                "cafile": lambda x: " (trusted TLS root)",
+                "globalDir": lambda x: " (global package dir)",
+                "globalBinDir": lambda x: " (global bin dir on PATH)",
+                "security": lambda x: " (install-time scanner package, runs code)",
+                "auto": lambda x: "" if x in ("auto", "fallback", "disable", False) else " (auto-install)",
+                "ignoreScripts": lambda x: "" if isinstance(x, bool) else " (lifecycle scripts)",
+                "cache": _cache,
+                "lockfile": _lock,
+            })
+        elif k == "run":
+            table("run", v, frozenset(("silent", "bun", "elide-lines", "elideLines")), {
+                "shell": lambda x: "" if x in ("system", "bun") else " (script shell)",
+            })
+        elif k == "serve":
+            def _static(x):
+                if not isinstance(x, dict):
+                    return " (not a table)"
+                bad = set(x) - {"env", "publicPath", "hmr"}
+                return f" ({', '.join(sorted(bad))[:40]}: loads code)" if bad else ""
+            table("serve", v, frozenset(("port", "hostname", "development")),
+                  {"static": _static})
+        elif k == "debug":
+            table("debug", v, frozenset(), {"editor": lambda x: " (program Bun.openInEditor runs)"})
+        else:
+            add(f"{k} (unrecognized bunfig key)", k, v)
+    return out
