@@ -63,6 +63,18 @@
 #     mode: ask            # deny | ask (default) | monitor | off
 #     allow: ['^/ci/repo/mise\.toml$', 'mise trust /ci/repo']
 
+# Bun bunfig.toml exec / package-source hijack (optional tuning). Built in
+# and ON by default (mode: ask): a write to bunfig.toml / ~/.bunfig.toml
+# that ADDS `preload`, `[test] preload`, plugins, an install security
+# scanner, a `[run] shell`, a non-official registry/scope, `ca`/`cafile`,
+# or an unknown key asks a human first; routine edits ([test] coverage,
+# [install] exact) pass. A human pre-approves with AEGIS_ALLOW_BUNFIG_EXEC=1
+# or a trailing '# aegis-allow'; a spawned agent cannot. Shell `allow`
+# regexes must match the WHOLE command.
+#   bunfig_exec:
+#     mode: ask            # deny | ask (default) | monitor | off
+#     allow: ['^/ci/repo/bunfig\.toml$']
+
 default_action: allow
 on_error: allow
 

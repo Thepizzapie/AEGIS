@@ -11190,6 +11190,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.HTTP_CLIENT_RC_PATH_RE, "a curl/wget config file (.curlrc/.wgetrc)"),
     (patterns.EDITOR_STARTUP_PATH_RE, "an editor startup/init file (vimrc/nvim/emacs.d)"),
     (patterns.MISE_PATH_RE, "a mise/asdf config (mise.toml/.tool-versions) or plugin/shim dir"),
+    (patterns.BUNFIG_PATH_RE, "a Bun config file (bunfig.toml / ~/.bunfig.toml)"),
 )
 
 
@@ -15870,6 +15871,242 @@ def rule_mise_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+# ---- Bun bunfig.toml exec / registry hijack: human-escapable ------------------
+def _bunfig_path_shaped(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or "\n" in t or len(t) > 4096:
+        return False
+    if not (_HTTP_RC_PATH_SHAPE_RE.match(t) or re.fullmatch(r"[\w.\-]+(?:[/\\][^\r\n]*)?", t)):
+        return False
+    return bool(patterns.bunfig_kind(t))
+
+
+def _bunfig_target(ev: Event, p: str) -> str:
+    """The bunfig path a write targets ('' if none). For MCP calls the path
+    may sit under any key, be a patch header, or be a mapping key."""
+    if p and patterns.bunfig_kind(p):
+        return p
+    if ev.action != ActionClass.MCP:
+        return ""
+    a = ev.args or {}
+    if p and "\n" not in p:
+        a = {k: v for k, v in a.items() if str(k) not in _ED_PLAIN_CONTENT_KEYS}
+    flat = [str(x) for x in _flatten_strings(a)]
+    for s_ in flat[:5000]:
+        if _bunfig_path_shaped(s_):
+            return s_.strip()
+    for s_ in flat[:5000]:
+        if patterns.bunfig_patch_hit(s_):
+            return "<patch>"
+    for k_ in _http_rc_mapping_keys(a):
+        if "\n" not in k_ and patterns.bunfig_kind(k_.strip()):
+            return k_
+    # A `{dir, name}`-style call: a name key that IS a bunfig name.
+    for k_, v_ in a.items():
+        if (_http_rc_words(k_) & _MISE_NAME_KEY_WORDS and isinstance(v_, str)
+                and patterns.bunfig_kind("/" + v_.strip())):
+            return v_.strip()
+    return ""
+
+
+def _bunfig_new_unsafe(ev: Event, p: str) -> list:
+    """Labels of gated bunfig entries the call would ADD. Edits are replayed
+    on the on-disk file and the parsed before/after sets are diffed by
+    canonical fingerprint (see `_mise_new_unsafe`, whose shape this reuses)."""
+    a = ev.args or {}
+    if _http_rc_mcp_read_only(ev) or _mise_mcp_delete_only(ev):
+        return []
+    if p == "<patch>":
+        return ["<patch touching a bunfig.toml>"]
+    if ev.action == ActionClass.MCP:
+        if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
+            return ["<copied/moved from another file>"]
+        for k in _HTTP_RC_NON_CONTENT_KEYS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != p \
+                    and _HTTP_RC_PATHLIKE_RE.match(v.strip()):
+                pn = str(p).replace("\\", "/").rstrip("/")
+                vn = v.strip().replace("\\", "/").rstrip("/")
+                if not (pn == vn or pn.startswith(vn + "/")):
+                    return [f"<content from another file: {v.strip()[:60]}>"]
+    edits, unreplayable = _http_rc_edit_list(a)
+    if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
+        return ["<edit shape not replayable against the file on disk>"]
+    before = _npmrc_read(ev, p)
+    if len(edits) > 500 or len(edits) * len(before or "") > 50_000_000:
+        return ["<too many edits to replay>"]
+    content = a.get("content", a.get("contents"))
+    if content is not None and not isinstance(content, str):
+        content = json.dumps(content, default=str)
+    if edits:
+        if before is None:
+            return ["<edit not verifiable against the file on disk>"]
+        after = _npmrc_apply_edits(before, edits)
+        if after is None:
+            return ["<edit not verifiable against the file on disk>"]
+    elif isinstance(content, str):
+        after = content
+    elif ev.action == ActionClass.MCP and _mise_mcp_item_content(a, p) is not None:
+        after = _mise_mcp_item_content(a, p)
+    elif ev.action == ActionClass.MCP:
+        after = "\n".join(x for x in _http_rc_mcp_strings(ev, a) if x.strip() and x.strip() != p)
+    else:
+        after = "\n".join(x for x in _http_rc_written_strings(a) if x != p)
+    had = [fp for _, fp in patterns.bunfig_unsafe_entries(before or "")]
+    added = []
+    for label, fp in patterns.bunfig_unsafe_entries(after):
+        if fp in ("<unparseable>", "<oversized>"):
+            added.append(label)           # never cancelled by an already-broken file
+        elif fp in had:
+            had.remove(fp)
+        else:
+            added.append(label)
+    return added
+
+
+def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate planting an exec-bearing or package-source entry in Bun's
+    config -- project ``bunfig.toml`` and global ``~/.bunfig.toml`` /
+    ``$XDG_CONFIG_HOME/.bunfig.toml``.
+
+    PLAN / THREAT MODEL: Bun reads these files, with no trust prompt, on
+    every ``bun run``/``bun test``/``bun install``/``bun <file>``/``bunx`` --
+    the commands a coding agent, a teammate and CI run most. A prompt-
+    injected agent (or a cloned repo it was asked to set up) writes one
+    line and the NEXT ordinary command runs attacker code: top-level
+    ``preload`` (executed before every ``bun run``), ``[test] preload``
+    (before every ``bun test``), ``[serve.static] plugins`` (bundler plugins
+    loaded in-process), ``[install.security] scanner`` (a package run on
+    every install), ``[run] shell`` (the shell every ``bun run <script>``
+    uses), ``[debug] editor`` (run by ``Bun.openInEditor``), ``define`` with
+    a non-constant expression (substituted into every transpiled source),
+    a ``loader`` entry mapping a data extension to a code loader, a path-
+    like ``jsxImportSource``. Or it swaps where code COMES from:
+    ``[install] registry`` off ``registry.npmjs.org``, ``scopes``,
+    ``ca``/``cafile`` (TLS roots), ``globalBinDir``/``globalDir``/
+    ``[install.cache] dir`` (PATH / cache poisoning), ``auto = "force"``,
+    ``ignoreScripts = false``. The global file never appears in any repo
+    diff and applies to every project on the machine. No existing guard
+    named these paths: ``rule_package_manifest_protect`` sees
+    ``package.json``/``.npmrc`` (Bun also reads ``.npmrc`` -- covered by
+    ``rule_npmrc_exec_protect``), never ``bunfig.toml``.
+
+    BUILD: bunfig has a large routine subset (``[test] coverage``,
+    ``[install] exact``, ``jsx``, ``logLevel``), so -- like
+    ``rule_mise_exec_protect`` -- the TOML is PARSED and only gated entries
+    count. Each table is an ALLOWLIST (an unknown key is gated, since Bun
+    adds keys every release); the before/after sets are diffed by canonical
+    fingerprint, with Edit/MultiEdit/MCP edits replayed on the on-disk file,
+    so uncommenting a staged ``# preload`` counts as adding it and an
+    unrelated edit beside a human-set ``preload`` does not re-ask.
+    Unparseable TOML, an unreplayable edit, an oversized file, copy/move/
+    patch MCP calls into a bunfig path fail closed. Shell is INVERTED: a
+    command naming a bunfig path (literal, ``\\``-escaped, quote-split,
+    ``..``, or a glob/brace word) asks unless every simple command only
+    reads/deletes or is a non-writing ``git`` subcommand. ``curl -o
+    bunfig.toml <url>`` is also caught by ``rule_fetch_to_file_protect``,
+    with which ``BUNFIG_PATH_RE`` is registered.
+
+    Config (``policy.bunfig_exec``): ``mode`` (deny|ask|monitor|off, default
+    ask), ``allow`` (regexes; matched against the normalized path for file
+    writes and against the WHOLE command, fullmatch, for shell). Escapable
+    only by a human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_BUNFIG_EXEC=1`` set before launch.
+
+    Honest scope: ``bun -c/--config <other.toml>`` naming a file under
+    another name; a bunfig DELIVERED by ``git clone``/``pull``/``checkout``/
+    archive extraction/whole-directory copy (no tool call names it); the
+    ``BUN_CONFIG_REGISTRY``/``NPM_CONFIG_REGISTRY``/``BUN_OPTIONS``
+    environment variables (a shell-startup write is
+    ``rule_shell_persist_protect``'s); ``package.json``
+    ``trustedDependencies`` (lets a dependency's own lifecycle script run
+    under Bun -- a candidate follow-up for ``package_manifest``); the
+    preloaded/plugin module's own contents once the entry is approved;
+    paths assembled indirectly. Accepted false ASKs: a shell command naming
+    a bunfig path with any non-read verb (``cp bunfig.toml /tmp``), the
+    first add of a non-official registry / ``ca`` (corporate mirrors are
+    legitimate but need a human look), an unknown/new bunfig key.
+    """
+    cfg = getattr(policy, "bunfig_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "bunfig-exec-protect-monitor")
+            return None
+        return would
+
+    if isinstance(ev.args, dict) and isinstance(ev.args.get("command"), (list, tuple)):
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={**ev.args, "command": " ".join(str(x) for x in ev.args["command"])})
+    if not isinstance(ev.args, dict):
+        raw_args = ev.args
+        txt = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)[:400000]
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"command": txt} if _is_shell(ev) else {"input": txt})
+
+    if ev.action == ActionClass.MCP:
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            for c in dict.fromkeys((shell_cmd, shell_cmd.replace("\n", " "))):
+                sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                 args={"command": c}, cwd=ev.cwd)
+                d = rule_bunfig_exec_protect(sub, policy)
+                if d is not None:
+                    return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                    "command that writes a bunfig.toml. " + d.message)
+            a0 = ev.args or {}
+            if isinstance(a0.get("command"), str) and re.fullmatch(r"\s*[A-Za-z_]{1,32}\s*", a0["command"]):
+                ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                                args={k: v for k, v in a0.items() if k != "command"})
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _bunfig_target(ev, _path(ev))
+        if not p:
+            return None
+        found = _bunfig_new_unsafe(ev, p)
+        if not found:
+            return None
+        if os.environ.get("AEGIS_ALLOW_BUNFIG_EXEC") or (
+                p != "<patch>" and _mise_allowed_path(cfg, p)):
+            return None
+        shown = ", ".join(found[:5]) + (", ..." if len(found) > 5 else "")
+        return _finish(Decision(action, "bunfig-exec-protect",
+                         f"'{p}' is Bun's config, read with no prompt on every "
+                         f"`bun run`/`bun test`/`bun install`, and this write "
+                         f"adds: {shown}. These entries run code before every "
+                         "script/test (preload, plugins, scanner, shell) or "
+                         "change where packages and TLS trust come from. "
+                         "Review the change, then confirm with "
+                         "AEGIS_ALLOW_BUNFIG_EXEC=1; a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        raw = _cmd(ev)
+        if not (patterns.bunfig_shell_path_hit(cmd) or patterns.bunfig_shell_path_hit(raw)):
+            return None
+        if patterns.mise_shell_only_reads(cmd) and patterns.mise_shell_only_reads(raw):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_BUNFIG_EXEC")
+                or _mise_allowed_cmd(cfg, raw)):
+            return None
+        return _finish(Decision(action, "bunfig-exec-protect",
+                         "A Bun config file (bunfig.toml / ~/.bunfig.toml) is "
+                         "being written from a shell -- Bun reads it with no "
+                         "prompt on every `bun run`/`bun test`/`bun install`, "
+                         "and a `preload`, plugin, scanner or registry entry "
+                         "in it runs code or swaps where packages come from. "
+                         "A human may append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_BUNFIG_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -15935,6 +16172,7 @@ _CORE_RULES = (
     # Any-write ASK; same tail-block reason as above.
     rule_editor_startup_protect,
     rule_mise_exec_protect,
+    rule_bunfig_exec_protect,
     rule_agent_rules_protect,
 )
 

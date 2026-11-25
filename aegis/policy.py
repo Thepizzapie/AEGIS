@@ -462,6 +462,14 @@ class Policy:
     # settings), mise/asdf plugin/shim/install dirs, and `mise trust`-style
     # CLI forms. See rules.rule_mise_exec_protect.
     mise_exec: dict = field(default_factory=dict)
+    # Bun bunfig.toml exec/registry-hijack protection: {mode: deny|ask|
+    # monitor|off, allow: [regex on path / whole command]}. Empty -> defaults
+    # (mode=ask). Covers bunfig.toml / ~/.bunfig.toml entries that run code
+    # (preload, [test] preload, plugins, security scanner, run shell, debug
+    # editor, non-constant define, code loaders) or swap package sources
+    # (registry, scopes, ca/cafile, global/cache dirs). See
+    # rules.rule_bunfig_exec_protect.
+    bunfig_exec: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/
