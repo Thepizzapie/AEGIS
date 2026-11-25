@@ -10709,6 +10709,8 @@ def bunfig_shell_path_hit(cmd) -> bool:
 # (`-e`/`-p`/`--eval`/`--print`), redirects, or carries a substitution.
 _BUNFIG_SEG_SPLIT_RE = re.compile(r"(&&|\|\||[;&|\n])")
 _BUNFIG_BUN_EVAL_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*[ep][A-Za-z]*|--eval|--print)(?:[=\s]|$)")
+_BUNFIG_BUN_OWN_SUBS = frozenset(("test", "install", "i", "ci", "add", "a", "remove",
+                                  "rm", "update", "outdated", "build", "audit"))
 _BUNFIG_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=\S*$")
 
 
@@ -10737,15 +10739,26 @@ def bunfig_neutralize_bun_runs(cmd: str) -> str:
             # --outfile bunfig.toml`, `bun x cp evil bunfig.toml`, `bun pm
             # pack --destination ...`), bun may be WRITING it -- keep the
             # segment as is (QA round 2).
+            # And only where BUN consumes it: `bun` (not `bunx`/`bun x`,
+            # which forward every later arg to a child tool -- QA round 3:
+            # `bun x install src -c bunfig.toml` copies onto bunfig), with
+            # every word before it a flag or one of bun's own consuming
+            # subcommands (`bun run s -c f` / `bun f.js -c f` forward too).
             rest, j = [], i + 1
+            own = verb in ("bun", "bun.exe")
             while j < len(words):
                 w = words[j]
-                if w in ("-c", "--config") and j + 1 < len(words):
-                    j += 2
-                    continue
-                if w.startswith(("-c=", "--config=")):
-                    j += 1
-                    continue
+                is_c = w in ("-c", "--config") or w.startswith(("-c=", "--config="))
+                if is_c and own:
+                    if w in ("-c", "--config"):
+                        if j + 1 < len(words):
+                            j += 2
+                            continue
+                    else:
+                        j += 1
+                        continue
+                if not w.startswith("-") and w.lower() not in _BUNFIG_BUN_OWN_SUBS:
+                    own = False
                 rest.append(w)
                 j += 1
             if bunfig_shell_path_hit(" ".join(rest)):

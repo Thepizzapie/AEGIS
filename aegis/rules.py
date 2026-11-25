@@ -16050,7 +16050,12 @@ def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     --destination`` wrote a working preload unseen (confirmed) -- only the
     ``--config`` value is exempt now; ``[test.reporter] junit`` (and
     ``coverageDir``) outside the project was an arbitrary-file-write
-    primitive on every ``bun test`` -- now gated.
+    primitive on every ``bun test`` -- now gated. Round 3: ``bun x
+    install src -c bunfig.toml`` (Bun forwards ``-c`` to the child, which
+    copies onto bunfig; confirmed) -- the ``--config`` exemption now holds
+    only for ``bun`` itself with every earlier word a flag or one of bun's
+    consuming subcommands (``test``/``install``/``add``/``build``...), never
+    for ``bunx``/``bun x``/``bun run s``/``bun f.js``, which forward it.
     """
     cfg = getattr(policy, "bunfig_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

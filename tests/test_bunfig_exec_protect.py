@@ -419,3 +419,27 @@ def test_qa2_output_paths_outside_gated(body):
 ])
 def test_qa2_output_paths_local_allowed(body):
     assert rule_bunfig_exec_protect(_write("/r/bunfig.toml", body), EMPTY) is None
+
+
+# ---- QA round 3 ----------------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "bun x install src.toml -c bunfig.toml",
+    "bunx install src.toml -c bunfig.toml",
+    "bun x install src.toml --config bunfig.toml",
+    "bun x rsync src.toml -c bunfig.toml",
+    "bun run gen -c bunfig.toml",
+    "bun ./write.js --config=bunfig.toml",
+    "bunx -c bunfig.toml",
+])
+def test_qa3_forwarded_config_gated(cmd):
+    assert _ours(rule_bunfig_exec_protect(_shell(cmd), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "bun -c bunfig.toml run dev",
+    "bun --config=./bunfig.toml test",
+    "bun install -c bunfig.toml",
+    "bun test --watch -c ./bunfig.toml",
+])
+def test_qa3_own_config_reads_allowed(cmd):
+    assert rule_bunfig_exec_protect(_shell(cmd), EMPTY) is None
