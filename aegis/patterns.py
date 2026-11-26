@@ -11288,10 +11288,30 @@ def claude_plugin_shell_kind(cmd) -> str:
         # Whole-tree writer whose DESTINATION is the config dir (QA r1/r2).
         if _cplug_tree_writer_into_config(seg):
             return "tree"
+        # cp/mv/install/ln/rsync INTO a managed-settings dir or the config
+        # dir named only as a directory (QA r6).
+        k = _cplug_copy_into_dir(seg)
+        if k:
+            return k
         # `find ... -exec <writer>` selecting a gated name (QA r1/r2).
         k = _cplug_find_kind(seg)
         if k:
             return k
+    # Quoted / backslashed destinations (`'/Library/Application Support/
+    # ClaudeCode/'`, `C:\\ProgramData\\ClaudeCode\\`) need the raw words.
+    for seg in _cplug_split_keep(cmd)[:20000]:
+        if seg and seg not in ("&&", "||", ";", "|", "\n"):
+            k = _cplug_copy_into_dir(seg)
+            if k:
+                return k
+    # `find ... | xargs <writer>` selecting tree files (QA r6).
+    if _CPLUG_FIND_RE.search(cflat) and re.search(r"\|\s*xargs\b", cflat) and re.search(
+            r"hooks\.json|known_marketplaces|installed_plugins|plugins|\.claude", cflat, re.IGNORECASE):
+        xs = re.findall(r"\|\s*xargs\s+(?:-\S+\s+(?:\{\}\s+)?)*(\S+)", cflat)
+        if any(x.rsplit("/", 1)[-1].lower() not in _CPLUG_READ_EXEC_VERBS for x in xs):
+            if re.search(r"hooks\.json", cflat) and re.search(r"cache|plugins|marketplaces", cflat) \
+                    or re.search(r"known_marketplaces|installed_plugins|\.claude[/\\]+plugins", cflat):
+                return "tree"
     return ""
 
 
@@ -11407,6 +11427,56 @@ def _cplug_writer_into_cwd(seg: str, home: bool) -> bool:
     return False
 
 
+_CPLUG_MANAGED_DIR_RE = re.compile(
+    r"(?:^|[/\\])(?:etc[/\\]+claude-code|Application Support[/\\]+ClaudeCode"
+    r"|(?:ProgramData|Program Files(?: \(x86\))?)[/\\]+ClaudeCode)(?:[/\\]+managed-settings\.d)?[/\\]*$",
+    re.IGNORECASE)
+_CPLUG_COPY_VERBS = frozenset(("cp", "mv", "install", "ln", "rsync", "ditto", "scp", "copy-item",
+                               "move-item", "copy", "move", "xcopy", "robocopy", "gcp", "gmv"))
+
+
+def _cplug_copy_into_dir(seg: str) -> str:
+    try:
+        import shlex as _shlex
+        words = _shlex.split(seg) if len(seg) < 20000 else seg.split()
+    except ValueError:
+        words = seg.split()
+    i = 0
+    while i < len(words) and (words[i].lower() in _HTTP_RC_PREFIX_WORDS or _HTTP_RC_ASSIGN_RE.match(words[i])):
+        i += 1
+    if i >= len(words):
+        return ""
+    verb = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if verb not in _CPLUG_COPY_VERBS:
+        return ""
+    args = words[i + 1:]
+    dests, pos = [], []
+    for j, a in enumerate(args):
+        if a in ("-t", "--target-directory", "-Destination") and j + 1 < len(args):
+            dests.append(args[j + 1])
+        elif a.startswith("--target-directory="):
+            dests.append(a.split("=", 1)[1])
+        elif a.startswith("-t") and len(a) > 2 and not a.startswith("--"):
+            dests.append(a[2:])
+        elif not a.startswith("-"):
+            pos.append(a)
+    if pos:
+        dests.append(pos[-1])
+    for d in dests:
+        dn = d.replace("\\", "/")
+        if _CPLUG_MANAGED_DIR_RE.search(dn):
+            return "settings"
+        if re.fullmatch(r"\$\{?CLAUDE_CONFIG_DIR\}?/*(?:\.)?", dn, re.IGNORECASE):
+            return "tree"
+        if _cplug_is_cfg_dir(dn) and _CPLUG_HOME_DIR_RE.search(dn.rstrip("/") + "/") is not None:
+            return "tree"
+        # `cp -r deploy/etc/claude-code /etc/`: a managed dir copied whole.
+        if re.fullmatch(r"/?etc/*|.*Application Support/*|.*(?:ProgramData|Program Files)/*", dn, re.IGNORECASE):
+            if any(re.search(r"(?:^|/)(?:claude-code|ClaudeCode)/*$", x.replace("\\", "/")) for x in pos[:-1]):
+                return "settings"
+    return ""
+
+
 def _cplug_find_kind(seg: str) -> str:
     if not _CPLUG_FIND_RE.search(seg) or not _CPLUG_FIND_ACTION_RE.search(seg):
         return ""
@@ -11446,7 +11516,8 @@ def _cplug_glob_hit(word: str) -> bool:
 # allowed, as in every sibling settings.local.json guard.
 _CPLUG_FOREIGN_CONTENT_RE = re.compile(
     r"(?:^|[\s;&|(`/])(?:cp|mv|ln|install|rsync|dd|ditto|scp|copy|xcopy|robocopy|copy-item"
-    r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat)\b"
+    r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat|tee|sponge"
+    r"|set-content|out-file|add-content)\b|--(?:slurpfile|rawfile)\b"
     r"|(?:^|[\s;&|(`/])(?:cat|type|get-content|gc)\b[^\n;&|]*>|<\s*[^\s<]", re.IGNORECASE)
 
 
@@ -11461,8 +11532,13 @@ def claude_plugin_settings_foreign_write(cmd) -> bool:
     """A shell write onto the settings file whose bytes come from another
     file/stream (cp/mv/ln/curl/decode/`cat x >`): the key need not appear
     in the command (QA round 1)."""
-    return isinstance(cmd, str) and bool(_CPLUG_FOREIGN_CONTENT_RE.search(
-        _HTTP_RC_HARMLESS_REDIR_RE.sub(" ", cmd)))
+    if not isinstance(cmd, str):
+        return False
+    # Input redirection from a file (`tee f < /tmp/x`): checked on the raw
+    # text, since the shared harmless-redirect strip removes a bare `<` (QA r6).
+    if re.search(r"(?<![<\d])<(?![<&(])\s*[^\s<&]", cmd):
+        return True
+    return bool(_CPLUG_FOREIGN_CONTENT_RE.search(_HTTP_RC_HARMLESS_REDIR_RE.sub(" ", cmd)))
 
 
 _CPLUG_FRAG_KEY_RE = re.compile(
@@ -11524,6 +11600,8 @@ def _cplug_tokens(cmd: str):
     # An unquoted newline ends a simple command; shlex would treat it as
     # whitespace and glue `ls\nclaude plugin install` into one (QA r2).
     cmd = _cplug_newlines_to_semis(cmd)
+    if len(cmd) > 100_000:
+        return None            # shlex is quadratic on one long token (QA r6)
     try:
         lex = _shlex.shlex(cmd, posix=True, punctuation_chars=";&|()")
         lex.whitespace_split = True
@@ -11788,7 +11866,8 @@ def claude_plugin_cli_hit(cmd) -> bool:
                     for ci, x in enumerate(cur[:-1]):
                         if x in _CPLUG_CODE_FLAGS or re.fullmatch(r"-[A-Za-z]*[ceE]", x):
                             code_idx.add(ci + 1)
-                if (verb == "git" and ("-c" in cur or "!" in joined)) or "-exec" in cur or "-execdir" in cur:
+                if (verb == "git" and ("-c" in cur or "!" in joined)) or "-exec" in cur or "-execdir" in cur \
+                        or verb in ("tmux", "screen", "byobu", "zellij", "dtach", "abduco", "expect"):
                     code_idx = set(range(len(cur)))
                 adj_parts.extend(x for ci, x in enumerate(cur)
                                  if ci in code_idx or not re.search(r"\s", x))

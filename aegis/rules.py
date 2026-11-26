@@ -16345,6 +16345,16 @@ def _cplug_new_unsafe(ev: Event, p: str, kind: str) -> list:
     content = a.get("content", a.get("contents"))
     if content is not None and not isinstance(content, str):
         content = json.dumps(content, default=str)
+    if ev.action == ActionClass.MCP and not any(
+            isinstance(v_, str) and ("\n" in v_ or v_.lstrip().startswith(("{", "["))) for v_ in a.values()):
+        # A JSON-setter (`{file, path: "enabledPlugins.x@m", value: true}`):
+        # a gated key named as the target path, unless set to false/null
+        # (QA round 6).
+        vals = [v_ for k_, v_ in a.items() if str(k_).lower() in ("value", "val", "data", "newvalue", "new_value")]
+        if not (vals and all(v_ is False or v_ is None for v_ in vals)):
+            for x in _flatten_strings(a):
+                if str(x).strip() != p and len(str(x)) < 4096 and patterns.claude_plugin_settings_shell_write(str(x)):
+                    return [f"<JSON-setter targeting {str(x)[:60]}>"]
     if ev.action == ActionClass.MCP:
         # A JSON object under any other key (`data`/`value`/`json`) is the
         # body an MCP JSON writer serializes (QA round 2).
@@ -16490,7 +16500,11 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     argsfile claude``, ``"dis"+"ableAllHooks"`` split across string
     literals in an interpreter); an Edit whose curly-quoted ``old_string``
     Claude Code normalizes (the fragment check accepts curly quotes, the
-    replay does not); other command-running settings keys
+    replay does not); a script or patch written earlier (by an ungated
+    tool call) and then run (``bash inst.sh``, ``python3 fix.py``, ``git
+    apply p.diff``) -- the file's content is not read, as in every sibling
+    guard; ``claude --settings`` JSON carrying ``hooks`` (the hooks
+    guard's key, not this one's); other command-running settings keys
     (``fileSuggestion``) belong to their own guards. Accepted false ASKs:
     any non-read shell command naming the plugin tree, or naming
     settings.local.json with a gated key or a copy/decode/download verb;
@@ -16582,7 +16596,14 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     judged on its own); writer verbs after ``cd`` into ANY ``.claude`` asked
     (the window now applies per-verb destination rules, and git only for a
     home-level config dir); every argument of an interpreter was read as
-    code (now only code-flag values).
+    code (now only code-flag values). Round 6, bypass: FAIL -- copying into a managed-settings
+    dir or ``$CLAUDE_CONFIG_DIR`` named only as a directory (``cp x
+    /etc/claude-code/``, ``-t``, ``install``, ``ln``, ``cp -r .../claude-code
+    /etc/``); ``tee``/``sponge`` fed from a staged file (a bare ``<`` was
+    removed by the shared harmless-redirect strip); ``tmux``/``expect``
+    string commands; ``jq --slurpfile``; an MCP JSON-setter naming a gated
+    key as its target path; ``find | xargs <writer>`` on tree files; and a
+    quadratic shlex pass on one huge token. Closed with regression tests.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")

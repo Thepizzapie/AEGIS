@@ -845,3 +845,66 @@ def test_r5_design_not_gated(cmd, cwd):
 ])
 def test_r5_design_still_gated(cmd, cwd):
     assert evaluate(_sh(cmd, cwd), EMPTY).action != Action.ALLOW, cmd
+
+
+# ---- QA round 6 (bypass review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cp managed-settings.json /etc/claude-code/", None),
+    ("sudo cp managed-settings.json /etc/claude-code/", None),
+    ("cp managed-settings.json /etc/claude-code", None),
+    ("cp -t /etc/claude-code managed-settings.json", None),
+    ("install -m644 managed-settings.json /etc/claude-code/", None),
+    ("mv managed-settings.json /etc/claude-code/", None),
+    ("rsync managed-settings.json /etc/claude-code/", None),
+    ("ln -s $PWD/managed-settings.json /etc/claude-code/", None),
+    ("cp -r deploy/etc/claude-code /etc/", None),
+    ("sudo cp managed-settings.json '/Library/Application Support/ClaudeCode/'", None),
+    ("Copy-Item .\\managed-settings.json C:\\ProgramData\\ClaudeCode\\", None),
+    ("sudo tee /etc/claude-code/managed-settings.json < managed-settings.json > /dev/null", None),
+    ("cat managed-settings.json | sudo tee /etc/claude-code/managed-settings.json > /dev/null", None),
+    ("cat /tmp/x | sudo tee /etc/claude-code/managed-settings.d/50-x.json", None),
+    ("cat /tmp/x | tee \"$CLAUDE_CONFIG_DIR/settings.json\"", None),
+    ("tee settings.local.json < /tmp/x", "/r/.claude"),
+    ("cat /tmp/x | tee settings.local.json", "/r/.claude"),
+    ("cd .claude; cat /tmp/x | tee settings.local.json", None),
+    ("cp settings.json \"$CLAUDE_CONFIG_DIR/\"", None),
+    ("cp ./ci/settings.json $CLAUDE_CONFIG_DIR", None),
+    ("cp -r plugins \"$CLAUDE_CONFIG_DIR/\"", None),
+    ("tmux new -d 'claude plugin install x@y'", None),
+    ("tmux send-keys -t x 'claude plugin install x@y' Enter", None),
+    ("expect -c 'spawn claude plugin install x@y; interact'", None),
+    ("sponge .claude/settings.local.json < /tmp/x", None),
+    ("jq --slurpfile p /tmp/x '. + $p[0]' .claude/settings.local.json | sponge .claude/settings.local.json", None),
+    ("find ~ -name hooks.json -path '*cache*' | xargs -I{} cp /tmp/h {}", None),
+])
+def test_b6_gated(cmd, cwd):
+    assert evaluate(_sh(cmd, cwd), EMPTY).action != Action.ALLOW, cmd
+
+
+def test_b6_mcp_json_setter():
+    import tempfile, os
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, ".claude"))
+    f = os.path.join(d, ".claude", "settings.local.json")
+    open(f, "w").write("{}")
+    ev = _mcp({"file": f, "path": "enabledPlugins.evil@m", "value": True}, tool="mcp__json__set_value")
+    assert evaluate(ev, EMPTY).action != Action.ALLOW
+
+
+@pytest.mark.parametrize("cmd", [
+    "cp README.md /tmp/",
+    "cp -r dist /etc/nginx/",
+    "tee out.log < input.txt",
+    "find . -name '*.json' | xargs grep plugins",
+    "tmux new -d 'npm run dev'",
+])
+def test_b6_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("s", ['"$a"' * 95000, "echo " + "\\u0041" * 65000, "echo " + "\\x41" * 97500])
+def test_b6_perf(s):
+    import time
+    t = time.time()
+    rule_claude_plugin_protect(_sh(s), EMPTY)
+    assert time.time() - t < 2.0
