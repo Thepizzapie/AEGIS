@@ -16549,7 +16549,14 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     check still covers ``xargs claude plugin``), and only the pipeline fed
     to the interpreter is judged, with the CLI words required in order.
     Also: ``find <tree> -exec cat|grep`` is a read; ``cd ~/.claude && git
-    pull`` now matches ``git -C ~/.claude pull``.
+    pull`` now matches ``git -C ~/.claude pull``. Round 3, bypass: FAIL --
+    ``tar --get`` (extract synonym) into ``~/.claude``; staged/relative
+    ``cd ~/.claude; cd plugins; sed -i ...`` (a cumulative directory tracker,
+    ``claude_plugin_cd_sim_kind``, now follows every ``cd`` from the event
+    cwd and gates a non-read command run inside the tree or a relative path
+    resolving into it); ``find ~ -path '*plugins/cache*' -exec <writer>``;
+    ``export CLAUDE_CONFIG_DIR=...; claude`` and ``env -S``. Closed with
+    regression tests.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -16622,7 +16629,11 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
         cli = any(patterns.claude_plugin_cli_hit(x) for x in _cplug_cli_surfaces(raw))
         if not cli:
             kind = patterns.claude_plugin_shell_kind(cmd) or patterns.claude_plugin_shell_kind(raw)
-            if not kind and ev.cwd and "\n" not in str(ev.cwd):
+            if not kind:
+                kind = (patterns.claude_plugin_cd_sim_kind(cmd, str(ev.cwd or ""))
+                        or patterns.claude_plugin_cd_sim_kind(raw, str(ev.cwd or "")))
+            if not kind and ev.cwd and "\n" not in str(ev.cwd) \
+                    and not re.search(r"\b(?:cd|pushd|chdir|sl|set-location|push-location)\b", raw, re.I):
                 # The command runs FROM the plugin tree / `.claude` dir: a
                 # bare relative write lands there (QA round 1).
                 pre = "cd '" + str(ev.cwd).replace("'", "") + "' && "

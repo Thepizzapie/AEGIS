@@ -4,6 +4,7 @@ Regex, not naive globs. These back the built-in rules in
 ``aegis.rules`` that ship secure-by-default.
 """
 import fnmatch
+import posixpath
 import os
 import functools
 import re
@@ -11131,6 +11132,55 @@ def _cplug_literal_kind(f: str) -> str:
     return ""
 
 
+_CPLUG_CD_WORDS = frozenset(("cd", "pushd", "chdir", "sl", "set-location", "push-location"))
+
+
+def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
+    """Track the shell's directory across `cd`s (absolute, `~`, relative,
+    staged `cd ~/.claude; cd plugins`) starting at the event cwd: any
+    non-read simple command run while inside the plugin tree, or naming a
+    relative path that resolves into it / onto a gated settings file, is a
+    hit (QA round 3)."""
+    if not isinstance(cmd, str) or len(cmd) > 400_000:
+        return ""
+    cur = (cwd or "").replace("\\", "/")
+    segs = re.split(r"&&|\|\||;|\n|\|", cmd)
+    if len(segs) > 20000:
+        return "tree"
+    for seg in segs:
+        words = seg.replace("'", "").replace('"', "").split()
+        if not words:
+            continue
+        verb = words[0].lower()
+        if verb in _CPLUG_CD_WORDS:
+            tgt = next((w for w in words[1:] if not w.startswith("-")), "~")
+            tgt = tgt.replace("\\", "/")
+            if tgt.startswith(("/", "~", "$")) or re.match(r"^[A-Za-z]:", tgt):
+                cur = tgt
+            elif cur:
+                cur = posixpath.normpath(cur.rstrip("/") + "/" + tgt)
+            else:
+                cur = tgt
+            continue
+        if not cur:
+            continue
+        if claude_plugin_kind(cur.rstrip("/") + "/") == "tree" or re.search(
+                r"(?:^|/)(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)/plugins(?:/|$)", cur, re.IGNORECASE):
+            if not claude_plugin_shell_only_reads(seg):
+                return "tree"
+            continue
+        for w in words[1:]:
+            w2 = w.lstrip("<>&|0123456789").replace("\\", "/")
+            if w2.startswith("-t") and len(w2) > 2:
+                w2 = w2[2:]
+            if not w2 or w2.startswith(("/", "~", "$", "-")):
+                continue
+            k = claude_plugin_kind(cur.rstrip("/") + "/" + w2)
+            if k:
+                return k
+    return ""
+
+
 def claude_plugin_shell_kind(cmd) -> str:
     """'tree'/'settings' if a shell command names the plugin tree or a gated
     settings file -- literally, via `\\`/quote splitting, `..`, 8.3 short
@@ -11249,7 +11299,9 @@ def _cplug_tree_writer_into_config(seg: str) -> bool:
         return False
     if verb in ("tar", "bsdtar", "gtar"):
         first = args[0] if args else ""
-        return bool(re.match(r"^-?[A-Za-z]*x", first) or "--extract" in args or "-x" in args
+        return bool(re.match(r"^-?[A-Za-z]*x", first) or "--extract" in args or "--get" in args
+                    or any(a.startswith(("--extract", "--get", "--ext", "--ge")) for a in args)
+                    or "-x" in args
                     or any(re.match(r"^-[A-Za-wyz]*x", a) for a in args if a.startswith("-") and not a.startswith("--")))
     if verb == "unzip":
         return not any(a in ("-l", "-t", "-v", "-Z", "-p", "-c") for a in args)
@@ -11279,6 +11331,14 @@ def _cplug_find_kind(seg: str) -> str:
         return "settings"
     if re.search(r"\.claude|known_marketplaces|installed_plugins", seg, re.IGNORECASE) or (
             re.search(r"plugins", seg, re.IGNORECASE) and re.search(r"hooks\.json|hooks/", seg, re.IGNORECASE)):
+        return "tree"
+    # `find ~ -path '*plugins/cache*' ...`: the installed-plugin layout named
+    # in a path predicate, or `plugins` searched from a home/root start (QA r3).
+    if re.search(r"-i?(?:path|wholename|regex)\s+\S*plugins[/\\]+[^\s]*(?:cache|marketplaces|\*)",
+                 seg, re.IGNORECASE):
+        return "tree"
+    if re.search(r"\bfind\s+(?:-\w+\s+)*(?:~[\w.-]*|\$\{?HOME\}?|/|/root|/home(?:/\S*)?|/Users(?:/\S*)?)/?(?:\s|$)",
+                 seg) and re.search(r"plugins", seg, re.IGNORECASE):
         return "tree"
     return ""
 
@@ -11436,7 +11496,15 @@ def _cplug_cli_tokens_hit(toks: list) -> bool:
         else:
             cur.append(t)
     segs.append(cur)
+    cfg_any = False                 # `export CLAUDE_CONFIG_DIR=...` earlier (QA r3)
     for seg in segs:
+        if any("CLAUDE_CONFIG_DIR=" in x.upper() or x.upper() == "CLAUDE_CONFIG_DIR" for x in seg[:200]) \
+                and any(x.lower() in ("export", "declare", "typeset", "setenv", "set", "env") or
+                        x.upper().startswith("$ENV:") for x in seg[:200]):
+            cfg_any = True
+        if cfg_any and any(_CPLUG_CLAUDE_TOKEN_RE.search(x) or re.search(
+                r"(?:^|\s)(?:\S*/)?claude(?:\s|$)", x) for x in seg[:200]):
+            return True
         lead = True                 # every earlier word a prefix/assignment/flag
         cfgdir = False              # an earlier `CLAUDE_CONFIG_DIR=` assignment
         for i, t in enumerate(seg):

@@ -707,3 +707,36 @@ def test_r3_not_gated(cmd):
 ])
 def test_r3_gated(cmd):
     assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+# ---- QA round 3 (bypass review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ("tar --get -f /tmp/e.tar -C ~/.claude", None),
+    ("tar --get --file=/tmp/e.tar -C ~/.claude", None),
+    ("tar --get -z -f /tmp/e.tar -C $CLAUDE_CONFIG_DIR", None),
+    ("cat /tmp/e.tar | tar --get -C ~/.claude", None),
+    ("bsdtar --get -f /tmp/e.tar -C ~/.claude", None),
+    ("cd plugins/cache/m/p/1.0 && sed -i s/a/b/ hooks/hooks.json", "/root/.claude"),
+    ("cd plugins && perl -pi -e s/a/b/ cache/m/p/1.0/hooks/hooks.json", "/root/.claude"),
+    ("cd ~/.claude; cd plugins; sed -i s/a/b/ cache/m/p/1.0/hooks/hooks.json", None),
+    ("cd $CLAUDE_CONFIG_DIR && cd plugins && sed -i s/a/b/ cache/m/p/hooks/hooks.json", None),
+    ("find ~ -path '*plugins/cache*' -name '*.sh' -exec sh -c 'echo evil >> \"$1\"' _ {} \;", None),
+    ("export CLAUDE_CONFIG_DIR=/tmp/evil; claude -p hi", None),
+    ("env -S 'CLAUDE_CONFIG_DIR=/tmp/e claude -p hi'", None),
+])
+def test_b3_gated(cmd, cwd):
+    assert evaluate(_sh(cmd, cwd), EMPTY).action != Action.ALLOW, cmd
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("tar --list -f a.tar -C ~/.claude", None),
+    ("cd src && cd plugins && sed -i s/a/b/ index.js", None),
+    ("cd ~/myrepo && cd plugins && npm test", None),
+    ("find . -name '*.sh' -exec chmod +x {} +", None),
+    ("cd plugins && ls", "/root/.claude"),
+    ("cd ~/.claude/plugins && cat known_marketplaces.json", None),
+    ("cd /tmp && echo x > y", "/root/.claude/plugins/cache"),
+    ("find src/plugins -name '*.js' -exec prettier --write {} +", None),
+])
+def test_b3_not_gated(cmd, cwd):
+    assert rule_claude_plugin_protect(_sh(cmd, cwd), EMPTY) is None, cmd
