@@ -11145,6 +11145,7 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
         return ""
     cur = (cwd or "").replace("\\", "/")
     cdpath = ""
+    stack = []
     # Subshell/brace groups and `builtin`/`command` wrappers do not hide a
     # `cd` (QA r4): split on them too and drop wrapper words.
     segs = re.split(r"&&|\|\||;|\n|\||[(){}]", cmd)
@@ -11156,21 +11157,36 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
                                               "typeset", "local", "readonly", "time", "nohup")
                          or (_HTTP_RC_ASSIGN_RE.match(words[0]) and len(words) > 1)):
             if words[0].upper().startswith("CDPATH="):
-                cdpath = words[0].split("=", 1)[1].split(":")[0]
+                cdpath = words[0].split("=", 1)[1]
             words = words[1:]
         if not words:
             continue
         if words[0].upper().startswith("CDPATH="):
-            cdpath = words[0].split("=", 1)[1].split(":")[0]
+            cdpath = words[0].split("=", 1)[1]
             continue
         verb = words[0].lower()
+        if verb in ("popd", "pop-location"):
+            cur = stack.pop() if stack else cur
+            continue
+        if verb in ("pushd", "push-location"):
+            stack.append(cur)
+            if len(stack) > 5000:
+                return "tree"
         if verb in _CPLUG_CD_WORDS:
             tgt = next((w for w in words[1:] if not w.startswith("-")), "~")
             tgt = tgt.replace("\\", "/")
             if tgt.startswith(("/", "~", "$")) or re.match(r"^[A-Za-z]:", tgt):
                 cur = tgt
             elif cdpath and not tgt.startswith("."):
-                cur = posixpath.normpath(cdpath.rstrip("/") + "/" + tgt)
+                # Every CDPATH entry is a candidate; prefer one that lands in
+                # the Claude config dir (QA r5: a later entry was ignored).
+                cands = [posixpath.normpath(e.rstrip("/") + "/" + tgt)
+                         for e in cdpath.split(":")[:50] if e]
+                if cur:
+                    cands.append(posixpath.normpath(cur.rstrip("/") + "/" + tgt))
+                cur = next((c for c in cands if re.search(
+                    r"(?:^|/)(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)(?:/|$)", c, re.IGNORECASE)),
+                    cands[0] if cands else tgt)
             elif cur:
                 cur = posixpath.normpath(cur.rstrip("/") + "/" + tgt)
             else:

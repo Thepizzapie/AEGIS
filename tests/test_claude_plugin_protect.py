@@ -797,3 +797,18 @@ def test_b4_gated(cmd):
 ])
 def test_b4_not_gated(cmd):
     assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 5 regressions ----------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "export CDPATH=/tmp:~/.claude; cd plugins; sed -i s/a/b/ cache/p/hooks/hooks.json",
+    "pushd ~/.claude; pushd plugins; sed -i s/a/b/ cache/p/hooks/hooks.json",
+    "pushd ~/x; popd; cd ~/.claude; cd plugins; sed -i s/a/b/ c/hooks.json",
+])
+def test_r5_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+def test_r5_popd_leaves_tree():
+    cmd = "pushd ~/proj; pushd ~/.claude/plugins; popd; sed -i s/a/b/ src/x.js"
+    assert patterns.claude_plugin_cd_sim_kind(cmd) == ""
