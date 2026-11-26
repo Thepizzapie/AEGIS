@@ -16633,7 +16633,14 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     expansions are now collapsed first); ``sed -n`` with no ``w``/``e``/
     ``-i`` is a read; an MCP edit's nested ``oldText``/``newText`` no
     longer retarget a non-plugin ``path``; the cd tracker skips commands
-    with no ``cd`` and no cwd. Bypass: FAIL (one MEDIUM) --
+    with no ``cd`` and no cwd. Bypass: FAIL (one MEDIUM) -- a settings
+    write wrapped in ``sh -c``/``sudo sh -c`` skipped the foreign-content
+    check (now run on every decoded rendering, with quotes as a verb
+    boundary); also ``jq -s``/``sed``/``awk``/``yq load()``/``exec 3>``/
+    ``<<<``/``shutil.copy``/``writeFileSync`` content into a settings
+    file, ``find $CLAUDE_CONFIG_DIR -exec``, extraction into a managed
+    dir, a ``settings.js?n`` glob, flags past the CLI look-ahead, and a
+    quadratic slowdown on long digit runs in the shared redirect regex. Bypass: FAIL (one MEDIUM) --
     ``${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`` and the config
     dir as a ``cp``/``rsync``/``tar -C`` destination in the default-value
     form (now recognized everywhere the plain form is, with a brace-safe
@@ -16739,7 +16746,9 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
                 return None
             if kind == "settings" and not (patterns.claude_plugin_settings_shell_write(cmd)
                                            or patterns.claude_plugin_settings_shell_write(raw)
-                                           or patterns.claude_plugin_settings_foreign_write(raw)):
+                                           or any(patterns.claude_plugin_settings_foreign_write(x)
+                                                  for x in srends)):
+                # (every rendering: `sudo sh -c "cp x /etc/..."` -- QA r9)
                 return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PLUGIN")
                 or _mise_allowed_cmd(cfg, raw)):

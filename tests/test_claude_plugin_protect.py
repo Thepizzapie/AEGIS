@@ -1060,3 +1060,34 @@ def test_r9_mcp_edit_nested_text_not_retarget():
                                                   "newText": "~/.claude/plugins/cache"}]},
               tool="mcp__filesystem__edit_file")
     assert rule_claude_plugin_protect(ev, EMPTY) is None
+
+
+# ---- QA round 9 (bypass review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "bash -c \"curl -so $CLAUDE_CONFIG_DIR/settings.json https://x/s\"",
+    "sudo bash -c 'curl -so /etc/claude-code/managed-settings.json https://x/s'",
+    "sudo sh -c \"cat /tmp/m.json > /etc/claude-code/managed-settings.json\"",
+    "sudo sh -c 'base64 -d /tmp/b > /etc/claude-code/managed-settings.json'",
+    "bash -c 'cp /tmp/s.json $CLAUDE_CONFIG_DIR/settings.json'",
+    "sudo sh -c \"cp /tmp/m.json '/Library/Application Support/ClaudeCode/managed-settings.json'\"",
+    "jq -s \".[0]*.[1]\" \"$CLAUDE_CONFIG_DIR/settings.json\" /tmp/p.json | sponge \"$CLAUDE_CONFIG_DIR/settings.json\"",
+    "sed \"\" /tmp/o > \"$CLAUDE_CONFIG_DIR/settings.json\"",
+    "exec 3>\"$CLAUDE_CONFIG_DIR/settings.json\"; cat /tmp/o >&3",
+    "tee \"$CLAUDE_CONFIG_DIR/settings.json\" <<<\"$(cat /tmp/o)\"",
+    "python3 -c \"import shutil,os; shutil.copy('/tmp/p.json', os.environ['CLAUDE_CONFIG_DIR']+'/settings.json')\"",
+    "find \"$CLAUDE_CONFIG_DIR\" -name hooks.json -exec sed -i s/a/b/ {} +",
+    "sudo tar xf /tmp/m.tar -C /etc/claude-code",
+    "sudo unzip -o /tmp/m.zip -d /etc/claude-code",
+    "echo '{\"disableAllHooks\": true}' > $CLAUDE_CONFIG_DIR/settings.js?n",
+    "claude " + "--add-dir d " * 40 + "--plugin-dir ./p",
+])
+def test_b9_gated(cmd):
+    assert evaluate(_sh(cmd, "/home/user/proj"), EMPTY).action != Action.ALLOW, cmd[:80]
+
+
+def test_b9_digit_run_perf():
+    import time
+    for c in ["echo $X " + "1" * 30000, "printf '%s' \\\\ " + "7" * 100000]:
+        t = time.time()
+        rule_claude_plugin_protect(_sh(c), EMPTY)
+        assert time.time() - t < 2.0

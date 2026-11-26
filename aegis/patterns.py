@@ -11066,7 +11066,7 @@ def claude_plugin_kind(path) -> str:
 
 # Canonical component names a glob/brace component may stand for. A leading
 # `.` must be literal for a hidden name, as in bash/zsh without dotglob.
-_CPLUG_CANON = (".claude", "plugins", "settings.local.json", "managed-settings.json",
+_CPLUG_CANON = (".claude", "plugins", "settings.local.json", "managed-settings.json", "settings.json",
                 "claude-code", "ClaudeCode")
 
 
@@ -11394,7 +11394,8 @@ def _cplug_tree_writer_into_config(seg: str) -> bool:
     verb = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower()
     args = words[i + 1:]
     cfg_idx = [j for j, w in enumerate(args) if _cplug_is_cfg_dir(w.split("=", 1)[-1])
-               or (w.startswith("-o") and _cplug_is_cfg_dir(w[2:]))]
+               or (w.startswith("-o") and _cplug_is_cfg_dir(w[2:]))
+               or _CPLUG_MANAGED_DIR_RE.search(w.strip("'\"").replace("\\", "/"))]
     if not cfg_idx:
         return False
     if verb in ("tar", "bsdtar", "gtar"):
@@ -11539,7 +11540,7 @@ def _cplug_find_kind(seg: str) -> str:
         return ""
     if re.search(r"settings\.local|managed-settings", seg, re.IGNORECASE):
         return "settings"
-    if re.search(r"\.claude|known_marketplaces|installed_plugins", seg, re.IGNORECASE) or (
+    if re.search(r"\.claude|CLAUDE_CONFIG_DIR|known_marketplaces|installed_plugins", seg, re.IGNORECASE) or (
             re.search(r"plugins", seg, re.IGNORECASE) and re.search(r"hooks\.json|hooks/", seg, re.IGNORECASE)):
         return "tree"
     # `find ~ -path '*plugins/cache*' ...`: the installed-plugin layout named
@@ -11567,15 +11568,22 @@ def _cplug_glob_hit(word: str) -> bool:
 # matches). A `jq '.env' file` read or an interpreter edit of other keys stays
 # allowed, as in every sibling settings.local.json guard.
 _CPLUG_FOREIGN_CONTENT_RE = re.compile(
-    r"(?:^|[\s;&|(`/])(?:cp|mv|ln|install|rsync|dd|ditto|scp|copy|xcopy|robocopy|copy-item"
-    r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat)\b"
+    r"(?:^|[\s;&|(`/]|[\s(]['\"])(?:cp|mv|ln|install|rsync|dd|ditto|scp|copy|xcopy|robocopy|copy-item"
+    r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat)(?=\s)"
     r"|--(?:slurpfile|rawfile)\b"
     r"|\bgit\s+(?:[^\n;&|]{0,200}\s)?(?:checkout|restore|show|cat-file|archive)\b"
     # `tee`/`sponge` only when fed a file's bytes (`cat /tmp/x | tee f`); a
     # `jq '.model=...' f | sponge f` edit names its keys (QA r6).
-    r"|(?:^|[\s;&|(`/])(?:cat|type|gc|get-content|head|tail|zcat|gunzip|base64|xxd|curl|wget|openssl"
-    r"|dd)\b[^;&|\n]*\|\s*(?:sudo\s+)?(?:tee|sponge)\b"
-    r"|(?:^|[\s;&|(`/])(?:cat|type|get-content|gc)\b[^\n;&|]*>|<\s*[^\s<]", re.IGNORECASE)
+    r"|(?:^|[\s;&|(`/]|[\s(]['\"])(?:cat|type|gc|get-content|head|tail|zcat|gunzip|base64|xxd|curl|wget"
+    r"|openssl|dd)\s[^;&|\n]*\|\s*(?:sudo\s+)?(?:tee|sponge)\b"
+    # A filter whose output is redirected (`sed "" /tmp/o > f`), `exec 3>`,
+    # here-strings, multi-file jq/yq merges, interpreter copy/write calls (QA r9).
+    r"|(?:^|[\s;&|(`/]|[\s(]['\"])(?:cat|type|get-content|gc|sed|awk|gawk|grep|paste|m4|iconv|jq|yq|sort)"
+    r"\s[^\n;&|]*>"
+    r"|\bexec\s+\d*>|<<<|\byq\b[^\n;&|]*\bload\(|\bjq\s+(?:-\w+\s+)*-s\b"
+    r"|(?:shutil\.copy\w*|shutil\.move|copyfile|copyFileSync|renameSync|os\.replace|os\.rename)\s*\("
+    r"|writeFileSync\s*\([^)]{0,300}readFileSync",
+    re.IGNORECASE)
 
 
 def claude_plugin_settings_shell_write(cmd) -> bool:
@@ -11596,6 +11604,8 @@ def claude_plugin_settings_foreign_write(cmd) -> bool:
                  " true ", cmd)
     # Input redirection from a file (`tee f < /tmp/x`): checked on the raw
     # text, since the shared harmless-redirect strip removes a bare `<` (QA r6).
+    if "<<<" in cmd and re.search(r"(?:^|[\s;&|(`/'\"])(?:tee|sponge|dd)\b", cmd, re.I):
+        return True            # here-string into a writer (QA r9)
     if re.search(r"(?<![<\d])<(?![<&(])\s*[^\s<&]", cmd) and (
             re.search(r"(?:^|[\s;&|(`/])(?:tee|sponge|dd|cp|mv|install|set-content|out-file)\b", cmd, re.I)
             or re.search(r"(?<![<\d&])>(?!\s*(?:/dev/null|&))", cmd)):
@@ -11761,13 +11771,13 @@ def _cplug_cli_tokens_hit(toks: list) -> bool:
             claude_like = bool(_CPLUG_CLAUDE_TOKEN_RE.search(t)) or (_cplug_dynamic(t) and lead)
             if not claude_like:
                 continue
-            rest = seg[i + 1:i + 80]
+            rest = seg[i + 1:i + 600]
             if cfgdir and _CPLUG_CLAUDE_TOKEN_RE.search(t):
                 return True           # child session reads another config dir
             if rest and _cplug_dynamic(rest[0]) and len(rest) > 1 and (
                     rest[1].lower() in _CPLUG_PLUGIN_SUBS or rest[1].lower() in ("marketplace", "marketplaces")):
                 return True           # `claude ${p:-plugin} install`
-            for j, w in enumerate(rest[:60]):
+            for j, w in enumerate(rest[:600]):
                 lw = w.lower()
                 if lw.startswith("--plugin-dir") or lw.startswith("--setting-sources"):
                     return True
@@ -11902,6 +11912,7 @@ def claude_plugin_cli_hit(cmd) -> bool:
                 "CLAUDE_CONFIG_DIR" in body and re.search(r"[\"'\s(\[,]claude[\"'\s,)\]]", body)):
             return True        # an interpreter heredoc spawning claude (QA r7)
     cmd = _cplug_drop_text_heredocs(cmd)
+    cmd = re.sub(r"\d{20,}", "0", cmd)       # quadratic shared regex on digit runs (QA r9)
     sink = bool(_CPLUG_EXEC_SINK_RE.search(cmd))
     if sink:
         # Only the pipeline that is actually fed to an interpreter (or the
@@ -12026,6 +12037,8 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
         return False
     if len(cmd) > 400_000:
         return False
+    # Long digit runs make the shared harmless-redirect regex quadratic (QA r9).
+    cmd = re.sub(r"\d{20,}", "0", cmd)
     # `${HOME}`/`${CLAUDE_CONFIG_DIR:-...}` are parameter expansions, not
     # groups: collapse them so the brace-splitting shared read check does
     # not see `HOME` as a verb (QA r9). `$(...)`/backticks are kept.
