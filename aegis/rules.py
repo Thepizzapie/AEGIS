@@ -16643,8 +16643,14 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
                     or patterns.claude_plugin_shell_kind(pre + raw))
             if not kind:
                 return None
-            if (patterns.claude_plugin_shell_only_reads(cmd)
-                    and patterns.claude_plugin_shell_only_reads(raw)):
+            # Renderings kept apart by newlines: `scan_surface`'s space join
+            # would glue one rendering's last word onto the next's (QA r4).
+            # The plain quote-stripped rendering is skipped: it splits a quoted
+            # jq filter's `|`; an odd quoted verb (`c'p'`) already fails the
+            # raw rendering's read check.
+            rends = normalize.scan_surface(raw, sep="\n\u0000").split("\n\u0000")
+            rends = [raw] + rends[2:]
+            if all(patterns.claude_plugin_shell_only_reads(x) for x in dict.fromkeys(rends)):
                 return None
             if kind == "settings" and not (patterns.claude_plugin_settings_shell_write(cmd)
                                            or patterns.claude_plugin_settings_shell_write(raw)

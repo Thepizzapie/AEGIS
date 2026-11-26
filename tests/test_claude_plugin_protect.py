@@ -740,3 +740,33 @@ def test_b3_gated(cmd, cwd):
 ])
 def test_b3_not_gated(cmd, cwd):
     assert rule_claude_plugin_protect(_sh(cmd, cwd), EMPTY) is None, cmd
+
+
+# ---- QA round 4 (design review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "git -C ~/.claude/plugins/marketplaces/acme log --oneline",
+    "git -C ~/.claude/plugins/marketplaces/acme status",
+    "git -C ~/.claude/plugins/marketplaces/acme rev-parse HEAD",
+    "git --git-dir ~/.claude/plugins/marketplaces/acme/.git log",
+    "cat ~/.claude/plugins/installed_plugins.json | grep x | sort | uniq -c",
+    "jq -r '.plugins|keys[]' ~/.claude/plugins/installed_plugins.json | sort",
+    "ls ~/.claude/plugins/cache | xargs -n1 basename",
+    "fd hooks.json ~/.claude/plugins",
+    "xxd ~/.claude/plugins/known_marketplaces.json",
+    "claude --settings '{\"enabledPlugins\":{\"a@b\":false}}' -p hi",
+    "claude --settings '{\"disableAllHooks\":false}' -p hi",
+])
+def test_r4_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git -C ~/.claude/plugins/marketplaces/acme pull",
+    "git -C ~/.claude/plugins/marketplaces/acme -c core.hooksPath=/x log",
+    "sort -o ~/.claude/plugins/known_marketplaces.json x",
+    "xxd -r x ~/.claude/plugins/x",
+    "ls | xargs -I{} cp {} ~/.claude/plugins/",
+    "claude --settings '{\"enabledPlugins\":{\"a@b\":true}}' -p hi",
+])
+def test_r4_still_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd

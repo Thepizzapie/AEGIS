@@ -11484,6 +11484,15 @@ def _cplug_settings_value_safe(v: str) -> bool:
     a gated key, is the child session's settings: not safe)."""
     if not v.strip().startswith("{"):
         return False
+    import json as _json
+    try:
+        parsed = _json.loads(v)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        # Value-gated, like the file form: `{"enabledPlugins":{"a@b":false}}`
+        # adds nothing (QA round 4).
+        return not claude_plugin_unsafe_entries(v)
     return not (claude_plugin_unsafe_entries(v) or claude_plugin_settings_shell_write(v))
 
 
@@ -11688,18 +11697,81 @@ def claude_plugin_cli_hit(cmd) -> bool:
 # Read-only inspection verbs beyond the shared safe list, for THIS guard:
 # `jq` cannot write a file by itself (a `>` is judged separately), and
 # `find` without an exec/delete/print-to-file action only lists (QA round 1).
+def _cplug_split_keep(cmd: str) -> list:
+    """Split on `&&`/`||`/`;`/`|`/newline OUTSIDE quotes, keeping the
+    separators (a jq filter's `|` stays inside its segment -- QA round 4)."""
+    out, cur, q, i, n = [], [], None, 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if q:
+            cur.append(c)
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c in "'\"":
+            q = c
+            cur.append(c)
+            i += 1
+            continue
+        two = cmd[i:i + 2]
+        if two in ("&&", "||"):
+            out.append("".join(cur)); out.append(two); cur = []; i += 2
+            continue
+        if c in ";|\n":
+            out.append("".join(cur)); out.append(c); cur = []; i += 1
+            continue
+        cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return out
+
+
+_CPLUG_GIT_READ_SUBS = frozenset(("status", "diff", "log", "show", "rev-parse", "describe",
+                                  "ls-files", "ls-tree", "blame", "shortlog", "branch", "tag",
+                                  "remote", "cat-file", "rev-list", "grep", "reflog", "config"))
+
+
 def claude_plugin_shell_only_reads(cmd: str) -> bool:
     if not isinstance(cmd, str):
         return False
+    if len(cmd) > 400_000:
+        return False
     out = []
-    for seg in re.split(r"(&&|\|\||[;|\n])", cmd):
+    for seg in _cplug_split_keep(cmd):
+        if seg in ("&&", "||", ";", "|", "\n"):
+            out.append(seg)
+            continue
         words = seg.split()
         verb = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower() if words else ""
         acts = re.findall(r"-(?:exec|execdir|ok|okdir)\s+(\S+)", seg)
         find_reads = verb == "find" and (not _CPLUG_FIND_ACTION_RE.search(seg) or (
             acts and all(x.strip("'\"").rsplit("/", 1)[-1].lower() in _CPLUG_READ_EXEC_VERBS for x in acts)
             and not re.search(r"-(?:delete|fprint0?|fprintf|fls)\b", seg)))
-        if (verb in ("jq", "tree", "exa", "eza") or find_reads) \
+        if verb == "git":
+            # `git -C <dir>` / `--git-dir` / `--work-tree` select a repo; the
+            # subcommand after them decides (QA round 4).
+            seg = re.sub(r"(?<=\s)(?:-C\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+)", " ", seg)
+            gw = seg.split()[1:]
+            sub = next((w for w in gw if not w.startswith("-")), "")
+            if (sub in _CPLUG_GIT_READ_SUBS and not _MISE_GIT_BAD_RE.search(" " + seg)
+                    and not any(c in seg for c in "<>`$")
+                    and not (sub in ("branch", "tag", "remote", "config")
+                             and len([w for w in gw if not w.startswith("-")]) > 1)):
+                out.append(" true ")
+                continue
+        args = words[1:]
+        extra_read = (
+            (verb == "sort" and not any(a.startswith(("-o", "--output")) for a in args))
+            or (verb == "uniq" and len([a for a in args if not a.startswith("-")]) <= 1)
+            or verb in ("fd", "fdfind", "hexdump", "strings", "cut", "nl", "column", "basename",
+                        "dirname", "od", "tr", "sha512sum", "b2sum", "cksum")
+            or (verb == "xxd" and "-r" not in args)
+            or (verb == "xargs" and any(a.rsplit("/", 1)[-1] in _CPLUG_READ_EXEC_VERBS
+                                        for a in args if not a.startswith("-"))
+                and next((a for a in args if not a.startswith("-") and not a.isdigit()), "")
+                .rsplit("/", 1)[-1] in _CPLUG_READ_EXEC_VERBS))
+        if (verb in ("jq", "tree", "exa", "eza") or find_reads or extra_read) \
                 and not any(c in seg for c in "<>`$"):
             out.append(" true ")
         else:
