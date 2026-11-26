@@ -11516,8 +11516,12 @@ def _cplug_glob_hit(word: str) -> bool:
 # allowed, as in every sibling settings.local.json guard.
 _CPLUG_FOREIGN_CONTENT_RE = re.compile(
     r"(?:^|[\s;&|(`/])(?:cp|mv|ln|install|rsync|dd|ditto|scp|copy|xcopy|robocopy|copy-item"
-    r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat|tee|sponge"
-    r"|set-content|out-file|add-content)\b|--(?:slurpfile|rawfile)\b"
+    r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat)\b"
+    r"|--(?:slurpfile|rawfile)\b"
+    # `tee`/`sponge` only when fed a file's bytes (`cat /tmp/x | tee f`); a
+    # `jq '.model=...' f | sponge f` edit names its keys (QA r6).
+    r"|(?:^|[\s;&|(`/])(?:cat|type|gc|get-content|head|tail|zcat|gunzip|base64|xxd|curl|wget|openssl"
+    r"|dd)\b[^;&|\n]*\|\s*(?:sudo\s+)?(?:tee|sponge)\b"
     r"|(?:^|[\s;&|(`/])(?:cat|type|get-content|gc)\b[^\n;&|]*>|<\s*[^\s<]", re.IGNORECASE)
 
 

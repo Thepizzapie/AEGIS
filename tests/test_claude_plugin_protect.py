@@ -908,3 +908,8 @@ def test_b6_perf(s):
     t = time.time()
     rule_claude_plugin_protect(_sh(s), EMPTY)
     assert time.time() - t < 2.0
+
+
+def test_b6_cat_jq_sponge_edit_not_gated():
+    cmd = "cat .claude/settings.local.json | jq '.model=\"x\"' | sponge .claude/settings.local.json"
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None
