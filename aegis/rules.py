@@ -16362,8 +16362,8 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     parse but names a gated key fails closed. An edit that cannot be
     replayed (file missing, ``old_string`` absent -- the Edit itself would
     fail) is judged on the text it inserts: a gated key as a JSON key, not
-    set to ``false``/``null``/empty. The plugin tree is path-only:
-    any non-delete write into it asks. Shell is path-only too and INVERTED:
+    set to ``false``/``null``/empty. The plugin tree is path-only for file
+    tools: any non-delete write into it asks. Shell is INVERTED:
     a command naming the plugin tree or a gated settings file (literal,
     ``\\``/quote-split, ``..``, glob/brace word, ``$CLAUDE_CONFIG_DIR``, or a
     ``cd ~/.claude`` followed by a bare ``plugins/``/``settings.local.json``)
@@ -16390,7 +16390,21 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     glob/brace word (canonicalized), Windows 8.3 short names, the event
     ``cwd`` (Claude Code keeps the shell's cwd between calls), an archive/
     rsync/patch/``git apply`` aimed at the config dir itself, and ``find ...
-    -exec`` selecting a gated name. MCP writes with base64/hex/binary
+    -exec <writer>`` selecting a gated name (a read-only action such as
+    ``-exec grep``/``wc``/``cat`` does not count; ``.claude``,
+    ``known_marketplaces``/``installed_plugins``, or ``plugins`` together with
+    ``hooks.json`` must appear in that find). The archive/rsync/patch/git
+    check is per simple command, needs the config dir as the DESTINATION
+    (``tar -x -C``, ``unzip -d``, ``7z x -o``, rsync's last operand), and
+    for git a home-level ``~/.claude``/``$CLAUDE_CONFIG_DIR`` (a project's
+    ``.claude/`` holds no plugin tree). The adjacent-words CLI fallback
+    (``claude plugin install`` inside one word) reads only whitespace-free
+    words, except for an interpreter's code argument (``python -c``,
+    ``node -e``, ``bash <<EOF``, ``git -c alias.x='!...'``): prose in a PR
+    body, a ``sed`` script, a prompt or a ``cat > doc <<EOF`` heredoc is not
+    an invocation. ``cli.js`` counts only under ``claude-code/``; a leading
+    ``$x``/``${x}``/``$(...)`` verb counts, ``$HOME/bin/tool`` does not.
+    MCP writes with base64/hex/binary
     content, and MCP extract/sync tools whose destination is the config dir,
     fail closed. A rules file inside the plugin tree is left to
     ``rule_agent_rules_protect`` (which must stay the last core rule), so
@@ -16419,7 +16433,10 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     a project-level ``.claude/plugins/`` path (Claude Code does not read
     one); ``claude plugin update`` / ``marketplace update`` (routine, but
     they pull new hook code); a settings.local.json body that does not
-    parse (e.g. a ``//`` comment) and names a gated key.
+    parse (e.g. a ``//`` comment) and names a gated key; ``claude
+    --setting-sources`` (even when it narrows) and ``--settings <file>`` (CI
+    configs); an MCP tool that is not a write (``create_issue``) whose whole
+    string argument is a plugin-tree path.
 
     QA history (independent bypass and design reviews, run in parallel).
     Round 1, design: PASS with should-fixes -- doc/commit-message/grep text
@@ -16434,7 +16451,16 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     rsync/patch into ``~/.claude``, ``find -exec``, 8.3 short names, a
     quadratic ``cd`` scan (now pos/endpos), and an inert ``DISABLEALLHOOKS``
     cancelling a real one (fingerprint now keeps the spelling). All closed
-    with regression tests.
+    with regression tests. Round 2, design: PASS with should-fixes -- the
+    round-1 heuristics over-asked: ``find ... -exec wc`` on any ``plugins``
+    word, an archive/git verb and a ``.claude`` word in unrelated simple
+    commands, ``claude plugin install`` prose in ``gh --body``/``sed``/
+    heredocs, any ``cli.js``, ``$HOME/bin/tool``, ``src/claude/plugins/``;
+    an inert mis-cased ``EnabledPlugins`` renamed to the real key passed
+    (fingerprints now keep every key's spelling); the ``ClaudeCode`` 8.3
+    form; agent_rules monitor-mode double recording. Narrowed as described
+    above, with negative and positive regression tests and an odd-argument
+    fuzz test.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -16481,7 +16507,9 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
         found = _cplug_new_unsafe(ev, p, kind)
         if not found:
             return None
-        if kind == "tree" and rule_agent_rules_protect(ev, policy) is not None:
+        ar_mode = str((getattr(policy, "agent_rules", None) or {}).get("mode", "ask")).lower()
+        if kind == "tree" and ar_mode not in ("monitor", "off", "false") \
+                and rule_agent_rules_protect(ev, policy) is not None:
             # A rules file inside the tree: agent_rules (deny-capable)
             # judges it, so this ASK never masks its DENY (QA round 1).
             return None

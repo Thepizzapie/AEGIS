@@ -11004,8 +11004,6 @@ CLAUDE_PLUGIN_SETTINGS_PATH_RE = re.compile(
     r"|(?:etc" + _SEP + r"claude-code|Application Support" + _SEP + r"ClaudeCode"
     r"|ProgramData" + _SEP + r"ClaudeCode)" + _SEP + r"managed-settings\.json)" + _CPLUG_END,
     re.IGNORECASE)
-# Keys whose ADDITION is gated (compared case-insensitively: conservative).
-CLAUDE_PLUGIN_KEYS = ("disableallhooks", "enabledplugins", "extraknownmarketplaces")
 _CPLUG_KEY_TEXT_RE = re.compile(r"disable\W{0,8}all\W{0,8}hooks|enabled\W{0,8}plugins"
                                 r"|extra\W{0,8}known\W{0,8}marketplaces", re.IGNORECASE)
 _CPLUG_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
@@ -11018,11 +11016,11 @@ def _cplug_short_names(text: str) -> str:
     long-name patterns see them (QA round 1)."""
     if "~" not in text:
         return text
-    t = re.sub(r"(?i)(?<![\w.])CLAUDE~\d+(?=[/\\\s'\"]|$)", ".claude", text)
+    t = re.sub(r"(?i)(?<![\w.])CLAUDE~\d+(?=[/\\](?:MANAGE~|managed-settings))", "ClaudeCode", text)
+    t = re.sub(r"(?i)(?<![\w.])CLAUDE~\d+(?=[/\\\s'\"]|$)", ".claude", t)
     t = re.sub(r"(?i)(?<![\w.])PLUGIN~\d+(?=[/\\\s'\"]|$)", "plugins", t)
     t = re.sub(r"(?i)(?<![\w.])SETTIN~\d+\.JSO[N]?(?=[/\\\s'\"]|$)", "settings.local.json", t)
     t = re.sub(r"(?i)(?<![\w.])MANAGE~\d+\.JSO[N]?(?=[/\\\s'\"]|$)", "managed-settings.json", t)
-    t = re.sub(r"(?i)(?<![\w.])CLAUDE~\d+(?=[/\\])", "claude-code", t)
     return t
 
 
@@ -11193,18 +11191,89 @@ def claude_plugin_shell_kind(cmd) -> str:
             return "settings"
         if _CPLUG_TREE_WRITER_RE.search(cflat, m.end(), end):
             return "tree"
-    if canon and any(w.rstrip("/").endswith(".claude") for w in canon) \
-            and _CPLUG_TREE_WRITER_RE.search(flat):
-        return "tree"
-    # Whole-tree writers aimed at the config dir itself (QA r1).
-    if _CPLUG_DIR_WORD_RE.search(flat) and _CPLUG_TREE_WRITER_RE.search(flat):
-        return "tree"
-    # `find ... -exec` selecting a gated name (QA r1).
-    if _CPLUG_FIND_RE.search(flat) and _CPLUG_FIND_ACTION_RE.search(flat):
-        if re.search(r"settings\.local|managed-settings", flat, re.IGNORECASE):
-            return "settings"
-        if re.search(r"plugins|hooks\.json|\.claude", flat, re.IGNORECASE):
+    for seg in _HTTP_RC_SEG_SPLIT_RE.split(cflat):
+        if not seg:
+            continue
+        # Whole-tree writer whose DESTINATION is the config dir (QA r1/r2).
+        if _cplug_tree_writer_into_config(seg):
             return "tree"
+        # `find ... -exec <writer>` selecting a gated name (QA r1/r2).
+        k = _cplug_find_kind(seg)
+        if k:
+            return k
+    return ""
+
+
+_CPLUG_HOME_DIR_RE = re.compile(
+    r"(?:~[\w.-]*|\$\{?HOME\}?|\$env:USERPROFILE|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+"
+    r"|[A-Za-z]:[/\\]+Users[/\\]+[^/\\\s]+)[/\\]+\.claude" + _WIN_TRIM + r"[/\\]?$"
+    r"|^\$\{?CLAUDE_CONFIG_DIR\}?[/\\]?$", re.IGNORECASE)
+_CPLUG_READ_EXEC_VERBS = frozenset(("grep", "egrep", "fgrep", "rg", "wc", "cat", "head", "tail",
+                                    "ls", "stat", "file", "md5sum", "sha256sum", "sha1sum", "du",
+                                    "jq", "less", "more", "echo", "printf", "basename", "dirname",
+                                    "realpath", "readlink", "test", "["))
+
+
+def _cplug_is_cfg_dir(w: str) -> bool:
+    w = w.strip("'\"")
+    if re.search(r"(?:^|[/\\])(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)" + _WIN_TRIM + r"[/\\]?$",
+                 w, re.IGNORECASE) is None:
+        return False
+    return True
+
+
+def _cplug_tree_writer_into_config(seg: str) -> bool:
+    """tar/bsdtar -x -C D, unzip -d D, 7z x -oD, rsync ... D, patch -d D,
+    `git -C D apply|am|checkout|restore`, cpio/ditto into D -- with D the
+    Claude config dir (home-level for git, whose project `.claude/` holds
+    no plugin tree)."""
+    words = seg.split()
+    if not words or not _CPLUG_TREE_WRITER_RE.search(seg):
+        return False
+    i = 0
+    while i < len(words) and (words[i].lower() in _HTTP_RC_PREFIX_WORDS or _HTTP_RC_ASSIGN_RE.match(words[i])):
+        i += 1
+    if i >= len(words):
+        return False
+    verb = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    args = words[i + 1:]
+    cfg_idx = [j for j, w in enumerate(args) if _cplug_is_cfg_dir(w.split("=", 1)[-1])
+               or (w.startswith("-o") and _cplug_is_cfg_dir(w[2:]))]
+    if not cfg_idx:
+        return False
+    if verb in ("tar", "bsdtar", "gtar"):
+        first = args[0] if args else ""
+        return bool(re.match(r"^-?[A-Za-z]*x", first) or "--extract" in args or "-x" in args
+                    or any(re.match(r"^-[A-Za-wyz]*x", a) for a in args if a.startswith("-") and not a.startswith("--")))
+    if verb == "unzip":
+        return not any(a in ("-l", "-t", "-v", "-Z", "-p", "-c") for a in args)
+    if verb in ("7z", "7za", "7zr"):
+        return bool(args) and args[0].lower() in ("x", "e")
+    if verb == "rsync":
+        pos = [j for j, a in enumerate(args) if not a.startswith("-")]
+        return bool(pos) and pos[-1] in cfg_idx
+    if verb == "git":
+        if not any(_CPLUG_HOME_DIR_RE.search(args[j].strip("'\"")) for j in cfg_idx):
+            return False
+        return bool(re.search(r"\b(?:apply|am|checkout|restore|clone|pull|merge|reset|switch|stash)\b", seg))
+    if verb in ("patch", "cpio", "ditto", "unar", "pax", "expand-archive"):
+        return True
+    return False
+
+
+def _cplug_find_kind(seg: str) -> str:
+    if not _CPLUG_FIND_RE.search(seg) or not _CPLUG_FIND_ACTION_RE.search(seg):
+        return ""
+    # A read-only action verb (`-exec grep/wc/cat ...`) only reads.
+    acts = re.findall(r"-(?:exec|execdir|ok|okdir)\s+(\S+)", seg)
+    if acts and all(a.strip("'\"").rsplit("/", 1)[-1].lower() in _CPLUG_READ_EXEC_VERBS for a in acts) \
+            and not re.search(r"-(?:delete|fprint0?|fprintf|fls)\b", seg):
+        return ""
+    if re.search(r"settings\.local|managed-settings", seg, re.IGNORECASE):
+        return "settings"
+    if re.search(r"\.claude|known_marketplaces|installed_plugins", seg, re.IGNORECASE) or (
+            re.search(r"plugins", seg, re.IGNORECASE) and re.search(r"hooks\.json|hooks/", seg, re.IGNORECASE)):
+        return "tree"
     return ""
 
 
@@ -11267,15 +11336,20 @@ def claude_plugin_fragment_hit(text) -> bool:
 # Token-based (shlex): a prompt string such as `claude -p 'fix the plugin
 # install docs'` stays one token and never counts (QA round 1).
 _CPLUG_CLAUDE_TOKEN_RE = re.compile(
-    r"(?:^|[/\\])(?:claude(?:\.exe|\.cmd|\.ps1)?|claude-code(?:@\S*)?|cli\.(?:m?js))$"
-    r"|@anthropic-ai[/\\]claude-code", re.IGNORECASE)
+    r"(?:^|[/\\])(?:claude(?:\.exe|\.cmd|\.ps1)?|claude-code(?:@\S*)?)$"
+    r"|@anthropic-ai[/\\]claude-code|claude-code[/\\](?:[^\s]*[/\\])?cli\.m?js$", re.IGNORECASE)
 _CPLUG_PLUGIN_SUBS = frozenset(("install", "i", "add", "enable", "update", "upgrade"))
 _CPLUG_MKT_SUBS = frozenset(("add", "update", "install", "upgrade"))
 # Fallback over quote-stripped text, for list-form spawns (`['claude',
 # 'plugin','install',...]`) and words the tokenizer can't see.
 _CPLUG_ADJ_RE = re.compile(
-    r"claude(?:-code)?\W{1,8}plugins?\W{1,8}(?:install|i|add|enable|update|upgrade"
-    r"|marketplaces?\W{1,8}(?:add|update|install))\b", re.IGNORECASE)
+    r"(?<![\w/.-])claude(?:-code)?[^\w/]{1,8}plugins?[^\w/]{1,8}(?:install|i|add|enable|update|upgrade"
+    r"|marketplaces?[^\w/]{1,8}(?:add|update|install))\b", re.IGNORECASE)
+_CPLUG_INTERP_VERBS = frozenset(("python", "python2", "python3", "py", "node", "nodejs", "deno",
+                                 "bun", "perl", "ruby", "php", "sh", "bash", "zsh", "dash", "ksh",
+                                 "fish", "pwsh", "powershell", "cmd", "osascript", "tclsh", "lua",
+                                 "awk", "gawk", "eval", "exec", "xargs", "env", "sudo", "nohup",
+                                 "timeout", "watch", "parallel", "su", "doas", "runuser", "script"))
 _CPLUG_EXEC_SINK_RE = re.compile(
     r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k|fi|c|tc)?sh\b|\|\s*(?:\S*/)?(?:python\d*|node|perl|ruby|php)\b"
     r"|\beval\b|\bxargs\b|\bsource\b|(?:^|[\s;&|])\.\s|<\(|>\(", re.IGNORECASE)
@@ -11296,7 +11370,11 @@ def _cplug_tokens(cmd: str):
 
 
 def _cplug_dynamic(t: str) -> bool:
-    return any(c in t for c in "$`") or t.startswith(("<(", "$("))
+    """A word whose value is computed: `$x`, `${x}`, `$(...)`, backticks --
+    but not `$HOME/bin/tool` (a fixed tool under a variable dir)."""
+    if "`" in t or "$(" in t or t.startswith("<("):
+        return True
+    return bool(re.fullmatch(r"\$\{?[\w:#%@*?!-]*\}?|\$\{[^}]*\}", t))
 
 
 def _cplug_settings_value_safe(v: str) -> bool:
@@ -11365,6 +11443,37 @@ def _cplug_cli_tokens_hit(toks: list) -> bool:
     return False
 
 
+_CPLUG_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w-]{0,40})\1")
+
+
+def _cplug_drop_text_heredocs(cmd: str) -> str:
+    """Remove heredoc bodies whose command is not an interpreter (`cat >
+    docs.md <<'E' ... E`): the body is file text, not commands (QA r2)."""
+    if "<<" not in cmd or len(cmd) > 400_000:
+        return cmd
+    out, pos = [], 0
+    for _ in range(200):
+        m = _CPLUG_HEREDOC_RE.search(cmd, pos)
+        if not m:
+            break
+        line_start = max(cmd.rfind("\n", 0, m.start()), max(cmd.rfind(c, 0, m.start()) for c in ";|&")) + 1
+        words = cmd[line_start:m.start()].split()
+        verb = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower() if words else ""
+        body_start = cmd.find("\n", m.end())
+        if body_start < 0:
+            break
+        end = re.compile(r"^[ \t]*" + re.escape(m.group(2)) + r"[ \t]*$", re.MULTILINE).search(cmd, body_start + 1)
+        if not end:
+            break
+        if verb in _CPLUG_INTERP_VERBS or verb.startswith("python") or not verb:
+            out.append(cmd[pos:end.end()])
+        else:
+            out.append(cmd[pos:body_start + 1])
+        pos = end.end()
+    out.append(cmd[pos:])
+    return "".join(out)
+
+
 def claude_plugin_cli_hit(cmd) -> bool:
     """A `claude plugin install|i|enable|update|marketplace add|update` (any
     flags between, a non-literal subcommand fails closed), `claude
@@ -11382,6 +11491,7 @@ def claude_plugin_cli_hit(cmd) -> bool:
         return False
     if len(cmd) > 400_000:
         return True
+    cmd = _cplug_drop_text_heredocs(cmd)
     sink = bool(_CPLUG_EXEC_SINK_RE.search(cmd))
     stripped = cmd.replace("\\", "").replace("'", "").replace('"', "")
     toks = _cplug_tokens(cmd)
@@ -11405,10 +11515,14 @@ def claude_plugin_cli_hit(cmd) -> bool:
                 pass
             else:
                 kept.extend(cur + [";"])
-                if _CPLUG_CLAUDE_TOKEN_RE.search(cur[0]):
-                    adj_parts.extend(x for x in cur if not re.search(r"\s", x))
-                else:
-                    adj_parts.extend(cur)
+                # Prose in a multi-word token (a PR body, a sed script, a
+                # prompt) is not an invocation; only an interpreter's code
+                # argument is judged whole (QA round 2).
+                interp = (sink or verb in _CPLUG_INTERP_VERBS or verb.startswith("python")
+                          # `git -c alias.x='!sh code'` runs its value (QA r1)
+                          or (verb == "git" and ("-c" in cur or "!" in joined))
+                          or "-exec" in cur or "-execdir" in cur)
+                adj_parts.extend(x for x in cur if interp or not re.search(r"\s", x))
         adj_parts.append(t)
         cur = []
     if _CPLUG_ADJ_RE.search(" ".join(adj_parts)):
@@ -11489,20 +11603,20 @@ def claude_plugin_unsafe_entries(text) -> list:
                     if pv is False or pv is None:
                         continue
                     out.append((f"enabledPlugins[{str(pk)[:60]}]",
-                                _mise_fp("cplug-enable", str(pk), _cplug_canon(pv))))
+                                _mise_fp("cplug-enable", str(k), str(pk), _cplug_canon(pv))))
             elif isinstance(v, list):
                 for pk in v:
                     out.append((f"enabledPlugins[{str(pk)[:60]}]",
-                                _mise_fp("cplug-enable", _cplug_canon(pk), "true")))
+                                _mise_fp("cplug-enable", str(k), _cplug_canon(pk), "true")))
             elif v is not None and v is not False:
                 out.append(("enabledPlugins (non-object value)",
-                            _mise_fp("cplug-enable-raw", _cplug_canon(v))))
+                            _mise_fp("cplug-enable-raw", str(k), _cplug_canon(v))))
         elif lk == "extraknownmarketplaces":
             if isinstance(v, dict):
                 for mk, mv in v.items():
                     out.append((f"extraKnownMarketplaces[{str(mk)[:60]}]",
-                                _mise_fp("cplug-mkt", str(mk), _cplug_canon(mv))))
+                                _mise_fp("cplug-mkt", str(k), str(mk), _cplug_canon(mv))))
             elif v is not None:
                 out.append(("extraKnownMarketplaces (non-object value)",
-                            _mise_fp("cplug-mkt-raw", _cplug_canon(v))))
+                            _mise_fp("cplug-mkt-raw", str(k), _cplug_canon(v))))
     return out
