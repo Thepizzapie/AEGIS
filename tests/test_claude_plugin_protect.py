@@ -299,3 +299,198 @@ def test_loader_wires_knob(tmp_path):
 def test_self_protect_still_denies_settings_json():
     d = evaluate(_write("/r/.claude/settings.json", {"enabledPlugins": {"a@b": True}}), EMPTY)
     assert d.action == Action.DENY and d.rule == "self-protect"
+
+
+# ---- QA round 1 regressions ------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "git commit -m 'docs: explain claude plugin install flow'",
+    "grep -rn 'claude plugin install' docs/",
+    "rg -n 'claude --plugin-dir' README.md",
+    "echo claude plugin install x@m",
+    "cd /r/.claude-tools && pytest tests/plugins",
+    "cd ~/.claudette && make plugins",
+    "cd ~/.claude && cd ~/proj && npm run build --prefix plugins",
+    "find ~/.claude/plugins -name hooks.json",
+    "cat ~/.claude/plugins/installed_plugins.json | jq .",
+    "jq .enabledPlugins .claude/settings.local.json",
+    "claude --settings '{\"model\":\"x\"}' -p hi",
+])
+def test_r1_not_gated(cmd):
+    assert rule_claude_plugin_protect(_shell(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'claude plugin install x@m' | sh",
+    "echo claude plugin install x@m | bash",
+    "git commit -m x && claude plugin install a@b",
+    "git -c alias.x='!claude plugin install a@b' x",
+    "claude --settings '{\"disableAllHooks\":true}' -p hi",
+    "claude --settings='{\"enabledPlugins\":{\"x@m\":true}}'",
+    "claude --settings ./child.json -p hi",
+    "claude --setting-sources project -p hi",
+    "find ~/.claude/plugins -name '*.sh' -exec sed -i s/a/b/ {} +",
+    "jq . x > ~/.claude/plugins/known_marketplaces.json",
+])
+def test_r1_gated(cmd):
+    assert _ours(rule_claude_plugin_protect(_shell(cmd), EMPTY)), cmd
+
+
+def test_r1_shell_cwd_in_plugin_tree():
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                    args={"command": "echo '{}' > hooks/hooks.json"},
+                    cwd="/home/u/.claude/plugins/cache/p/1")
+    assert _ours(rule_claude_plugin_protect(ev, EMPTY))
+    ev2 = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                     args={"command": "cp x plugins/cache/p/h.json"}, cwd="/home/u/.claude")
+    assert _ours(rule_claude_plugin_protect(ev2, EMPTY))
+    ev3 = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                     args={"command": "cat hooks/hooks.json"}, cwd="/home/u/.claude/plugins/cache/p/1")
+    assert rule_claude_plugin_protect(ev3, EMPTY) is None
+
+
+def test_r1_agent_rules_deny_not_preempted():
+    ev = _write("/home/u/.claude/plugins/cache/p/1/.cursorrules", "x")
+    d = evaluate(ev, Policy(agent_rules={"mode": "deny"}))
+    assert d.action == Action.DENY and d.rule != RULE
+
+
+def test_r1_managed_settings_only_real_locations():
+    assert patterns.claude_plugin_kind("/r/tests/fixtures/managed-settings.json") == ""
+    assert patterns.claude_plugin_kind("/Library/Application Support/ClaudeCode/managed-settings.json") == "settings"
+    assert patterns.claude_plugin_kind("C:\\ProgramData\\ClaudeCode\\managed-settings.json") == "settings"
+
+
+def test_r1_monitor_records(monkeypatch):
+    seen = []
+    import aegis.rules as R
+    monkeypatch.setattr(R, "_record_monitor", lambda ev, would, note="": seen.append((would.rule, note)))
+    assert rule_claude_plugin_protect(_write(LOCAL, {"disableAllHooks": True}),
+                                      Policy(claude_plugin={"mode": "monitor"})) is None
+    assert seen and seen[0][0] == RULE
+
+
+def test_r1_deny_mode_mcp_write():
+    d = rule_claude_plugin_protect(_mcp({"path": "/home/u/.claude/plugins/x.json", "content": "{}"}),
+                                   Policy(claude_plugin={"mode": "deny"}))
+    assert d.action == Action.DENY
+
+
+def test_r1_plugin_source_repo_not_gated():
+    for p in ("/r/myplugin/hooks/hooks.json", "/r/.claude-plugin/plugin.json",
+              "/r/.claude-tools/plugins/x"):
+        assert rule_claude_plugin_protect(_write(p, "{}"), EMPTY) is None, p
+
+
+def test_r1_shell_project_settings_json_still_self_protect():
+    d = evaluate(_shell("echo '{\"disableAllHooks\":true}' > .claude/settings.json"), EMPTY)
+    assert d.action == Action.DENY and d.rule == "self-protect"
+
+
+# ---- QA round 1 (bypass review) regressions -----------------------------------
+def _sh(cmd, cwd=None):
+    return Event.make(HookEvent.PRE_TOOL_USE, tool="Bash", args={"command": cmd}, cwd=cwd)
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("echo '{\"disableAllHooks\": true}' > settings.local.json", "/r/.claude"),
+    ("echo x > cache/m/p/1/hooks/hooks.json", "/home/u/.claude/plugins"),
+    ("echo x > plugins/cache/p/hooks/hooks.json", "/home/u/.claude"),
+])
+def test_b1_cwd(cmd, cwd):
+    assert evaluate(_sh(cmd, cwd), EMPTY).action != Action.ALLOW
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo '{\"disableAllHooks\":true}' | tee .cl*/settings.local.json",
+    "echo '{\"disableAllHooks\":true}' | tee {.claude,/tmp}/settings.local.json",
+    "echo '{\"disableAllHooks\":true}' > .{claude,x}/settings.local.json",
+    "cd .cl* && echo '{\"disableAllHooks\": true}' > settings.local.json",
+    "cp /tmp/evil.json .c[l]aude/settings.local.json",
+    "cp /tmp/a ./.c*/s*.local.json",
+    "echo '{\"disableAllHooks\":true}' > /etc/claude-code/manag*.json",
+    "echo '{\"disableAllHooks\":true}' > /etc/claude-code/managed-settings.js*",
+    "claude --model sonnet --fallback-model opus --permission-mode default --verbose --debug plugin install evil@m",
+    "claude --model a --b c --d e --f g --verbose plugin marketplace add evil/repo",
+    "claude -d -d -d -d -d -d -d plugin install x@m",
+    "claude plugin $(echo install) x@m",
+    "claude plugin `echo install` x@m",
+    "claude plugin ${X:-install} x@m",
+    "s=install; claude plugin $s x@m",
+    "c=claude; $c plugin install x@m",
+    "$(which claude) plugin install x@m",
+    "echo install x@m | xargs claude plugin",
+    "python3 -c \"import subprocess;subprocess.run(['claude','plugin','install','x@m'])\"",
+    "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js plugin install x@m",
+    "unzip -o /tmp/x.zip -d ~/.claude",
+    "tar xf /tmp/x.tar -C ~/.claude",
+    "rsync -a /tmp/evil/ ~/.claude/",
+    "git -C ~/.claude apply /tmp/x.patch",
+    "patch -d ~/.claude -p1 < /tmp/x.patch",
+    "patch -p1 -d .claude < /tmp/x.patch",
+    "find . -name settings.local.json -exec sed -i 's/\"disableAllHooks\": false/\"disableAllHooks\": true/' {} +",
+    "find ~ -path '*plugins/cache*' -name hooks.json -exec cp /tmp/evil {} \;",
+    "claude plugin --scope project install x@m",
+    "claude plugin marketplace --scope user add e/r",
+    "claude config set disableAllHooks true",
+    "claude config add enabledPlugins x@m",
+    "echo '{\"disableAllHooks\":true}' > /etc/claude-code/managed-settings.d/x.json",
+])
+def test_b_shell_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+@pytest.mark.parametrize("args,tool", [
+    ({"path": "/r/.claude/settings.local.json", "content": "eyJkaXNhYmxlQWxsSG9va3MiOiB0cnVlfQ==",
+      "encoding": "base64"}, "mcp__fs__write"),
+    ({"path": "/r/.claude/settings.local.json", "content": "7b7d", "encoding": "hex"}, "mcp__fs__write"),
+    ({"path": "/r/.claude/settings.local.json", "content_base64": "eyJ9"}, "mcp__fs__write"),
+    ({"archive": "/tmp/x.zip", "dest": "/root/.claude"}, "mcp__fs__extract"),
+])
+def test_b_mcp_gated(args, tool):
+    assert evaluate(_mcp(args, tool=tool), EMPTY).action != Action.ALLOW
+
+
+@pytest.mark.parametrize("p", [
+    "C:\\r\\CLAUDE~1\\SETTIN~1.JSO", "C:\\r\\CLAUDE~1\\plugins\\x", "C:\\u\\CLAUDE~1\\PLUGIN~1\\x",
+])
+def test_b_short_names(p):
+    assert patterns.claude_plugin_kind(p)
+    assert evaluate(_write(p, '{"disableAllHooks": true}'), EMPTY).action != Action.ALLOW
+
+
+def test_b_curly_quote_fragment():
+    assert patterns.claude_plugin_fragment_hit("\u201cdisableAllHooks\u201d: true")
+
+
+def test_b_inert_uppercase_key_does_not_cancel(tmp_path):
+    d = tmp_path / ".claude"
+    d.mkdir()
+    f = d / "settings.local.json"
+    f.write_text('{"DISABLEALLHOOKS": true, "model": "a"}')
+    ev = _edit(str(f), '"model": "a"', '"model": "a", "disableAllHooks": true')
+    assert _ours(rule_claude_plugin_protect(ev, EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "claude -p 'fix the plugin install script'",
+    "claude -p \"explain claude plugin install\"",
+    "cd ~/.claude && ls",
+    "tar xf x.tar -C build",
+    "find . -name '*.py' -exec grep -l foo {} +",
+])
+def test_b_still_allowed(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("s", [
+    "cd .claude " * 36000,
+    ("cd a/.claude/" + "x" * 290 + " ") * 1287,
+    "claude plugin " * 28000,
+    "{a,b}" * 50000,
+    ".c*/" * 90000,
+])
+def test_b_perf(s):
+    import time
+    t = time.time()
+    rule_claude_plugin_protect(_sh(s), EMPTY)
+    assert time.time() - t < 2.0

@@ -16158,6 +16158,60 @@ def _cplug_path_shaped(v) -> bool:
     return bool(patterns.claude_plugin_kind(t))
 
 
+_CPLUG_TREE_TOOL_WORDS = frozenset(("extract", "unzip", "untar", "unpack", "decompress",
+                                    "sync", "rsync", "copy", "cp", "move", "mv", "apply",
+                                    "patch", "clone", "checkout", "restore", "upload"))
+_CPLUG_ENCODING_KEY_RE = re.compile(r"base64|b64|hex|encod|binary|bytes|blob|compress|gzip",
+                                    re.IGNORECASE)
+
+
+def _cplug_encoded_mcp(a) -> bool:
+    """An MCP write whose content is (or may be) encoded: base64/hex keys or
+    an `encoding` other than utf-8/text -- the decoded bytes are what land
+    on disk, so the JSON check cannot see them (QA round 1)."""
+    if not isinstance(a, dict):
+        return False
+    for k, v in a.items():
+        if not _CPLUG_ENCODING_KEY_RE.search(str(k)):
+            continue
+        if isinstance(v, str) and v.strip().lower() in ("utf-8", "utf8", "text", "plain", "utf_8", ""):
+            continue
+        if v is False or v is None:
+            continue
+        return True
+    return False
+
+
+def _cplug_cli_surfaces(cmd: str, _depth: int = 0) -> list:
+    """`cmd` plus its decoded inner commands (bash -c / base64 / PowerShell
+    -enc bodies), WITHOUT `scan_surface`'s quote-stripped copy: for the CLI
+    check a quoted prompt (`claude -p 'explain plugin install'`) must stay
+    one token (QA round 1); shlex already joins quote-split words."""
+    if not cmd or _depth > 3:
+        return [cmd or ""]
+    cmd = str(cmd)[:normalize._MAX]
+    cmd = normalize._LINE_CONT_RE.sub(" ", cmd)
+    out = [cmd]
+    ansic = normalize._ANSIC_MARKER_RE.sub("", normalize._decode_ansic(cmd))
+    if ansic != cmd:
+        out.append(ansic)
+    for m in normalize._PS_ENC_RE.finditer(cmd):
+        dec = normalize._b64(m.group(1), utf16=True) or normalize._b64(m.group(1))
+        if dec:
+            out.extend(_cplug_cli_surfaces(dec, _depth + 1))
+    if normalize._B64_DECODE_HINT.search(cmd):
+        for tok in normalize._B64_TOKEN_RE.findall(cmd):
+            dec = normalize._b64(tok)
+            if dec:
+                out.extend(_cplug_cli_surfaces(dec, _depth + 1))
+    for rx in normalize._INTERP_RES:
+        for m in rx.finditer(cmd):
+            inner = m.group(m.lastindex)
+            if inner:
+                out.extend(_cplug_cli_surfaces(inner, _depth + 1))
+    return out[:200]
+
+
 def _cplug_target(ev: Event, p: str) -> tuple:
     """(kind, path) a write targets; kind '' if none. For MCP calls the path
     may sit under any key, be a patch header, or be a mapping key."""
@@ -16181,6 +16235,15 @@ def _cplug_target(ev: Event, p: str) -> tuple:
     for s_ in flat[:5000]:
         if _cplug_path_shaped(s_):
             return patterns.claude_plugin_kind(s_.strip()), s_.strip()
+    # An extract/sync/copy whose DESTINATION is the config dir itself writes
+    # whatever the archive holds into the plugin tree (QA round 1).
+    if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _CPLUG_TREE_TOOL_WORDS \
+            and not _http_rc_mcp_read_only(ev):
+        for s_ in flat[:5000]:
+            t = s_.strip().replace("\\", "/").rstrip("/ .")
+            if "\n" not in t and len(t) < 4096 and re.search(
+                    r"(?:^|/)(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)$", t, re.IGNORECASE):
+                return "tree", s_.strip()
     for s_ in flat[:5000]:
         if patterns.claude_plugin_patch_hit(s_):
             return "patch", "<patch>"
@@ -16208,6 +16271,8 @@ def _cplug_new_unsafe(ev: Event, p: str, kind: str) -> list:
     if ev.action == ActionClass.MCP:
         if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
             return ["<copied/moved from another file>"]
+        if _cplug_encoded_mcp(a):
+            return ["<encoded (base64/hex/binary) content>"]
         for k in _HTTP_RC_NON_CONTENT_KEYS:
             v = a.get(k)
             if isinstance(v, str) and v.strip() and v.strip() != p \
@@ -16315,17 +16380,61 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     Escapable only by a human: a trailing ``# aegis-allow`` on the shell
     form, or ``AEGIS_ALLOW_CLAUDE_PLUGIN=1`` set before launch.
 
-    Honest scope: a plugin/marketplace DELIVERED by ``git clone`` of a repo
-    whose committed ``.claude/settings.json`` names it (no tool call writes
-    it; Claude Code's own trust prompt is the control there); the in-session
-    ``/plugin`` slash command (not a tool call); the contents of a plugin's
-    SOURCE repo or a local marketplace directory outside the plugin tree
-    (``.claude-plugin/``) before it is installed -- the install step is the
-    gate; a relocated config dir not spelled ``.claude`` or
-    ``$CLAUDE_CONFIG_DIR``; paths assembled indirectly. Accepted false ASKs:
-    any non-read shell command naming the plugin tree or settings.local.json
-    (``cp ~/.claude/settings.local.json /tmp``), and a ``claude ...`` command
-    line whose prompt text happens to contain ``plugin install``.
+    Also gated on the CLI (``claude_plugin_cli_hit``, token-based so a
+    quoted prompt is one token): ``claude --settings <file or JSON adding a
+    gated entry>``, ``--setting-sources``, ``claude config set|add <gated
+    key>``, any flags between ``plugin`` and its subcommand, a non-literal
+    subcommand (``$s``/``$(...)``) failing closed, and ``$c``/``$(which
+    claude)``/``node .../cli.js``/``npx @anthropic-ai/claude-code``/``xargs
+    claude plugin``/list-form spawns. A shell write is also caught through a
+    glob/brace word (canonicalized), Windows 8.3 short names, the event
+    ``cwd`` (Claude Code keeps the shell's cwd between calls), an archive/
+    rsync/patch/``git apply`` aimed at the config dir itself, and ``find ...
+    -exec`` selecting a gated name. MCP writes with base64/hex/binary
+    content, and MCP extract/sync tools whose destination is the config dir,
+    fail closed. A rules file inside the plugin tree is left to
+    ``rule_agent_rules_protect`` (which must stay the last core rule), so
+    this ASK never masks its deny-mode DENY. Most literal shell writes to
+    ``.claude/...`` are already ``rule_self_protect``'s DENY; this rule's
+    shell branch is the backstop for spellings that never write ``.claude``
+    literally -- do not rely on self-protect for those.
+
+    Honest scope: ``disableAllHooks`` in a local file does not disable
+    managed-settings hooks, so "Aegis included" holds when Aegis is
+    installed in user/project settings; a plugin/marketplace DELIVERED by
+    ``git clone`` of a repo whose committed ``.claude/settings.json`` names
+    it (Claude Code's own trust prompt is the control there); the in-session
+    ``/plugin`` slash command (not a tool call); a plugin's SOURCE repo or a
+    local marketplace directory outside the plugin tree (``.claude-plugin/``)
+    before it is installed -- the install step is the gate; a relocated
+    config dir not spelled ``.claude``/``$CLAUDE_CONFIG_DIR``; paths or
+    arguments assembled indirectly (``d=.claude; ... $d/...``, ``xargs -a
+    argsfile claude``, ``"dis"+"ableAllHooks"`` split across string
+    literals in an interpreter); an Edit whose curly-quoted ``old_string``
+    Claude Code normalizes (the fragment check accepts curly quotes, the
+    replay does not); other command-running settings keys
+    (``fileSuggestion``) belong to their own guards. Accepted false ASKs:
+    any non-read shell command naming the plugin tree, or naming
+    settings.local.json with a gated key or a copy/decode/download verb;
+    a project-level ``.claude/plugins/`` path (Claude Code does not read
+    one); ``claude plugin update`` / ``marketplace update`` (routine, but
+    they pull new hook code); a settings.local.json body that does not
+    parse (e.g. a ``//`` comment) and names a gated key.
+
+    QA history (independent bypass and design reviews, run in parallel).
+    Round 1, design: PASS with should-fixes -- doc/commit-message/grep text
+    naming ``claude plugin install`` asked (now judged per simple command),
+    ``cd ~/.claude-tools`` matched (boundary added, later ``cd`` resets the
+    window), ``find``/``jq`` inspection asked (now reads), ordering vs.
+    agent_rules deny mode, ``--settings`` parity, shell ``cwd`` ignored,
+    ``managed-settings.json`` matched anywhere (now real locations plus
+    ``managed-settings.d/``). Round 1, bypass: FAIL -- cwd carried between
+    calls, glob/brace settings paths, >6 flags before ``plugin``,
+    non-literal subcommands, ``cli.js``, base64/hex MCP content, archive/
+    rsync/patch into ``~/.claude``, ``find -exec``, 8.3 short names, a
+    quadratic ``cd`` scan (now pos/endpos), and an inert ``DISABLEALLHOOKS``
+    cancelling a real one (fingerprint now keeps the spelling). All closed
+    with regression tests.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -16372,6 +16481,10 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
         found = _cplug_new_unsafe(ev, p, kind)
         if not found:
             return None
+        if kind == "tree" and rule_agent_rules_protect(ev, policy) is not None:
+            # A rules file inside the tree: agent_rules (deny-capable)
+            # judges it, so this ASK never masks its DENY (QA round 1).
+            return None
         if os.environ.get("AEGIS_ALLOW_CLAUDE_PLUGIN") or (
                 p != "<patch>" and _mise_allowed_path(cfg, p)):
             return None
@@ -16389,15 +16502,25 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     if _is_shell(ev):
         cmd = _shell_scan(ev)
         raw = _cmd(ev)
-        cli = patterns.claude_plugin_cli_hit(cmd) or patterns.claude_plugin_cli_hit(raw)
+        cli = any(patterns.claude_plugin_cli_hit(x) for x in _cplug_cli_surfaces(raw))
         if not cli:
             kind = patterns.claude_plugin_shell_kind(cmd) or patterns.claude_plugin_shell_kind(raw)
+            if not kind and ev.cwd and "\n" not in str(ev.cwd):
+                # The command runs FROM the plugin tree / `.claude` dir: a
+                # bare relative write lands there (QA round 1).
+                pre = "cd '" + str(ev.cwd).replace("'", "") + "' && "
+                ck = patterns.claude_plugin_kind(str(ev.cwd).rstrip("/\\") + "/")
+                kind = ck if ck == "tree" else (
+                    patterns.claude_plugin_shell_kind(pre + cmd)
+                    or patterns.claude_plugin_shell_kind(pre + raw))
             if not kind:
                 return None
-            if patterns.mise_shell_only_reads(cmd) and patterns.mise_shell_only_reads(raw):
+            if (patterns.claude_plugin_shell_only_reads(cmd)
+                    and patterns.claude_plugin_shell_only_reads(raw)):
                 return None
             if kind == "settings" and not (patterns.claude_plugin_settings_shell_write(cmd)
-                                           or patterns.claude_plugin_settings_shell_write(raw)):
+                                           or patterns.claude_plugin_settings_shell_write(raw)
+                                           or patterns.claude_plugin_settings_foreign_write(raw)):
                 return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PLUGIN")
                 or _mise_allowed_cmd(cfg, raw)):
@@ -16483,6 +16606,8 @@ _CORE_RULES = (
     rule_editor_startup_protect,
     rule_mise_exec_protect,
     rule_bunfig_exec_protect,
+    # Before agent_rules (which must stay last); it defers to agent_rules on
+    # a rules file inside the plugin tree (QA round 1).
     rule_claude_plugin_protect,
     rule_agent_rules_protect,
 )

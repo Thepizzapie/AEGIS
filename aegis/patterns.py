@@ -11001,13 +11001,29 @@ CLAUDE_PLUGIN_TREE_PATH_RE = re.compile(
     re.IGNORECASE)
 CLAUDE_PLUGIN_SETTINGS_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=:<>|&;(`{,])(?:" + _CPLUG_DIR + _SEP + r"settings\.local\.json"
-    r"|managed-settings\.json)" + _CPLUG_END,
+    r"|(?:etc" + _SEP + r"claude-code|Application Support" + _SEP + r"ClaudeCode"
+    r"|ProgramData" + _SEP + r"ClaudeCode)" + _SEP + r"managed-settings\.json)" + _CPLUG_END,
     re.IGNORECASE)
 # Keys whose ADDITION is gated (compared case-insensitively: conservative).
 CLAUDE_PLUGIN_KEYS = ("disableallhooks", "enabledplugins", "extraknownmarketplaces")
 _CPLUG_KEY_TEXT_RE = re.compile(r"disable\W{0,8}all\W{0,8}hooks|enabled\W{0,8}plugins"
                                 r"|extra\W{0,8}known\W{0,8}marketplaces", re.IGNORECASE)
 _CPLUG_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _cplug_short_names(text: str) -> str:
+    """Rewrite Windows 8.3 short names of the gated components to their long
+    spelling (`CLAUDE~1` -> `.claude`, `SETTIN~1.JSO` -> `settings.local.json`,
+    `PLUGIN~1` -> `plugins`, `MANAGE~1.JSO` -> `managed-settings.json`) so the
+    long-name patterns see them (QA round 1)."""
+    if "~" not in text:
+        return text
+    t = re.sub(r"(?i)(?<![\w.])CLAUDE~\d+(?=[/\\\s'\"]|$)", ".claude", text)
+    t = re.sub(r"(?i)(?<![\w.])PLUGIN~\d+(?=[/\\\s'\"]|$)", "plugins", t)
+    t = re.sub(r"(?i)(?<![\w.])SETTIN~\d+\.JSO[N]?(?=[/\\\s'\"]|$)", "settings.local.json", t)
+    t = re.sub(r"(?i)(?<![\w.])MANAGE~\d+\.JSO[N]?(?=[/\\\s'\"]|$)", "managed-settings.json", t)
+    t = re.sub(r"(?i)(?<![\w.])CLAUDE~\d+(?=[/\\])", "claude-code", t)
+    return t
 
 
 def _cplug_cands(path: str) -> list:
@@ -11019,7 +11035,11 @@ def _cplug_cands(path: str) -> list:
     except Exception:
         pass
     for c in list(cands):
-        cands.append(_ed_dotdot_normalize(c.replace("\\", "/")))
+        n = _ed_dotdot_normalize(c.replace("\\", "/"))
+        cands.append(n)
+        s8 = _cplug_short_names(n)
+        if s8 != n:
+            cands.append(s8)
     return cands
 
 
@@ -11035,42 +11055,87 @@ def claude_plugin_kind(path) -> str:
             pass
         if m and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?[/\\]?", c[m.end():]):
             return "settings"
+        if _CPLUG_MANAGED_D_RE.search(c):
+            return "settings"
     for c in cands:
         if CLAUDE_PLUGIN_TREE_PATH_RE.search(c):
             return "tree"
     return ""
 
 
-def _cplug_glob_hit(word: str) -> bool:
-    """A glob/brace word that could expand into the plugin tree
-    (`~/.claude/plug*`, `~/.cl?ude/{plugins,x}/m`, `~/.claude/*/cache`)."""
-    comps = [c for c in word.replace("\\", "/").split("/")]
-    budget = 0
-    for i, comp in enumerate(comps[:-1]):
-        nxt = comps[i + 1]
-        for a in _brace_expand(comp):
-            if not fnmatch.fnmatchcase(".claude", a.lower().rstrip(" .")):
-                continue
-            for b in _brace_expand(nxt):
-                budget += 1
-                if budget > 4000:
-                    return True
-                if fnmatch.fnmatchcase("plugins", b.lower().rstrip(" .")):
-                    return True
-    return False
+# Canonical component names a glob/brace component may stand for. A leading
+# `.` must be literal for a hidden name, as in bash/zsh without dotglob.
+_CPLUG_CANON = (".claude", "plugins", "settings.local.json", "managed-settings.json",
+                "claude-code", "ClaudeCode")
+
+
+def _cplug_canon_word(word: str, budget: list) -> list:
+    """Every canonical rewrite of a glob/brace `word`: each brace expansion,
+    with each component that could match a gated name replaced by it
+    (`.cl*/settings.local.json` -> `.claude/settings.local.json`,
+    `{.claude,/tmp}/s*.local.json` -> both expansions)."""
+    out = []
+    for cand in _brace_expand(word):
+        budget[0] += 1
+        if budget[0] > 4000:
+            return [".claude/plugins"]       # fail closed
+        comps = cand.replace("\\", "/").split("/")
+        new = []
+        for c in comps:
+            rep = c
+            if any(ch in c for ch in "*?["):
+                lc = c.lower().rstrip(" .") if not c.endswith(("*", "?")) else c.lower()
+                for name in _CPLUG_CANON:
+                    if name.startswith(".") and not lc.startswith("."):
+                        continue
+                    if fnmatch.fnmatchcase(name.lower(), lc):
+                        rep = name
+                        break
+            new.append(rep)
+        out.append("/".join(new))
+    return out
 
 
 _CPLUG_CD_RE = re.compile(
-    r"\b(?:cd|pushd|chdir|sl|set-location|push-location)\s+[\"']?"
+    r"\b(?:cd|pushd|chdir|sl|set-location|push-location)\s+(?:--?\s+)?[\"']?"
     r"(?:[^\s;&|\"'\n]{0,300}[/\\])?(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)" + _WIN_TRIM
-    + r"(?P<rest>[/\\][^\s;&|\"'\n]{0,300})?", re.IGNORECASE)
+    + r"(?=[/\\\s;&|\"')]|$)(?P<rest>[/\\][^\s;&|\"'\n]{0,300})?", re.IGNORECASE)
+# Any later directory change ends the window a `cd ~/.claude` opened (QA r1).
+_CPLUG_ANY_CD_RE = re.compile(r"\b(?:cd|pushd|popd|chdir|sl|set-location|push-location|pop-location)\b",
+                              re.IGNORECASE)
+_CPLUG_BARE_PLUGINS_RE = re.compile(r"(?:^|[\s'\"/=(,])plugins(?:[/\s;&|'\",)]|$)")
+_CPLUG_BARE_SETTINGS_RE = re.compile(r"(?:^|[\s'\"/=(,])settings\.local\.json", re.IGNORECASE)
+# The config dir itself (or its parent's write into it) as a TARGET of a
+# whole-tree writer: archive extraction, rsync, patch, `git apply`.
+_CPLUG_DIR_WORD_RE = re.compile(
+    r"(?:^|[\s'\"=])(?:[^\s'\";&|]{0,300}[/\\])?(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)"
+    + _WIN_TRIM + r"[/\\]?(?=[\s'\";&|)]|$)", re.IGNORECASE)
+_CPLUG_TREE_WRITER_RE = re.compile(
+    r"(?:^|[\s;&|(`/])(?:tar|bsdtar|gtar|unzip|7z|7za|7zr|cpio|rsync|patch|ditto|unar|pax"
+    r"|expand-archive|git\s+(?:[^\n;&|]{0,200}\s)?(?:apply|am|checkout|restore|archive)"
+    r"|git\s+-C)\b", re.IGNORECASE)
+_CPLUG_FIND_ACTION_RE = re.compile(r"(?:^|\s)-(?:exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)\b")
+_CPLUG_FIND_RE = re.compile(r"(?:^|[\s;&|(`/])find\b", re.IGNORECASE)
+_CPLUG_MANAGED_D_RE = re.compile(
+    r"(?:etc" + _SEP + r"claude-code|Application Support" + _SEP + r"ClaudeCode"
+    r"|ProgramData" + _SEP + r"ClaudeCode)" + _SEP + r"managed-settings\.d(?:[/\\]|$)", re.IGNORECASE)
+
+
+def _cplug_literal_kind(f: str) -> str:
+    if CLAUDE_PLUGIN_TREE_PATH_RE.search(f):
+        return "tree"
+    if CLAUDE_PLUGIN_SETTINGS_PATH_RE.search(f) or _CPLUG_MANAGED_D_RE.search(f):
+        return "settings"
+    return ""
 
 
 def claude_plugin_shell_kind(cmd) -> str:
     """'tree'/'settings' if a shell command names the plugin tree or a gated
-    settings file -- literally, via `\\`/quote splitting, `..`, a glob/brace
-    word, or a `cd ~/.claude` followed by a bare `plugins/...` or
-    `settings.local.json` -- else ''."""
+    settings file -- literally, via `\\`/quote splitting, `..`, 8.3 short
+    names, a glob/brace word, a `cd ~/.claude` followed by a bare
+    `plugins/...`/`settings.local.json`, an archive/rsync/patch whose target
+    is the config dir itself, or a `find ... -exec` selecting those names --
+    else ''."""
     if not isinstance(cmd, str) or not cmd:
         return ""
     if len(cmd) > 400_000:
@@ -11078,47 +11143,90 @@ def claude_plugin_shell_kind(cmd) -> str:
     unesc = cmd.replace("\\", "")
     forms = [cmd, unesc, unesc.replace("'", "").replace('"', "")]
     forms.append(_ed_dotdot_normalize(forms[-1]))
+    forms.append(_cplug_short_names(forms[-1]))
     for f in forms:
-        if CLAUDE_PLUGIN_TREE_PATH_RE.search(f):
-            return "tree"
-    for f in forms:
-        if CLAUDE_PLUGIN_SETTINGS_PATH_RE.search(f):
-            return "settings"
-    flat = forms[2]
+        k = _cplug_literal_kind(f)
+        if k:
+            return k
+    flat = forms[-1]
+    # Glob/brace words: canonicalize, then re-run the literal check (QA r1).
+    budget = [0]
+    canon = []
     for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(flat)):
         if i > 8000:
             return "tree"
         w = m.group(0)
-        if any(c in w for c in "*?[{") and _cplug_glob_hit(w):
+        if any(c in w for c in "*?[{"):
+            if len(w) > 2000:
+                return "tree"
+            canon.extend(_cplug_canon_word(w, budget))
+    if canon:
+        k = _cplug_literal_kind(" " + " ".join(canon) + " ")
+        if k:
+            return k
+        if any(_cplug_glob_hit(w) for w in canon):
             return "tree"
-    for m in _CPLUG_CD_RE.finditer(flat):
+    # `cd` windows, matched with pos/endpos (no tail copies: QA r1 found
+    # slicing per match quadratic). `cd .cl*` counts via the canon form.
+    cflat = flat
+    if canon:
+        b2 = [0]
+
+        def _sub(m):
+            w = m.group(0)
+            if not any(c in w for c in "*?[{"):
+                return w
+            alts = _cplug_canon_word(w, b2)
+            hit = [x for x in alts if ".claude" in x or "settings.local.json" in x]
+            return hit[0] if hit else w
+        cflat = _HTTP_RC_WORD_RE.sub(_sub, flat)
+    n = len(cflat)
+    for m in _CPLUG_CD_RE.finditer(cflat):
         rest = (m.group("rest") or "").replace("\\", "/").lower()
-        if rest.lstrip("/").startswith("plugins") or re.search(
-                r"(?:^|[\s'\"/=])plugins(?:[/\s;&|]|$)", flat[m.end():]):
+        if rest.lstrip("/").startswith("plugins"):
             return "tree"
-        if re.search(r"(?:^|[\s'\"/=])settings\.local\.json", flat[m.end():], re.IGNORECASE):
+        nxt = _CPLUG_ANY_CD_RE.search(cflat, m.end())
+        end = nxt.start() if nxt else n
+        if _CPLUG_BARE_PLUGINS_RE.search(cflat, m.end(), end):
+            return "tree"
+        if _CPLUG_BARE_SETTINGS_RE.search(cflat, m.end(), end):
             return "settings"
+        if _CPLUG_TREE_WRITER_RE.search(cflat, m.end(), end):
+            return "tree"
+    if canon and any(w.rstrip("/").endswith(".claude") for w in canon) \
+            and _CPLUG_TREE_WRITER_RE.search(flat):
+        return "tree"
+    # Whole-tree writers aimed at the config dir itself (QA r1).
+    if _CPLUG_DIR_WORD_RE.search(flat) and _CPLUG_TREE_WRITER_RE.search(flat):
+        return "tree"
+    # `find ... -exec` selecting a gated name (QA r1).
+    if _CPLUG_FIND_RE.search(flat) and _CPLUG_FIND_ACTION_RE.search(flat):
+        if re.search(r"settings\.local|managed-settings", flat, re.IGNORECASE):
+            return "settings"
+        if re.search(r"plugins|hooks\.json|\.claude", flat, re.IGNORECASE):
+            return "tree"
     return ""
 
 
-# `claude plugin(s) install|i|enable|update|marketplace add|update` and
-# `claude --plugin-dir`: the CLI writes the plugin tree / user settings
-# itself, so no tool call ever names a protected path.
-CLAUDE_PLUGIN_CLI_RE = re.compile(
-    r"(?:^|[\s;&|(`/\\'\"])(?:claude(?:\.exe|\.cmd)?|claude-code|@anthropic-ai[/\\]claude-code(?:@\S*)?)"
-    r"\s+(?:(?:-{1,2}[\w-]+(?:=\S*)?|[^\s;&|]+)\s+){0,6}?"
-    r"(?:plugins?\s+(?:-{1,2}[\w-]+(?:=\S*)?\s+){0,4}"
-    r"(?:install|i|add|enable|update|upgrade|marketplace\s+(?:-{1,2}[\w-]+(?:=\S*)?\s+){0,4}(?:add|update|install))\b"
-    r"|--plugin-dir\b)",
-    re.IGNORECASE)
-# A bare `--plugin-dir` anywhere on a claude command line.
-_CPLUG_PLUGIN_DIR_RE = re.compile(r"\bclaude\b[^\n;&|]{0,2000}--plugin-dir\b", re.IGNORECASE)
+def _cplug_glob_hit(word: str) -> bool:
+    """A (canonicalized) word whose components spell `.claude/plugins`."""
+    comps = word.replace("\\", "/").split("/")
+    for i in range(len(comps) - 1):
+        if comps[i].lower().rstrip(" .") == ".claude" and comps[i + 1].lower() == "plugins":
+            return True
+    return False
 
 
 # Shell signal for the settings file: a gated key named anywhere in the
 # command (`\uXXXX`-decoded, loosely spaced so `'disable'+'AllHooks'` still
 # matches). A `jq '.env' file` read or an interpreter edit of other keys stays
 # allowed, as in every sibling settings.local.json guard.
+_CPLUG_FOREIGN_CONTENT_RE = re.compile(
+    r"(?:^|[\s;&|(`/])(?:cp|mv|ln|install|rsync|dd|ditto|scp|copy|xcopy|robocopy|copy-item"
+    r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat)\b"
+    r"|(?:^|[\s;&|(`/])(?:cat|type|get-content|gc)\b[^\n;&|]*>|<\s*[^\s<]", re.IGNORECASE)
+
+
 def claude_plugin_settings_shell_write(cmd) -> bool:
     if not isinstance(cmd, str):
         return False
@@ -11126,8 +11234,17 @@ def claude_plugin_settings_shell_write(cmd) -> bool:
     return bool(_CPLUG_KEY_TEXT_RE.search(decoded) or _CPLUG_KEY_TEXT_RE.search(cmd))
 
 
+def claude_plugin_settings_foreign_write(cmd) -> bool:
+    """A shell write onto the settings file whose bytes come from another
+    file/stream (cp/mv/ln/curl/decode/`cat x >`): the key need not appear
+    in the command (QA round 1)."""
+    return isinstance(cmd, str) and bool(_CPLUG_FOREIGN_CONTENT_RE.search(
+        _HTTP_RC_HARMLESS_REDIR_RE.sub(" ", cmd)))
+
+
 _CPLUG_FRAG_KEY_RE = re.compile(
-    r"[\"'](?:disableAllHooks|enabledPlugins|extraKnownMarketplaces)[\"']\s*:\s*(?P<v>\S{0,6})",
+    r"[\"'“”‘’](?:disableAllHooks|enabledPlugins|extraKnownMarketplaces)"
+    r"[\"'“”‘’]\s*:\s*(?P<v>\S{0,6})",
     re.IGNORECASE)
 
 
@@ -11146,13 +11263,176 @@ def claude_plugin_fragment_hit(text) -> bool:
     return False
 
 
+# ---- CLI -----------------------------------------------------------------------
+# Token-based (shlex): a prompt string such as `claude -p 'fix the plugin
+# install docs'` stays one token and never counts (QA round 1).
+_CPLUG_CLAUDE_TOKEN_RE = re.compile(
+    r"(?:^|[/\\])(?:claude(?:\.exe|\.cmd|\.ps1)?|claude-code(?:@\S*)?|cli\.(?:m?js))$"
+    r"|@anthropic-ai[/\\]claude-code", re.IGNORECASE)
+_CPLUG_PLUGIN_SUBS = frozenset(("install", "i", "add", "enable", "update", "upgrade"))
+_CPLUG_MKT_SUBS = frozenset(("add", "update", "install", "upgrade"))
+# Fallback over quote-stripped text, for list-form spawns (`['claude',
+# 'plugin','install',...]`) and words the tokenizer can't see.
+_CPLUG_ADJ_RE = re.compile(
+    r"claude(?:-code)?\W{1,8}plugins?\W{1,8}(?:install|i|add|enable|update|upgrade"
+    r"|marketplaces?\W{1,8}(?:add|update|install))\b", re.IGNORECASE)
+_CPLUG_EXEC_SINK_RE = re.compile(
+    r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k|fi|c|tc)?sh\b|\|\s*(?:\S*/)?(?:python\d*|node|perl|ruby|php)\b"
+    r"|\beval\b|\bxargs\b|\bsource\b|(?:^|[\s;&|])\.\s|<\(|>\(", re.IGNORECASE)
+_CPLUG_TEXT_VERBS = frozenset(("git", "grep", "egrep", "fgrep", "rg", "echo", "printf",
+                               "cat", "head", "tail", "less", "more", "ls", "wc"))
+_CPLUG_TOKEN_SPLIT = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n", ";;", "|&"))
+
+
+def _cplug_tokens(cmd: str):
+    import shlex as _shlex
+    try:
+        lex = _shlex.shlex(cmd, posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        return list(lex)
+    except ValueError:
+        return None
+
+
+def _cplug_dynamic(t: str) -> bool:
+    return any(c in t for c in "$`") or t.startswith(("<(", "$("))
+
+
+def _cplug_settings_value_safe(v: str) -> bool:
+    """Inline JSON adding no gated plugin entry (a file path, or JSON naming
+    a gated key, is the child session's settings: not safe)."""
+    if not v.strip().startswith("{"):
+        return False
+    return not (claude_plugin_unsafe_entries(v) or claude_plugin_settings_shell_write(v))
+
+
+def _cplug_cli_tokens_hit(toks: list) -> bool:
+    segs, cur = [], []
+    for t in toks:
+        if t in _CPLUG_TOKEN_SPLIT:
+            segs.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    segs.append(cur)
+    for seg in segs:
+        for i, t in enumerate(seg):
+            claude_like = bool(_CPLUG_CLAUDE_TOKEN_RE.search(t)) or (
+                _cplug_dynamic(t) and i == 0)
+            if not claude_like:
+                continue
+            rest = seg[i + 1:]
+            for j, w in enumerate(rest[:60]):
+                lw = w.lower()
+                if lw.startswith("--plugin-dir") or lw.startswith("--setting-sources"):
+                    return True
+                if lw == "--settings" or lw.startswith("--settings="):
+                    val = w[len("--settings="):] if "=" in w else (rest[j + 1] if j + 1 < len(rest) else "")
+                    if not _cplug_settings_value_safe(val):
+                        return True
+                if lw in ("plugin", "plugins"):
+                    after = [x for x in rest[j + 1:j + 10]]
+                    words, skip = [], False
+                    for x in after:
+                        if x.startswith("-"):
+                            skip = "=" not in x
+                            continue
+                        if skip and not (_cplug_dynamic(x) or x.lower() in _CPLUG_PLUGIN_SUBS
+                                         or x.lower() in ("marketplace", "marketplaces", "market")):
+                            skip = False
+                            continue
+                        skip = False
+                        words.append(x)
+                    if not words:
+                        if _CPLUG_CLAUDE_TOKEN_RE.search(t) and seg and seg[0].lower() == "xargs":
+                            return True
+                        continue
+                    sub = words[0]
+                    if _cplug_dynamic(sub) or sub.lower() in _CPLUG_PLUGIN_SUBS:
+                        return True
+                    if sub.lower() in ("marketplace", "marketplaces", "market"):
+                        more = words[1:]
+                        if not more or _cplug_dynamic(more[0]) or more[0].lower() in _CPLUG_MKT_SUBS:
+                            return True
+                if lw == "config" and j + 1 < len(rest) and rest[j + 1].lower() in ("set", "add"):
+                    if claude_plugin_settings_shell_write(" ".join(rest[j + 2:j + 6])):
+                        return True
+            # xargs claude ... plugin with args from stdin
+            if seg and seg[0].lower() == "xargs" and _CPLUG_CLAUDE_TOKEN_RE.search(t):
+                if not rest or any(x.lower() in ("plugin", "plugins") for x in rest):
+                    return True
+    return False
+
+
 def claude_plugin_cli_hit(cmd) -> bool:
+    """A `claude plugin install|i|enable|update|marketplace add|update` (any
+    flags between, a non-literal subcommand fails closed), `claude
+    --plugin-dir`, `--setting-sources`, `--settings <file or gated JSON>`,
+    or `claude config set|add <gated key>` invocation -- also via `$c`,
+    `$(which claude)`, `node .../cli.js`, `npx @anthropic-ai/claude-code`,
+    `xargs claude plugin`, or a list-form spawn. A segment that only reads
+    (`git commit -m '...'`, `grep ... docs`, `echo`) does not count unless
+    the command feeds text to an interpreter (QA round 1)."""
     if not isinstance(cmd, str) or not cmd:
         return False
-    for f in (cmd, cmd.replace("\\", "").replace("'", "").replace('"', "")):
-        if CLAUDE_PLUGIN_CLI_RE.search(f) or _CPLUG_PLUGIN_DIR_RE.search(f):
-            return True
-    return False
+    low = re.sub(r"[\\'\"]", "", cmd.lower())
+    if "claude" not in low and "cli.js" not in low and "cli.mjs" not in low \
+            and "$" not in cmd and "`" not in cmd:
+        return False
+    if len(cmd) > 400_000:
+        return True
+    sink = bool(_CPLUG_EXEC_SINK_RE.search(cmd))
+    stripped = cmd.replace("\\", "").replace("'", "").replace('"', "")
+    toks = _cplug_tokens(cmd)
+    if toks is None:
+        toks = stripped.split()
+    if len(toks) > 20000:
+        return True
+    # Per simple command: text verbs (git/grep/echo...) that only read carry
+    # text, not invocations (unless fed to an interpreter); a `claude`
+    # segment's prompt string (a token with spaces) is not an invocation.
+    import shlex as _shlex
+    kept, adj_parts, cur = [], [], []
+    for t in toks + [";"]:
+        if t not in _CPLUG_TOKEN_SPLIT:
+            cur.append(t)
+            continue
+        if cur:
+            verb = cur[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+            joined = " ".join(_shlex.quote(x) for x in cur)
+            if (not sink and verb in _CPLUG_TEXT_VERBS and mise_shell_only_reads(joined)):
+                pass
+            else:
+                kept.extend(cur + [";"])
+                if _CPLUG_CLAUDE_TOKEN_RE.search(cur[0]):
+                    adj_parts.extend(x for x in cur if not re.search(r"\s", x))
+                else:
+                    adj_parts.extend(cur)
+        adj_parts.append(t)
+        cur = []
+    if _CPLUG_ADJ_RE.search(" ".join(adj_parts)):
+        return True
+    toks = kept
+    return _cplug_cli_tokens_hit(toks)
+
+
+# Read-only inspection verbs beyond the shared safe list, for THIS guard:
+# `jq` cannot write a file by itself (a `>` is judged separately), and
+# `find` without an exec/delete/print-to-file action only lists (QA round 1).
+def claude_plugin_shell_only_reads(cmd: str) -> bool:
+    if not isinstance(cmd, str):
+        return False
+    out = []
+    for seg in re.split(r"(&&|\|\||[;|\n])", cmd):
+        words = seg.split()
+        verb = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower() if words else ""
+        if (verb == "jq" or (verb == "find" and not _CPLUG_FIND_ACTION_RE.search(seg))) \
+                and not any(c in seg for c in "<>`$"):
+            out.append(" true ")
+        else:
+            out.append(seg)
+    return mise_shell_only_reads("".join(out))
 
 
 def claude_plugin_patch_hit(text) -> bool:
@@ -11201,8 +11481,8 @@ def claude_plugin_unsafe_entries(text) -> list:
         lk = str(k).strip().lower()
         if lk == "disableallhooks":
             if v is not False and v is not None:
-                out.append(("disableAllHooks (switches off every hook, Aegis included)",
-                            _mise_fp("cplug-disable", _cplug_canon(v))))
+                out.append(("disableAllHooks (switches off every non-managed hook, Aegis included)",
+                            _mise_fp("cplug-disable", str(k), _cplug_canon(v))))
         elif lk == "enabledplugins":
             if isinstance(v, dict):
                 for pk, pv in v.items():
