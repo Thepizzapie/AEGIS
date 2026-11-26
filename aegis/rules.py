@@ -16500,7 +16500,9 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     argsfile claude``, ``"dis"+"ableAllHooks"`` split across string
     literals in an interpreter); an Edit whose curly-quoted ``old_string``
     Claude Code normalizes (the fragment check accepts curly quotes, the
-    replay does not); a script or patch written earlier (by an ungated
+    replay does not); a pre-existing symlink to ``.claude``/``~/.claude``
+    (paths are not resolved; creating one is self-protect's DENY); ``HOME=``
+    relocation; a script or patch written earlier (by an ungated
     tool call) and then run (``bash inst.sh``, ``python3 fix.py``, ``git
     apply p.diff``) -- the file's content is not read, as in every sibling
     guard; ``claude --settings`` JSON carrying ``hooks`` (the hooks
@@ -16603,7 +16605,18 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     removed by the shared harmless-redirect strip); ``tmux``/``expect``
     string commands; ``jq --slurpfile``; an MCP JSON-setter naming a gated
     key as its target path; ``find | xargs <writer>`` on tree files; and a
-    quadratic shlex pass on one huge token. Closed with regression tests.
+    quadratic shlex pass on one huge token. Closed with regression tests. Round 7,
+    design: PASS with should-fixes -- ``jq . < settings.local.json`` read
+    asked (a ``<`` now counts only alongside a writer); the 8000-word cap
+    counted every word (now glob words only); ``unzip -d agents`` from
+    ``~/.claude`` asked (a relative destination counts only as ``.`` or
+    ``plugins/...``); a cheap pre-filter keeps unrelated long commands fast.
+    Bypass: FAIL (one MEDIUM) -- interpreter code building the path from
+    literal pieces (``Path('.claude') / 'settings.local.json'``,
+    ``os.path.join(home, '.claude', 'plugins', ...)``) is now matched;
+    also ``git checkout <ref> -- settings.local.json``, ``['claude',
+    '--plugin-dir', ...]`` spawned from code, and a ``CLAUDE_CONFIG_DIR``
+    env dict. Closed with regression tests.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")

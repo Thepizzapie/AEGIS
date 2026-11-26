@@ -913,3 +913,57 @@ def test_b6_perf(s):
 def test_b6_cat_jq_sponge_edit_not_gated():
     cmd = "cat .claude/settings.local.json | jq '.model=\"x\"' | sponge .claude/settings.local.json"
     assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None
+
+
+# ---- QA round 7 (design review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "jq . < .claude/settings.local.json",
+    "jq -r '.permissions.allow[]' < .claude/settings.local.json | sort",
+    "python3 -m json.tool < .claude/settings.local.json",
+    "cd ~/.claude && unzip -o ~/agents.zip -d agents",
+    "cat > out.py <<'EOF'\n" + "x = 1\n" * 9000 + "EOF",
+])
+def test_r7_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd, "/proj"), EMPTY) is None, cmd[:60]
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd ~/.claude && unzip -o /tmp/e.zip -d plugins/cache",
+    "cd ~/.claude && unzip -o /tmp/e.zip -d .",
+    "tee .claude/settings.local.json < /tmp/x",
+])
+def test_r7_still_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+# ---- QA round 7 (bypass review) regressions ---------------------------------
+_PYJ = ("python3 - <<'EOF'\nimport json, os\nfrom pathlib import Path\n{p}\n"
+        "d = json.loads(p.read_text())\nd['disableAllHooks'] = True\np.write_text(json.dumps(d))\nEOF")
+
+
+@pytest.mark.parametrize("cmd", [
+    _PYJ.format(p="p = Path('.claude') / 'settings.local.json'"),
+    _PYJ.format(p="p = Path(os.path.join('.claude','settings.local.json'))"),
+    "cat <<'EOF' | python3\nfrom pathlib import Path\np=Path('.claude')/'settings.local.json'\nimport json\nd=json.loads(p.read_text());d.setdefault('enabledPlugins',{})['x@y']=True\np.write_text(json.dumps(d))\nEOF",
+    "node <<'EOF'\nconst fs=require('fs'),path=require('path');const p=path.join('.claude','settings.local.json');const s=JSON.parse(fs.readFileSync(p));s.disableAllHooks=true;fs.writeFileSync(p,JSON.stringify(s));\nEOF",
+    "python3 - <<'EOF'\nfrom pathlib import Path\n(Path.home() / '.claude' / 'plugins' / 'cache' / 'p' / 'hooks.json').write_text('{}')\nEOF",
+    "python3 -c \"import os;open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'],'settings.json'),'w').write('{\\\"disableAllHooks\\\":true}')\"",
+    "python3 - <<'EOF'\nfrom pathlib import Path\n(Path('/etc/claude-code') / 'managed-settings.json').write_text('{\"enabledPlugins\":{\"a@b\":true}}')\nEOF",
+    "git checkout evil -- .claude/settings.local.json",
+    "git restore --source=evil .claude/settings.local.json",
+    "python3 -c \"import subprocess; subprocess.run(['claude','--plugin-dir','./p','-p','hi'])\"",
+    "python3 - <<'EOF'\nimport os\nos.system('claude -p \"review\" --plugin-dir ./tools/plugin')\nEOF",
+    "python3 -c \"import subprocess,os; subprocess.run(['claude','-p','hi'], env={**os.environ,'CLAUDE_CONFIG_DIR':'/tmp/c'})\"",
+])
+def test_b7_gated(cmd):
+    assert _ours(rule_claude_plugin_protect(_sh(cmd, "/proj"), EMPTY)), cmd[:80]
+
+
+@pytest.mark.parametrize("cmd", [
+    "python3 - <<'EOF'\nfrom pathlib import Path\nprint(Path('.claude') / 'settings.local.json')\nEOF",
+    "python3 -c \"import subprocess; subprocess.run(['claude','-p','hi'])\"",
+    "claude --settings '{\"model\":\"x\"}' -p hi",
+    "python3 scripts/build.py --out dist",
+])
+def test_b7_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd, "/proj"), EMPTY) is None, cmd[:80]

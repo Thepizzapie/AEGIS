@@ -11211,6 +11211,32 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
     return ""
 
 
+_CPLUG_PREFILTER = ("claude", "plugins", "settings", "managed", "cd", "pushd", "chdir",
+                    "set-location", "push-location", "find", "plugin")
+# A path built from literal pieces in code (`Path('.claude') /
+# 'settings.local.json'`, `os.path.join(home, '.claude', 'plugins', ...)`,
+# `path.join(process.env.CLAUDE_CONFIG_DIR, 'settings.json')`) -- QA r7.
+_CPLUG_Q = r"[\"'`]"
+_CPLUG_JOIN_SETTINGS_RE = re.compile(
+    _CPLUG_Q + r"(?:~/?)?\.claude/?" + _CPLUG_Q + r"[^\n]{0,300}?" + _CPLUG_Q + r"/?settings\.local\.json" + _CPLUG_Q
+    + r"|CLAUDE_CONFIG_DIR[^\n]{0,300}?" + _CPLUG_Q + r"/?settings(?:\.local)?\.json" + _CPLUG_Q
+    + r"|" + _CPLUG_Q + r"/?(?:etc/claude-code|ClaudeCode)/?" + _CPLUG_Q + r"[^\n]{0,300}?" + _CPLUG_Q
+    + r"/?managed-settings(?:\.json|\.d)", re.IGNORECASE)
+_CPLUG_JOIN_TREE_RE = re.compile(
+    _CPLUG_Q + r"(?:~/?)?\.claude/?" + _CPLUG_Q + r"[^\n]{0,300}?" + _CPLUG_Q + r"/?plugins(?:/[^\"'`]*)?" + _CPLUG_Q
+    + r"|CLAUDE_CONFIG_DIR[^\n]{0,300}?" + _CPLUG_Q + r"/?plugins(?:/[^\"'`]*)?" + _CPLUG_Q, re.IGNORECASE)
+
+
+def _cplug_joined_literal_kind(cmd: str) -> str:
+    if "claude" not in cmd.lower() and "CLAUDE_CONFIG_DIR" not in cmd:
+        return ""
+    if _CPLUG_JOIN_TREE_RE.search(cmd):
+        return "tree"
+    if _CPLUG_JOIN_SETTINGS_RE.search(cmd):
+        return "settings"
+    return ""
+
+
 def claude_plugin_shell_kind(cmd) -> str:
     """'tree'/'settings' if a shell command names the plugin tree or a gated
     settings file -- literally, via `\\`/quote splitting, `..`, 8.3 short
@@ -11222,6 +11248,12 @@ def claude_plugin_shell_kind(cmd) -> str:
         return ""
     if len(cmd) > 400_000:
         return "tree"                         # fail closed on absurd input
+    low = cmd.lower()
+    if not any(t in low for t in _CPLUG_PREFILTER) and not any(c in cmd for c in "*?[{~\\%"):
+        return ""                             # cheap exit (QA r7 perf)
+    k = _cplug_joined_literal_kind(cmd)
+    if k:
+        return k
     cmd = cmd.replace("\\\r\n", "").replace("\\\n", "")   # line continuation joins words
     unesc = cmd.replace("\\", "")
     forms = [cmd, unesc, unesc.replace("'", "").replace('"', "")]
@@ -11235,13 +11267,13 @@ def claude_plugin_shell_kind(cmd) -> str:
     # Glob/brace words: canonicalize, then re-run the literal check (QA r1).
     budget = [0]
     canon = []
-    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(flat)):
-        if i > 8000:
-            return "tree"
+    nglob = 0
+    for m in _HTTP_RC_WORD_RE.finditer(flat):
         w = m.group(0)
         if any(c in w for c in "*?[{"):
-            if len(w) > 2000:
-                return "tree"
+            nglob += 1
+            if nglob > 8000 or len(w) > 2000:
+                return "tree"         # fail closed on absurd glob input
             canon.extend(_cplug_canon_word(w, budget))
     if canon:
         k = _cplug_literal_kind(" " + " ".join(canon) + " ")
@@ -11392,6 +11424,12 @@ def _cplug_writer_into_cwd(seg: str, home: bool) -> bool:
         a = a.strip("'\"")
         return bool(a) and not a.startswith(("/", "~", "$")) and not re.match(r"^[A-Za-z]:", a)
 
+    def into(d):
+        # A relative destination lands in the tree only as `.` or `plugins/...`
+        # (`unzip -d agents` from ~/.claude writes ~/.claude/agents -- QA r7).
+        d = d.strip("'\"").replace("\\", "/")
+        return rel(d) and (posixpath.normpath(d) == "." or posixpath.normpath(d).split("/")[0] == "plugins")
+
     def dest_after(flags):
         for j, a in enumerate(args):
             if a in flags and j + 1 < len(args):
@@ -11407,15 +11445,15 @@ def _cplug_writer_into_cwd(seg: str, home: bool) -> bool:
         extract = bool(re.match(r"^-?[A-Za-z]*x", first) or any(
             a.startswith(("--extract", "--get")) or a == "-x" for a in args))
         d = dest_after(("-C", "--directory"))
-        return extract and (d is None or rel(d))
+        return extract and (d is None or into(d))
     if verb == "unzip":
         if any(a in ("-l", "-t", "-v", "-Z", "-p", "-c") for a in args):
             return False
         d = dest_after(("-d",))
-        return d is None or rel(d)
+        return d is None or into(d)
     if verb in ("7z", "7za", "7zr"):
         d = dest_after(("-o",))
-        return bool(args) and args[0].lower() in ("x", "e") and (d is None or rel(d))
+        return bool(args) and args[0].lower() in ("x", "e") and (d is None or into(d))
     if verb == "rsync":
         pos = [a for a in args if not a.startswith("-")]
         return bool(pos) and rel(pos[-1])
@@ -11518,6 +11556,7 @@ _CPLUG_FOREIGN_CONTENT_RE = re.compile(
     r"(?:^|[\s;&|(`/])(?:cp|mv|ln|install|rsync|dd|ditto|scp|copy|xcopy|robocopy|copy-item"
     r"|move-item|curl|wget|tar|unzip|patch|base64|xxd|openssl|gzip|gunzip|zcat)\b"
     r"|--(?:slurpfile|rawfile)\b"
+    r"|\bgit\s+(?:[^\n;&|]{0,200}\s)?(?:checkout|restore|show|cat-file|archive)\b"
     # `tee`/`sponge` only when fed a file's bytes (`cat /tmp/x | tee f`); a
     # `jq '.model=...' f | sponge f` edit names its keys (QA r6).
     r"|(?:^|[\s;&|(`/])(?:cat|type|gc|get-content|head|tail|zcat|gunzip|base64|xxd|curl|wget|openssl"
@@ -11540,7 +11579,10 @@ def claude_plugin_settings_foreign_write(cmd) -> bool:
         return False
     # Input redirection from a file (`tee f < /tmp/x`): checked on the raw
     # text, since the shared harmless-redirect strip removes a bare `<` (QA r6).
-    if re.search(r"(?<![<\d])<(?![<&(])\s*[^\s<&]", cmd):
+    if re.search(r"(?<![<\d])<(?![<&(])\s*[^\s<&]", cmd) and (
+            re.search(r"(?:^|[\s;&|(`/])(?:tee|sponge|dd|cp|mv|install|set-content|out-file)\b", cmd, re.I)
+            or re.search(r"(?<![<\d&])>(?!\s*(?:/dev/null|&))", cmd)):
+        # Fed into a writer (`tee f < x`, `sponge f < x`); `jq . < f` reads (QA r7).
         return True
     return bool(_CPLUG_FOREIGN_CONTENT_RE.search(_HTTP_RC_HARMLESS_REDIR_RE.sub(" ", cmd)))
 
@@ -11594,6 +11636,9 @@ _CPLUG_SINK_TEXT_RE = re.compile(
     r"|upgrade|marketplaces?)\b|--plugin-dir|--settings?\b|--setting-sources)", re.IGNORECASE)
 _CPLUG_CODE_FLAGS = frozenset(("-c", "-e", "-E", "--eval", "-p", "--print", "-r", "-Command",
                                "-command", "-C", "--command", "-x", "exec"))
+_CPLUG_CODE_SPAWN_RE = re.compile(
+    r"(?<![\w/.-])claude(?:-code)?[\"']?[\s,]{0,4}[^;\n]{0,200}?(?:--plugin-dir|--setting-sources"
+    r"|--settings\b)", re.IGNORECASE)
 _CPLUG_TEXT_VERBS = frozenset(("git", "grep", "egrep", "fgrep", "rg", "echo", "printf",
                                "cat", "head", "tail", "less", "more", "ls", "wc"))
 _CPLUG_TOKEN_SPLIT = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n", ";;", "|&"))
@@ -11751,6 +11796,24 @@ def _cplug_cli_tokens_hit(toks: list) -> bool:
 _CPLUG_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w-]{0,40})\1")
 
 
+def _cplug_code_heredoc_bodies(cmd: str) -> list:
+    """Bodies of heredocs that are kept as code by `_cplug_drop_text_heredocs`."""
+    if "<<" not in cmd or len(cmd) > 400_000:
+        return []
+    kept = _cplug_drop_text_heredocs(cmd)
+    out = []
+    for m in _CPLUG_HEREDOC_RE.finditer(kept):
+        bs = kept.find("\n", m.end())
+        if bs < 0:
+            continue
+        e = re.compile(r"^[ \t]*" + re.escape(m.group(2)) + r"[ \t]*$", re.MULTILINE).search(kept, bs + 1)
+        if e:
+            out.append(kept[bs + 1:e.start()])
+        if len(out) > 200:
+            break
+    return out
+
+
 def _cplug_drop_text_heredocs(cmd: str) -> str:
     """Remove heredoc bodies whose command is not an interpreter (`cat >
     docs.md <<'E' ... E`): the body is file text, not commands (QA r2)."""
@@ -11817,6 +11880,10 @@ def claude_plugin_cli_hit(cmd) -> bool:
         return False
     if len(cmd) > 100_000 and "claude" in low:
         return True            # fail closed: tokenizing is the slow part (QA r2 perf)
+    for body in _cplug_code_heredoc_bodies(cmd):
+        if _CPLUG_CODE_SPAWN_RE.search(body) or _CPLUG_ADJ_RE.search(body) or (
+                "CLAUDE_CONFIG_DIR" in body and re.search(r"[\"'\s(\[,]claude[\"'\s,)\]]", body)):
+            return True        # an interpreter heredoc spawning claude (QA r7)
     cmd = _cplug_drop_text_heredocs(cmd)
     sink = bool(_CPLUG_EXEC_SINK_RE.search(cmd))
     if sink:
@@ -11844,7 +11911,7 @@ def claude_plugin_cli_hit(cmd) -> bool:
     # text, not invocations (unless fed to an interpreter); a `claude`
     # segment's prompt string (a token with spaces) is not an invocation.
     import shlex as _shlex
-    kept, adj_parts, cur = [], [], []
+    kept, adj_parts, code_parts, cur = [], [], [], []
     for t in toks + [";"]:
         if t not in _CPLUG_TOKEN_SPLIT:
             cur.append(t)
@@ -11875,10 +11942,26 @@ def claude_plugin_cli_hit(cmd) -> bool:
                     code_idx = set(range(len(cur)))
                 adj_parts.extend(x for ci, x in enumerate(cur)
                                  if ci in code_idx or not re.search(r"\s", x))
+                if not _CPLUG_CLAUDE_TOKEN_RE.search(cur[0]) and not _cplug_dynamic(cur[0]) \
+                        and verb not in _CPLUG_TEXT_VERBS:
+                    # Code tokens only: an interpreter's code-flag value (not
+                    # every word a sink makes suspicious -- QA r7).
+                    cidx = set()
+                    if verb in _CPLUG_INTERP_VERBS or verb.startswith("python"):
+                        for ci, x in enumerate(cur[:-1]):
+                            if x in _CPLUG_CODE_FLAGS or re.fullmatch(r"-[A-Za-z]*[ceE]", x):
+                                cidx.add(ci + 1)
+                    code_parts.extend(x for ci, x in enumerate(cur)
+                                      if ci in cidx or not re.search(r"\s", x))
         adj_parts.append(t)
         cur = []
     if _CPLUG_ADJ_RE.search(" ".join(adj_parts)):
         return True
+    if code_parts:
+        cj = " ".join(code_parts)
+        if _CPLUG_CODE_SPAWN_RE.search(cj) or (
+                "CLAUDE_CONFIG_DIR" in cj and re.search(r"[\"'\s(\[,]claude[\"'\s,)\]]", cj)):
+            return True        # a child claude spawned from code (QA r7)
     toks = kept
     return _cplug_cli_tokens_hit(toks)
 
