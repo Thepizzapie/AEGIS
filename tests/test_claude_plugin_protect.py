@@ -967,3 +967,35 @@ def test_b7_gated(cmd):
 ])
 def test_b7_not_gated(cmd):
     assert rule_claude_plugin_protect(_sh(cmd, "/proj"), EMPTY) is None, cmd[:80]
+
+
+# ---- QA round 8 (design review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "gh pr create --title t --body \"Gate disableAllHooks in .claude/settings.local.json\"",
+    "gh issue create --title \"enabledPlugins in .claude/settings.local.json not gated\"",
+    "gh pr comment 5 --body 'see ~/.claude/plugins/cache for the hooks'",
+    "tar -czf backup.tgz ~/.claude/plugins",
+    "zip -r /tmp/p.zip ~/.claude/plugins",
+    "rsync -a ~/.claude/plugins/ /tmp/pb/",
+    "git restore --staged .claude/settings.local.json",
+])
+def test_r8_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("args,tool", [
+    ({"body": "~/.claude/plugins/cache/x/hooks/hooks.json is wrong"}, "mcp__github__add_issue_comment"),
+    ({"text": "~/.claude/plugins/ is where plugins live"}, "mcp__slack__post_message"),
+])
+def test_r8_mcp_prose_not_gated(args, tool):
+    assert rule_claude_plugin_protect(_mcp(args, tool=tool), EMPTY) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "gh api repos/x/y/contents/f > ~/.claude/plugins/x.json",
+    "tar -czf ~/.claude/plugins/evil.tgz x",
+    "rsync -a /tmp/evil/ ~/.claude/plugins/",
+    "git restore --staged --worktree --source=evil .claude/settings.local.json",
+])
+def test_r8_still_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd

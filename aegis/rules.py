@@ -16155,6 +16155,8 @@ def _cplug_path_shaped(v) -> bool:
         return False
     if not (_HTTP_RC_PATH_SHAPE_RE.match(t) or re.fullmatch(r"[\w.\-$%{}]+(?:[/\\][^\r\n]*)?", t)):
         return False
+    if re.search(r"\s", t) and not re.search(r"Program Files|Application Support", t, re.IGNORECASE):
+        return False            # prose that starts with a path (QA r8)
     return bool(patterns.claude_plugin_kind(t))
 
 
@@ -16516,7 +16518,10 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     parse (e.g. a ``//`` comment) and names a gated key; ``claude
     --setting-sources`` (even when it narrows) and ``--settings <file>`` (CI
     configs); an MCP tool that is not a write (``create_issue``) whose whole
-    string argument is a plugin-tree path; ``CLAUDE_CONFIG_DIR=<dir>
+    string argument (no whitespace) is a plugin-tree path; interpreter code
+    that only reads the tree (``print(Path.home() / '.claude' /
+    'plugins')``); ``cd ~/.claude`` followed by any later non-read command,
+    even after a ``cd`` elsewhere; ``CLAUDE_CONFIG_DIR=<dir>
     claude ...`` (CI may relocate it; the child reads that dir's settings and
     plugins); ``claude plugin install --help``; an interpreter that only
     reads a tree file (``python3 -m json.tool ~/.claude/plugins/x.json``);
@@ -16616,7 +16621,12 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``os.path.join(home, '.claude', 'plugins', ...)``) is now matched;
     also ``git checkout <ref> -- settings.local.json``, ``['claude',
     '--plugin-dir', ...]`` spawned from code, and a ``CLAUDE_CONFIG_DIR``
-    env dict. Closed with regression tests.
+    env dict. Closed with regression tests. Round 8, design: PASS with should-fixes
+    -- ``gh pr/issue`` text naming the settings file or tree asked (``gh``
+    is now a reader except ``api``/``repo clone``/downloads); MCP prose
+    starting with a tree path asked (a path-shaped argument must have no
+    whitespace); ``tar -c``/``zip``/``rsync`` backups of the tree and ``git
+    restore --staged`` are reads.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")

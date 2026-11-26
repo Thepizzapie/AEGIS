@@ -11577,6 +11577,9 @@ def claude_plugin_settings_foreign_write(cmd) -> bool:
     in the command (QA round 1)."""
     if not isinstance(cmd, str):
         return False
+    # `git restore --staged f` touches only the index (QA r8).
+    cmd = re.sub(r"\bgit\s+restore\s+(?![^;&|\n]*(?:-W\b|--worktree))[^;&|\n]*--staged\b[^;&|\n]*",
+                 " true ", cmd)
     # Input redirection from a file (`tee f < /tmp/x`): checked on the raw
     # text, since the shared harmless-redirect strip removes a bare `<` (QA r6).
     if re.search(r"(?<![<\d])<(?![<&(])\s*[^\s<&]", cmd) and (
@@ -12043,6 +12046,26 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
                                         for a in args if not a.startswith("-"))
                 and next((a for a in args if not a.startswith("-") and not a.isdigit()), "")
                 .rsplit("/", 1)[-1] in _CPLUG_READ_EXEC_VERBS))
+        pos_args = [a for a in args if not a.startswith("-")]
+        if verb == "gh":
+            # PR/issue text is data; only commands that fetch into a path write.
+            sub2 = " ".join(pos_args[:2]).lower()
+            extra_read = not re.match(r"(?:api|repo clone|release download|run download|gist clone"
+                                      r"|extension install|repo fork|pr checkout|repo sync)\b", sub2)
+        elif verb in ("tar", "bsdtar", "gtar"):
+            first = args[0] if args else ""
+            creating = bool(re.match(r"^-?[A-Za-wyz]*c", first) or "--create" in args or "-c" in args)
+            out_f = next((args[j + 1] for j, a in enumerate(args[:-1]) if a in ("-f", "--file")), "")
+            if not out_f and re.match(r"^-?[A-Za-z]*f$", first) and len(args) > 1:
+                out_f = args[1]
+            extra_read = creating and not any(a.startswith(("-x", "--extract", "--get")) for a in args) \
+                and not claude_plugin_kind(out_f or "x")
+        elif verb == "zip":
+            extra_read = bool(pos_args) and not claude_plugin_kind(pos_args[0])
+        elif verb == "rsync":
+            extra_read = len(pos_args) >= 2 and not claude_plugin_kind(pos_args[-1]) \
+                and not _cplug_is_cfg_dir(pos_args[-1]) and "--remove-source-files" not in args \
+                and not _CPLUG_MANAGED_DIR_RE.search(pos_args[-1].replace("\\", "/"))
         if (verb in ("jq", "tree", "exa", "eza") or find_reads or extra_read) \
                 and not any(c in seg for c in "<>`$"):
             out.append(" true ")
