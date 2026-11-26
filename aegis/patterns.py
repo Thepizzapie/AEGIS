@@ -11112,7 +11112,8 @@ _CPLUG_DIR_WORD_RE = re.compile(
     + _WIN_TRIM + r"[/\\]?(?=[\s'\";&|)]|$)", re.IGNORECASE)
 _CPLUG_TREE_WRITER_RE = re.compile(
     r"(?:^|[\s;&|(`/])(?:tar|bsdtar|gtar|unzip|7z|7za|7zr|cpio|rsync|patch|ditto|unar|pax"
-    r"|expand-archive|git\s+(?:[^\n;&|]{0,200}\s)?(?:apply|am|checkout|restore|archive)"
+    r"|expand-archive|git\s+(?:[^\n;&|]{0,200}\s)?(?:apply|am|checkout|restore|archive|pull|merge"
+    r"|reset|switch|stash|clone|rebase|cherry-pick)"
     r"|git\s+-C)\b", re.IGNORECASE)
 _CPLUG_FIND_ACTION_RE = re.compile(r"(?:^|\s)-(?:exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)\b")
 _CPLUG_FIND_RE = re.compile(r"(?:^|[\s;&|(`/])find\b", re.IGNORECASE)
@@ -11358,7 +11359,11 @@ _CPLUG_INTERP_VERBS = frozenset(("python", "python2", "python3", "py", "node", "
                                  "timeout", "watch", "parallel", "su", "doas", "runuser", "script"))
 _CPLUG_EXEC_SINK_RE = re.compile(
     r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k|fi|c|tc)?sh\b|\|\s*(?:\S*/)?(?:python\d*|node|perl|ruby|php)\b"
-    r"|\beval\b|\bxargs\b|\bsource\b|(?:^|[\s;&|])\.\s|<\(|>\(", re.IGNORECASE)
+    r"|(?:^|[;&|(\n]\s*|\$\(\s*)(?:eval|source|\.)(?=\s)", re.IGNORECASE)
+# Narrow text signal for a sink's decoded text: the CLI words in order.
+_CPLUG_SINK_TEXT_RE = re.compile(
+    r"(?<![\w/.-])claude(?:-code)?[^\w/]{1,8}(?:plugins?[^\w/]{1,8}(?:install|i|add|enable|update"
+    r"|upgrade|marketplaces?)\b|--plugin-dir|--settings?\b|--setting-sources)", re.IGNORECASE)
 _CPLUG_TEXT_VERBS = frozenset(("git", "grep", "egrep", "fgrep", "rg", "echo", "printf",
                                "cat", "head", "tail", "less", "more", "ls", "wc"))
 _CPLUG_TOKEN_SPLIT = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n", ";;", "|&"))
@@ -11560,11 +11565,20 @@ def claude_plugin_cli_hit(cmd) -> bool:
     cmd = _cplug_drop_text_heredocs(cmd)
     sink = bool(_CPLUG_EXEC_SINK_RE.search(cmd))
     if sink:
-        dec = _cplug_decode_escapes(cmd)
-        dl = dec.lower()
-        if re.search(r"(?<![\w/.-])claude", dl) and re.search(r"(?<![\w/.-])plugins?\b|--plugin-dir|--settings",
-                                                           dl):
-            return True        # text fed to an interpreter names the CLI (QA r2)
+        # Only the pipeline that is actually fed to an interpreter (or the
+        # eval/source command itself) carries code (QA r3: `git add . &&
+        # git commit -m "...claude plugin..."` is not one).
+        for pl in re.split(r"&&|\|\||;|\n", cmd):
+            if not _CPLUG_EXEC_SINK_RE.search(pl) and not re.match(r"\s*(?:eval|source|\.)\s", pl):
+                continue
+            dec = _cplug_decode_escapes(pl).replace("'", "").replace('"', "")
+            dec = re.sub(r"%s", " ", dec)
+            if _CPLUG_SINK_TEXT_RE.search(dec):
+                return True    # text fed to an interpreter names the CLI (QA r2)
+            if re.search(r"(?<![\w/.-])printf\b", dec) and re.search(r"(?<![\w/.-])claude\b", dec) \
+                    and re.search(r"\bplugins?\b", dec) and re.search(
+                        r"\b(?:install|enable|update|upgrade|add|marketplace)\b", dec):
+                return True    # `printf '%s ' claude plugin install | sh`
     stripped = cmd.replace("\\", "").replace("'", "").replace('"', "")
     toks = _cplug_tokens(cmd)
     if toks is None:
@@ -11613,7 +11627,11 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
     for seg in re.split(r"(&&|\|\||[;|\n])", cmd):
         words = seg.split()
         verb = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower() if words else ""
-        if (verb in ("jq", "tree", "exa", "eza") or (verb == "find" and not _CPLUG_FIND_ACTION_RE.search(seg))) \
+        acts = re.findall(r"-(?:exec|execdir|ok|okdir)\s+(\S+)", seg)
+        find_reads = verb == "find" and (not _CPLUG_FIND_ACTION_RE.search(seg) or (
+            acts and all(x.strip("'\"").rsplit("/", 1)[-1].lower() in _CPLUG_READ_EXEC_VERBS for x in acts)
+            and not re.search(r"-(?:delete|fprint0?|fprintf|fls)\b", seg)))
+        if (verb in ("jq", "tree", "exa", "eza") or find_reads) \
                 and not any(c in seg for c in "<>`$"):
             out.append(" true ")
         else:

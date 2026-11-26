@@ -16496,7 +16496,13 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     parse (e.g. a ``//`` comment) and names a gated key; ``claude
     --setting-sources`` (even when it narrows) and ``--settings <file>`` (CI
     configs); an MCP tool that is not a write (``create_issue``) whose whole
-    string argument is a plugin-tree path.
+    string argument is a plugin-tree path; ``CLAUDE_CONFIG_DIR=<dir>
+    claude ...`` (CI may relocate it; the child reads that dir's settings and
+    plugins); ``claude plugin install --help``; an interpreter that only
+    reads a tree file (``python3 -m json.tool ~/.claude/plugins/x.json``);
+    an MCP copy whose SOURCE is in the tree; a command whose ``cd
+    ~/.claude/plugins`` is followed by a later ``cd`` and a non-read verb.
+    An unknown ``mode`` resolves to deny, as in every sibling guard.
 
     QA history (independent bypass and design reviews, run in parallel).
     Round 1, design: PASS with should-fixes -- doc/commit-message/grep text
@@ -16534,7 +16540,16 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``command $c``/``env $c``; ``printf``/``echo -e`` escapes piped to a
     shell; the native-installer ``claude/versions/<v>`` binary; a glob or
     ``${p:-plugin}`` subcommand; ``CLAUDE_CONFIG_DIR=... claude``; and a
-    quadratic prefix-word scan. All closed with regression tests.
+    quadratic prefix-word scan. All closed with regression tests. Round 3,
+    design: one blocking false ASK -- a ``.`` argument (``git add .``,
+    ``grep ... .``) was read as the ``source`` builtin, making the whole
+    command an interpreter sink so any commit message naming "claude
+    plugin" asked; ``.``/``source``/``eval`` now count only at command
+    position, ``xargs``/``<(...)`` are no longer text sinks (the token
+    check still covers ``xargs claude plugin``), and only the pipeline fed
+    to the interpreter is judged, with the CLI words required in order.
+    Also: ``find <tree> -exec cat|grep`` is a read; ``cd ~/.claude && git
+    pull`` now matches ``git -C ~/.claude pull``.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")

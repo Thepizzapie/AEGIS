@@ -673,3 +673,37 @@ def test_b2_more_settings_paths(p):
 ])
 def test_b2_not_gated(cmd):
     assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+# ---- QA round 3 (design review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "git add . && git commit -m \"Add claude plugin install docs\"",
+    "git add . && git commit -m \"Add claude --plugin-dir docs\"",
+    "grep -rn \"claude plugin\" . --include=*.md",
+    "rg \"claude plugins\" . -g '*.md'",
+    "docker build -t app . && git commit -m \"feat: Claude plugins page\"",
+    "find . -name '*.md' && git commit -m \"docs: claude plugins\"",
+    "source .venv/bin/activate && git commit -m \"claude: fix plugins loader\"",
+    "eval \"$(direnv export bash)\" && git commit -m \"docs: claude --plugin-dir usage\"",
+    "git ls-files | xargs grep -l \"claude plugin\"",
+    "grep -rl \"claude plugin install\" docs | xargs sed -i 's/claude plugin install/claude plugin add/'",
+    "cat <(git diff) | claude -p \"review the plugins refactor\"",
+    "diff <(cat a) <(cat b) # claude plugins",
+    "find ~/.claude/plugins -name hooks.json -exec cat {} \;",
+    "cd ~/.claude && git status",
+])
+def test_r3_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "printf '%s ' claude plugin install x | sh",
+    "printf 'claude\\x20plugin\\x20install x@m' | sh",
+    "echo 'claude plugin install a@b' | bash",
+    "eval 'claude plugin install a@b'",
+    "git -C ~/.claude pull",
+    "cd ~/.claude && git pull",
+    "find ~/.claude/plugins -name hooks.json -exec sed -i s/a/b/ {} \;",
+])
+def test_r3_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
