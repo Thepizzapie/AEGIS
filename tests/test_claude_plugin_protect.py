@@ -1028,3 +1028,35 @@ _CD = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 ])
 def test_b8_gated(cmd):
     assert evaluate(_sh(cmd, "/proj"), EMPTY).action != Action.ALLOW, cmd
+
+
+# ---- QA round 9 (design review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "ls \"${HOME}/.claude/plugins\"",
+    "cat \"${HOME}/.claude/plugins/installed_plugins.json\"",
+    "ls \"${CLAUDE_CONFIG_DIR}/plugins\"",
+    "jq .plugins \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json\"",
+    "grep -r foo \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins\"",
+    "sed -n 1,20p ~/.claude/plugins/known_marketplaces.json",
+    "python3 - <<EOF\n" + "x=1\n" * 21000 + "EOF",
+])
+def test_r9_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd[:60]
+
+
+@pytest.mark.parametrize("cmd", [
+    "sed -n 'w /tmp/x' ~/.claude/plugins/known_marketplaces.json",
+    "sed -n -i 1p ~/.claude/plugins/known_marketplaces.json",
+    "sed -n '1e touch /tmp/p' ~/.claude/plugins/known_marketplaces.json",
+    "cat \"$(echo ~/.claude/plugins/x)\" > ~/.claude/plugins/y",
+    "ls \"${HOME}/.claude/plugins\" && cp x \"${HOME}/.claude/plugins/\"",
+])
+def test_r9_still_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+def test_r9_mcp_edit_nested_text_not_retarget():
+    ev = _mcp({"path": "/r/docs/a.md", "edits": [{"oldText": "~/.claude/plugins/old",
+                                                  "newText": "~/.claude/plugins/cache"}]},
+              tool="mcp__filesystem__edit_file")
+    assert rule_claude_plugin_protect(ev, EMPTY) is None

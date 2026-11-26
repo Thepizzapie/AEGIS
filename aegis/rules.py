@@ -16260,7 +16260,8 @@ def _cplug_target(ev: Event, p: str) -> tuple:
         return "", p
     a = ev.args or {}
     if p and "\n" not in p:
-        a = {k: v for k, v in a.items() if str(k) not in _ED_PLAIN_CONTENT_KEYS}
+        a = {k: v for k, v in a.items() if str(k) not in _ED_PLAIN_CONTENT_KEYS
+             and str(k).lower() not in ("edits", "changes", "replacements", "patches")}
     flat = [str(x) for x in _flatten_strings(a)]
     for s_ in flat[:5000]:
         if _cplug_path_shaped(s_):
@@ -16626,7 +16627,13 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     is now a reader except ``api``/``repo clone``/downloads); MCP prose
     starting with a tree path asked (a path-shaped argument must have no
     whitespace); ``tar -c``/``zip``/``rsync`` backups of the tree and ``git
-    restore --staged`` are reads. Bypass: FAIL (one MEDIUM) --
+    restore --staged`` are reads. Round 9, design: PASS with should-fixes -- a
+    ``${HOME}``/``${CLAUDE_CONFIG_DIR:-...}`` read (``ls``/``cat``/``jq``)
+    asked because the shared read check split on its braces (parameter
+    expansions are now collapsed first); ``sed -n`` with no ``w``/``e``/
+    ``-i`` is a read; an MCP edit's nested ``oldText``/``newText`` no
+    longer retarget a non-plugin ``path``; the cd tracker skips commands
+    with no ``cd`` and no cwd. Bypass: FAIL (one MEDIUM) --
     ``${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`` and the config
     dir as a ``cp``/``rsync``/``tar -C`` destination in the default-value
     form (now recognized everywhere the plain form is, with a brace-safe

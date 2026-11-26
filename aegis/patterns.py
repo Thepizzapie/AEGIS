@@ -11143,6 +11143,9 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
     hit (QA round 3)."""
     if not isinstance(cmd, str) or len(cmd) > 400_000:
         return ""
+    if not cwd and not re.search(r"\b(?:cd|pushd|popd|chdir|sl|set-location|push-location)\b", cmd,
+                                 re.IGNORECASE):
+        return ""           # nothing to track (QA r9)
     cur = (cwd or "").replace("\\", "/")
     cdpath = ""
     stack = []
@@ -12023,6 +12026,17 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
         return False
     if len(cmd) > 400_000:
         return False
+    # `${HOME}`/`${CLAUDE_CONFIG_DIR:-...}` are parameter expansions, not
+    # groups: collapse them so the brace-splitting shared read check does
+    # not see `HOME` as a verb (QA r9). `$(...)`/backticks are kept.
+    for _ in range(3):
+        # `${NAME...}` -> `$NAME`: braces gone, the variable kept (so the
+        # rsync/cp destination checks still see `$CLAUDE_CONFIG_DIR`).
+        cmd2 = re.sub(r"\$\{(\w*)[^{}$`()]*(?:\$[A-Za-z_]\w*[^{}$`()]*)*\}",
+                      lambda m: "$" + (m.group(1) or "PARAM"), cmd)
+        if cmd2 == cmd:
+            break
+        cmd = cmd2
     out = []
     for seg in _cplug_split_keep(cmd):
         if seg in ("&&", "||", ";", "|", "\n"):
@@ -12053,6 +12067,11 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
             or verb in ("fd", "fdfind", "hexdump", "strings", "cut", "nl", "column", "basename",
                         "dirname", "od", "tr", "sha512sum", "b2sum", "cksum")
             or (verb == "xxd" and not any(re.match(r"-[A-Za-z]*r|--r", a) for a in args))
+            # `sed -n 1,20p f`: no -i, and no w/W/e/r commands in the script.
+            or (verb == "sed" and any(re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*|--quiet|--silent", a) for a in args)
+                and not any(re.match(r"-[A-Za-z]*i|--in-place|-[A-Za-z]*s?f|--file", a) for a in args)
+                and not any(re.search(r"(?:^|[;}\s\d/$])[wWerR](?:\s|$)|[/;]\s*[wWe]\b|\bw\s*/", a.strip("'\""))
+                            for a in args if not a.startswith("-")))
             or (verb == "xargs" and any(a.rsplit("/", 1)[-1] in _CPLUG_READ_EXEC_VERBS
                                         for a in args if not a.startswith("-"))
                 and next((a for a in args if not a.startswith("-") and not a.isdigit()), "")
@@ -12081,7 +12100,7 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
             out.append(seg)
             continue
         if (verb in ("jq", "tree", "exa", "eza") or find_reads or extra_read) \
-                and not any(c in seg for c in "<>`$"):
+                and not re.search(r"[<>`]|\$\(", seg):
             out.append(" true ")
         else:
             out.append(seg)
