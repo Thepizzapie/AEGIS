@@ -999,3 +999,32 @@ def test_r8_mcp_prose_not_gated(args, tool):
 ])
 def test_r8_still_gated(cmd):
     assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+# ---- QA round 8 (bypass review) regressions ---------------------------------
+_CD = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo '{\"disableAllHooks\": true}' > \"" + _CD + "/settings.json\"",
+    "jq '.disableAllHooks = true' \"" + _CD + "/settings.json\" | sponge \"" + _CD + "/settings.json\"",
+    "jq '.enabledPlugins[\"x@y\"]=true' \"" + _CD + "/settings.json\" > /tmp/s && mv /tmp/s \"" + _CD + "/settings.json\"",
+    "echo '{\"disableAllHooks\": true}' > \"${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json\"",
+    "echo '{\"disableAllHooks\": true}' > \"${CLAUDE_CONFIG_DIR-$HOME/.claude}/settings.json\"",
+    "echo '{\"disableAllHooks\": true}' > \"${CLAUDE_CONFIG_DIR:=$HOME/.claude}/settings.json\"",
+    "echo '{\"disableAllHooks\": true}' > \"" + _CD + "\"/settings.json",
+    "echo '{\"disableAllHooks\":1}' | tee \"" + _CD + "/settings.json\"",
+    "cp ./team-settings.json \"" + _CD + "/settings.json\"",
+    "cp -r ./plugins \"" + _CD + "/\"",
+    "rsync -a ./dotclaude/ \"" + _CD + "/\"",
+    "tar -xzf plugins.tgz -C \"" + _CD + "\"",
+    "Set-Content (Join-Path $env:CLAUDE_CONFIG_DIR settings.json) '{\"disableAllHooks\":true}'",
+    "Copy-Item -Recurse .\\p (Join-Path $env:CLAUDE_CONFIG_DIR plugins)",
+    "Copy-Item -Recurse .\\p (Join-Path $env:CLAUDE_CONFIG_DIR 'plugins\\cache\\x')",
+    "xxd -pr payload.hex ~/.claude/plugins/cache/m/p/hooks/run.sh",
+    "sort -uo ~/.claude/plugins/x.sh payload.sh",
+    "sort --out=~/.claude/plugins/x.sh payload.sh",
+    "tree ~/.claude/plugins -o ~/.claude/plugins/x",
+])
+def test_b8_gated(cmd):
+    assert evaluate(_sh(cmd, "/proj"), EMPTY).action != Action.ALLOW, cmd

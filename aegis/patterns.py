@@ -11002,7 +11002,7 @@ CLAUDE_PLUGIN_TREE_PATH_RE = re.compile(
     re.IGNORECASE)
 CLAUDE_PLUGIN_SETTINGS_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=:<>|&;(`{,])(?:" + _CPLUG_DIR + _SEP + r"settings\.local\.json"
-    r"|(?:\$\{?|%|\$env:)CLAUDE_CONFIG_DIR[}%]?" + _SEP + r"settings\.json"
+    r"|(?:\$\{?|%|\$env:)CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?" + _SEP + r"settings\.json"
     r"|(?:etc" + _SEP + r"claude-code|Application Support" + _SEP + r"ClaudeCode"
     r"|(?:ProgramData|Program Files(?: \(x86\))?)" + _SEP + r"ClaudeCode)" + _SEP
     + r"managed-settings\.json)" + _CPLUG_END,
@@ -11099,7 +11099,7 @@ def _cplug_canon_word(word: str, budget: list) -> list:
 
 _CPLUG_CD_RE = re.compile(
     r"\b(?:cd|pushd|chdir|sl|set-location|push-location)\s+(?:--?\s+)?[\"']?"
-    r"(?:[^\s;&|\"'\n]{0,300}[/\\])?(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)" + _WIN_TRIM
+    r"(?:[^\s;&|\"'\n]{0,300}[/\\])?(?:\.claude|\$\{?CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?\}?)" + _WIN_TRIM
     + r"(?=[/\\\s;&|\"')]|$)(?P<rest>[/\\][^\s;&|\"'\n]{0,300})?", re.IGNORECASE)
 # Any later directory change ends the window a `cd ~/.claude` opened (QA r1).
 _CPLUG_ANY_CD_RE = re.compile(r"\b(?:cd|pushd|popd|chdir|sl|set-location|push-location|pop-location)\b",
@@ -11109,7 +11109,7 @@ _CPLUG_BARE_SETTINGS_RE = re.compile(r"(?:^|[\s'\"/=(,<>:]|(?<=\s-t))settings\.l
 # The config dir itself (or its parent's write into it) as a TARGET of a
 # whole-tree writer: archive extraction, rsync, patch, `git apply`.
 _CPLUG_DIR_WORD_RE = re.compile(
-    r"(?:^|[\s'\"=])(?:[^\s'\";&|]{0,300}[/\\])?(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)"
+    r"(?:^|[\s'\"=])(?:[^\s'\";&|]{0,300}[/\\])?(?:\.claude|\$\{?CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?\}?)"
     + _WIN_TRIM + r"[/\\]?(?=[\s'\";&|)]|$)", re.IGNORECASE)
 _CPLUG_TREE_WRITER_RE = re.compile(
     r"(?:^|[\s;&|(`/])(?:tar|bsdtar|gtar|unzip|7z|7za|7zr|cpio|rsync|patch|ditto|unar|pax"
@@ -11185,7 +11185,7 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
                 if cur:
                     cands.append(posixpath.normpath(cur.rstrip("/") + "/" + tgt))
                 cur = next((c for c in cands if re.search(
-                    r"(?:^|/)(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)(?:/|$)", c, re.IGNORECASE)),
+                    r"(?:^|/)(?:\.claude|\$\{?CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?\}?)(?:/|$)", c, re.IGNORECASE)),
                     cands[0] if cands else tgt)
             elif cur:
                 cur = posixpath.normpath(cur.rstrip("/") + "/" + tgt)
@@ -11195,7 +11195,7 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
         if not cur:
             continue
         if claude_plugin_kind(cur.rstrip("/") + "/") == "tree" or re.search(
-                r"(?:^|/)(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)/plugins(?:/|$)", cur, re.IGNORECASE):
+                r"(?:^|/)(?:\.claude|\$\{?CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?\}?)/plugins(?:/|$)", cur, re.IGNORECASE):
             if not claude_plugin_shell_only_reads(seg):
                 return "tree"
             continue
@@ -11222,6 +11222,9 @@ _CPLUG_JOIN_SETTINGS_RE = re.compile(
     + r"|CLAUDE_CONFIG_DIR[^\n]{0,300}?" + _CPLUG_Q + r"/?settings(?:\.local)?\.json" + _CPLUG_Q
     + r"|" + _CPLUG_Q + r"/?(?:etc/claude-code|ClaudeCode)/?" + _CPLUG_Q + r"[^\n]{0,300}?" + _CPLUG_Q
     + r"/?managed-settings(?:\.json|\.d)", re.IGNORECASE)
+_CPLUG_JOINPATH_RE = re.compile(
+    r"Join-Path\s+(?:-Path\s+)?\$env:CLAUDE_CONFIG_DIR\s+(?:-ChildPath\s+)?[\"']?"
+    r"(?P<c>plugins|settings(?:\.local)?\.json)", re.IGNORECASE)
 _CPLUG_JOIN_TREE_RE = re.compile(
     _CPLUG_Q + r"(?:~/?)?\.claude/?" + _CPLUG_Q + r"[^\n]{0,300}?" + _CPLUG_Q + r"/?plugins(?:/[^\"'`]*)?" + _CPLUG_Q
     + r"|CLAUDE_CONFIG_DIR[^\n]{0,300}?" + _CPLUG_Q + r"/?plugins(?:/[^\"'`]*)?" + _CPLUG_Q, re.IGNORECASE)
@@ -11232,6 +11235,9 @@ def _cplug_joined_literal_kind(cmd: str) -> str:
         return ""
     if _CPLUG_JOIN_TREE_RE.search(cmd):
         return "tree"
+    m = _CPLUG_JOINPATH_RE.search(cmd)
+    if m:
+        return "tree" if m.group("c").lower() == "plugins" else "settings"
     if _CPLUG_JOIN_SETTINGS_RE.search(cmd):
         return "settings"
     return ""
@@ -11336,6 +11342,9 @@ def claude_plugin_shell_kind(cmd) -> str:
             k = _cplug_copy_into_dir(seg)
             if k:
                 return k
+            # `${CLAUDE_CONFIG_DIR:-...}` survives only a brace-safe split (QA r8).
+            if _cplug_tree_writer_into_config(seg.replace('"', "").replace("'", "")):
+                return "tree"
     # `find ... | xargs <writer>` selecting tree files (QA r6).
     if _CPLUG_FIND_RE.search(cflat) and re.search(r"\|\s*xargs\b", cflat) and re.search(
             r"hooks\.json|known_marketplaces|installed_plugins|plugins|\.claude", cflat, re.IGNORECASE):
@@ -11350,7 +11359,7 @@ def claude_plugin_shell_kind(cmd) -> str:
 _CPLUG_HOME_DIR_RE = re.compile(
     r"(?:~[\w.-]*|\$\{?HOME\}?|\$env:USERPROFILE|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+"
     r"|[A-Za-z]:[/\\]+Users[/\\]+[^/\\\s]+)[/\\]+\.claude" + _WIN_TRIM + r"[/\\]?$"
-    r"|^\$\{?CLAUDE_CONFIG_DIR\}?[/\\]?$", re.IGNORECASE)
+    r"|^(?:\$\{?|\$env:|%)CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?[/\\]?$", re.IGNORECASE)
 _CPLUG_READ_EXEC_VERBS = frozenset(("grep", "egrep", "fgrep", "rg", "wc", "cat", "head", "tail",
                                     "ls", "stat", "file", "md5sum", "sha256sum", "sha1sum", "du",
                                     "jq", "less", "more", "echo", "printf", "basename", "dirname",
@@ -11359,7 +11368,8 @@ _CPLUG_READ_EXEC_VERBS = frozenset(("grep", "egrep", "fgrep", "rg", "wc", "cat",
 
 def _cplug_is_cfg_dir(w: str) -> bool:
     w = w.strip("'\"")
-    if re.search(r"(?:^|[/\\])(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)" + _WIN_TRIM + r"[/\\]?$",
+    if re.search(r"(?:^|[/\\])\.claude" + _WIN_TRIM + r"[/\\]?$"
+                 r"|^(?:\$\{?|\$env:|%)CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?[/\\]?$",
                  w, re.IGNORECASE) is None:
         return False
     return True
@@ -11504,7 +11514,8 @@ def _cplug_copy_into_dir(seg: str) -> str:
         dn = d.replace("\\", "/")
         if _CPLUG_MANAGED_DIR_RE.search(dn):
             return "settings"
-        if re.fullmatch(r"\$\{?CLAUDE_CONFIG_DIR\}?/*(?:\.)?", dn, re.IGNORECASE):
+        if re.fullmatch(r"(?:\$\{?|\$env:|%)CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?/*(?:\.)?", dn,
+                        re.IGNORECASE):
             return "tree"
         if _cplug_is_cfg_dir(dn) and _CPLUG_HOME_DIR_RE.search(dn.rstrip("/") + "/") is not None:
             return "tree"
@@ -12037,11 +12048,11 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
                 continue
         args = words[1:]
         extra_read = (
-            (verb == "sort" and not any(a.startswith(("-o", "--output")) for a in args))
+            (verb == "sort" and not any(re.match(r"-[A-Za-z]*o|--o", a) for a in args))
             or (verb == "uniq" and len([a for a in args if not a.startswith("-")]) <= 1)
             or verb in ("fd", "fdfind", "hexdump", "strings", "cut", "nl", "column", "basename",
                         "dirname", "od", "tr", "sha512sum", "b2sum", "cksum")
-            or (verb == "xxd" and "-r" not in args)
+            or (verb == "xxd" and not any(re.match(r"-[A-Za-z]*r|--r", a) for a in args))
             or (verb == "xargs" and any(a.rsplit("/", 1)[-1] in _CPLUG_READ_EXEC_VERBS
                                         for a in args if not a.startswith("-"))
                 and next((a for a in args if not a.startswith("-") and not a.isdigit()), "")
@@ -12066,6 +12077,9 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
             extra_read = len(pos_args) >= 2 and not claude_plugin_kind(pos_args[-1]) \
                 and not _cplug_is_cfg_dir(pos_args[-1]) and "--remove-source-files" not in args \
                 and not _CPLUG_MANAGED_DIR_RE.search(pos_args[-1].replace("\\", "/"))
+        if verb == "tree" and any(re.match(r"-[A-Za-z]*o|--o", a) for a in args):
+            out.append(seg)
+            continue
         if (verb in ("jq", "tree", "exa", "eza") or find_reads or extra_read) \
                 and not any(c in seg for c in "<>`$"):
             out.append(" true ")

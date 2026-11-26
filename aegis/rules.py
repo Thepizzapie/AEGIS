@@ -16626,7 +16626,12 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     is now a reader except ``api``/``repo clone``/downloads); MCP prose
     starting with a tree path asked (a path-shaped argument must have no
     whitespace); ``tar -c``/``zip``/``rsync`` backups of the tree and ``git
-    restore --staged`` are reads.
+    restore --staged`` are reads. Bypass: FAIL (one MEDIUM) --
+    ``${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`` and the config
+    dir as a ``cp``/``rsync``/``tar -C`` destination in the default-value
+    form (now recognized everywhere the plain form is, with a brace-safe
+    segment split); also PowerShell ``Join-Path $env:CLAUDE_CONFIG_DIR
+    plugins``, ``xxd -pr``, ``sort -uo``/``--out=``, ``tree -o``.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")
