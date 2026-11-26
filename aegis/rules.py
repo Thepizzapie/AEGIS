@@ -16189,10 +16189,12 @@ def _cplug_cli_surfaces(cmd: str, _depth: int = 0) -> list:
     one token (QA round 1); shlex already joins quote-split words."""
     if not cmd or _depth > 3:
         return [cmd or ""]
+    full = str(cmd)[:400_001]        # the whole command: no truncation (QA r4)
+    full = full.replace("\\\r\n", "").replace("\\\n", "")
     cmd = str(cmd)[:normalize._MAX]
     # Bash deletes a backslash-newline, joining the word (QA r2): judge that.
     cmd = cmd.replace("\\\r\n", "").replace("\\\n", "")
-    out = [cmd]
+    out = [full] if full != cmd else [cmd]
     ansic = normalize._ANSIC_MARKER_RE.sub("", normalize._decode_ansic(cmd))
     if ansic != cmd:
         out.append(ansic)
@@ -16556,7 +16558,16 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     cwd and gates a non-read command run inside the tree or a relative path
     resolving into it); ``find ~ -path '*plugins/cache*' -exec <writer>``;
     ``export CLAUDE_CONFIG_DIR=...; claude`` and ``env -S``. Closed with
-    regression tests.
+    regression tests. Round 4, design: PASS with should-fixes -- read-only
+    ``git -C <tree> log|status|rev-parse``, ``sort``/``uniq``/``fd``/``xxd``/
+    ``xargs basename`` pipelines on tree files, and ``--settings`` JSON
+    setting a plugin to ``false`` asked (reads now recognized per quote-aware
+    segment; ``--settings`` JSON is value-gated like the file form). Round 4,
+    bypass: FAIL -- ``cat <<EOF | bash`` (a heredoc whose pipeline feeds an
+    interpreter is now code); ``(cd ~/.claude; cd plugins; ...)``, ``{ ...
+    }``, ``builtin cd`` and ``CDPATH=`` hid the directory tracker; a CLI
+    call past the 20,000-char normalize cap was truncated away (the whole
+    command is now judged). Closed with regression tests.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")

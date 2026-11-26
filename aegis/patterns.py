@@ -11144,12 +11144,24 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
     if not isinstance(cmd, str) or len(cmd) > 400_000:
         return ""
     cur = (cwd or "").replace("\\", "/")
-    segs = re.split(r"&&|\|\||;|\n|\|", cmd)
+    cdpath = ""
+    # Subshell/brace groups and `builtin`/`command` wrappers do not hide a
+    # `cd` (QA r4): split on them too and drop wrapper words.
+    segs = re.split(r"&&|\|\||;|\n|\||[(){}]", cmd)
     if len(segs) > 20000:
         return "tree"
     for seg in segs:
         words = seg.replace("'", "").replace('"', "").split()
+        while words and (words[0].lower() in ("builtin", "command", "exec", "export", "env", "declare",
+                                              "typeset", "local", "readonly", "time", "nohup")
+                         or (_HTTP_RC_ASSIGN_RE.match(words[0]) and len(words) > 1)):
+            if words[0].upper().startswith("CDPATH="):
+                cdpath = words[0].split("=", 1)[1].split(":")[0]
+            words = words[1:]
         if not words:
+            continue
+        if words[0].upper().startswith("CDPATH="):
+            cdpath = words[0].split("=", 1)[1].split(":")[0]
             continue
         verb = words[0].lower()
         if verb in _CPLUG_CD_WORDS:
@@ -11157,6 +11169,8 @@ def claude_plugin_cd_sim_kind(cmd: str, cwd: str = "") -> str:
             tgt = tgt.replace("\\", "/")
             if tgt.startswith(("/", "~", "$")) or re.match(r"^[A-Za-z]:", tgt):
                 cur = tgt
+            elif cdpath and not tgt.startswith("."):
+                cur = posixpath.normpath(cdpath.rstrip("/") + "/" + tgt)
             elif cur:
                 cur = posixpath.normpath(cur.rstrip("/") + "/" + tgt)
             else:
@@ -11598,7 +11612,13 @@ def _cplug_drop_text_heredocs(cmd: str) -> str:
         end = re.compile(r"^[ \t]*" + re.escape(m.group(2)) + r"[ \t]*$", re.MULTILINE).search(cmd, body_start + 1)
         if not end:
             break
-        if verb in _CPLUG_INTERP_VERBS or verb.startswith("python") or not verb:
+        line_end = body_start
+        piped = bool(re.search(r"\|\s*(?:sudo\s+|env\s+|command\s+|exec\s+)*(?:\S*/)?"
+                               r"(?:ba|z|da|k|fi|c|tc)?sh\b|\|\s*(?:sudo\s+)?(?:\S*/)?"
+                               r"(?:python\d*|node|perl|ruby|php|xargs|eval|source|pwsh|powershell)\b"
+                               r"|\|\s*\.\s", cmd[line_start:line_end], re.IGNORECASE))
+        if piped or verb in _CPLUG_INTERP_VERBS or verb.startswith("python") or not verb:
+            # Fed to an interpreter (`cat <<E | bash`): the body is code (QA r4).
             out.append(cmd[pos:end.end()])
         else:
             out.append(cmd[pos:body_start + 1])

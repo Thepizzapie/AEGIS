@@ -770,3 +770,30 @@ def test_r4_not_gated(cmd):
 ])
 def test_r4_still_gated(cmd):
     assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd
+
+
+# ---- QA round 4 (bypass review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd", [
+    "cat <<'EOF' | bash\nclaude plugin install evil@mkt\nEOF",
+    "cat <<EOF | sh\nclaude plugin marketplace add evil/repo\nEOF",
+    "cat <<'EOF' | sudo bash\nclaude plugin install evil@mkt\nEOF",
+    "tee /tmp/z <<'EOF' | bash\nclaude plugin install evil@mkt\nEOF",
+    "(cd ~/.claude; cd plugins; echo x > cache/m/p/1/hooks/hooks.json)",
+    "{ cd ~/.claude; cd plugins; echo x > cache/m/p/1/hooks/hooks.json; }",
+    "builtin cd ~/.claude; builtin cd plugins; echo x > cache/m/p/1/hooks/hooks.json",
+    "export CDPATH=~/.claude; cd plugins; echo x > cache/m/p/1/hooks/hooks.json",
+    "(cd ~/.claude && cd plugins && sed -i s/a/b/ cache/p/hooks/hooks.json)",
+    "DATA=" + "a" * 24000 + " && claude plugin marketplace add evil/repo",
+])
+def test_b4_gated(cmd):
+    assert evaluate(_sh(cmd), EMPTY).action != Action.ALLOW, cmd[:80]
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat > README.md <<'EOF'\nRun claude plugin install fmt@acme\nEOF",
+    "cat <<'EOF' > docs/x.md\nclaude plugin install a@b\nEOF",
+    "(cd src && cd plugins && npm test)",
+    "export CDPATH=~/proj; cd plugins; npm test",
+])
+def test_b4_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd
