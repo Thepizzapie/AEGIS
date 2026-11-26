@@ -16461,8 +16461,10 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     for git a home-level ``~/.claude``/``$CLAUDE_CONFIG_DIR`` (a project's
     ``.claude/`` holds no plugin tree). The adjacent-words CLI fallback
     (``claude plugin install`` inside one word) reads only whitespace-free
-    words, except for an interpreter's code argument (``python -c``,
-    ``node -e``, ``bash <<EOF``, ``git -c alias.x='!...'``): prose in a PR
+    words, except for code: the value of an interpreter's ``-c``/``-e``/
+    ``--eval``/``-Command`` flag, ``eval``'s words, a heredoc or stdin fed
+    to an interpreter (judged line by line), ``git -c alias.x='!...'``, a
+    ``find -exec``; a string passed to a script file is data. Prose in a PR
     body, a ``sed`` script, a prompt or a ``cat > doc <<EOF`` heredoc is not
     an invocation. ``cli.js`` counts only under ``claude-code/``; a leading
     ``$x``/``${x}``/``$(...)`` verb counts, ``$HOME/bin/tool`` does not.
@@ -16504,7 +16506,11 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     reads a tree file (``python3 -m json.tool ~/.claude/plugins/x.json``);
     an MCP copy whose SOURCE is in the tree; a command whose ``cd
     ~/.claude/plugins`` is followed by a later ``cd`` and a non-read verb.
-    An unknown ``mode`` resolves to deny, as in every sibling guard.
+    An unknown (or empty) ``mode`` resolves to deny, as in every sibling
+    guard. Also accepted: a trailing ``# ... claude plugin install`` comment
+    after a non-text verb; ``awk`` naming a gated key in settings.local.json
+    (awk can ``system()``); an MCP extract into a project ``.claude``; a
+    ``git push``/heredoc commit with cwd inside the plugin tree.
 
     QA history (independent bypass and design reviews, run in parallel).
     Round 1, design: PASS with should-fixes -- doc/commit-message/grep text
@@ -16567,7 +16573,16 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     interpreter is now code); ``(cd ~/.claude; cd plugins; ...)``, ``{ ...
     }``, ``builtin cd`` and ``CDPATH=`` hid the directory tracker; a CLI
     call past the 20,000-char normalize cap was truncated away (the whole
-    command is now judged). Closed with regression tests.
+    command is now judged). Closed with regression tests. Round 5: the
+    bypass reviewer stopped early; its candidate list was checked directly
+    -- a second ``CDPATH`` entry and ``pushd``/``popd`` were fixed (the
+    tracker now keeps a directory stack and tries every CDPATH entry).
+    Design: PASS with should-fixes -- renderings glued by ``_shell_scan``'s
+    space join re-created the round-4 false ASK (each rendering is now
+    judged on its own); writer verbs after ``cd`` into ANY ``.claude`` asked
+    (the window now applies per-verb destination rules, and git only for a
+    home-level config dir); every argument of an interpreter was read as
+    code (now only code-flag values).
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")
@@ -16639,19 +16654,22 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = _cmd(ev)
         cli = any(patterns.claude_plugin_cli_hit(x) for x in _cplug_cli_surfaces(raw))
         if not cli:
-            kind = patterns.claude_plugin_shell_kind(cmd) or patterns.claude_plugin_shell_kind(raw)
+            # Each rendering judged on its own: `_shell_scan` joins them with
+            # a space, gluing one's last word onto the next's (QA r5).
+            srends = list(dict.fromkeys(
+                [raw] + normalize.scan_surface(raw, sep="\n\u0000").split("\n\u0000")))[:50]
+            kind = next((k for k in (patterns.claude_plugin_shell_kind(x) for x in srends) if k), "")
             if not kind:
-                kind = (patterns.claude_plugin_cd_sim_kind(cmd, str(ev.cwd or ""))
-                        or patterns.claude_plugin_cd_sim_kind(raw, str(ev.cwd or "")))
+                kind = next((k for k in (patterns.claude_plugin_cd_sim_kind(x, str(ev.cwd or ""))
+                                         for x in srends) if k), "")
             if not kind and ev.cwd and "\n" not in str(ev.cwd) \
                     and not re.search(r"\b(?:cd|pushd|chdir|sl|set-location|push-location)\b", raw, re.I):
                 # The command runs FROM the plugin tree / `.claude` dir: a
                 # bare relative write lands there (QA round 1).
                 pre = "cd '" + str(ev.cwd).replace("'", "") + "' && "
                 ck = patterns.claude_plugin_kind(str(ev.cwd).rstrip("/\\") + "/")
-                kind = ck if ck == "tree" else (
-                    patterns.claude_plugin_shell_kind(pre + cmd)
-                    or patterns.claude_plugin_shell_kind(pre + raw))
+                kind = ck if ck == "tree" else next(
+                    (k for k in (patterns.claude_plugin_shell_kind(pre + x) for x in srends) if k), "")
             if not kind:
                 return None
             # Renderings kept apart by newlines: `scan_surface`'s space join

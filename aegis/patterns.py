@@ -11276,7 +11276,12 @@ def claude_plugin_shell_kind(cmd) -> str:
         if _CPLUG_BARE_SETTINGS_RE.search(cflat, m.end(), end):
             return "settings"
         if _CPLUG_TREE_WRITER_RE.search(cflat, m.end(), end):
-            return "tree"
+            tgt = cflat[m.start():m.end()].split(None, 1)[-1].strip("'\" ")
+            home = bool(_CPLUG_HOME_DIR_RE.search(tgt.rstrip("/") + "/")
+                        or _CPLUG_HOME_DIR_RE.search(tgt))
+            for wseg in _HTTP_RC_SEG_SPLIT_RE.split(cflat[m.end():end]):
+                if wseg and _cplug_writer_into_cwd(wseg, home):
+                    return "tree"
     for seg in _HTTP_RC_SEG_SPLIT_RE.split(cflat):
         if not seg:
             continue
@@ -11346,6 +11351,59 @@ def _cplug_tree_writer_into_config(seg: str) -> bool:
         return bool(re.search(r"\b(?:apply|am|checkout|restore|clone|pull|merge|reset|switch|stash)\b", seg))
     if verb in ("patch", "cpio", "ditto", "unar", "pax", "expand-archive"):
         return True
+    return False
+
+
+def _cplug_writer_into_cwd(seg: str, home: bool) -> bool:
+    """A whole-tree writer run FROM the config dir that writes into it:
+    archive extraction with no explicit destination (or a relative one),
+    rsync/cp whose last operand is relative, patch, and -- only for a
+    home-level config dir -- a git command that rewrites the work tree."""
+    words = seg.split()
+    i = 0
+    while i < len(words) and (words[i].lower() in _HTTP_RC_PREFIX_WORDS or _HTTP_RC_ASSIGN_RE.match(words[i])):
+        i += 1
+    if i >= len(words):
+        return False
+    verb = words[i].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    args = words[i + 1:]
+
+    def rel(a):
+        a = a.strip("'\"")
+        return bool(a) and not a.startswith(("/", "~", "$")) and not re.match(r"^[A-Za-z]:", a)
+
+    def dest_after(flags):
+        for j, a in enumerate(args):
+            if a in flags and j + 1 < len(args):
+                return args[j + 1]
+            for f in flags:
+                if f.startswith("--") and a.startswith(f + "="):
+                    return a.split("=", 1)[1]
+                if not f.startswith("--") and a.startswith(f) and len(a) > len(f):
+                    return a[len(f):]
+        return None
+    if verb in ("tar", "bsdtar", "gtar"):
+        first = args[0] if args else ""
+        extract = bool(re.match(r"^-?[A-Za-z]*x", first) or any(
+            a.startswith(("--extract", "--get")) or a == "-x" for a in args))
+        d = dest_after(("-C", "--directory"))
+        return extract and (d is None or rel(d))
+    if verb == "unzip":
+        if any(a in ("-l", "-t", "-v", "-Z", "-p", "-c") for a in args):
+            return False
+        d = dest_after(("-d",))
+        return d is None or rel(d)
+    if verb in ("7z", "7za", "7zr"):
+        d = dest_after(("-o",))
+        return bool(args) and args[0].lower() in ("x", "e") and (d is None or rel(d))
+    if verb == "rsync":
+        pos = [a for a in args if not a.startswith("-")]
+        return bool(pos) and rel(pos[-1])
+    if verb in ("patch", "cpio", "ditto", "unar", "pax"):
+        return True
+    if verb == "git":
+        return home and bool(re.search(
+            r"\b(?:apply|am|checkout|restore|pull|merge|reset|switch|stash|rebase|cherry-pick)\b", seg))
     return False
 
 
@@ -11454,6 +11512,8 @@ _CPLUG_EXEC_SINK_RE = re.compile(
 _CPLUG_SINK_TEXT_RE = re.compile(
     r"(?<![\w/.-])claude(?:-code)?[^\w/]{1,8}(?:plugins?[^\w/]{1,8}(?:install|i|add|enable|update"
     r"|upgrade|marketplaces?)\b|--plugin-dir|--settings?\b|--setting-sources)", re.IGNORECASE)
+_CPLUG_CODE_FLAGS = frozenset(("-c", "-e", "-E", "--eval", "-p", "--print", "-r", "-Command",
+                               "-command", "-C", "--command", "-x", "exec"))
 _CPLUG_TEXT_VERBS = frozenset(("git", "grep", "egrep", "fgrep", "rg", "echo", "printf",
                                "cat", "head", "tail", "less", "more", "ls", "wc"))
 _CPLUG_TOKEN_SPLIT = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n", ";;", "|&"))
@@ -11717,11 +11777,21 @@ def claude_plugin_cli_hit(cmd) -> bool:
                 # Prose in a multi-word token (a PR body, a sed script, a
                 # prompt) is not an invocation; only an interpreter's code
                 # argument is judged whole (QA round 2).
-                interp = (sink or verb in _CPLUG_INTERP_VERBS or verb.startswith("python")
-                          # `git -c alias.x='!sh code'` runs its value (QA r1)
-                          or (verb == "git" and ("-c" in cur or "!" in joined))
-                          or "-exec" in cur or "-execdir" in cur)
-                adj_parts.extend(x for x in cur if interp or not re.search(r"\s", x))
+                # Whole multi-word arguments are read only where they are
+                # code: an interpreter's -c/-e/--eval value, eval's words,
+                # a git `-c alias.x='!...'`, find -exec (QA r5: a string
+                # passed to a script file is data).
+                code_idx = set()
+                if sink or verb in ("eval", "source", "."):
+                    code_idx = set(range(len(cur)))
+                elif verb in _CPLUG_INTERP_VERBS or verb.startswith("python"):
+                    for ci, x in enumerate(cur[:-1]):
+                        if x in _CPLUG_CODE_FLAGS or re.fullmatch(r"-[A-Za-z]*[ceE]", x):
+                            code_idx.add(ci + 1)
+                if (verb == "git" and ("-c" in cur or "!" in joined)) or "-exec" in cur or "-execdir" in cur:
+                    code_idx = set(range(len(cur)))
+                adj_parts.extend(x for ci, x in enumerate(cur)
+                                 if ci in code_idx or not re.search(r"\s", x))
         adj_parts.append(t)
         cur = []
     if _CPLUG_ADJ_RE.search(" ".join(adj_parts)):

@@ -812,3 +812,36 @@ def test_r5_gated(cmd):
 def test_r5_popd_leaves_tree():
     cmd = "pushd ~/proj; pushd ~/.claude/plugins; popd; sed -i s/a/b/ src/x.js"
     assert patterns.claude_plugin_cd_sim_kind(cmd) == ""
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("ls ~/.claude && git pull", None),
+    ("echo ~/.claude; git checkout main", None),
+    ("du -sh ~/.claude && rsync -a src/ dst/", None),
+    ("ls ~/.claude; tar -xf a.tar", None),
+    ("cd ~/.claude && cd ~/app && git pull", None),
+    ("cd .claude && git checkout -- commands/review.md", "/repo"),
+    ("cd /repo/.claude && git pull", None),
+    ("git stash", "/repo/.claude"),
+    ("rsync -av src/ /tmp/dist/", "/repo/.claude/agents"),
+    ("cd ~/.claude && tar -czf /tmp/backup.tgz .", None),
+    ("tar -xzf r.tgz -C /tmp/x", "/root/.claude"),
+    ("python3 test.py 'claude plugin install x'", None),
+    ("node cli.mjs --cmd 'claude plugin install x'", None),
+    ("bash scripts/e2e.sh 'claude plugin install x'", None),
+    ("python3 -m mytool 'claude plugin install x'", None),
+])
+def test_r5_design_not_gated(cmd, cwd):
+    assert rule_claude_plugin_protect(_sh(cmd, cwd), EMPTY) is None, cmd
+
+
+@pytest.mark.parametrize("cmd,cwd", [
+    ("cd ~/.claude && tar -xf /tmp/e.tar", None),
+    ("cd ~/.claude && git pull", None),
+    ("tar -xf /tmp/e.tar", "/root/.claude"),
+    ("unzip /tmp/e.zip", "/root/.claude"),
+    ("python3 -c \"import os; os.system('claude plugin install x@m')\"", None),
+    ("bash -c 'claude plugin install x@m'", None),
+])
+def test_r5_design_still_gated(cmd, cwd):
+    assert evaluate(_sh(cmd, cwd), EMPTY).action != Action.ALLOW, cmd
