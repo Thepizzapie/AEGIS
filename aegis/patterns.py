@@ -10972,3 +10972,257 @@ def bunfig_unsafe_entries(content) -> list:
         else:
             add(f"{k} (unrecognized bunfig key)", k, v)
     return out
+
+
+# ---- Claude Code plugin system (`rules.rule_claude_plugin_protect`) ---------
+# Claude Code plugins bundle hooks, MCP servers, slash commands, agents and
+# skills. An enabled plugin's `hooks/hooks.json` entries are executed by the
+# runtime as its own subprocess -- outside the tool-call loop Aegis gates --
+# exactly like a `hooks` entry in a settings file. Three ungated ways to get
+# one running (or to switch Aegis off altogether):
+#   * `.claude/settings.local.json` keys `enabledPlugins` /
+#     `extraKnownMarketplaces` (the project `.claude/settings.json` and the
+#     user `~/.claude/settings.json` are already `rule_self_protect`'s), and
+#     `disableAllHooks: true` -- which turns off EVERY hook, Aegis's own
+#     PreToolUse gate included, from the next session on;
+#   * any write into the installed-plugin tree `~/.claude/plugins/`
+#     (`marketplaces/`, `cache/`, `known_marketplaces.json`,
+#     `installed_plugins.json`): editing an installed plugin's hooks.json or
+#     a script one of its hooks already runs is code exec at the next event;
+#   * `claude plugin install|enable|update|marketplace add`, which write the
+#     user settings/plugin tree without any tool call naming them, and
+#     `claude --plugin-dir <dir>`, which loads a plugin (hooks included) into
+#     a child session.
+_CPLUG_END = _WIN_TRIM + r"(?=[/\;&|)(<>`}:,]|\s|['\"]|$)"
+_CPLUG_DIR = (r"(?:\.claude" + _WIN_TRIM
+              + r"|(?:\$\{?|%|\$env:)CLAUDE_CONFIG_DIR(?::?[-=+?][^}\s]{0,200})?[}%]?)")
+CLAUDE_PLUGIN_TREE_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=:<>|&;(`{,])" + _CPLUG_DIR + _SEP + r"plugins" + _CPLUG_END,
+    re.IGNORECASE)
+CLAUDE_PLUGIN_SETTINGS_PATH_RE = re.compile(
+    r"(?:^|[\s'\"/\\=:<>|&;(`{,])(?:" + _CPLUG_DIR + _SEP + r"settings\.local\.json"
+    r"|managed-settings\.json)" + _CPLUG_END,
+    re.IGNORECASE)
+# Keys whose ADDITION is gated (compared case-insensitively: conservative).
+CLAUDE_PLUGIN_KEYS = ("disableallhooks", "enabledplugins", "extraknownmarketplaces")
+_CPLUG_KEY_TEXT_RE = re.compile(r"disable\W{0,8}all\W{0,8}hooks|enabled\W{0,8}plugins"
+                                r"|extra\W{0,8}known\W{0,8}marketplaces", re.IGNORECASE)
+_CPLUG_UESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _cplug_cands(path: str) -> list:
+    cands = [path]
+    try:
+        import urllib.parse as _up
+        if "%" in path or path.lower().startswith("file://"):
+            cands.append(_up.unquote(path[7:] if path.lower().startswith("file://") else path))
+    except Exception:
+        pass
+    for c in list(cands):
+        cands.append(_ed_dotdot_normalize(c.replace("\\", "/")))
+    return cands
+
+
+def claude_plugin_kind(path) -> str:
+    """'settings' for a Claude Code local/managed settings file, 'tree' for a
+    path inside (or naming) the installed-plugin tree, else ''."""
+    if not isinstance(path, str) or not path or "\n" in path or len(path) > 4096:
+        return ""
+    cands = _cplug_cands(path)
+    for c in cands:
+        m = None
+        for m in CLAUDE_PLUGIN_SETTINGS_PATH_RE.finditer(c):
+            pass
+        if m and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?[/\\]?", c[m.end():]):
+            return "settings"
+    for c in cands:
+        if CLAUDE_PLUGIN_TREE_PATH_RE.search(c):
+            return "tree"
+    return ""
+
+
+def _cplug_glob_hit(word: str) -> bool:
+    """A glob/brace word that could expand into the plugin tree
+    (`~/.claude/plug*`, `~/.cl?ude/{plugins,x}/m`, `~/.claude/*/cache`)."""
+    comps = [c for c in word.replace("\\", "/").split("/")]
+    budget = 0
+    for i, comp in enumerate(comps[:-1]):
+        nxt = comps[i + 1]
+        for a in _brace_expand(comp):
+            if not fnmatch.fnmatchcase(".claude", a.lower().rstrip(" .")):
+                continue
+            for b in _brace_expand(nxt):
+                budget += 1
+                if budget > 4000:
+                    return True
+                if fnmatch.fnmatchcase("plugins", b.lower().rstrip(" .")):
+                    return True
+    return False
+
+
+_CPLUG_CD_RE = re.compile(
+    r"\b(?:cd|pushd|chdir|sl|set-location|push-location)\s+[\"']?"
+    r"(?:[^\s;&|\"'\n]{0,300}[/\\])?(?:\.claude|\$\{?CLAUDE_CONFIG_DIR\}?)" + _WIN_TRIM
+    + r"(?P<rest>[/\\][^\s;&|\"'\n]{0,300})?", re.IGNORECASE)
+
+
+def claude_plugin_shell_kind(cmd) -> str:
+    """'tree'/'settings' if a shell command names the plugin tree or a gated
+    settings file -- literally, via `\\`/quote splitting, `..`, a glob/brace
+    word, or a `cd ~/.claude` followed by a bare `plugins/...` or
+    `settings.local.json` -- else ''."""
+    if not isinstance(cmd, str) or not cmd:
+        return ""
+    if len(cmd) > 400_000:
+        return "tree"                         # fail closed on absurd input
+    unesc = cmd.replace("\\", "")
+    forms = [cmd, unesc, unesc.replace("'", "").replace('"', "")]
+    forms.append(_ed_dotdot_normalize(forms[-1]))
+    for f in forms:
+        if CLAUDE_PLUGIN_TREE_PATH_RE.search(f):
+            return "tree"
+    for f in forms:
+        if CLAUDE_PLUGIN_SETTINGS_PATH_RE.search(f):
+            return "settings"
+    flat = forms[2]
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(flat)):
+        if i > 8000:
+            return "tree"
+        w = m.group(0)
+        if any(c in w for c in "*?[{") and _cplug_glob_hit(w):
+            return "tree"
+    for m in _CPLUG_CD_RE.finditer(flat):
+        rest = (m.group("rest") or "").replace("\\", "/").lower()
+        if rest.lstrip("/").startswith("plugins") or re.search(
+                r"(?:^|[\s'\"/=])plugins(?:[/\s;&|]|$)", flat[m.end():]):
+            return "tree"
+        if re.search(r"(?:^|[\s'\"/=])settings\.local\.json", flat[m.end():], re.IGNORECASE):
+            return "settings"
+    return ""
+
+
+# `claude plugin(s) install|i|enable|update|marketplace add|update` and
+# `claude --plugin-dir`: the CLI writes the plugin tree / user settings
+# itself, so no tool call ever names a protected path.
+CLAUDE_PLUGIN_CLI_RE = re.compile(
+    r"(?:^|[\s;&|(`/\\'\"])(?:claude(?:\.exe|\.cmd)?|claude-code|@anthropic-ai[/\\]claude-code(?:@\S*)?)"
+    r"\s+(?:(?:-{1,2}[\w-]+(?:=\S*)?|[^\s;&|]+)\s+){0,6}?"
+    r"(?:plugins?\s+(?:-{1,2}[\w-]+(?:=\S*)?\s+){0,4}"
+    r"(?:install|i|add|enable|update|upgrade|marketplace\s+(?:-{1,2}[\w-]+(?:=\S*)?\s+){0,4}(?:add|update|install))\b"
+    r"|--plugin-dir\b)",
+    re.IGNORECASE)
+# A bare `--plugin-dir` anywhere on a claude command line.
+_CPLUG_PLUGIN_DIR_RE = re.compile(r"\bclaude\b[^\n;&|]{0,2000}--plugin-dir\b", re.IGNORECASE)
+
+
+# Shell signal for the settings file: a gated key named anywhere in the
+# command (`\uXXXX`-decoded, loosely spaced so `'disable'+'AllHooks'` still
+# matches). A `jq '.env' file` read or an interpreter edit of other keys stays
+# allowed, as in every sibling settings.local.json guard.
+def claude_plugin_settings_shell_write(cmd) -> bool:
+    if not isinstance(cmd, str):
+        return False
+    decoded = _CPLUG_UESC_RE.sub(lambda m: chr(int(m.group(1), 16)), cmd)
+    return bool(_CPLUG_KEY_TEXT_RE.search(decoded) or _CPLUG_KEY_TEXT_RE.search(cmd))
+
+
+_CPLUG_FRAG_KEY_RE = re.compile(
+    r"[\"'](?:disableAllHooks|enabledPlugins|extraKnownMarketplaces)[\"']\s*:\s*(?P<v>\S{0,6})",
+    re.IGNORECASE)
+
+
+def claude_plugin_fragment_hit(text) -> bool:
+    """Textual fallback for an edit that cannot be replayed on the file (the
+    file is missing, or `old_string` is not in it -- the Edit itself would
+    fail): a gated key introduced as a JSON key, not set to false/null/{}/[]."""
+    if not isinstance(text, str) or not text:
+        return False
+    decoded = _CPLUG_UESC_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    for m in _CPLUG_FRAG_KEY_RE.finditer(decoded):
+        v = m.group("v").lower()
+        if v.startswith(("false", "null", "{}", "[]")):
+            continue
+        return True
+    return False
+
+
+def claude_plugin_cli_hit(cmd) -> bool:
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    for f in (cmd, cmd.replace("\\", "").replace("'", "").replace('"', "")):
+        if CLAUDE_PLUGIN_CLI_RE.search(f) or _CPLUG_PLUGIN_DIR_RE.search(f):
+            return True
+    return False
+
+
+def claude_plugin_patch_hit(text) -> bool:
+    """True if `text` is a patch whose header line names a gated path."""
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    for m in _MISE_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        h = m.group(0)
+        if CLAUDE_PLUGIN_TREE_PATH_RE.search(h) or CLAUDE_PLUGIN_SETTINGS_PATH_RE.search(h):
+            return True
+    return False
+
+
+def _cplug_canon(v) -> str:
+    import json as _json
+    try:
+        return _json.dumps(v, sort_keys=True, default=str)
+    except Exception:
+        return repr(v)
+
+
+def claude_plugin_unsafe_entries(text) -> list:
+    """(label, fingerprint) for every gated entry in a Claude Code settings
+    body: `disableAllHooks` set to anything but false, each `enabledPlugins`
+    entry not set to false, each `extraKnownMarketplaces` source. A body
+    that does not parse as a JSON object but mentions a gated key fails
+    closed."""
+    import json as _json
+    if not isinstance(text, str) or not text.strip():
+        return []
+    if len(text) > 2_000_000:
+        return [("<oversized settings file>", "<oversized>")]
+    body = text.lstrip("﻿")
+    try:
+        data = _json.loads(body)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        decoded = _CPLUG_UESC_RE.sub(lambda m: chr(int(m.group(1), 16)), body)
+        if _CPLUG_KEY_TEXT_RE.search(decoded) or _CPLUG_KEY_TEXT_RE.search(body):
+            return [("<settings body that does not parse as JSON names "
+                     "disableAllHooks/enabledPlugins/extraKnownMarketplaces>", "<unparseable>")]
+        return []
+    out = []
+    for k, v in data.items():
+        lk = str(k).strip().lower()
+        if lk == "disableallhooks":
+            if v is not False and v is not None:
+                out.append(("disableAllHooks (switches off every hook, Aegis included)",
+                            _mise_fp("cplug-disable", _cplug_canon(v))))
+        elif lk == "enabledplugins":
+            if isinstance(v, dict):
+                for pk, pv in v.items():
+                    if pv is False or pv is None:
+                        continue
+                    out.append((f"enabledPlugins[{str(pk)[:60]}]",
+                                _mise_fp("cplug-enable", str(pk), _cplug_canon(pv))))
+            elif isinstance(v, list):
+                for pk in v:
+                    out.append((f"enabledPlugins[{str(pk)[:60]}]",
+                                _mise_fp("cplug-enable", _cplug_canon(pk), "true")))
+            elif v is not None and v is not False:
+                out.append(("enabledPlugins (non-object value)",
+                            _mise_fp("cplug-enable-raw", _cplug_canon(v))))
+        elif lk == "extraknownmarketplaces":
+            if isinstance(v, dict):
+                for mk, mv in v.items():
+                    out.append((f"extraKnownMarketplaces[{str(mk)[:60]}]",
+                                _mise_fp("cplug-mkt", str(mk), _cplug_canon(mv))))
+            elif v is not None:
+                out.append(("extraKnownMarketplaces (non-object value)",
+                            _mise_fp("cplug-mkt-raw", _cplug_canon(v))))
+    return out

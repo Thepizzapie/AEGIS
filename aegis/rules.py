@@ -11191,6 +11191,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.EDITOR_STARTUP_PATH_RE, "an editor startup/init file (vimrc/nvim/emacs.d)"),
     (patterns.MISE_PATH_RE, "a mise/asdf config (mise.toml/.tool-versions) or plugin/shim dir"),
     (patterns.BUNFIG_PATH_RE, "a Bun config file (bunfig.toml / ~/.bunfig.toml)"),
+    (patterns.CLAUDE_PLUGIN_TREE_PATH_RE, "Claude Code's installed-plugin tree (~/.claude/plugins/)"),
 )
 
 
@@ -16145,6 +16146,277 @@ def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+
+def _cplug_path_shaped(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or "\n" in t or len(t) > 4096:
+        return False
+    if not (_HTTP_RC_PATH_SHAPE_RE.match(t) or re.fullmatch(r"[\w.\-$%{}]+(?:[/\\][^\r\n]*)?", t)):
+        return False
+    return bool(patterns.claude_plugin_kind(t))
+
+
+def _cplug_target(ev: Event, p: str) -> tuple:
+    """(kind, path) a write targets; kind '' if none. For MCP calls the path
+    may sit under any key, be a patch header, or be a mapping key."""
+    def kind_of(x):
+        k = patterns.claude_plugin_kind(x)
+        if not k and ev.cwd and isinstance(x, str) and x and not x.startswith(("/", "~", "$", "%")) \
+                and not re.match(r"^[A-Za-z]:", x) and "\n" not in x:
+            k = patterns.claude_plugin_kind(
+                posixpath.join(str(ev.cwd).replace("\\", "/"), x.replace("\\", "/")))
+        return k
+    if p:
+        k = kind_of(p)
+        if k:
+            return k, p
+    if ev.action != ActionClass.MCP:
+        return "", p
+    a = ev.args or {}
+    if p and "\n" not in p:
+        a = {k: v for k, v in a.items() if str(k) not in _ED_PLAIN_CONTENT_KEYS}
+    flat = [str(x) for x in _flatten_strings(a)]
+    for s_ in flat[:5000]:
+        if _cplug_path_shaped(s_):
+            return patterns.claude_plugin_kind(s_.strip()), s_.strip()
+    for s_ in flat[:5000]:
+        if patterns.claude_plugin_patch_hit(s_):
+            return "patch", "<patch>"
+    for k_ in _http_rc_mapping_keys(a):
+        if "\n" not in k_ and patterns.claude_plugin_kind(k_.strip()):
+            return patterns.claude_plugin_kind(k_.strip()), k_
+    for k_, v_ in a.items():
+        if (_http_rc_words(k_) & _MISE_NAME_KEY_WORDS and isinstance(v_, str)
+                and patterns.claude_plugin_kind("/.claude/" + v_.strip()) == "settings"
+                and v_.strip().lower().endswith("settings.local.json")):
+            return "settings", v_.strip()
+    return "", p
+
+
+def _cplug_new_unsafe(ev: Event, p: str, kind: str) -> list:
+    """Labels of gated plugin-system entries the call would ADD (see
+    `_bunfig_new_unsafe`, whose replay-and-diff shape this reuses)."""
+    a = ev.args or {}
+    if _http_rc_mcp_read_only(ev) or _mise_mcp_delete_only(ev):
+        return []
+    if kind == "patch":
+        return ["<patch touching a Claude Code settings file or the plugin tree>"]
+    if kind == "tree":
+        return ["<write into the installed-plugin tree (~/.claude/plugins/)>"]
+    if ev.action == ActionClass.MCP:
+        if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
+            return ["<copied/moved from another file>"]
+        for k in _HTTP_RC_NON_CONTENT_KEYS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != p \
+                    and _HTTP_RC_PATHLIKE_RE.match(v.strip()):
+                pn = str(p).replace("\\", "/").rstrip("/")
+                vn = v.strip().replace("\\", "/").rstrip("/")
+                if not (pn == vn or pn.startswith(vn + "/")):
+                    return [f"<content from another file: {v.strip()[:60]}>"]
+    edits, unreplayable = _http_rc_edit_list(a)
+
+    def _fragment() -> list:
+        # Not replayable (file missing, `old_string` absent, unknown edit
+        # shape): the edit cannot apply as-is, so judge the text it would
+        # insert, as the sibling settings guards do.
+        body = " ".join(str(x) for x in _flatten_strings(a) if str(x).strip() != p)
+        if patterns.claude_plugin_fragment_hit(body):
+            return ["<edit fragment adding disableAllHooks/enabledPlugins/extraKnownMarketplaces>"]
+        return []
+    if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
+        return _fragment()
+    before = _npmrc_read(ev, p)
+    if len(edits) > 500 or len(edits) * len(before or "") > 50_000_000:
+        return ["<too many edits to replay>"]
+    content = a.get("content", a.get("contents"))
+    if content is not None and not isinstance(content, str):
+        content = json.dumps(content, default=str)
+    if edits:
+        if before is None:
+            return _fragment()
+        after = _npmrc_apply_edits(before, edits)
+        if after is None:
+            return _fragment()
+    elif isinstance(content, str):
+        after = content
+    elif ev.action == ActionClass.MCP and _mise_mcp_item_content(a, p) is not None:
+        after = _mise_mcp_item_content(a, p)
+    elif ev.action == ActionClass.MCP:
+        after = "\n".join(x for x in _http_rc_mcp_strings(ev, a) if x.strip() and x.strip() != p)
+    else:
+        after = "\n".join(x for x in _http_rc_written_strings(a) if x != p)
+    had = [fp for _, fp in patterns.claude_plugin_unsafe_entries(before or "")]
+    added = []
+    for label, fp in patterns.claude_plugin_unsafe_entries(after):
+        if fp in ("<unparseable>", "<oversized>"):
+            added.append(label)           # never cancelled by an already-broken file
+        elif fp in had:
+            had.remove(fp)
+        else:
+            added.append(label)
+    return added
+
+
+def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate the Claude Code plugin system: switching every hook off
+    (``disableAllHooks``), enabling a plugin or registering a marketplace
+    from ``.claude/settings.local.json`` (or ``managed-settings.json``),
+    writing into the installed-plugin tree (``~/.claude/plugins/``,
+    ``$CLAUDE_CONFIG_DIR/plugins/``), and the ``claude plugin install|
+    enable|update|marketplace add`` / ``claude --plugin-dir`` CLI forms.
+
+    PLAN / THREAT MODEL: a Claude Code plugin bundles hooks, MCP servers,
+    commands, agents and skills. Its ``hooks/hooks.json`` entries run as the
+    runtime's own subprocess, OUTSIDE the tool-call loop Aegis evaluates --
+    the same blind spot ``rule_claude_hooks_protect`` closes for a ``hooks``
+    key, reached by a different door. A prompt-injected agent can (1) add
+    ``"disableAllHooks": true`` to the gitignored ``settings.local.json`` --
+    one key that switches off every hook, Aegis's own PreToolUse gate
+    included, from the next session on, with no diff to review; (2) add an
+    ``extraKnownMarketplaces`` source it controls plus an ``enabledPlugins``
+    entry naming a plugin from it (or from a marketplace the human already
+    trusts); (3) edit an already-installed plugin under
+    ``~/.claude/plugins/{marketplaces,cache}/...`` -- its hooks.json, or a
+    script one of its existing hooks runs -- which needs no new consent at
+    all; or (4) run ``claude plugin install x@m`` / ``claude plugin
+    marketplace add evil/repo``, which write the user settings and plugin
+    tree without any tool call naming those paths (so ``rule_self_protect``,
+    which guards ``.claude/settings.json``, never sees them). Before this
+    guard, all four were ALLOWED (verified through ``evaluate()``). The
+    project/user ``settings.json`` forms stay ``rule_self_protect``'s DENY.
+
+    BUILD: settings files are parsed as JSON and the before/after set of
+    gated entries is diffed by canonical fingerprint, with Edit/MultiEdit/
+    MCP edits replayed on the on-disk file (the ``rule_bunfig_exec_protect``
+    machinery), so routine local-settings edits (``model``, ``permissions``)
+    and edits beside a human-enabled plugin stay allowed, and setting a
+    plugin or ``disableAllHooks`` to ``false`` passes. A body that does not
+    parse but names a gated key fails closed. An edit that cannot be
+    replayed (file missing, ``old_string`` absent -- the Edit itself would
+    fail) is judged on the text it inserts: a gated key as a JSON key, not
+    set to ``false``/``null``/empty. The plugin tree is path-only:
+    any non-delete write into it asks. Shell is path-only too and INVERTED:
+    a command naming the plugin tree or a gated settings file (literal,
+    ``\\``/quote-split, ``..``, glob/brace word, ``$CLAUDE_CONFIG_DIR``, or a
+    ``cd ~/.claude`` followed by a bare ``plugins/``/``settings.local.json``)
+    asks unless every simple command only reads/deletes or is a non-writing
+    ``git`` subcommand. For a settings file the shell command must also
+    name a gated key (``\\uXXXX``-decoded, loosely spaced so ``'disable'+
+    'AllHooks'`` still counts) -- a ``jq '.env' file`` read or an
+    interpreter edit of other keys stays allowed, as in every sibling
+    settings guard.
+
+    Config (``policy.claude_plugin``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes; matched against the normalized path for
+    file writes and against the WHOLE command, fullmatch, for shell).
+    Escapable only by a human: a trailing ``# aegis-allow`` on the shell
+    form, or ``AEGIS_ALLOW_CLAUDE_PLUGIN=1`` set before launch.
+
+    Honest scope: a plugin/marketplace DELIVERED by ``git clone`` of a repo
+    whose committed ``.claude/settings.json`` names it (no tool call writes
+    it; Claude Code's own trust prompt is the control there); the in-session
+    ``/plugin`` slash command (not a tool call); the contents of a plugin's
+    SOURCE repo or a local marketplace directory outside the plugin tree
+    (``.claude-plugin/``) before it is installed -- the install step is the
+    gate; a relocated config dir not spelled ``.claude`` or
+    ``$CLAUDE_CONFIG_DIR``; paths assembled indirectly. Accepted false ASKs:
+    any non-read shell command naming the plugin tree or settings.local.json
+    (``cp ~/.claude/settings.local.json /tmp``), and a ``claude ...`` command
+    line whose prompt text happens to contain ``plugin install``.
+    """
+    cfg = getattr(policy, "claude_plugin", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "claude-plugin-protect-monitor")
+            return None
+        return would
+
+    if isinstance(ev.args, dict) and isinstance(ev.args.get("command"), (list, tuple)):
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={**ev.args, "command": " ".join(str(x) for x in ev.args["command"])})
+    if not isinstance(ev.args, dict):
+        raw_args = ev.args
+        txt = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)[:400000]
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"command": txt} if _is_shell(ev) else {"input": txt})
+
+    if ev.action == ActionClass.MCP:
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            for c in dict.fromkeys((shell_cmd, shell_cmd.replace("\n", " "))):
+                sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                 args={"command": c}, cwd=ev.cwd)
+                d = rule_claude_plugin_protect(sub, policy)
+                if d is not None:
+                    return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                    "command that touches the Claude Code plugin "
+                                    "system. " + d.message)
+            a0 = ev.args or {}
+            if isinstance(a0.get("command"), str) and re.fullmatch(r"\s*[A-Za-z_]{1,32}\s*", a0["command"]):
+                ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                                args={k: v for k, v in a0.items() if k != "command"})
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        kind, p = _cplug_target(ev, _path(ev))
+        if not kind:
+            return None
+        found = _cplug_new_unsafe(ev, p, kind)
+        if not found:
+            return None
+        if os.environ.get("AEGIS_ALLOW_CLAUDE_PLUGIN") or (
+                p != "<patch>" and _mise_allowed_path(cfg, p)):
+            return None
+        shown = ", ".join(found[:5]) + (", ..." if len(found) > 5 else "")
+        return _finish(Decision(action, "claude-plugin-protect",
+                         f"'{p}' is part of Claude Code's plugin system, and "
+                         f"this write adds: {shown}. A plugin's hooks and MCP "
+                         "servers run as Claude Code's own subprocesses, "
+                         "OUTSIDE the tool-call loop Aegis evaluates, and "
+                         "`disableAllHooks` switches every hook -- Aegis "
+                         "included -- off. Review the change, then confirm "
+                         "with AEGIS_ALLOW_CLAUDE_PLUGIN=1; a spawned agent "
+                         "cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        raw = _cmd(ev)
+        cli = patterns.claude_plugin_cli_hit(cmd) or patterns.claude_plugin_cli_hit(raw)
+        if not cli:
+            kind = patterns.claude_plugin_shell_kind(cmd) or patterns.claude_plugin_shell_kind(raw)
+            if not kind:
+                return None
+            if patterns.mise_shell_only_reads(cmd) and patterns.mise_shell_only_reads(raw):
+                return None
+            if kind == "settings" and not (patterns.claude_plugin_settings_shell_write(cmd)
+                                           or patterns.claude_plugin_settings_shell_write(raw)):
+                return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_CLAUDE_PLUGIN")
+                or _mise_allowed_cmd(cfg, raw)):
+            return None
+        what = ("installs/enables a Claude Code plugin or marketplace (or loads "
+                "one with --plugin-dir)" if cli else
+                "writes Claude Code's installed-plugin tree or local/managed "
+                "settings file from a shell")
+        return _finish(Decision(action, "claude-plugin-protect",
+                         f"This command {what}. A plugin's hooks and MCP "
+                         "servers run as Claude Code's own subprocesses, "
+                         "OUTSIDE the tool-call loop Aegis evaluates, and "
+                         "`disableAllHooks` switches every hook -- Aegis "
+                         "included -- off. A human may append '# aegis-allow', "
+                         "or set AEGIS_ALLOW_CLAUDE_PLUGIN=1; a spawned agent "
+                         "cannot."))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -16211,6 +16483,7 @@ _CORE_RULES = (
     rule_editor_startup_protect,
     rule_mise_exec_protect,
     rule_bunfig_exec_protect,
+    rule_claude_plugin_protect,
     rule_agent_rules_protect,
 )
 

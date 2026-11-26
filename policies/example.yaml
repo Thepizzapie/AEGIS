@@ -75,6 +75,20 @@
 #     mode: ask            # deny | ask (default) | monitor | off
 #     allow: ['^/ci/repo/bunfig\.toml$']
 
+# Claude Code plugin-system protection (optional tuning). Built in and ON by
+# default (mode: ask): a write to .claude/settings.local.json that ADDS
+# `disableAllHooks` (switches off every hook -- Aegis included -- at the next
+# session), an `enabledPlugins` entry or an `extraKnownMarketplaces` source;
+# any write into the installed-plugin tree (~/.claude/plugins/, whose
+# hooks/MCP servers Claude Code runs outside the tool-call loop); and
+# `claude plugin install|enable|update|marketplace add` / `claude
+# --plugin-dir` asks a human first. A human pre-approves with
+# AEGIS_ALLOW_CLAUDE_PLUGIN=1 or a trailing '# aegis-allow'; a spawned agent
+# cannot. Shell `allow` regexes must match the WHOLE command.
+#   claude_plugin:
+#     mode: ask            # deny | ask (default) | monitor | off
+#     allow: ['^claude plugin install formatter@acme-tools$']
+
 default_action: allow
 on_error: allow
 
