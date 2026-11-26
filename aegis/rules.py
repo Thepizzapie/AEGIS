@@ -16190,7 +16190,8 @@ def _cplug_cli_surfaces(cmd: str, _depth: int = 0) -> list:
     if not cmd or _depth > 3:
         return [cmd or ""]
     cmd = str(cmd)[:normalize._MAX]
-    cmd = normalize._LINE_CONT_RE.sub(" ", cmd)
+    # Bash deletes a backslash-newline, joining the word (QA r2): judge that.
+    cmd = cmd.replace("\\\r\n", "").replace("\\\n", "")
     out = [cmd]
     ansic = normalize._ANSIC_MARKER_RE.sub("", normalize._decode_ansic(cmd))
     if ansic != cmd:
@@ -16210,6 +16211,31 @@ def _cplug_cli_surfaces(cmd: str, _depth: int = 0) -> list:
             if inner:
                 out.extend(_cplug_cli_surfaces(inner, _depth + 1))
     return out[:200]
+
+
+def _cplug_exists(ev: Event, p: str) -> bool:
+    fp = _npmrc_resolve(ev, p)
+    try:
+        return bool(fp) and os.path.exists(fp)
+    except Exception:
+        return False
+
+
+def _cplug_is_append(ev: Event, a) -> bool:
+    """An append-mode write (`append_file`, `mode: append`, `append: true`):
+    the result is the old file plus the content (QA round 2)."""
+    if not isinstance(a, dict):
+        return False
+    if ev.action == ActionClass.MCP and "append" in _http_rc_words(str(ev.tool or "").split("__")[-1]):
+        return True
+    for k, v in a.items():
+        lk = str(k).lower()
+        if lk in ("mode", "flag", "flags", "writemode", "write_mode", "op", "operation") \
+                and isinstance(v, str) and ("append" in v.lower() or v.strip().lower() in ("a", "a+", "ab")):
+            return True
+        if lk in ("append", "appendmode", "append_mode") and v not in (False, None, 0, "", "false"):
+            return True
+    return False
 
 
 def _cplug_target(ev: Event, p: str) -> tuple:
@@ -16255,6 +16281,19 @@ def _cplug_target(ev: Event, p: str) -> tuple:
                 and patterns.claude_plugin_kind("/.claude/" + v_.strip()) == "settings"
                 and v_.strip().lower().endswith("settings.local.json")):
             return "settings", v_.strip()
+    # `{dir: <a dir>, name|path: <relative>}`: join every dir-ish value with
+    # every relative string value (QA round 2).
+    dirs = [v_.strip() for k_, v_ in a.items() if isinstance(v_, str)
+            and _http_rc_words(k_) & _MISE_DIR_KEY_WORDS and "\n" not in v_ and len(v_) < 4096]
+    rels = [v_.strip() for v_ in a.values() if isinstance(v_, str) and v_.strip()
+            and "\n" not in v_ and len(v_) < 4096 and not v_.strip().startswith(("/", "~", "$"))
+            and not re.match(r"^[A-Za-z]:", v_.strip())]
+    for d_ in dirs[:20]:
+        for r_ in rels[:20]:
+            j = d_.replace("\\", "/").rstrip("/") + "/" + r_.replace("\\", "/")
+            k = patterns.claude_plugin_kind(j)
+            if k:
+                return k, j
     return "", p
 
 
@@ -16291,20 +16330,41 @@ def _cplug_new_unsafe(ev: Event, p: str, kind: str) -> list:
         if patterns.claude_plugin_fragment_hit(body):
             return ["<edit fragment adding disableAllHooks/enabledPlugins/extraKnownMarketplaces>"]
         return []
+    before = _npmrc_read(ev, p)
+    if before is None and _cplug_exists(ev, p):
+        # Present but unreadable/oversized: an edit or append cannot be
+        # judged against it, so fail closed (QA round 2).
+        if edits or unreplayable or _cplug_is_append(ev, a):
+            return ["<settings file too large or unreadable to verify the edit>"]
     if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
         return _fragment()
-    before = _npmrc_read(ev, p)
     if len(edits) > 500 or len(edits) * len(before or "") > 50_000_000:
         return ["<too many edits to replay>"]
     content = a.get("content", a.get("contents"))
     if content is not None and not isinstance(content, str):
         content = json.dumps(content, default=str)
+    if ev.action == ActionClass.MCP:
+        # A JSON object under any other key (`data`/`value`/`json`) is the
+        # body an MCP JSON writer serializes (QA round 2).
+        for k_, v_ in a.items():
+            if k_ not in ("content", "contents") and isinstance(v_, dict) \
+                    and patterns.claude_plugin_unsafe_entries(json.dumps(v_, default=str)):
+                had0 = [fp for _, fp in patterns.claude_plugin_unsafe_entries(before or "")]
+                new0 = [lb for lb, fp in patterns.claude_plugin_unsafe_entries(
+                    json.dumps(v_, default=str)) if fp not in had0]
+                if new0:
+                    return new0
     if edits:
         if before is None:
             return _fragment()
         after = _npmrc_apply_edits(before, edits)
+        if after is None and "\r\n" in before:
+            # Claude Code's Edit matches CRLF files with LF old_strings.
+            after = _npmrc_apply_edits(before.replace("\r\n", "\n"), edits)
         if after is None:
             return _fragment()
+    elif isinstance(content, str) and _cplug_is_append(ev, a):
+        after = (before or "") + content
     elif isinstance(content, str):
         after = content
     elif ev.action == ActionClass.MCP and _mise_mcp_item_content(a, p) is not None:
@@ -16460,7 +16520,21 @@ def rule_claude_plugin_protect(ev: Event, policy=None) -> Optional[Decision]:
     (fingerprints now keep every key's spelling); the ``ClaudeCode`` 8.3
     form; agent_rules monitor-mode double recording. Narrowed as described
     above, with negative and positive regression tests and an odd-argument
-    fuzz test.
+    fuzz test. Round 2, bypass: FAIL -- an unquoted newline after a read
+    (``ls\\nclaude plugin install``) was glued into one read-only segment
+    (newlines now end a simple command before tokenizing); a backslash-
+    newline inside a word (bash joins it; now joined, not spaced); MCP
+    append writes judged as the whole file (now old file + content); an
+    over-8MB settings file fell back to the fragment check (an edit/append
+    to an existing unreadable file now fails closed); CRLF files with LF
+    ``old_string``; JSON objects under ``data``/``value``/``json``; MCP
+    ``{dir, name}`` into the tree; glued redirects (``>plugins/x``,
+    ``-tplugins``) and globs inside a ``cd ~/.claude`` window;
+    ``Program Files\\ClaudeCode`` and ``$CLAUDE_CONFIG_DIR/settings.json``;
+    ``command $c``/``env $c``; ``printf``/``echo -e`` escapes piped to a
+    shell; the native-installer ``claude/versions/<v>`` binary; a glob or
+    ``${p:-plugin}`` subcommand; ``CLAUDE_CONFIG_DIR=... claude``; and a
+    quadratic prefix-word scan. All closed with regression tests.
     """
     cfg = getattr(policy, "claude_plugin", None) or {}
     raw_mode = cfg.get("mode", "ask")

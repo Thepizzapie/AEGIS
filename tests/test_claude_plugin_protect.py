@@ -575,3 +575,101 @@ def test_r2_fuzz_odd_args_no_exceptions():
                         action=ActionClass.MCP if t.startswith("mcp__") else None,
                         args=args, cwd=rnd.choice([None, "/home/u/.claude", "/r"]))
         rule_claude_plugin_protect(ev, EMPTY)
+
+
+# ---- QA round 2 (bypass review) regressions ---------------------------------
+@pytest.mark.parametrize("cmd,cwd", [
+    ("ls\nclaude plugin install x@m", None),
+    ("git status\nclaude plugin marketplace add evil/repo", None),
+    ("cat README.md\nclaude --plugin-dir /tmp/p -p hi", None),
+    ("echo ok\nclaude --settings /tmp/s.json -p hi", None),
+    ("wc -l f\nclaude config set -g disableAllHooks true", None),
+    ("claude plugin ins\\\ntall x@m", None),
+    ("cla\\\nude plugin install x@m", None),
+    ("claude plu\\\ngin install x@m", None),
+    ("claude plugin marketplace a\\\ndd evil/repo", None),
+    ("claude --plugin-\\\ndir /tmp/p", None),
+    ("claude --sett\\\nings /tmp/s.json", None),
+    ("bash -c 'claude plugin ins\\\ntall x@m'", None),
+    ("sh <<'E'\ncl\\\naude plugin install x@m\nE", None),
+    ("cd ~/.claude; echo x >plugins/x", None),
+    ("cd ~/.claude; echo x>>plugins/x", None),
+    ("cd .claude; echo '{\"disableAllHooks\":true}' >settings.local.json", None),
+    ("echo x >plugins/cache/p/hooks/hooks.json", "/root/.claude"),
+    ("echo '{\"disableAllHooks\":1}' >settings.local.json", "/r/.claude"),
+    ("cd ~/.claude; cp /tmp/h -tplugins", None),
+    ("cd ~/.claude; cp /tmp/h plugin?/x", None),
+    ("cd ~/.claude; cp /tmp/h plu*/cache/p/hooks/hooks.json", None),
+    ("c=claude; command $c plugin install x@m", None),
+    ("c=claude; env $c plugin install x@m", None),
+    ("printf 'cl\\x61ude plugin install x@m' | sh", None),
+    ("printf 'claude\\x20plugin\\x20install x@m' | sh", None),
+    ("echo -e 'claude plugin \\x69nstall x@m' | sh", None),
+    ("printf 'claude plugin %s x@m' install | sh", None),
+    ("~/.local/share/claude/versions/2.0.1 plugin install x@m", None),
+    ("claude plugin ins* x@m", None),
+    ("claude ${p:-plugin} install x@m", None),
+    ("CLAUDE_CONFIG_DIR=/tmp/evil claude -p hi", None),
+])
+def test_b2_shell_gated(cmd, cwd):
+    assert evaluate(_sh(cmd, cwd), EMPTY).action != Action.ALLOW, cmd
+
+
+def test_b2_mcp_shell_newline():
+    ev = _mcp({"cmd": "ls\nclaude plugin install x@m"}, tool="mcp__x__run_command")
+    assert evaluate(ev, EMPTY).action != Action.ALLOW
+
+
+def test_b2_mcp_append_split_key(tmp_path):
+    d = tmp_path / ".claude"
+    d.mkdir()
+    f = d / "settings.local.json"
+    f.write_text('{"model": "x", "disable')
+    for tool, extra in (("mcp__fs__append_file", {}), ("mcp__fs__write_file", {"mode": "append"})):
+        ev = _mcp({"path": str(f), "content": 'AllHooks": true}', **extra}, tool=tool)
+        assert evaluate(ev, EMPTY).action != Action.ALLOW, tool
+
+
+def test_b2_oversized_file_edit_fails_closed(tmp_path):
+    d = tmp_path / ".claude"
+    d.mkdir()
+    f = d / "settings.local.json"
+    f.write_text('{"disableAllHook_s": true, "pad": "' + " " * (9 * 1024 * 1024) + '"}')
+    assert _ours(rule_claude_plugin_protect(_edit(str(f), 'Hook_s"', 'Hooks"'), EMPTY))
+
+
+def test_b2_crlf_replay(tmp_path):
+    d = tmp_path / ".claude"
+    d.mkdir()
+    f = d / "settings.local.json"
+    f.write_bytes(b'{\r\n  "disableAllHooks_X": true,\r\n  "model": "x"\r\n}')
+    ev = _edit(str(f), 'Hooks_X": true,\n  "model"', 'Hooks": true,\n  "model"')
+    assert _ours(rule_claude_plugin_protect(ev, EMPTY))
+
+
+@pytest.mark.parametrize("args", [
+    {"path": "/r/.claude/settings.local.json", "data": {"disableAllHooks": True}},
+    {"path": "/r/.claude/settings.local.json", "value": {"enabledPlugins": {"x@m": True}}},
+    {"path": "/r/.claude/settings.local.json", "json": {"extraKnownMarketplaces": {"m": {}}}},
+    {"dir": "/root/.claude", "name": "plugins/cache/p/hooks/hooks.json", "content": "{}"},
+    {"dir": "/root/.claude", "path": "plugins/x.json", "content": "{}"},
+])
+def test_b2_mcp_shapes(args):
+    assert evaluate(_mcp(args, tool="mcp__fs__write_json"), EMPTY).action != Action.ALLOW
+
+
+@pytest.mark.parametrize("p", [
+    "C:\\Program Files\\ClaudeCode\\managed-settings.json",
+    "$CLAUDE_CONFIG_DIR/settings.json",
+])
+def test_b2_more_settings_paths(p):
+    assert evaluate(_write(p, {"disableAllHooks": True}), EMPTY).action != Action.ALLOW
+
+
+@pytest.mark.parametrize("cmd", [
+    "tree ~/.claude/plugins",
+    "printf '%s\\n' hello | sh",
+    "echo 'npm test' | sh",
+])
+def test_b2_not_gated(cmd):
+    assert rule_claude_plugin_protect(_sh(cmd), EMPTY) is None, cmd

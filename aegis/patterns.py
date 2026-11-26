@@ -11001,8 +11001,10 @@ CLAUDE_PLUGIN_TREE_PATH_RE = re.compile(
     re.IGNORECASE)
 CLAUDE_PLUGIN_SETTINGS_PATH_RE = re.compile(
     r"(?:^|[\s'\"/\\=:<>|&;(`{,])(?:" + _CPLUG_DIR + _SEP + r"settings\.local\.json"
+    r"|(?:\$\{?|%|\$env:)CLAUDE_CONFIG_DIR[}%]?" + _SEP + r"settings\.json"
     r"|(?:etc" + _SEP + r"claude-code|Application Support" + _SEP + r"ClaudeCode"
-    r"|ProgramData" + _SEP + r"ClaudeCode)" + _SEP + r"managed-settings\.json)" + _CPLUG_END,
+    r"|(?:ProgramData|Program Files(?: \(x86\))?)" + _SEP + r"ClaudeCode)" + _SEP
+    + r"managed-settings\.json)" + _CPLUG_END,
     re.IGNORECASE)
 _CPLUG_KEY_TEXT_RE = re.compile(r"disable\W{0,8}all\W{0,8}hooks|enabled\W{0,8}plugins"
                                 r"|extra\W{0,8}known\W{0,8}marketplaces", re.IGNORECASE)
@@ -11101,8 +11103,8 @@ _CPLUG_CD_RE = re.compile(
 # Any later directory change ends the window a `cd ~/.claude` opened (QA r1).
 _CPLUG_ANY_CD_RE = re.compile(r"\b(?:cd|pushd|popd|chdir|sl|set-location|push-location|pop-location)\b",
                               re.IGNORECASE)
-_CPLUG_BARE_PLUGINS_RE = re.compile(r"(?:^|[\s'\"/=(,])plugins(?:[/\s;&|'\",)]|$)")
-_CPLUG_BARE_SETTINGS_RE = re.compile(r"(?:^|[\s'\"/=(,])settings\.local\.json", re.IGNORECASE)
+_CPLUG_BARE_PLUGINS_RE = re.compile(r"(?:^|[\s'\"/=(,<>:]|(?<=\s-t))plugins(?:[/\s;&|'\",)<>]|$)")
+_CPLUG_BARE_SETTINGS_RE = re.compile(r"(?:^|[\s'\"/=(,<>:]|(?<=\s-t))settings\.local\.json", re.IGNORECASE)
 # The config dir itself (or its parent's write into it) as a TARGET of a
 # whole-tree writer: archive extraction, rsync, patch, `git apply`.
 _CPLUG_DIR_WORD_RE = re.compile(
@@ -11116,7 +11118,8 @@ _CPLUG_FIND_ACTION_RE = re.compile(r"(?:^|\s)-(?:exec|execdir|ok|okdir|delete|fp
 _CPLUG_FIND_RE = re.compile(r"(?:^|[\s;&|(`/])find\b", re.IGNORECASE)
 _CPLUG_MANAGED_D_RE = re.compile(
     r"(?:etc" + _SEP + r"claude-code|Application Support" + _SEP + r"ClaudeCode"
-    r"|ProgramData" + _SEP + r"ClaudeCode)" + _SEP + r"managed-settings\.d(?:[/\\]|$)", re.IGNORECASE)
+    r"|(?:ProgramData|Program Files(?: \(x86\))?)" + _SEP + r"ClaudeCode)" + _SEP
+    + r"managed-settings\.d(?:[/\\]|$)", re.IGNORECASE)
 
 
 def _cplug_literal_kind(f: str) -> str:
@@ -11138,6 +11141,7 @@ def claude_plugin_shell_kind(cmd) -> str:
         return ""
     if len(cmd) > 400_000:
         return "tree"                         # fail closed on absurd input
+    cmd = cmd.replace("\\\r\n", "").replace("\\\n", "")   # line continuation joins words
     unesc = cmd.replace("\\", "")
     forms = [cmd, unesc, unesc.replace("'", "").replace('"', "")]
     forms.append(_ed_dotdot_normalize(forms[-1]))
@@ -11175,7 +11179,8 @@ def claude_plugin_shell_kind(cmd) -> str:
             if not any(c in w for c in "*?[{"):
                 return w
             alts = _cplug_canon_word(w, b2)
-            hit = [x for x in alts if ".claude" in x or "settings.local.json" in x]
+            hit = [x for x in alts if ".claude" in x or "settings.local.json" in x
+                   or re.search(r"(?:^|/)plugins(?:/|$)", x)]
             return hit[0] if hit else w
         cflat = _HTTP_RC_WORD_RE.sub(_sub, flat)
     n = len(cflat)
@@ -11337,7 +11342,8 @@ def claude_plugin_fragment_hit(text) -> bool:
 # install docs'` stays one token and never counts (QA round 1).
 _CPLUG_CLAUDE_TOKEN_RE = re.compile(
     r"(?:^|[/\\])(?:claude(?:\.exe|\.cmd|\.ps1)?|claude-code(?:@\S*)?)$"
-    r"|@anthropic-ai[/\\]claude-code|claude-code[/\\](?:[^\s]*[/\\])?cli\.m?js$", re.IGNORECASE)
+    r"|@anthropic-ai[/\\]claude-code|claude-code[/\\](?:[^\s]*[/\\])?cli\.m?js$"
+    r"|claude[/\\]versions[/\\][^/\\\s]+$", re.IGNORECASE)
 _CPLUG_PLUGIN_SUBS = frozenset(("install", "i", "add", "enable", "update", "upgrade"))
 _CPLUG_MKT_SUBS = frozenset(("add", "update", "install", "upgrade"))
 # Fallback over quote-stripped text, for list-form spawns (`['claude',
@@ -11360,6 +11366,9 @@ _CPLUG_TOKEN_SPLIT = frozenset((";", "&&", "||", "|", "&", "(", ")", "\n", ";;",
 
 def _cplug_tokens(cmd: str):
     import shlex as _shlex
+    # An unquoted newline ends a simple command; shlex would treat it as
+    # whitespace and glue `ls\nclaude plugin install` into one (QA r2).
+    cmd = _cplug_newlines_to_semis(cmd)
     try:
         lex = _shlex.shlex(cmd, posix=True, punctuation_chars=";&|()")
         lex.whitespace_split = True
@@ -11367,6 +11376,34 @@ def _cplug_tokens(cmd: str):
         return list(lex)
     except ValueError:
         return None
+
+
+def _cplug_newlines_to_semis(cmd: str) -> str:
+    out, q, i, n = [], None, 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if q:
+            if c == "\\" and q == '"' and i + 1 < n:
+                out.append(cmd[i:i + 2])
+                i += 2
+                continue
+            if c == q:
+                q = None
+            out.append(c)
+        else:
+            if c == "\\" and i + 1 < n:
+                out.append(cmd[i:i + 2])
+                i += 2
+                continue
+            if c in "'\"":
+                q = c
+                out.append(c)
+            elif c == "\n":
+                out.append(" ; ")
+            else:
+                out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def _cplug_dynamic(t: str) -> bool:
@@ -11395,12 +11432,25 @@ def _cplug_cli_tokens_hit(toks: list) -> bool:
             cur.append(t)
     segs.append(cur)
     for seg in segs:
+        lead = True                 # every earlier word a prefix/assignment/flag
+        cfgdir = False              # an earlier `CLAUDE_CONFIG_DIR=` assignment
         for i, t in enumerate(seg):
-            claude_like = bool(_CPLUG_CLAUDE_TOKEN_RE.search(t)) or (
-                _cplug_dynamic(t) and i == 0)
+            if i > 0:
+                x = seg[i - 1]
+                lead = lead and (x.lower() in _HTTP_RC_PREFIX_WORDS
+                                 or bool(_HTTP_RC_ASSIGN_RE.match(x)) or x.startswith("-"))
+                cfgdir = cfgdir or x[:18].upper() == "CLAUDE_CONFIG_DIR="
+            if i > 4000:
+                return True         # absurd simple command: fail closed
+            claude_like = bool(_CPLUG_CLAUDE_TOKEN_RE.search(t)) or (_cplug_dynamic(t) and lead)
             if not claude_like:
                 continue
-            rest = seg[i + 1:]
+            rest = seg[i + 1:i + 80]
+            if cfgdir and _CPLUG_CLAUDE_TOKEN_RE.search(t):
+                return True           # child session reads another config dir
+            if rest and _cplug_dynamic(rest[0]) and len(rest) > 1 and (
+                    rest[1].lower() in _CPLUG_PLUGIN_SUBS or rest[1].lower() in ("marketplace", "marketplaces")):
+                return True           # `claude ${p:-plugin} install`
             for j, w in enumerate(rest[:60]):
                 lw = w.lower()
                 if lw.startswith("--plugin-dir") or lw.startswith("--setting-sources"):
@@ -11427,7 +11477,8 @@ def _cplug_cli_tokens_hit(toks: list) -> bool:
                             return True
                         continue
                     sub = words[0]
-                    if _cplug_dynamic(sub) or sub.lower() in _CPLUG_PLUGIN_SUBS:
+                    if _cplug_dynamic(sub) or sub.lower() in _CPLUG_PLUGIN_SUBS \
+                            or any(c in sub for c in "*?["):
                         return True
                     if sub.lower() in ("marketplace", "marketplaces", "market"):
                         more = words[1:]
@@ -11474,6 +11525,21 @@ def _cplug_drop_text_heredocs(cmd: str) -> str:
     return "".join(out)
 
 
+def _cplug_decode_escapes(t: str) -> str:
+    """printf/echo -e escapes: \\xHH, \\NNN octal, \\uHHHH."""
+    def x(m):
+        g = m.group(0)
+        try:
+            if g[1] in "xX":
+                return chr(int(g[2:], 16))
+            if g[1] in "uU":
+                return chr(int(g[2:], 16))
+            return chr(int(g[1:].lstrip("0") or "0", 8))
+        except Exception:
+            return g
+    return re.sub(r"\\(?:[xX][0-9a-fA-F]{1,2}|[uU][0-9a-fA-F]{4}|0?[0-7]{1,3})", x, t[:400_000])
+
+
 def claude_plugin_cli_hit(cmd) -> bool:
     """A `claude plugin install|i|enable|update|marketplace add|update` (any
     flags between, a non-literal subcommand fails closed), `claude
@@ -11487,12 +11553,18 @@ def claude_plugin_cli_hit(cmd) -> bool:
         return False
     low = re.sub(r"[\\'\"]", "", cmd.lower())
     if "claude" not in low and "cli.js" not in low and "cli.mjs" not in low \
-            and "$" not in cmd and "`" not in cmd:
+            and "$" not in cmd and "`" not in cmd and "\\" not in cmd:
         return False
-    if len(cmd) > 400_000:
-        return True
+    if len(cmd) > 100_000 and "claude" in low:
+        return True            # fail closed: tokenizing is the slow part (QA r2 perf)
     cmd = _cplug_drop_text_heredocs(cmd)
     sink = bool(_CPLUG_EXEC_SINK_RE.search(cmd))
+    if sink:
+        dec = _cplug_decode_escapes(cmd)
+        dl = dec.lower()
+        if re.search(r"(?<![\w/.-])claude", dl) and re.search(r"(?<![\w/.-])plugins?\b|--plugin-dir|--settings",
+                                                           dl):
+            return True        # text fed to an interpreter names the CLI (QA r2)
     stripped = cmd.replace("\\", "").replace("'", "").replace('"', "")
     toks = _cplug_tokens(cmd)
     if toks is None:
@@ -11541,7 +11613,7 @@ def claude_plugin_shell_only_reads(cmd: str) -> bool:
     for seg in re.split(r"(&&|\|\||[;|\n])", cmd):
         words = seg.split()
         verb = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower() if words else ""
-        if (verb == "jq" or (verb == "find" and not _CPLUG_FIND_ACTION_RE.search(seg))) \
+        if (verb in ("jq", "tree", "exa", "eza") or (verb == "find" and not _CPLUG_FIND_ACTION_RE.search(seg))) \
                 and not any(c in seg for c in "<>`$"):
             out.append(" true ")
         else:
