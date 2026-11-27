@@ -11250,6 +11250,21 @@ _LINT_OBFUSCATION_RE = re.compile(
     r"[$`]|\\(?:x[0-9a-fA-F]|u[0-9a-fA-F]|U[0-9a-fA-F]|[0-7]|c)|base64|xxd|\bcut\b|\brev\b")
 
 
+def lint_shared_paths_named(cmd) -> list:
+    """The shared-file path words a shell command names (for the on-disk
+    tail check)."""
+    out = []
+    if not isinstance(cmd, str):
+        return out
+    for m in _HTTP_RC_WORD_RE.finditer(cmd.replace("'", " ").replace('"', " ")[:200_000]):
+        w = m.group(0)
+        if LINT_SHARED_PATH_RE.search(w) and lint_kind_is_shared(lint_kind(w)):
+            out.append(w)
+        if len(out) > 50:
+            break
+    return out
+
+
 def lint_text_names_gated_key(text) -> bool:
     """True if `text` names any key this guard gates in a SHARED file (or
     carries an escape that could spell one)."""
@@ -11283,6 +11298,14 @@ def lint_shared_literal_write_ok(cmd: str) -> bool:
         head = flat if nl < 0 else flat[:nl]
     if re.search(r"(?<![<\d])<(?![<&(])", head):
         return False                              # `cat < other > setup.cfg`
+    q = ""
+    for ch in head:                               # unquoted glob: expands to file names
+        if q:
+            q = "" if ch == q else q
+        elif ch in "'\"":
+            q = ch
+        elif ch in "*?[{":
+            return False
     for seg in _HTTP_RC_SEG_SPLIT_RE.split(head):
         words = [w for w in re.split(r"\s+", re.sub(r"\d*>>?\s*\S+|<<-?\s*\S+", " ", seg)) if w]
         while words and (_HTTP_RC_ASSIGN_RE.match(words[0])
@@ -11297,8 +11320,23 @@ def lint_shared_literal_write_ok(cmd: str) -> bool:
                 continue
             return False
         args = words[1:]
-        if verb == "printf" and any("%" in a for a in args):
+        # Every write must end its line: `echo -n init >> setup.cfg` then
+        # `echo -hook=x >> setup.cfg` assembles a key no single command
+        # names (QA round 1). So no echo flags, and a printf format must
+        # end in `\n`.
+        if verb == "echo" and args and args[0].startswith("-"):
             return False
+        if verb == "printf":
+            if any("%" in a for a in args):
+                return False
+            import shlex as _shlex
+            try:
+                pw = _shlex.split(re.sub(r"\d*>>?\s*\S+", " ", seg), posix=True)
+            except ValueError:
+                return False
+            fmt = next((a for a in pw[1:] if not a.startswith("-")), "")
+            if not fmt.endswith("\\n"):
+                return False
         if verb == "cat" and any(a != "-" and not a.startswith("-") for a in args):
             return False                          # `cat other.cfg > setup.cfg`
         if verb == "tee" and sum(1 for a in args if not a.startswith("-")) > 1:

@@ -257,6 +257,12 @@ def test_mcp_shell_tool():
     "cat >> pyproject.toml <<'EOF'\n[tool.pytest.ini_options]\naddopts = '-p evil'\nEOF",
     "pytest --junitxml=setup.cfg",
     "pylint src --output=.pylintrc",
+    # QA round 1: assembling a key across writes / via expansion
+    "echo -n init >> setup.cfg; echo -hook=b >> setup.cfg",
+    "echo -n init >> setup.cfg",
+    "printf init >> setup.cfg",
+    "echo ini?-hook=x >> setup.cfg",
+    "echo {init,x}-hook=a >> setup.cfg",
 ])
 def test_shell_write_gated(cmd):
     assert _ours(R(_shell(cmd), EMPTY))
@@ -378,3 +384,16 @@ def test_dedicated_unverifiable_edit_stays_gated(tmp_path):
     ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Edit",
                     args={"file_path": str(tmp_path / ".pylintrc"), "new_string": "jobs=1"})
     assert _ours(R(ev, EMPTY))
+
+
+def test_shared_append_to_unterminated_file_gated(tmp_path):
+    f = tmp_path / "setup.cfg"
+    f.write_text("[MAIN]\ninit")             # last line left open
+    ev = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                    args={"command": "echo -hook=x >> setup.cfg"}, cwd=str(tmp_path))
+    assert _ours(R(ev, EMPTY))
+    ev2 = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                     args={"command": "echo hook=x >> setup.cfg"}, cwd=str(tmp_path))
+    assert _ours(R(ev2, EMPTY))
+    f.write_text("[MAIN]\njobs=1\n")
+    assert R(ev2, EMPTY) is None

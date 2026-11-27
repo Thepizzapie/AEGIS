@@ -16253,6 +16253,17 @@ def _lint_new_unsafe(ev: Event, p: str) -> list:
     return added
 
 
+def _lint_shared_tail_open(ev: Event, cmd: str) -> bool:
+    """True if a shared file the command names exists on disk and does not
+    end with a newline -- an append would then continue its last line
+    (`...\ninit` + `-hook=x`), assembling a key no command names."""
+    for w in patterns.lint_shared_paths_named(cmd):
+        txt = _npmrc_read(ev, w)
+        if txt and not txt.endswith(("\n", "\r")):
+            return True
+    return False
+
+
 def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Gate planting a code-loading entry in a linter / test-runner config
     -- pylint, mypy, flake8, pytest, RuboCop, Prettier.
@@ -16389,7 +16400,8 @@ def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
             return None
         if patterns.mise_shell_only_reads(ncmd) and patterns.mise_shell_only_reads(nraw):
             return None
-        if not (d1 or d2) and patterns.lint_shared_literal_write_ok(raw):
+        if not (d1 or d2) and patterns.lint_shared_literal_write_ok(raw) and \
+                not _lint_shared_tail_open(ev, raw):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_LINT_CONFIG_EXEC")
                 or _mise_allowed_cmd(cfg, raw)):
