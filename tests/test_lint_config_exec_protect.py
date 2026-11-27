@@ -115,6 +115,15 @@ def test_paths_not_recognized(p):
     ("/r/.prettierrc.toml", 'plugins = ["./p.js"]\n'),
     ("/r/pyproject.toml", '[tool.mypy\nplugins = ["x"]\n'),     # unparseable + key
     ("/r/.rubocop.yml", "require: [\n"),                         # unparseable + key
+    # QA round 1: configparser [DEFAULT] merge and line-boundary differential
+    ("/r/setup.cfg", "[metadata]\nname=x\n\n[DEFAULT]\nplugins = evilplug.py\n\n[mypy]\nstrict = False\n"),
+    ("/r/.flake8", "[DEFAULT]\nextension = X1 = evilf8:P\npaths = ./\n[flake8:local-plugins]\n"),
+    ("/r/tox.ini", "[DEFAULT]\nextension = X1 = evilf8:P\npaths = ./\n[flake8:local-plugins]\n"),
+    ("/r/setup.cfg", "[mypy]\n# note\x0c[metadata]\nplugins = evilplug.py\n"),
+    ("/r/setup.cfg", "[mypy]\n# note\x85[metadata]\nplugins = evilplug.py\n"),
+    ("/r/setup.cfg", "[mypy]\n# note\u2028[metadata]\nplugins = evilplug.py\n"),
+    ("/r/.rubocop.yml", "inherit_from: rubocop-base.yml\n"),
+    ("/r/.rubocop.yml", "inherit_from:\n  - config/lint.yml\n"),
 ])
 def test_gated_content(path, body):
     assert _ours(R(_write(path, body), EMPTY))

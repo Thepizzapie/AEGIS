@@ -11383,7 +11383,11 @@ def _lint_ini_entries(content: str):
     sect = ""
     cur = None       # [section, key, [value lines], indent]
     out = []
-    for line in content.lstrip("﻿").splitlines():
+    # configparser/iniconfig break lines on \n / \r only; str.splitlines()
+    # also breaks on \x0b \x0c \x1c-\x1e \x85 \u2028 \u2029, which would
+    # let a comment forge a section header the real tool never sees (QA
+    # round 1).
+    for line in re.split(r"\r\n|\r|\n", content.lstrip("\ufeff")):
         if not line.strip() or line.lstrip().startswith(("#", ";")):
             if cur is not None and not line.strip():
                 cur[2].append("")
@@ -11520,17 +11524,22 @@ def lint_unsafe_entries(content, kind) -> list:
             return [("<binary content>", "<unparseable>")]
         for sect, k, v in _lint_ini_entries(content):
             where = f"[{sect}] " if sect else ""
+            # configparser merges [DEFAULT] into EVERY section (mypy, flake8
+            # read it that way -- QA round 1), so a DEFAULT key is judged as
+            # if it sat in each gated section.
+            dflt = sect == "default"
             if kind in ("pylint-ini", "setup-cfg", "tox-ini"):
                 pylint_key(k, v, where)
-            if kind == "mypy-ini" or (kind == "setup-cfg" and sect.startswith("mypy")):
+            if kind == "mypy-ini" or (kind == "setup-cfg" and (sect.startswith("mypy") or dflt)):
                 mypy_key(k, v, where)
             if "local-plugins" in sect.replace("_", "-") or (
-                    kind == "flake8-ini" and k in ("paths", "extension", "report")
-                    and "plugin" in sect):
+                    kind in ("flake8-ini", "setup-cfg", "tox-ini")
+                    and k in ("paths", "extension", "report")
+                    and ("plugin" in sect or dflt)):
                 add(f"{where}{k} (flake8 local plugin, imported from a repo path)",
                     "flake8", sect, k, v)
-            if kind == "pytest-ini" or (kind == "tox-ini" and sect == "pytest") or (
-                    kind == "setup-cfg" and sect == "tool:pytest"):
+            if kind == "pytest-ini" or (kind == "tox-ini" and sect in ("pytest", "default")) or (
+                    kind == "setup-cfg" and sect in ("tool:pytest", "default")):
                 pytest_key(k, v, where)
         return out
 
@@ -11607,6 +11616,13 @@ def lint_unsafe_entries(content, kind) -> list:
                     if not isinstance(x, str) or re.match(r"\w+://", t) or t.startswith(
                             ("/", "~", "$", "%")) or re.match(r"^[A-Za-z]:", t) or ".." in t.split("/"):
                         add(f"{k}: {str(x)[:40]} (config from outside the project)",
+                            "rubocop", nk, x)
+                    elif lint_kind("/" + re.sub(r"^(?:\./)+", "", t)) != "rubocop":
+                        # RuboCop runs ANY inherited file through ERB and
+                        # honours its `require:`; a name this guard does not
+                        # watch (`rubocop-base.yml`) would carry the payload
+                        # unchecked (QA round 1).
+                        add(f"{k}: {str(x)[:40]} (inherits a file this guard does not watch)",
                             "rubocop", nk, x)
         return out
 
