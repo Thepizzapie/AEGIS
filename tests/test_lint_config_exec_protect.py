@@ -124,6 +124,11 @@ def test_paths_not_recognized(p):
     ("/r/setup.cfg", "[mypy]\n# note\u2028[metadata]\nplugins = evilplug.py\n"),
     ("/r/.rubocop.yml", "inherit_from: rubocop-base.yml\n"),
     ("/r/.rubocop.yml", "inherit_from:\n  - config/lint.yml\n"),
+    # QA round 2: configparser ignores text after the header's `]`
+    ("/r/setup.cfg", "[mypy] junk here\npython_executable = /tmp/x\n"),
+    ("/r/setup.cfg", "[mypy]extra\nplugins = /p/evil.py\n"),
+    ("/r/tox.ini", "[flake8:local-plugins]zzz\nextension = XX = m:C\npaths = .\n"),
+    ("/r/setup.cfg", "  [mypy] ] x\nplugins = e.py\n"),
 ])
 def test_gated_content(path, body):
     assert _ours(R(_write(path, body), EMPTY))

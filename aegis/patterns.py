@@ -11345,7 +11345,12 @@ def lint_shared_literal_write_ok(cmd: str) -> bool:
 
 
 # ---- content check ----------------------------------------------------------
-_LINT_INI_HDR_RE = re.compile(r"^\s*\[([^\]\n]*)\]\s*(?:[#;].*)?$")
+# configparser's SECTCRE is `\[(?P<header>.+)\]` applied with .match() to
+# the stripped line: text after the last `]` is ignored (`[mypy] junk` IS
+# the [mypy] section -- QA round 2). The header is greedy up to the LAST `]`;
+# the up-to-first-`]` reading is reported too (fail closed).
+_LINT_INI_HDR_RE = re.compile(r"^\s*\[(.+)\]")
+_LINT_INI_HDR_FIRST_RE = re.compile(r"^\s*\[([^\]\n]*)\]")
 _LINT_INI_KEY_RE = re.compile(r"^(\s*)([^\s=:#;\[][^=:\n]*?)\s*[=:](.*)$")
 _LINT_PYLINT_SAFE_PLUGIN_RE = re.compile(
     r"pylint\.extensions\.[A-Za-z_][\w.]*"
@@ -11379,10 +11384,15 @@ def _lint_split_list(v) -> list:
 def _lint_ini_entries(content: str):
     """(section_lower, norm_key, value) for every key line in an INI body.
     Mirrors configparser's continuation rule, and ALSO reports a key-shaped
-    continuation line under the current section (fail closed)."""
-    sect = ""
-    cur = None       # [section, key, [value lines], indent]
+    continuation line under the current section (fail closed). A key under
+    an ambiguous header is reported once per plausible section name."""
+    sects = [""]
+    cur = None       # [sections, key, [value lines], indent]
     out = []
+
+    def flush():
+        for sc in cur[0]:
+            out.append((sc, cur[1], "\n".join(cur[2]).strip()))
     # configparser/iniconfig break lines on \n / \r only; str.splitlines()
     # also breaks on \x0b \x0c \x1c-\x1e \x85 \u2028 \u2029, which would
     # let a comment forge a section header the real tool never sees (QA
@@ -11397,25 +11407,26 @@ def _lint_ini_entries(content: str):
             cur[2].append(line.strip())
             km = _LINT_INI_KEY_RE.match(line)
             if km:
-                out.append((sect, _lint_norm_key(km.group(2)), km.group(3).strip()))
+                for sc in sects:
+                    out.append((sc, _lint_norm_key(km.group(2)), km.group(3).strip()))
             continue
+        if cur is not None:
+            flush()
+            cur = None
         hm = _LINT_INI_HDR_RE.match(line)
         if hm:
-            if cur is not None:
-                out.append((cur[0], cur[1], "\n".join(cur[2]).strip()))
-                cur = None
-            sect = hm.group(1).strip().lower()
+            fm = _LINT_INI_HDR_FIRST_RE.match(line)
+            sects = list(dict.fromkeys(
+                [hm.group(1).strip().lower()] + ([fm.group(1).strip().lower()] if fm else [])))
             continue
         km = _LINT_INI_KEY_RE.match(line)
-        if cur is not None:
-            out.append((cur[0], cur[1], "\n".join(cur[2]).strip()))
-            cur = None
         if km:
-            cur = [sect, _lint_norm_key(km.group(2)), [km.group(3).strip()], indent]
+            cur = [sects, _lint_norm_key(km.group(2)), [km.group(3).strip()], indent]
         else:
-            out.append((sect, _lint_norm_key(line.strip()), ""))   # bare key
+            for sc in sects:
+                out.append((sc, _lint_norm_key(line.strip()), ""))   # bare key
     if cur is not None:
-        out.append((cur[0], cur[1], "\n".join(cur[2]).strip()))
+        flush()
     return out
 
 
