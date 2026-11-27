@@ -16215,8 +16215,13 @@ def _lint_new_unsafe(ev: Event, p: str) -> list:
         # reasons unrelated to linting; when an edit can't be replayed,
         # judge its NEW text: it can only plant a gated key by naming one.
         # Dedicated linter configs stay fail-closed.
-        if shared and not any(patterns.lint_text_names_gated_key(str(x))
-                              for x in _http_rc_written_strings(a)):
+        # ...unless the file on disk already names one (a commented-out
+        # `#addopts = -p x` that a regex edit or a non-matching old_string
+        # could uncomment -- QA round 3).
+        on_disk = _npmrc_read(ev, p)
+        if shared and not (on_disk and patterns.lint_text_names_gated_key(on_disk)) \
+                and not any(patterns.lint_text_names_gated_key(str(x))
+                            for x in _http_rc_written_strings(a)):
             return []
         return [why]
     if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
@@ -16278,7 +16283,9 @@ def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``load-plugins``; mypy ``plugins`` (modules or ``.py`` files imported
     in-process) and ``python_executable`` (a program mypy RUNS);
     ``[flake8:local-plugins]``; pytest ``addopts = -p <module>`` /
-    ``--pdbcls`` / ``--confcutdir``; RuboCop's ERB preprocessing
+    ``--pdbcls`` / ``--confcutdir``, and a ``filterwarnings`` / ``-W`` /
+    ``--pythonwarnings`` category naming a non-builtin module (pytest
+    imports it); RuboCop's ERB preprocessing
     (``<%= system(...) %>`` anywhere in ``.rubocop.yml``), ``require:``/
     ``plugins:`` of a Ruby file, ``inherit_from:`` a URL or outside path;
     Prettier ``plugins`` (bare names resolve through a git-ignored
@@ -16319,13 +16326,17 @@ def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     extraction; ``package.json`` ``prettier``/``eslintConfig`` keys and JS
     config files (``eslint.config.js``, ``prettier.config.js``,
     ``.stylelintrc.js`` -- those are code, edited like any source);
+    plugin-specific pytest ini keys (pytest-django ``DJANGO_SETTINGS_MODULE``,
+    pytest-env ``env``);
     ``PYTEST_ADDOPTS``/``PYLINTRC``/``MYPY_CONFIG_FILE_DIR`` env vars
     (``rule_shell_persist_protect``'s); a tox ``setenv`` of those; the
     plugin module's own contents once approved; a well-known plugin name
     shadowed by a same-named local package. Accepted false ASKs: ``sed -i``
     on pyproject.toml/setup.cfg/tox.ini, a first-time Prettier plugin, a
-    non-allowlisted pylint/mypy plugin, any non-read shell verb on a
-    dedicated config.
+    non-allowlisted pylint/mypy plugin, a first-time ``filterwarnings``
+    entry for a third-party warning class (``ignore::sqlalchemy.exc.X``),
+    an unreplayable edit to a shared file that already names a gated key,
+    any non-read shell verb on a dedicated config.
     """
     cfg = getattr(policy, "lint_config_exec", None) or {}
     raw_mode = cfg.get("mode", "ask")

@@ -11243,7 +11243,7 @@ def lint_neutralize_tool_runs(cmd: str) -> str:
 # command line.
 _LINT_SHARED_TOKENS_RE = re.compile(
     r"init[-_\s]*hook|load[-_\s]*plugins|plugins|python[-_\s]*executable"
-    r"|local[-_\s]*plugins|addopts|pdbcls|confcutdir",
+    r"|local[-_\s]*plugins|addopts|pdbcls|confcutdir|filter[-_\s]*warnings|python[-_\s]*warnings",
     re.IGNORECASE)
 _LINT_LITERAL_VERBS = frozenset(("echo", "printf", "cat", "tee", "cd", "true", ":"))
 _LINT_OBFUSCATION_RE = re.compile(
@@ -11363,7 +11363,7 @@ _LINT_MYPY_SAFE_PLUGINS = frozenset((
 ))
 _LINT_RAW_TOKENS_RE = re.compile(
     r"init[-_]?hook|load[-_]?plugins|plugins|python[-_]?executable|local[-_]?plugins"
-    r"|addopts|pdbcls|confcutdir|require|inherit[-_]?from|parser|<%", re.IGNORECASE)
+    r"|addopts|pdbcls|confcutdir|filter[-_]?warnings|require|inherit[-_]?from|parser|<%", re.IGNORECASE)
 
 
 def _lint_norm_key(k) -> str:
@@ -11381,7 +11381,7 @@ def _lint_split_list(v) -> list:
     return [v]
 
 
-def _lint_ini_entries(content: str):
+def _lint_ini_entries(content: str, iniconfig: bool = False):
     """(section_lower, norm_key, value) for every key line in an INI body.
     Mirrors configparser's continuation rule, and ALSO reports a key-shaped
     continuation line under the current section (fail closed). A key under
@@ -11397,7 +11397,9 @@ def _lint_ini_entries(content: str):
     # also breaks on \x0b \x0c \x1c-\x1e \x85 \u2028 \u2029, which would
     # let a comment forge a section header the real tool never sees (QA
     # round 1).
-    for line in re.split(r"\r\n|\r|\n", content.lstrip("\ufeff")):
+    body = content.lstrip("\ufeff")
+    lines = body.splitlines() if iniconfig else re.split(r"\r\n|\r|\n", body)
+    for line in lines:
         if not line.strip() or line.lstrip().startswith(("#", ";")):
             if cur is not None and not line.strip():
                 cur[2].append("")
@@ -11430,6 +11432,24 @@ def _lint_ini_entries(content: str):
     return out
 
 
+# pytest resolves a warning filter's CATEGORY (`action:message:category:
+# module:lineno`) by importing its module part (`ignore::evil.W` imports
+# `evil` -- QA round 3). Builtin categories and pytest's own are safe.
+_LINT_SAFE_WARN_MODULES = ("pytest", "_pytest", "warnings", "builtins")
+
+
+def _lint_warning_spec_imports(spec) -> bool:
+    if not isinstance(spec, str):
+        return True
+    parts = spec.split(":")
+    if len(parts) < 3:
+        return False
+    cat = parts[2].strip()
+    if "." not in cat:
+        return False
+    return cat.split(".", 1)[0] not in _LINT_SAFE_WARN_MODULES
+
+
 def _lint_addopts_bad(v) -> list:
     """Labels for plugin-loading flags in a pytest `addopts` value."""
     import shlex as _shlex
@@ -11449,12 +11469,17 @@ def _lint_addopts_bad(v) -> list:
         nxt = toks[i + 1] if i + 1 < len(toks) else ""
         if t.startswith("--"):
             name = t.split("=", 1)[0]
-            if any(name == f or (len(name) >= 4 and f.startswith(name))
-                   for f in ("--pdbcls", "--confcutdir", "--plugin")):
+            # pytest rejects abbreviated long options, so exact names only
+            # (`--pdb`/`--co` are real, harmless options -- QA round 3).
+            if name in ("--pdbcls", "--confcutdir"):
                 bad.append(f"addopts {name} (loads code / widens conftest search)")
+            elif name == "--pythonwarnings":
+                val = t.split("=", 1)[1] if "=" in t else nxt
+                if _lint_warning_spec_imports(val):
+                    bad.append(f"addopts {name} {val[:40]} (imports the warning category's module)")
             elif name in ("--override-ini",):
                 val = t.split("=", 1)[1] if "=" in t else nxt
-                if re.match(r"\s*(?:addopts|pythonpath|required[-_]plugins)\b", val, re.I):
+                if re.match(r"\s*(?:addopts|pythonpath|required[-_]plugins|filterwarnings)\b", val, re.I):
                     bad.append(f"addopts {name} {val[:30]}")
         elif t.startswith("-") and len(t) > 1:
             j = 1
@@ -11468,8 +11493,13 @@ def _lint_addopts_bad(v) -> list:
                     break
                 if c == "o":
                     val = t[j + 1:] or nxt
-                    if re.match(r"=?\s*(?:addopts|pythonpath)\b", val, re.I):
+                    if re.match(r"=?\s*(?:addopts|pythonpath|filterwarnings)\b", val, re.I):
                         bad.append(f"addopts -o {val[:30]}")
+                    break
+                if c == "W":
+                    val = (t[j + 1:] or nxt).lstrip("=")
+                    if _lint_warning_spec_imports(val):
+                        bad.append(f"addopts -W {val[:40]} (imports the warning category's module)")
                     break
                 if c in takes_val:
                     break
@@ -11527,13 +11557,27 @@ def lint_unsafe_entries(content, kind) -> list:
     def pytest_key(k, v, where):
         if k == "addopts":
             for lab in _lint_addopts_bad(v):
-                add(where + lab, "pytest", lab)
+                # Fingerprint the FULL value, not the (truncated) label, so a
+                # human-approved long plugin name can't be swapped for another
+                # sharing its first 40 characters (QA round 3).
+                add(where + lab, "pytest", lab, v)
+        elif k == "filterwarnings":
+            for x in _lint_split_list(v) if not isinstance(v, str) else \
+                    [y.strip() for y in re.split(r"[\r\n]+", v) if y.strip()]:
+                if _lint_warning_spec_imports(x):
+                    add(f"{where}filterwarnings {str(x)[:40]} (imports the category's module)",
+                        "pytest", "filterwarnings", x)
 
     # ---- INI kinds ----------------------------------------------------------
     if kind in ("pylint-ini", "mypy-ini", "flake8-ini", "pytest-ini", "setup-cfg", "tox-ini"):
         if "\x00" in content:
             return [("<binary content>", "<unparseable>")]
-        for sect, k, v in _lint_ini_entries(content):
+        # pytest's iniconfig splits with str.splitlines() (breaking on \x0c,
+        # \x85, \u2028 ...) and reads headers differently from configparser
+        # (QA round 3), so both line-splitting modes are scanned and pytest
+        # keys count in ANY section of a file pytest reads.
+        ents = list(dict.fromkeys(_lint_ini_entries(content) + _lint_ini_entries(content, iniconfig=True)))
+        for sect, k, v in ents:
             where = f"[{sect}] " if sect else ""
             # configparser merges [DEFAULT] into EVERY section (mypy, flake8
             # read it that way -- QA round 1), so a DEFAULT key is judged as
@@ -11549,8 +11593,7 @@ def lint_unsafe_entries(content, kind) -> list:
                     and ("plugin" in sect or dflt)):
                 add(f"{where}{k} (flake8 local plugin, imported from a repo path)",
                     "flake8", sect, k, v)
-            if kind == "pytest-ini" or (kind == "tox-ini" and sect in ("pytest", "default")) or (
-                    kind == "setup-cfg" and sect in ("tool:pytest", "default")):
+            if kind in ("pytest-ini", "tox-ini", "setup-cfg"):
                 pytest_key(k, v, where)
         return out
 
@@ -11615,7 +11658,8 @@ def lint_unsafe_entries(content, kind) -> list:
             if nk in ("require", "plugins"):
                 for x in _lint_split_list(v):
                     name = x.get("name") if isinstance(x, dict) else x
-                    if _lint_path_like(name) or isinstance(x, dict):
+                    if _lint_path_like(name) or isinstance(x, dict) or (
+                            "/" in str(name) and not str(name).startswith("rubocop")):
                         add(f"{k}: {str(name)[:40]} (Ruby file loaded by RuboCop)",
                             "rubocop", nk, x)
             elif nk == "inherit-from":

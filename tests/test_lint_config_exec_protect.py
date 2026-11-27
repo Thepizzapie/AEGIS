@@ -129,6 +129,20 @@ def test_paths_not_recognized(p):
     ("/r/setup.cfg", "[mypy]extra\nplugins = /p/evil.py\n"),
     ("/r/tox.ini", "[flake8:local-plugins]zzz\nextension = XX = m:C\npaths = .\n"),
     ("/r/setup.cfg", "  [mypy] ] x\nplugins = e.py\n"),
+    # QA round 3: iniconfig line splitting / header rules, warning categories
+    ("/r/pytest.ini", "[pytest]\n# note\x0caddopts = -p evilplug\n"),
+    ("/r/pytest.ini", "[pytest]\n# note\x85addopts = -p evilplug\n"),
+    ("/r/tox.ini", "[tox]\nenvlist = py\n# section\x0c[pytest]\naddopts = -p evilplug\n"),
+    ("/r/setup.cfg", "[metadata]\nname = x\n# s\x85[tool:pytest]\naddopts = -p evilplug\n"),
+    ("/r/tox.ini", "[tox]\nenvlist = py\n[pytest]\nmarkers = slow\n[testenv;]\naddopts = -p evilplug\n"),
+    ("/r/setup.cfg", "[metadata]\nname = x\n[tool:pytest]\ntestpaths = .\n[flake8 #tmp]\naddopts = -p evilplug\n"),
+    ("/r/pytest.ini", "[pytest]\nfilterwarnings = ignore::evilplug.W\n"),
+    ("/r/pytest.ini", "[pytest]\nfilterwarnings =\n    error\n    ignore::evilplug.W\n"),
+    ("/r/pytest.ini", "[pytest]\naddopts = -W ignore::evilplug.W\n"),
+    ("/r/pytest.ini", "[pytest]\naddopts = --pythonwarnings=ignore::evilplug.W\n"),
+    ("/r/pytest.ini", "[pytest]\naddopts = -o filterwarnings=ignore::evilplug.W\n"),
+    ("/r/pyproject.toml", "[tool.pytest]\nfilterwarnings = ['ignore::evilplug.W']\n"),
+    ("/r/.rubocop.yml", "require:\n  - lib/evil\n"),
 ])
 def test_gated_content(path, body):
     assert _ours(R(_write(path, body), EMPTY))
@@ -151,6 +165,9 @@ def test_gated_content(path, body):
     ("/r/.flake8", "[flake8]\nmax-line-length = 100\nextend-ignore = E203\n"),
     ("/r/tox.ini", "[tox]\nenvlist = py311\n[testenv]\ncommands = pytest\n"),
     ("/r/pytest.ini", "[pytest]\naddopts = -ra --strict-markers\n"),
+    ("/r/pytest.ini", "[pytest]\naddopts = --pdb --co -W error\n"),
+    ("/r/pytest.ini", "[pytest]\nfilterwarnings =\n    error\n    ignore::DeprecationWarning\n    ignore::pytest.PytestUnraisableExceptionWarning\n"),
+    ("/r/.rubocop.yml", "require:\n  - rubocop/cop/internal_affairs\n"),
     ("/r/.rubocop.yml", "require:\n  - rubocop-rails\n  - rubocop-rspec\nAllCops:\n  NewCops: enable\n"),
     ("/r/.rubocop.yml", "inherit_from: .rubocop_todo.yml\ninherit_gem:\n  rubocop-shopify: rubocop.yml\n"),
     ("/r/.prettierrc", '{"semi": false, "singleQuote": true, "parser": "typescript"}'),
@@ -411,3 +428,19 @@ def test_shared_append_to_unterminated_file_gated(tmp_path):
     assert _ours(R(ev2, EMPTY))
     f.write_text("[MAIN]\njobs=1\n")
     assert R(ev2, EMPTY) is None
+
+
+def test_shared_unreplayable_edit_uncommenting_staged_key_gated(tmp_path):
+    f = tmp_path / "setup.cfg"
+    f.write_text("[metadata]\nname = x\n\n[tool:pytest]\n#addopts = -p evilplug\n")
+    ev = _mcp({"path": str(f), "edits": [{"pattern": "^#", "replacement": ""}]},
+              tool="mcp__filesystem__edit_file")
+    assert _ours(R(ev, EMPTY))
+    assert _ours(R(_edit(str(f), "\u2018x\u2019\n#", ""), EMPTY))   # non-matching old_string
+
+
+def test_long_plugin_name_swap_gated(tmp_path):
+    f = tmp_path / "pytest.ini"
+    base = "a" * 45
+    f.write_text(f"[pytest]\naddopts = -p {base}_good\n")
+    assert _ours(R(_edit(str(f), f"{base}_good", f"{base}_evil"), EMPTY))
