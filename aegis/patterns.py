@@ -11458,7 +11458,7 @@ def _lint_override_bad(val: str) -> bool:
     if not m:
         return False
     name = m.group(1).lower().replace("-", "_")
-    if name in ("addopts", "pythonpath", "required_plugins"):
+    if name in ("addopts", "pythonpath", "required_plugins", "confcutdir"):
         return True
     if name == "filterwarnings":
         return _lint_warning_spec_imports(m.group(2).strip())

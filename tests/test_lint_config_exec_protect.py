@@ -472,6 +472,7 @@ def test_override_filterwarnings_routine_allowed(body):
 
 @pytest.mark.parametrize("body", ["[pytest]\naddopts = -o filterwarnings=ignore::evilplug.W\n",
                                   "[pytest]\naddopts = -o addopts=-pevil\n",
+                                  "[pytest]\naddopts = -o confcutdir=/\n",
                                   "require:\n  - rubocop_evil/x\n"])
 def test_round4_still_gated(body):
     path = "/r/.rubocop.yml" if body.startswith("require") else "/r/pytest.ini"
