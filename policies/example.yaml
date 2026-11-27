@@ -75,6 +75,19 @@
 #     mode: ask            # deny | ask (default) | monitor | off
 #     allow: ['^/ci/repo/bunfig\.toml$']
 
+# Linter / test-runner config exec hijack (optional tuning). Built in and
+# ON by default (mode: ask): a write that ADDS a pylint init-hook or plugin,
+# a mypy plugin / python_executable, a [flake8:local-plugins] entry, a pytest
+# `addopts = -p <module>`, a RuboCop ERB tag / require of a Ruby file, or a
+# Prettier plugin -- in .pylintrc, mypy.ini, .flake8, pytest.ini,
+# .rubocop.yml, .prettierrc, or pyproject.toml/setup.cfg/tox.ini -- asks a
+# human first; routine edits pass. A human pre-approves with
+# AEGIS_ALLOW_LINT_CONFIG_EXEC=1 or a trailing '# aegis-allow'; a spawned
+# agent cannot. Shell `allow` regexes must match the WHOLE command.
+#   lint_config_exec:
+#     mode: ask            # deny | ask (default) | monitor | off
+#     allow: ['^/ci/repo/\.pylintrc$']
+
 default_action: allow
 on_error: allow
 

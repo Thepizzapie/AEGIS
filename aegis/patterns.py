@@ -10972,3 +10972,654 @@ def bunfig_unsafe_entries(content) -> list:
         else:
             add(f"{k} (unrecognized bunfig key)", k, v)
     return out
+
+
+# ---- Linter / test-runner config exec hijack (`rules.rule_lint_config_exec_protect`)
+# Python and Ruby linters / test runners read their config with no prompt on
+# every run -- by the agent, the human, CI, AND the editor (the VS Code
+# pylint/mypy/flake8/RuboCop/Prettier extensions lint on open and on save).
+# Several keys in those DATA-looking files run code:
+#   * pylint `init-hook` -- an arbitrary Python statement exec()'d at start;
+#     `load-plugins` -- modules imported in-process (.pylintrc, pylintrc,
+#     pylintrc.toml, pyproject `[tool.pylint.*]`, setup.cfg/tox.ini
+#     `[pylint.*]`);
+#   * mypy `plugins` -- modules / `.py` FILES imported in-process;
+#     `python_executable` -- a program mypy RUNS to discover site-packages
+#     (mypy.ini, .mypy.ini, ~/.config/mypy/config, setup.cfg `[mypy]`,
+#     pyproject `[tool.mypy]`);
+#   * flake8 `[flake8:local-plugins]` -- imports a module from a repo path;
+#   * pytest `addopts = -p <module>` -- a plugin module imported on every
+#     run (also `--pdbcls`, `--confcutdir`) (pytest.ini, .pytest.ini,
+#     pytest.toml, tox.ini `[pytest]`, setup.cfg `[tool:pytest]`, pyproject
+#     `[tool.pytest.ini_options]` / `[tool.pytest]`);
+#   * RuboCop runs every config through ERB (`<%= system(...) %>` is Ruby
+#     executed on load) and `require:`/`plugins:` load Ruby files;
+#     `inherit_from:` a URL fetches remote config;
+#   * Prettier `plugins` (and a path-like `parser`) -- JS loaded in-process
+#     by `prettier` and format-on-save.
+# Dedicated files are parsed whole; the shared files (pyproject.toml,
+# setup.cfg, tox.ini) are parsed but only these keys count, so routine
+# edits to them never ask.
+_LINT_END = _WIN_TRIM + r"(?=[/\;&|)(<>`}:,]|\s|['\"]|$)"
+_LINT_DEDICATED_ALT = (
+    r"\.?pylintrc(?:\.toml)?"
+    r"|\.?mypy\.ini"
+    r"|mypy[/\\]config"
+    r"|\.flake8"
+    r"|\.?pytest\.(?:ini|toml)"
+    r"|\.rubocop[\w.\-]*\.ya?ml"
+    r"|rubocop[/\\]config\.ya?ml"
+    r"|\.prettierrc(?:\.(?:json5?|ya?ml|toml))?"
+)
+_LINT_SHARED_ALT = r"pyproject\.toml|setup\.cfg|tox\.ini"
+LINT_DEDICATED_PATH_RE = re.compile(_HTTP_RC_B + r"(?:" + _LINT_DEDICATED_ALT + r")" + _LINT_END,
+                                    re.IGNORECASE)
+LINT_SHARED_PATH_RE = re.compile(_HTTP_RC_B + r"(?:" + _LINT_SHARED_ALT + r")" + _LINT_END,
+                                 re.IGNORECASE)
+# Every path this guard protects (registered with the fetch-to-file backstop).
+LINT_CONFIG_PATH_RE = re.compile(
+    _HTTP_RC_B + r"(?:" + _LINT_DEDICATED_ALT + r"|" + _LINT_SHARED_ALT + r")" + _LINT_END,
+    re.IGNORECASE)
+_LINT_DEDICATED_NAMES = (
+    ".pylintrc", "pylintrc", ".pylintrc.toml", "pylintrc.toml", "mypy.ini",
+    ".mypy.ini", ".flake8", "pytest.ini", ".pytest.ini", "pytest.toml",
+    ".pytest.toml", ".rubocop.yml", ".rubocop.yaml", ".rubocop_todo.yml",
+    ".prettierrc", ".prettierrc.json", ".prettierrc.json5", ".prettierrc.yaml",
+    ".prettierrc.yml", ".prettierrc.toml",
+)
+_LINT_SHARED_NAMES = ("pyproject.toml", "setup.cfg", "tox.ini")
+
+
+def _lint_kind_of_name(tail: str) -> str:
+    t = tail.replace("\\", "/").lower().rstrip(" .")
+    t = re.sub(r"::?[^/]*$", "", t) if "::" in t or re.search(r":\$data$", t) else t
+    t = t.rstrip(" .")
+    base = t.rsplit("/", 1)[-1]
+    parent = t.rsplit("/", 2)[-2] if t.count("/") >= 1 else ""
+    if base in ("pylintrc", ".pylintrc"):
+        return "pylint-ini"
+    if base in ("pylintrc.toml", ".pylintrc.toml"):
+        return "pylint-toml"
+    if base in ("mypy.ini", ".mypy.ini") or (base == "config" and parent == "mypy"):
+        return "mypy-ini"
+    if base == ".flake8":
+        return "flake8-ini"
+    if base in ("pytest.ini", ".pytest.ini"):
+        return "pytest-ini"
+    if base in ("pytest.toml", ".pytest.toml"):
+        return "pytest-toml"
+    if re.fullmatch(r"\.rubocop[\w.\-]*\.ya?ml", base) or (
+            parent == "rubocop" and re.fullmatch(r"config\.ya?ml", base)):
+        return "rubocop"
+    if base.startswith(".prettierrc"):
+        return "prettier"
+    if base == "pyproject.toml":
+        return "pyproject"
+    if base == "setup.cfg":
+        return "setup-cfg"
+    if base == "tox.ini":
+        return "tox-ini"
+    return ""
+
+
+def lint_kind(path) -> str:
+    """The config kind a path names ('pylint-ini', 'mypy-ini', 'pyproject',
+    'rubocop', ...) -- raw, URL-decoded or `..`-normalized, NTFS ` .` /
+    `::$DATA` trims tolerated -- else ''."""
+    if not isinstance(path, str) or not path or "\n" in path or len(path) > 4096:
+        return ""
+    cands = [path]
+    try:
+        import urllib.parse as _up
+        if "%" in path or path.lower().startswith("file://"):
+            cands.append(_up.unquote(path[7:] if path.lower().startswith("file://") else path))
+    except Exception:
+        pass
+    for c in list(cands):
+        cands.append(_ed_dotdot_normalize(c.replace("\\", "/")))
+    for c in cands:
+        m = None
+        for m in LINT_CONFIG_PATH_RE.finditer(c):
+            pass
+        if m and re.fullmatch(r"[ .]*(?::[^\s/\\]*)?[/\\]?", c[m.end():]):
+            k = _lint_kind_of_name(c[:m.end()])
+            if k:
+                return k
+    return ""
+
+
+def lint_kind_is_shared(kind: str) -> bool:
+    return kind in ("pyproject", "setup-cfg", "tox-ini")
+
+
+_LINT_STEM_RE = re.compile(r"pylintrc|mypy|flake8|pytest|rubocop|prettierrc|pyproject|setup\.cfg|tox\.ini")
+
+
+def lint_shell_path_hits(cmd) -> tuple:
+    """(dedicated, shared): whether a shell command names a dedicated
+    linter config / a shared one (pyproject.toml, setup.cfg, tox.ini) --
+    literally, through backslash escapes or quote splits, or through a
+    glob/brace word bash would expand to one."""
+    if not isinstance(cmd, str) or not cmd:
+        return (False, False)
+    # Fast path: no name stem (even split by quotes/backslashes) and no glob
+    # character means no hit (keeps the engine's adversarial-input budget).
+    squeezed = cmd.lower().replace("\\", "").replace("'", "").replace('"', "")
+    if not any(c in cmd for c in "*?[{") and not _LINT_STEM_RE.search(squeezed):
+        return (False, False)
+    ded = shr = False
+    unesc = cmd.replace("\\", "")
+    views = [cmd, unesc] + [unesc.replace(q, "") for q in ("'", '"') if q in unesc]
+    for v in views:
+        if not ded and LINT_DEDICATED_PATH_RE.search(v):
+            ded = True
+        if not shr and LINT_SHARED_PATH_RE.search(v):
+            shr = True
+    if ded and shr:
+        return (True, True)
+    budget = 0
+    for i, m in enumerate(_HTTP_RC_WORD_RE.finditer(unesc.replace("'", "").replace('"', ""))):
+        if i > 8000:
+            return (True, True)              # fail closed on absurd input
+        w = m.group(0)
+        if not any(c in w for c in "*?[{"):
+            continue
+        parts = w.replace("\\", "/").rstrip("/").rsplit("/", 2)
+        base = parts[-1]
+        if not base:
+            continue
+        if len(base) > 200:
+            return (True, True)
+        for cand in _brace_expand(base):
+            budget += 1
+            if budget > 4000:
+                return (True, True)
+            full = "/".join(parts[:-1] + [cand]) if len(parts) > 1 else cand
+            if LINT_DEDICATED_PATH_RE.search("/" + full):
+                ded = True
+            if LINT_SHARED_PATH_RE.search("/" + cand):
+                shr = True
+            lc = cand.lower()
+            if not any(c in lc for c in "*?["):
+                continue
+            # A bare extension glob (`*.ini`, `*.toml`, `*.yml`, `*`) is too
+            # generic to call a hit.
+            if re.fullmatch(r"[*?]*(?:\.[*?]*(?:ini|toml|cfg|ya?ml|json5?)?)?", lc):
+                continue
+            for name in _LINT_DEDICATED_NAMES:
+                if fnmatch.fnmatchcase(name, lc):
+                    ded = True
+            for name in _LINT_SHARED_NAMES:
+                if fnmatch.fnmatchcase(name, lc):
+                    shr = True
+            if len(parts) > 1 and parts[-2].lower() in ("mypy", "rubocop") and \
+                    any(fnmatch.fnmatchcase(n, lc) for n in ("config", "config.yml", "config.yaml")):
+                ded = True
+    return (ded, shr)
+
+
+def lint_patch_hit(text) -> bool:
+    """True if `text` is a patch whose header line names a linter config."""
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    for m in _MISE_PATCH_HDR_RE.finditer(text[:2_000_000]):
+        if LINT_CONFIG_PATH_RE.search(m.group(0)):
+            return True
+    return False
+
+
+# Tools that only READ their config: `pylint --rcfile=.pylintrc src`,
+# `pytest -c pytest.ini`, `mypy --config-file mypy.ini .` are judged as the
+# reads they are. Only the config-flag VALUE is dropped; a lint path still
+# named anywhere else in the segment (`pytest --junitxml=setup.cfg`,
+# `pylint --output=.pylintrc`) keeps the segment as is.
+_LINT_TOOLS = frozenset((
+    "pylint", "mypy", "dmypy", "flake8", "pytest", "py.test", "rubocop",
+    "prettier", "tox", "black", "ruff", "isort", "coverage", "pyright",
+    "basedpyright", "pylsp",
+))
+_LINT_RUNNER_1 = frozenset(("npx", "bunx", "pnpx"))
+_LINT_RUNNER_2 = {"pnpm": "exec", "yarn": "", "bundle": "exec", "uv": "run",
+                  "poetry": "run", "pipx": "run", "hatch": "run", "pdm": "run"}
+_LINT_CONFIG_FLAGS = frozenset(("-c", "--config", "--rcfile", "--config-file",
+                                "--append-config", "--settings-path",
+                                "--settings-file", "--sp", "--inifile"))
+_LINT_SEG_SPLIT_RE = re.compile(r"(&&|\|\||[;&|\n])")
+
+
+def lint_neutralize_tool_runs(cmd: str) -> str:
+    """`cmd` with every plain linter/test-runner simple command whose only
+    mention of a lint config is a `--config`-style value replaced by
+    `true`."""
+    if not isinstance(cmd, str) or len(cmd) > 200_000:
+        return cmd
+    out = []
+    for seg in _LINT_SEG_SPLIT_RE.split(cmd):
+        if _LINT_SEG_SPLIT_RE.fullmatch(seg or "x"):
+            out.append(seg)
+            continue
+        words = seg.split()
+        i = 0
+        while i < len(words) and _BUNFIG_ASSIGN_RE.match(words[i]):
+            i += 1
+
+        def _v(j):
+            return words[j].replace("\\", "/").rsplit("/", 1)[-1].lower() if j < len(words) else ""
+        verb = _v(i)
+        if verb in _LINT_RUNNER_1:
+            i += 1
+        elif verb in _LINT_RUNNER_2 and (not _LINT_RUNNER_2[verb] or _v(i + 1) == _LINT_RUNNER_2[verb]):
+            i += 1 if not _LINT_RUNNER_2[verb] else 2
+        elif re.fullmatch(r"python(?:\d(?:\.\d+)?)?(?:\.exe)?", verb) and _v(i + 1) == "-m":
+            i += 2
+        verb = _v(i)
+        if verb.endswith(".exe"):
+            verb = verb[:-4]
+        if (verb in _LINT_TOOLS
+                and not any(c in seg for c in "<>`$'\"\\(){}*?[")):
+            rest, j = [], i + 1
+            while j < len(words):
+                w = words[j]
+                if w in _LINT_CONFIG_FLAGS:
+                    j += 2
+                    continue
+                if "=" in w and w.split("=", 1)[0] in _LINT_CONFIG_FLAGS:
+                    j += 1
+                    continue
+                rest.append(w)
+                j += 1
+            d, s = lint_shell_path_hits(" ".join(rest))
+            out.append(seg if (d or s) else " true ")
+        else:
+            out.append(seg)
+    return "".join(out)
+
+
+# A shell write to a SHARED file (pyproject.toml / setup.cfg / tox.ini) is
+# allowed only in the plainest literal shape -- `echo`/`printf`/heredoc
+# `cat`/`tee` of literal text that names none of the gated keys. Anything
+# else (`sed -i`, `cp`, an interpreter, an expansion, `printf %s` assembly,
+# `cat other > setup.cfg`) asks, since its result can't be read off the
+# command line.
+_LINT_SHARED_TOKENS_RE = re.compile(
+    r"init[-_\s]*hook|load[-_\s]*plugins|plugins|python[-_\s]*executable"
+    r"|local[-_\s]*plugins|addopts|pdbcls|confcutdir",
+    re.IGNORECASE)
+_LINT_LITERAL_VERBS = frozenset(("echo", "printf", "cat", "tee", "cd", "true", ":"))
+_LINT_OBFUSCATION_RE = re.compile(
+    r"[$`]|\\(?:x[0-9a-fA-F]|u[0-9a-fA-F]|U[0-9a-fA-F]|[0-7]|c)|base64|xxd|\bcut\b|\brev\b")
+
+
+def lint_text_names_gated_key(text) -> bool:
+    """True if `text` names any key this guard gates in a SHARED file (or
+    carries an escape that could spell one)."""
+    if not isinstance(text, str):
+        return True
+    if len(text) > 2_000_000:
+        return True
+    probe = text.replace("\\", "").replace("'", "").replace('"', "")
+    return bool(_LINT_SHARED_TOKENS_RE.search(probe)
+                or _LINT_SHARED_TOKENS_RE.search(re.sub(r"\s+", "", probe)))
+
+
+def lint_shared_literal_write_ok(cmd: str) -> bool:
+    """True if `cmd` (raw) writes the shared file only with literal text
+    that names no gated key."""
+    if not isinstance(cmd, str) or len(cmd) > 200_000:
+        return False
+    flat = cmd.replace("\\\n", "")
+    if _LINT_OBFUSCATION_RE.search(flat):
+        return False
+    probe = flat.replace("\\", "").replace("'", "").replace('"', "")
+    if _LINT_SHARED_TOKENS_RE.search(probe) or _LINT_SHARED_TOKENS_RE.search(
+            re.sub(r"\s+", "", probe)):
+        return False
+    # Heredoc bodies are content, not commands: judge only the lines up to
+    # the first heredoc opener's line.
+    head = flat
+    m = re.search(r"<<-?\s*['\"]?\w+['\"]?", flat)
+    if m:
+        nl = flat.find("\n", m.end())
+        head = flat if nl < 0 else flat[:nl]
+    if re.search(r"(?<![<\d])<(?![<&(])", head):
+        return False                              # `cat < other > setup.cfg`
+    for seg in _HTTP_RC_SEG_SPLIT_RE.split(head):
+        words = [w for w in re.split(r"\s+", re.sub(r"\d*>>?\s*\S+|<<-?\s*\S+", " ", seg)) if w]
+        while words and (_HTTP_RC_ASSIGN_RE.match(words[0])
+                         or words[0].lower() in ("then", "do", "else", "{", "!")):
+            words.pop(0)
+        if not words:
+            continue
+        verb = words[0].strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if verb not in _LINT_LITERAL_VERBS:
+            if verb == "git" and len(words) > 1 and words[1].lower() in _MISE_GIT_SAFE_SUBS \
+                    and not _MISE_GIT_BAD_RE.search(" " + " ".join(words[1:])):
+                continue
+            return False
+        args = words[1:]
+        if verb == "printf" and any("%" in a for a in args):
+            return False
+        if verb == "cat" and any(a != "-" and not a.startswith("-") for a in args):
+            return False                          # `cat other.cfg > setup.cfg`
+        if verb == "tee" and sum(1 for a in args if not a.startswith("-")) > 1:
+            return False
+    return True
+
+
+# ---- content check ----------------------------------------------------------
+_LINT_INI_HDR_RE = re.compile(r"^\s*\[([^\]\n]*)\]\s*(?:[#;].*)?$")
+_LINT_INI_KEY_RE = re.compile(r"^(\s*)([^\s=:#;\[][^=:\n]*?)\s*[=:](.*)$")
+_LINT_PYLINT_SAFE_PLUGIN_RE = re.compile(
+    r"pylint\.extensions\.[A-Za-z_][\w.]*"
+    r"|pylint_(?:django|pytest|pydantic|celery|flask|flask_sqlalchemy|odoo|quotes|mongoengine)")
+_LINT_MYPY_SAFE_PLUGINS = frozenset((
+    "pydantic.mypy", "pydantic.v1.mypy", "sqlalchemy.ext.mypy.plugin",
+    "mypy_django_plugin.main", "mypy_drf_plugin.main", "numpy.typing.mypy_plugin",
+    "strawberry.ext.mypy_plugin", "returns.contrib.mypy.returns_plugin",
+    "pandera.mypy", "sqlmypy", "attrs", "trio_typing.plugin",
+))
+_LINT_RAW_TOKENS_RE = re.compile(
+    r"init[-_]?hook|load[-_]?plugins|plugins|python[-_]?executable|local[-_]?plugins"
+    r"|addopts|pdbcls|confcutdir|require|inherit[-_]?from|parser|<%", re.IGNORECASE)
+
+
+def _lint_norm_key(k) -> str:
+    return re.sub(r"[_\s]+", "-", str(k).strip().lower())
+
+
+def _lint_split_list(v) -> list:
+    if isinstance(v, (list, tuple)):
+        out = []
+        for x in v:
+            out.extend(_lint_split_list(x) if isinstance(x, (list, tuple)) else [x])
+        return out
+    if isinstance(v, str):
+        return [x.strip() for x in re.split(r"[,\n]", v) if x.strip()]
+    return [v]
+
+
+def _lint_ini_entries(content: str):
+    """(section_lower, norm_key, value) for every key line in an INI body.
+    Mirrors configparser's continuation rule, and ALSO reports a key-shaped
+    continuation line under the current section (fail closed)."""
+    sect = ""
+    cur = None       # [section, key, [value lines], indent]
+    out = []
+    for line in content.lstrip("﻿").splitlines():
+        if not line.strip() or line.lstrip().startswith(("#", ";")):
+            if cur is not None and not line.strip():
+                cur[2].append("")
+            continue
+        indent = len(line) - len(line.lstrip())
+        if cur is not None and indent > cur[3]:
+            cur[2].append(line.strip())
+            km = _LINT_INI_KEY_RE.match(line)
+            if km:
+                out.append((sect, _lint_norm_key(km.group(2)), km.group(3).strip()))
+            continue
+        hm = _LINT_INI_HDR_RE.match(line)
+        if hm:
+            if cur is not None:
+                out.append((cur[0], cur[1], "\n".join(cur[2]).strip()))
+                cur = None
+            sect = hm.group(1).strip().lower()
+            continue
+        km = _LINT_INI_KEY_RE.match(line)
+        if cur is not None:
+            out.append((cur[0], cur[1], "\n".join(cur[2]).strip()))
+            cur = None
+        if km:
+            cur = [sect, _lint_norm_key(km.group(2)), [km.group(3).strip()], indent]
+        else:
+            out.append((sect, _lint_norm_key(line.strip()), ""))   # bare key
+    if cur is not None:
+        out.append((cur[0], cur[1], "\n".join(cur[2]).strip()))
+    return out
+
+
+def _lint_addopts_bad(v) -> list:
+    """Labels for plugin-loading flags in a pytest `addopts` value."""
+    import shlex as _shlex
+    toks = []
+    for x in (v if isinstance(v, (list, tuple)) else [v]):
+        if not isinstance(x, str):
+            return [f"addopts (non-string {type(x).__name__})"]
+        try:
+            toks.extend(_shlex.split(x, comments=False, posix=True))
+        except ValueError:
+            return ["addopts (unparseable)"]
+    bad = []
+    i = 0
+    takes_val = set("kmcoWrn")
+    while i < len(toks):
+        t = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if t.startswith("--"):
+            name = t.split("=", 1)[0]
+            if any(name == f or (len(name) >= 4 and f.startswith(name))
+                   for f in ("--pdbcls", "--confcutdir", "--plugin")):
+                bad.append(f"addopts {name} (loads code / widens conftest search)")
+            elif name in ("--override-ini",):
+                val = t.split("=", 1)[1] if "=" in t else nxt
+                if re.match(r"\s*(?:addopts|pythonpath|required[-_]plugins)\b", val, re.I):
+                    bad.append(f"addopts {name} {val[:30]}")
+        elif t.startswith("-") and len(t) > 1:
+            j = 1
+            while j < len(t):
+                c = t[j]
+                if c == "p":
+                    val = t[j + 1:] or nxt
+                    val = val.lstrip("=")
+                    if not val.startswith("no:"):
+                        bad.append(f"addopts -p {val[:40]} (plugin module imported on every run)")
+                    break
+                if c == "o":
+                    val = t[j + 1:] or nxt
+                    if re.match(r"=?\s*(?:addopts|pythonpath)\b", val, re.I):
+                        bad.append(f"addopts -o {val[:30]}")
+                    break
+                if c in takes_val:
+                    break
+                j += 1
+        i += 1
+    return bad
+
+
+def _lint_path_like(s) -> bool:
+    if not isinstance(s, str):
+        return True
+    t = s.strip()
+    return (not t or t.startswith((".", "/", "~", "\\", "$", "%", "file:"))
+            or bool(re.match(r"^[A-Za-z]:", t)) or "\\" in t
+            or bool(re.search(r"\.(?:rb|py|js|mjs|cjs|ts|mts|cts|so|dll)$", t, re.I))
+            or ".." in t.replace("\\", "/").split("/"))
+
+
+def lint_unsafe_entries(content, kind) -> list:
+    """(label, fingerprint) for every gated entry in a linter config body
+    of the given kind (see `lint_kind`)."""
+    out = []
+    if not isinstance(content, str) or not content.strip():
+        return out
+    if len(content) > _MISE_MAX_TEXT:
+        return [("<oversized>", "<oversized>")]
+
+    def add(label, *parts):
+        out.append((label[:100], _mise_fp("lint", *parts)))
+
+    def unparseable(what):
+        # A broken file only counts if it names a gated key at all: an
+        # unparseable pyproject.toml without one is not this guard's concern.
+        if _LINT_RAW_TOKENS_RE.search(content):
+            out.append((f"<unparseable {what} naming a code-loading key>", "<unparseable>"))
+
+    def pylint_key(k, v, where):
+        if k == "init-hook":
+            add(f"{where}init-hook (Python exec()'d at every pylint start)", "pylint", "init-hook", v)
+        elif k == "load-plugins":
+            for x in _lint_split_list(v):
+                if not (isinstance(x, str) and _LINT_PYLINT_SAFE_PLUGIN_RE.fullmatch(x.strip())):
+                    add(f"{where}load-plugins {str(x)[:40]} (module imported by pylint)",
+                        "pylint", "load-plugins", x)
+
+    def mypy_key(k, v, where):
+        if k == "plugins":
+            for x in _lint_split_list(v):
+                if not (isinstance(x, str) and x.strip() in _LINT_MYPY_SAFE_PLUGINS):
+                    add(f"{where}plugins {str(x)[:40]} (mypy plugin, imported in-process)",
+                        "mypy", "plugins", x)
+        elif k == "python-executable":
+            add(f"{where}python_executable (program mypy runs)", "mypy", "python-executable", v)
+
+    def pytest_key(k, v, where):
+        if k == "addopts":
+            for lab in _lint_addopts_bad(v):
+                add(where + lab, "pytest", lab)
+
+    # ---- INI kinds ----------------------------------------------------------
+    if kind in ("pylint-ini", "mypy-ini", "flake8-ini", "pytest-ini", "setup-cfg", "tox-ini"):
+        if "\x00" in content:
+            return [("<binary content>", "<unparseable>")]
+        for sect, k, v in _lint_ini_entries(content):
+            where = f"[{sect}] " if sect else ""
+            if kind in ("pylint-ini", "setup-cfg", "tox-ini"):
+                pylint_key(k, v, where)
+            if kind == "mypy-ini" or (kind == "setup-cfg" and sect.startswith("mypy")):
+                mypy_key(k, v, where)
+            if "local-plugins" in sect.replace("_", "-") or (
+                    kind == "flake8-ini" and k in ("paths", "extension", "report")
+                    and "plugin" in sect):
+                add(f"{where}{k} (flake8 local plugin, imported from a repo path)",
+                    "flake8", sect, k, v)
+            if kind == "pytest-ini" or (kind == "tox-ini" and sect == "pytest") or (
+                    kind == "setup-cfg" and sect == "tool:pytest"):
+                pytest_key(k, v, where)
+        return out
+
+    # ---- TOML kinds ---------------------------------------------------------
+    if kind in ("pyproject", "pylint-toml", "pytest-toml"):
+        if _mise_toml is None:
+            return [("<no TOML parser available>", _mise_fp("noparser", content))]
+        try:
+            doc = _mise_toml.loads(content.lstrip("﻿"))
+        except Exception:
+            unparseable("TOML")
+            return out
+        tool = doc.get("tool") if isinstance(doc.get("tool"), dict) else {}
+
+        def walk(v, fn, where, depth=0):
+            if depth > 16:
+                add(f"{where}<oversized nesting>", "deep", where)
+                return
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    nk = _lint_norm_key(k)
+                    fn(nk, x, where)
+                    if isinstance(x, (dict, list)):
+                        walk(x, fn, f"{where}{k}.", depth + 1)
+            elif isinstance(v, list):
+                for x in v:
+                    if isinstance(x, dict):
+                        walk(x, fn, where, depth + 1)
+
+        if kind in ("pyproject", "pylint-toml"):
+            walk(tool.get("pylint", {}), pylint_key, "tool.pylint.")
+            if kind == "pylint-toml":
+                # pylintrc.toml: also any top-level pylint-shaped table.
+                walk({k: v for k, v in doc.items() if k != "tool"}, pylint_key, "")
+        if kind == "pyproject":
+            walk(tool.get("mypy", {}), mypy_key, "tool.mypy.")
+            pt = tool.get("pytest", {})
+            if isinstance(pt, dict):
+                walk(pt, pytest_key, "tool.pytest.")
+        if kind == "pytest-toml":
+            walk(doc, pytest_key, "")
+        return out
+
+    # ---- RuboCop (YAML through ERB) -------------------------------------------
+    if kind == "rubocop":
+        for m in re.finditer(r"<%.*?(?:%>|\Z)", content, re.DOTALL):
+            add(f"ERB tag {m.group(0)[:40]!r} (Ruby run when RuboCop loads the config)",
+                "rubocop", "erb", m.group(0))
+        try:
+            import yaml as _yaml
+            doc = _yaml.safe_load(re.sub(r"<%.*?(?:%>|\Z)", "", content, flags=re.DOTALL))
+        except Exception:
+            unparseable("YAML")
+            return out
+        if doc is None:
+            return out
+        if not isinstance(doc, dict):
+            add("<not a mapping>", "rubocop", "notmap", content)
+            return out
+        for k, v in doc.items():
+            nk = _lint_norm_key(k)
+            if nk in ("require", "plugins"):
+                for x in _lint_split_list(v):
+                    name = x.get("name") if isinstance(x, dict) else x
+                    if _lint_path_like(name) or isinstance(x, dict):
+                        add(f"{k}: {str(name)[:40]} (Ruby file loaded by RuboCop)",
+                            "rubocop", nk, x)
+            elif nk == "inherit-from":
+                # A URL (fetched remotely) or a path outside the project
+                # (`~/x.yml`, `/tmp/x.yml`, `../x.yml`) pulls in config --
+                # ERB and `require:` included -- no repo diff shows.
+                for x in _lint_split_list(v):
+                    t = str(x).strip().replace("\\", "/")
+                    if not isinstance(x, str) or re.match(r"\w+://", t) or t.startswith(
+                            ("/", "~", "$", "%")) or re.match(r"^[A-Za-z]:", t) or ".." in t.split("/"):
+                        add(f"{k}: {str(x)[:40]} (config from outside the project)",
+                            "rubocop", nk, x)
+        return out
+
+    # ---- Prettier (JSON / JSON5 / YAML / TOML) --------------------------------
+    if kind == "prettier":
+        doc = None
+        import json as _json
+        try:
+            doc = _json.loads(content.lstrip("﻿"))
+        except Exception:
+            try:
+                import yaml as _yaml
+                doc = _yaml.safe_load(content)
+            except Exception:
+                doc = None
+                if _mise_toml is not None:
+                    try:
+                        doc = _mise_toml.loads(content.lstrip("﻿"))
+                    except Exception:
+                        doc = None
+            if doc is None or isinstance(doc, str):
+                if _mise_toml is not None:
+                    try:
+                        doc = _mise_toml.loads(content.lstrip("﻿"))
+                    except Exception:
+                        pass
+        if doc is None or isinstance(doc, (str, int, float, bool)):
+            if doc is None and not content.strip():
+                return out
+            unparseable("Prettier config")
+            return out
+
+        def pwalk(v, where, depth=0):
+            if depth > 16:
+                add(f"{where}<oversized nesting>", "deep", where)
+                return
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    nk = _lint_norm_key(k)
+                    if nk in ("plugins", "plugin-search-dirs", "pluginsearchdirs"):
+                        for y in _lint_split_list(x):
+                            add(f"{where}{k} {str(y)[:40]} (JS loaded by prettier / format-on-save)",
+                                "prettier", nk, y)
+                    elif nk == "parser" and _lint_path_like(x):
+                        add(f"{where}parser {str(x)[:40]} (path-like: loads code)",
+                            "prettier", nk, x)
+                    elif isinstance(x, (dict, list)):
+                        pwalk(x, f"{where}{k}.", depth + 1)
+            elif isinstance(v, list):
+                for x in v:
+                    pwalk(x, where, depth + 1)
+        pwalk(doc, "")
+        return out
+    return out

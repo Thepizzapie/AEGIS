@@ -470,6 +470,13 @@ class Policy:
     # (registry, scopes, ca/cafile, global/cache dirs). See
     # rules.rule_bunfig_exec_protect.
     bunfig_exec: dict = field(default_factory=dict)
+    # Linter / test-runner config exec-hijack protection: {mode: deny|ask|
+    # monitor|off, allow: [regex on path / whole command]}. Empty -> defaults
+    # (mode=ask). Covers pylint init-hook/load-plugins, mypy plugins/
+    # python_executable, flake8 local-plugins, pytest addopts -p, RuboCop
+    # ERB/require, Prettier plugins -- in their dedicated files and in
+    # pyproject.toml/setup.cfg/tox.ini. See rules.rule_lint_config_exec_protect.
+    lint_config_exec: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/
