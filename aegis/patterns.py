@@ -11450,17 +11450,35 @@ def _lint_warning_spec_imports(spec) -> bool:
     return cat.split(".", 1)[0] not in _LINT_SAFE_WARN_MODULES
 
 
+def _lint_override_bad(val: str) -> bool:
+    """An `-o name=value` override that loads code: addopts / pythonpath /
+    required_plugins always; filterwarnings only when its category imports
+    a module (QA round 4: `-o filterwarnings=error` is routine)."""
+    m = re.match(r"\s*([\w-]+)\s*=?(.*)$", val or "", re.S)
+    if not m:
+        return False
+    name = m.group(1).lower().replace("-", "_")
+    if name in ("addopts", "pythonpath", "required_plugins"):
+        return True
+    if name == "filterwarnings":
+        return _lint_warning_spec_imports(m.group(2).strip())
+    return False
+
+
 def _lint_addopts_bad(v) -> list:
-    """Labels for plugin-loading flags in a pytest `addopts` value."""
+    """(label, fingerprint value) for plugin-loading flags in a pytest
+    `addopts` value. The fingerprint value is the offending flag's FULL
+    value, so unrelated flags on the same line can change freely while a
+    swap of a long approved plugin name is still seen."""
     import shlex as _shlex
     toks = []
     for x in (v if isinstance(v, (list, tuple)) else [v]):
         if not isinstance(x, str):
-            return [f"addopts (non-string {type(x).__name__})"]
+            return [(f"addopts (non-string {type(x).__name__})", v)]
         try:
             toks.extend(_shlex.split(x, comments=False, posix=True))
         except ValueError:
-            return ["addopts (unparseable)"]
+            return [("addopts (unparseable)", v)]
     bad = []
     i = 0
     takes_val = set("kmcoWrn")
@@ -11472,15 +11490,15 @@ def _lint_addopts_bad(v) -> list:
             # pytest rejects abbreviated long options, so exact names only
             # (`--pdb`/`--co` are real, harmless options -- QA round 3).
             if name in ("--pdbcls", "--confcutdir"):
-                bad.append(f"addopts {name} (loads code / widens conftest search)")
+                bad.append((f"addopts {name} (loads code / widens conftest search)", t))
             elif name == "--pythonwarnings":
                 val = t.split("=", 1)[1] if "=" in t else nxt
                 if _lint_warning_spec_imports(val):
-                    bad.append(f"addopts {name} {val[:40]} (imports the warning category's module)")
+                    bad.append((f"addopts {name} {val[:40]} (imports the warning category's module)", val))
             elif name in ("--override-ini",):
                 val = t.split("=", 1)[1] if "=" in t else nxt
-                if re.match(r"\s*(?:addopts|pythonpath|required[-_]plugins|filterwarnings)\b", val, re.I):
-                    bad.append(f"addopts {name} {val[:30]}")
+                if _lint_override_bad(val):
+                    bad.append((f"addopts {name} {val[:30]}", val))
         elif t.startswith("-") and len(t) > 1:
             j = 1
             while j < len(t):
@@ -11489,17 +11507,17 @@ def _lint_addopts_bad(v) -> list:
                     val = t[j + 1:] or nxt
                     val = val.lstrip("=")
                     if not val.startswith("no:"):
-                        bad.append(f"addopts -p {val[:40]} (plugin module imported on every run)")
+                        bad.append((f"addopts -p {val[:40]} (plugin module imported on every run)", val))
                     break
                 if c == "o":
                     val = t[j + 1:] or nxt
-                    if re.match(r"=?\s*(?:addopts|pythonpath|filterwarnings)\b", val, re.I):
-                        bad.append(f"addopts -o {val[:30]}")
+                    if _lint_override_bad(val.lstrip("=")):
+                        bad.append((f"addopts -o {val[:30]}", val))
                     break
                 if c == "W":
                     val = (t[j + 1:] or nxt).lstrip("=")
                     if _lint_warning_spec_imports(val):
-                        bad.append(f"addopts -W {val[:40]} (imports the warning category's module)")
+                        bad.append((f"addopts -W {val[:40]} (imports the warning category's module)", val))
                     break
                 if c in takes_val:
                     break
@@ -11556,11 +11574,12 @@ def lint_unsafe_entries(content, kind) -> list:
 
     def pytest_key(k, v, where):
         if k == "addopts":
-            for lab in _lint_addopts_bad(v):
-                # Fingerprint the FULL value, not the (truncated) label, so a
-                # human-approved long plugin name can't be swapped for another
-                # sharing its first 40 characters (QA round 3).
-                add(where + lab, "pytest", lab, v)
+            for lab, fv in _lint_addopts_bad(v):
+                # Fingerprint the offending flag's FULL value, not the
+                # truncated label (QA round 3) -- and not the whole addopts
+                # line, so editing an unrelated flag beside an approved `-p`
+                # does not re-ask (QA round 4).
+                add(where + lab, "pytest", lab.split(" ", 2)[:2], fv)
         elif k == "filterwarnings":
             for x in _lint_split_list(v) if not isinstance(v, str) else \
                     [y.strip() for y in re.split(r"[\r\n]+", v) if y.strip()]:
@@ -11659,7 +11678,7 @@ def lint_unsafe_entries(content, kind) -> list:
                 for x in _lint_split_list(v):
                     name = x.get("name") if isinstance(x, dict) else x
                     if _lint_path_like(name) or isinstance(x, dict) or (
-                            "/" in str(name) and not str(name).startswith("rubocop")):
+                            "/" in str(name) and not str(name).startswith(("rubocop/", "rubocop-"))):
                         add(f"{k}: {str(name)[:40]} (Ruby file loaded by RuboCop)",
                             "rubocop", nk, x)
             elif nk == "inherit-from":

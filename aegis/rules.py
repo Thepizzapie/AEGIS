@@ -16219,6 +16219,10 @@ def _lint_new_unsafe(ev: Event, p: str) -> list:
         # `#addopts = -p x` that a regex edit or a non-matching old_string
         # could uncomment -- QA round 3).
         on_disk = _npmrc_read(ev, p)
+        # Any gated-key name on disk counts, not just a commented one: a
+        # regex edit appending ` -p x` to a live `addopts = -q` line names no
+        # key in its new text (kept over QA round 4's narrowing; normal
+        # Edit/MultiEdit calls replay exactly and never reach this path).
         if shared and not (on_disk and patterns.lint_text_names_gated_key(on_disk)) \
                 and not any(patterns.lint_text_names_gated_key(str(x))
                             for x in _http_rc_written_strings(a)):
@@ -16335,7 +16339,8 @@ def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     on pyproject.toml/setup.cfg/tox.ini, a first-time Prettier plugin, a
     non-allowlisted pylint/mypy plugin, a first-time ``filterwarnings``
     entry for a third-party warning class (``ignore::sqlalchemy.exc.X``),
-    an unreplayable edit to a shared file that already names a gated key,
+    an unreplayable edit (regex-style MCP edit, non-matching old_string)
+    to a shared file that names any gated key,
     any non-read shell verb on a dedicated config.
     """
     cfg = getattr(policy, "lint_config_exec", None) or {}

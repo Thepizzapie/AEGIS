@@ -444,3 +444,35 @@ def test_long_plugin_name_swap_gated(tmp_path):
     base = "a" * 45
     f.write_text(f"[pytest]\naddopts = -p {base}_good\n")
     assert _ours(R(_edit(str(f), f"{base}_good", f"{base}_evil"), EMPTY))
+
+
+# ---- QA round 4 ----------------------------------------------------------------
+def test_unrelated_addopts_flag_beside_approved_plugin_allowed(tmp_path):
+    f = tmp_path / "pytest.ini"
+    f.write_text("[pytest]\naddopts = -p myplug -q\n")
+    assert R(_edit(str(f), "-q", "-q --strict-markers"), EMPTY) is None
+    f2 = tmp_path / "pyproject.toml"
+    f2.write_text('[tool.pytest.ini_options]\naddopts = "-p myplug -q"\n')
+    assert R(_edit(str(f2), "-q", "-q -ra"), EMPTY) is None
+
+
+def test_regex_edit_extending_live_addopts_gated(tmp_path):
+    f = tmp_path / "setup.cfg"
+    f.write_text("[tool:pytest]\naddopts = -q\n")
+    ev = _mcp({"path": str(f), "edits": [{"pattern": "-q$", "replacement": "-q -p evilplug"}]},
+              tool="mcp__filesystem__edit_file")
+    assert _ours(R(ev, EMPTY))
+
+
+@pytest.mark.parametrize("body", ["[pytest]\naddopts = -o filterwarnings=error\n",
+                                  "[pytest]\naddopts = --override-ini=filterwarnings=error\n"])
+def test_override_filterwarnings_routine_allowed(body):
+    assert R(_write("/r/pytest.ini", body), EMPTY) is None
+
+
+@pytest.mark.parametrize("body", ["[pytest]\naddopts = -o filterwarnings=ignore::evilplug.W\n",
+                                  "[pytest]\naddopts = -o addopts=-pevil\n",
+                                  "require:\n  - rubocop_evil/x\n"])
+def test_round4_still_gated(body):
+    path = "/r/.rubocop.yml" if body.startswith("require") else "/r/pytest.ini"
+    assert _ours(R(_write(path, body), EMPTY))
