@@ -11191,6 +11191,7 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.EDITOR_STARTUP_PATH_RE, "an editor startup/init file (vimrc/nvim/emacs.d)"),
     (patterns.MISE_PATH_RE, "a mise/asdf config (mise.toml/.tool-versions) or plugin/shim dir"),
     (patterns.BUNFIG_PATH_RE, "a Bun config file (bunfig.toml / ~/.bunfig.toml)"),
+    (patterns.LINT_CONFIG_PATH_RE, "a linter/test-runner config (.pylintrc/mypy.ini/pytest.ini/.rubocop.yml/.prettierrc/pyproject.toml)"),
 )
 
 
@@ -16145,6 +16146,297 @@ def rule_bunfig_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
     return None
 
 
+
+# ---- Linter / test-runner config exec hijack: human-escapable --------------
+def _lint_path_shaped(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    t = v.strip()
+    if not t or "\n" in t or len(t) > 4096:
+        return False
+    if not (_HTTP_RC_PATH_SHAPE_RE.match(t) or re.fullmatch(r"[\w.\-]+(?:[/\\][^\r\n]*)?", t)):
+        return False
+    return bool(patterns.lint_kind(t))
+
+
+def _lint_target(ev: Event, p: str) -> str:
+    """The linter-config path a write targets ('' if none). For MCP calls
+    the path may sit under any key, be a patch header, or a mapping key."""
+    if p and patterns.lint_kind(p):
+        return p
+    if ev.action != ActionClass.MCP:
+        return ""
+    a = ev.args or {}
+    if p and "\n" not in p:
+        a = {k: v for k, v in a.items() if str(k) not in _ED_PLAIN_CONTENT_KEYS}
+    flat = [str(x) for x in _flatten_strings(a)]
+    for s_ in flat[:5000]:
+        if _lint_path_shaped(s_):
+            return s_.strip()
+    for s_ in flat[:5000]:
+        if patterns.lint_patch_hit(s_):
+            return "<patch>"
+    for k_ in _http_rc_mapping_keys(a):
+        if "\n" not in k_ and patterns.lint_kind(k_.strip()):
+            return k_
+    for k_, v_ in a.items():
+        if (_http_rc_words(k_) & _MISE_NAME_KEY_WORDS and isinstance(v_, str)
+                and patterns.lint_kind("/" + v_.strip())):
+            return v_.strip()
+    return ""
+
+
+def _lint_new_unsafe(ev: Event, p: str) -> list:
+    """Labels of gated linter-config entries the call would ADD. Edits are
+    replayed on the on-disk file and the parsed before/after sets are
+    diffed by canonical fingerprint (the `_bunfig_new_unsafe` shape)."""
+    a = ev.args or {}
+    if _http_rc_mcp_read_only(ev) or _mise_mcp_delete_only(ev):
+        return []
+    if p == "<patch>":
+        return ["<patch touching a linter/test-runner config>"]
+    kind = patterns.lint_kind(p)
+    if ev.action == ActionClass.MCP:
+        if _http_rc_words(str(ev.tool or "").split("__")[-1]) & _HTTP_RC_COPY_WORDS:
+            return ["<copied/moved from another file>"]
+        for k in _HTTP_RC_NON_CONTENT_KEYS:
+            v = a.get(k)
+            if isinstance(v, str) and v.strip() and v.strip() != p \
+                    and _HTTP_RC_PATHLIKE_RE.match(v.strip()):
+                pn = str(p).replace("\\", "/").rstrip("/")
+                vn = v.strip().replace("\\", "/").rstrip("/")
+                if not (pn == vn or pn.startswith(vn + "/")):
+                    return [f"<content from another file: {v.strip()[:60]}>"]
+    edits, unreplayable = _http_rc_edit_list(a)
+    shared = patterns.lint_kind_is_shared(kind)
+
+    def _unverifiable(why):
+        # pyproject.toml / setup.cfg / tox.ini are edited constantly for
+        # reasons unrelated to linting; when an edit can't be replayed,
+        # judge its NEW text: it can only plant a gated key by naming one.
+        # Dedicated linter configs stay fail-closed.
+        # ...unless the file on disk already names one (a commented-out
+        # `#addopts = -p x` that a regex edit or a non-matching old_string
+        # could uncomment -- QA round 3).
+        on_disk = _npmrc_read(ev, p)
+        # Any gated-key name on disk counts, not just a commented one: a
+        # regex edit appending ` -p x` to a live `addopts = -q` line names no
+        # key in its new text (kept over QA round 4's narrowing; normal
+        # Edit/MultiEdit calls replay exactly and never reach this path).
+        if shared and not (on_disk and patterns.lint_text_names_gated_key(on_disk)) \
+                and not any(patterns.lint_text_names_gated_key(str(x))
+                            for x in _http_rc_written_strings(a)):
+            return []
+        return [why]
+    if unreplayable and ev.action in (ActionClass.MCP, ActionClass.EDIT):
+        return _unverifiable("<edit shape not replayable against the file on disk>")
+    before = _npmrc_read(ev, p)
+    if len(edits) > 500 or len(edits) * len(before or "") > 50_000_000:
+        return ["<too many edits to replay>"]
+    content = a.get("content", a.get("contents"))
+    if content is not None and not isinstance(content, str):
+        content = json.dumps(content, default=str)
+    if edits:
+        if before is None:
+            return _unverifiable("<edit not verifiable against the file on disk>")
+        after = _npmrc_apply_edits(before, edits)
+        if after is None:
+            return _unverifiable("<edit not verifiable against the file on disk>")
+    elif isinstance(content, str):
+        after = content
+    elif ev.action == ActionClass.MCP and _mise_mcp_item_content(a, p) is not None:
+        after = _mise_mcp_item_content(a, p)
+    elif ev.action == ActionClass.MCP:
+        after = "\n".join(x for x in _http_rc_mcp_strings(ev, a) if x.strip() and x.strip() != p)
+    else:
+        after = "\n".join(x for x in _http_rc_written_strings(a) if x != p)
+    had = [fp for _, fp in patterns.lint_unsafe_entries(before or "", kind)]
+    added = []
+    for label, fp in patterns.lint_unsafe_entries(after, kind):
+        if fp in ("<unparseable>", "<oversized>"):
+            added.append(label)           # never cancelled by an already-broken file
+        elif fp in had:
+            had.remove(fp)
+        else:
+            added.append(label)
+    return added
+
+
+def _lint_shared_tail_open(ev: Event, cmd: str) -> bool:
+    """True if a shared file the command names exists on disk and does not
+    end with a newline -- an append would then continue its last line
+    (`...\ninit` + `-hook=x`), assembling a key no command names."""
+    for w in patterns.lint_shared_paths_named(cmd):
+        txt = _npmrc_read(ev, w)
+        if txt and not txt.endswith(("\n", "\r")):
+            return True
+    return False
+
+
+def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate planting a code-loading entry in a linter / test-runner config
+    -- pylint, mypy, flake8, pytest, RuboCop, Prettier.
+
+    PLAN / THREAT MODEL: these configs look like inert data, but each tool
+    reads them with no prompt on every run -- by the agent, by the human,
+    by CI, and by the EDITOR (the VS Code pylint/mypy/flake8/RuboCop/
+    Prettier extensions lint on open and format on save, so the human need
+    not run anything). A prompt-injected agent writes one line and code
+    runs on the next ordinary lint/test/open: pylint ``init-hook`` (a Python
+    statement exec()'d at start -- no separate file needed) and
+    ``load-plugins``; mypy ``plugins`` (modules or ``.py`` files imported
+    in-process) and ``python_executable`` (a program mypy RUNS);
+    ``[flake8:local-plugins]``; pytest ``addopts = -p <module>`` /
+    ``--pdbcls`` / ``--confcutdir``, and a ``filterwarnings`` / ``-W`` /
+    ``--pythonwarnings`` category naming a non-builtin module (pytest
+    imports it); RuboCop's ERB preprocessing
+    (``<%= system(...) %>`` anywhere in ``.rubocop.yml``), ``require:``/
+    ``plugins:`` of a Ruby file, ``inherit_from:`` a URL or outside path;
+    Prettier ``plugins`` (bare names resolve through a git-ignored
+    ``node_modules``) and a path-like ``parser``. A reviewer skims a
+    ``.pylintrc`` diff; ``init-hook`` hides a full payload in it. No
+    existing guard named these files: ``rule_conftest_protect`` sees
+    ``conftest.py``, ``rule_vscode_settings_exec_protect`` the editor's own
+    ``pylint.args``, ``rule_package_manifest_protect`` ``package.json``.
+
+    BUILD: dedicated files (``.pylintrc``, ``pylintrc[.toml]``, ``mypy.ini``,
+    ``.mypy.ini``, ``~/.config/mypy/config``, ``.flake8``, ``pytest.ini``,
+    ``.pytest.ini``, ``pytest.toml``, ``.rubocop*.yml``,
+    ``~/.config/rubocop/config.yml``, ``.prettierrc[.json|.json5|.yaml|
+    .yml|.toml]``) and the SHARED files (``pyproject.toml``, ``setup.cfg``,
+    ``tox.ini``) are PARSED and only the code-loading keys count, so routine
+    edits (``max-line-length``, ``[project] version``, ``testpaths``) pass.
+    INI is scanned with configparser's continuation rule plus a fail-closed
+    report of key-shaped continuation lines; TOML/YAML/JSON are parsed.
+    The before/after sets are diffed by canonical fingerprint, with Edit/
+    MultiEdit/MCP edits replayed on disk, so uncommenting a staged
+    ``# init-hook`` counts and an edit beside a human-set plugin does not
+    re-ask. Shipped/well-known plugins (``pylint.extensions.*``,
+    ``pydantic.mypy``, ``rubocop-rails``-style gem names) pass. Shell:
+    a dedicated path is gated unless the command only reads/deletes (a
+    linter run whose only mention is its ``--rcfile``/``-c`` value is a
+    read); a shared path is gated unless it only reads or is a plain
+    literal ``echo``/``printf``/heredoc/``tee`` write naming no gated key.
+    ``LINT_CONFIG_PATH_RE`` is registered with
+    ``rule_fetch_to_file_protect``.
+
+    Config (``policy.lint_config_exec``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes; normalized path for file writes, the
+    WHOLE command for shell). Escapable only by a human: ``# aegis-allow``
+    on the shell form, or ``AEGIS_ALLOW_LINT_CONFIG_EXEC=1`` set before
+    launch.
+
+    Honest scope: configs delivered by ``git clone``/``pull``/archive
+    extraction; ``package.json`` ``prettier``/``eslintConfig`` keys and JS
+    config files (``eslint.config.js``, ``prettier.config.js``,
+    ``.stylelintrc.js`` -- those are code, edited like any source);
+    plugin-specific pytest ini keys (pytest-django ``DJANGO_SETTINGS_MODULE``,
+    pytest-env ``env``);
+    ``PYTEST_ADDOPTS``/``PYLINTRC``/``MYPY_CONFIG_FILE_DIR`` env vars
+    (``rule_shell_persist_protect``'s); a tox ``setenv`` of those; the
+    plugin module's own contents once approved; a well-known plugin name
+    shadowed by a same-named local package. Accepted false ASKs: ``sed -i``
+    on pyproject.toml/setup.cfg/tox.ini, a first-time Prettier plugin, a
+    non-allowlisted pylint/mypy plugin, a first-time ``filterwarnings``
+    entry for a third-party warning class (``ignore::sqlalchemy.exc.X``),
+    an unreplayable edit (regex-style MCP edit, non-matching old_string)
+    to a shared file that names any gated key,
+    any non-read shell verb on a dedicated config.
+    """
+    cfg = getattr(policy, "lint_config_exec", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "lint-config-exec-protect-monitor")
+            return None
+        return would
+
+    if isinstance(ev.args, dict) and isinstance(ev.args.get("command"), (list, tuple)):
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={**ev.args, "command": " ".join(str(x) for x in ev.args["command"])})
+    if not isinstance(ev.args, dict):
+        raw_args = ev.args
+        txt = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)[:400000]
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"command": txt} if _is_shell(ev) else {"input": txt})
+
+    if ev.action == ActionClass.MCP:
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            for c in dict.fromkeys((shell_cmd, shell_cmd.replace("\n", " "))):
+                sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                 args={"command": c}, cwd=ev.cwd)
+                d = rule_lint_config_exec_protect(sub, policy)
+                if d is not None:
+                    return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                    "command that writes a linter config. " + d.message)
+            a0 = ev.args or {}
+            if isinstance(a0.get("command"), str) and re.fullmatch(r"\s*[A-Za-z_]{1,32}\s*", a0["command"]):
+                ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                                args={k: v for k, v in a0.items() if k != "command"})
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _lint_target(ev, _path(ev))
+        if not p:
+            return None
+        found = _lint_new_unsafe(ev, p)
+        if not found:
+            return None
+        if os.environ.get("AEGIS_ALLOW_LINT_CONFIG_EXEC") or (
+                p != "<patch>" and _mise_allowed_path(cfg, p)):
+            return None
+        shown = ", ".join(found[:5]) + (", ..." if len(found) > 5 else "")
+        return _finish(Decision(action, "lint-config-exec-protect",
+                         f"'{p}' is a linter/test-runner config read with no "
+                         "prompt on every pylint/mypy/flake8/pytest/RuboCop/"
+                         "Prettier run -- including the editor's lint-on-open "
+                         f"and format-on-save -- and this write adds: {shown}. "
+                         "These entries execute code (init-hook, plugins, "
+                         "python_executable, -p, ERB). Review the change, "
+                         "then confirm with AEGIS_ALLOW_LINT_CONFIG_EXEC=1; "
+                         "a spawned agent cannot."))
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        raw = _cmd(ev)
+        d1, s1 = patterns.lint_shell_path_hits(cmd)
+        d2, s2 = patterns.lint_shell_path_hits(raw)
+        if not (d1 or s1 or d2 or s2):
+            return None
+        ncmd = patterns.lint_neutralize_tool_runs(normalize.scan_surface(raw, sep="\n"))
+        nraw = patterns.lint_neutralize_tool_runs(raw)
+        d1, s1 = patterns.lint_shell_path_hits(ncmd)
+        d2, s2 = patterns.lint_shell_path_hits(nraw)
+        if not (d1 or s1 or d2 or s2):
+            return None
+        if patterns.mise_shell_only_reads(ncmd) and patterns.mise_shell_only_reads(nraw):
+            return None
+        if not (d1 or d2) and patterns.lint_shared_literal_write_ok(raw) and \
+                not _lint_shared_tail_open(ev, raw):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_LINT_CONFIG_EXEC")
+                or _mise_allowed_cmd(cfg, raw)):
+            return None
+        what = ("a linter/test-runner config (.pylintrc, mypy.ini, .flake8, "
+                "pytest.ini, .rubocop.yml, .prettierrc)" if (d1 or d2) else
+                "pyproject.toml/setup.cfg/tox.ini in a shape whose result "
+                "can't be read off the command line")
+        return _finish(Decision(action, "lint-config-exec-protect",
+                         f"A shell command writes {what}. pylint/mypy/flake8/"
+                         "pytest/RuboCop/Prettier -- and the editor's lint-on-"
+                         "save -- read these with no prompt, and an init-hook, "
+                         "plugin, `-p` or ERB entry in them runs code. Prefer "
+                         "the Edit tool (its content is checked); a human may "
+                         "append '# aegis-allow', or set "
+                         "AEGIS_ALLOW_LINT_CONFIG_EXEC=1; a spawned agent cannot."))
+    return None
+
+
 _CORE_RULES = (
     rule_attest_session,
     rule_containment,
@@ -16211,6 +16503,7 @@ _CORE_RULES = (
     rule_editor_startup_protect,
     rule_mise_exec_protect,
     rule_bunfig_exec_protect,
+    rule_lint_config_exec_protect,
     rule_agent_rules_protect,
 )
 
