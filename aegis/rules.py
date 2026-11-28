@@ -16456,6 +16456,71 @@ def _login_autostart_rel_hit(p: str, cwd) -> bool:
     return patterns.login_autostart_path_hit(str(cwd).rstrip("/\\") + "/" + p)
 
 
+_LA_PATHISH_KEY_WORDS = frozenset(("path", "paths", "file", "files", "filename", "filepath",
+                                   "dest", "destination", "target", "dst", "to", "output",
+                                   "out", "outfile", "location", "uri", "url", "dir",
+                                   "directory", "folder", "new", "newpath", "save", "saveas"))
+
+
+def _la_pathish_leaves(v, key_ok=False, _d=0):
+    """String leaves sitting under a path-like key (at any depth)."""
+    if _d > 12:
+        return
+    if isinstance(v, str):
+        if key_ok:
+            yield v
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            yield from _la_pathish_leaves(
+                x, key_ok or bool(_http_rc_words(str(k)) & _LA_PATHISH_KEY_WORDS), _d + 1)
+    elif isinstance(v, (list, tuple)):
+        for x in list(v)[:5000]:
+            yield from _la_pathish_leaves(x, key_ok, _d + 1)
+
+
+def _la_dest_hit(d: str, bases) -> bool:
+    d = str(d).strip()
+    if not d:
+        return False
+    if patterns.login_autostart_path_hit(d) or patterns.login_autostart_dir_hit(d):
+        return True
+    if re.match(r"^(?:[/\\~$%]|[A-Za-z]:)", d):
+        return False
+    for b in bases:
+        if not b:
+            continue
+        j = str(b).rstrip("/\\") + "/" + d
+        if patterns.login_autostart_path_hit(j) or patterns.login_autostart_dir_hit(j):
+            return True
+    return False
+
+
+def _login_autostart_shell_writes(r: str, cwd) -> bool:
+    """Does shell text ``r`` WRITE into a gated location? Destination-aware
+    (QA round 1: reading/copying FROM a target is not a plant); falls back
+    to the coarse named-target + write-verb check when ``r`` can't be
+    tokenized."""
+    if not (patterns.login_autostart_maybe_target(r)
+            or (cwd and patterns.login_autostart_maybe_target(str(cwd)))):
+        return False
+    if patterns.login_autostart_find_hit(r) and re.search(r"-(?:exec(?:dir)?|ok(?:dir)?)\b", r) and (
+            patterns.INPLACE_WRITE_RE.search(r) or patterns.COPY_WRITE_VERB_RE.search(r)
+            or re.search(r"\b(?:tee|chmod|sh|bash|zsh|truncate|patch)\b", r)):
+        return True
+    res = patterns.la_shell_destinations(r)
+    if res is None:
+        named = (patterns.login_autostart_path_hit(r) or patterns.login_autostart_dir_hit(r)
+                 or patterns.login_autostart_cd_hit(r, cwd))
+        return bool(named and any(rx.search(r) for rx in (
+            patterns.WRITE_REDIRECT_RE, patterns.COPY_WRITE_VERB_RE,
+            patterns.INPLACE_WRITE_RE, patterns.FORCED_LINK_WRITE_RE,
+            patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
+            patterns.FETCH_TO_FILE_VERB_RE)))
+    dests, cds = res
+    bases = list(cds) + ([cwd] if cwd else [])
+    return any(_la_dest_hit(d, bases) for d in dests[:2000])
+
+
 def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     """Gate login/desktop-session autostart and cron/at-spool persistence.
 
@@ -16525,7 +16590,28 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     followed; ``at``'s detection is anchored to a command position, so an
     ``at`` reached through an alias/function of another name is missed;
     reading/listing (``atq``, ``at -l``, ``cat ~/.xinitrc``) is never
-    gated."""
+    gated. Shell analysis is destination-aware: only a redirect target,
+    ``tee`` arg, the last operand / ``-t`` of a copy tool, tar ``-C``, a
+    fetch tool's output, an in-place edit's file, ``chmod`` operands, or a
+    path in interpreter write code counts -- so copying/reading FROM a
+    target passes. ``at``/``batch`` are matched with quoted strings, comments
+    and heredoc bodies removed (a heredoc fed to a shell/``at`` is kept), so
+    an ``at`` hidden inside a double-quoted ``"$(at now ...)"`` is missed;
+    registry/login-item commands are judged on their own simple command.
+    Path patterns are not anchored to ``/``, so an in-repo packaging tree
+    (``debian/etc/cron.d/app``, ``packaging/xdg/autostart/x.desktop``) asks
+    too -- the ``rule_service_persist_protect`` posture; exempt such trees
+    with an ``allow`` regex.
+
+    QA history: round 1 ran two independent reviewers in parallel. Bypass
+    hunting found ``seg/../`` path spellings, ``cd``-then-relative writes,
+    ``curl --output-dir``/``wget -P``, the ``STARTM~1`` 8.3 name and
+    ``xargs at``; all closed. The false-positive review found ``at``
+    matched inside commit-message heredocs and quoted prose, loose
+    day/month words (``decode``, ``marshal``), ``./batch`` scripts, bare
+    paths in MCP messaging values, and reads/copies FROM a target; closed
+    with the prose-free surface, exact time-spec words, path-like-key MCP
+    scanning, and destination-aware shell analysis."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -16583,47 +16669,35 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
             return _file_gate(p)
         if ev.action == ActionClass.MCP and not _http_rc_mcp_read_only(ev):
             a0 = ev.args or {}
-            for k, v in a0.items():
-                if not isinstance(v, (str, dict, list, tuple)):
-                    continue
-                for leaf in _flatten_strings(v)[:5000]:
-                    leaf = str(leaf).strip()
-                    if (leaf and "\n" not in leaf and len(leaf) <= 4096
-                            and not re.search(r"\s", leaf.replace("Start Menu", "StartMenu"))
-                            and patterns.login_autostart_path_hit(leaf)):
-                        return _file_gate(leaf)
+            # Path-like keys only (QA round 1: a bare path as an issue title
+            # / chat message / memory value is data, not a write target).
+            for leaf in list(_la_pathish_leaves(a0))[:5000]:
+                leaf = str(leaf).strip()
+                if (leaf and "\n" not in leaf and len(leaf) <= 4096
+                        and not re.search(r"\s", leaf.replace("Start Menu", "StartMenu"))
+                        and (patterns.login_autostart_path_hit(leaf)
+                             or _login_autostart_rel_hit(leaf, ev.cwd))):
+                    return _file_gate(leaf)
         if not _is_shell(ev):
             return None
 
     if _is_shell(ev):
-        cmd = _shell_scan(ev)
         raw = _cmd(ev)
-        names_target = False
-        for t in dict.fromkeys((cmd, raw)):
-            if (patterns.login_autostart_path_hit(t)
-                    or patterns.login_autostart_dir_hit(t)
-                    or patterns.login_autostart_find_hit(t)):
-                names_target = True
+        touches_target = activates = False
+        for r in patterns.la_shell_renderings(raw):
+            if not touches_target:
+                touches_target = _login_autostart_shell_writes(r, ev.cwd)
+            if not activates:
+                activates = patterns.login_autostart_activation_hit(r)
+            if touches_target and activates:
                 break
-        if not names_target:
-            names_target = any(patterns.login_autostart_cd_hit(t, ev.cwd)
-                               for t in dict.fromkeys((cmd, raw)))
-        touches_target = names_target and any(
-            rx.search(cmd) or rx.search(raw) for rx in (
-                patterns.WRITE_REDIRECT_RE, patterns.COPY_WRITE_VERB_RE,
-                patterns.DELETE_OR_MOVE_VERB_RE, patterns.DESTRUCTIVE_DELETE_RE,
-                patterns.INPLACE_WRITE_RE, patterns.FORCED_LINK_WRITE_RE,
-                patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
-                patterns.FETCH_TO_FILE_VERB_RE))
-        activates = (patterns.login_autostart_cmd_hit(cmd)
-                     or patterns.login_autostart_cmd_hit(raw))
         if not (touches_target or activates):
             return None
         if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_LOGIN_AUTOSTART")
                 or _login_autostart_allowed_by_policy(cfg, raw)):
             return None
-        reason = ("A login/desktop-session autostart or cron/at spool file is "
-                  "being modified from a shell" if touches_target else
+        reason = ("A shell command writes into a login/desktop-session "
+                  "autostart or cron/at spool location" if touches_target else
                   "A command is scheduling a job (at/batch) or registering a "
                   "login item / logon autostart")
         return _finish(Decision(action, "login-autostart-protect",

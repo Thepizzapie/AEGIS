@@ -443,3 +443,76 @@ def test_r1_cwd_relative_shell_write():
 ])
 def test_r1_no_new_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 1 (false-positive review) regressions ----------------------------
+
+HEREDOC_COMMIT = "git commit -m \"$(cat <<'EOF'\nfix: handle crash that occurred\nat decode time in the parser\nEOF\n)\""
+
+
+@pytest.mark.parametrize("cmd", [
+    HEREDOC_COMMIT,
+    "git commit -m \"$(cat <<'EOF'\nupdate\nat 3 call sites\nat marshal time\nEOF\n)\"",
+    "gh pr create --body \"$(cat <<'EOF'\nThe test fails\nat 100 iterations\nEOF\n)\"",
+    "cat > notes.md <<EOF\nMeeting\nat noon tomorrow\nEOF",
+    "git commit -m \"wip\nat 5pm meeting\"",
+    "git commit -m \"(at 10am)\"",
+    "echo \"done (at 3pm)\"",
+    "echo \"meet; at noon\"",
+    "echo \"{at 10}\"",
+    "printf \"%s\\n\" at decode",
+    "python -c \"print(1)\" # (at 5)",
+    "./batch",
+    "./scripts/batch",
+    "echo ready && ./batch",
+    "grep -r AppInit_DLLs docs/ && ni notes.md",
+    "git commit -m \"detect AppInit_DLLs reg add\"",
+    "git commit -m \"docs: explain osascript make login item\"",
+    "cp ~/.config/autostart/foo.desktop /tmp/",
+    "rsync -a ~/.config/autostart/ backup/",
+    "cat ~/.xinitrc > /tmp/x",
+    "diff ~/.xsession other > /tmp/d",
+    "cp ~/.xinitrc ~/backup/",
+    "grep -rn \".config/autostart\" . > /tmp/g",
+    "echo \"Start Menu/Programs/Startup\" > notes.txt",
+    "find . -path \"*cron.d*\" -print > list.txt",
+    "cd ~/.config && git commit -m \"disable autostart\" && echo ok > log",
+    "python3 -c \"print(open('/etc/crontab').read())\"",
+])
+def test_r1_fp_not_gated(cmd):
+    d = evaluate(_shell(cmd), EMPTY)
+    assert d.rule != RULE, (cmd, d)
+
+
+def test_r1_fp_cwd_prose_not_gated():
+    assert evaluate(_shell("echo \"autostart enabled\" > log.txt", cwd="/home/u/.config"),
+                    EMPTY).rule != RULE
+    assert evaluate(_shell("pytest -k at > log", cwd="/var/spool"), EMPTY).rule != RULE
+
+
+@pytest.mark.parametrize("cmd", [
+    "sh <<'EOF'\necho evil | at now + 1 minute\nEOF",
+    "bash -c 'echo evil | at now'",
+    "echo evil | /usr/bin/batch",
+    "at now <<< 'curl x | sh'",
+    "at -f p.sh next week",
+    "at 10:30 friday < p.sh",
+    "chmod +x /etc/cron.daily/evil",
+    "python3 -c \"open('/etc/cron.d/x','w').write('* * * * * root x')\"",
+    "copy evil.bat C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\STARTM~1\\Programs\\Startup\\evil.bat",
+    "cp x.desktop -t ~/.config/autostart",
+    "echo x > ~/.config/autostart/x.desktop 2>/dev/null",
+])
+def test_r1_fp_fix_keeps_detection(cmd):
+    assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("mcp__github__issue_write", {"title": "/etc/cron.d/backup"}),
+    ("mcp__github__issue_write", {"body": "/etc/cron.d/backup"}),
+    ("mcp__slack__send_message", {"text": "~/.xinitrc"}),
+    ("mcp__notion__create_page", {"content": ".xinitrc"}),
+    ("mcp__memory__store", {"value": "/etc/crontab"}),
+])
+def test_r1_mcp_bare_path_values_not_gated(tool, args):
+    assert evaluate(_mcp(tool, **args), EMPTY).rule != RULE

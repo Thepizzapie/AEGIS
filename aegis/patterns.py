@@ -11954,17 +11954,21 @@ FETCH_DIR_VERB_RE = re.compile(
 #    Userinit/Shell, Policies\Explorer\Run, Active Setup StubPath,
 #    Winlogon\Notify, AppInit_DLLs, Image File Execution Options Debugger.
 _LA_CMDPOS = r"(?:^|[|;&\n(`{]|\$\(|\b(?:sudo|doas|exec|nohup|command|env|xargs|time)\s+(?:-\S+\s+)*)\s*(?:[^\s|;&]*[/\\])?"
+_LA_CMDPOS_BATCH = r"(?:^|[|;&\n(`{]|\$\(|\b(?:sudo|doas|exec|nohup|command|env|xargs|time)\s+(?:-\S+\s+)*)\s*(?:/usr(?:/local)?/bin/|/bin/)?"
 _LA_TIMESPEC = (
-    r"(?:now|noon|midnight|teatime|tomorrow|today|next\b"
-    r"|\d{1,4}(?::\d{2})?(?:\s*(?:am|pm))?\b"
-    r"|(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b"
-    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b)"
+    r"(?:now|noon|midnight|teatime|tomorrow|today|next\s+(?:minute|hour|day|week|month|year)"
+    r"|\d{1,2}:\d{2}(?:\s*(?:am|pm))?\b|\d{3,4}\b|\d{1,2}\s*(?:am|pm)\b"
+    r"|\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b"
+    r"|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b"
+    r"|(?:january|february|march|april|may|june|july|august|september|october"
+    r"|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b)"
 )
 LOGIN_AUTOSTART_CMD_RE = re.compile(
     _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
     + r"(?:-t\s*\d|" + _LA_TIMESPEC + r")"
-    + r"|" + _LA_CMDPOS + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
-    + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:[^\s|;&]*[/\\])?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))"
+    + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
+    + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))"
     + r"|\bosascript\b[^|;&\n]{0,400}?\blogin\s+items?\b"
     + r"|\bdefaults\s+write\b[^|;&\n]{0,200}?\bloginwindow\b[^|;&\n]{0,200}?\b(?:LoginHook|LogoutHook)\b"
     + r"|\bsfltool\s+add-?item\b"
@@ -11990,7 +11994,7 @@ _LA_REG_KEY_RE = re.compile(
 
 _LA_CMD_LITERALS = ("batch", "osascript", "loginwindow", "sfltool", "winlogon",
                     "explorer", "active setup", "appinit_dlls", "image file execution")
-_LA_AT_WORD_RE = re.compile(r"(?<![\w.\-])at(?:\.exe)?\s", re.IGNORECASE)
+_LA_AT_WORD_RE = re.compile(r"(?<![\w.\-])at(?:\.exe)?(?:\s|$|[;&|)])", re.IGNORECASE)
 
 
 def login_autostart_cmd_hit(cmd: str) -> bool:
@@ -12004,6 +12008,256 @@ def login_autostart_cmd_hit(cmd: str) -> bool:
     for clause in _CLAUSE_SPLIT_RE.split(cmd):
         for m in LOGIN_AUTOSTART_CMD_RE.finditer(clause):
             if _LA_REG_KEY_RE.search(m.group(0)) and not REGISTRY_WRITE_VERB_RE.search(clause):
+                continue
+            return True
+    return False
+
+
+# ---- login-autostart: quote/heredoc-aware shell analysis (QA round 1 FP) ---
+# The `at`/`batch`/registry/login-item matchers and the write-destination
+# check run on a surface with prose removed: a heredoc body (unless it is fed
+# to a shell/at/batch, where it IS code) and quoted strings -- so a wrapped
+# commit message line "at decode time" or `echo "meet; at noon"` is data.
+_LA_HEREDOC_RE = re.compile(
+    r"<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]{0,40})\1[^\n]*\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
+    re.S)
+_LA_CODE_SINKS = frozenset((
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "at", "batch", "python", "python3",
+    "perl", "ruby", "node", "pwsh", "powershell", "osascript", "crontab", "tee",
+    "sudo", "doas", "su", "ssh", "eval", "source", ".", "busybox", "env",
+))
+_LA_QUOTED_RE = re.compile(r"'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\"|\$'(?:[^'\\\\]|\\\\.)*'")
+_LA_COMMENT_RE = re.compile(r"(?:(?<=\s)|^)#[^\n]*", re.M)
+
+
+def _la_heredocs(cmd: str):
+    """(cmd with heredoc bodies removed, [bodies fed to a code sink])."""
+    code = []
+
+    def _sub(m):
+        head = cmd[:m.start()].rsplit("\n", 1)[-1]
+        head = re.split(r"[;&|(]|\$\(", head)[-1].split()
+        name = head[0].rsplit("/", 1)[-1].lower() if head else ""
+        if name in _LA_CODE_SINKS:
+            code.append(m.group(3))
+        return "<<" + m.group(2) + "\n"
+    out = _LA_HEREDOC_RE.sub(_sub, cmd) if "<<" in cmd else cmd
+    return out, code
+
+
+def la_prose_free(cmd: str) -> str:
+    """``cmd`` minus heredoc bodies, quoted strings and comments."""
+    c, _ = _la_heredocs(cmd)
+    c = _LA_QUOTED_RE.sub(" Q ", c)
+    return _LA_COMMENT_RE.sub("", c)
+
+
+_LA_COPY_CMDS = frozenset(("cp", "mv", "install", "ln", "rsync", "scp", "copy", "xcopy",
+                           "move", "copy-item", "cpi", "move-item", "mi", "dd", "ditto",
+                           "gcp", "gmv", "ginstall", "rclone", "cpio"))
+_LA_INPLACE_CMDS = frozenset(("sed", "gsed", "perl", "ruby"))
+_LA_WRAPPERS = frozenset(("sudo", "doas", "nohup", "command", "exec", "time", "builtin",
+                          "nice", "ionice", "stdbuf", "env", "xargs", "busybox", "run0"))
+_LA_INTERP = frozenset(("python", "python2", "python3", "perl", "ruby", "node", "deno",
+                        "bun", "php", "lua", "pwsh", "powershell", "osascript", "Rscript"))
+_LA_CD_CMDS = frozenset(("cd", "pushd", "chdir", "set-location", "sl"))
+
+
+def _la_unquote(t: str) -> str:
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
+        return t[1:-1]
+    return t
+
+
+def _la_split_simple(toks):
+    cur = []
+    for t in toks:
+        if t and all(ch in ";&|()\n" for ch in t):
+            if cur:
+                yield cur
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        yield cur
+
+
+def la_shell_destinations(cmd: str):
+    """(destinations, cd_dirs) a shell command WRITES to, or None if the
+    command can't be tokenized. Redirect targets, `tee` args, the last
+    operand / `-t DIR` of cp/mv/install/ln/rsync/..., `dd of=`, tar `-C`,
+    unzip `-d`, curl `-o`/`--output-dir`, wget `-O`/`-P`, PowerShell
+    `-Path`/`-Destination`, sed/perl `-i` files, chmod operands (cron.daily
+    runs only EXECUTABLE scripts), interpreter `-c`/`-e` code naming a path."""
+    import shlex
+    c, _ = _la_heredocs(cmd)
+    c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(c[:200000], posix=False, punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        toks = [_la_unquote(t) for t in list(lex)[:20000]]
+    except ValueError:
+        return None
+    dests, cds = [], []
+    for sc in _la_split_simple(toks):
+        # redirects anywhere in the simple command
+        words = []
+        i = 0
+        while i < len(sc):
+            t = sc[i]
+            if t and set(t) <= set("<>&|") and ">" in t:
+                if i + 1 < len(sc):
+                    dests.append(sc[i + 1])
+                i += 2
+                continue
+            if t and set(t) <= set("<"):
+                i += 2
+                continue
+            words.append(t)
+            i += 1
+        # strip assignments / wrappers and their options
+        while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or
+                         words[0].rsplit("/", 1)[-1].lower() in _LA_WRAPPERS or
+                         (words[0].startswith("-") and len(words) > 1)):
+            words = words[1:]
+        if not words:
+            continue
+        name = re.split(r"[/\\]", words[0])[-1].lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        args = words[1:]
+        ops = [a for a in args if not a.startswith("-")]
+        if name in _LA_CD_CMDS:
+            if ops:
+                cds.append(ops[0])
+            continue
+        if name == "tee":
+            dests.extend(ops)
+        elif name in _LA_COPY_CMDS:
+            if name == "dd":
+                dests.extend(a[3:] for a in args if a.startswith("of="))
+                continue
+            for j, a in enumerate(args):
+                if a in ("-t", "--target-directory", "-Destination", "-destination") and j + 1 < len(args):
+                    dests.append(args[j + 1])
+                elif a.startswith("--target-directory="):
+                    dests.append(a.split("=", 1)[1])
+            if name in ("robocopy", "xcopy", "rclone"):
+                dests.extend(ops[1:])
+            elif ops:
+                dests.append(ops[-1])
+        elif name == "robocopy":
+            dests.extend(ops[1:2])
+        elif name in ("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "unrar", "bsdcpio"):
+            for j, a in enumerate(args):
+                if a in ("-C", "--directory", "-d") and j + 1 < len(args):
+                    dests.append(args[j + 1])
+                elif a.startswith("--directory="):
+                    dests.append(a.split("=", 1)[1])
+                elif a.startswith("-o") and name.startswith("7z"):
+                    dests.append(a[2:])
+                elif re.match(r"^-[A-Za-z]*C$", a) and j + 1 < len(args):
+                    dests.append(args[j + 1])
+        elif name in ("curl", "wget", "wget2", "aria2c", "http", "xh"):
+            for j, a in enumerate(args):
+                if a in ("-o", "--output", "-O", "--output-document", "--output-dir",
+                         "-P", "--directory-prefix", "-d", "--dir", "--out") and j + 1 < len(args):
+                    if not (name == "curl" and a == "-O"):
+                        dests.append(args[j + 1])
+                elif re.match(r"^--(?:output|output-document|output-dir|directory-prefix|dir|out)=", a):
+                    dests.append(a.split("=", 1)[1])
+                elif re.match(r"^-[a-zA-Z]*[oOP].", a) and not a.startswith("--"):
+                    k = max(a.find("o"), a.find("O"), a.find("P"))
+                    dests.append(a[k + 1:])
+        elif name in ("set-content", "add-content", "out-file", "sc", "ac", "new-item", "ni",
+                      "copy-item", "move-item", "set-itemproperty", "tee-object"):
+            for j, a in enumerate(args):
+                if a.lower() in ("-path", "-filepath", "-literalpath", "-destination") and j + 1 < len(args):
+                    dests.append(args[j + 1])
+            if ops:
+                dests.append(ops[0])
+        elif name in _LA_INPLACE_CMDS:
+            if any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in args):
+                dests.extend(ops)
+            if name in ("perl", "ruby"):
+                dests.extend(a for a in args if LOGIN_AUTOSTART_PATH_RE.search(" " + a)
+                             or CRON_SPOOL_PATH_RE.search(" " + a))
+        elif name in ("chmod", "chown", "truncate", "touch", "patch", "ex", "ed", "vi", "vim", "nvim",
+                      "nano", "emacs", "crontab"):
+            if name in ("chmod", "chown"):
+                dests.extend(ops[1:])
+            elif name in ("patch", "ex", "ed", "vi", "vim", "nvim", "nano", "emacs"):
+                dests.extend(ops)
+        if (name in _LA_INTERP or name.startswith("python")) and any(
+                re.search(r"['\"][wax]b?\+?['\"]|write|shutil|copy|symlink|rename|replace|"
+                          r"writeFile|appendFile|createWriteStream|Set-Content|Out-File|>", a)
+                for a in args):
+            for a in args:
+                dests.extend(m.group(0).strip(" '\"=") for m in re.finditer(r"[^\s'\"]+", a)
+                             if ("/" in m.group(0) or "\\" in m.group(0) or m.group(0).startswith(".x")))
+    return dests, cds
+
+
+def la_shell_renderings(raw: str):
+    """The raw command plus its decoded / inner-interpreter bodies, without
+    scan_surface's quote-stripped copy (that copy turns prose into code)."""
+    from . import normalize as _n
+    out = [raw]
+    _, code = _la_heredocs(raw)
+    out.extend(code)
+    for r in _n.scan_surface(raw, sep="\x1e").split("\x1e")[1:]:
+        if not r.strip() or r in out:
+            continue
+        if re.sub(r"[\s'\"$\\\\]", "", r) == re.sub(r"[\s'\"$\\\\]", "", raw):
+            continue
+        out.append(r)
+    return list(dict.fromkeys(out))[:16]
+
+
+LA_AT_RE = re.compile(
+    _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
+    + r"(?:-t\s*\d|" + _LA_TIMESPEC + r")"
+    + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
+    + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))",
+    re.IGNORECASE)
+_LA_ACT_CMDS = frozenset(("reg", "set-itemproperty", "new-itemproperty", "new-item", "sp", "ni",
+                          "set-item", "regedit", "osascript", "defaults", "sfltool", "cmd", "powershell", "pwsh"))
+
+
+def login_autostart_activation_hit(r: str) -> bool:
+    """at/batch on the prose-free surface; registry / macOS login-item
+    commands judged on their own simple command only (their key or script
+    is legitimately quoted, so quote-stripping would hide it)."""
+    import shlex
+    if not (any(k in r.lower() for k in _LA_CMD_LITERALS) or _LA_AT_WORD_RE.search(r)):
+        return False
+    if LA_AT_RE.search(la_prose_free(r)):
+        return True
+    c, _ = _la_heredocs(r)
+    c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(c[:200000], posix=False, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        toks = list(lex)[:20000]
+    except ValueError:
+        return login_autostart_cmd_hit(la_prose_free(r))
+    for sc in _la_split_simple(toks):
+        w = list(sc)
+        while w and (re.match(r"^[A-Za-z_]\w*=", w[0]) or w[0].rsplit("/", 1)[-1].lower() in _LA_WRAPPERS
+                     or (w[0].startswith("-") and len(w) > 1)):
+            w = w[1:]
+        if not w:
+            continue
+        name = re.split(r"[/\\]", w[0])[-1].lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        if name not in _LA_ACT_CMDS:
+            continue
+        text = " ".join(w)
+        for m in LOGIN_AUTOSTART_CMD_RE.finditer(text):
+            if _LA_REG_KEY_RE.search(m.group(0)) and not REGISTRY_WRITE_VERB_RE.search(text):
                 continue
             return True
     return False
