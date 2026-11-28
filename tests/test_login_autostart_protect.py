@@ -979,3 +979,28 @@ def test_r12_gaps_closed(cmd):
 ])
 def test_r12_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 13 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cd /tmp 2>/dev/null && cat > s.sh <<'EOF'\ncp a.desktop ~/.config/autostart/\nEOF\nbash s.sh",
+    "rm -f s.sh 2>/dev/null; cat > s.sh <<'EOF'\necho x >> ~/.xinitrc\nEOF\nbash s.sh",
+    "printf 'x\\n' > a.txt && cat > s.sh <<'EOF'\ncp a.desktop ~/.config/autostart/\nEOF\nbash s.sh",
+    "cat 2>/dev/null > s.sh <<'EOF'\ncp a.desktop ~/.config/autostart/\nEOF\nbash s.sh",
+    "SCRIPT=$(cat <<'EOF'\necho x > ~/.xinitrc\nEOF\n)\nbash -c \"$SCRIPT\"",
+    "read -r -d '' S <<'EOF'\ncp a.desktop ~/.config/autostart/\nEOF\neval \"$S\"",
+    "read -r -d '' S <<'EOF'\ncp a.desktop ~/.config/autostart/\nEOF\nbash -c \"$S\"",
+])
+def test_r13_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "MSG=$(cat <<'EOF'\nsee ~/.config/autostart docs\nEOF\n)\necho \"$MSG\"",
+    "read -r -d '' S <<'EOF'\ncp a.desktop ~/.config/autostart/\nEOF\necho \"$S\"",
+])
+def test_r13_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

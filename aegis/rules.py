@@ -16762,7 +16762,18 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     heredoc-written script run in the same command (``cat > s.sh <<EOF
     .. EOF; bash s.sh`` -- the body is now judged as code when the file is
     named again); ``<<<word`` taken as a heredoc; quoted delimiters like
-    ``'1EOF'``/``'---'``; and ``done <<EOF`` loop input judged as code."""
+    ``'1EOF'``/``'---'``; and ``done <<EOF`` loop input judged as code.
+    Round 13 (no HIGH) found the heredoc's redirect target taken from an
+    earlier ``2>/dev/null`` on the same line (now: every target of the
+    heredoc's own simple command, fd redirects and /dev/null skipped) and
+    bodies stored in a variable then run via ``eval``/``sh -c``.
+
+    Further disclosed scope: past ~20k shell tokens the destination parser
+    gives up and the coarse named-target + write-verb check applies (fails
+    closed: may ask on a long script that only reads a target); an
+    unterminated heredoc keeps the rest of the input as code; paths built
+    from separate pieces (``Path.home() / '.config' / 'autostart'``) and a
+    script written in one tool call and run in another are not seen."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

@@ -12123,7 +12123,7 @@ def _la_heredocs(cmd: str):
     code = []
     if "<<" not in cmd or "\n" not in cmd:
         return cmd, code
-    out, pending, stack, written = [], [], [], []
+    out, pending, stack, written, stored = [], [], [], [], []
     cur = []                       # output of the current line (for the head)
     i, n = 0, len(cmd)
 
@@ -12221,9 +12221,17 @@ def _la_heredocs(cmd: str):
                 tail_end = cmd.find("\n", mk.end())
                 tail = cmd[mk.end():tail_end if tail_end >= 0 else n][:2000]
                 piped = [x.split()[0].rsplit("/", 1)[-1].lower() for x in tail.split("|")[1:] if x.split()]
-                rd = re.search(r">>?\|?\s*['\"]?([^\s'\";&|<>()]+)", line_so_far[-400:] + " " + tail)
-                pending.append((delim, quoted, dash, name, piped, rd.group(1) if rd else "",
-                                "(" in stack))
+                # Redirect targets of THIS simple command only, every one of
+                # them, fd-numbered and /dev/null skipped (QA round 13).
+                own = re.split(r"[;&|]", line_so_far[-400:])[-1] + " " + re.split(r"[;&|]", tail)[0]
+                targets = [t for t in re.findall(r"(?<![\d&])>>?\|?\s*['\"]?([^\s'\";&|<>()]+)", own)
+                           if t != "/dev/null"]
+                vm = re.search(r"\b([A-Za-z_]\w*)=\$\([^()]*$", line_so_far[-400:])
+                var = vm.group(1) if vm else ""
+                if not var and name == "read":
+                    rw = [w for w in own.split() if re.fullmatch(r"[A-Za-z_]\w*", w) and w != "read"]
+                    var = rw[-1] if rw else ""
+                pending.append((delim, quoted, dash, name, piped, targets, "(" in stack, var))
                 emit("< HEREDOC")
                 i = mk.end()
                 continue
@@ -12233,7 +12241,7 @@ def _la_heredocs(cmd: str):
             i += 1
             if pending:
                 j = i
-                for delim, quoted, dash, name, piped, target, in_sub in pending:
+                for delim, quoted, dash, name, piped, targets, in_sub, var in pending:
                     lines, term = [], False
                     while j < n:
                         e = cmd.find("\n", j)
@@ -12254,8 +12262,10 @@ def _la_heredocs(cmd: str):
                     body = "\n".join(lines)
                     if not quoted:
                         code.extend(_la_substitutions(body)[1])
-                    if target:
+                    for target in targets[:16]:
                         written.append((target, body))
+                    if var:
+                        stored.append((var, body))
                     if (not term or name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
                             or any(x not in _LA_PROSE_SINKS for x in piped)):
                         code.append(body)
@@ -12275,6 +12285,11 @@ def _la_heredocs(cmd: str):
     for target, body in written[:64]:
         bn = re.split(r"[/\\]", target)[-1]
         if bn and len(re.findall(r"(?<![\w.-])" + re.escape(bn) + r"(?![\w.-])", res)) >= 2:
+            code.append(body)
+    # A body stored in a variable and later run (`S=$(cat <<EOF..)` /
+    # `read -d '' S <<EOF`, then `eval "$S"` / `bash -c "$S"`).
+    for var, body in stored[:64]:
+        if re.search(r"\b(?:eval|(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-c)\s+['\"]?\$\{?" + re.escape(var) + r"\b", res):
             code.append(body)
     return res, code
 
