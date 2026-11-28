@@ -16605,12 +16605,16 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
                     or patterns.login_autostart_find_hit(t)):
                 names_target = True
                 break
+        if not names_target:
+            names_target = any(patterns.login_autostart_cd_hit(t, ev.cwd)
+                               for t in dict.fromkeys((cmd, raw)))
         touches_target = names_target and any(
             rx.search(cmd) or rx.search(raw) for rx in (
                 patterns.WRITE_REDIRECT_RE, patterns.COPY_WRITE_VERB_RE,
                 patterns.DELETE_OR_MOVE_VERB_RE, patterns.DESTRUCTIVE_DELETE_RE,
                 patterns.INPLACE_WRITE_RE, patterns.FORCED_LINK_WRITE_RE,
-                patterns.ARCHIVE_SYNC_VERB_RE))
+                patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
+                patterns.FETCH_TO_FILE_VERB_RE))
         activates = (patterns.login_autostart_cmd_hit(cmd)
                      or patterns.login_autostart_cmd_hit(raw))
         if not (touches_target or activates):
