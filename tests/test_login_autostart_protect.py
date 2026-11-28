@@ -1382,3 +1382,41 @@ def test_r23_gaps_closed(cmd):
 ])
 def test_r23_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 24 regressions ---------------------------------------------------
+
+_R24_README = "cat > README.md <<'EOF'\nTo start MyApp at login, copy myapp.desktop to ~/.config/autostart/.\nEOF\n"
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat > notes.md <<'EOF'\n# Meeting\nAt 10am Monday we sync.\nEOF\nnpx prettier --write notes.md",
+    "cat > notes.md <<'EOF'\nAt 10am Monday we sync.\nEOF\npandoc notes.md -o n.html",
+    "cat > notes.md <<'EOF'\nAt 10am Monday we sync.\nEOF\nsed -i 's/x/y/' notes.md",
+    "cat > CHANGELOG.md <<'EOF'\n## 1.2\n- Install autostart entry into /etc/xdg/autostart\nEOF\nnpx prettier --write CHANGELOG.md",
+    _R24_README + "markdownlint README.md",
+    _R24_README + "scp README.md host:/tmp/",
+    _R24_README + "tar czf d.tgz README.md",
+    _R24_README + "pre-commit run --files README.md",
+    "cat > config.yaml <<'EOF'\npath: ~/.config/autostart/x.desktop\nEOF\nyamllint config.yaml",
+    "cat > msg.txt <<'EOF'\nat noon\nEOF\nhub pull-request -F msg.txt",
+])
+def test_r24_doc_files_not_run(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat > Makefile <<'EOF'\ninstall:\n\tcp app.desktop ~/.config/autostart/\nEOF\nmake install",
+    "cat > justfile <<'EOF'\ninstall:\n  cp app.desktop ~/.config/autostart/\nEOF\njust install",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\ncat s.sh | sudo -E bash",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\ncat s.sh | sudo -u bob sh",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\ncat s.sh | env bash",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\ncat s.sh | fish",
+    "echo 'cp app.desktop ~/.config/autostart/' > s.sh && bash s.sh",
+    "printf '%s\\n' 'cp app.desktop ~/.config/autostart/' > s.sh && ./s.sh",
+    "cat > notes.md <<'EOF'\ncp a ~/.xinitrc\nEOF\nbash notes.md",
+])
+def test_r24_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd

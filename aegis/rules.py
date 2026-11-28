@@ -16867,7 +16867,16 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``time ./s.sh``, ``cat s.sh | bash`` missed): it now fails closed --
     any later mention counts as a run unless its command is known not to
     run the file (git/cat/chmod/shellcheck/...) -- plus ``| tee FILE``
-    heredoc targets, and parallel ``:::`` items judged as operands."""
+    heredoc targets, and parallel ``:::`` items judged as operands. Round
+    24 (no HIGH) found that fail-closed check flagging doc/data files that
+    were merely formatted, linted or copied (``prettier``/``pandoc``/
+    ``yamllint``/``scp`` on a README) -- a ``.md``/``.txt``/``.yaml``/...
+    file now counts as run only by a shell/interpreter or a pipe into one
+    -- plus heredoc-written Makefile/justfile bodies run by ``make``/
+    ``just``, pipes into ``sudo -E bash``/``env bash``/``fish``, and
+    ``echo '..' > s.sh && bash s.sh``. Still out of scope: a heredoc-
+    written script renamed or copied (``mv s.sh run.sh && ./run.sh``)
+    before it is run."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

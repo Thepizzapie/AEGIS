@@ -12083,6 +12083,9 @@ def _la_substitutions(cmd: str, limit: int = 64):
 
 
 _LA_QBODY = r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
+_LA_ECHO_WRITE_RE = re.compile(
+    r"\b(?:echo|printf)\s+(?:-\S+\s+)*(?:'%s\\n'\s+)?" + r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
+    r"\s*>>?\s*['\"]?([^\s'\";&|<>()]+)")
 _LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*" + _LA_QBODY)
 # `su -c BODY` / `runuser -c BODY`, `sh <<< BODY`, `echo BODY | sh` (QA round 6).
 _LA_EXTRA_BODY_RES = (
@@ -12113,6 +12116,10 @@ _LA_HD_NONRUN = frozenset((
     "chmod", "chown", "shellcheck", "grep", "rg", "egrep", "echo", "printf", "rm", "cp", "mv",
     "md5sum", "sha256sum", "touch", "tee", "test", "[", "[[", "realpath", "readlink",
     "dirname", "basename", "mkdir", "gh", "vim", "nano", "code", "bat", "jq", "yq",
+))
+_LA_HD_RUNNERS = frozenset((
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "busybox", "source", ".", "perl", "node",
+    "ruby", "php", "exec", "deno", "bun", "lua", "pwsh", "osascript",
 ))
 _LA_HD_SPECIAL_RE = re.compile(r"[\\'\"#$<\n()`]")
 
@@ -12302,6 +12309,13 @@ def _la_heredocs(cmd: str):
         # `time ./s.sh` are).
         rx_ = re.compile(r"(?<![\w.-])" + re.escape(bn) + r"(?![\w.-])")
         ran = False
+        # Build files run by their tool (QA round 24: `make install`).
+        if re.fullmatch(r"(?:GNU)?[Mm]akefile|[Jj]ustfile|Taskfile\.ya?ml|Rakefile", bn) and \
+                re.search(r"(?:^|[\s;&|(])(?:make|gmake|just|task|rake)\b", res):
+            code.append(body)
+            continue
+        is_doc = bool(re.search(r"\.(?:md|markdown|rst|txt|json|ya?ml|toml|html?|csv|xml|ini|cfg"
+                                r"|adoc|org|tex|log|svg|lock)$", bn, re.I))
         for mm in list(rx_.finditer(res))[:64]:
             seg = re.split(r"[;&\n(){}]|\|\|?", res[max(0, mm.start() - 2000):mm.start()])[-1]
             after = re.split(r"[;&\n(){}]", res[mm.end():mm.end() + 2000], maxsplit=1)[0]
@@ -12310,8 +12324,14 @@ def _la_heredocs(cmd: str):
                              or words[0] in ("then", "if", "do", "time", "!", "command")):
                 words = words[1:]
             first = words[0].rsplit("/", 1)[-1].lower() if words else ""
-            if first in _LA_HD_NONRUN and not re.search(r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b", after):
+            piped_sh = bool(re.search(
+                r"\|\s*(?:(?:sudo|doas|env|command)(?:\s+-\S+(?:\s+[^\s-]\S*)?)*\s+(?:[A-Za-z_]\w*=\S*\s+)*)?"
+                r"(?:\S*/)?(?:ba|z|da|k|fi)?sh\b", after))
+            if first in _LA_HD_NONRUN and not piped_sh:
                 continue
+            if is_doc and not piped_sh and words and not (
+                    first in _LA_HD_RUNNERS or first.startswith("python")):
+                continue                   # a doc/data file: formatted, linted, copied (QA round 24)
             if words and words[0].startswith(">"):
                 continue
             if re.search(r">\s*$", seg):
@@ -12815,6 +12835,13 @@ def la_shell_renderings(raw: str, _depth: int = 0):
     out.extend(code)
     for rx in (_LA_EVAL_BODY_RE,) + _LA_EXTRA_BODY_RES:
         out.extend((m.group(1) or m.group(2) or "") for m in rx.finditer(outer))
+    for m in list(_LA_ECHO_WRITE_RE.finditer(outer))[:64]:
+        body_, f_ = (m.group(1) or m.group(2) or ""), m.group(3)
+        bn_ = re.split(r"[/\\]", f_)[-1]
+        if bn_ and re.search(r"(?:\b(?:(?:ba|z|da|k|fi)?sh|source|exec)\s+(?:-\S+\s+)*|(?:^|[;&|(\n])\s*\.\s+|"
+                             r"(?:^|[;&|(\n])\s*(?:\./|/|~/))(?:[^\s;&|]*/)?" + re.escape(bn_) + r"(?![\w.-])",
+                             outer[m.end():]):
+            out.append(body_.replace("\\n", "\n"))
     if "$" in outer and "=" in outer:
         out.extend(b_ for b_ in la_var_bodies(outer, la_var_map(outer)) if b_.strip())
     if _depth < 3:
