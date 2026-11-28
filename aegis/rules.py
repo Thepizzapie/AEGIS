@@ -16851,7 +16851,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     the wrapper stripper treating every single-letter sudo/doas flag as
     value-taking, so ``sudo -n tee <target>``/``sudo -E tee ..`` swallowed
     the real command; wrappers now consume a separate value only after
-    options that take one (per-wrapper tables, incl. ``--user bob``)."""
+    options that take one (per-wrapper tables, incl. ``--user bob``).
+    Round 21 (no HIGH) found that table read only a bundle's LAST letter,
+    so an attached value ending in a value-letter (``sudo -uroot``,
+    ``xargs -d'\\n'``) swallowed the command -- bundles are now read left
+    to right -- and ``flock/script/sg -c``, ``env -S`` and ``watch``
+    command strings dropped; those bodies are now judged as commands."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

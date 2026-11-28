@@ -1277,3 +1277,40 @@ def test_r20_mcp_runner():
 ])
 def test_r20_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 21 regressions (attached option values, command strings) ---------
+
+@pytest.mark.parametrize("cmd", [
+    "ls *.desktop | xargs -d'\\n' cp -t ~/.config/autostart/",
+    "env -uDBUS_SESSION_BUS_ADDRESS tee ~/.xinitrc",
+    "sudo -uroot tee /etc/xdg/autostart/a.desktop",
+    "sudo -uroot dd of=/etc/xdg/autostart/x if=x",
+    "sudo -iuroot tee ~/.xinitrc",
+    "flock /tmp/l -c 'cp x ~/.config/autostart/'",
+    'flock -x /var/lock/x.lock -c "cp a.desktop $HOME/.config/autostart/"',
+    "sudo flock /tmp/l -c 'tee /etc/xdg/autostart/a.desktop < a'",
+    "flock --command 'cp x ~/.config/autostart/' /tmp/l",
+    "flock -n /tmp/l -c 'echo j | at now'",
+    "script -q -c 'cp x ~/.config/autostart/' /dev/null",
+    "script -qc 'echo j | at now' /dev/null",
+    "sg docker -c 'cp x ~/.config/autostart/'",
+    "xargs -l tee ~/.xinitrc",
+    "xargs -e tee ~/.xinitrc",
+    "watch -n 60 'cp a.desktop ~/.config/autostart/'",
+    "env -S 'cp x ~/.config/autostart/'",
+])
+def test_r21_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo -uroot cat /etc/xdg/autostart/a.desktop",
+    "flock /tmp/l -c 'make test'",
+    "xargs -d'\\n' rm -f < list.txt",
+    "watch -n 2 'ls ~/.config/autostart'",
+])
+def test_r21_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

@@ -12086,7 +12086,9 @@ _LA_QBODY = r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
 _LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*" + _LA_QBODY)
 # `su -c BODY` / `runuser -c BODY`, `sh <<< BODY`, `echo BODY | sh` (QA round 6).
 _LA_EXTRA_BODY_RES = (
-    re.compile(r"\b(?:su|runuser)\b[^|;&\n]{0,200}?\s(?:-c|--command(?:=|\s))\s*" + _LA_QBODY),
+    re.compile(r"\b(?:su|runuser|flock|script|sg)\b[^|;&\n]{0,300}?\s(?:-[A-Za-z]*c|--command(?:=|\s))\s*" + _LA_QBODY),
+    re.compile(r"\benv\b[^|;&\n]{0,200}?\s(?:-[A-Za-z]*S|--split-string(?:=|\s))\s*" + _LA_QBODY),
+    re.compile(r"\bwatch\b(?:\s+-[^\s]{1,40}(?:\s+\d[\d.]*)?){0,6}\s+" + _LA_QBODY),
     re.compile(r"\b(?:ba|z|da|k|fi)?sh\b[^|;&\n]{0,100}?<<<\s*" + _LA_QBODY),
     re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*" + _LA_QBODY
                + r"\s*\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b"),
@@ -12423,7 +12425,7 @@ _LA_WRAPPER_VALUE_OPTS = {
     "timeout": ("sk", ("--signal", "--kill-after")),
     "stdbuf": ("ioe", ("--input", "--output", "--error")),
     "flock": ("wEc", ("--timeout", "--conflict-exit-code", "--command")),
-    "xargs": ("aEeIiLlnPsd", ("--arg-file", "--delimiter", "--max-args", "--max-procs",
+    "xargs": ("aEILnPsd", ("--arg-file", "--delimiter", "--max-args", "--max-procs",
                               "--max-lines", "--max-chars", "--replace")),
     "watch": ("nq", ("--interval", "--equexit")),
     "strace": ("eoPpSsuIXb", ()),
@@ -12473,8 +12475,15 @@ def _la_strip_wrappers(words):
             if w.startswith("--"):
                 if "=" not in w and w in vlong and i < n:
                     i += 1
-            elif vshort and w[-1] in vshort and i < n:
-                i += 1                     # `-u bob`, bundled `-iu bob`, `-n 10`
+            elif vshort and i < n:
+                # Left to right: the first value-taking letter takes the
+                # NEXT word only if it ends the bundle; otherwise the value
+                # is attached (`-uroot`, `-d'\n'` -- QA round 21).
+                for k, ch_ in enumerate(w[1:], 1):
+                    if ch_ in vshort:
+                        if k == len(w) - 1:
+                            i += 1
+                        break
             continue
         if prev_wrapper and _LA_TIME_TOK_RE.match(w):
             i += 1                       # timeout 5 / chrt 0 / taskset 0x1
@@ -12539,7 +12548,18 @@ def la_shell_destinations(cmd: str):
         words = _la_strip_wrappers(words)
         if not words:
             continue
-        if re.search(r"['\"(),{}]", words[0]):
+        if re.search(r"\s", words[0].strip()):
+            # A quoted command string as the command (`watch -n 2 'cmd ..'`,
+            # `xargs sh -c` bodies): judge it as its own command.
+            sub = la_shell_destinations(words[0])
+            if sub is None:
+                unknown.extend(words)
+            else:
+                dests.extend(sub[0]); cds.extend(sub[1]); unknown.extend(sub[2])
+            unknown.extend(words[1:])
+            continue
+        if re.search(r"['\"(),{}]", words[0]) or login_autostart_path_hit(words[0]) \
+                or login_autostart_dir_hit(words[0]):
             unknown.extend(words)                 # code, not a command name (QA round 4)
             continue
         name = re.split(r"[/\\]", words[0])[-1].lower()
@@ -12972,7 +12992,7 @@ def la_var_map(cmd: str) -> dict:
 
 def la_var_subst(t: str, vm: dict, depth: int = 0) -> list:
     """Every spelling of ``t`` with known variables substituted."""
-    if not vm or "$" not in t or depth > 2:
+    if not vm or "$" not in t or depth > 1:
         return [t]
     out = [t]
     refs = list(dict.fromkeys(re.findall(r"\$\{?([A-Za-z_]\w{0,63})", t)))[:8]
@@ -12984,11 +13004,11 @@ def la_var_subst(t: str, vm: dict, depth: int = 0) -> list:
         nxt = []
         for x in out:
             if rx.search(x):
-                for v in val.split("\x00")[:16]:
+                for v in val.split("\x00")[:8]:
                     nxt.append(rx.sub(lambda _m: v, x))
             nxt.append(x)
         out = list(dict.fromkeys(nxt))[:16]
-    if depth < 2 and any("$" in x for x in out):
+    if depth < 1 and any("$" in x for x in out):
         more = []
         for x in out:
             more.extend(la_var_subst(x, vm, depth + 1))
