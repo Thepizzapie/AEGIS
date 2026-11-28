@@ -12289,7 +12289,7 @@ def _la_heredocs(cmd: str):
     # A body stored in a variable and later run (`S=$(cat <<EOF..)` /
     # `read -d '' S <<EOF`, then `eval "$S"` / `bash -c "$S"`).
     for var, body in stored[:64]:
-        if re.search(r"\b(?:eval|(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-c)\s+['\"]?\$\{?" + re.escape(var) + r"\b", res):
+        if la_var_bodies(res, {var: body}):
             code.append(body)
     return res, code
 
@@ -12682,6 +12682,8 @@ def la_shell_renderings(raw: str, _depth: int = 0):
     out.extend(code)
     for rx in (_LA_EVAL_BODY_RE,) + _LA_EXTRA_BODY_RES:
         out.extend((m.group(1) or m.group(2) or "") for m in rx.finditer(outer))
+    if "$" in outer and "=" in outer:
+        out.extend(b_ for b_ in la_var_bodies(outer, la_var_map(outer)) if b_.strip())
     if _depth < 3:
         for b_ in subs:
             out.extend(la_shell_renderings(b_, _depth + 1))
@@ -12820,3 +12822,76 @@ def _la_glob_resolve(out: list, cap: int) -> list:
                 combos = [c + sg for c in combos[:cap]]
         res.extend(combos)
     return list(dict.fromkeys(res))[:cap]
+
+
+# ---- single-assignment shell variables (QA round 14) -----------------------
+# `DEST=~/.config/autostart; cp x "$DEST/"` is the ordinary install-script
+# shape: a variable assigned ONE literal value in the same command is
+# substituted into later `$NAME`/`${NAME}`/`${NAME:-..}` references before
+# destination analysis. (Values built across several assignments, loops or
+# computed at run time stay a disclosed limitation.)
+_LA_ASSIGN_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:export\s+|local\s+|readonly\s+|declare\s+(?:-\S+\s+)*|typeset\s+(?:-\S+\s+)*)?"
+    r"([A-Za-z_]\w{0,63})=(\"(?:[^\"\\]|\\.){0,2000}\"|'[^']{0,2000}'|[^\s;&|()<>'\"]{0,2000})")
+
+
+def la_var_map(cmd: str) -> dict:
+    vm = {}
+    for m in list(_LA_ASSIGN_RE.finditer(cmd[:200000]))[:256]:
+        v = m.group(2)
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]
+        if m.group(1) in vm and vm[m.group(1)] != v:
+            vm[m.group(1)] = vm[m.group(1)] + "\x00" + v      # several values: try each
+        else:
+            vm[m.group(1)] = v
+    return vm
+
+
+def la_var_subst(t: str, vm: dict, depth: int = 0) -> list:
+    """Every spelling of ``t`` with known variables substituted."""
+    if not vm or "$" not in t or depth > 2:
+        return [t]
+    out = [t]
+    refs = list(dict.fromkeys(re.findall(r"\$\{?([A-Za-z_]\w{0,63})", t)))[:8]
+    for name in refs:
+        val = vm.get(name)
+        if val is None:
+            continue
+        rx = re.compile(r"\$(?:\{" + re.escape(name) + r"(?:[:=?+-][^}]{0,400})?\}|" + re.escape(name) + r"(?!\w))")
+        nxt = []
+        for x in out:
+            if rx.search(x):
+                for v in val.split("\x00")[:4]:
+                    nxt.append(rx.sub(lambda _m: v, x))
+            nxt.append(x)
+        out = list(dict.fromkeys(nxt))[:16]
+    if depth < 2 and any("$" in x for x in out):
+        more = []
+        for x in out:
+            more.extend(la_var_subst(x, vm, depth + 1))
+        out = list(dict.fromkeys(out + more))[:16]
+    return out
+
+
+_LA_VAR_RUN_RES = (
+    re.compile(r"\b(?:eval|(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-c)\s+['\"]?\$\{?([A-Za-z_]\w{0,63})\b"),
+    re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*['\"]?\$\{?([A-Za-z_]\w{0,63})\b[^|\n]{0,40}\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b"),
+    re.compile(r"\b(?:ba|z|da|k)?sh\b[^\n|;&]{0,60}<<<\s*['\"]?\$\{?([A-Za-z_]\w{0,63})\b"),
+)
+
+
+def la_var_bodies(cmd: str, vm: dict) -> list:
+    """String values later RUN as code: `eval "$S"`, `sh -c "$S"`,
+    `echo "$S" | sh`, `sh <<< "$S"`. Run sites are found once, then only
+    the variables they name are looked up (linear)."""
+    if not vm or "$" not in cmd:
+        return []
+    names = []
+    for rx in _LA_VAR_RUN_RES:
+        names.extend(m.group(1) for m in rx.finditer(cmd[:200000]))
+    out = []
+    for name in list(dict.fromkeys(names))[:64]:
+        if name in vm:
+            out.extend(vm[name].split("\x00")[:4])
+    return out

@@ -16528,6 +16528,11 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
             patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
             patterns.FETCH_TO_FILE_VERB_RE)))
     dests, cds, unknown = res
+    vm = patterns.la_var_map(r) if ("$" in r and "=" in r) else {}
+    if vm:
+        dests = [x for d in dests[:2000] for x in patterns.la_var_subst(d, vm)]
+        cds = [x for d in cds[:64] for x in patterns.la_var_subst(d, vm)]
+        unknown = [x for d in unknown[:2000] for x in patterns.la_var_subst(d, vm)]
     ucds = list(dict.fromkeys(cds))
     if len(ucds) > 16 and any(patterns.login_autostart_maybe_target(x) for x in ucds):
         return True                       # past the cd cap: fail closed (QA round 7)
@@ -16669,7 +16674,7 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``AEGIS_ALLOW_LOGIN_AUTOSTART=1`` set before launch. A spawned agent can
     do neither.
 
-    Honest scope: a path assembled indirectly (variables across separate
+    Honest scope: a path assembled indirectly (a value built from several
     assignments, loops, ``basename`` reconstruction) is not seen; an
     in-process interpreter write (``python -c "open(...,'w')"``) is seen
     only when the target path is literal in the command; a custom
@@ -16773,7 +16778,14 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     closed: may ask on a long script that only reads a target); an
     unterminated heredoc keeps the rest of the input as code; paths built
     from separate pieces (``Path.home() / '.config' / 'autostart'``) and a
-    script written in one tool call and run in another are not seen."""
+    script written in one tool call and run in another are not seen.
+    Round 14 found the ordinary install-script shape ``DEST=~/.config/
+    autostart; cp x "$DEST/"`` allowed: a variable assigned a literal in
+    the same command is now substituted into later ``$NAME``/``${NAME}``/
+    ``${NAME:-..}`` references before destination analysis, and a string
+    variable later run via ``eval``/``sh -c``/``echo "$S" | sh``/``sh <<<``
+    is judged as code. Values computed at run time or assembled across
+    loops remain out of scope."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

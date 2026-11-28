@@ -1004,3 +1004,37 @@ def test_r13_gaps_closed(cmd):
 ])
 def test_r13_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 14 regressions (single-assignment variables) ---------------------
+
+@pytest.mark.parametrize("cmd", [
+    'DESKTOP_FILE="$HOME/.config/autostart/myapp.desktop"\ncat > "$DESKTOP_FILE" <<EOF\n[Desktop Entry]\nExec=x\nEOF',
+    'AUTOSTART="$HOME/.config/autostart"\nmkdir -p "$AUTOSTART"\ncp app.desktop "$AUTOSTART/"',
+    'DEST=~/.config/autostart; cp x.desktop "$DEST/"',
+    "export AUTOSTART_DIR=$HOME/.config/autostart && cp a.desktop $AUTOSTART_DIR",
+    'dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"; mkdir -p "$dir"; cp a.desktop "$dir"/',
+    'XINITRC="$HOME/.xinitrc"; echo "exec i3" >> "$XINITRC"',
+    "TARGET=~/.xinitrc; cp xinitrc.example $TARGET",
+    'local f="$HOME/.xsession"; echo x > "$f"',
+    'CRONFILE=/var/spool/cron/crontabs/$USER; echo "0 * * * * x" | sudo tee -a $CRONFILE',
+    'P=/etc/periodic/daily; sudo cp backup "$P/500.backup"',
+    'S=$(cat <<\'EOF\'\ncp a.desktop ~/.config/autostart/\nEOF\n)\necho "$S" | bash',
+    'S=$(cat <<\'EOF\'\ncp a.desktop ~/.config/autostart/\nEOF\n)\nbash <<< "$S"',
+    "S='cp a.desktop ~/.config/autostart/'; eval \"$S\"",
+    'S="cp a.desktop ~/.config/autostart/"; bash -c "$S"',
+])
+def test_r14_variable_paths(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    'SRC="$HOME/.config/autostart"; cp "$SRC/app.desktop" /tmp/',
+    'F=~/.xinitrc; cat "$F"',
+    'S="cp a.desktop ~/.config/autostart/"; echo "$S"',
+    'OUT=build; cp -r src/* "$OUT/"',
+])
+def test_r14_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
