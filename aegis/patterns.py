@@ -12221,21 +12221,20 @@ def la_shell_destinations(cmd: str):
                 if not any(a.startswith("of=") for a in args):
                     known = False
                 continue
-            tdir = False
             for j, a in enumerate(args):
-                if (a in ("-t", "--target-directory", "-Destination", "-destination")
-                        or re.fullmatch(r"-[A-Za-z]*t", a)) and j + 1 < len(args):
+                gnu_t = name in ("cp", "mv", "install", "ln", "gcp", "gmv", "ginstall")
+                if (a in ("--target-directory", "-Destination", "-destination")
+                        or (gnu_t and re.fullmatch(r"-[A-Za-z]*t", a))) and j + 1 < len(args):
                     dests.append(args[j + 1])
-                    tdir = True
                 elif a.startswith("--target-directory="):
                     dests.append(a.split("=", 1)[1])
-                    tdir = True
-                elif re.fullmatch(r"-[A-Za-z]*t.+", a) and not a.startswith("--"):
+                elif gnu_t and re.fullmatch(r"-[A-Za-z]*t.+", a) and not a.startswith("--"):
                     dests.append(a[a.index("t") + 1:])
-                    tdir = True
             if name in ("robocopy", "xcopy", "rclone"):
                 dests.extend(ops[1:])
-            elif not tdir and ops:
+            elif ops:
+                # Always the last operand too, even with -t (fail closed --
+                # QA round 3b: rsync `-t` is preserve-times, not a target).
                 dests.append(ops[-1])
         elif name in ("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "unrar", "bsdcpio"):
             for j, a in enumerate(args):
@@ -12255,6 +12254,8 @@ def la_shell_destinations(cmd: str):
                         dests.append(args[j + 1])
                 elif re.match(r"^--(?:output|output-document|output-dir|directory-prefix|dir|out)=", a):
                     dests.append(a.split("=", 1)[1])
+                elif re.fullmatch(r"-[a-zA-Z]*[oOP]", a) and j + 1 < len(args):
+                    dests.append(args[j + 1])      # bundled `-sSLo FILE` (QA round 3b)
                 elif re.match(r"^-[a-zA-Z]*[oOP].", a) and not a.startswith("--"):
                     k = max(a.find("o"), a.find("O"), a.find("P"))
                     dests.append(a[k + 1:])

