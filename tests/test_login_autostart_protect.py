@@ -694,3 +694,42 @@ def test_r5_cd_chain_not_quadratic():
     t0 = time.perf_counter()
     evaluate(ev, EMPTY)
     assert time.perf_counter() - t0 < 3.0
+
+
+# ---- QA round 6 regressions ----------------------------------------------------
+
+def _r6_cases():
+    sh, mcp = _r4_sh, _r4_mcp
+    G=[sh("sudo cp x /var/spool/cron/crontabs/$(whoami)"),sh("sudo cp x /var/spool/cron/$(whoami)"),sh("cp x.desktop ~/.config/autostart/`basename x`"),
+     sh("su -c 'echo x > ~/.xinitrc' bob"),sh("su -c 'echo x | at now'"),sh("sudo su - -c 'echo x | at now'"),
+     mcp("mcp__desktop-commander__interact_with_process",pid=1,input="echo x > ~/.xinitrc"),
+     mcp("mcp__wcgw__BashCommand",action_json={"command":"echo x > ~/.xinitrc"}),mcp("mcp__wcgw__BashCommand",action_json={"send_text":"echo x > ~/.xinitrc"}),
+     sh("bash <<< 'echo x > ~/.xinitrc'"),sh("sh <<< 'echo x | at now'"),sh("echo 'echo x > ~/.xinitrc' | sh"),sh("echo 'echo x | at now' | bash"),
+     sh("python3 -c 'open('\"'\"'/home/u/.xinitrc'\"'\"','\"'\"'w'\"'\"')'"),mcp("mcp__python__run_python_code",python_code="open('/home/u/.xinitrc','w')"),
+     mcp("mcp__ipython__run",code="open('/home/u/.xinitrc','w')"),
+     sh("echo x > ~/.config/autost*/x.desktop"),sh("echo x > ~/.xsess*"),sh("echo x > /etc/peri*/daily/x"),sh("echo x > /etc/X1?/Xsession.d/99x")]
+    F=[sh(c) for c in ["cp -r assets/* public/","mv build/* dist/","cp -r docs/* site/","cp -R static/* public/static/","rm *","chmod 644 *","touch src/*","zip a.zip *",
+     "npx prettier --write *","black src/*","ruff check src/*","mypy src/*","pytest tests/*","go build ./cmd/*","clang-format -i src/*","shellcheck scripts/*",
+     "scp dist/* host:/srv/","rsync -av dist/* host:/srv/www/","cp -r * /var/tmp/","cp -r ./* ../backup/","cp shutdown/* /tmp","cp env/* /tmp/","./at now","cp ~/.xinitrc{,.bak}"]]+[
+     mcp("mcp__jupyter__add_cell",cell_type="markdown",source="We write to /etc/cron.d/x with open(...,'w')"),mcp("mcp__x__process_document",text="Report\nat 10:00 done")]
+    return G, F
+
+
+@pytest.mark.parametrize("i", range(len(_r6_cases()[0])))
+def test_r6_gaps_closed(i):
+    ev = _r6_cases()[0][i]
+    assert _gated(evaluate(ev, EMPTY)), ev.args
+
+
+@pytest.mark.parametrize("i", range(len(_r6_cases()[1])))
+def test_r6_no_false_positives(i):
+    ev = _r6_cases()[1][i]
+    assert evaluate(ev, EMPTY).rule != RULE, ev.args
+
+
+@pytest.mark.parametrize("cmd", ["cp x " + "/".join(["*"] * 2000),
+                                 "touch " + "/".join(["ab*"] * 2000)])
+def test_r6_glob_expansion_bounded(cmd):
+    t0 = time.perf_counter()
+    evaluate(_shell(cmd), EMPTY)
+    assert time.perf_counter() - t0 < 3.0

@@ -16544,9 +16544,10 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
 
 
 _LA_MCP_SHELL_WORDS = frozenset(("exec", "execute", "shell", "bash", "sh", "zsh", "terminal",
+                                 "interact",
                                  "cmd", "command", "commands", "powershell", "pwsh", "console",
                                  "pty", "tty", "tmux", "ssh", "spawn", "subprocess"))
-_LA_MCP_CODE_WORDS = frozenset(("python", "cell", "notebook", "jupyter", "code", "repl",
+_LA_MCP_CODE_WORDS = frozenset(("python", "ipython", "py", "cell", "notebook", "jupyter", "code", "repl",
                                 "eval", "script", "node", "javascript", "interpreter"))
 _LA_MCP_INPUT_KEY_WORDS = frozenset(("command", "commands", "cmd", "script", "input", "keys",
                                      "text", "line", "lines", "stdin", "code", "args", "argv",
@@ -16589,8 +16590,16 @@ def _la_mcp_commands(ev: Event) -> list:
                 for x in _flatten_strings(v)[:2000]:
                     if isinstance(x, str) and x.strip():
                         out.append(x)
-    if words & (_LA_MCP_CODE_WORDS | {"run", "execute"}) and words & _LA_MCP_CODE_WORDS:
-        for k in ("code", "source", "cell", "script", "input", "content"):
+            elif isinstance(v, dict):          # `{action_json: {command: ...}}`
+                for k2, v2 in v.items():
+                    if _http_rc_words(str(k2)) & _LA_MCP_INPUT_KEY_WORDS:
+                        for x in _flatten_strings(v2)[:2000]:
+                            if isinstance(x, str) and x.strip():
+                                out.append(x)
+    if words & {"run", "execute", "exec", "eval", "evaluate"} and (
+            words & _LA_MCP_CODE_WORDS or any(k in a for k in ("code", "python_code", "source"))):
+        for k in ("code", "python_code", "pythonCode", "source_code", "source", "cell",
+                  "script", "input", "content"):
             v = a.get(k)
             if isinstance(v, str) and v.strip():
                 out.append("python3 -c " + patterns._la_squote(v))
@@ -16713,7 +16722,14 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     /etc/``); an uncapped cd x destination product (quadratic); ``at -b``;
     glob/brace spellings (``autost*``, ``auto{s,}tart`` -- resolved against
     the protected names); chained ``cd``; MCP ``files`` maps; and a
-    description-field false positive. All closed."""
+    description-field false positive. All closed. Round 6 found the
+    round-5 glob resolution over-broad (``src/*`` became ``src/.xinitrc``:
+    now only segments with >= 2 literal characters resolve, at most 8) and
+    super-linear on ``*/*/*...``; ``cp x .../cron/$(whoami)`` (a
+    substitution now stays inside its word); ``su -c``/``sh <<<``/``echo
+    .. | sh`` bodies; ``interact_with_process`` and nested ``action_json``
+    MCP runners; ``open(.., 'w')`` after unquoting; and false positives on
+    ``./at``, ``cp f{,.bak}`` and a non-running ``add_cell``. All closed."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

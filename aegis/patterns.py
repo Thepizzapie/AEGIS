@@ -12068,14 +12068,14 @@ def _la_substitutions(cmd: str, limit: int = 64):
                     depth -= 1
                 j += 1
             bodies.append(cmd[i + 2:j - 1] if depth == 0 else cmd[i + 2:j])
-            out.append(" SUBST ")
+            out.append("SUBST" if cmd[i] == "$" else " SUBST ")
             i = j
             continue
         elif not in_sq and ch == "`" and len(bodies) < limit:
             j = cmd.find("`", i + 1)
             j = n if j < 0 else j
             bodies.append(cmd[i + 1:j])
-            out.append(" SUBST ")
+            out.append("SUBST")
             i = j + 1
             continue
         out.append(ch)
@@ -12084,6 +12084,12 @@ def _la_substitutions(cmd: str, limit: int = 64):
 
 
 _LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*(['\"])(.{1,20000}?)\1", re.S)
+# `su -c BODY` / `runuser -c BODY`, `sh <<< BODY`, `echo BODY | sh` (QA round 6).
+_LA_EXTRA_BODY_RES = (
+    re.compile(r"\b(?:su|runuser)\b[^|;&\n]{0,200}?\s(?:-c|--command(?:=|\s))\s*(['\"])(.{1,20000}?)\1", re.S),
+    re.compile(r"\b(?:ba|z|da|k|fi)?sh\b[^|;&\n]{0,100}?<<<\s*(['\"])(.{1,20000}?)\1", re.S),
+    re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*(['\"])(.{1,20000}?)\1\s*\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b", re.S),
+)
 
 
 def _la_heredocs(cmd: str):
@@ -12271,6 +12277,11 @@ def la_shell_destinations(cmd: str):
             name = name[:-4]
         args = words[1:]
         ops = [a for a in args if not a.startswith("-")]
+        if name in _LA_COPY_CMDS and ops and "{" in ops[-1] and "," in ops[-1]:
+            # `cp f{,.bak}` expands to `cp f f.bak`: only the LAST
+            # alternative is the destination (QA round 6).
+            ops = ops[:-1] + la_brace_expand(ops[-1], 16)
+            args = [a for a in args if a.startswith("-")] + ops
         if name in _LA_CD_CMDS:
             if ops:
                 t0 = ops[0]
@@ -12393,7 +12404,7 @@ def la_shell_destinations(cmd: str):
                    for a in args if a.startswith("-")):
                 known = False
         elif name in _LA_INTERP or name.startswith("python"):
-            if any(re.search(r"['\"][wax]b?\+?['\"]|write|shutil|copy|symlink|rename|replace|"
+            if any(re.search(r"['\"][wax]b?\+?['\"]|,\s*(?:mode\s*=\s*)?[wax]b?\+?\s*[),]|write|shutil|copy|symlink|rename|replace|"
                              r"writeFile|appendFile|createWriteStream|Set-Content|Out-File|>", a)
                    for a in args):
                 for a in args:
@@ -12428,6 +12439,8 @@ def la_shell_renderings(raw: str, _depth: int = 0):
     _, code = _la_heredocs(raw)
     out.extend(code)
     out.extend(m.group(2) for m in _LA_EVAL_BODY_RE.finditer(outer))
+    for rx in _LA_EXTRA_BODY_RES:
+        out.extend(m.group(2) for m in rx.finditer(outer))
     if _depth < 3:
         for b_ in subs:
             out.extend(la_shell_renderings(b_, _depth + 1))
@@ -12444,7 +12457,7 @@ def la_shell_renderings(raw: str, _depth: int = 0):
 
 
 LA_AT_RE = re.compile(
-    _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVk]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
+    _LA_CMDPOS_BATCH + r"at(?:\.exe)?\s+(?:-[mMvVk]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
     + r"(?:-t\s*\d|-[A-Za-z]*b[A-Za-z]*(?=\s|$|[;&|)])|" + _LA_TIMESPEC + r")"
     + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
     + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))",
@@ -12522,6 +12535,15 @@ def la_glob_candidates(path: str, cap: int = 64) -> list:
     """Brace-expand, then resolve glob segments (``*?[``) against the
     protected names (QA round 5: `~/.config/autost*/x`, `auto{s,}tart`)."""
     import fnmatch
+    if len(path) > 4096:
+        return [path]
+    out = la_brace_expand(path, cap)
+    if not re.search(r"[*?\[]", "".join(out)):
+        return out
+    return _la_glob_resolve(out, cap)
+
+
+def la_brace_expand(path: str, cap: int = 64) -> list:
     out = [path]
     if "{" in path:
         for _ in range(3):
@@ -12534,17 +12556,27 @@ def la_glob_candidates(path: str, cap: int = 64) -> list:
                 for alt in m.group(1).split(",")[:16]:
                     nxt.append(p[:m.start()] + alt + p[m.end():])
             out = list(dict.fromkeys(nxt))[:cap]
-    if not re.search(r"[*?\[]", "".join(out)):
-        return out
+    return out
+
+
+def _la_glob_resolve(out: list, cap: int) -> list:
+    """Resolve wildcard segments with >= 2 literal characters (`autost*`,
+    `.xsess*`, `X1?`) against the protected names. A bare `*`/`.*`/`c*`
+    is left alone (QA round 6: `src/*` must not become `src/.xinitrc`);
+    at most 8 wildcard segments are resolved (bounded work)."""
+    import fnmatch
     res = []
     for p in out:
         segs = re.split(r"([/\\]+)", p)
         combos = [""]
+        nwild = 0
         for sg in segs:
-            if re.search(r"[*?\[]", sg):
+            if (re.search(r"[*?\[]", sg) and nwild < 8
+                    and len(re.sub(r"\[[^\]]*\]|[*?]", "", sg)) >= 2):
+                nwild += 1
                 ms = [n for n in _LA_GLOB_NAMES if fnmatch.fnmatchcase(n.lower(), sg.lower())] or [sg]
-                combos = [c + m for c in combos for m in ms][:cap]
+                combos = [c + m for c in combos[:cap] for m in ms][:cap]
             else:
-                combos = [c + sg for c in combos]
+                combos = [c + sg for c in combos[:cap]]
         res.extend(combos)
     return list(dict.fromkeys(res))[:cap]
