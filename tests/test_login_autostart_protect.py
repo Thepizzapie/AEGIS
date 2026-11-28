@@ -942,3 +942,40 @@ def test_r11_scanner_linear(cmd):
     t0 = time.perf_counter()
     rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
     assert time.perf_counter() - t0 < 1.5
+
+
+# ---- QA round 12 regressions ---------------------------------------------------
+
+R12_GATED = [
+    "git commit -m \"$(cat <<'EOF'\nFix parser\nEOF)\"\ncat > ~/.xinitrc <<'EOF'\nexec x\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nFix parser\nEOF)\"\ntee ~/.config/autostart/a.desktop <<'EOF'\nx\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nFix\nEOF)\"\nat now <<'EOF'\n/tmp/x\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nFix\nEOF)\"\ncp a ~/.config/autostart/\ncat <<'EOF'\ndone\nEOF",
+    "git commit -m \"$(cat <<'EOF'\nFix\nEOF)\"\necho /tmp/x | at now\ncat <<'EOF'\nok\nEOF",
+    "gh pr create --body \"$(cat <<'EOF'\nbody\nEOF)\"\ncp a /etc/xdg/autostart/\n"
+    "git commit -m \"$(cat <<'EOF'\nx\nEOF\n)\"",
+    "cat > /tmp/setup.sh <<'EOF'\n#!/bin/sh\nmkdir -p ~/.config/autostart\n"
+    "cp app.desktop ~/.config/autostart/\nEOF\nbash /tmp/setup.sh",
+    "cat > /tmp/s.sh <<'EOF'\necho '* * * * * /x' > /var/spool/cron/crontabs/root\nEOF\nsudo sh /tmp/s.sh",
+    "cat > s.sh <<'EOF'\necho x | at now\nEOF\nchmod +x s.sh && ./s.sh",
+    "wc -c <<< hello\ncp a /etc/xdg/autostart/\nhello\nEOF",
+    "cat <<<EOF\necho hi > ~/.xsession\nEOF",
+    "cat <<'1EOF'\nit's\n1EOF\nat now <<'EOF'\n/tmp/x\nEOF",
+    "cat <<'---'\nit's\n---\ncp a ~/.xinitrc",
+]
+
+
+@pytest.mark.parametrize("cmd", R12_GATED)
+def test_r12_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "while read l; do echo $l; done <<EOF\nat now\nEOF",
+    "cat > notes.sh <<'EOF'\necho x > ~/.xinitrc\nEOF",      # written, never run
+    "git commit -m \"$(cat <<'EOF'\nat noon\nEOF)\"",
+])
+def test_r12_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

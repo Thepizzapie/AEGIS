@@ -16756,7 +16756,13 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     found quote pairing lost after any ``"..$(..).."``, so a later quoted
     ``<<EOF`` became a live marker; the scanner is now stateful (single/
     double quotes, ``$(..)`` nesting inside double quotes, ``$((..))``
-    arithmetic, comments, escapes) and linear in the number of markers."""
+    arithmetic, comments, escapes) and linear in the number of markers.
+    Round 12 found ``EOF)`` (bash closes the heredoc and ``$(..)``
+    together) ending a commit-message body only at a LATER ``EOF``; a
+    heredoc-written script run in the same command (``cat > s.sh <<EOF
+    .. EOF; bash s.sh`` -- the body is now judged as code when the file is
+    named again); ``<<<word`` taken as a heredoc; quoted delimiters like
+    ``'1EOF'``/``'---'``; and ``done <<EOF`` loop input judged as code."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

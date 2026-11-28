@@ -12030,7 +12030,7 @@ _LA_PROSE_SINKS = frozenset((
     "cat", "git", "gh", "glab", "hub", "echo", "printf", "tee", "less", "more", "grep",
     "wc", "jq", "yq", "mail", "mailx", "sendmail", "mutt", "wl-copy", "xclip", "pbcopy",
     "head", "tail", "sort", "uniq", "diff", "column", "fold", "fmt", "base64", "md5sum",
-    "sha256sum", "read", "curl", "http",
+    "sha256sum", "read", "curl", "http", "done", "while", "mapfile", "readarray",
 ))
 
 
@@ -12104,8 +12104,8 @@ def _la_heredoc_head(prefix: str) -> str:
 
 
 _LA_HD_MARK_RE = re.compile(
-    r"<<(?!<)(?P<dash>-?)[ \t]*(?P<qt>['\"]?)(?P<delim>[A-Za-z_][\w.-]{0,40})(?P=qt)"
-    r"|<<(?!<)(?P<dash2>-?)[ \t]*\\(?P<delim2>[A-Za-z_][\w.-]{0,40})")
+    r"<<(?!<)(?P<dash>-?)[ \t]*(?:'(?P<d1>[^'\n]{1,80})'|\"(?P<d2>[^\"\n]{1,80})\""
+    r"|\\(?P<d3>[\w.-]{1,40})|(?P<d4>[A-Za-z0-9_][\w.-]{0,40}))")
 _LA_HD_SPECIAL_RE = re.compile(r"[\\'\"#$<\n()`]")
 
 
@@ -12123,7 +12123,7 @@ def _la_heredocs(cmd: str):
     code = []
     if "<<" not in cmd or "\n" not in cmd:
         return cmd, code
-    out, pending, stack = [], [], []
+    out, pending, stack, written = [], [], [], []
     cur = []                       # output of the current line (for the head)
     i, n = 0, len(cmd)
 
@@ -12206,17 +12206,24 @@ def _la_heredocs(cmd: str):
                 continue
             if stack and stack[-1] in "(a":
                 stack.pop()
+        elif ch == "<" and cmd.startswith("<<<", i):
+            emit("<<<")                    # here-string, not a heredoc (QA round 12)
+            i += 3
+            continue
         elif ch == "<" and "A" not in stack:
             mk = _LA_HD_MARK_RE.match(cmd, i)
             if mk and len(pending) < 64:
-                delim = mk.group("delim") or mk.group("delim2")
-                quoted = bool(mk.group("qt")) or bool(mk.group("delim2"))
-                dash = bool(mk.group("dash") or mk.group("dash2"))
-                name = _la_heredoc_head("".join(cur[-200:]))
+                delim = mk.group("d1") or mk.group("d2") or mk.group("d3") or mk.group("d4")
+                quoted = not mk.group("d4")
+                dash = bool(mk.group("dash"))
+                line_so_far = "".join(cur[-200:])
+                name = _la_heredoc_head(line_so_far)
                 tail_end = cmd.find("\n", mk.end())
                 tail = cmd[mk.end():tail_end if tail_end >= 0 else n][:2000]
                 piped = [x.split()[0].rsplit("/", 1)[-1].lower() for x in tail.split("|")[1:] if x.split()]
-                pending.append((delim, quoted, dash, name, piped))
+                rd = re.search(r">>?\|?\s*['\"]?([^\s'\";&|<>()]+)", line_so_far[-400:] + " " + tail)
+                pending.append((delim, quoted, dash, name, piped, rd.group(1) if rd else "",
+                                "(" in stack))
                 emit("< HEREDOC")
                 i = mk.end()
                 continue
@@ -12226,19 +12233,29 @@ def _la_heredocs(cmd: str):
             i += 1
             if pending:
                 j = i
-                for delim, quoted, dash, name, piped in pending:
+                for delim, quoted, dash, name, piped, target, in_sub in pending:
                     lines, term = [], False
                     while j < n:
                         e = cmd.find("\n", j)
                         line = cmd[j:e if e >= 0 else n]
-                        j = (e + 1) if e >= 0 else n
-                        if (line.lstrip("\t") if dash else line) == delim:
+                        ln = line.lstrip("\t") if dash else line
+                        if ln == delim:
+                            j = (e + 1) if e >= 0 else n
                             term = True
                             break
+                        if in_sub and re.match(re.escape(delim) + r"[ \t]*\)", ln):
+                            # `EOF)` closes the heredoc and the $(..) together
+                            # (bash accepts it -- QA round 12).
+                            j = j + (len(line) - len(ln)) + len(delim)
+                            term = True
+                            break
+                        j = (e + 1) if e >= 0 else n
                         lines.append(line)
                     body = "\n".join(lines)
                     if not quoted:
                         code.extend(_la_substitutions(body)[1])
+                    if target:
+                        written.append((target, body))
                     if (not term or name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
                             or any(x not in _LA_PROSE_SINKS for x in piped)):
                         code.append(body)
@@ -12252,7 +12269,14 @@ def _la_heredocs(cmd: str):
             continue
         emit(ch)
         i += 1
-    return "".join(out), code
+    res = "".join(out)
+    # A file a heredoc wrote, named again later (`bash /tmp/setup.sh`,
+    # `./setup.sh`, `source f`): its body is code (QA round 12).
+    for target, body in written[:64]:
+        bn = re.split(r"[/\\]", target)[-1]
+        if bn and len(re.findall(r"(?<![\w.-])" + re.escape(bn) + r"(?![\w.-])", res)) >= 2:
+            code.append(body)
+    return res, code
 
 
 _LA_PROSE_RE = re.compile(
