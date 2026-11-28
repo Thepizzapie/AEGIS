@@ -864,3 +864,47 @@ def test_r9_perf(cmd):
     t0 = time.perf_counter()
     rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
     assert time.perf_counter() - t0 < 1.0
+
+
+# ---- QA round 10 regressions (multi-heredoc scripts) ---------------------------
+
+R10_GATED = [
+    "cat > README.md <<'EOF'\nDon't edit this file.\nEOF\n"
+    "cat > ~/.config/autostart/app.desktop <<'EOF'\n[Desktop Entry]\nExec=/opt/app/run\nEOF",
+    "cat > README.md <<'EOF'\nDon't edit this file.\nEOF\ncat > ~/.xinitrc <<'EOF'\nexec i3\nEOF",
+    "cat > README.md <<'EOF'\nDon't edit this file.\nEOF\nat now + 1 hour <<'EOF'\nmake\nEOF",
+    "cat > a.md <<'EOF'\nDon't forget\nEOF\ncp app.desktop ~/.config/autostart/\ncat > b.md <<'EOF'\ndone\nEOF",
+    "cat > a.md <<'EOF'\nDon't forget\nEOF\necho /tmp/x | at now + 1 minute\ncat > b.md <<'EOF'\ndone\nEOF",
+    "cat > a.md <<EOF\nit's here\nEOF\nsudo cp job /var/spool/cron/crontabs/root\necho 'ok'",
+    "cat > a.md <<'EOF'\nSay \"hi\nEOF\ncp a ~/.xsession\ncat > b <<\"EOF\"\nx\nEOF",
+    "cat > a.md <<'EOF'\n<<EOF in a body\nEOF\ncp a ~/.xinitrc",
+]
+
+
+@pytest.mark.parametrize("cmd", R10_GATED)
+def test_r10_multi_heredoc_scripts(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+def test_r10_heredoc_strip_is_idempotent():
+    from aegis import patterns
+    c = "cat > a <<'EOF'\nDon't\nEOF\ncp x ~/.xinitrc\n"
+    once = patterns._la_heredocs(c)[0]
+    assert patterns._la_heredocs(once)[0] == once
+    assert "~/.xinitrc" in once
+
+
+def test_r10_continuation_padding_past_token_cap():
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell("\\\n" * 80000 + "cp x ~/.xsession"), EMPTY)
+    assert d is not None and d.rule == RULE
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat > README.md <<'EOF'\nDon't run `at now` here.\nEOF\necho 'ok'",
+    "cat > a.md <<'EOF'\nit's fine\nEOF\ncat > b.md <<'EOF'\nat noon\nEOF",
+])
+def test_r10_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

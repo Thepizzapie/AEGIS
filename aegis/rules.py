@@ -16747,7 +16747,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     ANSI-C ``$'..\\'..'`` strings, ``<<EOF`` inside quotes/comments or
     unterminated dropping the rest of the input (now masked / kept as
     code), backticks in quoted heredoc bodies and escaped backticks, and
-    two unusual-shape slowdowns. All closed."""
+    two unusual-shape slowdowns. All closed. Round 10 found a quote
+    character inside one heredoc BODY (``Don't``) still desynced the
+    marker mask and hid every later heredoc and the commands between them;
+    heredocs are now found by one left-to-right scanner that never looks
+    inside bodies, reads bodies line by line like the shell, and leaves an
+    inert ``< HEREDOC`` marker (re-running is a no-op)."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

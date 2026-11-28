@@ -12021,11 +12021,6 @@ def login_autostart_cmd_hit(cmd: str) -> bool:
 # check run on a surface with prose removed: a heredoc body (unless it is fed
 # to a shell/at/batch, where it IS code) and quoted strings -- so a wrapped
 # commit message line "at decode time" or `echo "meet; at noon"` is data.
-_LA_HEREDOC_RE = re.compile(
-    r"<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]{0,40})\1([^\n]*+)\n(.*?)(\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
-    re.S)
-_LA_MASK_RE = re.compile(
-    r"(?<![^\s;&|()<>])#[^\n]*|\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.")
 _LA_CODE_SINKS = frozenset((
     "sh", "bash", "zsh", "dash", "ksh", "fish", "at", "batch", "python", "python3",
     "perl", "ruby", "node", "pwsh", "powershell", "osascript", "crontab", "tee",
@@ -12037,8 +12032,6 @@ _LA_PROSE_SINKS = frozenset((
     "head", "tail", "sort", "uniq", "diff", "column", "fold", "fmt", "base64", "md5sum",
     "sha256sum", "read", "curl", "http",
 ))
-_LA_QUOTED_RE = re.compile(r"'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\"|\$'(?:[^'\\\\]|\\\\.)*'")
-_LA_COMMENT_RE = re.compile(r"(?:(?<=\s)|^)#[^\n]*", re.M)
 
 
 def _la_squote(t: str) -> str:
@@ -12101,49 +12094,83 @@ _LA_EXTRA_BODY_RES = (
 )
 
 
+_LA_SCAN_RE = re.compile(
+    r"(?P<c>(?<![^\s;&|()<>])#[^\n]*)"
+    # A double-quoted string containing `$(` is not skipped whole: a
+    # heredoc inside `"$(cat <<'EOF' ...)"` is real.
+    r"|(?P<q>\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\$]|\\.|\$(?!\())*\")"
+    r"|(?P<e>\\.)"
+    r"|(?P<h><<(?!<)(?P<dash>-?)[ \t]*(?P<qt>['\"]?)(?P<delim>[A-Za-z_][\w.-]{0,40})(?P=qt))"
+    r"|(?P<n>\n)", re.S)
+
+
+def _la_heredoc_head(prefix: str) -> str:
+    head = prefix.rsplit("\n", 1)[-1]
+    head = re.split(r"[;&|(]|\$\(", head)[-1].split()
+    while head and (re.match(r"^[A-Za-z_]\w*=", head[0])
+                    or head[0].rsplit("/", 1)[-1].lower() in ("sudo", "doas", "env", "nohup", "command", "exec", "time")):
+        head = head[1:]
+    return head[0].rsplit("/", 1)[-1].lower() if head else ""
+
+
 def _la_heredocs(cmd: str):
-    """(cmd with heredoc bodies removed, [bodies fed to a code sink])."""
+    """(cmd with heredoc bodies removed, [bodies fed to code]).
+
+    One left-to-right scan (QA round 10): a `<<WORD` counts only outside
+    quotes/comments of the COMMAND text -- quote characters inside a body
+    are never seen -- and bodies are read line by line after the marker's
+    line, the way the shell does. Each marker becomes an inert `< HEREDOC`
+    (re-running this is a no-op). A body fed to a non-prose consumer, or a
+    heredoc with no terminator, is returned as code; an unquoted body's
+    $(..)/`..` substitutions are returned as code too."""
     code = []
     if "<<" not in cmd or "\n" not in cmd:
         return cmd, code
-    import bisect
-    spans = [(m.start(), m.end()) for m in _LA_MASK_RE.finditer(cmd[:200000]) if m.end() - m.start() > 1]
-    starts = [a for a, _ in spans]
-
-    def _masked(pos):
-        k = bisect.bisect_right(starts, pos) - 1
-        return k >= 0 and spans[k][0] <= pos < spans[k][1]
-
-    def _sub(m):
-        # A `<<` inside quotes or a comment is text, and an unterminated
-        # heredoc is kept as code -- never silently dropped (QA round 9).
-        if _masked(m.start()) or not m.group(5):
-            return m.group(0)
-        head = cmd[:m.start()].rsplit("\n", 1)[-1]
-        head = re.split(r"[;&|(]|\$\(", head)[-1].split()
-        while head and (re.match(r"^[A-Za-z_]\w*=", head[0])
-                        or head[0].rsplit("/", 1)[-1].lower() in ("sudo", "doas", "env", "nohup", "command", "exec", "time")):
-            head = head[1:]
-        name = head[0].rsplit("/", 1)[-1].lower() if head else ""
-        # Rest of the heredoc's own line: `cat <<EOF | sh` pipes the body on.
-        tail = m.group(3)
-        piped = [p.split()[0].rsplit("/", 1)[-1].lower() for p in tail.split("|")[1:] if p.split()]
-        body = m.group(4)
-        # Only a body fed to a known prose/data consumer is dropped (QA
-        # round 3 lead: any other consumer may run it as code).
-        if not m.group(1):
-            # Unquoted delimiter: $(..)/`..` in the body still run.
-            code.extend(_la_substitutions(body)[1])
-        if (name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
-                or any(x not in _LA_PROSE_SINKS for x in piped)):
-            code.append(body)
-            if name in _LA_INTERP or name.startswith("python"):
-                # Judge it as interpreter code too (QA round 4: `python3 - <<EOF`).
-                code.append(name + " -c " + _la_squote(body))
-        # Keep the rest of the marker's line (QA round 4: `cat <<EOF > ~/.xinitrc`).
-        return "<<" + m.group(2) + tail + "\n"
-    out = _LA_HEREDOC_RE.sub(_sub, cmd)
-    return out, code
+    out, pending, i, n = [], [], 0, len(cmd)
+    while i < n:
+        m = _LA_SCAN_RE.search(cmd, i)
+        if not m:
+            out.append(cmd[i:])
+            break
+        out.append(cmd[i:m.start()])
+        if m.group("h"):
+            name = _la_heredoc_head("".join(out))
+            tail_end = cmd.find("\n", m.end())
+            tail = cmd[m.end():tail_end if tail_end >= 0 else n]
+            piped = [x.split()[0].rsplit("/", 1)[-1].lower() for x in tail.split("|")[1:] if x.split()]
+            pending.append((m.group("delim"), bool(m.group("qt")), bool(m.group("dash")), name, piped))
+            out.append("< HEREDOC")
+            i = m.end()
+            continue
+        if m.group("n") and pending:
+            out.append("\n")
+            j = m.end()
+            for delim, quoted, dash, name, piped in pending:
+                lines, term = [], False
+                while j < n:
+                    e = cmd.find("\n", j)
+                    line = cmd[j:e if e >= 0 else n]
+                    j = (e + 1) if e >= 0 else n
+                    if (line.lstrip("\t") if dash else line) .strip(" ") == delim or line.strip() == delim:
+                        term = True
+                        break
+                    lines.append(line)
+                body = "\n".join(lines)
+                if not quoted:
+                    code.extend(_la_substitutions(body)[1])
+                if (not term or name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
+                        or any(x not in _LA_PROSE_SINKS for x in piped)):
+                    code.append(body)
+                    if name in _LA_INTERP or name.startswith("python"):
+                        code.append(name + " -c " + _la_squote(body))
+                if not term:
+                    out.append(body)        # unterminated: keep it as code
+            pending = []
+            i = j
+            continue
+        out.append(m.group(0))
+        i = m.end()
+    return "".join(out), code
 
 
 _LA_PROSE_RE = re.compile(
@@ -12314,7 +12341,7 @@ def la_shell_destinations(cmd: str):
     import shlex
     c, _ = _la_heredocs(cmd)
     raw_toks = _la_tokens_nocomment(c)
-    if len(raw_toks) >= 19000 or len(c) >= 200000:
+    if len(_la_tokens(c)) >= 19900 or len(raw_toks) >= 19000 or len(c) >= 200000:
         return None                       # truncated: caller falls back (QA round 7)
     toks = [_la_unquote(t) for t in raw_toks]
     dests, cds, unknown = [], [], []
