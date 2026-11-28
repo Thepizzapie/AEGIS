@@ -12122,11 +12122,24 @@ def _la_heredocs(cmd: str):
     return out, code
 
 
+_LA_PROSE_RE = re.compile(
+    r"(?<![^\s;&|()<>])#[^\n]*|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$'(?:[^'\\]|\\.)*'|\\.")
+
+
 def la_prose_free(cmd: str) -> str:
-    """``cmd`` minus heredoc bodies, quoted strings and comments."""
+    """``cmd`` minus heredoc bodies, quoted strings, escapes and comments --
+    in one left-to-right pass, so whichever starts first wins (QA round 8:
+    `# don't` must not open a quote that hides the next line)."""
     c, _ = _la_heredocs(cmd)
-    c = _LA_QUOTED_RE.sub(" Q ", c)
-    return _LA_COMMENT_RE.sub("", c)
+
+    def _sub(m):
+        t = m.group(0)
+        if t.startswith("#"):
+            return ""
+        if t.startswith("\\"):
+            return t[1:] if t[1:] not in "'\"" else ""
+        return " Q "
+    return _LA_PROSE_RE.sub(_sub, c)
 
 
 _LA_COPY_CMDS = frozenset(("cp", "mv", "install", "ln", "rsync", "scp", "copy", "xcopy",
@@ -12140,8 +12153,12 @@ _LA_INTERP = frozenset(("python", "python2", "python3", "perl", "ruby", "node", 
 _LA_CD_CMDS = frozenset(("cd", "pushd", "chdir", "set-location", "sl"))
 
 
+# One left-to-right pass: a word-initial `#` outside quotes is a comment
+# (to end of line), so an apostrophe inside it can't open a "quoted word"
+# that swallows later lines (QA round 8); `\x` escapes are word parts.
 _LA_WORD_RE = re.compile(
-    r"(?:'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\"|\$\([^()]{0,2000}\)|[^\s'\";&|()<>])+"
+    r"(?<![^\s;&|()<>])#[^\n]*"
+    r"|(?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$\([^()]{0,2000}\)|\\.|[^\s'\";&|()<>\\])+"
     r"|[;&|()<>]+|['\"]|\n")
 
 

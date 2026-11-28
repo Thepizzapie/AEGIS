@@ -781,3 +781,38 @@ def test_r7_padding_past_caps_fails_closed():
     ev = _shell("cd ~/.config; " * 8000 + "cp x autostart/")
     d = rules.rule_login_autostart_protect(ev, EMPTY)
     assert d is not None and d.rule == RULE
+
+
+# ---- QA round 8 regressions (comment / escape tokenization) --------------------
+
+@pytest.mark.parametrize("cmd", [
+    "# don't start twice\ncp app.desktop ~/.config/autostart/\n# that's it",
+    "# user's xinitrc\necho 'exec i3' > ~/.xinitrc",
+    "# Install the user's autostart entry\nmkdir -p ~/.config/autostart\n"
+    "cp app.desktop ~/.config/autostart/\n# Verify it's there\nls ~/.config/autostart",
+    "# don't\nsudo cp backup.sh /etc/periodic/daily/\n# won't",
+    "# don't\nsudo cp 99x /etc/X11/Xsession.d/\n# won't",
+    "# don't\necho x | sudo tee /var/spool/cron/crontabs/u\n# won't",
+    "echo hi #don't\ncp a.desktop ~/.config/autostart/\necho 'x'",
+    "# don't\necho make | at now + 1 hour\n# it's",
+    "echo don\\'t\ncp a.desktop ~/.config/autostart/ && echo 'x'",
+])
+def test_r8_comment_and_escape_tokenization(cmd):
+    assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r8_mcp_comment_apostrophe():
+    ev = _mcp("mcp__desktop-commander__start_process",
+              command="# don't\ncp a.desktop ~/.config/autostart/\n# it's")
+    assert _gated(evaluate(ev, EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "# don't run at noon\necho ok",
+    "echo \"it's at 5\" # don't",
+    "git commit -m 'fix: don'\\''t crash at decode'",
+    "echo a#b > out.txt",
+    "C:\\Users\\me\\app.exe --flag",
+])
+def test_r8_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

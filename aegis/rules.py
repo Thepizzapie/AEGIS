@@ -16736,7 +16736,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     Round 7 (acceptance) found a trailing ``# comment`` became a copy
     tool's "last operand" (``cp a ~/.xinitrc # x``) -- comments are now
     dropped per line, quote-aware -- plus ``env -C DIR``, ``ssh host '..'``
-    bodies, and padding past the 16-``cd`` cap (now fails closed)."""
+    bodies, and padding past the 16-``cd`` cap (now fails closed). Round 8
+    found that fix tokenized before recognising comments, so an apostrophe
+    in ``# don't`` opened a "quoted word" hiding the following lines, and
+    a ``don\\'t`` escape desynced quoting; comments, quotes and escapes are
+    now recognised in one left-to-right pass (tokenizer and prose-free
+    surface alike)."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
