@@ -16601,7 +16601,7 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
         names_target = False
         for t in dict.fromkeys((cmd, raw)):
             if (patterns.login_autostart_path_hit(t)
-                    or patterns.LOGIN_AUTOSTART_DIR_RE.search(t)
+                    or patterns.login_autostart_dir_hit(t)
                     or patterns.login_autostart_find_hit(t)):
                 names_target = True
                 break

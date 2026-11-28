@@ -11855,8 +11855,31 @@ def login_autostart_find_hit(cmd: str) -> bool:
     return _find_word_and_predicate_hit(cmd, LOGIN_AUTOSTART_FIND_RE)
 
 
+# Literal fragments at least one of which every LOGIN_AUTOSTART_PATH_RE/
+# CRON_SPOOL_PATH_RE/LOGIN_AUTOSTART_DIR_RE match contains (lower-cased);
+# a substring pre-check keeps the common no-target case off the regexes
+# (QA perf budget: the shared 1s engine budget on 120KB adversarial input).
+_LA_LITERALS = (
+    "autostart", "plasma-workspace", "kde", "xinitrc", "xsession", "xserverrc",
+    "xclients", "xprofile.d", "x11", "gdm", "start menu", "cron", "spool",
+    "periodic", "daily.local", "weekly.local", "monthly.local",
+)
+_LA_AT_DIR_RE = re.compile(r"[/\\]at" + _WIN_TRIM + _SEP + r"(?:tabs|jobs)", re.IGNORECASE)
+
+
+def login_autostart_maybe_target(text: str) -> bool:
+    low = text.lower()
+    return any(k in low for k in _LA_LITERALS) or bool(_LA_AT_DIR_RE.search(text))
+
+
 def login_autostart_path_hit(text: str) -> bool:
+    if not login_autostart_maybe_target(text):
+        return False
     return bool(LOGIN_AUTOSTART_PATH_RE.search(text) or CRON_SPOOL_PATH_RE.search(text))
+
+
+def login_autostart_dir_hit(text: str) -> bool:
+    return login_autostart_maybe_target(text) and bool(LOGIN_AUTOSTART_DIR_RE.search(text))
 
 
 # Commands that install login/scheduled persistence with no file path in
@@ -11903,11 +11926,19 @@ _LA_REG_KEY_RE = re.compile(
     r"|\\Image File Execution Options\\", re.IGNORECASE)
 
 
+_LA_CMD_LITERALS = ("batch", "osascript", "loginwindow", "sfltool", "winlogon",
+                    "explorer", "active setup", "appinit_dlls", "image file execution")
+_LA_AT_WORD_RE = re.compile(r"(?<![\w.\-])at(?:\.exe)?\s", re.IGNORECASE)
+
+
 def login_autostart_cmd_hit(cmd: str) -> bool:
     """True when a clause of ``cmd`` schedules/installs login persistence
     with no file write (at/batch, macOS login items, registry autostarts).
     A registry-key mention counts only alongside a registry WRITE verb in
     the same clause -- reading these keys is ordinary triage."""
+    low = cmd.lower()
+    if not (any(k in low for k in _LA_CMD_LITERALS) or _LA_AT_WORD_RE.search(cmd)):
+        return False
     for clause in _CLAUSE_SPLIT_RE.split(cmd):
         for m in LOGIN_AUTOSTART_CMD_RE.finditer(clause):
             if _LA_REG_KEY_RE.search(m.group(0)) and not REGISTRY_WRITE_VERB_RE.search(clause):
