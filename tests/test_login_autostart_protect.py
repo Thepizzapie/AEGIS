@@ -603,3 +603,8 @@ def test_r3_leads_not_gated(cmd):
 ])
 def test_r3b_bypasses_closed(cmd):
     assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r3b_yq_inplace_gated():
+    assert _hit(evaluate(_shell("yq -i .a /home/u/.config/autostart/x.desktop"), EMPTY))
+    assert evaluate(_shell("yq .a /home/u/.config/autostart/x.desktop"), EMPTY).rule != RULE

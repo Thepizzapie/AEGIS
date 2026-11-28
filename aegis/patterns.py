@@ -12280,6 +12280,8 @@ def la_shell_destinations(cmd: str):
         elif name in _LA_READONLY_CMDS or name in ("find", "awk", "gawk", "mawk"):
             if name in ("awk", "gawk", "mawk") and any("inplace" in a or ">" in a for a in args):
                 known = False
+            if name in ("yq", "jq") and any(re.fullmatch(r"-[A-Za-z]*i|--inplace", a) for a in args):
+                dests.extend(ops)              # in-place edit (QA round 3b)
             if name == "find":
                 for j, a in enumerate(args):
                     if a in ("-exec", "-execdir", "-ok", "-okdir") and j + 1 < len(args):
