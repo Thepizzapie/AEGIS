@@ -12408,13 +12408,48 @@ _LA_WRAPPERS = frozenset((
     "cgexec", "sg", "runuser", "su", "nocache", "catchsegv", "valgrind", "sem", "parallel",
     "then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "coproc",
 ))
+_LA_WRAPPER_VALUE_OPTS = {
+    "sudo": ("ugChpUrtDRT", ("--user", "--group", "--close-from", "--host", "--prompt",
+                             "--other-user", "--role", "--type", "--chdir", "--chroot",
+                             "--command-timeout")),
+    "doas": ("uC", ()),
+    "su": ("csgGw", ("--command", "--shell", "--group", "--supp-group",
+                     "--whitelist-environment")),
+    "runuser": ("ugGcsw", ("--user", "--group", "--supp-group", "--command", "--shell")),
+    "pkexec": ("", ("--user",)),
+    "env": ("uCS", ("--chdir", "--unset", "--split-string")),
+    "nice": ("n", ("--adjustment",)),
+    "ionice": ("cnpPu", ("--class", "--classdata", "--pid", "--pgid", "--uid")),
+    "timeout": ("sk", ("--signal", "--kill-after")),
+    "stdbuf": ("ioe", ("--input", "--output", "--error")),
+    "flock": ("wEc", ("--timeout", "--conflict-exit-code", "--command")),
+    "xargs": ("aEeIiLlnPsd", ("--arg-file", "--delimiter", "--max-args", "--max-procs",
+                              "--max-lines", "--max-chars", "--replace")),
+    "watch": ("nq", ("--interval", "--equexit")),
+    "strace": ("eoPpSsuIXb", ()),
+    "ltrace": ("eoPpSsuIn", ()),
+    "systemd-run": ("upMEs", ("--unit", "--property", "--machine", "--setenv", "--slice",
+                              "--description", "--uid", "--gid", "--working-directory")),
+    "nsenter": ("tSG", ("--target", "--setuid", "--setgid")),
+    "taskset": ("", ()),
+    "chrt": ("", ()),
+    "numactl": ("CNmMp", ()),
+    "cgexec": ("g", ()),
+    "sg": ("", ()),
+    "firejail": ("", ()),
+    "script": ("cEeOIqT", ("--command",)),
+    "faketime": ("f", ()),
+    "valgrind": ("", ()),
+    "unshare": ("", ()),
+    "chroot": ("", ("--userspec", "--groups")),
+}
 _LA_TIME_TOK_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|0x[0-9a-fA-F]+|[\d,\-]+)$")
 
 
 def _la_strip_wrappers(words):
     """Drop leading assignments / wrappers and their options/option-args."""
     i, n = 0, len(words)
-    prev_wrapper = None
+    prev_wrapper, took_pos = None, False
     while i < n:
         w = words[i]
         base = re.split(r"[/\\]", w)[-1].lower()
@@ -12423,28 +12458,30 @@ def _la_strip_wrappers(words):
             continue
         if base in _LA_WRAPPERS:
             prev_wrapper = base
+            took_pos = False
             i += 1
             continue
-        if prev_wrapper == "env" and w in ("-C", "-u", "-S", "--chdir", "--unset", "--split-string"):
-            i += 2
-            continue
-        if prev_wrapper and w.startswith("-"):
+        if prev_wrapper and w == "--":
             i += 1
-            # option with a separate value (`nice -n 10`, `sudo -u bob`)
-            if (i < n and prev_wrapper in ("sudo", "doas", "runuser", "su") and not words[i].startswith("-")
-                    and re.fullmatch(r"-[A-Za-z]*[ugCchpUrtDR]", w)):
-                i += 1                     # bundled `sudo -iu USER` (QA round 19)
-                continue
-            if i < n and re.fullmatch(r"-[A-Za-z]", w) and not words[i].startswith("-") and (
-                    _LA_TIME_TOK_RE.match(words[i]) or prev_wrapper in ("sudo", "doas", "su", "runuser", "sg", "chroot", "nsenter", "cgexec")):
-                i += 1
+            continue
+        if prev_wrapper and w.startswith("-") and len(w) > 1:
+            # Consume a separate value ONLY after an option that takes one
+            # (QA round 20: `sudo -n tee ..`, `sudo -E tee ..` -- -n/-E take
+            # none, and swallowing `tee` hid the real command).
+            i += 1
+            vshort, vlong = _LA_WRAPPER_VALUE_OPTS.get(prev_wrapper, ("", ()))
+            if w.startswith("--"):
+                if "=" not in w and w in vlong and i < n:
+                    i += 1
+            elif vshort and w[-1] in vshort and i < n:
+                i += 1                     # `-u bob`, bundled `-iu bob`, `-n 10`
             continue
         if prev_wrapper and _LA_TIME_TOK_RE.match(w):
             i += 1                       # timeout 5 / chrt 0 / taskset 0x1
             continue
-        if prev_wrapper in ("flock", "chroot", "sg", "cgexec") and i + 1 < n:
-            i += 1                       # flock LOCKFILE cmd / chroot DIR cmd
-            prev_wrapper = None
+        if prev_wrapper in ("flock", "chroot", "sg", "cgexec") and not took_pos and i + 1 < n:
+            i += 1                       # flock LOCKFILE cmd / chroot DIR cmd / sg GROUP -c cmd
+            took_pos = True
             continue
         break
     return words[i:]

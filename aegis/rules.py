@@ -16847,7 +16847,11 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     fed by a redirect (``sudo -u deploy batch < job.sh`` -- redirect
     operands are now dropped with their operator, bundled ``sudo -iu``
     values skipped) and ``cd <target> && gh release download`` (gh/glab/
-    hub downloads with no ``-D`` now write into the cwd)."""
+    hub downloads with no ``-D`` now write into the cwd). Round 20 found
+    the wrapper stripper treating every single-letter sudo/doas flag as
+    value-taking, so ``sudo -n tee <target>``/``sudo -E tee ..`` swallowed
+    the real command; wrappers now consume a separate value only after
+    options that take one (per-wrapper tables, incl. ``--user bob``)."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

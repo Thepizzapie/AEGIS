@@ -1225,3 +1225,55 @@ def test_r19_gaps_closed(cmd):
 ])
 def test_r19_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 20 regressions (no-value wrapper flags) --------------------------
+
+R20_GATED = [
+    "echo y | sudo -n tee -a /etc/X11/Xsession.d/99x",
+    "cat x.desktop | sudo -E tee /etc/xdg/autostart/x.desktop >/dev/null",
+    "sudo -E tee ~/.config/autostart/x.desktop < x",
+    "sudo -n ln -s /x /etc/xdg/autostart/x.desktop",
+    "sudo -E sed -i s/a/b/ /etc/xdg/autostart/x.desktop",
+    "sudo -E tee /var/spool/cron/crontabs/root < job",
+    "sudo -E tee /etc/periodic/daily/x < job",
+    "sudo -E dd of=/etc/xdg/autostart/x.desktop < x",
+    "sudo -H tee -a /home/bob/.xinitrc",
+    "sudo -E tee -a ~/.xinitrc <<EOF\nexec i3\nEOF",
+    "sudo -n -E tee /etc/xdg/autostart/x < x",
+    "doas -n tee /etc/xdg/autostart/x.desktop < x",
+    "doas -s tee /etc/xdg/autostart/x.desktop < x",
+    "sudo -u deploy -H at now -f j",
+    "sudo -u root -E batch < job.sh",
+    "sudo --user bob at now -f j",
+    "sudo --user bob batch < j",
+    "pkexec --user bob at now -f j",
+    "sg wheel -c at now -f j",
+    "ssh -t host sudo -n tee /etc/xdg/autostart/x < x",
+    "sudo -iu deploy batch < job.sh",
+    "nice -n 10 cp a.desktop ~/.config/autostart/",
+    "timeout -s KILL 5 cp a.desktop ~/.config/autostart/",
+]
+
+
+@pytest.mark.parametrize("cmd", R20_GATED)
+def test_r20_no_value_wrapper_flags(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+def test_r20_mcp_runner():
+    ev = _mcp("mcp__desktop-commander__start_process",
+              command="sudo -n tee /etc/xdg/autostart/x.desktop < x")
+    assert _gated(evaluate(ev, EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo -n apt-get install -y foo",
+    "sudo -iu postgres psql -c 'select 1'",
+    "sudo -n tee /etc/hosts.bak < /etc/hosts",
+    "sudo -E cat /etc/xdg/autostart/x.desktop",
+])
+def test_r20_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
