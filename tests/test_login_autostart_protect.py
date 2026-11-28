@@ -816,3 +816,51 @@ def test_r8_mcp_comment_apostrophe():
 ])
 def test_r8_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 9 regressions ----------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "# copy files \\\ncp a.desktop ~/.config/autostart/",
+    "# setup \\\necho 'exec i3' > ~/.xinitrc",
+    "# Windows dest: C:\\Users\\me\\\ncp a.desktop ~/.config/autostart/",
+    "read -p $'Don\\'t continue? ' x\ncp a.desktop ~/.config/autostart/\necho 'bye'",
+    "echo $'don\\'t'\ncp a.desktop ~/.config/autostart/\necho 'done'",
+    "echo $'a\\'b' ; cp a ~/.xsession ; echo 'x'",
+    "grep -n '<<EOF' install.sh\ncp a.desktop ~/.config/autostart/",
+    "echo 'cat <<EOF'\ncp a.desktop ~/.config/autostart/",
+    "echo \"Tip: cat <<EOF\"\necho './x' | at now + 2 minutes",
+    "cat README # see <<EOF part\ncp a ~/.xinitrc",
+    "cat > x.txt <<EOF\n$(cp a ~/.xinitrc)\nEOF",
+    "cp a.desktop \\\n  ~/.config/autostart/",
+])
+def test_r9_gaps_closed(cmd):
+    assert _gated(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+def test_r9_mcp_comment_continuation():
+    assert _gated(evaluate(_mcp("mcp__shell__run_command",
+                                command="# copy \\\ncp a.desktop ~/.config/autostart/"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "git commit -m \"$(cat <<'EOF'\nWe use `at now` in examples.\nEOF\n)\"",
+    "cat > notes.md <<'EOF'\nRun `cp a ~/.xinitrc`\nEOF",
+    "git commit -m \"Use \\`at now\\`\"",
+])
+def test_r9_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "".join(f'echo "line {i}"\n' for i in range(4000)) + "ls ~/.xinitrc",
+    "echo 'a' \"b\" " * 12000,
+    "x <<E" * 30000,
+    "\n" * 150000 + "at",
+    "# c\n" * 40000,
+])
+def test_r9_perf(cmd):
+    from aegis import rules
+    t0 = time.perf_counter()
+    rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert time.perf_counter() - t0 < 1.0

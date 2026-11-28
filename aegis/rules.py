@@ -16741,7 +16741,13 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     in ``# don't`` opened a "quoted word" hiding the following lines, and
     a ``don\\'t`` escape desynced quoting; comments, quotes and escapes are
     now recognised in one left-to-right pass (tokenizer and prose-free
-    surface alike)."""
+    surface alike). Round 9 found an over-long lazy body regex (>1s on a
+    67KB ``echo`` script; now bounded at the first closing quote), a
+    ``# comment \\`` joined onto the next line before comments were seen,
+    ANSI-C ``$'..\\'..'`` strings, ``<<EOF`` inside quotes/comments or
+    unterminated dropping the rest of the input (now masked / kept as
+    code), backticks in quoted heredoc bodies and escaped backticks, and
+    two unusual-shape slowdowns. All closed."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

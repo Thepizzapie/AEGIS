@@ -12022,8 +12022,10 @@ def login_autostart_cmd_hit(cmd: str) -> bool:
 # to a shell/at/batch, where it IS code) and quoted strings -- so a wrapped
 # commit message line "at decode time" or `echo "meet; at noon"` is data.
 _LA_HEREDOC_RE = re.compile(
-    r"<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]{0,40})\1([^\n]*)\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
+    r"<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]{0,40})\1([^\n]*+)\n(.*?)(\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
     re.S)
+_LA_MASK_RE = re.compile(
+    r"(?<![^\s;&|()<>])#[^\n]*|\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.")
 _LA_CODE_SINKS = frozenset((
     "sh", "bash", "zsh", "dash", "ksh", "fish", "at", "batch", "python", "python3",
     "perl", "ruby", "node", "pwsh", "powershell", "osascript", "crontab", "tee",
@@ -12071,6 +12073,10 @@ def _la_substitutions(cmd: str, limit: int = 64):
             out.append("SUBST" if cmd[i] == "$" else " SUBST ")
             i = j
             continue
+        elif ch == "\\" and not in_sq:
+            out.append(cmd[i:i + 2])      # `\`` / `\$` are literal
+            i += 2
+            continue
         elif not in_sq and ch == "`" and len(bodies) < limit:
             j = cmd.find("`", i + 1)
             j = n if j < 0 else j
@@ -12083,21 +12089,36 @@ def _la_substitutions(cmd: str, limit: int = 64):
     return "".join(out), bodies
 
 
-_LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*(['\"])(.{1,20000}?)\1", re.S)
+_LA_QBODY = r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
+_LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*" + _LA_QBODY)
 # `su -c BODY` / `runuser -c BODY`, `sh <<< BODY`, `echo BODY | sh` (QA round 6).
 _LA_EXTRA_BODY_RES = (
-    re.compile(r"\b(?:su|runuser)\b[^|;&\n]{0,200}?\s(?:-c|--command(?:=|\s))\s*(['\"])(.{1,20000}?)\1", re.S),
-    re.compile(r"\b(?:ba|z|da|k|fi)?sh\b[^|;&\n]{0,100}?<<<\s*(['\"])(.{1,20000}?)\1", re.S),
-    re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*(['\"])(.{1,20000}?)\1\s*\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b", re.S),
-    re.compile(r"\bssh\b[^|;&\n'\"]{0,300}?\s(['\"])(.{1,20000}?)\1", re.S),
+    re.compile(r"\b(?:su|runuser)\b[^|;&\n]{0,200}?\s(?:-c|--command(?:=|\s))\s*" + _LA_QBODY),
+    re.compile(r"\b(?:ba|z|da|k|fi)?sh\b[^|;&\n]{0,100}?<<<\s*" + _LA_QBODY),
+    re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*" + _LA_QBODY
+               + r"\s*\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b"),
+    re.compile(r"\bssh\b[^|;&\n'\"]{0,300}?\s" + _LA_QBODY),
 )
 
 
 def _la_heredocs(cmd: str):
     """(cmd with heredoc bodies removed, [bodies fed to a code sink])."""
     code = []
+    if "<<" not in cmd or "\n" not in cmd:
+        return cmd, code
+    import bisect
+    spans = [(m.start(), m.end()) for m in _LA_MASK_RE.finditer(cmd[:200000]) if m.end() - m.start() > 1]
+    starts = [a for a, _ in spans]
+
+    def _masked(pos):
+        k = bisect.bisect_right(starts, pos) - 1
+        return k >= 0 and spans[k][0] <= pos < spans[k][1]
 
     def _sub(m):
+        # A `<<` inside quotes or a comment is text, and an unterminated
+        # heredoc is kept as code -- never silently dropped (QA round 9).
+        if _masked(m.start()) or not m.group(5):
+            return m.group(0)
         head = cmd[:m.start()].rsplit("\n", 1)[-1]
         head = re.split(r"[;&|(]|\$\(", head)[-1].split()
         while head and (re.match(r"^[A-Za-z_]\w*=", head[0])
@@ -12110,6 +12131,9 @@ def _la_heredocs(cmd: str):
         body = m.group(4)
         # Only a body fed to a known prose/data consumer is dropped (QA
         # round 3 lead: any other consumer may run it as code).
+        if not m.group(1):
+            # Unquoted delimiter: $(..)/`..` in the body still run.
+            code.extend(_la_substitutions(body)[1])
         if (name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
                 or any(x not in _LA_PROSE_SINKS for x in piped)):
             code.append(body)
@@ -12118,12 +12142,12 @@ def _la_heredocs(cmd: str):
                 code.append(name + " -c " + _la_squote(body))
         # Keep the rest of the marker's line (QA round 4: `cat <<EOF > ~/.xinitrc`).
         return "<<" + m.group(2) + tail + "\n"
-    out = _LA_HEREDOC_RE.sub(_sub, cmd) if "<<" in cmd else cmd
+    out = _LA_HEREDOC_RE.sub(_sub, cmd)
     return out, code
 
 
 _LA_PROSE_RE = re.compile(
-    r"(?<![^\s;&|()<>])#[^\n]*|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$'(?:[^'\\]|\\.)*'|\\.")
+    r"(?<![^\s;&|()<>])#[^\n]*|\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$'(?:[^'\\]|\\.)*'|\\.")
 
 
 def la_prose_free(cmd: str) -> str:
@@ -12139,7 +12163,8 @@ def la_prose_free(cmd: str) -> str:
         if t.startswith("\\"):
             return t[1:] if t[1:] not in "'\"" else ""
         return " Q "
-    return _LA_PROSE_RE.sub(_sub, c)
+    c = _LA_PROSE_RE.sub(_sub, c)
+    return re.sub(r"\s*\n\s*", "\n", c)          # bounded LA_AT_RE restarts (QA round 9)
 
 
 _LA_COPY_CMDS = frozenset(("cp", "mv", "install", "ln", "rsync", "scp", "copy", "xcopy",
@@ -12158,7 +12183,8 @@ _LA_CD_CMDS = frozenset(("cd", "pushd", "chdir", "set-location", "sl"))
 # that swallows later lines (QA round 8); `\x` escapes are word parts.
 _LA_WORD_RE = re.compile(
     r"(?<![^\s;&|()<>])#[^\n]*"
-    r"|(?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$\([^()]{0,2000}\)|\\.|[^\s'\";&|()<>\\])+"
+    r"|\\\n"
+    r"|(?:\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$\([^()]{0,2000}\)|\\.|[^\s'\";&|()<>\\])+"
     r"|[;&|()<>]+|['\"]|\n")
 
 
@@ -12173,6 +12199,8 @@ def _la_tokens_nocomment(c: str):
     so a `#` or newline inside quotes never splits it."""
     out, skip = [], False
     for t in _la_tokens(c):
+        if t == "\\\n":
+            continue                      # line continuation (never inside a comment)
         if t == "\n":
             skip = False
             out.append(";")
@@ -12285,7 +12313,6 @@ def la_shell_destinations(cmd: str):
     `sponge`, `sort -o`)."""
     import shlex
     c, _ = _la_heredocs(cmd)
-    c = re.sub(r"\\\n", " ", c)
     raw_toks = _la_tokens_nocomment(c)
     if len(raw_toks) >= 19000 or len(c) >= 200000:
         return None                       # truncated: caller falls back (QA round 7)
@@ -12501,13 +12528,12 @@ def la_shell_renderings(raw: str, _depth: int = 0):
     fed to code, trap/eval bodies, decoded / inner-interpreter payloads --
     without scan_surface's quote-stripped copies (they turn prose into code)."""
     from . import normalize as _n
-    outer, subs = _la_substitutions(raw)
+    stripped, code = _la_heredocs(raw)
+    outer, subs = _la_substitutions(stripped)
     out = [outer]
-    _, code = _la_heredocs(raw)
     out.extend(code)
-    out.extend(m.group(2) for m in _LA_EVAL_BODY_RE.finditer(outer))
-    for rx in _LA_EXTRA_BODY_RES:
-        out.extend(m.group(2) for m in rx.finditer(outer))
+    for rx in (_LA_EVAL_BODY_RE,) + _LA_EXTRA_BODY_RES:
+        out.extend((m.group(1) or m.group(2) or "") for m in rx.finditer(outer))
     if _depth < 3:
         for b_ in subs:
             out.extend(la_shell_renderings(b_, _depth + 1))
@@ -12550,7 +12576,6 @@ def login_autostart_activation_hit(r: str) -> bool:
     if LA_AT_RE.search(la_prose_free(r)):
         return True
     c, _ = _la_heredocs(r)
-    c = re.sub(r"\\\n", " ", c)
     toks = [t for t in _la_tokens_nocomment(c) if not (t and set(t) <= set("<>"))]
     for sc in _la_split_simple(toks):
         quoted_name = bool(sc) and len(sc[0]) > 1 and sc[0][0] == sc[0][-1] and sc[0][0] in "'\""
