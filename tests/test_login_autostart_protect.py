@@ -563,3 +563,28 @@ def test_r2_bypasses_closed(cmd):
 ])
 def test_r2_no_new_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 3 leads ----------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<'EOF' | sh\necho x | at now\nEOF",
+    "tclsh <<EOF\nexec at now\nEOF",
+    "tree -o ~/.config/autostart/x.desktop",
+    "gh release download -D ~/.config/autostart",
+    "find ~/.config/autostart -name '*.desktop' -exec sed -i s/a/b/ {} +",
+    "find /etc/xdg/autostart -type f -exec cp /tmp/evil {} \\;",
+    "perl -pi -e s/a/b/ ~/.xinitrc",
+])
+def test_r3_leads_gated(cmd):
+    assert _hit(evaluate(_shell(cmd), EMPTY)), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "find ~/.config/autostart -name '*.desktop' -exec grep -l Exec {} \\;",
+    "git commit -F- <<'EOF'\nfix\nat decode time\nEOF",
+    "cat > notes.md <<EOF\nat noon tomorrow\nEOF",
+    "tree ~/.config/autostart",
+])
+def test_r3_leads_not_gated(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

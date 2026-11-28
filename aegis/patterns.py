@@ -12026,6 +12026,12 @@ _LA_CODE_SINKS = frozenset((
     "perl", "ruby", "node", "pwsh", "powershell", "osascript", "crontab", "tee",
     "sudo", "doas", "su", "ssh", "eval", "source", ".", "busybox", "env",
 ))
+_LA_PROSE_SINKS = frozenset((
+    "cat", "git", "gh", "glab", "hub", "echo", "printf", "tee", "less", "more", "grep",
+    "wc", "jq", "yq", "mail", "mailx", "sendmail", "mutt", "wl-copy", "xclip", "pbcopy",
+    "head", "tail", "sort", "uniq", "diff", "column", "fold", "fmt", "base64", "md5sum",
+    "sha256sum", "read", "curl", "http",
+))
 _LA_QUOTED_RE = re.compile(r"'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\"|\$'(?:[^'\\\\]|\\\\.)*'")
 _LA_COMMENT_RE = re.compile(r"(?:(?<=\s)|^)#[^\n]*", re.M)
 
@@ -12037,8 +12043,17 @@ def _la_heredocs(cmd: str):
     def _sub(m):
         head = cmd[:m.start()].rsplit("\n", 1)[-1]
         head = re.split(r"[;&|(]|\$\(", head)[-1].split()
+        while head and (re.match(r"^[A-Za-z_]\w*=", head[0])
+                        or head[0].rsplit("/", 1)[-1].lower() in ("sudo", "doas", "env", "nohup", "command", "exec", "time")):
+            head = head[1:]
         name = head[0].rsplit("/", 1)[-1].lower() if head else ""
-        if name in _LA_CODE_SINKS:
+        # Rest of the heredoc's own line: `cat <<EOF | sh` pipes the body on.
+        tail = m.group(0).split("\n", 1)[0]
+        piped = [p.split()[0].rsplit("/", 1)[-1].lower() for p in tail.split("|")[1:] if p.split()]
+        # Only a body fed to a known prose/data consumer is dropped (QA
+        # round 3 lead: any other consumer may run it as code).
+        if (name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
+                or any(x not in _LA_PROSE_SINKS for x in piped)):
             code.append(m.group(3))
         return "<<" + m.group(2) + "\n"
     out = _LA_HEREDOC_RE.sub(_sub, cmd) if "<<" in cmd else cmd
@@ -12099,7 +12114,7 @@ _LA_READONLY_CMDS = frozenset((
     "echo", "printf", "test", "[", "[[", "readlink", "realpath", "basename", "dirname",
     "which", "type", "whereis", "du", "df", "tree", "jq", "yq", "strings", "hexdump", "od",
     "cut", "nl", "column", "bat", "batcat", "view", "lsattr", "getfacl", "namei",
-    "gh", "true", "false", ":", "desktop-file-validate", "atq", "atrm", "crontab",
+    "true", "false", ":", "desktop-file-validate", "atq", "atrm",
     "systemctl", "journalctl", "pgrep", "ps", "id", "whoami", "date", "sleep", "wait",
     "read", "export", "unset", "local", "declare", "typeset", "set", "shift", "return",
     "exit", "break", "continue", "trap", "alias", "unalias", "hash", "history",
@@ -12243,7 +12258,7 @@ def la_shell_destinations(cmd: str):
                 elif re.match(r"^-[a-zA-Z]*[oOP].", a) and not a.startswith("--"):
                     k = max(a.find("o"), a.find("O"), a.find("P"))
                     dests.append(a[k + 1:])
-        elif name in _LA_INPLACE_CMDS and name == "sed" or name == "gsed":
+        elif name in ("sed", "gsed"):
             if any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in args):
                 dests.extend(ops)
             for j, a in enumerate(args):        # sed's own `w FILE` command
@@ -12263,6 +12278,19 @@ def la_shell_destinations(cmd: str):
             dests.extend(ops[1:])
         elif name in _LA_READONLY_CMDS or name in ("find", "awk", "gawk", "mawk"):
             if name in ("awk", "gawk", "mawk") and any("inplace" in a or ">" in a for a in args):
+                known = False
+            if name == "find":
+                for j, a in enumerate(args):
+                    if a in ("-exec", "-execdir", "-ok", "-okdir") and j + 1 < len(args):
+                        x = re.split(r"[/\\]", args[j + 1])[-1].lower()
+                        if x not in _LA_READONLY_CMDS:
+                            known = False
+                    elif a in ("-fprint", "-fprint0", "-fprintf", "-fls") and j + 1 < len(args):
+                        dests.append(args[j + 1])
+            # A "read-only" tool with an output/write option (tree -o, sdiff -o,
+            # jq --output, du/ls never) is judged fail-closed (QA round 3 lead).
+            if any(re.match(r"^(?:-[A-Za-z]*[oOwD][^-]*$|--(?:out|output|write|dest|dir|save|to)\b)", a)
+                   for a in args if a.startswith("-")):
                 known = False
         elif name in _LA_INTERP or name.startswith("python"):
             if any(re.search(r"['\"][wax]b?\+?['\"]|write|shutil|copy|symlink|rename|replace|"

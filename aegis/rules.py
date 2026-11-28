@@ -16503,9 +16503,10 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
     if not (patterns.login_autostart_maybe_target(r)
             or (cwd and patterns.login_autostart_maybe_target(str(cwd)))):
         return False
-    if patterns.login_autostart_find_hit(r) and re.search(r"-(?:exec(?:dir)?|ok(?:dir)?)\b", r) and (
-            patterns.INPLACE_WRITE_RE.search(r) or patterns.COPY_WRITE_VERB_RE.search(r)
-            or re.search(r"\b(?:tee|chmod|sh|bash|zsh|truncate|patch)\b", r)):
+    if patterns.login_autostart_find_hit(r) and re.search(
+            r"-(?:exec(?:dir)?|ok(?:dir)?)\s+(?:\S*/)?(?:sed\s+(?:-\S+\s+)*-[a-zA-Z]*i|perl\s+-[a-zA-Z]*i"
+            r"|cp|mv|install|ln|tee|chmod|dd|rsync|truncate|patch|sh|bash|zsh|dash|ksh|python3?|perl|node)\b",
+            r, re.IGNORECASE):
         return True
     res = patterns.la_shell_destinations(r)
     if res is None:
