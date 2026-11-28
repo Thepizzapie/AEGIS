@@ -12431,6 +12431,10 @@ def _la_strip_wrappers(words):
         if prev_wrapper and w.startswith("-"):
             i += 1
             # option with a separate value (`nice -n 10`, `sudo -u bob`)
+            if (i < n and prev_wrapper in ("sudo", "doas", "runuser", "su") and not words[i].startswith("-")
+                    and re.fullmatch(r"-[A-Za-z]*[ugCchpUrtDR]", w)):
+                i += 1                     # bundled `sudo -iu USER` (QA round 19)
+                continue
             if i < n and re.fullmatch(r"-[A-Za-z]", w) and not words[i].startswith("-") and (
                     _LA_TIME_TOK_RE.match(words[i]) or prev_wrapper in ("sudo", "doas", "su", "runuser", "sg", "chroot", "nsenter", "cgexec")):
                 i += 1
@@ -12641,11 +12645,18 @@ def la_shell_destinations(cmd: str):
                     skip.add(j + 1)
             rest = [a for j, a in enumerate(args) if j not in skip and not
                     re.match(r"^--(?:title|body|message|summary|description|notes|comment|text)=", a)]
+            has_dir = False
             for j, a in enumerate(rest):
                 if a in ("-D", "--dir", "--output", "-O") and j + 1 < len(rest):
                     dests.append(rest[j + 1])
+                    has_dir = True
+                elif re.match(r"^--(?:dir|output)=", a):
+                    dests.append(a.split("=", 1)[1])
+                    has_dir = True
             if any(a in ("clone", "download", "archive") for a in rest[:3]):
                 unknown.extend(rest)
+                if not has_dir:
+                    dests.append(".")          # downloads into the cwd (QA round 19)
             continue
         elif name == "git":
             sub = next((a for a in args if not a.startswith("-")), "")
@@ -12752,7 +12763,18 @@ def login_autostart_activation_hit(r: str) -> bool:
     if LA_AT_RE.search(la_prose_free(r)):
         return True
     c, _ = _la_heredocs(r)
-    toks = [t for t in _la_tokens_nocomment(c) if not (t and set(t) <= set("<>"))]
+    toks, skip_next = [], False
+    for t in _la_tokens_nocomment(c):
+        if skip_next and t != ";":
+            skip_next = False
+            continue                       # the redirect's own operand (QA round 19)
+        skip_next = False
+        if t and set(t) <= set("<>&|") and ("<" in t or ">" in t):
+            skip_next = True
+            if toks and re.fullmatch(r"\d", toks[-1]):
+                toks.pop()                 # `2>` / `0<` fd number
+            continue
+        toks.append(t)
     for sc in _la_split_simple(toks):
         quoted_name = bool(sc) and len(sc[0]) > 1 and sc[0][0] == sc[0][-1] and sc[0][0] in "'\""
         w = _la_strip_wrappers([_la_unquote(t).strip() if t[:1] in "'\"" else t for t in sc])

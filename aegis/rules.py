@@ -16842,7 +16842,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     HIGH) found ``at -t "$(date ..)"``/``at -t "$TS"`` computed timestamps
     and positional ``at "$1"``/``"$@"`` times allowed, and prose flags of
     ``gh``/``glab`` (``--body "..~/.xinitrc.."``) failing closed as
-    unknown-command paths; all closed (download destinations still count)."""
+    unknown-command paths; all closed (download destinations still count).
+    Round 19 (no HIGH) found ``batch`` behind a wrapper with arguments and
+    fed by a redirect (``sudo -u deploy batch < job.sh`` -- redirect
+    operands are now dropped with their operator, bundled ``sudo -iu``
+    values skipped) and ``cd <target> && gh release download`` (gh/glab/
+    hub downloads with no ``-D`` now write into the cwd)."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

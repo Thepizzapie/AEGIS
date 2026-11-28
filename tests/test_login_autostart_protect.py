@@ -1188,3 +1188,40 @@ def test_r18_gaps_closed(cmd):
 ])
 def test_r18_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 19 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "sudo -u deploy batch < job.sh",
+    "sudo -iu deploy batch < job.sh",
+    'sudo -u bob batch <<< "./x"',
+    "sudo -u www-data batch <<EOF\n./x\nEOF",
+    "runuser -u deploy -- batch < job.sh",
+    "nice batch < j",
+    "nice -n 10 batch < j",
+    "timeout 5 batch < j",
+    "env X=1 batch < j",
+    "chrt -i 0 batch < j",
+    "sudo -u deploy batch 2>/dev/null < j",
+    'cd ~/.config/autostart && gh release download v1 -p "*.desktop"',
+    "cd /etc/periodic/daily && gh release download v1 -p backup",
+    "pushd /etc/xdg/autostart && gh release download v1 && popd",
+    "cd ~/.config/autostart && gh gist clone abc",
+    "cd ~/.config/autostart && gh run download 123",
+    "cd ~/.config/autostart && glab release download v1",
+    "cd ~/.config/autostart && hub release download v1",
+])
+def test_r19_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd ~/project && gh release download v1",
+    "sort < data.txt > out.txt",
+    "make batch < /dev/null",
+])
+def test_r19_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
