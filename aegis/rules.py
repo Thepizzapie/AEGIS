@@ -11161,6 +11161,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),
     (patterns.SYSTEMD_UNIT_PATH_RE, "a systemd unit"),
     (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
+    (patterns.LOGIN_AUTOSTART_PATH_RE, "a login/desktop-session autostart file"),
+    (patterns.CRON_SPOOL_PATH_RE, "a cron/at/periodic scheduler file"),
     (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
     (patterns.LD_SO_CONF_PATH_RE, "the dynamic linker's search-path config"),
     (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
@@ -16436,6 +16438,198 @@ def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "AEGIS_ALLOW_LINT_CONFIG_EXEC=1; a spawned agent cannot."))
     return None
 
+def _login_autostart_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _login_autostart_rel_hit(p: str, cwd) -> bool:
+    """A relative target resolved against the call's cwd (`autostart/x.desktop`
+    written from inside `~/.config`)."""
+    if not p or not cwd or "\n" in p or re.match(r"^(?:[/\\~$%]|[A-Za-z]:|file:)", p):
+        return False
+    return patterns.login_autostart_path_hit(str(cwd).rstrip("/\\") + "/" + p)
+
+
+def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate login/desktop-session autostart and cron/at-spool persistence.
+
+    PLAN / THREAT MODEL: an agent (prompt-injected through a README, an issue,
+    a fetched page, or an MCP tool result) plants a command that runs LATER,
+    with the human's or root's full privileges, the next time they log in to
+    a desktop session or a scheduler fires -- outside every repo, so
+    invisible to ``git status``/code review, and with no further agent
+    action, git op, CI run or session restart needed:
+
+    - freedesktop XDG autostart (``~/.config/autostart/*.desktop``,
+      ``/etc/xdg/autostart``, ``$XDG_CONFIG_HOME/autostart``; MITRE ATT&CK
+      T1547.013) -- every GNOME/KDE/Xfce/Cinnamon/MATE/LXQt login runs its
+      ``Exec=`` line; KDE Plasma ``plasma-workspace/env/*.sh`` (sourced at
+      login) and ``shutdown/*`` (run at logout), KDE4 ``~/.kde/Autostart``,
+      ``autostart-scripts``; openbox/labwc/lxsession ``autostart`` files;
+    - X session scripts: ``~/.xinitrc``/``.xsession``/``.xsessionrc``/
+      ``.xserverrc``/``.Xclients``, ``/etc/X11/xinit/xinitrc[.d]``,
+      ``/etc/X11/Xsession[.d]``/``Xreset[.d]``, GDM ``PostLogin``/
+      ``PreSession``/``PostSession``/``Init`` scripts;
+    - cron/at spools written as FILES (T1053.003/.002): ``/etc/crontab``,
+      ``/etc/anacrontab``, ``/etc/cron.{d,hourly,daily,weekly,monthly}/*``,
+      ``/var/spool/cron/**``, ``/var/spool/at*``, ``/var/at/{tabs,jobs}``,
+      macOS ``/usr/lib/cron/tabs``; BSD/macOS ``periodic`` scripts and
+      ``periodic.conf``;
+    - the Windows Startup folder written as a FILE;
+    - with no file at all: ``at``/``batch`` job scheduling, macOS
+      ``osascript ... login item`` / ``defaults write ... loginwindow
+      LoginHook`` / ``sfltool add-item``, and Windows registry autostarts
+      ``PERSIST_RE`` doesn't name (Winlogon ``Userinit``/``Shell``/
+      ``Notify``, ``Policies\\Explorer\\Run``, Active Setup ``StubPath``,
+      ``AppInit_DLLs``, Image File Execution Options ``Debugger``) when
+      paired with a registry write verb.
+
+    GAP CLOSED: ``rule_containment``'s ``PERSIST_RE`` denies ``crontab``,
+    ``/etc/cron`` and the Startup folder -- but only on the SHELL branch, so
+    the Write/Edit/MCP file-write form of the very same targets was never
+    checked; every other surface above had no coverage on any branch
+    (``rule_service_persist_protect`` covers systemd/launchd only;
+    ``rule_shell_persist_protect`` covers shell rc files, incl.
+    ``~/.xprofile``).
+
+    IMPLEMENTATION: path-based, any write (the target IS the payload; there
+    is no benign content shape worth parsing, the ``rule_service_persist_
+    protect`` posture). Edit/Write/MultiEdit/NotebookEdit and MCP file
+    writes are matched on the target path (also cwd-relative, and for MCP on
+    any path-shaped argument leaf); a shell call is gated when it names a
+    target (file, bare directory, or ``find`` predicate) together with a
+    write verb (redirect/``tee``, ``cp``/``install``/``ln``/``dd``, ``mv``/
+    ``rm``, ``sed -i``, forced link, archive/sync), or runs one of the
+    no-file activation commands above; an MCP shell-runner's command is
+    judged as a shell command. Registered with the fetch-to-file backstop
+    (``curl -o ~/.config/autostart/x.desktop``).
+
+    Config (``policy.login_autostart``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path / whole command). Escapable
+    only by a human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_LOGIN_AUTOSTART=1`` set before launch. A spawned agent can
+    do neither.
+
+    Honest scope: a path assembled indirectly (variables across separate
+    assignments, loops, ``basename`` reconstruction) is not seen; an
+    in-process interpreter write (``python -c "open(...,'w')"``) is seen
+    only when the target path is literal in the command; a custom
+    ``$XDG_CONFIG_HOME`` pointing at an unrecognised directory, or a
+    ``periodic.conf`` pointing ``periodic`` at a custom directory, is not
+    followed; ``at``'s detection is anchored to a command position, so an
+    ``at`` reached through an alias/function of another name is missed;
+    reading/listing (``atq``, ``at -l``, ``cat ~/.xinitrc``) is never
+    gated."""
+    cfg = getattr(policy, "login_autostart", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "login-autostart-protect-monitor")
+            return None
+        return would
+
+    if isinstance(ev.args, dict) and isinstance(ev.args.get("command"), (list, tuple)):
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={**ev.args, "command": " ".join(str(x) for x in ev.args["command"])})
+    if ev.args is not None and not isinstance(ev.args, dict):
+        raw_args = ev.args
+        txt = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)[:400000]
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"command": txt} if _is_shell(ev) else {"input": txt})
+
+    def _file_gate(p: str) -> Optional[Decision]:
+        if os.environ.get("AEGIS_ALLOW_LOGIN_AUTOSTART") or \
+                _login_autostart_allowed_by_policy(cfg, p):
+            return None
+        what = ("a cron/at/periodic scheduler file -- its entries run "
+                "unattended on the scheduler's next tick"
+                if patterns.CRON_SPOOL_PATH_RE.search(p) else
+                "a login/desktop-session autostart file -- it runs "
+                "automatically the next time the human logs in")
+        return _finish(Decision(action, "login-autostart-protect",
+                         f"'{p}' is {what}, with their full privileges and "
+                         "outside any repo's review. Review the change, then "
+                         "confirm with AEGIS_ALLOW_LOGIN_AUTOSTART=1; a "
+                         "spawned agent cannot."))
+
+    if ev.action == ActionClass.MCP:
+        shell_cmd = _http_rc_mcp_shell_command(ev)
+        if shell_cmd is not None:
+            for c in dict.fromkeys((shell_cmd, shell_cmd.replace("\n", " "))):
+                sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                 args={"command": c}, cwd=ev.cwd)
+                d = rule_login_autostart_protect(sub, policy)
+                if d is not None:
+                    return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                    "command that installs login/scheduled "
+                                    "persistence. " + d.message)
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if p and (patterns.login_autostart_path_hit(p) or _login_autostart_rel_hit(p, ev.cwd)):
+            if ev.action == ActionClass.MCP and _http_rc_mcp_read_only(ev):
+                return None
+            return _file_gate(p)
+        if ev.action == ActionClass.MCP and not _http_rc_mcp_read_only(ev):
+            a0 = ev.args or {}
+            for k, v in a0.items():
+                if not isinstance(v, (str, dict, list, tuple)):
+                    continue
+                for leaf in _flatten_strings(v)[:5000]:
+                    leaf = str(leaf).strip()
+                    if (leaf and "\n" not in leaf and len(leaf) <= 4096
+                            and not re.search(r"\s", leaf.replace("Start Menu", "StartMenu"))
+                            and patterns.login_autostart_path_hit(leaf)):
+                        return _file_gate(leaf)
+        if not _is_shell(ev):
+            return None
+
+    if _is_shell(ev):
+        cmd = _shell_scan(ev)
+        raw = _cmd(ev)
+        names_target = False
+        for t in dict.fromkeys((cmd, raw)):
+            if (patterns.login_autostart_path_hit(t)
+                    or patterns.LOGIN_AUTOSTART_DIR_RE.search(t)
+                    or patterns.login_autostart_find_hit(t)):
+                names_target = True
+                break
+        touches_target = names_target and any(
+            rx.search(cmd) or rx.search(raw) for rx in (
+                patterns.WRITE_REDIRECT_RE, patterns.COPY_WRITE_VERB_RE,
+                patterns.DELETE_OR_MOVE_VERB_RE, patterns.DESTRUCTIVE_DELETE_RE,
+                patterns.INPLACE_WRITE_RE, patterns.FORCED_LINK_WRITE_RE,
+                patterns.ARCHIVE_SYNC_VERB_RE))
+        activates = (patterns.login_autostart_cmd_hit(cmd)
+                     or patterns.login_autostart_cmd_hit(raw))
+        if not (touches_target or activates):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_LOGIN_AUTOSTART")
+                or _login_autostart_allowed_by_policy(cfg, raw)):
+            return None
+        reason = ("A login/desktop-session autostart or cron/at spool file is "
+                  "being modified from a shell" if touches_target else
+                  "A command is scheduling a job (at/batch) or registering a "
+                  "login item / logon autostart")
+        return _finish(Decision(action, "login-autostart-protect",
+                         f"{reason} -- it runs automatically, unattended, at "
+                         "the human's next login or when the scheduler fires, "
+                         "with their full privileges. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_LOGIN_AUTOSTART=1; "
+                         "a spawned agent cannot."))
+    return None
+
 
 _CORE_RULES = (
     rule_attest_session,
@@ -16504,6 +16698,8 @@ _CORE_RULES = (
     rule_mise_exec_protect,
     rule_bunfig_exec_protect,
     rule_lint_config_exec_protect,
+    # Path/any-write ASK; tail-block so it never pre-empts a later DENY.
+    rule_login_autostart_protect,
     rule_agent_rules_protect,
 )
 

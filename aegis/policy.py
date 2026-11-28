@@ -477,6 +477,15 @@ class Policy:
     # ERB/require, Prettier plugins -- in their dedicated files and in
     # pyproject.toml/setup.cfg/tox.ini. See rules.rule_lint_config_exec_protect.
     lint_config_exec: dict = field(default_factory=dict)
+    # Login / desktop-session autostart + cron/at spool persistence:
+    # {mode: deny|ask|monitor|off, allow: [regex on path / whole command]}.
+    # Empty -> defaults (mode=ask). Covers XDG autostart (~/.config/
+    # autostart/*.desktop), KDE Plasma env/shutdown scripts, X session
+    # scripts (.xinitrc/.xsession), cron/at spool FILES (/etc/cron.d,
+    # /var/spool/cron), the Windows Startup folder as a file write, `at`/
+    # `batch`, macOS login items, Winlogon/Active Setup registry autostarts.
+    # See rules.rule_login_autostart_protect.
+    login_autostart: dict = field(default_factory=dict)
     # Terraform provisioner / external-data-source exec-hijack protection:
     # {mode: deny|ask|monitor|off, allow: [regex on path/command]}. Empty ->
     # defaults (mode=ask) apply. Covers a `provisioner "local-exec"`/

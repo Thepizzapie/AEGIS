@@ -88,6 +88,19 @@
 #     mode: ask            # deny | ask (default) | monitor | off
 #     allow: ['^/ci/repo/\.pylintrc$']
 
+# Login / desktop-session autostart + cron/at spool persistence (optional
+# tuning). Built in and ON by default (mode: ask): any write to an XDG
+# autostart entry (~/.config/autostart/*.desktop, /etc/xdg/autostart), KDE
+# Plasma env/shutdown scripts, X session scripts (~/.xinitrc, ~/.xsession),
+# a cron/at spool file (/etc/cron.d/*, /etc/crontab, /var/spool/cron/*), the
+# Windows Startup folder, and `at`/`batch` scheduling, macOS login items, or
+# Winlogon/Active Setup registry autostarts ask a human first. A human
+# pre-approves with AEGIS_ALLOW_LOGIN_AUTOSTART=1 or a trailing
+# '# aegis-allow'; a spawned agent cannot.
+#   login_autostart:
+#     mode: ask            # deny | ask (default) | monitor | off
+#     allow: ['^/etc/cron\.d/logrotate$']
+
 default_action: allow
 on_error: allow
 

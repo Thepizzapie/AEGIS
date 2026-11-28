@@ -11751,3 +11751,166 @@ def lint_unsafe_entries(content, kind) -> list:
         pwalk(doc, "")
         return out
     return out
+
+
+# ---- login / desktop-session autostart + cron/at spool persistence ----------
+# The "runs at the next LOGIN, or on a schedule" surfaces no other guard
+# reaches. PERSIST_RE (rule_containment) covers Windows Run keys/schtasks/
+# services, the Startup folder, `crontab` and `/etc/cron` -- but ONLY on the
+# shell branch: a Write/Edit/MCP file write to `/etc/cron.d/x`, `/etc/crontab`
+# or `...\Start Menu\Programs\Startup\x.bat` was never checked. And the
+# freedesktop XDG autostart spec (`~/.config/autostart/*.desktop` -- MITRE
+# ATT&CK T1547.013), KDE Plasma's login/logout scripts, X session scripts
+# (`~/.xinitrc`/`~/.xsession`/`~/.xsessionrc`), lightweight-WM autostart files,
+# the `/var/spool/cron` per-user crontab spool, the `at`/`batch` one-shot
+# scheduler (T1053.002), BSD/macOS `periodic` scripts, macOS login items /
+# LoginHook, and the Windows Winlogon Userinit/Shell + Policies\Explorer\Run +
+# Active Setup StubPath autostarts had no coverage on ANY branch. Each runs
+# the planted command with the human's (or root's) full privileges the next
+# time they log in to a desktop session or the scheduler fires -- no git op,
+# CI run, or agent-session restart needed, and outside every repo, so
+# invisible to `git status`/code review.
+_LA_PRE = r"(?:^|[\s'\"/\\=])"
+_LA_END = _CI_END
+_LA_DIRSEG = _WIN_TRIM + _SEP
+LOGIN_AUTOSTART_PATH_RE = re.compile(
+    # XDG autostart: ~/.config/autostart, /etc/xdg/autostart, $XDG_CONFIG_HOME
+    # /autostart; KDE's legacy autostart-scripts dir alongside it.
+    _LA_PRE + r"(?:\.config|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)\}?)" + _LA_DIRSEG
+    + r"autostart(?:-scripts)?" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # KDE Plasma: env/*.sh sourced at login, shutdown/* run at logout.
+    + r"|" + _LA_PRE + r"plasma-workspace" + _LA_DIRSEG + r"(?:env|shutdown)"
+    + _LA_DIRSEG + _CI_SEG + _LA_END
+    # KDE 4 legacy: ~/.kde[4]/Autostart|env|shutdown, ~/.kde/share/...
+    + r"|" + _LA_PRE + r"\.kde4?" + _LA_DIRSEG + r"(?:share" + _LA_DIRSEG + r")?"
+    + r"(?:Autostart|env|shutdown)" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # Lightweight WM / session-manager autostart files.
+    + r"|" + _LA_PRE + r"(?:openbox|labwc)" + _LA_DIRSEG + r"autostart(?:\.sh)?" + _LA_END
+    + r"|" + _LA_PRE + r"lxsession" + _LA_DIRSEG + _CI_SEG + _LA_DIRSEG + r"autostart" + _LA_END
+    # X session scripts run by startx/xinit/the display manager at login.
+    + r"|" + _LA_PRE + r"\.(?:xinitrc|xsession|xsessionrc|xserverrc|Xclients|xprofile\.d)" + _LA_END
+    + r"|" + _LA_PRE + r"X11" + _LA_DIRSEG + r"(?:"
+    + r"xinit" + _LA_DIRSEG + r"(?:xinitrc|xserverrc)"
+    + r"|xinit" + _LA_DIRSEG + r"xinitrc\.d" + _LA_DIRSEG + _CI_SEG
+    + r"|Xsession|Xreset|Xstartup"
+    + r"|(?:Xsession|Xreset)\.d" + _LA_DIRSEG + _CI_SEG
+    + r")" + _LA_END
+    # Display-manager login scripts (GDM PostLogin/PreSession, LightDM).
+    + r"|" + _LA_PRE + r"gdm3?" + _LA_DIRSEG + r"(?:PostLogin|PreSession|PostSession|Init)"
+    + _LA_DIRSEG + _CI_SEG + _LA_END
+    # Windows Startup folder (per-user and all-users) -- file-tool form; the
+    # shell form is already a hard DENY in rule_containment.
+    + r"|Start Menu" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_DIRSEG + r"[^'\"/\\\n]{1,200}",
+    re.IGNORECASE,
+)
+CRON_SPOOL_PATH_RE = re.compile(
+    _LA_PRE + r"etc" + _LA_DIRSEG + r"(?:crontab|anacrontab)" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG
+    + r"cron\.(?:d|hourly|daily|weekly|monthly|yearly)" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # Per-user crontab / at-job spools (Debian, RHEL, BSD, macOS).
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"spool" + _LA_DIRSEG
+    + r"(?:cron|anacron|at|atjobs|atspool)(?:" + _LA_DIRSEG + _CI_SEG + r"){1,3}" + _LA_END
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"at" + _LA_DIRSEG + r"(?:tabs|jobs)"
+    + _LA_DIRSEG + _CI_SEG + _LA_END
+    + r"|" + _LA_PRE + r"usr" + _LA_DIRSEG + r"lib" + _LA_DIRSEG + r"cron" + _LA_DIRSEG
+    + r"tabs" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # BSD/macOS periodic(8): every script in these dirs runs as root daily/
+    # weekly/monthly; periodic.conf(.local) can point it at extra dirs.
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"periodic" + _LA_DIRSEG
+    + r"(?:daily|weekly|monthly)" + _LA_DIRSEG + _CI_SEG + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"periodic\.conf(?:\.local)?" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"(?:daily|weekly|monthly)\.local" + _LA_END,
+    re.IGNORECASE,
+)
+# Bare directory references (no filename): `rsync -a x/ ~/.config/autostart/`,
+# `tar xf p.tar -C /etc/cron.d`, `cp x.desktop ~/.config/autostart`.
+LOGIN_AUTOSTART_DIR_RE = re.compile(
+    _LA_PRE + r"(?:\.config|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)\}?)" + _LA_DIRSEG
+    + r"autostart(?:-scripts)?" + _LA_END
+    + r"|" + _LA_PRE + r"plasma-workspace" + _LA_DIRSEG + r"(?:env|shutdown)" + _LA_END
+    + r"|" + _LA_PRE + r"\.kde4?" + _LA_DIRSEG + r"(?:share" + _LA_DIRSEG + r")?"
+    + r"(?:Autostart|env|shutdown)" + _LA_END
+    + r"|" + _LA_PRE + r"X11" + _LA_DIRSEG
+    + r"(?:xinit" + _LA_DIRSEG + r"xinitrc\.d|(?:Xsession|Xreset)\.d)" + _LA_END
+    + r"|" + _LA_PRE + r"gdm3?" + _LA_DIRSEG + r"(?:PostLogin|PreSession|PostSession|Init)" + _LA_END
+    + r"|Start Menu" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"cron\.(?:d|hourly|daily|weekly|monthly|yearly)" + _LA_END
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"spool" + _LA_DIRSEG
+    + r"(?:cron|anacron|at|atjobs|atspool)(?:" + _LA_DIRSEG + _CI_SEG + r")?" + _LA_END
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"at" + _LA_DIRSEG + r"(?:tabs|jobs)" + _LA_END
+    + r"|" + _LA_PRE + r"usr" + _LA_DIRSEG + r"lib" + _LA_DIRSEG + r"cron" + _LA_DIRSEG + r"tabs" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"periodic" + _LA_DIRSEG
+    + r"(?:daily|weekly|monthly)" + _LA_END,
+    re.IGNORECASE,
+)
+_LOGIN_AUTOSTART_FIND_FRAGMENTS = (
+    r"[/\\]autostart(?:-scripts)?[/\\*]|plasma-workspace|xinitrc|xsession|Xsession\.d"
+    r"|cron\.d|cron\.(?:hourly|daily|weekly|monthly)|spool[/\\](?:cron|at)"
+    r"|Programs[/\\]Startup"
+)
+LOGIN_AUTOSTART_FIND_RE = _find_predicate_re(r"(?:" + _LOGIN_AUTOSTART_FIND_FRAGMENTS + r")")
+
+
+def login_autostart_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, LOGIN_AUTOSTART_FIND_RE)
+
+
+def login_autostart_path_hit(text: str) -> bool:
+    return bool(LOGIN_AUTOSTART_PATH_RE.search(text) or CRON_SPOOL_PATH_RE.search(text))
+
+
+# Commands that install login/scheduled persistence with no file path in
+# the call at all.
+#  - `at`/`batch`: queue a command to run later (T1053.002). Anchored to a
+#    command position so the English word "at" in an argument doesn't hit;
+#    `at -l`/`atq`/`atrm`/`at -c` (list/remove/show) are not gated.
+#  - macOS: `osascript ... make login item`, `defaults write ...loginwindow
+#    LoginHook|LogoutHook`, `sfltool add-item`.
+#  - Windows registry autostarts PERSIST_RE doesn't name: Winlogon
+#    Userinit/Shell, Policies\Explorer\Run, Active Setup StubPath,
+#    Winlogon\Notify, AppInit_DLLs, Image File Execution Options Debugger.
+_LA_CMDPOS = r"(?:^|[|;&\n(`{]|\$\(|\b(?:sudo|doas|exec|nohup|command|env|xargs|time)\s+(?:-\S+\s+)*)\s*(?:[^\s|;&]*[/\\])?"
+_LA_TIMESPEC = (
+    r"(?:now|noon|midnight|teatime|tomorrow|today|next\b"
+    r"|\d{1,4}(?::\d{2})?(?:\s*(?:am|pm))?\b"
+    r"|(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b)"
+)
+LOGIN_AUTOSTART_CMD_RE = re.compile(
+    _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
+    + r"(?:-t\s*\d|" + _LA_TIMESPEC + r")"
+    + r"|" + _LA_CMDPOS + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
+    + r"|\bosascript\b[^|;&\n]{0,400}?\blogin\s+items?\b"
+    + r"|\bdefaults\s+write\b[^|;&\n]{0,200}?\bloginwindow\b[^|;&\n]{0,200}?\b(?:LoginHook|LogoutHook)\b"
+    + r"|\bsfltool\s+add-?item\b"
+    + r"|\\Winlogon\b[^|;&\n]{0,200}?\b(?:Userinit|Shell|Taskman|AppSetup)\b"
+    + r"|\\Winlogon\\Notify\b"
+    + r"|\\Policies\\Explorer\\Run\b"
+    + r"|\\Active Setup\\Installed Components\b[^|;&\n]{0,300}?\bStubPath\b"
+    + r"|\bAppInit_DLLs\b"
+    + r"|\\Image File Execution Options\\[^|;&\n]{0,300}?\b(?:Debugger|GlobalFlag)\b",
+    re.IGNORECASE,
+)
+# A Windows registry WRITE verb -- the registry branch above only counts
+# when paired with one (reading these keys is ordinary triage).
+REGISTRY_WRITE_VERB_RE = re.compile(
+    r"\breg(?:\.exe)?\s+(?:add|import|copy|load|restore)\b"
+    r"|\b(?:Set-ItemProperty|New-ItemProperty|New-Item|sp|ni|Set-Item|regedit(?:\.exe)?\s+/s)\b",
+    re.IGNORECASE,
+)
+_LA_REG_KEY_RE = re.compile(
+    r"\\Winlogon\b|\\Policies\\Explorer\\Run\b|\\Active Setup\\|\bAppInit_DLLs\b"
+    r"|\\Image File Execution Options\\", re.IGNORECASE)
+
+
+def login_autostart_cmd_hit(cmd: str) -> bool:
+    """True when a clause of ``cmd`` schedules/installs login persistence
+    with no file write (at/batch, macOS login items, registry autostarts).
+    A registry-key mention counts only alongside a registry WRITE verb in
+    the same clause -- reading these keys is ordinary triage."""
+    for clause in _CLAUSE_SPLIT_RE.split(cmd):
+        for m in LOGIN_AUTOSTART_CMD_RE.finditer(clause):
+            if _LA_REG_KEY_RE.search(m.group(0)) and not REGISTRY_WRITE_VERB_RE.search(clause):
+                continue
+            return True
+    return False
