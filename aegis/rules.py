@@ -16471,6 +16471,8 @@ def _la_pathish_leaves(v, key_ok=False, _d=0):
         if key_ok:
             yield v
     elif isinstance(v, dict):
+        if key_ok:
+            yield from (str(k) for k in list(v)[:5000])   # `{files: {path: content}}`
         for k, x in v.items():
             yield from _la_pathish_leaves(
                 x, key_ok or bool(_http_rc_words(str(k)) & _LA_PATHISH_KEY_WORDS), _d + 1)
@@ -16483,16 +16485,22 @@ def _la_dest_hit(d: str, bases) -> bool:
     d = str(d).strip()
     if not d:
         return False
-    if patterns.login_autostart_path_hit(d) or patterns.login_autostart_dir_hit(d):
-        return True
-    if re.match(r"^(?:[/\\~$%]|[A-Za-z]:)", d):
-        return False
-    for b in bases:
-        if not b:
-            continue
-        j = str(b).rstrip("/\\") + "/" + d
-        if patterns.login_autostart_path_hit(j) or patterns.login_autostart_dir_hit(j):
-            return True
+    forms = [d]
+    if "\\" in d and not re.match(r"^[A-Za-z]:|^\\\\", d):
+        forms.append(d.replace("\\", ""))         # `auto\start` is `autostart` in a shell
+    for f in forms:
+        for c in patterns.la_glob_candidates(f):
+            if patterns.login_autostart_path_hit(c) or patterns.login_autostart_dir_hit(c):
+                return True
+            if re.match(r"^(?:[/\\~$%]|[A-Za-z]:)", c):
+                continue
+            for b in bases:
+                if not b:
+                    continue
+                for bc in patterns.la_glob_candidates(str(b))[:16]:
+                    j = bc.rstrip("/\\") + "/" + c
+                    if patterns.login_autostart_path_hit(j) or patterns.login_autostart_dir_hit(j):
+                        return True
     return False
 
 
@@ -16502,7 +16510,8 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
     to the coarse named-target + write-verb check when ``r`` can't be
     tokenized."""
     if not (patterns.login_autostart_maybe_target(r)
-            or (cwd and patterns.login_autostart_maybe_target(str(cwd)))):
+            or (cwd and patterns.login_autostart_maybe_target(str(cwd)))
+            or re.search(r"[*?\[{]", r)):
         return False
     if patterns.login_autostart_find_hit(r) and re.search(
             r"-(?:exec(?:dir)?|ok(?:dir)?)\s+(?:\S*/)?(?:sed\s+(?:-\S+\s+)*-[a-zA-Z]*i|perl\s+-[a-zA-Z]*i"
@@ -16519,7 +16528,9 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
             patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
             patterns.FETCH_TO_FILE_VERB_RE)))
     dests, cds, unknown = res
-    bases = list(cds) + ([cwd] if cwd else [])
+    bases = list(dict.fromkeys(cds))[:16] + ([cwd] if cwd else [])
+    dests = list(dict.fromkeys(dests))
+    unknown = list(dict.fromkeys(unknown))
     if any(_la_dest_hit(d, bases) for d in dests[:2000]):
         return True
     # Fail closed: a target among an unrecognised command's operands counts
@@ -16537,8 +16548,12 @@ _LA_MCP_SHELL_WORDS = frozenset(("exec", "execute", "shell", "bash", "sh", "zsh"
                                  "pty", "tty", "tmux", "ssh", "spawn", "subprocess"))
 _LA_MCP_CODE_WORDS = frozenset(("python", "cell", "notebook", "jupyter", "code", "repl",
                                 "eval", "script", "node", "javascript", "interpreter"))
+_LA_MCP_INPUT_KEY_WORDS = frozenset(("command", "commands", "cmd", "script", "input", "keys",
+                                     "text", "line", "lines", "stdin", "code", "args", "argv",
+                                     "arguments", "chars", "data", "exec", "shell", "program",
+                                     "executable", "cmdline", "commandline", "body", "payload"))
 _LA_MCP_CMD_KEYS = ("command", "cmd", "script", "shell_command", "commandLine", "command_line",
-                    "shellCommand", "bash", "sh")
+                    "shellCommand", "bash", "sh", "command_text", "commandText", "cmdline")
 
 
 def _la_mcp_commands(ev: Event) -> list:
@@ -16548,7 +16563,10 @@ def _la_mcp_commands(ev: Event) -> list:
     shell word in its own name or a command-shaped key; code-runner tools
     (`run_cell{code}`) are judged as interpreter code."""
     a = ev.args if isinstance(ev.args, dict) else {}
-    words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+    parts = str(ev.tool or "").split("__")
+    words = _http_rc_words(parts[-1])
+    if len(parts) >= 3:
+        words = words | _http_rc_words(parts[1])     # `mcp__shell__run` (QA round 5)
     out = []
     inner = a.get("args") if isinstance(a.get("args"), dict) else {}
     for src in (a, inner):
@@ -16565,9 +16583,12 @@ def _la_mcp_commands(ev: Event) -> list:
                         v += "\n" + src[sk]
                 out.append(v)
     if words & _LA_MCP_SHELL_WORDS:
-        for x in _flatten_strings(a)[:2000]:
-            if isinstance(x, str) and x.strip():
-                out.append(x)
+        # Command-shaped fields only -- not description/title/note (QA round 5).
+        for k, v in a.items():
+            if _http_rc_words(str(k)) & _LA_MCP_INPUT_KEY_WORDS:
+                for x in _flatten_strings(v)[:2000]:
+                    if isinstance(x, str) and x.strip():
+                        out.append(x)
     if words & (_LA_MCP_CODE_WORDS | {"run", "execute"}) and words & _LA_MCP_CODE_WORDS:
         for k in ("code", "source", "cell", "script", "input", "content"):
             v = a.get(k)
@@ -16674,7 +16695,25 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     -out``/``git clone``). Fixed by making it fail CLOSED: any operand of an
     unrecognised command that names a target counts as a write; only a
     known read-only command or a known writer whose destination is
-    elsewhere passes."""
+    elsewhere passes. Round 3 (two reviewers; one cut short) added
+    heredoc-to-interpreter / piped-heredoc bodies, read-only tools with an
+    output option, ``find -exec`` of a writer, bundled ``curl -sSLo``,
+    rsync ``-t`` (preserve times, not a target) and ``yq -i``. Round 4
+    found a heredoc marker's own trailing redirect dropped (``cat <<EOF >
+    ~/.xinitrc``), unparsed ``$(..)``/backtick/``<(..)``/``trap``/``eval``
+    bodies, implicit cwd writes (``cd autostart && curl -O``/``tar x``/
+    ``unzip``), a computed ``at`` time, attached ``-C<dir>``/``-d<dir>``/
+    ``sort -uo``, MCP ``name``/``pathname``/``directory+filename`` keys and
+    code-runner tools; and MCP messaging tools whose prose was joined into
+    one "command" (now: shell-runner only by a real shell word in the tool
+    or server name, command-shaped fields only, each judged on its own).
+    Round 5 found the early exit read only scan_surface's 40KB-capped
+    text; quote/backslash-split names (``auto''start``, ``a''t``); copies
+    INTO a parent dir (``cp dotfiles/.xinitrc ~/``, ``cp -r stage/cron.d
+    /etc/``); an uncapped cd x destination product (quadratic); ``at -b``;
+    glob/brace spellings (``autost*``, ``auto{s,}tart`` -- resolved against
+    the protected names); chained ``cd``; MCP ``files`` maps; and a
+    description-field false positive. All closed."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
@@ -16752,8 +16791,11 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
         raw = _cmd(ev)
         surf = _shell_scan(ev)
         if not (patterns.login_autostart_maybe_target(surf)
+                or patterns.login_autostart_maybe_target(raw)      # surf is length-capped
                 or (ev.cwd and patterns.login_autostart_maybe_target(str(ev.cwd)))
-                or patterns.login_autostart_activation_maybe(surf)):
+                or patterns.login_autostart_activation_maybe(surf)
+                or patterns.login_autostart_activation_maybe(raw)
+                or re.search(r"[*?\[]|\{[^{}\s]*,", raw)):   # glob/brace spellings
             return None                   # cheap exit (shared perf budget)
         touches_target = activates = False
         for r in patterns.la_shell_renderings(raw):

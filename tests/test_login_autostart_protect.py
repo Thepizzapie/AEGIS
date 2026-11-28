@@ -652,3 +652,45 @@ def test_r4_gaps_closed(i):
 def test_r4_no_false_positives(i):
     ev = _r4_cases()[1][i]
     assert evaluate(ev, EMPTY).rule != RULE, ev.args
+
+
+# ---- QA round 5 regressions ----------------------------------------------------
+
+def _r5_cases():
+    sh, mcp = _r4_sh, _r4_mcp
+    G=[sh("x"*50000+"; echo x > ~/.xinitrc"),
+     sh("echo x > ~/.config/auto''start/x.desktop"),sh("echo x > ~/.xinit''rc"),sh('echo x > ~/.xinit"rc"'),sh("echo x > \"$HOME\"/.xsess'ion'"),
+     sh("echo x > /etc/peri''odic/daily/x"),sh("echo x > ~/.config/plasma-work''space/env/x.sh"),sh("cp /tmp/x ~/.config/auto''start/"),
+     sh("echo x > ~/.config/auto\\start/x.desktop"),sh("a''t now <<< x"),sh('echo x | a"t" now'),sh('echo x | ba"tch"'),
+     sh("cp dotfiles/.xinitrc ~/"),sh("cp dotfiles/.xinitrc ~"),sh("mv /tmp/.xsession ~/"),sh("cp /tmp/.xsession $HOME"),sh("ln -s /tmp/x/.xinitrc ~/"),
+     sh("rsync -a dotfiles/.xinitrc ~/"),sh("install -m755 dotfiles/.xinitrc ~/"),sh("cp -r /tmp/stage/autostart ~/.config/"),sh("mv /tmp/autostart ~/.config/"),
+     sh("cp -r stage/cron.d /etc/"),sh("cp /tmp/periodic/daily /etc/periodic/"),sh("cp -r Xsession.d /etc/X11/"),sh("cp -r stage/env ~/.config/plasma-workspace/"),
+     sh("echo x | at -b"),sh("echo x | at -bq a"),
+     sh("echo x > ~/.config/autost*/x.desktop"),sh("tee ~/.config/auto{s,}tart/x.desktop <<< x"),sh("echo x > ~/.config/{autostart,x}/y.desktop"),
+     sh("echo x > ~/.xsess*"),sh("echo x > /etc/peri*/daily/x"),sh("echo x > /etc/X1?/Xsession.d/99x"),sh("cd ~/.config/autost* && echo x > x.desktop"),
+     sh("cd ~/.config && cd autostart && echo x > x.desktop"),sh("cd /etc && cd periodic/daily && echo x > y"),sh("cd /etc/X11 && cd Xsession.d && echo x > 99x"),
+     mcp("mcp__shell__run",input="echo x > /etc/periodic/daily/x"),mcp("mcp__terminal__run",input="echo x > /etc/periodic/daily/x"),
+     mcp("mcp__tmux__send_keys",keys="echo x > /etc/periodic/daily/x"),mcp("mcp__server__run",command_text="echo x | at now"),
+     mcp("mcp__fs__write_files",files={"/var/spool/cron/root":"x"})]
+    F=[mcp("mcp__shell__execute",command="ls",description="echo x | at now"),sh("cp ~/.xinitrc ~/backup/"),sh("cp src/*.py build/"),sh("echo {a,b} > out.txt"),
+     sh("ls ~/.config/autost*"),sh("cp -r src ~/.config/"),sh("cd ~/.config && cd nvim && ls"),sh("rm -f build/*.o")]
+    return G, F
+
+
+@pytest.mark.parametrize("i", range(len(_r5_cases()[0])))
+def test_r5_gaps_closed(i):
+    ev = _r5_cases()[0][i]
+    assert _gated(evaluate(ev, EMPTY)), ev.args
+
+
+@pytest.mark.parametrize("i", range(len(_r5_cases()[1])))
+def test_r5_no_false_positives(i):
+    ev = _r5_cases()[1][i]
+    assert evaluate(ev, EMPTY).rule != RULE, ev.args
+
+
+def test_r5_cd_chain_not_quadratic():
+    ev = _shell("cd /etc/X11; cp a b; echo x > c; " * 3000)
+    t0 = time.perf_counter()
+    evaluate(ev, EMPTY)
+    assert time.perf_counter() - t0 < 3.0

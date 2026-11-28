@@ -11869,6 +11869,8 @@ _LA_AT_DIR_RE = re.compile(r"[/\\]at" + _WIN_TRIM + _SEP + r"(?:tabs|jobs)", re.
 
 def login_autostart_maybe_target(text: str) -> bool:
     low = text.lower()
+    if "'" in low or '"' in low or "\\" in low:
+        low = low + " " + re.sub(r"['\"\\]", "", low)
     return any(k in low for k in _LA_LITERALS) or bool(_LA_AT_DIR_RE.search(text))
 
 
@@ -12221,6 +12223,11 @@ def _la_strip_wrappers(words):
     return words[i:]
 
 
+_LA_HOME_RE = re.compile(
+    r"^(?:~[^/\\\s]*|\$\{?HOME\}?|%USERPROFILE%|/root|/home/[^/\\\s]+|/Users/[^/\\\s]+"
+    r"|[A-Za-z]:[/\\]+Users[/\\]+[^/\\\s]+)[/\\]*$")
+
+
 def la_shell_destinations(cmd: str):
     """(destinations, cd_dirs, unknown_args) for shell text, or None if it
     can't be tokenized. ``destinations``: what known write commands write
@@ -12266,7 +12273,10 @@ def la_shell_destinations(cmd: str):
         ops = [a for a in args if not a.startswith("-")]
         if name in _LA_CD_CMDS:
             if ops:
-                cds.append(ops[0])
+                t0 = ops[0]
+                if cds and not re.match(r"^(?:[/\\~$%]|[A-Za-z]:)", t0):
+                    cds.append(cds[-1].rstrip("/\\") + "/" + t0)   # chained `cd a && cd b`
+                cds.append(t0)
             continue
         known = True
         if name == "tee":
@@ -12277,11 +12287,13 @@ def la_shell_destinations(cmd: str):
                 if not any(a.startswith("of=") for a in args):
                     known = False
                 continue
+            tdirs = []
             for j, a in enumerate(args):
                 gnu_t = name in ("cp", "mv", "install", "ln", "gcp", "gmv", "ginstall")
                 if (a in ("--target-directory", "-Destination", "-destination")
                         or (gnu_t and re.fullmatch(r"-[A-Za-z]*t", a))) and j + 1 < len(args):
                     dests.append(args[j + 1])
+                    tdirs.append(args[j + 1])
                 elif a.startswith("--target-directory="):
                     dests.append(a.split("=", 1)[1])
                 elif gnu_t and re.fullmatch(r"-[A-Za-z]*t.+", a) and not a.startswith("--"):
@@ -12292,6 +12304,18 @@ def la_shell_destinations(cmd: str):
                 # Always the last operand too, even with -t (fail closed --
                 # QA round 3b: rsync `-t` is preserve-times, not a target).
                 dests.append(ops[-1])
+                tdirs.append(ops[-1])
+            # A source copied INTO a directory lands at dir/basename(src)
+            # (QA round 5: `cp dotfiles/.xinitrc ~/`, `cp -r stage/cron.d /etc/`).
+            for td in dict.fromkeys(tdirs):
+                for src in ops[:64]:
+                    if src != td:
+                        bn = re.split(r"[/\\]", src.rstrip("/\\"))[-1]
+                        if bn and bn not in (".", "..") and (
+                                not re.match(r"^\.[xX]", bn) or _LA_HOME_RE.match(td)):
+                            # X-session dotfiles count only in a HOME dir
+                            # (`cp ~/.xinitrc ~/backup/` is a backup).
+                            dests.append(td.rstrip("/\\") + "/" + bn)
         elif name in ("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "unrar", "bsdcpio"):
             n0 = len(dests)
             extract = (name not in ("tar", "bsdtar", "gtar")
@@ -12420,8 +12444,8 @@ def la_shell_renderings(raw: str, _depth: int = 0):
 
 
 LA_AT_RE = re.compile(
-    _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
-    + r"(?:-t\s*\d|" + _LA_TIMESPEC + r")"
+    _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVk]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
+    + r"(?:-t\s*\d|-[A-Za-z]*b[A-Za-z]*(?=\s|$|[;&|)])|" + _LA_TIMESPEC + r")"
     + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
     + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))",
     re.IGNORECASE)
@@ -12430,6 +12454,8 @@ _LA_ACT_CMDS = frozenset(("reg", "set-itemproperty", "new-itemproperty", "new-it
 
 
 def login_autostart_activation_maybe(r: str) -> bool:
+    if "'" in r or '"' in r or "\\" in r:
+        r = r + " " + re.sub(r"['\"\\]", "", r)
     low = r.lower()
     return any(k in low for k in _LA_CMD_LITERALS) or bool(_LA_AT_WORD_RE.search(r))
 
@@ -12439,7 +12465,7 @@ def login_autostart_activation_hit(r: str) -> bool:
     commands judged on their own simple command only (their key or script
     is legitimately quoted, so quote-stripping would hide it)."""
     import shlex
-    if not (any(k in r.lower() for k in _LA_CMD_LITERALS) or _LA_AT_WORD_RE.search(r)):
+    if not login_autostart_activation_maybe(r):
         return False
     if LA_AT_RE.search(la_prose_free(r)):
         return True
@@ -12447,10 +12473,16 @@ def login_autostart_activation_hit(r: str) -> bool:
     c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
     toks = [t for t in _la_tokens(c) if not (t and set(t) <= set("<>"))]
     for sc in _la_split_simple(toks):
-        quoted_name = bool(sc) and sc[0][:1] in "'\""
+        quoted_name = bool(sc) and len(sc[0]) > 1 and sc[0][0] == sc[0][-1] and sc[0][0] in "'\""
         w = _la_strip_wrappers([_la_unquote(t).strip() if t[:1] in "'\"" else t for t in sc])
         if not w:
             continue
+        # The command NAME seen through embedded quotes / backslashes
+        # (QA round 5: `a''t now`, `ba"tch"`); arguments keep their text.
+        w0 = re.sub(r"['\"]", "", w[0])
+        if "\\" in w0 and "/" not in w0 and not re.match(r"^[A-Za-z]:", w0):
+            w0 = w0.replace("\\", "")
+        w = [w0] + w[1:]
         name = re.split(r"[/\\]", w[0])[-1].lower()
         if name.endswith(".exe"):
             name = name[:-4]
@@ -12459,7 +12491,7 @@ def login_autostart_activation_hit(r: str) -> bool:
             if name == "batch" and not quoted_name and re.fullmatch(r"(?:\s*-[fqmv]\S*(?:\s+\S+)?)*\s*(?:<.*)?", rest):
                 return True
             if name == "at" and re.match(
-                    r"(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*\S+\s+)*(?:-t\s*\d|" + _LA_TIMESPEC + r")",
+                    r"(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*\S+\s+)*(?:-t\s*\d|-[A-Za-z]*b[A-Za-z]*(?:\s|$)|" + _LA_TIMESPEC + r")",
                     rest, re.IGNORECASE):
                 return True
             continue
@@ -12471,3 +12503,48 @@ def login_autostart_activation_hit(r: str) -> bool:
                 continue
             return True
     return False
+
+
+_LA_GLOB_NAMES = (
+    "autostart", "autostart-scripts", ".config", "xdg", "plasma-workspace", "env", "shutdown",
+    ".kde", ".kde4", "Autostart", "openbox", "labwc", "lxsession", ".xinitrc", ".xsession",
+    ".xsessionrc", ".xserverrc", ".Xclients", "X11", "xinit", "xinitrc", "xinitrc.d",
+    "Xsession", "Xsession.d", "Xreset", "Xreset.d", "gdm", "gdm3", "PostLogin", "PreSession",
+    "PostSession", "Init", "etc", "crontab", "anacrontab", "cron.d", "cron.hourly",
+    "cron.daily", "cron.weekly", "cron.monthly", "var", "spool", "cron", "at", "atjobs",
+    "crontabs", "periodic", "daily", "weekly", "monthly", "periodic.conf", "Start Menu",
+    "Programs", "Startup", "usr", "lib", "tabs", "jobs",
+)
+_LA_BRACE_RE = re.compile(r"\{([^{}]{0,400})\}")
+
+
+def la_glob_candidates(path: str, cap: int = 64) -> list:
+    """Brace-expand, then resolve glob segments (``*?[``) against the
+    protected names (QA round 5: `~/.config/autost*/x`, `auto{s,}tart`)."""
+    import fnmatch
+    out = [path]
+    if "{" in path:
+        for _ in range(3):
+            nxt = []
+            for p in out:
+                m = _LA_BRACE_RE.search(p)
+                if not m or "," not in m.group(1):
+                    nxt.append(p)
+                    continue
+                for alt in m.group(1).split(",")[:16]:
+                    nxt.append(p[:m.start()] + alt + p[m.end():])
+            out = list(dict.fromkeys(nxt))[:cap]
+    if not re.search(r"[*?\[]", "".join(out)):
+        return out
+    res = []
+    for p in out:
+        segs = re.split(r"([/\\]+)", p)
+        combos = [""]
+        for sg in segs:
+            if re.search(r"[*?\[]", sg):
+                ms = [n for n in _LA_GLOB_NAMES if fnmatch.fnmatchcase(n.lower(), sg.lower())] or [sg]
+                combos = [c + m for c in combos for m in ms][:cap]
+            else:
+                combos = [c + sg for c in combos]
+        res.extend(combos)
+    return list(dict.fromkeys(res))[:cap]
