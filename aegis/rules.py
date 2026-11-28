@@ -16516,9 +16516,14 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
             patterns.INPLACE_WRITE_RE, patterns.FORCED_LINK_WRITE_RE,
             patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
             patterns.FETCH_TO_FILE_VERB_RE)))
-    dests, cds = res
+    dests, cds, unknown = res
     bases = list(cds) + ([cwd] if cwd else [])
-    return any(_la_dest_hit(d, bases) for d in dests[:2000])
+    if any(_la_dest_hit(d, bases) for d in dests[:2000]):
+        return True
+    # Fail closed: a target among an unrecognised command's operands counts
+    # (relative operands joined to cwd/cd only when they look like a path).
+    return any(_la_dest_hit(u, bases if re.search(r"[/\\]", u) else ())
+               for u in unknown[:2000])
 
 
 def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -16611,7 +16616,15 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     day/month words (``decode``, ``marshal``), ``./batch`` scripts, bare
     paths in MCP messaging values, and reads/copies FROM a target; closed
     with the prose-free surface, exact time-spec words, path-like-key MCP
-    scanning, and destination-aware shell analysis."""
+    scanning, and destination-aware shell analysis. Round 2 (fresh
+    reviewer) found the destination parser trusted a misparse: unlisted
+    wrappers (``timeout 5``/``nice -n 10``/``flock``/``{ ...; }``), clustered
+    ``-vt``/``-Dt``, quote-split ``"$XDG_CONFIG_HOME"/autostart``, and write
+    tools it didn't know (``gio copy``/``sponge``/``sort -o``/``openssl
+    -out``/``git clone``). Fixed by making it fail CLOSED: any operand of an
+    unrecognised command that names a target counts as a write; only a
+    known read-only command or a known writer whose destination is
+    elsewhere passes."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

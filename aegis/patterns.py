@@ -11776,7 +11776,7 @@ _LA_DIRSEG = _WIN_TRIM + _SEP
 LOGIN_AUTOSTART_PATH_RE = re.compile(
     # XDG autostart: ~/.config/autostart, /etc/xdg/autostart, $XDG_CONFIG_HOME
     # /autostart; KDE's legacy autostart-scripts dir alongside it.
-    _LA_PRE + r"(?:\.config|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)\}?)" + _LA_DIRSEG
+    _LA_PRE + r"(?:\.config\}?|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)(?:[:=?+-][^}\s'\"]{0,200})?\}?)" + _LA_DIRSEG
     + r"autostart(?:-scripts)?" + _LA_DIRSEG + _CI_SEG + _LA_END
     # KDE Plasma: env/*.sh sourced at login, shutdown/* run at logout.
     + r"|" + _LA_PRE + r"plasma-workspace" + _LA_DIRSEG + r"(?:env|shutdown)"
@@ -11825,7 +11825,7 @@ CRON_SPOOL_PATH_RE = re.compile(
 # Bare directory references (no filename): `rsync -a x/ ~/.config/autostart/`,
 # `tar xf p.tar -C /etc/cron.d`, `cp x.desktop ~/.config/autostart`.
 LOGIN_AUTOSTART_DIR_RE = re.compile(
-    _LA_PRE + r"(?:\.config|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)\}?)" + _LA_DIRSEG
+    _LA_PRE + r"(?:\.config\}?|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)(?:[:=?+-][^}\s'\"]{0,200})?\}?)" + _LA_DIRSEG
     + r"autostart(?:-scripts)?" + _LA_END
     + r"|" + _LA_PRE + r"plasma-workspace" + _LA_DIRSEG + r"(?:env|shutdown)" + _LA_END
     + r"|" + _LA_PRE + r"\.kde4?" + _LA_DIRSEG + r"(?:share" + _LA_DIRSEG + r")?"
@@ -12063,10 +12063,18 @@ _LA_INTERP = frozenset(("python", "python2", "python3", "perl", "ruby", "node", 
 _LA_CD_CMDS = frozenset(("cd", "pushd", "chdir", "set-location", "sl"))
 
 
+_LA_WORD_RE = re.compile(
+    r"(?:'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\"|\$\([^()]{0,2000}\)|[^\s'\";&|()<>])+"
+    r"|[;&|()<>]+|['\"]")
+
+
+def _la_tokens(c: str):
+    return _LA_WORD_RE.findall(c[:200000])[:20000]
+
+
 def _la_unquote(t: str) -> str:
-    if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
-        return t[1:-1]
-    return t
+    # Embedded quotes too (QA round 2: `"$XDG_CONFIG_HOME"/autostart/x`).
+    return t.replace("'", "").replace('"', "") if len(t) > 1 else t
 
 
 def _la_split_simple(toks):
@@ -12082,26 +12090,84 @@ def _la_split_simple(toks):
         yield cur
 
 
+# Commands whose arguments are READ, never written (a target named as one
+# of their operands is not a plant; their redirects still count).
+_LA_READONLY_CMDS = frozenset((
+    "cat", "tac", "grep", "egrep", "fgrep", "rg", "ag", "ack", "diff", "cmp", "colordiff",
+    "ls", "ll", "dir", "exa", "eza", "lsd", "head", "tail", "less", "more", "most", "wc",
+    "stat", "file", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum",
+    "echo", "printf", "test", "[", "[[", "readlink", "realpath", "basename", "dirname",
+    "which", "type", "whereis", "du", "df", "tree", "jq", "yq", "strings", "hexdump", "od",
+    "cut", "nl", "column", "bat", "batcat", "view", "lsattr", "getfacl", "namei",
+    "gh", "true", "false", ":", "desktop-file-validate", "atq", "atrm", "crontab",
+    "systemctl", "journalctl", "pgrep", "ps", "id", "whoami", "date", "sleep", "wait",
+    "read", "export", "unset", "local", "declare", "typeset", "set", "shift", "return",
+    "exit", "break", "continue", "trap", "alias", "unalias", "hash", "history",
+    "get-content", "gc", "type", "select-string", "sls", "get-childitem", "gci", "get-item",
+    "gi", "test-path", "resolve-path", "get-itemproperty", "gp", "write-host", "write-output",
+))
+# Wrappers that run their remaining argv as a command. Option-arguments
+# they take are skipped heuristically; a mis-skip only makes the real
+# command "unknown", which fails CLOSED below.
+_LA_WRAPPERS = frozenset((
+    "sudo", "doas", "nohup", "command", "exec", "time", "builtin", "nice", "ionice",
+    "stdbuf", "env", "xargs", "busybox", "run0", "timeout", "setsid", "flock", "chrt",
+    "taskset", "unbuffer", "strace", "ltrace", "firejail", "proxychains", "proxychains4",
+    "torsocks", "caffeinate", "chronic", "pkexec", "nsenter", "unshare", "chroot",
+    "systemd-run", "script", "watch", "faketime", "fakeroot", "eatmydata", "numactl",
+    "cgexec", "sg", "runuser", "su", "nocache", "catchsegv", "valgrind", "sem", "parallel",
+    "then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "coproc",
+))
+_LA_TIME_TOK_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|0x[0-9a-fA-F]+|[\d,\-]+)$")
+
+
+def _la_strip_wrappers(words):
+    """Drop leading assignments / wrappers and their options/option-args."""
+    i, n = 0, len(words)
+    prev_wrapper = None
+    while i < n:
+        w = words[i]
+        base = re.split(r"[/\\]", w)[-1].lower()
+        if re.match(r"^[A-Za-z_]\w*=", w):
+            i += 1
+            continue
+        if base in _LA_WRAPPERS:
+            prev_wrapper = base
+            i += 1
+            continue
+        if prev_wrapper and w.startswith("-"):
+            i += 1
+            # option with a separate value (`nice -n 10`, `sudo -u bob`)
+            if i < n and re.fullmatch(r"-[A-Za-z]", w) and not words[i].startswith("-") and (
+                    _LA_TIME_TOK_RE.match(words[i]) or prev_wrapper in ("sudo", "doas", "su", "runuser", "sg", "chroot", "nsenter", "cgexec")):
+                i += 1
+            continue
+        if prev_wrapper and _LA_TIME_TOK_RE.match(w):
+            i += 1                       # timeout 5 / chrt 0 / taskset 0x1
+            continue
+        if prev_wrapper in ("flock", "chroot", "sg", "cgexec") and i + 1 < n:
+            i += 1                       # flock LOCKFILE cmd / chroot DIR cmd
+            prev_wrapper = None
+            continue
+        break
+    return words[i:]
+
+
 def la_shell_destinations(cmd: str):
-    """(destinations, cd_dirs) a shell command WRITES to, or None if the
-    command can't be tokenized. Redirect targets, `tee` args, the last
-    operand / `-t DIR` of cp/mv/install/ln/rsync/..., `dd of=`, tar `-C`,
-    unzip `-d`, curl `-o`/`--output-dir`, wget `-O`/`-P`, PowerShell
-    `-Path`/`-Destination`, sed/perl `-i` files, chmod operands (cron.daily
-    runs only EXECUTABLE scripts), interpreter `-c`/`-e` code naming a path."""
+    """(destinations, cd_dirs, unknown_args) for shell text, or None if it
+    can't be tokenized. ``destinations``: what known write commands write
+    (redirect targets, ``tee``, last operand / ``-t`` of copy tools, tar
+    ``-C``, fetch outputs, in-place edits, ``chmod`` operands, interpreter
+    write code). ``unknown_args``: every operand of a command this parser
+    doesn't know -- the caller treats a target among them as a write
+    (fail closed; QA round 2: `timeout 5 cp`, `{ cp ...; }`, `gio copy`,
+    `sponge`, `sort -o`)."""
     import shlex
     c, _ = _la_heredocs(cmd)
     c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
-    try:
-        lex = shlex.shlex(c[:200000], posix=False, punctuation_chars=";&|()<>")
-        lex.whitespace_split = True
-        lex.commenters = ""
-        toks = [_la_unquote(t) for t in list(lex)[:20000]]
-    except ValueError:
-        return None
-    dests, cds = [], []
+    toks = [_la_unquote(t) for t in _la_tokens(c)]
+    dests, cds, unknown = [], [], []
     for sc in _la_split_simple(toks):
-        # redirects anywhere in the simple command
         words = []
         i = 0
         while i < len(sc):
@@ -12114,13 +12180,12 @@ def la_shell_destinations(cmd: str):
             if t and set(t) <= set("<"):
                 i += 2
                 continue
+            if re.fullmatch(r"\d", t) and i + 1 < len(sc) and set(sc[i + 1]) <= set("<>&|") and ">" in sc[i + 1]:
+                i += 1                     # fd number before a redirect: `2>`
+                continue
             words.append(t)
             i += 1
-        # strip assignments / wrappers and their options
-        while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or
-                         words[0].rsplit("/", 1)[-1].lower() in _LA_WRAPPERS or
-                         (words[0].startswith("-") and len(words) > 1)):
-            words = words[1:]
+        words = _la_strip_wrappers(words)
         if not words:
             continue
         name = re.split(r"[/\\]", words[0])[-1].lower()
@@ -12132,23 +12197,31 @@ def la_shell_destinations(cmd: str):
             if ops:
                 cds.append(ops[0])
             continue
+        known = True
         if name == "tee":
             dests.extend(ops)
-        elif name in _LA_COPY_CMDS:
+        elif name in _LA_COPY_CMDS or name in ("robocopy",):
             if name == "dd":
                 dests.extend(a[3:] for a in args if a.startswith("of="))
+                if not any(a.startswith("of=") for a in args):
+                    known = False
                 continue
+            tdir = False
             for j, a in enumerate(args):
-                if a in ("-t", "--target-directory", "-Destination", "-destination") and j + 1 < len(args):
+                if (a in ("-t", "--target-directory", "-Destination", "-destination")
+                        or re.fullmatch(r"-[A-Za-z]*t", a)) and j + 1 < len(args):
                     dests.append(args[j + 1])
+                    tdir = True
                 elif a.startswith("--target-directory="):
                     dests.append(a.split("=", 1)[1])
+                    tdir = True
+                elif re.fullmatch(r"-[A-Za-z]*t.+", a) and not a.startswith("--"):
+                    dests.append(a[a.index("t") + 1:])
+                    tdir = True
             if name in ("robocopy", "xcopy", "rclone"):
                 dests.extend(ops[1:])
-            elif ops:
+            elif not tdir and ops:
                 dests.append(ops[-1])
-        elif name == "robocopy":
-            dests.extend(ops[1:2])
         elif name in ("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "unrar", "bsdcpio"):
             for j, a in enumerate(args):
                 if a in ("-C", "--directory", "-d") and j + 1 < len(args):
@@ -12170,33 +12243,50 @@ def la_shell_destinations(cmd: str):
                 elif re.match(r"^-[a-zA-Z]*[oOP].", a) and not a.startswith("--"):
                     k = max(a.find("o"), a.find("O"), a.find("P"))
                     dests.append(a[k + 1:])
+        elif name in _LA_INPLACE_CMDS and name == "sed" or name == "gsed":
+            if any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in args):
+                dests.extend(ops)
+            for j, a in enumerate(args):        # sed's own `w FILE` command
+                if re.search(r"(?:^|[;}\s])w\s+\S", a):
+                    known = False
+        elif name == "sort":
+            for j, a in enumerate(args):
+                if a in ("-o", "--output") and j + 1 < len(args):
+                    dests.append(args[j + 1])
+                elif re.match(r"^(?:-o|--output=)(.+)", a):
+                    dests.append(re.match(r"^(?:-o|--output=)(.+)", a).group(1))
+        elif name == "git":
+            sub = next((a for a in args if not a.startswith("-")), "")
+            if sub in ("clone", "worktree", "submodule", "archive", "checkout-index", "-C") or "-C" in args:
+                known = False
+        elif name in ("chmod", "chown", "chgrp", "setfacl", "chattr"):
+            dests.extend(ops[1:])
+        elif name in _LA_READONLY_CMDS or name in ("find", "awk", "gawk", "mawk"):
+            if name in ("awk", "gawk", "mawk") and any("inplace" in a or ">" in a for a in args):
+                known = False
+        elif name in _LA_INTERP or name.startswith("python"):
+            if any(re.search(r"['\"][wax]b?\+?['\"]|write|shutil|copy|symlink|rename|replace|"
+                             r"writeFile|appendFile|createWriteStream|Set-Content|Out-File|>", a)
+                   for a in args):
+                for a in args:
+                    dests.extend(m.group(0).strip(" '\"=()") for m in re.finditer(r"[^\s'\"(),]+", a)
+                                 if ("/" in m.group(0) or "\\" in m.group(0) or m.group(0).startswith(".x")))
+            if name in ("perl", "ruby") and any(re.match(r"^-[a-zA-Z]*i", a) for a in args):
+                dests.extend(ops)
         elif name in ("set-content", "add-content", "out-file", "sc", "ac", "new-item", "ni",
-                      "copy-item", "move-item", "set-itemproperty", "tee-object"):
+                      "copy-item", "move-item", "cpi", "mi", "tee-object", "set-itemproperty"):
             for j, a in enumerate(args):
                 if a.lower() in ("-path", "-filepath", "-literalpath", "-destination") and j + 1 < len(args):
                     dests.append(args[j + 1])
-            if ops:
+            if name in ("copy-item", "move-item", "cpi", "mi"):
+                dests.extend(ops[1:2])
+            elif ops:
                 dests.append(ops[0])
-        elif name in _LA_INPLACE_CMDS:
-            if any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in args):
-                dests.extend(ops)
-            if name in ("perl", "ruby"):
-                dests.extend(a for a in args if LOGIN_AUTOSTART_PATH_RE.search(" " + a)
-                             or CRON_SPOOL_PATH_RE.search(" " + a))
-        elif name in ("chmod", "chown", "truncate", "touch", "patch", "ex", "ed", "vi", "vim", "nvim",
-                      "nano", "emacs", "crontab"):
-            if name in ("chmod", "chown"):
-                dests.extend(ops[1:])
-            elif name in ("patch", "ex", "ed", "vi", "vim", "nvim", "nano", "emacs"):
-                dests.extend(ops)
-        if (name in _LA_INTERP or name.startswith("python")) and any(
-                re.search(r"['\"][wax]b?\+?['\"]|write|shutil|copy|symlink|rename|replace|"
-                          r"writeFile|appendFile|createWriteStream|Set-Content|Out-File|>", a)
-                for a in args):
-            for a in args:
-                dests.extend(m.group(0).strip(" '\"=") for m in re.finditer(r"[^\s'\"]+", a)
-                             if ("/" in m.group(0) or "\\" in m.group(0) or m.group(0).startswith(".x")))
-    return dests, cds
+        else:
+            known = False
+        if not known:
+            unknown.extend(words[1:])
+    return dests, cds, unknown
 
 
 def la_shell_renderings(raw: str):
@@ -12236,23 +12326,23 @@ def login_autostart_activation_hit(r: str) -> bool:
         return True
     c, _ = _la_heredocs(r)
     c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
-    try:
-        lex = shlex.shlex(c[:200000], posix=False, punctuation_chars=";&|()")
-        lex.whitespace_split = True
-        lex.commenters = ""
-        toks = list(lex)[:20000]
-    except ValueError:
-        return login_autostart_cmd_hit(la_prose_free(r))
+    toks = [t for t in _la_tokens(c) if not (t and set(t) <= set("<>"))]
     for sc in _la_split_simple(toks):
-        w = list(sc)
-        while w and (re.match(r"^[A-Za-z_]\w*=", w[0]) or w[0].rsplit("/", 1)[-1].lower() in _LA_WRAPPERS
-                     or (w[0].startswith("-") and len(w) > 1)):
-            w = w[1:]
+        w = _la_strip_wrappers([_la_unquote(t) if t[:1] in "'\"" else t for t in sc])
         if not w:
             continue
         name = re.split(r"[/\\]", w[0])[-1].lower()
         if name.endswith(".exe"):
             name = name[:-4]
+        if name in ("at", "batch") and not re.search(r"[/\\]", w[0].replace("/usr/bin/", "").replace("/usr/local/bin/", "").replace("/bin/", "")):
+            rest = " ".join(w[1:])
+            if name == "batch" and re.fullmatch(r"(?:\s*-[fqmv]\S*(?:\s+\S+)?)*\s*(?:<.*)?", rest):
+                return True
+            if name == "at" and re.match(
+                    r"(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*\S+\s+)*(?:-t\s*\d|" + _LA_TIMESPEC + r")",
+                    rest, re.IGNORECASE):
+                return True
+            continue
         if name not in _LA_ACT_CMDS:
             continue
         text = " ".join(w)
