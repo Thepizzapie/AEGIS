@@ -1126,3 +1126,35 @@ def test_r16_var_subst_bounded(cmd):
     t0 = time.perf_counter()
     rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
     assert time.perf_counter() - t0 < 1.5
+
+
+# ---- QA round 17 regressions (assignments after keywords) ----------------------
+
+@pytest.mark.parametrize("cmd", [
+    'if [ "$EUID" -eq 0 ]; then DIR=/etc/xdg/autostart; else DIR="$HOME/.config/autostart"; fi\n'
+    'mkdir -p "$DIR"\ncp myapp.desktop "$DIR/"',
+    'if [ -z "${XDG_CONFIG_HOME:-}" ]; then CONFIG_DIR="$HOME/.config"; else CONFIG_DIR="$XDG_CONFIG_HOME"; fi; '
+    'mkdir -p "$CONFIG_DIR/autostart"; cp app.desktop "$CONFIG_DIR/autostart/"',
+    'if [ -z "$DIR" ]; then DIR=~/.config/autostart; fi; cp app.desktop "$DIR/"',
+    'install_desktop() { DEST="$HOME/.config/autostart"; mkdir -p "$DEST"; cp app.desktop "$DEST/"; }',
+    'install_autostart() { local dir="$HOME/.config/autostart"; mkdir -p "$dir"; cp app.desktop "$dir/"; }; install_autostart',
+    '{ DIR=~/.config/autostart; cp app.desktop "$DIR"; }',
+    'for i in 1; do DIR=~/.config/autostart; cp app.desktop "$DIR"; done',
+    'while true; do F=~/.xinitrc; break; done; echo "exec i3" >> "$F"',
+    "sudo DIR=/etc/xdg/autostart sh -c 'cp app.desktop $DIR'",
+    'for f in .xinitrc .xsession; do cp "dotfiles/$f" "$HOME/$f"; done',
+    "".join(f"V{i}=x\n" for i in range(300)) + 'DEST=~/.config/autostart\ncp app.desktop "$DEST/"',
+    "".join(f"D=/tmp/{i}\n" for i in range(6)) + 'D=~/.config/autostart\ncp app.desktop "$D/"',
+])
+def test_r17_assignments_after_keywords(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd[:100]
+
+
+@pytest.mark.parametrize("cmd", [
+    'for f in a.txt b.txt; do cp "$f" ~/backup/; done',
+    'if true; then OUT=build; fi; cp -r src "$OUT/"',
+])
+def test_r17_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

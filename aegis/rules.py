@@ -16529,7 +16529,7 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
             patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
             patterns.FETCH_TO_FILE_VERB_RE)))
     dests, cds, unknown = res
-    vm = patterns.la_var_map(r) if ("$" in r and "=" in r) else {}
+    vm = patterns.la_var_map(r) if "$" in r else {}
     memo = {}
 
     def subst(t):
@@ -16834,7 +16834,11 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     /.xinitrc}`` nested defaults and ``${HOME:?}``/``${HOME%/}`` modifiers,
     X-session dotfiles copied into a ``$HOME`` held in a variable, the
     destination-cap check running before substitution, and a contrived
-    chained-variable slowdown (substitution now memoized and capped)."""
+    chained-variable slowdown (substitution now memoized and capped).
+    Round 17 found that change dropped assignments after a keyword on the
+    same line (``then DIR=..``, ``{ DEST=..``, ``do F=..``, ``sudo DIR=..
+    sh -c``) -- leading reserved words/wrappers are now skipped -- and
+    ``for VAR in w1 w2`` values are mapped as VAR's values."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

@@ -12844,6 +12844,8 @@ _LA_DEFAULT_EXP_RE = re.compile(r"\$\{(?:[A-Za-z_]\w{0,63}|\d+):?[-=?+]([^{}]{0,
 
 
 _LA_DECL_WORDS = frozenset(("export", "local", "readonly", "declare", "typeset"))
+_LA_VM_LEAD = frozenset(("then", "do", "else", "elif", "if", "while", "until", "{", "}", "!",
+                         "time", "sudo", "doas", "env", "nohup", "command", "exec", "builtin"))
 
 
 def la_var_map(cmd: str) -> dict:
@@ -12855,6 +12857,17 @@ def la_var_map(cmd: str) -> dict:
     pairs = []
     for sc in list(_la_split_simple([_la_unquote(t) for t in _la_tokens_nocomment(c)]))[:20000]:
         w = list(sc)
+        # Leading reserved words / wrappers (QA round 17: `then DIR=..`,
+        # `{ DEST=..`, `do F=..`, `sudo DIR=.. sh -c ..`).
+        while w and (w[0] in _LA_VM_LEAD or (w[0].startswith("-") and len(w) > 1)):
+            w = w[1:]
+        if len(w) >= 3 and w[0] == "for" and w[2] == "in":
+            # `for VAR in w1 w2 ..` -- each word is a value of VAR.
+            for x in w[3:19]:
+                if x in ("do", ";"):
+                    break
+                pairs.append((w[1], x))
+            continue
         decl = bool(w) and w[0] in _LA_DECL_WORDS
         if decl:
             w = [x for x in w[1:] if not x.startswith("-")]
@@ -12865,13 +12878,13 @@ def la_var_map(cmd: str) -> dict:
                     break                  # first non-assignment word: the command
                 continue
             pairs.append((m.group(1), m.group(2)[:2000]))
-        if len(pairs) > 256:
+        if len(pairs) > 4000:
             break
     pairs += [(m.group(1), m.group(2)) for m in list(_LA_DEFAULT_ASSIGN_RE.finditer(c))[:64]]
-    for name, v in pairs[:320]:
+    for name, v in pairs[:4096]:
         v = re.sub(r"['\"]", "", v)
         if name in vm and v not in vm[name].split("\x00"):
-            if vm[name].count("\x00") < 3:
+            if vm[name].count("\x00") < 15:
                 vm[name] = vm[name] + "\x00" + v          # several values: try each
         else:
             vm.setdefault(name, v)
@@ -12892,7 +12905,7 @@ def la_var_subst(t: str, vm: dict, depth: int = 0) -> list:
         nxt = []
         for x in out:
             if rx.search(x):
-                for v in val.split("\x00")[:4]:
+                for v in val.split("\x00")[:16]:
                     nxt.append(rx.sub(lambda _m: v, x))
             nxt.append(x)
         out = list(dict.fromkeys(nxt))[:16]
