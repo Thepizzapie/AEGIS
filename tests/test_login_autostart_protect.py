@@ -1495,3 +1495,27 @@ def test_r26_many_distinct_files_perf():
     t0 = time.perf_counter()
     rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
     assert time.perf_counter() - t0 < 1.0
+
+
+# ---- QA round 27 (PASS) low-severity follow-ups --------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "echo '#!/bin/bash' > install.sh\necho 'cp app.desktop ~/.config/autostart/' >> install.sh\n"
+    + "".join(f"echo 'echo step {i}' >> install.sh\n" for i in range(70)) + "bash install.sh",
+    "cat > s.txt <<'EOF'\ncp a ~/.xinitrc\nEOF\nsh -e s.txt",
+    "echo 'cp x.desktop ~/.config/autostart/' > steps.txt && sh -e ./steps.txt",
+])
+def test_r27_followups_gated(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd[:100]
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'cp a ~/.xinitrc' > s.sh; tar czf s.tgz s.sh",
+    "echo 'cp a ~/.xinitrc' > s.sh; scp s.sh host:/tmp/",
+    "echo 'cp a ~/.xinitrc' > s.sh; shfmt -w s.sh",
+    "echo 'cp a ~/.xinitrc' > s.sh; date > ./s.sh",
+])
+def test_r27_followups_not_gated(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

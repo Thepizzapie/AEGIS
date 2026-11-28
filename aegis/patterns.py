@@ -12116,6 +12116,8 @@ _LA_HD_NONRUN = frozenset((
     "chmod", "chown", "shellcheck", "grep", "rg", "egrep", "echo", "printf", "rm", "cp", "mv",
     "md5sum", "sha256sum", "touch", "tee", "test", "[", "[[", "realpath", "readlink",
     "dirname", "basename", "mkdir", "gh", "vim", "nano", "code", "bat", "jq", "yq",
+    "tar", "zip", "gzip", "xz", "bzip2", "scp", "rsync", "shfmt", "dos2unix", "xxd", "find",
+    "ln", "prettier", "npx", "install", "hexdump", "od", "sort", "uniq", "cut",
 ))
 _LA_HD_RUNNERS = frozenset((
     "sh", "bash", "zsh", "dash", "ksh", "fish", "busybox", "source", ".", "perl", "node",
@@ -12134,12 +12136,16 @@ def _la_file_is_run(res: str, bn: str) -> bool:
     rx_ = re.compile(r"(?<![\w.-])" + re.escape(bn) + r"(?![\w.-])")
     is_doc = bool(re.search(r"\.(?:md|markdown|rst|txt|json|ya?ml|toml|html?|csv|xml|ini|cfg"
                             r"|adoc|org|tex|log|svg|lock)$", bn, re.I))
-    for mm in list(rx_.finditer(res))[:64]:
+    mentions = list(rx_.finditer(res))
+    if len(mentions) > 256:
+        return True                        # past the cap: fail closed (QA round 27)
+    for mm in mentions:
         seg = re.split(r"[;&\n(){}]|\|\|?", res[max(0, mm.start() - 2000):mm.start()])[-1]
         after = re.split(r"[;&\n(){}]", res[mm.end():mm.end() + 2000], maxsplit=1)[0]
         words = [w.strip("'\"") for w in seg.split()]
         if words and seg and not seg[-1].isspace():
             words = words[:-1]             # the mention's own path prefix (`bash ./x.txt`)
+            seg = seg[:len(seg.rstrip()) - len(seg.rstrip().split()[-1])] if seg.strip() else seg
         while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or words[0] in _LA_VM_LEAD
                          or words[0] in ("then", "if", "do", "time", "!", "command")):
             words = words[1:]
@@ -12159,7 +12165,8 @@ def _la_file_is_run(res: str, bn: str) -> bool:
             if not (first in _LA_HD_RUNNERS or first.startswith("python")):
                 continue
             rest = words[1:]
-            if any(w in ("-m", "-c", "-e", "-n", "--check") for w in rest):
+            shellish = first in ("sh", "bash", "zsh", "dash", "ksh", "fish", "busybox", "source", ".")
+            if any(w in (("-c", "-n") if shellish else ("-m", "-c", "-e", "-n", "--check")) for w in rest):
                 continue
             ops = [w for w in rest if not w.startswith("-")]
             if ops:
@@ -12868,6 +12875,7 @@ def la_shell_renderings(raw: str, _depth: int = 0):
                 continue
             if bn_ not in run_cache:
                 if len(run_cache) >= 64:
+                    out.append(body_.replace("\\n", "\n"))   # past the cap: fail closed
                     continue
                 run_cache[bn_] = _la_file_is_run(outer[m.end():], bn_)
             if run_cache[bn_]:

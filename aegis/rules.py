@@ -16887,7 +16887,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     body judged), ``bash ./steps.txt`` path-prefixed doc scripts, and
     ``echo .. | tee s.sh`` writes. Still out of scope: copying a whole
     parent tree (``cp -a .config ~/``, ``stow``) and a written script run
-    through ``eval "$(cat s.sh)"``."""
+    through ``eval "$(cat s.sh)"``. Round 27 (acceptance): PASS -- no HIGH
+    or MEDIUM; its LOW follow-ups closed (mention/file caps now fail
+    closed, ``sh -e doc.txt``, more non-running tools, path-prefixed
+    redirect-into). Remaining disclosed LOW: write-then-run scripts built
+    from multi-argument ``printf``/``echo`` or ``{ ..; } > f`` groups, a
+    ``$(bash s.sh)`` run inside a substitution, and ``bash < doc.txt``."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
