@@ -1314,3 +1314,32 @@ def test_r21_gaps_closed(cmd):
 ])
 def test_r21_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 22 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    'CONFIG_DIR="$HOME/.config"\nAUTOSTART_DIR="$CONFIG_DIR/autostart"\nDESKTOP_FILE="$AUTOSTART_DIR/app.desktop"\n'
+    'cat > "$DESKTOP_FILE" <<EOF\n[Desktop Entry]\nExec=x\nEOF',
+    'CONF="$HOME/.config"\nAUTOSTART_DIR="$CONF/autostart"\nDESKTOP_FILE="$AUTOSTART_DIR/myapp.desktop"\n'
+    'cp myapp.desktop "$DESKTOP_FILE"',
+    'ROOT=/etc\nCRON=$ROOT/cron.d\nF=$CRON/myjob\necho "* * * * * root x" | sudo tee "$F"',
+    'SPOOL=/var/spool\nCRONDIR=$SPOOL/cron/crontabs\nF=$CRONDIR/root\nsudo cp tab "$F"',
+    'A=$HOME/.config; B=${A}/autostart; C=$B/app.desktop; cp x "$C"',
+    "parallel cp {} ~/.config/autostart/ ::: a.desktop",
+    "cat > /tmp/s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\nbash /tmp/s.sh",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\n./s.sh",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\nsource s.sh",
+])
+def test_r22_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd[:100]
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat > notes.md <<EOF\n# Meeting\nAt 10am Monday we sync.\nEOF\ngit add notes.md",
+    "cat > README.md <<'EOF'\n```bash\ncp app.desktop ~/.config/autostart/\n```\nEOF\ngit add README.md",
+])
+def test_r22_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

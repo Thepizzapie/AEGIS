@@ -12286,7 +12286,15 @@ def _la_heredocs(cmd: str):
     # `./setup.sh`, `source f`): its body is code (QA round 12).
     for target, body in written[:64]:
         bn = re.split(r"[/\\]", target)[-1]
-        if bn and len(re.findall(r"(?<![\w.-])" + re.escape(bn) + r"(?![\w.-])", res)) >= 2:
+        if not bn:
+            continue
+        b_ = r"['\"]?(?:[^\s'\";&|]*/)?" + re.escape(bn) + r"(?![\w.-])"
+        # Only a mention that RUNS the file counts (QA round 22: `git add
+        # notes.md` is not running it).
+        if re.search(r"\b(?:(?:ba|z|da|k|fi)?sh|source|python[\d.]*|perl|node|ruby|php|exec|nohup|"
+                     r"env|sudo|doas|at\s+(?:-\S+\s+)*-f|batch\s+(?:-\S+\s+)*-f)\s+(?:-\S+\s+)*" + b_, res) or \
+                re.search(r"(?:^|[;&|(\n])\s*\.\s+" + b_, res) or \
+                re.search(r"(?:^|[;&|(\n])\s*(?:\./|/|~/)(?:[^\s'\";&|]*/)?" + re.escape(bn) + r"(?![\w.-])", res):
             code.append(body)
     # A body stored in a variable and later run (`S=$(cat <<EOF..)` /
     # `read -d '' S <<EOF`, then `eval "$S"` / `bash -c "$S"`).
@@ -12545,6 +12553,9 @@ def la_shell_destinations(cmd: str):
                     elif re.fullmatch(r"-C.+", a_):
                         cds.append(a_[2:])
                 break
+        for sep_ in (":::", "::::", ":::+", "::::+"):
+            if sep_ in words:
+                words = words[:words.index(sep_)]      # GNU parallel input list
         words = _la_strip_wrappers(words)
         if not words:
             continue
@@ -12980,13 +12991,30 @@ def la_var_map(cmd: str) -> dict:
         if len(pairs) > 4000:
             break
     pairs += [(m.group(1), m.group(2)) for m in list(_LA_DEFAULT_ASSIGN_RE.finditer(c))[:64]]
+    latest = {}
     for name, v in pairs[:4096]:
         v = re.sub(r"['\"]", "", v)
+        res_ = []
+        if "$" in v and vm:
+            # Resolve against what is already known, in order, so a chain
+            # A=..; B=$A/..; C=$B/.. is followed in one linear pass (QA
+            # round 22); keep the raw spelling as a fallback value.
+            r_ = re.sub(r"\$\{([A-Za-z_]\w{0,63})\}|\$([A-Za-z_]\w{0,63})",
+                        lambda mm: latest.get(mm.group(1) or mm.group(2), mm.group(0)), v)
+            res_ = [r_] if (r_ != v and len(r_) <= 1024) else []
+            if res_:
+                for x in res_:
+                    if name in vm and x not in vm[name].split("\x00"):
+                        if vm[name].count("\x00") < 15:
+                            vm[name] += "\x00" + x
+                    else:
+                        vm.setdefault(name, x)
         if name in vm and v not in vm[name].split("\x00"):
             if vm[name].count("\x00") < 15:
                 vm[name] = vm[name] + "\x00" + v          # several values: try each
         else:
             vm.setdefault(name, v)
+        latest[name] = res_[0] if res_ else v
     return vm
 
 

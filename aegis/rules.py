@@ -16856,7 +16856,13 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     so an attached value ending in a value-letter (``sudo -uroot``,
     ``xargs -d'\\n'``) swallowed the command -- bundles are now read left
     to right -- and ``flock/script/sg -c``, ``env -S`` and ``watch``
-    command strings dropped; those bodies are now judged as commands."""
+    command strings dropped; those bodies are now judged as commands.
+    Round 22 (no HIGH) found round 21's bounded substitution stopped
+    following 3-variable chains (``CONF=..; AUTOSTART_DIR=$CONF/autostart;
+    F=$AUTOSTART_DIR/x.desktop``) -- chains are now resolved in order, in
+    one linear pass, while the map is built -- plus a heredoc-written file
+    "named again" by ``git add`` treated as run (now only a run counts) and
+    GNU ``parallel .. :::`` input lists."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
