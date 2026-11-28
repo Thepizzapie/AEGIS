@@ -1158,3 +1158,33 @@ def test_r17_assignments_after_keywords(cmd):
 ])
 def test_r17_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 18 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "echo x | at -t \"$(date -d '+1 hour' +%Y%m%d%H%M)\"",
+    "echo x | at -t $(date +%Y%m%d%H%M)",
+    "echo x | at -t `date +%m%d%H%M`",
+    'TS=$(date -d tomorrow +%Y%m%d0300); echo x | at -t "$TS"',
+    'at -t "$STAMP" -f job.sh',
+    'schedule() { echo "$1" | at "$2"; }; schedule /opt/x "now + 1 hour"',
+    'echo x | at "$1"',
+    'echo x | at "${1:-now}"',
+    'echo x | at -m "$@"',
+    "gh release download v1 -D ~/.config/autostart",
+])
+def test_r18_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    'gh pr create --title t --body "Explains ~/.config/autostart usage"',
+    'gh issue create --body "Writes ~/.xinitrc"',
+    'gh api repos/o/r/issues -f body="install to ~/.config/autostart"',
+    'gh pr create --title "fix ~/.xinitrc handling" --body-file notes.md',
+])
+def test_r18_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

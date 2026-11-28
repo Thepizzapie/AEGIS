@@ -16838,7 +16838,11 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     Round 17 found that change dropped assignments after a keyword on the
     same line (``then DIR=..``, ``{ DEST=..``, ``do F=..``, ``sudo DIR=..
     sh -c``) -- leading reserved words/wrappers are now skipped -- and
-    ``for VAR in w1 w2`` values are mapped as VAR's values."""
+    ``for VAR in w1 w2`` values are mapped as VAR's values. Round 18 (no
+    HIGH) found ``at -t "$(date ..)"``/``at -t "$TS"`` computed timestamps
+    and positional ``at "$1"``/``"$@"`` times allowed, and prose flags of
+    ``gh``/``glab`` (``--body "..~/.xinitrc.."``) failing closed as
+    unknown-command paths; all closed (download destinations still count)."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

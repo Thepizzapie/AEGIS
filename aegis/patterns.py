@@ -11965,11 +11965,11 @@ _LA_TIMESPEC = (
     r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b"
     r"|(?:january|february|march|april|may|june|july|august|september|october"
     r"|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b"
-    r"|SUBST\b|\$\{?[A-Za-z_])"
+    r"|SUBST\b|\$\{?(?:[A-Za-z_]|\d|[@*]))"
 )
 LOGIN_AUTOSTART_CMD_RE = re.compile(
     _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
-    + r"(?:-t\s*\d|" + _LA_TIMESPEC + r")"
+    + r"(?:-t\s*['\"]?(?:\d|SUBST\b|\$|`)|" + _LA_TIMESPEC + r")"
     + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
     + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))"
     + r"|\bosascript\b[^|;&\n]{0,400}?\blogin\s+items?\b"
@@ -12627,6 +12627,26 @@ def la_shell_destinations(cmd: str):
                     dests.append(args[j + 1])
                 elif re.match(r"^(?:-[A-Za-z]*o|--output=)(.+)", a):
                     dests.append(re.match(r"^(?:-[A-Za-z]*o|--output=)(.+)", a).group(1))
+        elif name in ("gh", "glab", "hub", "jira", "linear"):
+            # Values of prose flags are text, not paths (QA round 18);
+            # download/clone destinations still count.
+            prose = {"--title", "-t", "--body", "-b", "--message", "-m", "--summary",
+                     "--description", "--notes", "-n", "--comment", "--text"}
+            skip = set()
+            for j, a in enumerate(args):
+                if a in prose and j + 1 < len(args):
+                    skip.add(j + 1)
+                elif a in ("-f", "-F", "--field", "--raw-field") and j + 1 < len(args) and \
+                        re.match(r"^(?:body|title|message|text|description)=", args[j + 1]):
+                    skip.add(j + 1)
+            rest = [a for j, a in enumerate(args) if j not in skip and not
+                    re.match(r"^--(?:title|body|message|summary|description|notes|comment|text)=", a)]
+            for j, a in enumerate(rest):
+                if a in ("-D", "--dir", "--output", "-O") and j + 1 < len(rest):
+                    dests.append(rest[j + 1])
+            if any(a in ("clone", "download", "archive") for a in rest[:3]):
+                unknown.extend(rest)
+            continue
         elif name == "git":
             sub = next((a for a in args if not a.startswith("-")), "")
             if sub in ("clone", "worktree", "submodule", "archive", "checkout-index", "-C") or "-C" in args:
@@ -12707,7 +12727,7 @@ def la_shell_renderings(raw: str, _depth: int = 0):
 
 LA_AT_RE = re.compile(
     _LA_CMDPOS_BATCH + r"at(?:\.exe)?\s+(?:-[mMvVk]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
-    + r"(?:-t\s*\d|-[A-Za-z]*b[A-Za-z]*(?=\s|$|[;&|)])|" + _LA_TIMESPEC + r")"
+    + r"(?:-t\s*['\"]?(?:\d|SUBST\b|\$|`)|-[A-Za-z]*b[A-Za-z]*(?=\s|$|[;&|)])|" + _LA_TIMESPEC + r")"
     + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
     + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))",
     re.IGNORECASE)
@@ -12752,7 +12772,7 @@ def login_autostart_activation_hit(r: str) -> bool:
             if name == "batch" and not quoted_name and re.fullmatch(r"(?:\s*-[fqmv]\S*(?:\s+\S+)?)*\s*(?:<.*)?", rest):
                 return True
             if name == "at" and re.match(
-                    r"(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*\S+\s+)*(?:-t\s*\d|-[A-Za-z]*b[A-Za-z]*(?:\s|$)|" + _LA_TIMESPEC + r")",
+                    r"(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*\S+\s+)*(?:-t\s*['\"]?(?:\d|SUBST\b|\$|`)|-[A-Za-z]*b[A-Za-z]*(?:\s|$)|" + _LA_TIMESPEC + r")",
                     rest, re.IGNORECASE):
                 return True
             continue
