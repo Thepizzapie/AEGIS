@@ -12564,6 +12564,11 @@ def la_shell_destinations(cmd: str):
                 for src in ops[:64]:
                     if src != td:
                         bn = re.split(r"[/\\]", src.rstrip("/\\"))[-1]
+                        if "$" in src:
+                            # Resolved by the caller once variables are known:
+                            # only the value's BASENAME lands in td (QA round 15).
+                            dests.append("\x01" + td + "\x02" + src)
+                            continue
                         if bn and bn not in (".", "..") and (
                                 not re.match(r"^\.[xX]", bn) or _LA_HOME_RE.match(td)):
                             # X-session dotfiles count only in a HOME dir
@@ -12832,19 +12837,21 @@ def _la_glob_resolve(out: list, cap: int) -> list:
 # computed at run time stay a disclosed limitation.)
 _LA_ASSIGN_RE = re.compile(
     r"(?:^|[\s;&|(])(?:export\s+|local\s+|readonly\s+|declare\s+(?:-\S+\s+)*|typeset\s+(?:-\S+\s+)*)?"
-    r"([A-Za-z_]\w{0,63})=(\"(?:[^\"\\]|\\.){0,2000}\"|'[^']{0,2000}'|[^\s;&|()<>'\"]{0,2000})")
+    r"([A-Za-z_]\w{0,63})=((?:\"(?:[^\"\\]|\\.){0,2000}\"|'[^']{0,2000}'|\$\{[^}\s]{0,400}\}|[^\s;&|()<>'\"]){0,64})")
+_LA_DEFAULT_ASSIGN_RE = re.compile(r"\$\{([A-Za-z_]\w{0,63}):?=([^}]{0,2000})\}")
+_LA_DEFAULT_EXP_RE = re.compile(r"\$\{(?:[A-Za-z_]\w{0,63}|\d+):?[-=?+]([^{}]{0,2000})\}")
 
 
 def la_var_map(cmd: str) -> dict:
     vm = {}
-    for m in list(_LA_ASSIGN_RE.finditer(cmd[:200000]))[:256]:
-        v = m.group(2)
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-            v = v[1:-1]
-        if m.group(1) in vm and vm[m.group(1)] != v:
-            vm[m.group(1)] = vm[m.group(1)] + "\x00" + v      # several values: try each
+    pairs = [(m.group(1), m.group(2)) for m in list(_LA_ASSIGN_RE.finditer(cmd[:200000]))[:256]]
+    pairs += [(m.group(1), m.group(2)) for m in list(_LA_DEFAULT_ASSIGN_RE.finditer(cmd[:200000]))[:64]]
+    for name, v in pairs:
+        v = re.sub(r"['\"]", "", v)                  # `"$HOME"/.config/autostart` (QA round 15)
+        if name in vm and vm[name] != v:
+            vm[name] = vm[name] + "\x00" + v              # several values: try each
         else:
-            vm[m.group(1)] = v
+            vm[name] = v
     return vm
 
 
@@ -12894,4 +12901,18 @@ def la_var_bodies(cmd: str, vm: dict) -> list:
     for name in list(dict.fromkeys(names))[:64]:
         if name in vm:
             out.extend(vm[name].split("\x00")[:4])
+    return out
+
+
+def la_default_forms(t: str) -> list:
+    """`${X:-word}` / `${X:=word}` / `${1:-word}` also read as `word`
+    (QA round 15: `echo x >> "${XINITRC:-$HOME/.xinitrc}"`)."""
+    if "${" not in t:
+        return [t]
+    out = [t]
+    for _ in range(3):
+        nxt = _LA_DEFAULT_EXP_RE.sub(lambda m: m.group(1), out[-1])
+        if nxt == out[-1]:
+            break
+        out.append(nxt)
     return out

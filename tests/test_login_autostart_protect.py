@@ -1038,3 +1038,35 @@ def test_r14_variable_paths(cmd):
 ])
 def test_r14_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 15 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    'echo "exec i3" >> "${XINITRC:-$HOME/.xinitrc}"',
+    'XINITRC="${XINITRC:-$HOME/.xinitrc}"; echo "exec i3" >> "$XINITRC"',
+    'cp x.desktop "${AUTOSTART:-~/.config/autostart}/x.desktop"',
+    'cp x.desktop "${1:-/etc/xdg/autostart}"',
+    'DEST=${1:-$HOME/.config/autostart}; cp x.desktop "$DEST"',
+    'D="${D:-/etc/periodic/daily}"; sudo cp x "$D/600.x"',
+    ': "${DEST:=$HOME/.config/autostart}"; cp x.desktop "$DEST/"',
+    'DEST="$HOME"/.config/autostart; cp x.desktop "$DEST"/',
+    'DEST="$HOME"/.xinitrc; echo exec i3 > "$DEST"',
+    "".join(f"cp a{i} b{i}\n" for i in range(1100)) + "cp x ~/.config/autostart/",
+    'S=x.desktop; cp "$S" ~/.config/autostart/',
+])
+def test_r15_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd[:80]
+
+
+@pytest.mark.parametrize("cmd", [
+    "SRC=/etc/xdg/autostart/x.desktop; cp \"$SRC\" .",
+    'F=~/.xinitrc; cp "$F" /tmp/',
+    'AUTOSTART=~/.config/autostart; cp -r "$AUTOSTART" ~/backup/',
+    'XINITRC=~/.xinitrc; [ -f "$XINITRC" ] && cp "$XINITRC" "$XINITRC.bak"',
+    'OUT="${OUT:-build}"; cp -r src "$OUT/"',
+])
+def test_r15_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

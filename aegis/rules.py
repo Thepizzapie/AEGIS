@@ -16488,6 +16488,7 @@ def _la_dest_hit(d: str, bases) -> bool:
     forms = [d]
     if "\\" in d and not re.match(r"^[A-Za-z]:|^\\\\", d):
         forms.append(d.replace("\\", ""))         # `auto\start` is `autostart` in a shell
+    forms = [x for f in forms for x in patterns.la_default_forms(f)]
     for f in forms:
         for c in patterns.la_glob_candidates(f):
             if patterns.login_autostart_path_hit(c) or patterns.login_autostart_dir_hit(c):
@@ -16529,6 +16530,21 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
             patterns.FETCH_TO_FILE_VERB_RE)))
     dests, cds, unknown = res
     vm = patterns.la_var_map(r) if ("$" in r and "=" in r) else {}
+    if len(dests) > 2000 and any(patterns.login_autostart_maybe_target(d) for d in dests[2000:]):
+        return True                       # past the destination cap: fail closed (QA round 15)
+    joined = []
+    for d in dests:
+        if d.startswith("\x01"):
+            td, src = d[1:].split("\x02", 1)
+            for sv in (patterns.la_var_subst(src, vm) if vm else [src]):
+                for sv2 in patterns.la_default_forms(sv):
+                    bn = re.split(r"[/\\]", sv2.rstrip("/\\"))[-1]
+                    if bn and "$" not in bn and bn not in (".", "..") and (
+                            not re.match(r"^\.[xX]", bn) or patterns._LA_HOME_RE.match(td)):
+                        joined.append(td.rstrip("/\\") + "/" + bn)
+        else:
+            joined.append(d)
+    dests = joined
     if vm:
         dests = [x for d in dests[:2000] for x in patterns.la_var_subst(d, vm)]
         cds = [x for d in cds[:64] for x in patterns.la_var_subst(d, vm)]
@@ -16785,7 +16801,13 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``${NAME:-..}`` references before destination analysis, and a string
     variable later run via ``eval``/``sh -c``/``echo "$S" | sh``/``sh <<<``
     is judged as code. Values computed at run time or assembled across
-    loops remain out of scope."""
+    loops remain out of scope. Round 15 found ``${VAR:-default}``/
+    ``${VAR:=default}`` defaults (the overridable-default idiom) never
+    read as the default path, quote-split values (``DEST="$HOME"/.xinitrc``)
+    truncated, padding past the 2000-destination cap (now fails closed),
+    and a round-14 false positive -- copying FROM a variable holding a
+    target (``cp "$F" /tmp/``) -- now only the value's basename lands in
+    the destination dir, as for a literal source."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
