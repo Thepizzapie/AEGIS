@@ -12392,6 +12392,7 @@ _LA_READONLY_CMDS = frozenset((
     "systemctl", "journalctl", "pgrep", "ps", "id", "whoami", "date", "sleep", "wait",
     "read", "export", "unset", "local", "declare", "typeset", "set", "shift", "return",
     "exit", "break", "continue", "trap", "alias", "unalias", "hash", "history",
+    "for", "select", "case", "in",
     "get-content", "gc", "type", "select-string", "sls", "get-childitem", "gci", "get-item",
     "gi", "test-path", "resolve-path", "get-itemproperty", "gp", "write-host", "write-output",
 ))
@@ -12564,7 +12565,7 @@ def la_shell_destinations(cmd: str):
                 for src in ops[:64]:
                     if src != td:
                         bn = re.split(r"[/\\]", src.rstrip("/\\"))[-1]
-                        if "$" in src:
+                        if "$" in src or "$" in td:
                             # Resolved by the caller once variables are known:
                             # only the value's BASENAME lands in td (QA round 15).
                             dests.append("\x01" + td + "\x02" + src)
@@ -12842,16 +12843,38 @@ _LA_DEFAULT_ASSIGN_RE = re.compile(r"\$\{([A-Za-z_]\w{0,63}):?=([^}]{0,2000})\}"
 _LA_DEFAULT_EXP_RE = re.compile(r"\$\{(?:[A-Za-z_]\w{0,63}|\d+):?[-=?+]([^{}]{0,2000})\}")
 
 
+_LA_DECL_WORDS = frozenset(("export", "local", "readonly", "declare", "typeset"))
+
+
 def la_var_map(cmd: str) -> dict:
+    """NAME -> value for assignments at a COMMAND-WORD position, read from
+    the quote-aware tokenizer (QA round 16: ` PATH=..` inside an earlier
+    quoted string is prose, not an assignment), plus `: ${X:=v}` forms."""
     vm = {}
-    pairs = [(m.group(1), m.group(2)) for m in list(_LA_ASSIGN_RE.finditer(cmd[:200000]))[:256]]
-    pairs += [(m.group(1), m.group(2)) for m in list(_LA_DEFAULT_ASSIGN_RE.finditer(cmd[:200000]))[:64]]
-    for name, v in pairs:
-        v = re.sub(r"['\"]", "", v)                  # `"$HOME"/.config/autostart` (QA round 15)
-        if name in vm and vm[name] != v:
-            vm[name] = vm[name] + "\x00" + v              # several values: try each
+    c, _ = _la_heredocs(cmd[:200000])
+    pairs = []
+    for sc in list(_la_split_simple([_la_unquote(t) for t in _la_tokens_nocomment(c)]))[:20000]:
+        w = list(sc)
+        decl = bool(w) and w[0] in _LA_DECL_WORDS
+        if decl:
+            w = [x for x in w[1:] if not x.startswith("-")]
+        for x in w[:32]:
+            m = re.match(r"^([A-Za-z_]\w{0,63})=(.*)$", x, re.S)
+            if not m:
+                if not decl:
+                    break                  # first non-assignment word: the command
+                continue
+            pairs.append((m.group(1), m.group(2)[:2000]))
+        if len(pairs) > 256:
+            break
+    pairs += [(m.group(1), m.group(2)) for m in list(_LA_DEFAULT_ASSIGN_RE.finditer(c))[:64]]
+    for name, v in pairs[:320]:
+        v = re.sub(r"['\"]", "", v)
+        if name in vm and v not in vm[name].split("\x00"):
+            if vm[name].count("\x00") < 3:
+                vm[name] = vm[name] + "\x00" + v          # several values: try each
         else:
-            vm[name] = v
+            vm.setdefault(name, v)
     return vm
 
 
@@ -12909,8 +12932,9 @@ def la_default_forms(t: str) -> list:
     (QA round 15: `echo x >> "${XINITRC:-$HOME/.xinitrc}"`)."""
     if "${" not in t:
         return [t]
-    out = [t]
-    for _ in range(3):
+    t2 = re.sub(r"\$\{([A-Za-z_]\w{0,63})(?::?\?[^{}]*|%%?[^{}]*|##?[^{}]*)?\}", r"$\1", t)
+    out = [t] if t2 == t else [t, t2]
+    for _ in range(4):
         nxt = _LA_DEFAULT_EXP_RE.sub(lambda m: m.group(1), out[-1])
         if nxt == out[-1]:
             break

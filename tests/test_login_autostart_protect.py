@@ -1070,3 +1070,59 @@ def test_r15_gaps_closed(cmd):
 ])
 def test_r15_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 16 regressions ---------------------------------------------------
+
+R16_GATED = [
+    'BIN_DIR="$HOME/.local/bin"\necho "Make sure PATH contains it: export PATH=$BIN_DIR:\\$PATH"\n'
+    'AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"\nmkdir -p "$AUTOSTART_DIR"\n'
+    'cp app.desktop "$AUTOSTART_DIR/"',
+    'python3 -c "import sys; v=1"\nD="$HOME/.config/autostart"; cp a.desktop "$D/"',
+    'node -e "const a=1"\nAS=~/.config/autostart\ncp a.desktop "$AS"',
+    'git commit -m "set PORT=8080"\nX="$HOME/.xinitrc"\necho "exec i3" >> "$X"',
+    'echo "Run: export PATH=$HOME/.local/bin:\\$PATH"\nCRON_FILE=/var/spool/cron/crontabs/$USER\n'
+    'echo "@reboot x" | sudo tee -a "$CRON_FILE"',
+    'echo "exec i3" >> "${XINITRC:-${HOME}/.xinitrc}"',
+    'cat > "${XSESSION:-${HOME}/.xsession}" <<EOF\nexec i3\nEOF',
+    'XINITRC="${XINITRC:-${HOME}/.xinitrc}"; echo "exec i3" >> "$XINITRC"',
+    'ln -sf "$PWD/xinitrc" "${XINITRC:-${HOME}/.xinitrc}"',
+    'cp app.desktop "${AUTOSTART:-${XDG_CONFIG_HOME}/autostart}/"',
+    'DEST=$HOME; cp dotfiles/.xinitrc "$DEST/"',
+    'TARGET="$HOME"; cp .xinitrc "$TARGET"',
+    'H=~; cp dotfiles/.xsession "$H/"',
+    'DEST="${DEST:-$HOME}"; cp dotfiles/.xinitrc "$DEST/"',
+    'cp dotfiles/.xinitrc "${DEST:-$HOME}/"',
+    'cp dotfiles/.xinitrc "${HOME:?}/"',
+    'cp dotfiles/.xinitrc "${HOME%/}/"',
+    "".join(f"cp a{i} b{i}\n" for i in range(2100)) + 'D=~/.config/autostart\ncp x "$D"',
+]
+
+
+@pytest.mark.parametrize("cmd", R16_GATED)
+def test_r16_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd[:100]
+
+
+@pytest.mark.parametrize("cmd", [
+    'for f in ~/.config/autostart/*.desktop; do echo "$f"; done',
+    "for f in /etc/cron.d/*; do echo $f; done",
+    'F=~/.config/autostart/a.desktop; cp "$F" /tmp/',
+    'DEST=$HOME/backup; cp ~/.xinitrc "$DEST/"',
+    'echo "export X=~/.xinitrc"\ncp a b',
+])
+def test_r16_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "\n".join(f'D=/tmp/b{i}; cp "$D/$E" "$D/$E/{i}"; E=$D' for i in range(1500)) + "\n:cron",
+    "\n".join(f'A=/tmp/{i}; B=$A/$C; C=$B/$D; D=$C/$A; cp "$A" "$B/$C/$D"' for i in range(1500)) + "\n:cron",
+])
+def test_r16_var_subst_bounded(cmd):
+    from aegis import rules
+    t0 = time.perf_counter()
+    rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert time.perf_counter() - t0 < 1.5

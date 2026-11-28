@@ -16530,25 +16530,45 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
             patterns.FETCH_TO_FILE_VERB_RE)))
     dests, cds, unknown = res
     vm = patterns.la_var_map(r) if ("$" in r and "=" in r) else {}
-    if len(dests) > 2000 and any(patterns.login_autostart_maybe_target(d) for d in dests[2000:]):
-        return True                       # past the destination cap: fail closed (QA round 15)
+    memo = {}
+
+    def subst(t):
+        if not vm or "$" not in t:
+            return [t]
+        if t not in memo:
+            if len(memo) > 4000:
+                return [t]
+            memo[t] = patterns.la_var_subst(t, vm)
+        return memo[t]
+
+    def spellings(t):
+        return list(dict.fromkeys(y for x in subst(t) for y in patterns.la_default_forms(x)))[:16]
+
+    udests = list(dict.fromkeys(dests))
+    if len(udests) > 2000:
+        tail = udests[2000:]
+        if any(patterns.login_autostart_maybe_target(d) for d in tail) or any(
+                patterns.login_autostart_maybe_target(x) for d in [t for t in tail if "$" in t][:2000]
+                for x in spellings(d.replace("\x01", "").replace("\x02", "/"))):
+            return True                   # past the destination cap: fail closed (QA rounds 15-16)
     joined = []
-    for d in dests:
+    for d in udests[:2000]:
         if d.startswith("\x01"):
             td, src = d[1:].split("\x02", 1)
-            for sv in (patterns.la_var_subst(src, vm) if vm else [src]):
-                for sv2 in patterns.la_default_forms(sv):
-                    bn = re.split(r"[/\\]", sv2.rstrip("/\\"))[-1]
-                    if bn and "$" not in bn and bn not in (".", "..") and (
-                            not re.match(r"^\.[xX]", bn) or patterns._LA_HOME_RE.match(td)):
-                        joined.append(td.rstrip("/\\") + "/" + bn)
+            tds = spellings(td)
+            for sv in spellings(src):
+                bn = re.split(r"[/\\]", sv.rstrip("/\\"))[-1]
+                if not bn or "$" in bn or bn in (".", ".."):
+                    continue
+                for tdv in tds:
+                    if not re.match(r"^\.[xX]", bn) or patterns._LA_HOME_RE.match(tdv):
+                        joined.append(tdv.rstrip("/\\") + "/" + bn)
         else:
-            joined.append(d)
-    dests = joined
+            joined.extend(spellings(d) if "$" in d else [d])
+    dests = list(dict.fromkeys(joined))
     if vm:
-        dests = [x for d in dests[:2000] for x in patterns.la_var_subst(d, vm)]
-        cds = [x for d in cds[:64] for x in patterns.la_var_subst(d, vm)]
-        unknown = [x for d in unknown[:2000] for x in patterns.la_var_subst(d, vm)]
+        cds = [x for d in cds[:64] for x in subst(d)]
+        unknown = [x for d in unknown[:2000] for x in subst(d)]
     ucds = list(dict.fromkeys(cds))
     if len(ucds) > 16 and any(patterns.login_autostart_maybe_target(x) for x in ucds):
         return True                       # past the cd cap: fail closed (QA round 7)
@@ -16807,7 +16827,14 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     truncated, padding past the 2000-destination cap (now fails closed),
     and a round-14 false positive -- copying FROM a variable holding a
     target (``cp "$F" /tmp/``) -- now only the value's basename lands in
-    the destination dir, as for a literal source."""
+    the destination dir, as for a literal source. Round 16 found
+    assignments matched inside earlier quoted prose (``echo "export
+    PATH=.."`` swallowed the next real assignment -- now read from the
+    quote-aware tokenizer at command-word position only), ``${X:-${HOME}
+    /.xinitrc}`` nested defaults and ``${HOME:?}``/``${HOME%/}`` modifiers,
+    X-session dotfiles copied into a ``$HOME`` held in a variable, the
+    destination-cap check running before substitution, and a contrived
+    chained-variable slowdown (substitution now memoized and capped)."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
