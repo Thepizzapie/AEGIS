@@ -12085,7 +12085,7 @@ def _la_substitutions(cmd: str, limit: int = 64):
 _LA_QBODY = r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
 _LA_ECHO_WRITE_RE = re.compile(
     r"\b(?:echo|printf)\s+(?:-\S+\s+)*(?:'%s\\n'\s+)?" + r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
-    r"\s*>>?\s*['\"]?([^\s'\";&|<>()]+)")
+    r"\s*(?:>>?\s*['\"]?([^\s'\";&|<>()]+)|\|\s*(?:sudo\s+(?:-\S+\s+)*)?tee\s+(?:-\S+\s+)*['\"]?([^\s'\";&|<>()]+))")
 _LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*" + _LA_QBODY)
 # `su -c BODY` / `runuser -c BODY`, `sh <<< BODY`, `echo BODY | sh` (QA round 6).
 _LA_EXTRA_BODY_RES = (
@@ -12138,6 +12138,8 @@ def _la_file_is_run(res: str, bn: str) -> bool:
         seg = re.split(r"[;&\n(){}]|\|\|?", res[max(0, mm.start() - 2000):mm.start()])[-1]
         after = re.split(r"[;&\n(){}]", res[mm.end():mm.end() + 2000], maxsplit=1)[0]
         words = [w.strip("'\"") for w in seg.split()]
+        if words and seg and not seg[-1].isspace():
+            words = words[:-1]             # the mention's own path prefix (`bash ./x.txt`)
         while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or words[0] in _LA_VM_LEAD
                          or words[0] in ("then", "if", "do", "time", "!", "command")):
             words = words[1:]
@@ -12852,18 +12854,23 @@ def la_shell_renderings(raw: str, _depth: int = 0):
     out.extend(code)
     for rx in (_LA_EVAL_BODY_RE,) + _LA_EXTRA_BODY_RES:
         out.extend((m.group(1) or m.group(2) or "") for m in rx.finditer(outer))
-    seen_bn = set()
-    if ">" in outer and ("echo" in outer or "printf" in outer):
-        for m in list(_LA_ECHO_WRITE_RE.finditer(outer))[:256]:
-            body_, f_ = (m.group(1) or m.group(2) or ""), m.group(3)
-            # Only a body that could matter, once per file (QA round 25 perf).
+    run_cache = {}
+    if ("echo" in outer or "printf" in outer) and (">" in outer or "tee" in outer):
+        for m in list(_LA_ECHO_WRITE_RE.finditer(outer))[:512]:
+            body_, f_ = (m.group(1) or m.group(2) or ""), (m.group(3) or m.group(4) or "")
+            # Only a body that could matter (QA round 25 perf); the run check
+            # is cached per FILE, every body judged (QA round 26: a script
+            # built with several `echo .. >>` lines).
             if not (login_autostart_maybe_target(body_) or login_autostart_activation_maybe(body_)):
                 continue
             bn_ = re.split(r"[/\\]", f_)[-1]
-            if not bn_ or bn_ in seen_bn or bn_ == "null":
+            if not bn_ or bn_ == "null":
                 continue
-            seen_bn.add(bn_)
-            if _la_file_is_run(outer[m.end():], bn_):
+            if bn_ not in run_cache:
+                if len(run_cache) >= 64:
+                    continue
+                run_cache[bn_] = _la_file_is_run(outer[m.end():], bn_)
+            if run_cache[bn_]:
                 out.append(body_.replace("\\n", "\n"))
     if "$" in outer and "=" in outer:
         out.extend(b_ for b_ in la_var_bodies(outer, la_var_map(outer)) if b_.strip())

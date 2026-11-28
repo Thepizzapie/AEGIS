@@ -1464,3 +1464,34 @@ def test_r25_echo_loop_perf(cmd):
     t0 = time.perf_counter()
     rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
     assert time.perf_counter() - t0 < 1.0
+
+
+# ---- QA round 26 regressions ---------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "echo '#!/bin/bash' > setup.sh\necho 'echo \"Setup started at $(date)\"' >> setup.sh\n"
+    "echo 'mkdir -p ~/.config/autostart' >> setup.sh\necho 'cp app.desktop ~/.config/autostart/' >> setup.sh\n"
+    "chmod +x setup.sh && ./setup.sh",
+    "echo 'echo Installing autostart entry' > setup.sh\necho 'cp app.desktop ~/.config/autostart/' >> setup.sh\nbash setup.sh",
+    "echo 'test -d ~/.config/autostart || exit 0' > s.sh && echo 'install -m644 a.desktop ~/.config/autostart/' >> s.sh && bash s.sh",
+    "echo 'set -e # run at login' > i.sh; echo 'echo x | at now' >> i.sh; sh i.sh",
+    "echo 'cat ~/.xinitrc' > s.sh; echo 'echo exec i3 >> ~/.xinitrc' >> s.sh; bash s.sh",
+    "echo 'cp x.desktop ~/.config/autostart/' > steps.txt && bash ./steps.txt",
+    "cat > /tmp/setup.txt <<'EOF'\ncp x.desktop ~/.config/autostart/\nEOF\nbash /tmp/setup.txt",
+    "echo 'cp x.desktop ~/.config/autostart/' > steps.md && source ./steps.md",
+    "echo 'cp x.desktop ~/.config/autostart/' > steps.txt && bash ~/steps.txt",
+    "echo 'cp a ~/.xinitrc' | tee s.sh && bash s.sh",
+    "echo 'cp a ~/.xinitrc' | tee s.sh > /dev/null && ./s.sh",
+])
+def test_r26_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd[:100]
+
+
+def test_r26_many_distinct_files_perf():
+    from aegis import rules
+    cmd = "".join(f'echo "batch {i} done at midnight" > st{i}.log\ngrep done st{i}.log\n' for i in range(3000))
+    t0 = time.perf_counter()
+    rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert time.perf_counter() - t0 < 1.0

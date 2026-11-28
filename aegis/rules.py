@@ -16881,7 +16881,13 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     pre-filtered on the body, deduped per file, one shared run check) and
     a doc file passed as an ARGUMENT to an interpreter script (``python3
     check_links.py README.md``) counted as run -- a doc now counts only as
-    the runner's own script operand or when piped into a shell."""
+    the runner's own script operand or when piped into a shell. Round 26
+    found that loop's per-file dedupe keeping only the FIRST ``echo .. >>``
+    body of a multi-line script (now: run result cached per file, every
+    body judged), ``bash ./steps.txt`` path-prefixed doc scripts, and
+    ``echo .. | tee s.sh`` writes. Still out of scope: copying a whole
+    parent tree (``cp -a .config ~/``, ``stow``) and a written script run
+    through ``eval "$(cat s.sh)"``."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
