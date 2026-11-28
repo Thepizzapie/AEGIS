@@ -11751,3 +11751,1425 @@ def lint_unsafe_entries(content, kind) -> list:
         pwalk(doc, "")
         return out
     return out
+
+
+# ---- login / desktop-session autostart + cron/at spool persistence ----------
+# The "runs at the next LOGIN, or on a schedule" surfaces no other guard
+# reaches. PERSIST_RE (rule_containment) covers Windows Run keys/schtasks/
+# services, the Startup folder, `crontab` and `/etc/cron` -- but ONLY on the
+# shell branch: a Write/Edit/MCP file write to `/etc/cron.d/x`, `/etc/crontab`
+# or `...\Start Menu\Programs\Startup\x.bat` was never checked. And the
+# freedesktop XDG autostart spec (`~/.config/autostart/*.desktop` -- MITRE
+# ATT&CK T1547.013), KDE Plasma's login/logout scripts, X session scripts
+# (`~/.xinitrc`/`~/.xsession`/`~/.xsessionrc`), lightweight-WM autostart files,
+# the `/var/spool/cron` per-user crontab spool, the `at`/`batch` one-shot
+# scheduler (T1053.002), BSD/macOS `periodic` scripts, macOS login items /
+# LoginHook, and the Windows Winlogon Userinit/Shell + Policies\Explorer\Run +
+# Active Setup StubPath autostarts had no coverage on ANY branch. Each runs
+# the planted command with the human's (or root's) full privileges the next
+# time they log in to a desktop session or the scheduler fires -- no git op,
+# CI run, or agent-session restart needed, and outside every repo, so
+# invisible to `git status`/code review.
+_LA_PRE = r"(?:^|[\s'\"/\\=])"
+_LA_END = _CI_END
+_LA_DIRSEG = _WIN_TRIM + _SEP
+LOGIN_AUTOSTART_PATH_RE = re.compile(
+    # XDG autostart: ~/.config/autostart, /etc/xdg/autostart, $XDG_CONFIG_HOME
+    # /autostart; KDE's legacy autostart-scripts dir alongside it.
+    _LA_PRE + r"(?:\.config\}?|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)(?:[:=?+-][^}\s'\"]{0,200})?\}?)" + _LA_DIRSEG
+    + r"autostart(?:-scripts)?" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # KDE Plasma: env/*.sh sourced at login, shutdown/* run at logout.
+    + r"|" + _LA_PRE + r"plasma-workspace" + _LA_DIRSEG + r"(?:env|shutdown)"
+    + _LA_DIRSEG + _CI_SEG + _LA_END
+    # KDE 4 legacy: ~/.kde[4]/Autostart|env|shutdown, ~/.kde/share/...
+    + r"|" + _LA_PRE + r"\.kde4?" + _LA_DIRSEG + r"(?:share" + _LA_DIRSEG + r")?"
+    + r"(?:Autostart|env|shutdown)" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # Lightweight WM / session-manager autostart files.
+    + r"|" + _LA_PRE + r"(?:openbox|labwc)" + _LA_DIRSEG + r"autostart(?:\.sh)?" + _LA_END
+    + r"|" + _LA_PRE + r"lxsession" + _LA_DIRSEG + _CI_SEG + _LA_DIRSEG + r"autostart" + _LA_END
+    # X session scripts run by startx/xinit/the display manager at login.
+    + r"|" + _LA_PRE + r"\.(?:xinitrc|xsession|xsessionrc|xserverrc|Xclients|xprofile\.d)" + _LA_END
+    + r"|" + _LA_PRE + r"X11" + _LA_DIRSEG + r"(?:"
+    + r"xinit" + _LA_DIRSEG + r"(?:xinitrc|xserverrc)"
+    + r"|xinit" + _LA_DIRSEG + r"xinitrc\.d" + _LA_DIRSEG + _CI_SEG
+    + r"|Xsession|Xreset|Xstartup"
+    + r"|(?:Xsession|Xreset)\.d" + _LA_DIRSEG + _CI_SEG
+    + r")" + _LA_END
+    # Display-manager login scripts (GDM PostLogin/PreSession, LightDM).
+    + r"|" + _LA_PRE + r"gdm3?" + _LA_DIRSEG + r"(?:PostLogin|PreSession|PostSession|Init)"
+    + _LA_DIRSEG + _CI_SEG + _LA_END
+    # Windows Startup folder (per-user and all-users) -- file-tool form; the
+    # shell form is already a hard DENY in rule_containment.
+    + r"|(?:Start Menu|STARTM~\d)" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_DIRSEG + r"[^'\"/\\\n]{1,200}",
+    re.IGNORECASE,
+)
+CRON_SPOOL_PATH_RE = re.compile(
+    _LA_PRE + r"etc" + _LA_DIRSEG + r"(?:crontab|anacrontab)" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG
+    + r"cron\.(?:d|hourly|daily|weekly|monthly|yearly)" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # Per-user crontab / at-job spools (Debian, RHEL, BSD, macOS).
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"spool" + _LA_DIRSEG
+    + r"(?:cron|anacron|at|atjobs|atspool)(?:" + _LA_DIRSEG + _CI_SEG + r"){1,3}" + _LA_END
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"at" + _LA_DIRSEG + r"(?:tabs|jobs)"
+    + _LA_DIRSEG + _CI_SEG + _LA_END
+    + r"|" + _LA_PRE + r"usr" + _LA_DIRSEG + r"lib" + _LA_DIRSEG + r"cron" + _LA_DIRSEG
+    + r"tabs" + _LA_DIRSEG + _CI_SEG + _LA_END
+    # BSD/macOS periodic(8): every script in these dirs runs as root daily/
+    # weekly/monthly; periodic.conf(.local) can point it at extra dirs.
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"periodic" + _LA_DIRSEG
+    + r"(?:daily|weekly|monthly)" + _LA_DIRSEG + _CI_SEG + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"periodic\.conf(?:\.local)?" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"(?:daily|weekly|monthly)\.local" + _LA_END,
+    re.IGNORECASE,
+)
+# Bare directory references (no filename): `rsync -a x/ ~/.config/autostart/`,
+# `tar xf p.tar -C /etc/cron.d`, `cp x.desktop ~/.config/autostart`.
+LOGIN_AUTOSTART_DIR_RE = re.compile(
+    _LA_PRE + r"(?:\.config\}?|xdg|\$\{?XDG_CONFIG_(?:HOME|DIRS)(?:[:=?+-][^}\s'\"]{0,200})?\}?)" + _LA_DIRSEG
+    + r"autostart(?:-scripts)?" + _LA_END
+    + r"|" + _LA_PRE + r"plasma-workspace" + _LA_DIRSEG + r"(?:env|shutdown)" + _LA_END
+    + r"|" + _LA_PRE + r"\.kde4?" + _LA_DIRSEG + r"(?:share" + _LA_DIRSEG + r")?"
+    + r"(?:Autostart|env|shutdown)" + _LA_END
+    + r"|" + _LA_PRE + r"X11" + _LA_DIRSEG
+    + r"(?:xinit" + _LA_DIRSEG + r"xinitrc\.d|(?:Xsession|Xreset)\.d)" + _LA_END
+    + r"|" + _LA_PRE + r"gdm3?" + _LA_DIRSEG + r"(?:PostLogin|PreSession|PostSession|Init)" + _LA_END
+    + r"|(?:Start Menu|STARTM~\d)" + _LA_DIRSEG + r"Programs" + _LA_DIRSEG + r"Startup" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"cron\.(?:d|hourly|daily|weekly|monthly|yearly)" + _LA_END
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"spool" + _LA_DIRSEG
+    + r"(?:cron|anacron|at|atjobs|atspool)(?:" + _LA_DIRSEG + _CI_SEG + r")?" + _LA_END
+    + r"|" + _LA_PRE + r"var" + _LA_DIRSEG + r"at" + _LA_DIRSEG + r"(?:tabs|jobs)" + _LA_END
+    + r"|" + _LA_PRE + r"usr" + _LA_DIRSEG + r"lib" + _LA_DIRSEG + r"cron" + _LA_DIRSEG + r"tabs" + _LA_END
+    + r"|" + _LA_PRE + r"etc" + _LA_DIRSEG + r"periodic" + _LA_DIRSEG
+    + r"(?:daily|weekly|monthly)" + _LA_END,
+    re.IGNORECASE,
+)
+_LOGIN_AUTOSTART_FIND_FRAGMENTS = (
+    r"[/\\]autostart(?:-scripts)?[/\\*]|plasma-workspace|xinitrc|xsession|Xsession\.d"
+    r"|cron\.d|cron\.(?:hourly|daily|weekly|monthly)|spool[/\\](?:cron|at)"
+    r"|Programs[/\\]Startup"
+)
+LOGIN_AUTOSTART_FIND_RE = _find_predicate_re(r"(?:" + _LOGIN_AUTOSTART_FIND_FRAGMENTS + r")")
+
+
+def login_autostart_find_hit(cmd: str) -> bool:
+    return _find_word_and_predicate_hit(cmd, LOGIN_AUTOSTART_FIND_RE)
+
+
+# Literal fragments at least one of which every LOGIN_AUTOSTART_PATH_RE/
+# CRON_SPOOL_PATH_RE/LOGIN_AUTOSTART_DIR_RE match contains (lower-cased);
+# a substring pre-check keeps the common no-target case off the regexes
+# (QA perf budget: the shared 1s engine budget on 120KB adversarial input).
+_LA_LITERALS = (
+    "autostart", "plasma-workspace", "kde", "xinitrc", "xsession", "xserverrc",
+    "xclients", "xprofile.d", "x11", "gdm", "start menu", "cron", "spool",
+    "periodic", "daily.local", "weekly.local", "monthly.local", "startm~",
+)
+_LA_AT_DIR_RE = re.compile(r"[/\\]at" + _WIN_TRIM + _SEP + r"(?:tabs|jobs)", re.IGNORECASE)
+
+
+def login_autostart_maybe_target(text: str) -> bool:
+    low = text.lower()
+    if "'" in low or '"' in low or "\\" in low:
+        low = low + " " + re.sub(r"['\"\\]", "", low)
+    return any(k in low for k in _LA_LITERALS) or bool(_LA_AT_DIR_RE.search(text))
+
+
+# `seg/../` and `/./` collapse (QA round 1: `~/.config/x/../autostart/y`,
+# `/etc/x/../cron.d/y` resolve into a gated dir but never spell it adjacently).
+_LA_DOTDOT_RE = re.compile(
+    r"(?<![^\s'\"/\\=])(?!\.\.?(?:[/\\]|$))[^\s'\"/\\]{1,200}[/\\]+\.\.(?:[/\\]+|(?=[\s'\"]|$))")
+_LA_DOT_RE = re.compile(r"(?<=[/\\])\.[/\\]+")
+
+
+def login_autostart_normalize(text: str) -> str:
+    if ".." not in text and "./" not in text and ".\\" not in text:
+        return text
+    t = _LA_DOT_RE.sub("", text)
+    for _ in range(64):
+        t2 = _LA_DOTDOT_RE.sub("", t)
+        if t2 == t:
+            break
+        t = t2
+    return t
+
+
+def _la_forms(text: str):
+    n = login_autostart_normalize(text)
+    return (text,) if n == text else (text, n)
+
+
+def login_autostart_path_hit(text: str) -> bool:
+    if not login_autostart_maybe_target(text):
+        return False
+    return any(LOGIN_AUTOSTART_PATH_RE.search(t) or CRON_SPOOL_PATH_RE.search(t)
+               for t in _la_forms(text))
+
+
+def login_autostart_dir_hit(text: str) -> bool:
+    return login_autostart_maybe_target(text) and any(
+        LOGIN_AUTOSTART_DIR_RE.search(t) for t in _la_forms(text))
+
+
+# `cd`/`pushd` targets, so a relative write after `cd ~/.config` is resolved
+# against them (QA round 1: `cd /etc && echo x > cron.d/x`).
+_LA_CD_RE = re.compile(r"(?:^|[;&|\n(]|&&)\s*(?:builtin\s+)?(?:cd|pushd|chdir|Set-Location|sl)\s+(?:-[LPe]\s+)*['\"]?([^\s'\";&|)]+)",
+                       re.IGNORECASE)
+_LA_TOKEN_RE = re.compile(r"[^\s'\"<>|;&()=]+")
+
+
+def login_autostart_cd_hit(cmd: str, cwd=None) -> bool:
+    """A relative token in ``cmd`` that lands in a gated location once
+    resolved against a ``cd`` target in the same command (or the cwd)."""
+    dirs = list(dict.fromkeys(m.group(1) for m in _LA_CD_RE.finditer(cmd)))[:8]
+    if cwd:
+        dirs.append(str(cwd))
+    if not dirs:
+        return False
+    toks = [t for t in list(dict.fromkeys(_LA_TOKEN_RE.findall(cmd)))[:4000]
+            if not re.match(r"^(?:[/\\~$%]|[A-Za-z]:|-)", t)]
+    for d in dirs:
+        base = d.rstrip("/\\")
+        for t in toks:
+            j = base + "/" + t
+            if login_autostart_path_hit(j) or login_autostart_dir_hit(j):
+                return True
+    return False
+
+
+# Fetch tools that write into a DIRECTORY (curl --output-dir, wget -P) --
+# the fetch-to-file backstop only knows `-o`/`-O <file>` (QA round 1).
+FETCH_DIR_VERB_RE = re.compile(
+    r"\bcurl\b[^|;&\n]{0,400}?--output-dir\b"
+    r"|\bwget2?\b[^|;&\n]{0,400}?(?:\s-[a-zA-Z]*P|--directory-prefix\b)"
+    r"|\b(?:Invoke-WebRequest|iwr|Start-BitsTransfer)\b",
+    re.IGNORECASE)
+
+
+# Commands that install login/scheduled persistence with no file path in
+# the call at all.
+#  - `at`/`batch`: queue a command to run later (T1053.002). Anchored to a
+#    command position so the English word "at" in an argument doesn't hit;
+#    `at -l`/`atq`/`atrm`/`at -c` (list/remove/show) are not gated.
+#  - macOS: `osascript ... make login item`, `defaults write ...loginwindow
+#    LoginHook|LogoutHook`, `sfltool add-item`.
+#  - Windows registry autostarts PERSIST_RE doesn't name: Winlogon
+#    Userinit/Shell, Policies\Explorer\Run, Active Setup StubPath,
+#    Winlogon\Notify, AppInit_DLLs, Image File Execution Options Debugger.
+_LA_CMDPOS = r"(?:^|[|;&\n(`{]|\$\(|\b(?:sudo|doas|exec|nohup|command|env|xargs|time)\s+(?:-\S+\s+)*)\s*(?:[^\s|;&]*[/\\])?"
+_LA_CMDPOS_BATCH = r"(?:^|[|;&\n(`{]|\$\(|\b(?:sudo|doas|exec|nohup|command|env|xargs|time)\s+(?:-\S+\s+)*)\s*(?:/usr(?:/local)?/bin/|/bin/)?"
+_LA_TIMESPEC = (
+    r"(?:now|noon|midnight|teatime|tomorrow|today|next\s+(?:minute|hour|day|week|month|year)"
+    r"|\d{1,2}:\d{2}(?:\s*(?:am|pm))?\b|\d{3,4}\b|\d{1,2}\s*(?:am|pm)\b"
+    r"|\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b"
+    r"|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b"
+    r"|(?:january|february|march|april|may|june|july|august|september|october"
+    r"|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b"
+    r"|SUBST\b|\$\{?(?:[A-Za-z_]|\d|[@*]))"
+)
+LOGIN_AUTOSTART_CMD_RE = re.compile(
+    _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
+    + r"(?:-t\s*['\"]?(?:\d|SUBST\b|\$|`)|" + _LA_TIMESPEC + r")"
+    + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
+    + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))"
+    + r"|\bosascript\b[^|;&\n]{0,400}?\blogin\s+items?\b"
+    + r"|\bdefaults\s+write\b[^|;&\n]{0,200}?\bloginwindow\b[^|;&\n]{0,200}?\b(?:LoginHook|LogoutHook)\b"
+    + r"|\bsfltool\s+add-?item\b"
+    + r"|\\Winlogon\b[^|;&\n]{0,200}?\b(?:Userinit|Shell|Taskman|AppSetup)\b"
+    + r"|\\Winlogon\\Notify\b"
+    + r"|\\Policies\\Explorer\\Run\b"
+    + r"|\\Active Setup\\Installed Components\b[^|;&\n]{0,300}?\bStubPath\b"
+    + r"|\bAppInit_DLLs\b"
+    + r"|\\Image File Execution Options\\[^|;&\n]{0,300}?\b(?:Debugger|GlobalFlag)\b",
+    re.IGNORECASE,
+)
+# A Windows registry WRITE verb -- the registry branch above only counts
+# when paired with one (reading these keys is ordinary triage).
+REGISTRY_WRITE_VERB_RE = re.compile(
+    r"\breg(?:\.exe)?\s+(?:add|import|copy|load|restore)\b"
+    r"|\b(?:Set-ItemProperty|New-ItemProperty|New-Item|sp|ni|Set-Item|regedit(?:\.exe)?\s+/s)\b",
+    re.IGNORECASE,
+)
+_LA_REG_KEY_RE = re.compile(
+    r"\\Winlogon\b|\\Policies\\Explorer\\Run\b|\\Active Setup\\|\bAppInit_DLLs\b"
+    r"|\\Image File Execution Options\\", re.IGNORECASE)
+
+
+_LA_CMD_LITERALS = ("batch", "osascript", "loginwindow", "sfltool", "winlogon",
+                    "explorer", "active setup", "appinit_dlls", "image file execution")
+_LA_AT_WORD_RE = re.compile(r"(?<![\w.\-])at(?:\.exe)?(?:\s|$|[;&|)'\"])", re.IGNORECASE)
+
+
+def login_autostart_cmd_hit(cmd: str) -> bool:
+    """True when a clause of ``cmd`` schedules/installs login persistence
+    with no file write (at/batch, macOS login items, registry autostarts).
+    A registry-key mention counts only alongside a registry WRITE verb in
+    the same clause -- reading these keys is ordinary triage."""
+    low = cmd.lower()
+    if not (any(k in low for k in _LA_CMD_LITERALS) or _LA_AT_WORD_RE.search(cmd)):
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(cmd):
+        for m in LOGIN_AUTOSTART_CMD_RE.finditer(clause):
+            if _LA_REG_KEY_RE.search(m.group(0)) and not REGISTRY_WRITE_VERB_RE.search(clause):
+                continue
+            return True
+    return False
+
+
+# ---- login-autostart: quote/heredoc-aware shell analysis (QA round 1 FP) ---
+# The `at`/`batch`/registry/login-item matchers and the write-destination
+# check run on a surface with prose removed: a heredoc body (unless it is fed
+# to a shell/at/batch, where it IS code) and quoted strings -- so a wrapped
+# commit message line "at decode time" or `echo "meet; at noon"` is data.
+_LA_CODE_SINKS = frozenset((
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "at", "batch", "python", "python3",
+    "perl", "ruby", "node", "pwsh", "powershell", "osascript", "crontab", "tee",
+    "sudo", "doas", "su", "ssh", "eval", "source", ".", "busybox", "env",
+))
+_LA_PROSE_SINKS = frozenset((
+    "cat", "git", "gh", "glab", "hub", "echo", "printf", "tee", "less", "more", "grep",
+    "wc", "jq", "yq", "mail", "mailx", "sendmail", "mutt", "wl-copy", "xclip", "pbcopy",
+    "head", "tail", "sort", "uniq", "diff", "column", "fold", "fmt", "base64", "md5sum",
+    "sha256sum", "read", "curl", "http", "done", "while", "mapfile", "readarray",
+))
+
+
+def _la_squote(t: str) -> str:
+    return "'" + t.replace("'", "'\"'\"'") + "'"
+
+
+def _la_substitutions(cmd: str, limit: int = 64):
+    """(cmd with $(..)/`..`/<(..)/>(..) replaced by ` SUBST `, [bodies]).
+    Single-quoted text is left alone; nesting handled by paren depth."""
+    if "`" not in cmd and "(" not in cmd:
+        return cmd, []
+    if not re.search(r"[$<>]\(|`", cmd):
+        return cmd, []
+    out, bodies = [], []
+    i, n, in_sq, in_dq = 0, len(cmd), False, False
+    while i < n:
+        ch = cmd[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and ch in "$<>" and cmd[i + 1:i + 2] == "(" and cmd[i + 2:i + 3] != "(" \
+                and len(bodies) < limit:
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if cmd[j] == "(":
+                    depth += 1
+                elif cmd[j] == ")":
+                    depth -= 1
+                j += 1
+            bodies.append(cmd[i + 2:j - 1] if depth == 0 else cmd[i + 2:j])
+            out.append("SUBST" if cmd[i] == "$" else " SUBST ")
+            i = j
+            continue
+        elif ch == "\\" and not in_sq:
+            out.append(cmd[i:i + 2])      # `\`` / `\$` are literal
+            i += 2
+            continue
+        elif not in_sq and ch == "`" and len(bodies) < limit:
+            j = cmd.find("`", i + 1)
+            j = n if j < 0 else j
+            bodies.append(cmd[i + 1:j])
+            out.append("SUBST")
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), bodies
+
+
+_LA_QBODY = r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
+_LA_ECHO_WRITE_RE = re.compile(
+    r"\b(?:echo|printf)\s+(?:-\S+\s+)*(?:'%s\\n'\s+)?" + r"(?:'([^']{1,20000})'|\"((?:[^\"\\]|\\.){1,20000})\")"
+    r"\s*(?:>>?\s*['\"]?([^\s'\";&|<>()]+)|\|\s*(?:sudo\s+(?:-\S+\s+)*)?tee\s+(?:-\S+\s+)*['\"]?([^\s'\";&|<>()]+))")
+_LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*" + _LA_QBODY)
+# `su -c BODY` / `runuser -c BODY`, `sh <<< BODY`, `echo BODY | sh` (QA round 6).
+_LA_EXTRA_BODY_RES = (
+    re.compile(r"\b(?:su|runuser|flock|script|sg)\b[^|;&\n]{0,300}?\s(?:-[A-Za-z]*c|--command(?:=|\s))\s*" + _LA_QBODY),
+    re.compile(r"\benv\b[^|;&\n]{0,200}?\s(?:-[A-Za-z]*S|--split-string(?:=|\s))\s*" + _LA_QBODY),
+    re.compile(r"\bwatch\b(?:\s+-[^\s]{1,40}(?:\s+\d[\d.]*)?){0,6}\s+" + _LA_QBODY),
+    re.compile(r"\b(?:ba|z|da|k|fi)?sh\b[^|;&\n]{0,100}?<<<\s*" + _LA_QBODY),
+    re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*" + _LA_QBODY
+               + r"\s*\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b"),
+    re.compile(r"\bssh\b[^|;&\n'\"]{0,300}?\s" + _LA_QBODY),
+)
+
+
+def _la_heredoc_head(prefix: str) -> str:
+    head = prefix.rsplit("\n", 1)[-1]
+    head = re.split(r"[;&|(]|\$\(", head)[-1].split()
+    while head and (re.match(r"^[A-Za-z_]\w*=", head[0])
+                    or head[0].rsplit("/", 1)[-1].lower() in ("sudo", "doas", "env", "nohup", "command", "exec", "time")):
+        head = head[1:]
+    return head[0].rsplit("/", 1)[-1].lower() if head else ""
+
+
+_LA_HD_MARK_RE = re.compile(
+    r"<<(?!<)(?P<dash>-?)[ \t]*(?:'(?P<d1>[^'\n]{1,80})'|\"(?P<d2>[^\"\n]{1,80})\""
+    r"|\\(?P<d3>[\w.-]{1,40})|(?P<d4>[A-Za-z0-9_][\w.-]{0,40}))")
+_LA_HD_NONRUN = frozenset((
+    "git", "cat", "less", "more", "head", "tail", "wc", "ls", "stat", "file", "diff", "cmp",
+    "chmod", "chown", "shellcheck", "grep", "rg", "egrep", "echo", "printf", "rm", "cp", "mv",
+    "md5sum", "sha256sum", "touch", "tee", "test", "[", "[[", "realpath", "readlink",
+    "dirname", "basename", "mkdir", "gh", "vim", "nano", "code", "bat", "jq", "yq",
+    "tar", "zip", "gzip", "xz", "bzip2", "scp", "rsync", "shfmt", "dos2unix", "xxd", "find",
+    "ln", "prettier", "npx", "install", "hexdump", "od", "sort", "uniq", "cut",
+))
+_LA_HD_RUNNERS = frozenset((
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "busybox", "source", ".", "perl", "node",
+    "ruby", "php", "exec", "deno", "bun", "lua", "pwsh", "osascript",
+))
+_LA_HD_SPECIAL_RE = re.compile(r"[\\'\"#$<\n()`]")
+
+
+def _la_file_is_run(res: str, bn: str) -> bool:
+    """Does a LATER command in ``res`` run the file named ``bn``? Fails
+    closed (any mention counts) except commands known not to run it; a
+    doc/data file (.md/.txt/.yaml/...) counts only as the script operand of
+    a shell/interpreter or when piped into a shell (QA rounds 22-25)."""
+    if bn not in res:
+        return False
+    rx_ = re.compile(r"(?<![\w.-])" + re.escape(bn) + r"(?![\w.-])")
+    is_doc = bool(re.search(r"\.(?:md|markdown|rst|txt|json|ya?ml|toml|html?|csv|xml|ini|cfg"
+                            r"|adoc|org|tex|log|svg|lock)$", bn, re.I))
+    mentions = list(rx_.finditer(res))
+    if len(mentions) > 256:
+        return True                        # past the cap: fail closed (QA round 27)
+    for mm in mentions:
+        seg = re.split(r"[;&\n(){}]|\|\|?", res[max(0, mm.start() - 2000):mm.start()])[-1]
+        after = re.split(r"[;&\n(){}]", res[mm.end():mm.end() + 2000], maxsplit=1)[0]
+        words = [w.strip("'\"") for w in seg.split()]
+        if words and seg and not seg[-1].isspace():
+            words = words[:-1]             # the mention's own path prefix (`bash ./x.txt`)
+            seg = seg[:len(seg.rstrip()) - len(seg.rstrip().split()[-1])] if seg.strip() else seg
+        while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or words[0] in _LA_VM_LEAD
+                         or words[0] in ("then", "if", "do", "time", "!", "command")):
+            words = words[1:]
+        first = words[0].rsplit("/", 1)[-1].lower() if words else ""
+        piped_sh = bool(re.search(
+            r"\|\s*(?:(?:sudo|doas|env|command)(?:\s+-\S+(?:\s+[^\s-]\S*)?)*\s+(?:[A-Za-z_]\w*=\S*\s+)*)?"
+            r"(?:\S*/)?(?:ba|z|da|k|fi)?sh\b", after))
+        if first in _LA_HD_NONRUN and not piped_sh:
+            continue
+        if words and words[0].startswith(">"):
+            continue
+        if re.search(r">\s*$", seg):
+            continue                       # a later redirect INTO it
+        if is_doc and not piped_sh and words:
+            # Only as the runner's own SCRIPT operand: the first non-option
+            # word after the runner, and no -m/-c/-e (QA round 25).
+            if not (first in _LA_HD_RUNNERS or first.startswith("python")):
+                continue
+            rest = words[1:]
+            shellish = first in ("sh", "bash", "zsh", "dash", "ksh", "fish", "busybox", "source", ".")
+            if any(w in (("-c", "-n") if shellish else ("-m", "-c", "-e", "-n", "--check")) for w in rest):
+                continue
+            ops = [w for w in rest if not w.startswith("-")]
+            if ops:
+                continue                   # something else is the script; the doc is an argument
+        return True
+    return False
+
+
+def _la_heredocs(cmd: str):
+    """(cmd with heredoc bodies removed, [bodies fed to code]).
+
+    A small stateful scanner (QA rounds 10-11): it tracks single quotes,
+    double quotes, `$(..)` nesting (including inside double quotes),
+    comments and escapes, so a `<<WORD` counts only where the shell would
+    see one, and quote characters inside a body are never seen. Bodies are
+    read line by line after the marker's line, the way the shell does.
+    Each marker becomes an inert `< HEREDOC` (re-running is a no-op). A
+    body fed to a non-prose consumer, or with no terminator, is returned as
+    code; an unquoted body's $(..)/`..` substitutions are returned too."""
+    code = []
+    if "<<" not in cmd or "\n" not in cmd:
+        return cmd, code
+    out, pending, stack, written, stored = [], [], [], [], []
+    cur = []                       # output of the current line (for the head)
+    i, n = 0, len(cmd)
+
+    def emit(t):
+        out.append(t)
+        cur.append(t)
+
+    while i < n:
+        top = stack[-1] if stack else ""
+        m = _LA_HD_SPECIAL_RE.search(cmd, i)
+        if not m:
+            emit(cmd[i:])
+            break
+        if m.start() > i:
+            emit(cmd[i:m.start()])
+            i = m.start()
+        ch = cmd[i]
+        if ch == "\\":
+            emit(cmd[i:i + 2])
+            i += 2
+            continue
+        if top == '"':
+            if ch == '"':
+                stack.pop()
+            elif cmd.startswith("$((", i):
+                stack.append("A")
+                emit("$((")
+                i += 3
+                continue
+            elif cmd.startswith("$(", i):
+                stack.append("(")
+                emit("$(")
+                i += 2
+                continue
+            emit(ch)
+            i += 1
+            continue
+        if ch == "'":
+            if cmd.startswith("$'", i - 1) and i > 0 and cmd[i - 1] == "$":
+                j = i + 1
+                while j < n and cmd[j] != "'":
+                    j += 2 if cmd[j] == "\\" else 1
+            else:
+                j = cmd.find("'", i + 1)
+                j = n if j < 0 else j
+            emit(cmd[i:j + 1])
+            i = j + 1
+            continue
+        if ch == '"':
+            stack.append('"')
+            emit(ch)
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|()<>"):
+            j = cmd.find("\n", i)
+            j = n if j < 0 else j
+            emit(cmd[i:j])
+            i = j
+            continue
+        if ch == "$" and cmd.startswith("$((", i):
+            stack.append("A")              # arithmetic: `<<` is a shift
+            emit("$((")
+            i += 3
+            continue
+        if ch == "$" and cmd.startswith("$(", i):
+            stack.append("(")
+            emit("$(")
+            i += 2
+            continue
+        if ch == "(":
+            if top == "A":
+                stack.append("a")
+            else:
+                stack.append("(")
+        elif ch == ")":
+            if top == "A" and cmd.startswith("))", i):
+                stack.pop()
+                emit("))")
+                i += 2
+                continue
+            if stack and stack[-1] in "(a":
+                stack.pop()
+        elif ch == "<" and cmd.startswith("<<<", i):
+            emit("<<<")                    # here-string, not a heredoc (QA round 12)
+            i += 3
+            continue
+        elif ch == "<" and "A" not in stack:
+            mk = _LA_HD_MARK_RE.match(cmd, i)
+            if mk and len(pending) < 64:
+                delim = mk.group("d1") or mk.group("d2") or mk.group("d3") or mk.group("d4")
+                quoted = not mk.group("d4")
+                dash = bool(mk.group("dash"))
+                line_so_far = "".join(cur[-200:])
+                name = _la_heredoc_head(line_so_far)
+                tail_end = cmd.find("\n", mk.end())
+                tail = cmd[mk.end():tail_end if tail_end >= 0 else n][:2000]
+                piped = [x.split()[0].rsplit("/", 1)[-1].lower() for x in tail.split("|")[1:] if x.split()]
+                # Redirect targets of THIS simple command only, every one of
+                # them, fd-numbered and /dev/null skipped (QA round 13).
+                own = re.split(r"[;&|]", line_so_far[-400:])[-1] + " " + re.split(r"[;&|]", tail)[0]
+                targets = [t for t in re.findall(r"(?<![\d&])>>?\|?\s*['\"]?([^\s'\";&|<>()]+)", own)
+                           if t != "/dev/null"]
+                targets += re.findall(r"\btee\s+(?:-\S+\s+)*['\"]?([^\s'\";&|<>()]+)",
+                                      line_so_far[-400:] + " " + tail)
+                vm = re.search(r"\b([A-Za-z_]\w*)=\$\([^()]*$", line_so_far[-400:])
+                var = vm.group(1) if vm else ""
+                if not var and name == "read":
+                    rw = [w for w in own.split() if re.fullmatch(r"[A-Za-z_]\w*", w) and w != "read"]
+                    var = rw[-1] if rw else ""
+                pending.append((delim, quoted, dash, name, piped, targets, "(" in stack, var))
+                emit("< HEREDOC")
+                i = mk.end()
+                continue
+        elif ch == "\n":
+            out.append("\n")
+            cur = []
+            i += 1
+            if pending:
+                j = i
+                for delim, quoted, dash, name, piped, targets, in_sub, var in pending:
+                    lines, term = [], False
+                    while j < n:
+                        e = cmd.find("\n", j)
+                        line = cmd[j:e if e >= 0 else n]
+                        ln = line.lstrip("\t") if dash else line
+                        if ln == delim:
+                            j = (e + 1) if e >= 0 else n
+                            term = True
+                            break
+                        if in_sub and re.match(re.escape(delim) + r"[ \t]*\)", ln):
+                            # `EOF)` closes the heredoc and the $(..) together
+                            # (bash accepts it -- QA round 12).
+                            j = j + (len(line) - len(ln)) + len(delim)
+                            term = True
+                            break
+                        j = (e + 1) if e >= 0 else n
+                        lines.append(line)
+                    body = "\n".join(lines)
+                    if not quoted:
+                        code.extend(_la_substitutions(body)[1])
+                    for target in targets[:16]:
+                        written.append((target, body))
+                    if var:
+                        stored.append((var, body))
+                    if (not term or name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
+                            or any(x not in _LA_PROSE_SINKS for x in piped)):
+                        code.append(body)
+                        if name in _LA_INTERP or name.startswith("python"):
+                            code.append(name + " -c " + _la_squote(body))
+                    if not term:
+                        out.append(body)    # unterminated: keep it as code
+                        break
+                pending = []
+                i = j
+            continue
+        emit(ch)
+        i += 1
+    res = "".join(out)
+    # A file a heredoc wrote, named again later (`bash /tmp/setup.sh`,
+    # `./setup.sh`, `source f`): its body is code (QA round 12).
+    for target, body in written[:64]:
+        bn = re.split(r"[/\\]", target)[-1]
+        if not bn:
+            continue
+        # Fail closed: any later mention counts as RUNNING the file unless
+        # its command is known not to run it (QA rounds 22-23: `git add
+        # notes.md` is not a run; `DEBUG=1 ./s.sh`, `"$S"`, `cat s.sh | sh`,
+        # `time ./s.sh` are).
+        # Build files run by their tool (QA round 24: `make install`).
+        if re.fullmatch(r"(?:GNU)?[Mm]akefile|[Jj]ustfile|Taskfile\.ya?ml|Rakefile", bn) and \
+                re.search(r"(?:^|[\s;&|(])(?:make|gmake|just|task|rake)\b", res):
+            code.append(body)
+            continue
+        ran = _la_file_is_run(res, bn)
+        if ran:
+            code.append(body)
+    # A body stored in a variable and later run (`S=$(cat <<EOF..)` /
+    # `read -d '' S <<EOF`, then `eval "$S"` / `bash -c "$S"`).
+    for var, body in stored[:64]:
+        if la_var_bodies(res, {var: body}):
+            code.append(body)
+    return res, code
+
+
+_LA_PROSE_RE = re.compile(
+    r"(?<![^\s;&|()<>])#[^\n]*|\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$'(?:[^'\\]|\\.)*'|\\.")
+
+
+def la_prose_free(cmd: str) -> str:
+    """``cmd`` minus heredoc bodies, quoted strings, escapes and comments --
+    in one left-to-right pass, so whichever starts first wins (QA round 8:
+    `# don't` must not open a quote that hides the next line)."""
+    c, _ = _la_heredocs(cmd)
+
+    def _sub(m):
+        t = m.group(0)
+        if t.startswith("#"):
+            return ""
+        if t.startswith("\\"):
+            return t[1:] if t[1:] not in "'\"" else ""
+        return " Q "
+    c = _LA_PROSE_RE.sub(_sub, c)
+    return re.sub(r"\s*\n\s*", "\n", c)          # bounded LA_AT_RE restarts (QA round 9)
+
+
+_LA_COPY_CMDS = frozenset(("cp", "mv", "install", "ln", "rsync", "scp", "copy", "xcopy",
+                           "move", "copy-item", "cpi", "move-item", "mi", "dd", "ditto",
+                           "gcp", "gmv", "ginstall", "rclone", "cpio"))
+_LA_INPLACE_CMDS = frozenset(("sed", "gsed", "perl", "ruby"))
+_LA_WRAPPERS = frozenset(("sudo", "doas", "nohup", "command", "exec", "time", "builtin",
+                          "nice", "ionice", "stdbuf", "env", "xargs", "busybox", "run0"))
+_LA_INTERP = frozenset(("python", "python2", "python3", "perl", "ruby", "node", "deno",
+                        "bun", "php", "lua", "pwsh", "powershell", "osascript", "Rscript"))
+_LA_CD_CMDS = frozenset(("cd", "pushd", "chdir", "set-location", "sl"))
+
+
+# One left-to-right pass: a word-initial `#` outside quotes is a comment
+# (to end of line), so an apostrophe inside it can't open a "quoted word"
+# that swallows later lines (QA round 8); `\x` escapes are word parts.
+_LA_WORD_RE = re.compile(
+    r"(?<![^\s;&|()<>])#[^\n]*"
+    r"|\\\n"
+    r"|(?:\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\$\([^()]{0,2000}\)|\\.|[^\s'\";&|()<>\\])+"
+    r"|[;&|()<>]+|['\"]|\n")
+
+
+def _la_tokens(c: str):
+    return _LA_WORD_RE.findall(c[:200000])[:20000]
+
+
+def _la_tokens_nocomment(c: str):
+    """Tokens with each unquoted `# comment` dropped up to its newline
+    (QA round 7: `cp a ~/.xinitrc # x` made `x` the destination). Quoted
+    text -- including a multi-line commit message -- stays inside its word,
+    so a `#` or newline inside quotes never splits it."""
+    out, skip = [], False
+    for t in _la_tokens(c):
+        if t == "\\\n":
+            continue                      # line continuation (never inside a comment)
+        if t == "\n":
+            skip = False
+            out.append(";")
+        elif skip:
+            continue
+        elif t.startswith("#"):
+            skip = True
+        else:
+            out.append(t)
+    return out
+
+
+def _la_unquote(t: str) -> str:
+    # Embedded quotes too (QA round 2: `"$XDG_CONFIG_HOME"/autostart/x`).
+    return t.replace("'", "").replace('"', "") if len(t) > 1 else t
+
+
+def _la_split_simple(toks):
+    cur = []
+    for t in toks:
+        if t and all(ch in ";&|()\n" for ch in t):
+            if cur:
+                yield cur
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        yield cur
+
+
+# Commands whose arguments are READ, never written (a target named as one
+# of their operands is not a plant; their redirects still count).
+_LA_READONLY_CMDS = frozenset((
+    "cat", "tac", "grep", "egrep", "fgrep", "rg", "ag", "ack", "diff", "cmp", "colordiff",
+    "ls", "ll", "dir", "exa", "eza", "lsd", "head", "tail", "less", "more", "most", "wc",
+    "stat", "file", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum",
+    "echo", "printf", "test", "[", "[[", "readlink", "realpath", "basename", "dirname",
+    "which", "type", "whereis", "du", "df", "tree", "jq", "yq", "strings", "hexdump", "od",
+    "cut", "nl", "column", "bat", "batcat", "view", "lsattr", "getfacl", "namei",
+    "true", "false", ":", "desktop-file-validate", "atq", "atrm",
+    "systemctl", "journalctl", "pgrep", "ps", "id", "whoami", "date", "sleep", "wait",
+    "read", "export", "unset", "local", "declare", "typeset", "set", "shift", "return",
+    "exit", "break", "continue", "trap", "alias", "unalias", "hash", "history",
+    "for", "select", "case", "in",
+    "get-content", "gc", "type", "select-string", "sls", "get-childitem", "gci", "get-item",
+    "gi", "test-path", "resolve-path", "get-itemproperty", "gp", "write-host", "write-output",
+))
+# Wrappers that run their remaining argv as a command. Option-arguments
+# they take are skipped heuristically; a mis-skip only makes the real
+# command "unknown", which fails CLOSED below.
+_LA_WRAPPERS = frozenset((
+    "sudo", "doas", "nohup", "command", "exec", "time", "builtin", "nice", "ionice",
+    "stdbuf", "env", "xargs", "busybox", "run0", "timeout", "setsid", "flock", "chrt",
+    "taskset", "unbuffer", "strace", "ltrace", "firejail", "proxychains", "proxychains4",
+    "torsocks", "caffeinate", "chronic", "pkexec", "nsenter", "unshare", "chroot",
+    "systemd-run", "script", "watch", "faketime", "fakeroot", "eatmydata", "numactl",
+    "cgexec", "sg", "runuser", "su", "nocache", "catchsegv", "valgrind", "sem", "parallel",
+    "then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "coproc",
+))
+_LA_WRAPPER_VALUE_OPTS = {
+    "sudo": ("ugChpUrtDRT", ("--user", "--group", "--close-from", "--host", "--prompt",
+                             "--other-user", "--role", "--type", "--chdir", "--chroot",
+                             "--command-timeout")),
+    "doas": ("uC", ()),
+    "su": ("csgGw", ("--command", "--shell", "--group", "--supp-group",
+                     "--whitelist-environment")),
+    "runuser": ("ugGcsw", ("--user", "--group", "--supp-group", "--command", "--shell")),
+    "pkexec": ("", ("--user",)),
+    "env": ("uCS", ("--chdir", "--unset", "--split-string")),
+    "nice": ("n", ("--adjustment",)),
+    "ionice": ("cnpPu", ("--class", "--classdata", "--pid", "--pgid", "--uid")),
+    "timeout": ("sk", ("--signal", "--kill-after")),
+    "stdbuf": ("ioe", ("--input", "--output", "--error")),
+    "flock": ("wEc", ("--timeout", "--conflict-exit-code", "--command")),
+    "xargs": ("aEILnPsd", ("--arg-file", "--delimiter", "--max-args", "--max-procs",
+                              "--max-lines", "--max-chars", "--replace")),
+    "watch": ("nq", ("--interval", "--equexit")),
+    "strace": ("eoPpSsuIXb", ()),
+    "ltrace": ("eoPpSsuIn", ()),
+    "systemd-run": ("upMEs", ("--unit", "--property", "--machine", "--setenv", "--slice",
+                              "--description", "--uid", "--gid", "--working-directory")),
+    "nsenter": ("tSG", ("--target", "--setuid", "--setgid")),
+    "taskset": ("", ()),
+    "chrt": ("", ()),
+    "numactl": ("CNmMp", ()),
+    "cgexec": ("g", ()),
+    "sg": ("", ()),
+    "firejail": ("", ()),
+    "script": ("cEeOIqT", ("--command",)),
+    "faketime": ("f", ()),
+    "valgrind": ("", ()),
+    "unshare": ("", ()),
+    "chroot": ("", ("--userspec", "--groups")),
+}
+_LA_TIME_TOK_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|0x[0-9a-fA-F]+|[\d,\-]+)$")
+
+
+def _la_strip_wrappers(words):
+    """Drop leading assignments / wrappers and their options/option-args."""
+    i, n = 0, len(words)
+    prev_wrapper, took_pos = None, False
+    while i < n:
+        w = words[i]
+        base = re.split(r"[/\\]", w)[-1].lower()
+        if re.match(r"^[A-Za-z_]\w*=", w):
+            i += 1
+            continue
+        if base in _LA_WRAPPERS:
+            prev_wrapper = base
+            took_pos = False
+            i += 1
+            continue
+        if prev_wrapper and w == "--":
+            i += 1
+            continue
+        if prev_wrapper and w.startswith("-") and len(w) > 1:
+            # Consume a separate value ONLY after an option that takes one
+            # (QA round 20: `sudo -n tee ..`, `sudo -E tee ..` -- -n/-E take
+            # none, and swallowing `tee` hid the real command).
+            i += 1
+            vshort, vlong = _LA_WRAPPER_VALUE_OPTS.get(prev_wrapper, ("", ()))
+            if w.startswith("--"):
+                if "=" not in w and w in vlong and i < n:
+                    i += 1
+            elif vshort and i < n:
+                # Left to right: the first value-taking letter takes the
+                # NEXT word only if it ends the bundle; otherwise the value
+                # is attached (`-uroot`, `-d'\n'` -- QA round 21).
+                for k, ch_ in enumerate(w[1:], 1):
+                    if ch_ in vshort:
+                        if k == len(w) - 1:
+                            i += 1
+                        break
+            continue
+        if prev_wrapper and _LA_TIME_TOK_RE.match(w):
+            i += 1                       # timeout 5 / chrt 0 / taskset 0x1
+            continue
+        if prev_wrapper in ("flock", "chroot", "sg", "cgexec") and not took_pos and i + 1 < n:
+            i += 1                       # flock LOCKFILE cmd / chroot DIR cmd / sg GROUP -c cmd
+            took_pos = True
+            continue
+        break
+    return words[i:]
+
+
+_LA_HOME_RE = re.compile(
+    r"^(?:~[^/\\\s]*|\$\{?HOME\}?|%USERPROFILE%|/root|/home/[^/\\\s]+|/Users/[^/\\\s]+"
+    r"|[A-Za-z]:[/\\]+Users[/\\]+[^/\\\s]+)[/\\]*$")
+
+
+def la_shell_destinations(cmd: str):
+    """(destinations, cd_dirs, unknown_args) for shell text, or None if it
+    can't be tokenized. ``destinations``: what known write commands write
+    (redirect targets, ``tee``, last operand / ``-t`` of copy tools, tar
+    ``-C``, fetch outputs, in-place edits, ``chmod`` operands, interpreter
+    write code). ``unknown_args``: every operand of a command this parser
+    doesn't know -- the caller treats a target among them as a write
+    (fail closed; QA round 2: `timeout 5 cp`, `{ cp ...; }`, `gio copy`,
+    `sponge`, `sort -o`)."""
+    import shlex
+    c, _ = _la_heredocs(cmd)
+    raw_toks = _la_tokens_nocomment(c)
+    if len(_la_tokens(c)) >= 19900 or len(raw_toks) >= 19000 or len(c) >= 200000:
+        return None                       # truncated: caller falls back (QA round 7)
+    toks = [_la_unquote(t) for t in raw_toks]
+    dests, cds, unknown = [], [], []
+    for sc in _la_split_simple(toks):
+        words = []
+        i = 0
+        while i < len(sc):
+            t = sc[i]
+            if t and set(t) <= set("<>&|") and ">" in t:
+                if i + 1 < len(sc):
+                    dests.append(sc[i + 1])
+                i += 2
+                continue
+            if t and set(t) <= set("<"):
+                i += 2
+                continue
+            if re.fullmatch(r"\d", t) and i + 1 < len(sc) and set(sc[i + 1]) <= set("<>&|") and ">" in sc[i + 1]:
+                i += 1                     # fd number before a redirect: `2>`
+                continue
+            words.append(t)
+            i += 1
+        for j, w_ in enumerate(words[:12]):         # `env -C DIR cmd` (QA round 7)
+            if re.split(r"[/\\]", w_)[-1].lower() == "env":
+                for k_, a_ in enumerate(words[j + 1:j + 12]):
+                    if a_ in ("-C", "--chdir") and j + k_ + 2 < len(words):
+                        cds.append(words[j + k_ + 2])
+                    elif a_.startswith("--chdir="):
+                        cds.append(a_.split("=", 1)[1])
+                    elif re.fullmatch(r"-C.+", a_):
+                        cds.append(a_[2:])
+                break
+        for sep_ in (":::", "::::", ":::+", "::::+"):
+            if sep_ in words:
+                # GNU parallel input list: not the template's last operand,
+                # but its items are still judged (fail closed, QA round 23).
+                k_ = words.index(sep_)
+                unknown.extend(w_ for w_ in words[k_ + 1:] if w_ not in (":::", "::::", ":::+", "::::+"))
+                words = words[:k_]
+        words = _la_strip_wrappers(words)
+        if not words:
+            continue
+        if re.search(r"\s", words[0].strip()):
+            # A quoted command string as the command (`watch -n 2 'cmd ..'`,
+            # `xargs sh -c` bodies): judge it as its own command.
+            sub = la_shell_destinations(words[0])
+            if sub is None:
+                unknown.extend(words)
+            else:
+                dests.extend(sub[0]); cds.extend(sub[1]); unknown.extend(sub[2])
+            unknown.extend(words[1:])
+            continue
+        if re.search(r"['\"(),{}]", words[0]) or login_autostart_path_hit(words[0]) \
+                or login_autostart_dir_hit(words[0]):
+            unknown.extend(words)                 # code, not a command name (QA round 4)
+            continue
+        name = re.split(r"[/\\]", words[0])[-1].lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        args = words[1:]
+        ops = [a for a in args if not a.startswith("-")]
+        if name in _LA_COPY_CMDS and ops and "{" in ops[-1] and "," in ops[-1]:
+            # `cp f{,.bak}` expands to `cp f f.bak`: only the LAST
+            # alternative is the destination (QA round 6).
+            ops = ops[:-1] + la_brace_expand(ops[-1], 16)
+            args = [a for a in args if a.startswith("-")] + ops
+        if name in _LA_CD_CMDS:
+            if ops:
+                t0 = ops[0]
+                if cds and not re.match(r"^(?:[/\\~$%]|[A-Za-z]:)", t0):
+                    cds.append(cds[-1].rstrip("/\\") + "/" + t0)   # chained `cd a && cd b`
+                cds.append(t0)
+            continue
+        known = True
+        if name in ("ssh", "autossh", "mosh"):
+            # The remote command (after options and the host) is a command
+            # of its own -- judged like a local one (QA round 7).
+            rest, j = [], 0
+            while j < len(args) and args[j].startswith("-"):
+                j += 2 if re.fullmatch(r"-[bcDEeFIiJLlmOopQRSWw]", args[j]) else 1
+            rest = args[j + 1:]
+            if rest:
+                sub = la_shell_destinations(" ".join(rest))
+                if sub is None:
+                    unknown.extend(rest)
+                else:
+                    dests.extend(sub[0]); cds.extend(sub[1]); unknown.extend(sub[2])
+            continue
+        if name == "tee":
+            dests.extend(ops)
+        elif name in _LA_COPY_CMDS or name in ("robocopy",):
+            if name == "dd":
+                dests.extend(a[3:] for a in args if a.startswith("of="))
+                if not any(a.startswith("of=") for a in args):
+                    known = False
+                continue
+            tdirs = []
+            for j, a in enumerate(args):
+                gnu_t = name in ("cp", "mv", "install", "ln", "gcp", "gmv", "ginstall")
+                if (a in ("--target-directory", "-Destination", "-destination")
+                        or (gnu_t and re.fullmatch(r"-[A-Za-z]*t", a))) and j + 1 < len(args):
+                    dests.append(args[j + 1])
+                    tdirs.append(args[j + 1])
+                elif a.startswith("--target-directory="):
+                    dests.append(a.split("=", 1)[1])
+                elif gnu_t and re.fullmatch(r"-[A-Za-z]*t.+", a) and not a.startswith("--"):
+                    dests.append(a[a.index("t") + 1:])
+            if name in ("robocopy", "xcopy", "rclone"):
+                dests.extend(ops[1:])
+            elif ops:
+                # Always the last operand too, even with -t (fail closed --
+                # QA round 3b: rsync `-t` is preserve-times, not a target).
+                dests.append(ops[-1])
+                tdirs.append(ops[-1])
+            # A source copied INTO a directory lands at dir/basename(src)
+            # (QA round 5: `cp dotfiles/.xinitrc ~/`, `cp -r stage/cron.d /etc/`).
+            for td in dict.fromkeys(tdirs):
+                for src in ops[:64]:
+                    if src != td:
+                        bn = re.split(r"[/\\]", src.rstrip("/\\"))[-1]
+                        if "$" in src or "$" in td:
+                            # Resolved by the caller once variables are known:
+                            # only the value's BASENAME lands in td (QA round 15).
+                            dests.append("\x01" + td + "\x02" + src)
+                            continue
+                        if bn and bn not in (".", "..") and (
+                                not re.match(r"^\.[xX]", bn) or _LA_HOME_RE.match(td)):
+                            # X-session dotfiles count only in a HOME dir
+                            # (`cp ~/.xinitrc ~/backup/` is a backup).
+                            dests.append(td.rstrip("/\\") + "/" + bn)
+        elif name in ("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "unrar", "bsdcpio"):
+            n0 = len(dests)
+            extract = (name not in ("tar", "bsdtar", "gtar")
+                       or any(re.fullmatch(r"-?[A-Za-z]*x[A-Za-z]*", a) or a in ("--extract", "--get")
+                              for a in args[:3]))
+            for j, a in enumerate(args):
+                if ((name.startswith("unzip") and re.fullmatch(r"-d.+", a))
+                        or (name in ("tar", "bsdtar", "gtar") and re.fullmatch(r"-C.+", a))):
+                    dests.append(a[2:])            # attached `-C<dir>` / `-d<dir>`
+                elif a.startswith("--one-top-level="):
+                    dests.append(a.split("=", 1)[1])
+                if a in ("-C", "--directory", "-d") and j + 1 < len(args):
+                    dests.append(args[j + 1])
+                elif a.startswith("--directory="):
+                    dests.append(a.split("=", 1)[1])
+                elif a.startswith("-o") and name.startswith("7z"):
+                    dests.append(a[2:])
+                elif re.match(r"^-[A-Za-z]*C$", a) and j + 1 < len(args):
+                    dests.append(args[j + 1])
+            if extract and len(dests) == n0 and (name != "7z" or "x" in ops[:1] or "e" in ops[:1]):
+                dests.append(".")                 # extracts into the cwd (QA round 4)
+        elif name in ("curl", "wget", "wget2", "aria2c", "http", "xh"):
+            n0 = len(dests)
+            implicit = (name in ("wget", "wget2", "aria2c") and "--spider" not in args) or any(
+                a in ("--remote-name", "--remote-name-all", "-J", "--remote-header-name")
+                or (re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", a) and name == "curl") for a in args)
+            for j, a in enumerate(args):
+                if a in ("-o", "--output", "-O", "--output-document", "--output-dir",
+                         "-P", "--directory-prefix", "-d", "--dir", "--out") and j + 1 < len(args):
+                    if not (name == "curl" and a == "-O"):
+                        dests.append(args[j + 1])
+                elif re.match(r"^--(?:output|output-document|output-dir|directory-prefix|dir|out)=", a):
+                    dests.append(a.split("=", 1)[1])
+                elif re.fullmatch(r"-[a-zA-Z]*[oOP]", a) and j + 1 < len(args):
+                    dests.append(args[j + 1])      # bundled `-sSLo FILE` (QA round 3b)
+                elif re.match(r"^-[a-zA-Z]*[oOP].", a) and not a.startswith("--"):
+                    k = max(a.find("o"), a.find("O"), a.find("P"))
+                    dests.append(a[k + 1:])
+            if implicit and len(dests) == n0:
+                dests.append(".")                 # remote-name download into the cwd
+        elif name in ("sed", "gsed"):
+            if any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in args):
+                dests.extend(ops)
+            for j, a in enumerate(args):        # sed's own `w FILE` command
+                if re.search(r"(?:^|[;}\s])w\s+\S", a):
+                    known = False
+        elif name == "sort":
+            for j, a in enumerate(args):
+                if (a == "--output" or re.fullmatch(r"-[A-Za-z]*o", a)) and j + 1 < len(args):
+                    dests.append(args[j + 1])
+                elif re.match(r"^(?:-[A-Za-z]*o|--output=)(.+)", a):
+                    dests.append(re.match(r"^(?:-[A-Za-z]*o|--output=)(.+)", a).group(1))
+        elif name in ("gh", "glab", "hub", "jira", "linear"):
+            # Values of prose flags are text, not paths (QA round 18);
+            # download/clone destinations still count.
+            prose = {"--title", "-t", "--body", "-b", "--message", "-m", "--summary",
+                     "--description", "--notes", "-n", "--comment", "--text"}
+            skip = set()
+            for j, a in enumerate(args):
+                if a in prose and j + 1 < len(args):
+                    skip.add(j + 1)
+                elif a in ("-f", "-F", "--field", "--raw-field") and j + 1 < len(args) and \
+                        re.match(r"^(?:body|title|message|text|description)=", args[j + 1]):
+                    skip.add(j + 1)
+            rest = [a for j, a in enumerate(args) if j not in skip and not
+                    re.match(r"^--(?:title|body|message|summary|description|notes|comment|text)=", a)]
+            has_dir = False
+            for j, a in enumerate(rest):
+                if a in ("-D", "--dir", "--output", "-O") and j + 1 < len(rest):
+                    dests.append(rest[j + 1])
+                    has_dir = True
+                elif re.match(r"^--(?:dir|output)=", a):
+                    dests.append(a.split("=", 1)[1])
+                    has_dir = True
+            if any(a in ("clone", "download", "archive") for a in rest[:3]):
+                unknown.extend(rest)
+                if not has_dir:
+                    dests.append(".")          # downloads into the cwd (QA round 19)
+            continue
+        elif name == "git":
+            sub = next((a for a in args if not a.startswith("-")), "")
+            if sub in ("clone", "worktree", "submodule", "archive", "checkout-index", "-C") or "-C" in args:
+                known = False
+        elif name in ("chmod", "chown", "chgrp", "setfacl", "chattr"):
+            dests.extend(ops[1:])
+        elif name in _LA_READONLY_CMDS or name in ("find", "awk", "gawk", "mawk"):
+            if name in ("awk", "gawk", "mawk") and any("inplace" in a or ">" in a for a in args):
+                known = False
+            if name in ("yq", "jq") and any(re.fullmatch(r"-[A-Za-z]*i|--inplace", a) for a in args):
+                dests.extend(ops)              # in-place edit (QA round 3b)
+            if name == "find":
+                for j, a in enumerate(args):
+                    if a in ("-exec", "-execdir", "-ok", "-okdir") and j + 1 < len(args):
+                        x = re.split(r"[/\\]", args[j + 1])[-1].lower()
+                        if x not in _LA_READONLY_CMDS:
+                            known = False
+                    elif a in ("-fprint", "-fprint0", "-fprintf", "-fls") and j + 1 < len(args):
+                        dests.append(args[j + 1])
+            # A "read-only" tool with an output/write option (tree -o, sdiff -o,
+            # jq --output, du/ls never) is judged fail-closed (QA round 3 lead).
+            if any(re.match(r"^(?:-[A-Za-z]*[oOwD][^-]*$|--(?:out|output|write|dest|dir|save|to)\b)", a)
+                   for a in args if a.startswith("-")):
+                known = False
+        elif name in _LA_INTERP or name.startswith("python"):
+            if any(re.search(r"['\"][wax]b?\+?['\"]|,\s*(?:mode\s*=\s*)?[wax]b?\+?\s*[),]|write|shutil|copy|symlink|rename|replace|"
+                             r"writeFile|appendFile|createWriteStream|Set-Content|Out-File|>", a)
+                   for a in args):
+                for a in args:
+                    dests.extend(m.group(0).strip(" '\"=()") for m in re.finditer(r"[^\s'\"(),]+", a)
+                                 if ("/" in m.group(0) or "\\" in m.group(0) or m.group(0).startswith(".x")))
+            if name in ("perl", "ruby") and any(re.match(r"^-[a-zA-Z]*i", a) for a in args):
+                dests.extend(ops)
+        elif name in ("set-content", "add-content", "out-file", "sc", "ac", "new-item", "ni",
+                      "copy-item", "move-item", "cpi", "mi", "tee-object", "set-itemproperty"):
+            for j, a in enumerate(args):
+                if a.lower() in ("-path", "-filepath", "-literalpath", "-destination") and j + 1 < len(args):
+                    dests.append(args[j + 1])
+            if name in ("copy-item", "move-item", "cpi", "mi"):
+                dests.extend(ops[1:2])
+            elif ops:
+                dests.append(ops[0])
+        else:
+            known = False
+        if not known:
+            unknown.extend(words[1:])
+    return dests, cds, unknown
+
+
+def la_shell_renderings(raw: str, _depth: int = 0):
+    """The command (substitutions replaced by SUBST) plus every body that
+    runs as its own command: $(..)/`..`/<(..)/>(..) bodies, heredoc bodies
+    fed to code, trap/eval bodies, decoded / inner-interpreter payloads --
+    without scan_surface's quote-stripped copies (they turn prose into code)."""
+    from . import normalize as _n
+    stripped, code = _la_heredocs(raw)
+    outer, subs = _la_substitutions(stripped)
+    out = [outer]
+    out.extend(code)
+    for rx in (_LA_EVAL_BODY_RE,) + _LA_EXTRA_BODY_RES:
+        out.extend((m.group(1) or m.group(2) or "") for m in rx.finditer(outer))
+    run_cache = {}
+    if ("echo" in outer or "printf" in outer) and (">" in outer or "tee" in outer):
+        for m in list(_LA_ECHO_WRITE_RE.finditer(outer))[:512]:
+            body_, f_ = (m.group(1) or m.group(2) or ""), (m.group(3) or m.group(4) or "")
+            # Only a body that could matter (QA round 25 perf); the run check
+            # is cached per FILE, every body judged (QA round 26: a script
+            # built with several `echo .. >>` lines).
+            if not (login_autostart_maybe_target(body_) or login_autostart_activation_maybe(body_)):
+                continue
+            bn_ = re.split(r"[/\\]", f_)[-1]
+            if not bn_ or bn_ == "null":
+                continue
+            if bn_ not in run_cache:
+                if len(run_cache) >= 64:
+                    out.append(body_.replace("\\n", "\n"))   # past the cap: fail closed
+                    continue
+                run_cache[bn_] = _la_file_is_run(outer[m.end():], bn_)
+            if run_cache[bn_]:
+                out.append(body_.replace("\\n", "\n"))
+    if "$" in outer and "=" in outer:
+        out.extend(b_ for b_ in la_var_bodies(outer, la_var_map(outer)) if b_.strip())
+    if _depth < 3:
+        for b_ in subs:
+            out.extend(la_shell_renderings(b_, _depth + 1))
+    seen = {re.sub(r"[\s'\"$\\\\]", "", x) for x in out + [raw]}
+    for r in _n.scan_surface(raw, sep="\x1e").split("\x1e")[1:]:
+        if not r.strip() or r in out:
+            continue
+        k = re.sub(r"[\s'\"$\\\\]", "", r)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+    return list(dict.fromkeys(out))[:32]
+
+
+LA_AT_RE = re.compile(
+    _LA_CMDPOS_BATCH + r"at(?:\.exe)?\s+(?:-[mMvVk]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
+    + r"(?:-t\s*['\"]?(?:\d|SUBST\b|\$|`)|-[A-Za-z]*b[A-Za-z]*(?=\s|$|[;&|)])|" + _LA_TIMESPEC + r")"
+    + r"|" + _LA_CMDPOS_BATCH + r"batch(?=\s*(?:$|[<|;&\n)]|-[fqmv]\b))"
+    + r"|\bxargs\b(?:\s+-[^\s]{1,40}(?:\s+\d{1,6})?){0,8}\s+(?:/usr(?:/local)?/bin/|/bin/)?(?:at|batch)(?=\s*(?:$|[<|;&\n)]|\{\}))",
+    re.IGNORECASE)
+_LA_ACT_CMDS = frozenset(("reg", "set-itemproperty", "new-itemproperty", "new-item", "sp", "ni",
+                          "set-item", "regedit", "osascript", "defaults", "sfltool", "cmd", "powershell", "pwsh"))
+
+
+def login_autostart_activation_maybe(r: str) -> bool:
+    if "'" in r or '"' in r or "\\" in r:
+        r = r + " " + re.sub(r"['\"\\]", "", r)
+    low = r.lower()
+    return any(k in low for k in _LA_CMD_LITERALS) or bool(_LA_AT_WORD_RE.search(r))
+
+
+def login_autostart_activation_hit(r: str) -> bool:
+    """at/batch on the prose-free surface; registry / macOS login-item
+    commands judged on their own simple command only (their key or script
+    is legitimately quoted, so quote-stripping would hide it)."""
+    import shlex
+    if not login_autostart_activation_maybe(r):
+        return False
+    if LA_AT_RE.search(la_prose_free(r)):
+        return True
+    c, _ = _la_heredocs(r)
+    toks, skip_next = [], False
+    for t in _la_tokens_nocomment(c):
+        if skip_next and t != ";":
+            skip_next = False
+            continue                       # the redirect's own operand (QA round 19)
+        skip_next = False
+        if t and set(t) <= set("<>&|") and ("<" in t or ">" in t):
+            skip_next = True
+            if toks and re.fullmatch(r"\d", toks[-1]):
+                toks.pop()                 # `2>` / `0<` fd number
+            continue
+        toks.append(t)
+    for sc in _la_split_simple(toks):
+        quoted_name = bool(sc) and len(sc[0]) > 1 and sc[0][0] == sc[0][-1] and sc[0][0] in "'\""
+        w = _la_strip_wrappers([_la_unquote(t).strip() if t[:1] in "'\"" else t for t in sc])
+        if not w:
+            continue
+        # The command NAME seen through embedded quotes / backslashes
+        # (QA round 5: `a''t now`, `ba"tch"`); arguments keep their text.
+        w0 = re.sub(r"['\"]", "", w[0])
+        if "\\" in w0 and "/" not in w0 and not re.match(r"^[A-Za-z]:", w0):
+            w0 = w0.replace("\\", "")
+        w = [w0] + w[1:]
+        name = re.split(r"[/\\]", w[0])[-1].lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        if name in ("at", "batch") and not re.search(r"[/\\]", w[0].replace("/usr/bin/", "").replace("/usr/local/bin/", "").replace("/bin/", "")):
+            rest = " ".join(x.strip() for x in w[1:] if x.strip())
+            if name == "batch" and not quoted_name and re.fullmatch(r"(?:\s*-[fqmv]\S*(?:\s+\S+)?)*\s*(?:<.*)?", rest):
+                return True
+            if name == "at" and re.match(
+                    r"(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*\S+\s+)*(?:-t\s*['\"]?(?:\d|SUBST\b|\$|`)|-[A-Za-z]*b[A-Za-z]*(?:\s|$)|" + _LA_TIMESPEC + r")",
+                    rest, re.IGNORECASE):
+                return True
+            continue
+        if name not in _LA_ACT_CMDS:
+            continue
+        text = " ".join(w)
+        for m in LOGIN_AUTOSTART_CMD_RE.finditer(text):
+            if _LA_REG_KEY_RE.search(m.group(0)) and not REGISTRY_WRITE_VERB_RE.search(text):
+                continue
+            return True
+    return False
+
+
+_LA_GLOB_NAMES = (
+    "autostart", "autostart-scripts", ".config", "xdg", "plasma-workspace", "env", "shutdown",
+    ".kde", ".kde4", "Autostart", "openbox", "labwc", "lxsession", ".xinitrc", ".xsession",
+    ".xsessionrc", ".xserverrc", ".Xclients", "X11", "xinit", "xinitrc", "xinitrc.d",
+    "Xsession", "Xsession.d", "Xreset", "Xreset.d", "gdm", "gdm3", "PostLogin", "PreSession",
+    "PostSession", "Init", "etc", "crontab", "anacrontab", "cron.d", "cron.hourly",
+    "cron.daily", "cron.weekly", "cron.monthly", "var", "spool", "cron", "at", "atjobs",
+    "crontabs", "periodic", "daily", "weekly", "monthly", "periodic.conf", "Start Menu",
+    "Programs", "Startup", "usr", "lib", "tabs", "jobs",
+)
+_LA_BRACE_RE = re.compile(r"\{([^{}]{0,400})\}")
+
+
+def la_glob_candidates(path: str, cap: int = 64) -> list:
+    """Brace-expand, then resolve glob segments (``*?[``) against the
+    protected names (QA round 5: `~/.config/autost*/x`, `auto{s,}tart`)."""
+    import fnmatch
+    if len(path) > 4096:
+        return [path]
+    out = la_brace_expand(path, cap)
+    if not re.search(r"[*?\[]", "".join(out)):
+        return out
+    return _la_glob_resolve(out, cap)
+
+
+def la_brace_expand(path: str, cap: int = 64) -> list:
+    out = [path]
+    if "{" in path:
+        for _ in range(3):
+            nxt = []
+            for p in out:
+                m = _LA_BRACE_RE.search(p)
+                if not m or "," not in m.group(1):
+                    nxt.append(p)
+                    continue
+                for alt in m.group(1).split(",")[:16]:
+                    nxt.append(p[:m.start()] + alt + p[m.end():])
+            out = list(dict.fromkeys(nxt))[:cap]
+    return out
+
+
+def _la_glob_resolve(out: list, cap: int) -> list:
+    """Resolve wildcard segments with >= 2 literal characters (`autost*`,
+    `.xsess*`, `X1?`) against the protected names. A bare `*`/`.*`/`c*`
+    is left alone (QA round 6: `src/*` must not become `src/.xinitrc`);
+    at most 8 wildcard segments are resolved (bounded work)."""
+    import fnmatch
+    res = []
+    for p in out:
+        segs = re.split(r"([/\\]+)", p)
+        combos = [""]
+        nwild = 0
+        for sg in segs:
+            if (re.search(r"[*?\[]", sg) and nwild < 8
+                    and len(re.sub(r"\[[^\]]*\]|[*?]", "", sg)) >= 2):
+                nwild += 1
+                ms = [n for n in _LA_GLOB_NAMES if fnmatch.fnmatchcase(n.lower(), sg.lower())] or [sg]
+                combos = [c + m for c in combos[:cap] for m in ms][:cap]
+            else:
+                combos = [c + sg for c in combos[:cap]]
+        res.extend(combos)
+    return list(dict.fromkeys(res))[:cap]
+
+
+# ---- single-assignment shell variables (QA round 14) -----------------------
+# `DEST=~/.config/autostart; cp x "$DEST/"` is the ordinary install-script
+# shape: a variable assigned ONE literal value in the same command is
+# substituted into later `$NAME`/`${NAME}`/`${NAME:-..}` references before
+# destination analysis. (Values built across several assignments, loops or
+# computed at run time stay a disclosed limitation.)
+_LA_ASSIGN_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:export\s+|local\s+|readonly\s+|declare\s+(?:-\S+\s+)*|typeset\s+(?:-\S+\s+)*)?"
+    r"([A-Za-z_]\w{0,63})=((?:\"(?:[^\"\\]|\\.){0,2000}\"|'[^']{0,2000}'|\$\{[^}\s]{0,400}\}|[^\s;&|()<>'\"]){0,64})")
+_LA_DEFAULT_ASSIGN_RE = re.compile(r"\$\{([A-Za-z_]\w{0,63}):?=([^}]{0,2000})\}")
+_LA_DEFAULT_EXP_RE = re.compile(r"\$\{(?:[A-Za-z_]\w{0,63}|\d+):?[-=?+]([^{}]{0,2000})\}")
+
+
+_LA_DECL_WORDS = frozenset(("export", "local", "readonly", "declare", "typeset"))
+_LA_VM_LEAD = frozenset(("then", "do", "else", "elif", "if", "while", "until", "{", "}", "!",
+                         "time", "sudo", "doas", "env", "nohup", "command", "exec", "builtin"))
+
+
+def la_var_map(cmd: str) -> dict:
+    """NAME -> value for assignments at a COMMAND-WORD position, read from
+    the quote-aware tokenizer (QA round 16: ` PATH=..` inside an earlier
+    quoted string is prose, not an assignment), plus `: ${X:=v}` forms."""
+    vm = {}
+    c, _ = _la_heredocs(cmd[:200000])
+    pairs = []
+    for sc in list(_la_split_simple([_la_unquote(t) for t in _la_tokens_nocomment(c)]))[:20000]:
+        w = list(sc)
+        # Leading reserved words / wrappers (QA round 17: `then DIR=..`,
+        # `{ DEST=..`, `do F=..`, `sudo DIR=.. sh -c ..`).
+        while w and (w[0] in _LA_VM_LEAD or (w[0].startswith("-") and len(w) > 1)):
+            w = w[1:]
+        if len(w) >= 3 and w[0] == "for" and w[2] == "in":
+            # `for VAR in w1 w2 ..` -- each word is a value of VAR.
+            for x in w[3:19]:
+                if x in ("do", ";"):
+                    break
+                pairs.append((w[1], x))
+            continue
+        decl = bool(w) and w[0] in _LA_DECL_WORDS
+        if decl:
+            w = [x for x in w[1:] if not x.startswith("-")]
+        for x in w[:32]:
+            m = re.match(r"^([A-Za-z_]\w{0,63})=(.*)$", x, re.S)
+            if not m:
+                if not decl:
+                    break                  # first non-assignment word: the command
+                continue
+            pairs.append((m.group(1), m.group(2)[:2000]))
+        if len(pairs) > 4000:
+            break
+    pairs += [(m.group(1), m.group(2)) for m in list(_LA_DEFAULT_ASSIGN_RE.finditer(c))[:64]]
+    latest = {}
+    for name, v in pairs[:4096]:
+        v = re.sub(r"['\"]", "", v)
+        res_ = []
+        if "$" in v and vm:
+            # Resolve against what is already known, in order, so a chain
+            # A=..; B=$A/..; C=$B/.. is followed in one linear pass (QA
+            # round 22); keep the raw spelling as a fallback value.
+            r_ = re.sub(r"\$\{([A-Za-z_]\w{0,63})\}|\$([A-Za-z_]\w{0,63})",
+                        lambda mm: latest.get(mm.group(1) or mm.group(2), mm.group(0)), v)
+            res_ = [r_] if (r_ != v and len(r_) <= 1024) else []
+            if res_:
+                for x in res_:
+                    if name in vm and x not in vm[name].split("\x00"):
+                        if vm[name].count("\x00") < 15:
+                            vm[name] += "\x00" + x
+                    else:
+                        vm.setdefault(name, x)
+        if name in vm and v not in vm[name].split("\x00"):
+            if vm[name].count("\x00") < 15:
+                vm[name] = vm[name] + "\x00" + v          # several values: try each
+        else:
+            vm.setdefault(name, v)
+        latest[name] = res_[0] if res_ else v
+    return vm
+
+
+def la_var_subst(t: str, vm: dict, depth: int = 0) -> list:
+    """Every spelling of ``t`` with known variables substituted."""
+    if not vm or "$" not in t or depth > 1:
+        return [t]
+    out = [t]
+    refs = list(dict.fromkeys(re.findall(r"\$\{?([A-Za-z_]\w{0,63})", t)))[:8]
+    for name in refs:
+        val = vm.get(name)
+        if val is None:
+            continue
+        rx = re.compile(r"\$(?:\{" + re.escape(name) + r"(?:[:=?+-][^}]{0,400})?\}|" + re.escape(name) + r"(?!\w))")
+        nxt = []
+        for x in out:
+            if rx.search(x):
+                for v in val.split("\x00")[:8]:
+                    nxt.append(rx.sub(lambda _m: v, x))
+            nxt.append(x)
+        out = list(dict.fromkeys(nxt))[:16]
+    if depth < 1 and any("$" in x for x in out):
+        more = []
+        for x in out:
+            more.extend(la_var_subst(x, vm, depth + 1))
+        out = list(dict.fromkeys(out + more))[:16]
+    return out
+
+
+_LA_VAR_RUN_RES = (
+    re.compile(r"\b(?:eval|(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-c)\s+['\"]?\$\{?([A-Za-z_]\w{0,63})\b"),
+    re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*['\"]?\$\{?([A-Za-z_]\w{0,63})\b[^|\n]{0,40}\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b"),
+    re.compile(r"\b(?:ba|z|da|k)?sh\b[^\n|;&]{0,60}<<<\s*['\"]?\$\{?([A-Za-z_]\w{0,63})\b"),
+)
+
+
+def la_var_bodies(cmd: str, vm: dict) -> list:
+    """String values later RUN as code: `eval "$S"`, `sh -c "$S"`,
+    `echo "$S" | sh`, `sh <<< "$S"`. Run sites are found once, then only
+    the variables they name are looked up (linear)."""
+    if not vm or "$" not in cmd:
+        return []
+    names = []
+    for rx in _LA_VAR_RUN_RES:
+        names.extend(m.group(1) for m in rx.finditer(cmd[:200000]))
+    out = []
+    for name in list(dict.fromkeys(names))[:64]:
+        if name in vm:
+            out.extend(vm[name].split("\x00")[:4])
+    return out
+
+
+def la_default_forms(t: str) -> list:
+    """`${X:-word}` / `${X:=word}` / `${1:-word}` also read as `word`
+    (QA round 15: `echo x >> "${XINITRC:-$HOME/.xinitrc}"`)."""
+    if "${" not in t:
+        return [t]
+    t2 = re.sub(r"\$\{([A-Za-z_]\w{0,63})(?::?\?[^{}]*|%%?[^{}]*|##?[^{}]*)?\}", r"$\1", t)
+    out = [t] if t2 == t else [t, t2]
+    for _ in range(4):
+        nxt = _LA_DEFAULT_EXP_RE.sub(lambda m: m.group(1), out[-1])
+        if nxt == out[-1]:
+            break
+        out.append(nxt)
+    return out

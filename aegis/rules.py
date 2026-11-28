@@ -11161,6 +11161,8 @@ _FETCH_HUMAN_ESCAPABLE = (
     (patterns.GITMODULES_PATH_RE, "a .gitmodules submodule config"),
     (patterns.SYSTEMD_UNIT_PATH_RE, "a systemd unit"),
     (patterns.LAUNCHD_PLIST_PATH_RE, "a launchd plist"),
+    (patterns.LOGIN_AUTOSTART_PATH_RE, "a login/desktop-session autostart file"),
+    (patterns.CRON_SPOOL_PATH_RE, "a cron/at/periodic scheduler file"),
     (patterns.LD_PRELOAD_PATH_RE, "the dynamic linker's preload list"),
     (patterns.LD_SO_CONF_PATH_RE, "the dynamic linker's search-path config"),
     (patterns.DEVCONTAINER_PATH_RE, "a dev-container config"),
@@ -16436,6 +16438,569 @@ def rule_lint_config_exec_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "AEGIS_ALLOW_LINT_CONFIG_EXEC=1; a spawned agent cannot."))
     return None
 
+def _login_autostart_allowed_by_policy(cfg: dict, text: str) -> bool:
+    for pat in (cfg.get("allow") or []):
+        try:
+            if re.search(str(pat), text, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _login_autostart_rel_hit(p: str, cwd) -> bool:
+    """A relative target resolved against the call's cwd (`autostart/x.desktop`
+    written from inside `~/.config`)."""
+    if not p or not cwd or "\n" in p or re.match(r"^(?:[/\\~$%]|[A-Za-z]:|file:)", p):
+        return False
+    return patterns.login_autostart_path_hit(str(cwd).rstrip("/\\") + "/" + p)
+
+
+_LA_PATHISH_KEY_WORDS = frozenset(("path", "paths", "file", "files", "filename", "filepath",
+                                   "dest", "destination", "target", "dst", "to", "output",
+                                   "out", "outfile", "location", "uri", "url", "dir",
+                                   "directory", "folder", "new", "newpath", "save", "saveas",
+                                   "name", "pathname", "fullpath", "abspath"))
+
+
+def _la_pathish_leaves(v, key_ok=False, _d=0):
+    """String leaves sitting under a path-like key (at any depth)."""
+    if _d > 12:
+        return
+    if isinstance(v, str):
+        if key_ok:
+            yield v
+    elif isinstance(v, dict):
+        if key_ok:
+            yield from (str(k) for k in list(v)[:5000])   # `{files: {path: content}}`
+        for k, x in v.items():
+            yield from _la_pathish_leaves(
+                x, key_ok or bool(_http_rc_words(str(k)) & _LA_PATHISH_KEY_WORDS), _d + 1)
+    elif isinstance(v, (list, tuple)):
+        for x in list(v)[:5000]:
+            yield from _la_pathish_leaves(x, key_ok, _d + 1)
+
+
+def _la_dest_hit(d: str, bases) -> bool:
+    d = str(d).strip()
+    if not d:
+        return False
+    forms = [d]
+    if "\\" in d and not re.match(r"^[A-Za-z]:|^\\\\", d):
+        forms.append(d.replace("\\", ""))         # `auto\start` is `autostart` in a shell
+    forms = [x for f in forms for x in patterns.la_default_forms(f)]
+    for f in forms:
+        for c in patterns.la_glob_candidates(f):
+            if patterns.login_autostart_path_hit(c) or patterns.login_autostart_dir_hit(c):
+                return True
+            if re.match(r"^(?:[/\\~$%]|[A-Za-z]:)", c):
+                continue
+            for b in bases:
+                if not b:
+                    continue
+                for bc in patterns.la_glob_candidates(str(b))[:16]:
+                    j = bc.rstrip("/\\") + "/" + c
+                    if patterns.login_autostart_path_hit(j) or patterns.login_autostart_dir_hit(j):
+                        return True
+    return False
+
+
+def _login_autostart_shell_writes(r: str, cwd) -> bool:
+    """Does shell text ``r`` WRITE into a gated location? Destination-aware
+    (QA round 1: reading/copying FROM a target is not a plant); falls back
+    to the coarse named-target + write-verb check when ``r`` can't be
+    tokenized."""
+    if not (patterns.login_autostart_maybe_target(r)
+            or (cwd and patterns.login_autostart_maybe_target(str(cwd)))
+            or re.search(r"[*?\[{]", r)):
+        return False
+    if patterns.login_autostart_find_hit(r) and re.search(
+            r"-(?:exec(?:dir)?|ok(?:dir)?)\s+(?:\S*/)?(?:sed\s+(?:-\S+\s+)*-[a-zA-Z]*i|perl\s+-[a-zA-Z]*i"
+            r"|cp|mv|install|ln|tee|chmod|dd|rsync|truncate|patch|sh|bash|zsh|dash|ksh|python3?|perl|node)\b",
+            r, re.IGNORECASE):
+        return True
+    res = patterns.la_shell_destinations(r)
+    if res is None:
+        named = (patterns.login_autostart_path_hit(r) or patterns.login_autostart_dir_hit(r)
+                 or patterns.login_autostart_cd_hit(r, cwd))
+        return bool(named and any(rx.search(r) for rx in (
+            patterns.WRITE_REDIRECT_RE, patterns.COPY_WRITE_VERB_RE,
+            patterns.INPLACE_WRITE_RE, patterns.FORCED_LINK_WRITE_RE,
+            patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
+            patterns.FETCH_TO_FILE_VERB_RE)))
+    dests, cds, unknown = res
+    vm = patterns.la_var_map(r) if "$" in r else {}
+    memo = {}
+
+    def subst(t):
+        if not vm or "$" not in t:
+            return [t]
+        if t not in memo:
+            if len(memo) > 4000:
+                return [t]
+            memo[t] = patterns.la_var_subst(t, vm)
+        return memo[t]
+
+    def spellings(t):
+        return list(dict.fromkeys(y for x in subst(t) for y in patterns.la_default_forms(x)))[:16]
+
+    udests = list(dict.fromkeys(dests))
+    if len(udests) > 2000:
+        tail = udests[2000:]
+        if any(patterns.login_autostart_maybe_target(d) for d in tail) or any(
+                patterns.login_autostart_maybe_target(x) for d in [t for t in tail if "$" in t][:2000]
+                for x in spellings(d.replace("\x01", "").replace("\x02", "/"))):
+            return True                   # past the destination cap: fail closed (QA rounds 15-16)
+    joined = []
+    for d in udests[:2000]:
+        if d.startswith("\x01"):
+            td, src = d[1:].split("\x02", 1)
+            tds = spellings(td)
+            for sv in spellings(src):
+                bn = re.split(r"[/\\]", sv.rstrip("/\\"))[-1]
+                if not bn or "$" in bn or bn in (".", ".."):
+                    continue
+                for tdv in tds:
+                    if not re.match(r"^\.[xX]", bn) or patterns._LA_HOME_RE.match(tdv):
+                        joined.append(tdv.rstrip("/\\") + "/" + bn)
+        else:
+            joined.extend(spellings(d) if "$" in d else [d])
+    dests = list(dict.fromkeys(joined))
+    if vm:
+        cds = [x for d in cds[:64] for x in subst(d)]
+        unknown = [x for d in unknown[:2000] for x in subst(d)]
+    ucds = list(dict.fromkeys(cds))
+    if len(ucds) > 16 and any(patterns.login_autostart_maybe_target(x) for x in ucds):
+        return True                       # past the cd cap: fail closed (QA round 7)
+    bases = ucds[:16] + ([cwd] if cwd else [])
+    dests = list(dict.fromkeys(dests))
+    unknown = list(dict.fromkeys(unknown))
+    if any(_la_dest_hit(d, bases) for d in dests[:2000]):
+        return True
+    # Fail closed: a target among an unrecognised command's operands counts
+    # (relative operands joined to cwd/cd only when they look like a path).
+    for u in unknown[:2000]:
+        pieces = [u] + [x for x in re.split(r"[\s{}()\[\],;<>|&=]+", u) if x and x != u]
+        for x in pieces[:200]:
+            if _la_dest_hit(x, bases if re.search(r"[/\\]", x) else ()):
+                return True
+    return False
+
+
+_LA_MCP_SHELL_WORDS = frozenset(("exec", "execute", "shell", "bash", "sh", "zsh", "terminal",
+                                 "interact",
+                                 "cmd", "command", "commands", "powershell", "pwsh", "console",
+                                 "pty", "tty", "tmux", "ssh", "spawn", "subprocess"))
+_LA_MCP_CODE_WORDS = frozenset(("python", "ipython", "py", "cell", "notebook", "jupyter", "code", "repl",
+                                "eval", "script", "node", "javascript", "interpreter"))
+_LA_MCP_INPUT_KEY_WORDS = frozenset(("command", "commands", "cmd", "script", "input", "keys",
+                                     "text", "line", "lines", "stdin", "code", "args", "argv",
+                                     "arguments", "chars", "data", "exec", "shell", "program",
+                                     "executable", "cmdline", "commandline", "body", "payload"))
+_LA_MCP_CMD_KEYS = ("command", "cmd", "script", "shell_command", "commandLine", "command_line",
+                    "shellCommand", "bash", "sh", "command_text", "commandText", "cmdline")
+
+
+def _la_mcp_commands(ev: Event) -> list:
+    """Shell commands an MCP call runs, each judged on its own (QA round 4:
+    joining every field of a `send_email`/`run_tests` call with newlines
+    turned prose into commands). A tool is a shell runner only by a real
+    shell word in its own name or a command-shaped key; code-runner tools
+    (`run_cell{code}`) are judged as interpreter code."""
+    a = ev.args if isinstance(ev.args, dict) else {}
+    parts = str(ev.tool or "").split("__")
+    words = _http_rc_words(parts[-1])
+    if len(parts) >= 3:
+        words = words | _http_rc_words(parts[1])     # `mcp__shell__run` (QA round 5)
+    out = []
+    inner = a.get("args") if isinstance(a.get("args"), dict) else {}
+    for src in (a, inner):
+        for k in _LA_MCP_CMD_KEYS:
+            v = src.get(k)
+            if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+                v = " ".join(list(v)[:256])
+            if isinstance(v, str) and v.strip():
+                extra = src.get("args")
+                if isinstance(extra, (list, tuple)):
+                    v += " " + " ".join(str(x) for x in list(extra)[:256])
+                for sk in ("stdin", "input"):
+                    if isinstance(src.get(sk), str) and src.get(sk):
+                        v += "\n" + src[sk]
+                out.append(v)
+    if words & _LA_MCP_SHELL_WORDS:
+        # Command-shaped fields only -- not description/title/note (QA round 5).
+        for k, v in a.items():
+            if _http_rc_words(str(k)) & _LA_MCP_INPUT_KEY_WORDS:
+                for x in _flatten_strings(v)[:2000]:
+                    if isinstance(x, str) and x.strip():
+                        out.append(x)
+            elif isinstance(v, dict):          # `{action_json: {command: ...}}`
+                for k2, v2 in v.items():
+                    if _http_rc_words(str(k2)) & _LA_MCP_INPUT_KEY_WORDS:
+                        for x in _flatten_strings(v2)[:2000]:
+                            if isinstance(x, str) and x.strip():
+                                out.append(x)
+    if words & {"run", "execute", "exec", "eval", "evaluate"} and (
+            words & _LA_MCP_CODE_WORDS or any(k in a for k in ("code", "python_code", "source"))):
+        for k in ("code", "python_code", "pythonCode", "source_code", "source", "cell",
+                  "script", "input", "content"):
+            v = a.get(k)
+            if isinstance(v, str) and v.strip():
+                out.append("python3 -c " + patterns._la_squote(v))
+    return list(dict.fromkeys(out))[:64]
+
+
+def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
+    """Gate login/desktop-session autostart and cron/at-spool persistence.
+
+    PLAN / THREAT MODEL: an agent (prompt-injected through a README, an issue,
+    a fetched page, or an MCP tool result) plants a command that runs LATER,
+    with the human's or root's full privileges, the next time they log in to
+    a desktop session or a scheduler fires -- outside every repo, so
+    invisible to ``git status``/code review, and with no further agent
+    action, git op, CI run or session restart needed:
+
+    - freedesktop XDG autostart (``~/.config/autostart/*.desktop``,
+      ``/etc/xdg/autostart``, ``$XDG_CONFIG_HOME/autostart``; MITRE ATT&CK
+      T1547.013) -- every GNOME/KDE/Xfce/Cinnamon/MATE/LXQt login runs its
+      ``Exec=`` line; KDE Plasma ``plasma-workspace/env/*.sh`` (sourced at
+      login) and ``shutdown/*`` (run at logout), KDE4 ``~/.kde/Autostart``,
+      ``autostart-scripts``; openbox/labwc/lxsession ``autostart`` files;
+    - X session scripts: ``~/.xinitrc``/``.xsession``/``.xsessionrc``/
+      ``.xserverrc``/``.Xclients``, ``/etc/X11/xinit/xinitrc[.d]``,
+      ``/etc/X11/Xsession[.d]``/``Xreset[.d]``, GDM ``PostLogin``/
+      ``PreSession``/``PostSession``/``Init`` scripts;
+    - cron/at spools written as FILES (T1053.003/.002): ``/etc/crontab``,
+      ``/etc/anacrontab``, ``/etc/cron.{d,hourly,daily,weekly,monthly}/*``,
+      ``/var/spool/cron/**``, ``/var/spool/at*``, ``/var/at/{tabs,jobs}``,
+      macOS ``/usr/lib/cron/tabs``; BSD/macOS ``periodic`` scripts and
+      ``periodic.conf``;
+    - the Windows Startup folder written as a FILE;
+    - with no file at all: ``at``/``batch`` job scheduling, macOS
+      ``osascript ... login item`` / ``defaults write ... loginwindow
+      LoginHook`` / ``sfltool add-item``, and Windows registry autostarts
+      ``PERSIST_RE`` doesn't name (Winlogon ``Userinit``/``Shell``/
+      ``Notify``, ``Policies\\Explorer\\Run``, Active Setup ``StubPath``,
+      ``AppInit_DLLs``, Image File Execution Options ``Debugger``) when
+      paired with a registry write verb.
+
+    GAP CLOSED: ``rule_containment``'s ``PERSIST_RE`` denies ``crontab``,
+    ``/etc/cron`` and the Startup folder -- but only on the SHELL branch, so
+    the Write/Edit/MCP file-write form of the very same targets was never
+    checked; every other surface above had no coverage on any branch
+    (``rule_service_persist_protect`` covers systemd/launchd only;
+    ``rule_shell_persist_protect`` covers shell rc files, incl.
+    ``~/.xprofile``).
+
+    IMPLEMENTATION: path-based, any write (the target IS the payload; there
+    is no benign content shape worth parsing, the ``rule_service_persist_
+    protect`` posture). Edit/Write/MultiEdit/NotebookEdit and MCP file
+    writes are matched on the target path (also cwd-relative, and for MCP on
+    any path-shaped argument leaf); a shell call is gated when it names a
+    target (file, bare directory, or ``find`` predicate) together with a
+    write verb (redirect/``tee``, ``cp``/``install``/``ln``/``dd``, ``mv``/
+    ``rm``, ``sed -i``, forced link, archive/sync), or runs one of the
+    no-file activation commands above; an MCP shell-runner's command is
+    judged as a shell command. Registered with the fetch-to-file backstop
+    (``curl -o ~/.config/autostart/x.desktop``).
+
+    Config (``policy.login_autostart``): ``mode`` (deny|ask|monitor|off,
+    default ask), ``allow`` (regexes on the path / whole command). Escapable
+    only by a human: a trailing ``# aegis-allow`` on the shell form, or
+    ``AEGIS_ALLOW_LOGIN_AUTOSTART=1`` set before launch. A spawned agent can
+    do neither.
+
+    Honest scope: a path assembled indirectly (a value built from several
+    assignments, loops, ``basename`` reconstruction) is not seen; an
+    in-process interpreter write (``python -c "open(...,'w')"``) is seen
+    only when the target path is literal in the command; a custom
+    ``$XDG_CONFIG_HOME`` pointing at an unrecognised directory, or a
+    ``periodic.conf`` pointing ``periodic`` at a custom directory, is not
+    followed; ``at``'s detection is anchored to a command position, so an
+    ``at`` reached through an alias/function of another name is missed;
+    reading/listing (``atq``, ``at -l``, ``cat ~/.xinitrc``) is never
+    gated. Shell analysis is destination-aware: only a redirect target,
+    ``tee`` arg, the last operand / ``-t`` of a copy tool, tar ``-C``, a
+    fetch tool's output, an in-place edit's file, ``chmod`` operands, or a
+    path in interpreter write code counts -- so copying/reading FROM a
+    target passes. ``at``/``batch`` are matched with quoted strings, comments
+    and heredoc bodies removed (a heredoc fed to a shell/``at`` is kept), so
+    an ``at`` hidden inside a double-quoted ``"$(at now ...)"`` is missed;
+    registry/login-item commands are judged on their own simple command.
+    Path patterns are not anchored to ``/``, so an in-repo packaging tree
+    (``debian/etc/cron.d/app``, ``packaging/xdg/autostart/x.desktop``) asks
+    too -- the ``rule_service_persist_protect`` posture; exempt such trees
+    with an ``allow`` regex.
+
+    QA history: round 1 ran two independent reviewers in parallel. Bypass
+    hunting found ``seg/../`` path spellings, ``cd``-then-relative writes,
+    ``curl --output-dir``/``wget -P``, the ``STARTM~1`` 8.3 name and
+    ``xargs at``; all closed. The false-positive review found ``at``
+    matched inside commit-message heredocs and quoted prose, loose
+    day/month words (``decode``, ``marshal``), ``./batch`` scripts, bare
+    paths in MCP messaging values, and reads/copies FROM a target; closed
+    with the prose-free surface, exact time-spec words, path-like-key MCP
+    scanning, and destination-aware shell analysis. Round 2 (fresh
+    reviewer) found the destination parser trusted a misparse: unlisted
+    wrappers (``timeout 5``/``nice -n 10``/``flock``/``{ ...; }``), clustered
+    ``-vt``/``-Dt``, quote-split ``"$XDG_CONFIG_HOME"/autostart``, and write
+    tools it didn't know (``gio copy``/``sponge``/``sort -o``/``openssl
+    -out``/``git clone``). Fixed by making it fail CLOSED: any operand of an
+    unrecognised command that names a target counts as a write; only a
+    known read-only command or a known writer whose destination is
+    elsewhere passes. Round 3 (two reviewers; one cut short) added
+    heredoc-to-interpreter / piped-heredoc bodies, read-only tools with an
+    output option, ``find -exec`` of a writer, bundled ``curl -sSLo``,
+    rsync ``-t`` (preserve times, not a target) and ``yq -i``. Round 4
+    found a heredoc marker's own trailing redirect dropped (``cat <<EOF >
+    ~/.xinitrc``), unparsed ``$(..)``/backtick/``<(..)``/``trap``/``eval``
+    bodies, implicit cwd writes (``cd autostart && curl -O``/``tar x``/
+    ``unzip``), a computed ``at`` time, attached ``-C<dir>``/``-d<dir>``/
+    ``sort -uo``, MCP ``name``/``pathname``/``directory+filename`` keys and
+    code-runner tools; and MCP messaging tools whose prose was joined into
+    one "command" (now: shell-runner only by a real shell word in the tool
+    or server name, command-shaped fields only, each judged on its own).
+    Round 5 found the early exit read only scan_surface's 40KB-capped
+    text; quote/backslash-split names (``auto''start``, ``a''t``); copies
+    INTO a parent dir (``cp dotfiles/.xinitrc ~/``, ``cp -r stage/cron.d
+    /etc/``); an uncapped cd x destination product (quadratic); ``at -b``;
+    glob/brace spellings (``autost*``, ``auto{s,}tart`` -- resolved against
+    the protected names); chained ``cd``; MCP ``files`` maps; and a
+    description-field false positive. All closed. Round 6 found the
+    round-5 glob resolution over-broad (``src/*`` became ``src/.xinitrc``:
+    now only segments with >= 2 literal characters resolve, at most 8) and
+    super-linear on ``*/*/*...``; ``cp x .../cron/$(whoami)`` (a
+    substitution now stays inside its word); ``su -c``/``sh <<<``/``echo
+    .. | sh`` bodies; ``interact_with_process`` and nested ``action_json``
+    MCP runners; ``open(.., 'w')`` after unquoting; and false positives on
+    ``./at``, ``cp f{,.bak}`` and a non-running ``add_cell``. All closed.
+    Round 7 (acceptance) found a trailing ``# comment`` became a copy
+    tool's "last operand" (``cp a ~/.xinitrc # x``) -- comments are now
+    dropped per line, quote-aware -- plus ``env -C DIR``, ``ssh host '..'``
+    bodies, and padding past the 16-``cd`` cap (now fails closed). Round 8
+    found that fix tokenized before recognising comments, so an apostrophe
+    in ``# don't`` opened a "quoted word" hiding the following lines, and
+    a ``don\\'t`` escape desynced quoting; comments, quotes and escapes are
+    now recognised in one left-to-right pass (tokenizer and prose-free
+    surface alike). Round 9 found an over-long lazy body regex (>1s on a
+    67KB ``echo`` script; now bounded at the first closing quote), a
+    ``# comment \\`` joined onto the next line before comments were seen,
+    ANSI-C ``$'..\\'..'`` strings, ``<<EOF`` inside quotes/comments or
+    unterminated dropping the rest of the input (now masked / kept as
+    code), backticks in quoted heredoc bodies and escaped backticks, and
+    two unusual-shape slowdowns. All closed. Round 10 found a quote
+    character inside one heredoc BODY (``Don't``) still desynced the
+    marker mask and hid every later heredoc and the commands between them;
+    heredocs are now found by one left-to-right scanner that never looks
+    inside bodies, reads bodies line by line like the shell, and leaves an
+    inert ``< HEREDOC`` marker (re-running is a no-op). Round 11 (no HIGH)
+    found quote pairing lost after any ``"..$(..).."``, so a later quoted
+    ``<<EOF`` became a live marker; the scanner is now stateful (single/
+    double quotes, ``$(..)`` nesting inside double quotes, ``$((..))``
+    arithmetic, comments, escapes) and linear in the number of markers.
+    Round 12 found ``EOF)`` (bash closes the heredoc and ``$(..)``
+    together) ending a commit-message body only at a LATER ``EOF``; a
+    heredoc-written script run in the same command (``cat > s.sh <<EOF
+    .. EOF; bash s.sh`` -- the body is now judged as code when the file is
+    named again); ``<<<word`` taken as a heredoc; quoted delimiters like
+    ``'1EOF'``/``'---'``; and ``done <<EOF`` loop input judged as code.
+    Round 13 (no HIGH) found the heredoc's redirect target taken from an
+    earlier ``2>/dev/null`` on the same line (now: every target of the
+    heredoc's own simple command, fd redirects and /dev/null skipped) and
+    bodies stored in a variable then run via ``eval``/``sh -c``.
+
+    Further disclosed scope: past ~20k shell tokens the destination parser
+    gives up and the coarse named-target + write-verb check applies (fails
+    closed: may ask on a long script that only reads a target); an
+    unterminated heredoc keeps the rest of the input as code; paths built
+    from separate pieces (``Path.home() / '.config' / 'autostart'``) and a
+    script written in one tool call and run in another are not seen.
+    Round 14 found the ordinary install-script shape ``DEST=~/.config/
+    autostart; cp x "$DEST/"`` allowed: a variable assigned a literal in
+    the same command is now substituted into later ``$NAME``/``${NAME}``/
+    ``${NAME:-..}`` references before destination analysis, and a string
+    variable later run via ``eval``/``sh -c``/``echo "$S" | sh``/``sh <<<``
+    is judged as code. Values computed at run time or assembled across
+    loops remain out of scope. Round 15 found ``${VAR:-default}``/
+    ``${VAR:=default}`` defaults (the overridable-default idiom) never
+    read as the default path, quote-split values (``DEST="$HOME"/.xinitrc``)
+    truncated, padding past the 2000-destination cap (now fails closed),
+    and a round-14 false positive -- copying FROM a variable holding a
+    target (``cp "$F" /tmp/``) -- now only the value's basename lands in
+    the destination dir, as for a literal source. Round 16 found
+    assignments matched inside earlier quoted prose (``echo "export
+    PATH=.."`` swallowed the next real assignment -- now read from the
+    quote-aware tokenizer at command-word position only), ``${X:-${HOME}
+    /.xinitrc}`` nested defaults and ``${HOME:?}``/``${HOME%/}`` modifiers,
+    X-session dotfiles copied into a ``$HOME`` held in a variable, the
+    destination-cap check running before substitution, and a contrived
+    chained-variable slowdown (substitution now memoized and capped).
+    Round 17 found that change dropped assignments after a keyword on the
+    same line (``then DIR=..``, ``{ DEST=..``, ``do F=..``, ``sudo DIR=..
+    sh -c``) -- leading reserved words/wrappers are now skipped -- and
+    ``for VAR in w1 w2`` values are mapped as VAR's values. Round 18 (no
+    HIGH) found ``at -t "$(date ..)"``/``at -t "$TS"`` computed timestamps
+    and positional ``at "$1"``/``"$@"`` times allowed, and prose flags of
+    ``gh``/``glab`` (``--body "..~/.xinitrc.."``) failing closed as
+    unknown-command paths; all closed (download destinations still count).
+    Round 19 (no HIGH) found ``batch`` behind a wrapper with arguments and
+    fed by a redirect (``sudo -u deploy batch < job.sh`` -- redirect
+    operands are now dropped with their operator, bundled ``sudo -iu``
+    values skipped) and ``cd <target> && gh release download`` (gh/glab/
+    hub downloads with no ``-D`` now write into the cwd). Round 20 found
+    the wrapper stripper treating every single-letter sudo/doas flag as
+    value-taking, so ``sudo -n tee <target>``/``sudo -E tee ..`` swallowed
+    the real command; wrappers now consume a separate value only after
+    options that take one (per-wrapper tables, incl. ``--user bob``).
+    Round 21 (no HIGH) found that table read only a bundle's LAST letter,
+    so an attached value ending in a value-letter (``sudo -uroot``,
+    ``xargs -d'\\n'``) swallowed the command -- bundles are now read left
+    to right -- and ``flock/script/sg -c``, ``env -S`` and ``watch``
+    command strings dropped; those bodies are now judged as commands.
+    Round 22 (no HIGH) found round 21's bounded substitution stopped
+    following 3-variable chains (``CONF=..; AUTOSTART_DIR=$CONF/autostart;
+    F=$AUTOSTART_DIR/x.desktop``) -- chains are now resolved in order, in
+    one linear pass, while the map is built -- plus a heredoc-written file
+    "named again" by ``git add`` treated as run (now only a run counts) and
+    GNU ``parallel .. :::`` input lists. Round 23 (no HIGH) found that
+    "only a run counts" check too narrow (``DEBUG=1 ./s.sh``, ``"$S"``,
+    ``time ./s.sh``, ``cat s.sh | bash`` missed): it now fails closed --
+    any later mention counts as a run unless its command is known not to
+    run the file (git/cat/chmod/shellcheck/...) -- plus ``| tee FILE``
+    heredoc targets, and parallel ``:::`` items judged as operands. Round
+    24 (no HIGH) found that fail-closed check flagging doc/data files that
+    were merely formatted, linted or copied (``prettier``/``pandoc``/
+    ``yamllint``/``scp`` on a README) -- a ``.md``/``.txt``/``.yaml``/...
+    file now counts as run only by a shell/interpreter or a pipe into one
+    -- plus heredoc-written Makefile/justfile bodies run by ``make``/
+    ``just``, pipes into ``sudo -E bash``/``env bash``/``fish``, and
+    ``echo '..' > s.sh && bash s.sh``. Still out of scope: a heredoc-
+    written script renamed or copied (``mv s.sh run.sh && ./run.sh``)
+    before it is run. Round 25 found the echo/printf-script loop rescanning
+    the whole command per ``echo .. >> log`` line (>1s at 189KB; now
+    pre-filtered on the body, deduped per file, one shared run check) and
+    a doc file passed as an ARGUMENT to an interpreter script (``python3
+    check_links.py README.md``) counted as run -- a doc now counts only as
+    the runner's own script operand or when piped into a shell. Round 26
+    found that loop's per-file dedupe keeping only the FIRST ``echo .. >>``
+    body of a multi-line script (now: run result cached per file, every
+    body judged), ``bash ./steps.txt`` path-prefixed doc scripts, and
+    ``echo .. | tee s.sh`` writes. Still out of scope: copying a whole
+    parent tree (``cp -a .config ~/``, ``stow``) and a written script run
+    through ``eval "$(cat s.sh)"``. Round 27 (acceptance): PASS -- no HIGH
+    or MEDIUM; its LOW follow-ups closed (mention/file caps now fail
+    closed, ``sh -e doc.txt``, more non-running tools, path-prefixed
+    redirect-into). Remaining disclosed LOW: write-then-run scripts built
+    from multi-argument ``printf``/``echo`` or ``{ ..; } > f`` groups, a
+    ``$(bash s.sh)`` run inside a substitution, and ``bash < doc.txt``."""
+    cfg = getattr(policy, "login_autostart", None) or {}
+    raw_mode = cfg.get("mode", "ask")
+    mode = str(raw_mode).lower()
+    if mode in ("off", "false") or raw_mode is False:
+        return None
+    action = Action.ASK if mode == "ask" else Action.DENY
+
+    def _finish(would: Decision) -> Optional[Decision]:
+        if mode == "monitor":
+            _record_monitor(ev, would, "login-autostart-protect-monitor")
+            return None
+        return would
+
+    if isinstance(ev.args, dict) and isinstance(ev.args.get("command"), (list, tuple)):
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={**ev.args, "command": " ".join(str(x) for x in ev.args["command"])})
+    if ev.args is not None and not isinstance(ev.args, dict):
+        raw_args = ev.args
+        txt = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, default=str)[:400000]
+        ev = Event.make(ev.event, tool=ev.tool, action=ev.action, cwd=ev.cwd,
+                        args={"command": txt} if _is_shell(ev) else {"input": txt})
+
+    def _file_gate(p: str) -> Optional[Decision]:
+        if os.environ.get("AEGIS_ALLOW_LOGIN_AUTOSTART") or \
+                _login_autostart_allowed_by_policy(cfg, p):
+            return None
+        what = ("a cron/at/periodic scheduler file -- its entries run "
+                "unattended on the scheduler's next tick"
+                if patterns.CRON_SPOOL_PATH_RE.search(p) else
+                "a login/desktop-session autostart file -- it runs "
+                "automatically the next time the human logs in")
+        return _finish(Decision(action, "login-autostart-protect",
+                         f"'{p}' is {what}, with their full privileges and "
+                         "outside any repo's review. Review the change, then "
+                         "confirm with AEGIS_ALLOW_LOGIN_AUTOSTART=1; a "
+                         "spawned agent cannot."))
+
+    if ev.action == ActionClass.MCP:
+        for c in _la_mcp_commands(ev):
+                sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
+                                 args={"command": c}, cwd=ev.cwd)
+                d = rule_login_autostart_protect(sub, policy)
+                if d is not None:
+                    return Decision(d.action, d.rule, f"MCP tool '{ev.tool}' runs a "
+                                    "command that installs login/scheduled "
+                                    "persistence. " + d.message)
+
+    if ev.action in (ActionClass.EDIT, ActionClass.WRITE, ActionClass.MCP):
+        p = _path(ev)
+        if p and (patterns.login_autostart_path_hit(p) or _login_autostart_rel_hit(p, ev.cwd)):
+            if ev.action == ActionClass.MCP and _http_rc_mcp_read_only(ev):
+                return None
+            return _file_gate(p)
+        if ev.action == ActionClass.MCP and not _http_rc_mcp_read_only(ev):
+            a0 = ev.args or {}
+            # Path-like keys only (QA round 1: a bare path as an issue title
+            # / chat message / memory value is data, not a write target).
+            _dir = next((str(a0[k]) for k in ("directory", "dir", "folder", "cwd", "parent", "base_dir")
+                         if isinstance(a0.get(k), str)), "")
+            _fn = next((str(a0[k]) for k in ("filename", "name", "file", "file_name", "fileName")
+                        if isinstance(a0.get(k), str)), "")
+            if _dir and _fn and patterns.login_autostart_path_hit(_dir.rstrip("/\\") + "/" + _fn):
+                return _file_gate(_dir.rstrip("/\\") + "/" + _fn)
+            for leaf in list(_la_pathish_leaves(a0))[:5000]:
+                leaf = str(leaf).strip()
+                if (leaf and "\n" not in leaf and len(leaf) <= 4096
+                        and not re.search(r"\s", leaf.replace("Start Menu", "StartMenu"))
+                        and (patterns.login_autostart_path_hit(leaf)
+                             or _login_autostart_rel_hit(leaf, ev.cwd))):
+                    return _file_gate(leaf)
+        if not _is_shell(ev):
+            return None
+
+    if _is_shell(ev):
+        raw = _cmd(ev)
+        surf = _shell_scan(ev)
+        if not (patterns.login_autostart_maybe_target(surf)
+                or patterns.login_autostart_maybe_target(raw)      # surf is length-capped
+                or (ev.cwd and patterns.login_autostart_maybe_target(str(ev.cwd)))
+                or patterns.login_autostart_activation_maybe(surf)
+                or patterns.login_autostart_activation_maybe(raw)
+                or re.search(r"[*?\[]|\{[^{}\s]*,", raw)):   # glob/brace spellings
+            return None                   # cheap exit (shared perf budget)
+        touches_target = activates = False
+        for r in patterns.la_shell_renderings(raw):
+            if not touches_target:
+                touches_target = _login_autostart_shell_writes(r, ev.cwd)
+            if not activates:
+                activates = patterns.login_autostart_activation_hit(r)
+            if touches_target and activates:
+                break
+        if not (touches_target or activates):
+            return None
+        if (_override_allowed(ev) or os.environ.get("AEGIS_ALLOW_LOGIN_AUTOSTART")
+                or _login_autostart_allowed_by_policy(cfg, raw)):
+            return None
+        reason = ("A shell command writes into a login/desktop-session "
+                  "autostart or cron/at spool location" if touches_target else
+                  "A command is scheduling a job (at/batch) or registering a "
+                  "login item / logon autostart")
+        return _finish(Decision(action, "login-autostart-protect",
+                         f"{reason} -- it runs automatically, unattended, at "
+                         "the human's next login or when the scheduler fires, "
+                         "with their full privileges. A human may append "
+                         "'# aegis-allow', or set AEGIS_ALLOW_LOGIN_AUTOSTART=1; "
+                         "a spawned agent cannot."))
+    return None
+
 
 _CORE_RULES = (
     rule_attest_session,
@@ -16504,6 +17069,8 @@ _CORE_RULES = (
     rule_mise_exec_protect,
     rule_bunfig_exec_protect,
     rule_lint_config_exec_protect,
+    # Path/any-write ASK; tail-block so it never pre-empts a later DENY.
+    rule_login_autostart_protect,
     rule_agent_rules_protect,
 )
 
