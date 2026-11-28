@@ -12108,6 +12108,12 @@ def _la_heredoc_head(prefix: str) -> str:
 _LA_HD_MARK_RE = re.compile(
     r"<<(?!<)(?P<dash>-?)[ \t]*(?:'(?P<d1>[^'\n]{1,80})'|\"(?P<d2>[^\"\n]{1,80})\""
     r"|\\(?P<d3>[\w.-]{1,40})|(?P<d4>[A-Za-z0-9_][\w.-]{0,40}))")
+_LA_HD_NONRUN = frozenset((
+    "git", "cat", "less", "more", "head", "tail", "wc", "ls", "stat", "file", "diff", "cmp",
+    "chmod", "chown", "shellcheck", "grep", "rg", "egrep", "echo", "printf", "rm", "cp", "mv",
+    "md5sum", "sha256sum", "touch", "tee", "test", "[", "[[", "realpath", "readlink",
+    "dirname", "basename", "mkdir", "gh", "vim", "nano", "code", "bat", "jq", "yq",
+))
 _LA_HD_SPECIAL_RE = re.compile(r"[\\'\"#$<\n()`]")
 
 
@@ -12228,6 +12234,8 @@ def _la_heredocs(cmd: str):
                 own = re.split(r"[;&|]", line_so_far[-400:])[-1] + " " + re.split(r"[;&|]", tail)[0]
                 targets = [t for t in re.findall(r"(?<![\d&])>>?\|?\s*['\"]?([^\s'\";&|<>()]+)", own)
                            if t != "/dev/null"]
+                targets += re.findall(r"\btee\s+(?:-\S+\s+)*['\"]?([^\s'\";&|<>()]+)",
+                                      line_so_far[-400:] + " " + tail)
                 vm = re.search(r"\b([A-Za-z_]\w*)=\$\([^()]*$", line_so_far[-400:])
                 var = vm.group(1) if vm else ""
                 if not var and name == "read":
@@ -12288,13 +12296,29 @@ def _la_heredocs(cmd: str):
         bn = re.split(r"[/\\]", target)[-1]
         if not bn:
             continue
-        b_ = r"['\"]?(?:[^\s'\";&|]*/)?" + re.escape(bn) + r"(?![\w.-])"
-        # Only a mention that RUNS the file counts (QA round 22: `git add
-        # notes.md` is not running it).
-        if re.search(r"\b(?:(?:ba|z|da|k|fi)?sh|source|python[\d.]*|perl|node|ruby|php|exec|nohup|"
-                     r"env|sudo|doas|at\s+(?:-\S+\s+)*-f|batch\s+(?:-\S+\s+)*-f)\s+(?:-\S+\s+)*" + b_, res) or \
-                re.search(r"(?:^|[;&|(\n])\s*\.\s+" + b_, res) or \
-                re.search(r"(?:^|[;&|(\n])\s*(?:\./|/|~/)(?:[^\s'\";&|]*/)?" + re.escape(bn) + r"(?![\w.-])", res):
+        # Fail closed: any later mention counts as RUNNING the file unless
+        # its command is known not to run it (QA rounds 22-23: `git add
+        # notes.md` is not a run; `DEBUG=1 ./s.sh`, `"$S"`, `cat s.sh | sh`,
+        # `time ./s.sh` are).
+        rx_ = re.compile(r"(?<![\w.-])" + re.escape(bn) + r"(?![\w.-])")
+        ran = False
+        for mm in list(rx_.finditer(res))[:64]:
+            seg = re.split(r"[;&\n(){}]|\|\|?", res[max(0, mm.start() - 2000):mm.start()])[-1]
+            after = re.split(r"[;&\n(){}]", res[mm.end():mm.end() + 2000], maxsplit=1)[0]
+            words = [w.strip("'\"") for w in seg.split()]
+            while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or words[0] in _LA_VM_LEAD
+                             or words[0] in ("then", "if", "do", "time", "!", "command")):
+                words = words[1:]
+            first = words[0].rsplit("/", 1)[-1].lower() if words else ""
+            if first in _LA_HD_NONRUN and not re.search(r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b", after):
+                continue
+            if words and words[0].startswith(">"):
+                continue
+            if re.search(r">\s*$", seg):
+                continue                   # a later redirect INTO it
+            ran = True
+            break
+        if ran:
             code.append(body)
     # A body stored in a variable and later run (`S=$(cat <<EOF..)` /
     # `read -d '' S <<EOF`, then `eval "$S"` / `bash -c "$S"`).
@@ -12555,7 +12579,11 @@ def la_shell_destinations(cmd: str):
                 break
         for sep_ in (":::", "::::", ":::+", "::::+"):
             if sep_ in words:
-                words = words[:words.index(sep_)]      # GNU parallel input list
+                # GNU parallel input list: not the template's last operand,
+                # but its items are still judged (fail closed, QA round 23).
+                k_ = words.index(sep_)
+                unknown.extend(w_ for w_ in words[k_ + 1:] if w_ not in (":::", "::::", ":::+", "::::+"))
+                words = words[:k_]
         words = _la_strip_wrappers(words)
         if not words:
             continue

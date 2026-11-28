@@ -1343,3 +1343,42 @@ def test_r22_gaps_closed(cmd):
 ])
 def test_r22_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 23 regressions ---------------------------------------------------
+
+_R23_B = ("cat > /tmp/install.sh <<'EOF'\n#!/bin/bash\ncp /opt/app/app.desktop ~/.config/autostart/\nEOF\n"
+          "chmod +x /tmp/install.sh\n")
+
+
+@pytest.mark.parametrize("cmd", [
+    _R23_B + "DEBUG=1 /tmp/install.sh",
+    _R23_B + "cd /tmp && DEBUG=1 ./install.sh",
+    _R23_B + "env DEBUG=1 /tmp/install.sh",
+    _R23_B + "sudo env DEBUG=1 /tmp/install.sh",
+    _R23_B + "if /tmp/install.sh; then echo ok; fi",
+    _R23_B + "time /tmp/install.sh",
+    "S=$(mktemp); cat > \"$S\" <<'EOF'\ncp a ~/.config/autostart/\nEOF\nchmod +x \"$S\"; \"$S\"",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\n\"./s.sh\"",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\n{ ./s.sh; }",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\ncat s.sh | bash",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\nbash < s.sh",
+    "cat <<'EOF' | tee s.sh\ncp a ~/.xinitrc\nEOF\nbash s.sh",
+    "parallel cp app.desktop {} ::: ~/.config/autostart/",
+    'parallel "echo x >> {}" ::: ~/.xinitrc',
+    "parallel cp {1} {2} ::: a.desktop ::: ~/.config/autostart/",
+    'parallel ::: "cp a ~/.config/autostart/"',
+])
+def test_r23_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd[:100]
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat > notes.md <<EOF\n# Meeting\nAt 10am Monday we sync.\nEOF\ngit add notes.md",
+    "cat > README.md <<'EOF'\ncp app.desktop ~/.config/autostart/\nEOF\ngit add README.md && git commit -m docs",
+    "cat > s.sh <<'EOF'\ncp a ~/.xinitrc\nEOF\nshellcheck s.sh; cat s.sh",
+])
+def test_r23_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd

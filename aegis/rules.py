@@ -16862,7 +16862,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     F=$AUTOSTART_DIR/x.desktop``) -- chains are now resolved in order, in
     one linear pass, while the map is built -- plus a heredoc-written file
     "named again" by ``git add`` treated as run (now only a run counts) and
-    GNU ``parallel .. :::`` input lists."""
+    GNU ``parallel .. :::`` input lists. Round 23 (no HIGH) found that
+    "only a run counts" check too narrow (``DEBUG=1 ./s.sh``, ``"$S"``,
+    ``time ./s.sh``, ``cat s.sh | bash`` missed): it now fails closed --
+    any later mention counts as a run unless its command is known not to
+    run the file (git/cat/chmod/shellcheck/...) -- plus ``| tee FILE``
+    heredoc targets, and parallel ``:::`` items judged as operands."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
