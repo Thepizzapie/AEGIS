@@ -1420,3 +1420,47 @@ def test_r24_gaps_closed(cmd):
     from aegis import rules
     d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
     assert d is not None and d.rule == RULE, cmd
+
+
+# ---- QA round 25 regressions ---------------------------------------------------
+
+_R25_README = "cat > README.md <<'EOF'\n## Install\n\n```\ncp app.desktop ~/.config/autostart/\n```\nEOF\n"
+
+
+@pytest.mark.parametrize("cmd", [
+    _R25_README + "python3 scripts/check_links.py README.md",
+    _R25_README + "node scripts/toc.js README.md",
+    _R25_README + "python3 -m markdown README.md > out.html",
+    _R25_README + "bash scripts/lint-docs.sh README.md",
+    "cat > config.yaml <<'EOF'\nautostart_dir: ~/.config/autostart\nEOF\npython3 app.py --config config.yaml",
+    "cat > config.yaml <<'EOF'\nautostart_dir: ~/.config/autostart\nEOF\npython3 -m yamllint config.yaml",
+    "cat > notes.md <<'EOF'\nat 10:00 we meet\nEOF\nbash scripts/publish.sh notes.md",
+])
+def test_r25_doc_args_not_run(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'echo hi > ~/.xinitrc' > s.sh && cat s.sh | bash",
+    "echo 'cp a ~/.xinitrc' > s.sh && DEBUG=1 ./s.sh",
+    "echo 'cp x.desktop ~/.config/autostart/' > s.sh; chmod 755 s.sh; sudo ./s.sh",
+    "echo 'open(\"/home/u/.xinitrc\",\"w\")' > s.py && python3 s.py",
+    "cat > notes.md <<'EOF'\ncp a ~/.xinitrc\nEOF\nbash notes.md",
+])
+def test_r25_gaps_closed(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "".join(f'echo "[$(date +%T)] building module {i}" >> build.log\nmake -C mod{i} >> build.log 2>&1\n'
+            for i in range(2150)),
+    "".join(f"echo 'copied {i}' >> log.txt\n" for i in range(64))
+    + "".join(f"cp build/f{i}.o dist/\n" for i in range(8200)) + "cp x ~/.xinitrc",
+])
+def test_r25_echo_loop_perf(cmd):
+    from aegis import rules
+    t0 = time.perf_counter()
+    rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert time.perf_counter() - t0 < 1.0

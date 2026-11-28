@@ -16876,7 +16876,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     ``just``, pipes into ``sudo -E bash``/``env bash``/``fish``, and
     ``echo '..' > s.sh && bash s.sh``. Still out of scope: a heredoc-
     written script renamed or copied (``mv s.sh run.sh && ./run.sh``)
-    before it is run."""
+    before it is run. Round 25 found the echo/printf-script loop rescanning
+    the whole command per ``echo .. >> log`` line (>1s at 189KB; now
+    pre-filtered on the body, deduped per file, one shared run check) and
+    a doc file passed as an ARGUMENT to an interpreter script (``python3
+    check_links.py README.md``) counted as run -- a doc now counts only as
+    the runner's own script operand or when piped into a shell."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()
