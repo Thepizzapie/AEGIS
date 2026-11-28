@@ -11962,7 +11962,8 @@ _LA_TIMESPEC = (
     r"|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday"
     r"|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b"
     r"|(?:january|february|march|april|may|june|july|august|september|october"
-    r"|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b)"
+    r"|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b"
+    r"|SUBST\b|\$\{?[A-Za-z_])"
 )
 LOGIN_AUTOSTART_CMD_RE = re.compile(
     _LA_CMDPOS + r"at(?:\.exe)?\s+(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*['\"]?[^\s'\"|;&]+['\"]?\s+)*"
@@ -11994,7 +11995,7 @@ _LA_REG_KEY_RE = re.compile(
 
 _LA_CMD_LITERALS = ("batch", "osascript", "loginwindow", "sfltool", "winlogon",
                     "explorer", "active setup", "appinit_dlls", "image file execution")
-_LA_AT_WORD_RE = re.compile(r"(?<![\w.\-])at(?:\.exe)?(?:\s|$|[;&|)])", re.IGNORECASE)
+_LA_AT_WORD_RE = re.compile(r"(?<![\w.\-])at(?:\.exe)?(?:\s|$|[;&|)'\"])", re.IGNORECASE)
 
 
 def login_autostart_cmd_hit(cmd: str) -> bool:
@@ -12019,7 +12020,7 @@ def login_autostart_cmd_hit(cmd: str) -> bool:
 # to a shell/at/batch, where it IS code) and quoted strings -- so a wrapped
 # commit message line "at decode time" or `echo "meet; at noon"` is data.
 _LA_HEREDOC_RE = re.compile(
-    r"<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]{0,40})\1[^\n]*\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
+    r"<<-?[ \t]*(['\"]?)([A-Za-z_][\w.-]{0,40})\1([^\n]*)\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|$)|\Z)",
     re.S)
 _LA_CODE_SINKS = frozenset((
     "sh", "bash", "zsh", "dash", "ksh", "fish", "at", "batch", "python", "python3",
@@ -12036,6 +12037,53 @@ _LA_QUOTED_RE = re.compile(r"'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\"|\$'(?:[^'\\\\]|\\\
 _LA_COMMENT_RE = re.compile(r"(?:(?<=\s)|^)#[^\n]*", re.M)
 
 
+def _la_squote(t: str) -> str:
+    return "'" + t.replace("'", "'\"'\"'") + "'"
+
+
+def _la_substitutions(cmd: str, limit: int = 64):
+    """(cmd with $(..)/`..`/<(..)/>(..) replaced by ` SUBST `, [bodies]).
+    Single-quoted text is left alone; nesting handled by paren depth."""
+    if "`" not in cmd and "(" not in cmd:
+        return cmd, []
+    if not re.search(r"[$<>]\(|`", cmd):
+        return cmd, []
+    out, bodies = [], []
+    i, n, in_sq, in_dq = 0, len(cmd), False, False
+    while i < n:
+        ch = cmd[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and ch in "$<>" and cmd[i + 1:i + 2] == "(" and cmd[i + 2:i + 3] != "(" \
+                and len(bodies) < limit:
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if cmd[j] == "(":
+                    depth += 1
+                elif cmd[j] == ")":
+                    depth -= 1
+                j += 1
+            bodies.append(cmd[i + 2:j - 1] if depth == 0 else cmd[i + 2:j])
+            out.append(" SUBST ")
+            i = j
+            continue
+        elif not in_sq and ch == "`" and len(bodies) < limit:
+            j = cmd.find("`", i + 1)
+            j = n if j < 0 else j
+            bodies.append(cmd[i + 1:j])
+            out.append(" SUBST ")
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), bodies
+
+
+_LA_EVAL_BODY_RE = re.compile(r"\b(?:trap|eval|watch)\s+(?:-\S+\s+)*(['\"])(.{1,20000}?)\1", re.S)
+
+
 def _la_heredocs(cmd: str):
     """(cmd with heredoc bodies removed, [bodies fed to a code sink])."""
     code = []
@@ -12048,14 +12096,19 @@ def _la_heredocs(cmd: str):
             head = head[1:]
         name = head[0].rsplit("/", 1)[-1].lower() if head else ""
         # Rest of the heredoc's own line: `cat <<EOF | sh` pipes the body on.
-        tail = m.group(0).split("\n", 1)[0]
+        tail = m.group(3)
         piped = [p.split()[0].rsplit("/", 1)[-1].lower() for p in tail.split("|")[1:] if p.split()]
+        body = m.group(4)
         # Only a body fed to a known prose/data consumer is dropped (QA
         # round 3 lead: any other consumer may run it as code).
         if (name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
                 or any(x not in _LA_PROSE_SINKS for x in piped)):
-            code.append(m.group(3))
-        return "<<" + m.group(2) + "\n"
+            code.append(body)
+            if name in _LA_INTERP or name.startswith("python"):
+                # Judge it as interpreter code too (QA round 4: `python3 - <<EOF`).
+                code.append(name + " -c " + _la_squote(body))
+        # Keep the rest of the marker's line (QA round 4: `cat <<EOF > ~/.xinitrc`).
+        return "<<" + m.group(2) + tail + "\n"
     out = _LA_HEREDOC_RE.sub(_sub, cmd) if "<<" in cmd else cmd
     return out, code
 
@@ -12203,6 +12256,9 @@ def la_shell_destinations(cmd: str):
         words = _la_strip_wrappers(words)
         if not words:
             continue
+        if re.search(r"['\"(),{}]", words[0]):
+            unknown.extend(words)                 # code, not a command name (QA round 4)
+            continue
         name = re.split(r"[/\\]", words[0])[-1].lower()
         if name.endswith(".exe"):
             name = name[:-4]
@@ -12237,7 +12293,16 @@ def la_shell_destinations(cmd: str):
                 # QA round 3b: rsync `-t` is preserve-times, not a target).
                 dests.append(ops[-1])
         elif name in ("tar", "bsdtar", "gtar", "unzip", "7z", "7za", "unrar", "bsdcpio"):
+            n0 = len(dests)
+            extract = (name not in ("tar", "bsdtar", "gtar")
+                       or any(re.fullmatch(r"-?[A-Za-z]*x[A-Za-z]*", a) or a in ("--extract", "--get")
+                              for a in args[:3]))
             for j, a in enumerate(args):
+                if ((name.startswith("unzip") and re.fullmatch(r"-d.+", a))
+                        or (name in ("tar", "bsdtar", "gtar") and re.fullmatch(r"-C.+", a))):
+                    dests.append(a[2:])            # attached `-C<dir>` / `-d<dir>`
+                elif a.startswith("--one-top-level="):
+                    dests.append(a.split("=", 1)[1])
                 if a in ("-C", "--directory", "-d") and j + 1 < len(args):
                     dests.append(args[j + 1])
                 elif a.startswith("--directory="):
@@ -12246,7 +12311,13 @@ def la_shell_destinations(cmd: str):
                     dests.append(a[2:])
                 elif re.match(r"^-[A-Za-z]*C$", a) and j + 1 < len(args):
                     dests.append(args[j + 1])
+            if extract and len(dests) == n0 and (name != "7z" or "x" in ops[:1] or "e" in ops[:1]):
+                dests.append(".")                 # extracts into the cwd (QA round 4)
         elif name in ("curl", "wget", "wget2", "aria2c", "http", "xh"):
+            n0 = len(dests)
+            implicit = (name in ("wget", "wget2", "aria2c") and "--spider" not in args) or any(
+                a in ("--remote-name", "--remote-name-all", "-J", "--remote-header-name")
+                or (re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", a) and name == "curl") for a in args)
             for j, a in enumerate(args):
                 if a in ("-o", "--output", "-O", "--output-document", "--output-dir",
                          "-P", "--directory-prefix", "-d", "--dir", "--out") and j + 1 < len(args):
@@ -12259,6 +12330,8 @@ def la_shell_destinations(cmd: str):
                 elif re.match(r"^-[a-zA-Z]*[oOP].", a) and not a.startswith("--"):
                     k = max(a.find("o"), a.find("O"), a.find("P"))
                     dests.append(a[k + 1:])
+            if implicit and len(dests) == n0:
+                dests.append(".")                 # remote-name download into the cwd
         elif name in ("sed", "gsed"):
             if any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in args):
                 dests.extend(ops)
@@ -12267,10 +12340,10 @@ def la_shell_destinations(cmd: str):
                     known = False
         elif name == "sort":
             for j, a in enumerate(args):
-                if a in ("-o", "--output") and j + 1 < len(args):
+                if (a == "--output" or re.fullmatch(r"-[A-Za-z]*o", a)) and j + 1 < len(args):
                     dests.append(args[j + 1])
-                elif re.match(r"^(?:-o|--output=)(.+)", a):
-                    dests.append(re.match(r"^(?:-o|--output=)(.+)", a).group(1))
+                elif re.match(r"^(?:-[A-Za-z]*o|--output=)(.+)", a):
+                    dests.append(re.match(r"^(?:-[A-Za-z]*o|--output=)(.+)", a).group(1))
         elif name == "git":
             sub = next((a for a in args if not a.startswith("-")), "")
             if sub in ("clone", "worktree", "submodule", "archive", "checkout-index", "-C") or "-C" in args:
@@ -12320,20 +12393,30 @@ def la_shell_destinations(cmd: str):
     return dests, cds, unknown
 
 
-def la_shell_renderings(raw: str):
-    """The raw command plus its decoded / inner-interpreter bodies, without
-    scan_surface's quote-stripped copy (that copy turns prose into code)."""
+def la_shell_renderings(raw: str, _depth: int = 0):
+    """The command (substitutions replaced by SUBST) plus every body that
+    runs as its own command: $(..)/`..`/<(..)/>(..) bodies, heredoc bodies
+    fed to code, trap/eval bodies, decoded / inner-interpreter payloads --
+    without scan_surface's quote-stripped copies (they turn prose into code)."""
     from . import normalize as _n
-    out = [raw]
+    outer, subs = _la_substitutions(raw)
+    out = [outer]
     _, code = _la_heredocs(raw)
     out.extend(code)
+    out.extend(m.group(2) for m in _LA_EVAL_BODY_RE.finditer(outer))
+    if _depth < 3:
+        for b_ in subs:
+            out.extend(la_shell_renderings(b_, _depth + 1))
+    seen = {re.sub(r"[\s'\"$\\\\]", "", x) for x in out + [raw]}
     for r in _n.scan_surface(raw, sep="\x1e").split("\x1e")[1:]:
         if not r.strip() or r in out:
             continue
-        if re.sub(r"[\s'\"$\\\\]", "", r) == re.sub(r"[\s'\"$\\\\]", "", raw):
+        k = re.sub(r"[\s'\"$\\\\]", "", r)
+        if k in seen:
             continue
+        seen.add(k)
         out.append(r)
-    return list(dict.fromkeys(out))[:16]
+    return list(dict.fromkeys(out))[:32]
 
 
 LA_AT_RE = re.compile(
@@ -12344,6 +12427,11 @@ LA_AT_RE = re.compile(
     re.IGNORECASE)
 _LA_ACT_CMDS = frozenset(("reg", "set-itemproperty", "new-itemproperty", "new-item", "sp", "ni",
                           "set-item", "regedit", "osascript", "defaults", "sfltool", "cmd", "powershell", "pwsh"))
+
+
+def login_autostart_activation_maybe(r: str) -> bool:
+    low = r.lower()
+    return any(k in low for k in _LA_CMD_LITERALS) or bool(_LA_AT_WORD_RE.search(r))
 
 
 def login_autostart_activation_hit(r: str) -> bool:
@@ -12359,15 +12447,16 @@ def login_autostart_activation_hit(r: str) -> bool:
     c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
     toks = [t for t in _la_tokens(c) if not (t and set(t) <= set("<>"))]
     for sc in _la_split_simple(toks):
-        w = _la_strip_wrappers([_la_unquote(t) if t[:1] in "'\"" else t for t in sc])
+        quoted_name = bool(sc) and sc[0][:1] in "'\""
+        w = _la_strip_wrappers([_la_unquote(t).strip() if t[:1] in "'\"" else t for t in sc])
         if not w:
             continue
         name = re.split(r"[/\\]", w[0])[-1].lower()
         if name.endswith(".exe"):
             name = name[:-4]
         if name in ("at", "batch") and not re.search(r"[/\\]", w[0].replace("/usr/bin/", "").replace("/usr/local/bin/", "").replace("/bin/", "")):
-            rest = " ".join(w[1:])
-            if name == "batch" and re.fullmatch(r"(?:\s*-[fqmv]\S*(?:\s+\S+)?)*\s*(?:<.*)?", rest):
+            rest = " ".join(x.strip() for x in w[1:] if x.strip())
+            if name == "batch" and not quoted_name and re.fullmatch(r"(?:\s*-[fqmv]\S*(?:\s+\S+)?)*\s*(?:<.*)?", rest):
                 return True
             if name == "at" and re.match(
                     r"(?:-[mMvVkb]+\s+|-[A-Za-z]*[fq]\s*\S+\s+)*(?:-t\s*\d|" + _LA_TIMESPEC + r")",

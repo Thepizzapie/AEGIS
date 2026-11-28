@@ -16459,7 +16459,8 @@ def _login_autostart_rel_hit(p: str, cwd) -> bool:
 _LA_PATHISH_KEY_WORDS = frozenset(("path", "paths", "file", "files", "filename", "filepath",
                                    "dest", "destination", "target", "dst", "to", "output",
                                    "out", "outfile", "location", "uri", "url", "dir",
-                                   "directory", "folder", "new", "newpath", "save", "saveas"))
+                                   "directory", "folder", "new", "newpath", "save", "saveas",
+                                   "name", "pathname", "fullpath", "abspath"))
 
 
 def _la_pathish_leaves(v, key_ok=False, _d=0):
@@ -16523,8 +16524,56 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
         return True
     # Fail closed: a target among an unrecognised command's operands counts
     # (relative operands joined to cwd/cd only when they look like a path).
-    return any(_la_dest_hit(u, bases if re.search(r"[/\\]", u) else ())
-               for u in unknown[:2000])
+    for u in unknown[:2000]:
+        pieces = [u] + [x for x in re.split(r"[\s{}()\[\],;<>|&=]+", u) if x and x != u]
+        for x in pieces[:200]:
+            if _la_dest_hit(x, bases if re.search(r"[/\\]", x) else ()):
+                return True
+    return False
+
+
+_LA_MCP_SHELL_WORDS = frozenset(("exec", "execute", "shell", "bash", "sh", "zsh", "terminal",
+                                 "cmd", "command", "commands", "powershell", "pwsh", "console",
+                                 "pty", "tty", "tmux", "ssh", "spawn", "subprocess"))
+_LA_MCP_CODE_WORDS = frozenset(("python", "cell", "notebook", "jupyter", "code", "repl",
+                                "eval", "script", "node", "javascript", "interpreter"))
+_LA_MCP_CMD_KEYS = ("command", "cmd", "script", "shell_command", "commandLine", "command_line",
+                    "shellCommand", "bash", "sh")
+
+
+def _la_mcp_commands(ev: Event) -> list:
+    """Shell commands an MCP call runs, each judged on its own (QA round 4:
+    joining every field of a `send_email`/`run_tests` call with newlines
+    turned prose into commands). A tool is a shell runner only by a real
+    shell word in its own name or a command-shaped key; code-runner tools
+    (`run_cell{code}`) are judged as interpreter code."""
+    a = ev.args if isinstance(ev.args, dict) else {}
+    words = _http_rc_words(str(ev.tool or "").split("__")[-1])
+    out = []
+    inner = a.get("args") if isinstance(a.get("args"), dict) else {}
+    for src in (a, inner):
+        for k in _LA_MCP_CMD_KEYS:
+            v = src.get(k)
+            if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v):
+                v = " ".join(list(v)[:256])
+            if isinstance(v, str) and v.strip():
+                extra = src.get("args")
+                if isinstance(extra, (list, tuple)):
+                    v += " " + " ".join(str(x) for x in list(extra)[:256])
+                for sk in ("stdin", "input"):
+                    if isinstance(src.get(sk), str) and src.get(sk):
+                        v += "\n" + src[sk]
+                out.append(v)
+    if words & _LA_MCP_SHELL_WORDS:
+        for x in _flatten_strings(a)[:2000]:
+            if isinstance(x, str) and x.strip():
+                out.append(x)
+    if words & (_LA_MCP_CODE_WORDS | {"run", "execute"}) and words & _LA_MCP_CODE_WORDS:
+        for k in ("code", "source", "cell", "script", "input", "content"):
+            v = a.get(k)
+            if isinstance(v, str) and v.strip():
+                out.append("python3 -c " + patterns._la_squote(v))
+    return list(dict.fromkeys(out))[:64]
 
 
 def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
@@ -16664,9 +16713,7 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
                          "spawned agent cannot."))
 
     if ev.action == ActionClass.MCP:
-        shell_cmd = _http_rc_mcp_shell_command(ev)
-        if shell_cmd is not None:
-            for c in dict.fromkeys((shell_cmd, shell_cmd.replace("\n", " "))):
+        for c in _la_mcp_commands(ev):
                 sub = Event.make(HookEvent.PRE_TOOL_USE, tool="Bash",
                                  args={"command": c}, cwd=ev.cwd)
                 d = rule_login_autostart_protect(sub, policy)
@@ -16685,6 +16732,12 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
             a0 = ev.args or {}
             # Path-like keys only (QA round 1: a bare path as an issue title
             # / chat message / memory value is data, not a write target).
+            _dir = next((str(a0[k]) for k in ("directory", "dir", "folder", "cwd", "parent", "base_dir")
+                         if isinstance(a0.get(k), str)), "")
+            _fn = next((str(a0[k]) for k in ("filename", "name", "file", "file_name", "fileName")
+                        if isinstance(a0.get(k), str)), "")
+            if _dir and _fn and patterns.login_autostart_path_hit(_dir.rstrip("/\\") + "/" + _fn):
+                return _file_gate(_dir.rstrip("/\\") + "/" + _fn)
             for leaf in list(_la_pathish_leaves(a0))[:5000]:
                 leaf = str(leaf).strip()
                 if (leaf and "\n" not in leaf and len(leaf) <= 4096
@@ -16697,6 +16750,11 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
 
     if _is_shell(ev):
         raw = _cmd(ev)
+        surf = _shell_scan(ev)
+        if not (patterns.login_autostart_maybe_target(surf)
+                or (ev.cwd and patterns.login_autostart_maybe_target(str(ev.cwd)))
+                or patterns.login_autostart_activation_maybe(surf)):
+            return None                   # cheap exit (shared perf budget)
         touches_target = activates = False
         for r in patterns.la_shell_renderings(raw):
             if not touches_target:

