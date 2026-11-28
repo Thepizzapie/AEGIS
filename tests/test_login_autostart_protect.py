@@ -908,3 +908,37 @@ def test_r10_continuation_padding_past_token_cap():
 ])
 def test_r10_no_false_positives(cmd):
     assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+# ---- QA round 11 regressions (stateful heredoc scanner) ------------------------
+
+@pytest.mark.parametrize("cmd", [
+    'cd "$(git rev-parse --show-toplevel)"\ngrep -rn "<<EOF" scripts/ | head\n'
+    "cp scripts/app.desktop ~/.config/autostart/\ncat > /tmp/notes.txt <<EOF\ndone\nEOF",
+    'cd "$(dirname "$0")"\necho "Writing heredoc <<EOF"\necho ./job.sh | at now + 1 minute\n'
+    "cat > n <<EOF\nx\nEOF",
+    'echo "$(echo "nested") <<EOF"\ncp a ~/.xinitrc\ncat > n <<EOF\nx\nEOF',
+    "x=$((1<<3))\ncp a ~/.xinitrc\ncat > n <<EOF\nx\nEOF",
+    "cat <<\\EOF > ~/.xinitrc\nexec i3\nEOF",
+])
+def test_r11_quote_state_after_substitution(cmd):
+    from aegis import rules
+    d = rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert d is not None and d.rule == RULE, cmd
+
+
+def test_r11_arithmetic_shift_not_heredoc():
+    from aegis import patterns
+    out, code = patterns._la_heredocs("y=$((1<<x))\nx\necho ok\n")
+    assert "HEREDOC" not in out
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<A\na\nA\n" * 16000 + "cp a ~/.xinitrc",
+    "cat " + "<<A " * 20000 + "\nx",
+])
+def test_r11_scanner_linear(cmd):
+    from aegis import rules
+    t0 = time.perf_counter()
+    rules.rule_login_autostart_protect(_shell(cmd), EMPTY)
+    assert time.perf_counter() - t0 < 1.5

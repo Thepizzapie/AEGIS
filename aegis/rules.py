@@ -16752,7 +16752,11 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     marker mask and hid every later heredoc and the commands between them;
     heredocs are now found by one left-to-right scanner that never looks
     inside bodies, reads bodies line by line like the shell, and leaves an
-    inert ``< HEREDOC`` marker (re-running is a no-op)."""
+    inert ``< HEREDOC`` marker (re-running is a no-op). Round 11 (no HIGH)
+    found quote pairing lost after any ``"..$(..).."``, so a later quoted
+    ``<<EOF`` became a live marker; the scanner is now stateful (single/
+    double quotes, ``$(..)`` nesting inside double quotes, ``$((..))``
+    arithmetic, comments, escapes) and linear in the number of markers."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

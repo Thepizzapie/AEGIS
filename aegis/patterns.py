@@ -12094,16 +12094,6 @@ _LA_EXTRA_BODY_RES = (
 )
 
 
-_LA_SCAN_RE = re.compile(
-    r"(?P<c>(?<![^\s;&|()<>])#[^\n]*)"
-    # A double-quoted string containing `$(` is not skipped whole: a
-    # heredoc inside `"$(cat <<'EOF' ...)"` is real.
-    r"|(?P<q>\$'(?:[^'\\]|\\.)*'|'[^']*'|\"(?:[^\"\\$]|\\.|\$(?!\())*\")"
-    r"|(?P<e>\\.)"
-    r"|(?P<h><<(?!<)(?P<dash>-?)[ \t]*(?P<qt>['\"]?)(?P<delim>[A-Za-z_][\w.-]{0,40})(?P=qt))"
-    r"|(?P<n>\n)", re.S)
-
-
 def _la_heredoc_head(prefix: str) -> str:
     head = prefix.rsplit("\n", 1)[-1]
     head = re.split(r"[;&|(]|\$\(", head)[-1].split()
@@ -12113,63 +12103,155 @@ def _la_heredoc_head(prefix: str) -> str:
     return head[0].rsplit("/", 1)[-1].lower() if head else ""
 
 
+_LA_HD_MARK_RE = re.compile(
+    r"<<(?!<)(?P<dash>-?)[ \t]*(?P<qt>['\"]?)(?P<delim>[A-Za-z_][\w.-]{0,40})(?P=qt)"
+    r"|<<(?!<)(?P<dash2>-?)[ \t]*\\(?P<delim2>[A-Za-z_][\w.-]{0,40})")
+_LA_HD_SPECIAL_RE = re.compile(r"[\\'\"#$<\n()`]")
+
+
 def _la_heredocs(cmd: str):
     """(cmd with heredoc bodies removed, [bodies fed to code]).
 
-    One left-to-right scan (QA round 10): a `<<WORD` counts only outside
-    quotes/comments of the COMMAND text -- quote characters inside a body
-    are never seen -- and bodies are read line by line after the marker's
-    line, the way the shell does. Each marker becomes an inert `< HEREDOC`
-    (re-running this is a no-op). A body fed to a non-prose consumer, or a
-    heredoc with no terminator, is returned as code; an unquoted body's
-    $(..)/`..` substitutions are returned as code too."""
+    A small stateful scanner (QA rounds 10-11): it tracks single quotes,
+    double quotes, `$(..)` nesting (including inside double quotes),
+    comments and escapes, so a `<<WORD` counts only where the shell would
+    see one, and quote characters inside a body are never seen. Bodies are
+    read line by line after the marker's line, the way the shell does.
+    Each marker becomes an inert `< HEREDOC` (re-running is a no-op). A
+    body fed to a non-prose consumer, or with no terminator, is returned as
+    code; an unquoted body's $(..)/`..` substitutions are returned too."""
     code = []
     if "<<" not in cmd or "\n" not in cmd:
         return cmd, code
-    out, pending, i, n = [], [], 0, len(cmd)
+    out, pending, stack = [], [], []
+    cur = []                       # output of the current line (for the head)
+    i, n = 0, len(cmd)
+
+    def emit(t):
+        out.append(t)
+        cur.append(t)
+
     while i < n:
-        m = _LA_SCAN_RE.search(cmd, i)
+        top = stack[-1] if stack else ""
+        m = _LA_HD_SPECIAL_RE.search(cmd, i)
         if not m:
-            out.append(cmd[i:])
+            emit(cmd[i:])
             break
-        out.append(cmd[i:m.start()])
-        if m.group("h"):
-            name = _la_heredoc_head("".join(out))
-            tail_end = cmd.find("\n", m.end())
-            tail = cmd[m.end():tail_end if tail_end >= 0 else n]
-            piped = [x.split()[0].rsplit("/", 1)[-1].lower() for x in tail.split("|")[1:] if x.split()]
-            pending.append((m.group("delim"), bool(m.group("qt")), bool(m.group("dash")), name, piped))
-            out.append("< HEREDOC")
-            i = m.end()
+        if m.start() > i:
+            emit(cmd[i:m.start()])
+            i = m.start()
+        ch = cmd[i]
+        if ch == "\\":
+            emit(cmd[i:i + 2])
+            i += 2
             continue
-        if m.group("n") and pending:
-            out.append("\n")
-            j = m.end()
-            for delim, quoted, dash, name, piped in pending:
-                lines, term = [], False
-                while j < n:
-                    e = cmd.find("\n", j)
-                    line = cmd[j:e if e >= 0 else n]
-                    j = (e + 1) if e >= 0 else n
-                    if (line.lstrip("\t") if dash else line) .strip(" ") == delim or line.strip() == delim:
-                        term = True
-                        break
-                    lines.append(line)
-                body = "\n".join(lines)
-                if not quoted:
-                    code.extend(_la_substitutions(body)[1])
-                if (not term or name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
-                        or any(x not in _LA_PROSE_SINKS for x in piped)):
-                    code.append(body)
-                    if name in _LA_INTERP or name.startswith("python"):
-                        code.append(name + " -c " + _la_squote(body))
-                if not term:
-                    out.append(body)        # unterminated: keep it as code
-            pending = []
+        if top == '"':
+            if ch == '"':
+                stack.pop()
+            elif cmd.startswith("$((", i):
+                stack.append("A")
+                emit("$((")
+                i += 3
+                continue
+            elif cmd.startswith("$(", i):
+                stack.append("(")
+                emit("$(")
+                i += 2
+                continue
+            emit(ch)
+            i += 1
+            continue
+        if ch == "'":
+            if cmd.startswith("$'", i - 1) and i > 0 and cmd[i - 1] == "$":
+                j = i + 1
+                while j < n and cmd[j] != "'":
+                    j += 2 if cmd[j] == "\\" else 1
+            else:
+                j = cmd.find("'", i + 1)
+                j = n if j < 0 else j
+            emit(cmd[i:j + 1])
+            i = j + 1
+            continue
+        if ch == '"':
+            stack.append('"')
+            emit(ch)
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|()<>"):
+            j = cmd.find("\n", i)
+            j = n if j < 0 else j
+            emit(cmd[i:j])
             i = j
             continue
-        out.append(m.group(0))
-        i = m.end()
+        if ch == "$" and cmd.startswith("$((", i):
+            stack.append("A")              # arithmetic: `<<` is a shift
+            emit("$((")
+            i += 3
+            continue
+        if ch == "$" and cmd.startswith("$(", i):
+            stack.append("(")
+            emit("$(")
+            i += 2
+            continue
+        if ch == "(":
+            if top == "A":
+                stack.append("a")
+            else:
+                stack.append("(")
+        elif ch == ")":
+            if top == "A" and cmd.startswith("))", i):
+                stack.pop()
+                emit("))")
+                i += 2
+                continue
+            if stack and stack[-1] in "(a":
+                stack.pop()
+        elif ch == "<" and "A" not in stack:
+            mk = _LA_HD_MARK_RE.match(cmd, i)
+            if mk and len(pending) < 64:
+                delim = mk.group("delim") or mk.group("delim2")
+                quoted = bool(mk.group("qt")) or bool(mk.group("delim2"))
+                dash = bool(mk.group("dash") or mk.group("dash2"))
+                name = _la_heredoc_head("".join(cur[-200:]))
+                tail_end = cmd.find("\n", mk.end())
+                tail = cmd[mk.end():tail_end if tail_end >= 0 else n][:2000]
+                piped = [x.split()[0].rsplit("/", 1)[-1].lower() for x in tail.split("|")[1:] if x.split()]
+                pending.append((delim, quoted, dash, name, piped))
+                emit("< HEREDOC")
+                i = mk.end()
+                continue
+        elif ch == "\n":
+            out.append("\n")
+            cur = []
+            i += 1
+            if pending:
+                j = i
+                for delim, quoted, dash, name, piped in pending:
+                    lines, term = [], False
+                    while j < n:
+                        e = cmd.find("\n", j)
+                        line = cmd[j:e if e >= 0 else n]
+                        j = (e + 1) if e >= 0 else n
+                        if (line.lstrip("\t") if dash else line) == delim:
+                            term = True
+                            break
+                        lines.append(line)
+                    body = "\n".join(lines)
+                    if not quoted:
+                        code.extend(_la_substitutions(body)[1])
+                    if (not term or name in _LA_CODE_SINKS or name not in _LA_PROSE_SINKS
+                            or any(x not in _LA_PROSE_SINKS for x in piped)):
+                        code.append(body)
+                        if name in _LA_INTERP or name.startswith("python"):
+                            code.append(name + " -c " + _la_squote(body))
+                    if not term:
+                        out.append(body)    # unterminated: keep it as code
+                        break
+                pending = []
+                i = j
+            continue
+        emit(ch)
+        i += 1
     return "".join(out), code
 
 
