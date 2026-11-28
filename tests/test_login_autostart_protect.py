@@ -733,3 +733,51 @@ def test_r6_glob_expansion_bounded(cmd):
     t0 = time.perf_counter()
     evaluate(_shell(cmd), EMPTY)
     assert time.perf_counter() - t0 < 3.0
+
+
+# ---- QA round 7 (acceptance) regressions ---------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "cp a.desktop ~/.config/autostart/ # setup",
+    "cp xinitrc ~/.xinitrc # use i3",
+    "sudo install -m755 backup.sh /etc/periodic/daily/500.backup  # nightly",
+    "sudo cp 99x /etc/X11/Xsession.d/ # x",
+    "sudo cp job /var/spool/cron/crontabs/root # x",
+    "cp env.sh ~/.config/plasma-workspace/env/ # x",
+    "mv x ~/.xinitrc # move",
+    "ln -s /opt/a.desktop ~/.config/autostart/ # link",
+    "rsync -a a.desktop ~/.config/autostart/ # sync",
+    "cp a ~/.xinitrc #",
+    "cp a ~/.xinitrc # first\necho done",
+    "env -C ~/.config/autostart cp /tmp/a .",
+    "env --chdir=/etc/xdg/autostart cp /tmp/a .",
+    "ssh host 'echo x | at now'",
+])
+def test_r7_gaps_closed(cmd):
+    assert _hit(evaluate(_shell(cmd), EMPTY)), cmd[:80]
+
+
+def test_r7_mcp_trailing_comment():
+    assert _gated(evaluate(_mcp("mcp__shell__run_command",
+                                command="cp a.desktop ~/.config/autostart/ # x"), EMPTY))
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo 'a # b' > notes.txt",
+    "cp a#b /tmp/ # copy ~/.xinitrc later",
+    "cp ~/.xinitrc /tmp/ # backup",
+    "ssh host 'ls ~/.config/autostart'",
+])
+def test_r7_no_false_positives(cmd):
+    assert evaluate(_shell(cmd), EMPTY).rule != RULE, cmd
+
+
+def test_r7_quoted_hash_is_not_a_comment():
+    assert _hit(evaluate(_shell('echo "a # b" > ~/.xinitrc'), EMPTY))
+
+
+def test_r7_padding_past_caps_fails_closed():
+    from aegis import rules
+    ev = _shell("cd ~/.config; " * 8000 + "cp x autostart/")
+    d = rules.rule_login_autostart_protect(ev, EMPTY)
+    assert d is not None and d.rule == RULE

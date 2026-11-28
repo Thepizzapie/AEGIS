@@ -16528,7 +16528,10 @@ def _login_autostart_shell_writes(r: str, cwd) -> bool:
             patterns.ARCHIVE_SYNC_VERB_RE, patterns.FETCH_DIR_VERB_RE,
             patterns.FETCH_TO_FILE_VERB_RE)))
     dests, cds, unknown = res
-    bases = list(dict.fromkeys(cds))[:16] + ([cwd] if cwd else [])
+    ucds = list(dict.fromkeys(cds))
+    if len(ucds) > 16 and any(patterns.login_autostart_maybe_target(x) for x in ucds):
+        return True                       # past the cd cap: fail closed (QA round 7)
+    bases = ucds[:16] + ([cwd] if cwd else [])
     dests = list(dict.fromkeys(dests))
     unknown = list(dict.fromkeys(unknown))
     if any(_la_dest_hit(d, bases) for d in dests[:2000]):
@@ -16729,7 +16732,11 @@ def rule_login_autostart_protect(ev: Event, policy=None) -> Optional[Decision]:
     substitution now stays inside its word); ``su -c``/``sh <<<``/``echo
     .. | sh`` bodies; ``interact_with_process`` and nested ``action_json``
     MCP runners; ``open(.., 'w')`` after unquoting; and false positives on
-    ``./at``, ``cp f{,.bak}`` and a non-running ``add_cell``. All closed."""
+    ``./at``, ``cp f{,.bak}`` and a non-running ``add_cell``. All closed.
+    Round 7 (acceptance) found a trailing ``# comment`` became a copy
+    tool's "last operand" (``cp a ~/.xinitrc # x``) -- comments are now
+    dropped per line, quote-aware -- plus ``env -C DIR``, ``ssh host '..'``
+    bodies, and padding past the 16-``cd`` cap (now fails closed)."""
     cfg = getattr(policy, "login_autostart", None) or {}
     raw_mode = cfg.get("mode", "ask")
     mode = str(raw_mode).lower()

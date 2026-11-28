@@ -11920,12 +11920,12 @@ _LA_TOKEN_RE = re.compile(r"[^\s'\"<>|;&()=]+")
 def login_autostart_cd_hit(cmd: str, cwd=None) -> bool:
     """A relative token in ``cmd`` that lands in a gated location once
     resolved against a ``cd`` target in the same command (or the cwd)."""
-    dirs = [m.group(1) for m in _LA_CD_RE.finditer(cmd)][:8]
+    dirs = list(dict.fromkeys(m.group(1) for m in _LA_CD_RE.finditer(cmd)))[:8]
     if cwd:
         dirs.append(str(cwd))
     if not dirs:
         return False
-    toks = [t for t in _LA_TOKEN_RE.findall(cmd)[:4000]
+    toks = [t for t in list(dict.fromkeys(_LA_TOKEN_RE.findall(cmd)))[:4000]
             if not re.match(r"^(?:[/\\~$%]|[A-Za-z]:|-)", t)]
     for d in dirs:
         base = d.rstrip("/\\")
@@ -12089,6 +12089,7 @@ _LA_EXTRA_BODY_RES = (
     re.compile(r"\b(?:su|runuser)\b[^|;&\n]{0,200}?\s(?:-c|--command(?:=|\s))\s*(['\"])(.{1,20000}?)\1", re.S),
     re.compile(r"\b(?:ba|z|da|k|fi)?sh\b[^|;&\n]{0,100}?<<<\s*(['\"])(.{1,20000}?)\1", re.S),
     re.compile(r"\b(?:echo|printf)\s+(?:-\S+\s+)*(['\"])(.{1,20000}?)\1\s*\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b", re.S),
+    re.compile(r"\bssh\b[^|;&\n'\"]{0,300}?\s(['\"])(.{1,20000}?)\1", re.S),
 )
 
 
@@ -12141,11 +12142,30 @@ _LA_CD_CMDS = frozenset(("cd", "pushd", "chdir", "set-location", "sl"))
 
 _LA_WORD_RE = re.compile(
     r"(?:'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\"|\$\([^()]{0,2000}\)|[^\s'\";&|()<>])+"
-    r"|[;&|()<>]+|['\"]")
+    r"|[;&|()<>]+|['\"]|\n")
 
 
 def _la_tokens(c: str):
     return _LA_WORD_RE.findall(c[:200000])[:20000]
+
+
+def _la_tokens_nocomment(c: str):
+    """Tokens with each unquoted `# comment` dropped up to its newline
+    (QA round 7: `cp a ~/.xinitrc # x` made `x` the destination). Quoted
+    text -- including a multi-line commit message -- stays inside its word,
+    so a `#` or newline inside quotes never splits it."""
+    out, skip = [], False
+    for t in _la_tokens(c):
+        if t == "\n":
+            skip = False
+            out.append(";")
+        elif skip:
+            continue
+        elif t.startswith("#"):
+            skip = True
+        else:
+            out.append(t)
+    return out
 
 
 def _la_unquote(t: str) -> str:
@@ -12211,6 +12231,9 @@ def _la_strip_wrappers(words):
             prev_wrapper = base
             i += 1
             continue
+        if prev_wrapper == "env" and w in ("-C", "-u", "-S", "--chdir", "--unset", "--split-string"):
+            i += 2
+            continue
         if prev_wrapper and w.startswith("-"):
             i += 1
             # option with a separate value (`nice -n 10`, `sudo -u bob`)
@@ -12245,8 +12268,11 @@ def la_shell_destinations(cmd: str):
     `sponge`, `sort -o`)."""
     import shlex
     c, _ = _la_heredocs(cmd)
-    c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
-    toks = [_la_unquote(t) for t in _la_tokens(c)]
+    c = re.sub(r"\\\n", " ", c)
+    raw_toks = _la_tokens_nocomment(c)
+    if len(raw_toks) >= 19000 or len(c) >= 200000:
+        return None                       # truncated: caller falls back (QA round 7)
+    toks = [_la_unquote(t) for t in raw_toks]
     dests, cds, unknown = [], [], []
     for sc in _la_split_simple(toks):
         words = []
@@ -12266,6 +12292,16 @@ def la_shell_destinations(cmd: str):
                 continue
             words.append(t)
             i += 1
+        for j, w_ in enumerate(words[:12]):         # `env -C DIR cmd` (QA round 7)
+            if re.split(r"[/\\]", w_)[-1].lower() == "env":
+                for k_, a_ in enumerate(words[j + 1:j + 12]):
+                    if a_ in ("-C", "--chdir") and j + k_ + 2 < len(words):
+                        cds.append(words[j + k_ + 2])
+                    elif a_.startswith("--chdir="):
+                        cds.append(a_.split("=", 1)[1])
+                    elif re.fullmatch(r"-C.+", a_):
+                        cds.append(a_[2:])
+                break
         words = _la_strip_wrappers(words)
         if not words:
             continue
@@ -12290,6 +12326,20 @@ def la_shell_destinations(cmd: str):
                 cds.append(t0)
             continue
         known = True
+        if name in ("ssh", "autossh", "mosh"):
+            # The remote command (after options and the host) is a command
+            # of its own -- judged like a local one (QA round 7).
+            rest, j = [], 0
+            while j < len(args) and args[j].startswith("-"):
+                j += 2 if re.fullmatch(r"-[bcDEeFIiJLlmOopQRSWw]", args[j]) else 1
+            rest = args[j + 1:]
+            if rest:
+                sub = la_shell_destinations(" ".join(rest))
+                if sub is None:
+                    unknown.extend(rest)
+                else:
+                    dests.extend(sub[0]); cds.extend(sub[1]); unknown.extend(sub[2])
+            continue
         if name == "tee":
             dests.extend(ops)
         elif name in _LA_COPY_CMDS or name in ("robocopy",):
@@ -12483,8 +12533,8 @@ def login_autostart_activation_hit(r: str) -> bool:
     if LA_AT_RE.search(la_prose_free(r)):
         return True
     c, _ = _la_heredocs(r)
-    c = re.sub(r"\\\n", " ", c).replace("\n", " ; ")
-    toks = [t for t in _la_tokens(c) if not (t and set(t) <= set("<>"))]
+    c = re.sub(r"\\\n", " ", c)
+    toks = [t for t in _la_tokens_nocomment(c) if not (t and set(t) <= set("<>"))]
     for sc in _la_split_simple(toks):
         quoted_name = bool(sc) and len(sc[0]) > 1 and sc[0][0] == sc[0][-1] and sc[0][0] in "'\""
         w = _la_strip_wrappers([_la_unquote(t).strip() if t[:1] in "'\"" else t for t in sc])
